@@ -1029,6 +1029,10 @@ class SessionSupervisorStore:
                 ).fetchone()
             if identity_owner is not None:
                 session["session_id"] = str(identity_owner["session_id"])
+            identity_reused = (
+                identity_owner is not None
+                and requested_session_id != session["session_id"]
+            )
             existing = connection.execute(
                 "SELECT * FROM session_record WHERE session_id = ?",
                 (session["session_id"],),
@@ -1041,6 +1045,29 @@ class SessionSupervisorStore:
                         "session_id is already bound to a different lifetime kind",
                         status=409,
                     )
+                requested_location = {
+                    "project_id": session["project_id"],
+                    "node": session["node"],
+                    "mode": session["mode"],
+                    "anchor_ref": session["anchor_ref"],
+                }
+                requested_location_changed = any(
+                    (
+                        material.get("current_project_id") != session["project_id"],
+                        material["node"] != session["node"],
+                        material["mode"] != session["mode"],
+                        session["anchor_ref"] is not None
+                        and material.get("anchor_ref") != session["anchor_ref"],
+                    )
+                )
+                passive_location_preserved = (
+                    identity_reused and requested_location_changed
+                )
+                if passive_location_preserved:
+                    session["project_id"] = material.get("current_project_id")
+                    session["node"] = material["node"]
+                    session["mode"] = material["mode"]
+                    session["anchor_ref"] = material.get("anchor_ref")
                 provider_changed = (
                     material["provider"] != session["provider"]
                     or material["provider_session_ref"]
@@ -1171,8 +1198,9 @@ class SessionSupervisorStore:
                         "owned_process_exact": effective_state == "LIVE"
                         and material["state"] != "STOPPED",
                         "requested_session_id": requested_session_id,
-                        "identity_reused": requested_session_id
-                        != session["session_id"],
+                        "identity_reused": identity_reused,
+                        "passive_location_preserved": passive_location_preserved,
+                        "requested_location": requested_location,
                     },
                 )
                 row = connection.execute(
@@ -1366,6 +1394,35 @@ class SessionSupervisorStore:
             if int(row["row_version"]) != version:
                 raise SessionSupervisorError(
                     "SESSION_VERSION_CONFLICT", "session row version changed", status=409
+                )
+            provider_ref_hash = self._hash_provider_ref(normalized_ref)
+            owner = connection.execute(
+                """
+                SELECT session_id
+                FROM session_binding_history
+                WHERE provider = ?
+                  AND provider_session_ref_hash = ?
+                  AND is_current = 1
+                LIMIT 1
+                """,
+                (normalized_provider, provider_ref_hash),
+            ).fetchone()
+            if owner is not None:
+                owner_id = str(owner["session_id"])
+                if (
+                    owner_id == normalized_id
+                    and str(row["provider"] or "").upper() == normalized_provider
+                    and str(row["provider_session_ref"] or "") == normalized_ref
+                ):
+                    # Provider attach is retried by the host during startup
+                    # and after a Session Hook refresh.  Repeating the exact
+                    # bind must not append a second history row or advance the
+                    # session version.
+                    return self._session_material(connection, row)
+                raise SessionSupervisorError(
+                    "PROVIDER_SESSION_ALREADY_BOUND",
+                    "provider session is already bound to another Universe session",
+                    status=409,
                 )
             next_version = version + 1
             binding_ref = self._append_provider_binding(
@@ -1765,7 +1822,7 @@ class SessionSupervisorStore:
             )
 
     def set_default(
-        self, session_id: str, *, expected_pointer_version: Any
+        self, session_id: str, *, expected_pointer_version: Any, force: bool = False
     ) -> dict[str, Any]:
         normalized_id = _required_text(session_id, "session_id")
         expected = _non_negative_integer(
@@ -1778,7 +1835,7 @@ class SessionSupervisorStore:
                 (session["node"], session["mode"]),
             ).fetchone()
             current_version = 0 if current is None else int(current["pointer_version"])
-            if current_version != expected:
+            if not force and current_version != expected:
                 raise SessionSupervisorError(
                     "DEFAULT_SESSION_VERSION_CONFLICT",
                     "default session pointer version changed",
@@ -1820,7 +1877,7 @@ class SessionSupervisorStore:
         *,
         stop_capability: Any,
     ) -> dict[str, Any]:
-        """Register one already-started Session Boot executor as owned.
+        """Register one already-started persistent project runtime host as owned.
 
         The caller must provide the exact process identity and the short-lived
         capability returned by the executor. The Supervisor probes the process
@@ -2803,7 +2860,51 @@ class SessionSupervisorStore:
             "execution_assignment": "UNASSIGNED",
         }
 
-    def sweep_stale_live_sessions(self) -> dict[str, Any]:
+    def record_host_termination(
+        self, session_id: str, *, session_anchor_ref: str
+    ) -> dict[str, Any]:
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_anchor = _required_text(
+            session_anchor_ref, "session_anchor_ref"
+        )
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if str(row["session_anchor_ref"] or "") != normalized_anchor:
+                raise SessionSupervisorError(
+                    "SESSION_ANCHOR_MISMATCH",
+                    "Host termination does not match the stored Session Anchor",
+                    status=409,
+                )
+            prior_state = str(row["state"] or "UNKNOWN")
+            if prior_state != "STOPPED":
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'STOPPED', current_activity_state = 'TERMINATED',
+                        row_version = row_version + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (now, normalized_id),
+                )
+                self._event(
+                    connection,
+                    session_id=normalized_id,
+                    event_type="SESSION_HOST_TERMINATED",
+                    prior_state=prior_state,
+                    state="STOPPED",
+                    details={
+                        "session_anchor_ref": normalized_anchor,
+                        "authority_created": False,
+                    },
+                )
+            return self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
+
+    def sweep_stale_live_sessions(
+        self, *, live_session_anchors: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Demote LIVE/STARTING sessions that have no living process.
 
         - OWNED lease + PID gone / PID reused / process exited → DISCONNECTED
@@ -2816,8 +2917,59 @@ class SessionSupervisorStore:
         now = utc_now()
         demoted: list[dict[str, Any]] = []
         kept_live = 0
+        pty_kept_live = 0
         unknown_probe = 0
+        restored_live: list[dict[str, Any]] = []
+        normalized_live_anchors = {
+            str(session_id).strip(): str(anchor_ref).strip()
+            for session_id, anchor_ref in (live_session_anchors or {}).items()
+            if str(session_id).strip() and str(anchor_ref).strip()
+        }
         with self._connection(immediate=True) as connection:
+            for session_id, anchor_ref in normalized_live_anchors.items():
+                row = connection.execute(
+                    "SELECT * FROM session_record WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["state"]) == "STOPPED"
+                    or str(row["session_anchor_ref"] or "") != anchor_ref
+                ):
+                    continue
+                prior_state = str(row["state"])
+                if prior_state == "LIVE":
+                    continue
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'LIVE', current_activity_state = 'ATTACHED',
+                        row_version = row_version + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (now, session_id),
+                )
+                self._event(
+                    connection,
+                    session_id=session_id,
+                    event_type="SESSION_RESTORED_BY_LIVE_PTY",
+                    prior_state=prior_state,
+                    state="LIVE",
+                    details={
+                        "session_anchor_ref": anchor_ref,
+                        "host_liveness_source": "PTY_SUPERVISOR",
+                        "currentness_changed": False,
+                        "authority_created": False,
+                    },
+                )
+                restored_live.append(
+                    {
+                        "session_id": session_id,
+                        "session_anchor_ref": anchor_ref,
+                        "prior_state": prior_state,
+                        "state": "LIVE",
+                    }
+                )
             rows = connection.execute(
                 """
                 SELECT * FROM session_record
@@ -2834,6 +2986,13 @@ class SessionSupervisorStore:
                 ).fetchone()
                 reason = None
                 observation: dict[str, Any] | None = None
+                if (
+                    normalized_live_anchors.get(session_id)
+                    == str(row["session_anchor_ref"] or "")
+                ):
+                    kept_live += 1
+                    pty_kept_live += 1
+                    continue
                 if lease is None or str(lease["lease_state"]) != "OWNED":
                     reason = (
                         "NO_PROCESS_LEASE"
@@ -2904,6 +3063,9 @@ class SessionSupervisorStore:
             "demoted_count": len(demoted),
             "kept_live_count": kept_live,
             "unknown_probe_count": unknown_probe,
+            "restored_live_count": len(restored_live),
+            "restored_live": restored_live,
+            "pty_kept_live_count": pty_kept_live,
             "demoted": demoted,
         }
 

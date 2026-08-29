@@ -47,6 +47,7 @@ class MultiRoomStoreTests(unittest.TestCase):
                 "slot_role": "MASTER",
                 "provider": "GROK",
                 "provider_session_ref": "sess-abc",
+                "session_anchor_ref": "MASTER-CURRENT-PROJ-DEMO",
                 "display_name": "Master",
             },
         )
@@ -56,6 +57,53 @@ class MultiRoomStoreTests(unittest.TestCase):
         snap = self.store.room_snapshot(room["room_id"])
         self.assertTrue(snap["user_may_write"])
         self.assertEqual(1, len(snap["bindings"]))
+        self.assertEqual(
+            "MASTER-CURRENT-PROJ-DEMO",
+            snap["bindings"][0]["session_anchor_ref"],
+        )
+
+    def test_room_listing_can_include_open_and_closed_states(self) -> None:
+        open_room = self.store.create_boss_room(
+            project_id="proj_demo", task_frame_id="tf_open"
+        )
+        closed_room = self.store.create_boss_room(
+            project_id="proj_demo", task_frame_id="tf_closed"
+        )
+        self.store.close_room(closed_room["room_id"])
+
+        self.assertEqual(
+            [open_room["room_id"]],
+            [room["room_id"] for room in self.store.list_rooms(room_type="BOSS")],
+        )
+        self.assertEqual(
+            {open_room["room_id"], closed_room["room_id"]},
+            {
+                room["room_id"]
+                for room in self.store.list_rooms(room_type="BOSS", state=None)
+            },
+        )
+
+    def test_close_room_detaches_active_participants_but_keeps_history(self) -> None:
+        room = self.store.create_meeting_room(
+            {"title": "Lifecycle", "project_id": "proj_demo"}
+        )["room"]
+        attached = self.store.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": "CODEX",
+                "provider_session_ref": "fresh-1",
+                "provider_chat_key": "meeting_chat_1",
+                "metadata": {"lifecycle_owner": "MEETING", "archive_on_close": True},
+            },
+        )
+
+        self.store.close_room(room["room_id"])
+
+        self.assertEqual([], self.store.list_bindings(room["room_id"]))
+        historical = self.store.get_binding(attached["binding"]["binding_id"])
+        self.assertEqual("DETACHED", historical["state"])
+        self.assertEqual("MEETING", historical["metadata"]["lifecycle_owner"])
 
     def test_boss_room_user_cannot_write(self) -> None:
         room = self.store.create_boss_room(
@@ -109,6 +157,148 @@ class MultiRoomStoreTests(unittest.TestCase):
         messages = self.store.list_messages(room_id)
         self.assertEqual(1, len(messages))
         self.assertEqual("USER", messages[0]["author_role"])
+
+    def test_meeting_room_artifacts_are_revisioned_and_evidence_backed(self) -> None:
+        created = self.store.create_meeting_room(
+            {"title": "Specification workshop", "topic": "compare two paths"}
+        )
+        room_id = created["room"]["room_id"]
+        source = self.store.post_message(
+            room_id,
+            {"author_role": "USER", "body_text": "Draft the terminal path"},
+        )
+        cursor = self.store.hub.cursor()
+
+        artifact = self.store.create_artifact(
+            room_id,
+            {
+                "artifact_type": "SPECIFICATION",
+                "title": "Terminal path A",
+                "body_text": "Use the existing bounded PTY stream.",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/pty", "docs/meeting-room.md"],
+                "source_message_id": source["message_id"],
+            },
+        )
+        self.assertEqual(1, artifact["current_revision"])
+        self.assertEqual("USER_SELECTION_REQUIRED", artifact["promotion_state"])
+        self.assertEqual("UNASSIGNED", artifact["authority"])
+        self.assertEqual(2, len(artifact["evidence_refs"]))
+
+        revised = self.store.revise_artifact(
+            room_id,
+            artifact["artifact_id"],
+            {
+                "expected_revision": 1,
+                "body_text": "Use the existing bounded PTY stream with reconnect.",
+                "state": "REVIEW",
+                "author_role": "CONDUCTOR",
+            },
+        )
+        self.assertEqual(2, revised["current_revision"])
+        self.assertEqual(2, len(revised["revisions"]))
+        self.assertEqual(artifact["evidence_refs"], revised["evidence_refs"])
+        self.assertEqual(1, len(self.store.room_snapshot(room_id)["artifacts"]))
+
+        events = self.store.hub.wait(
+            room_id, after_event_id=cursor, timeout_seconds=0.1
+        )
+        self.assertEqual("ROOM_ARTIFACT_CREATED", events[0]["payload"]["type"])
+        self.assertEqual("ROOM_ARTIFACT_REVISED", events[1]["payload"]["type"])
+
+        with self.assertRaises(MultiRoomError) as conflict:
+            self.store.revise_artifact(
+                room_id,
+                artifact["artifact_id"],
+                {
+                    "expected_revision": 1,
+                    "body_text": "stale rewrite",
+                    "author_role": "USER",
+                },
+            )
+        self.assertEqual("ROOM_ARTIFACT_REVISION_CONFLICT", conflict.exception.code)
+
+    def test_meeting_room_findings_require_sources_and_preserve_boundaries(self) -> None:
+        created = self.store.create_meeting_room(
+            {"title": "Finding workshop", "topic": "research and dependencies"}
+        )
+        room_id = created["room"]["room_id"]
+        source = self.store.post_message(
+            room_id,
+            {"author_role": "USER", "body_text": "Compare the room and graph planes"},
+        )
+        cursor = self.store.hub.cursor()
+
+        rag = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "RAG_FINDING",
+                "summary": "Room messages already expose stable evidence refs",
+                "detail_text": "Private source excerpt stays in the finding detail.",
+                "author_role": "MODEL",
+                "evidence_refs": ["docs/multi-room-chat-architecture.md#retrieval"],
+                "feature_refs": ["feature://meeting-room"],
+                "source_message_id": source["message_id"],
+            },
+        )
+        dependency = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "CROSS_FEATURE_DEPENDENCY",
+                "summary": "Meeting artifacts depend on graph projection",
+                "author_role": "CONDUCTOR",
+                "evidence_refs": ["universe://evidence/graph-contract"],
+                "feature_refs": ["feature://meeting-room", "feature://graph"],
+            },
+        )
+        escalation = self.store.record_finding(
+            room_id,
+            {
+                "finding_type": "ESCALATION_REQUEST",
+                "summary": "Master must decide whether graph scope expands",
+                "author_role": "USER",
+                "evidence_refs": ["universe://evidence/dependency"],
+                "feature_refs": ["feature://graph"],
+                "requested_owner_role": "MASTER",
+            },
+        )
+
+        self.assertEqual("REVIEW_REQUIRED", rag["resolution_state"])
+        self.assertEqual(2, len(dependency["feature_refs"]))
+        self.assertEqual("OWNER_ACTION_REQUIRED", escalation["resolution_state"])
+        self.assertEqual("UNASSIGNED", escalation["authority"])
+        resolved = self.store.update_finding_state(
+            room_id,
+            escalation["finding_id"],
+            {"state": "RESOLVED", "author_role": "USER"},
+        )
+        self.assertEqual("RESOLVED", resolved["state"])
+        self.assertEqual("RESOLVED", resolved["resolution_state"])
+        self.assertEqual(3, len(self.store.room_snapshot(room_id)["findings"]))
+        events = self.store.hub.wait(
+            room_id, after_event_id=cursor, timeout_seconds=0.1
+        )
+        self.assertEqual(4, len(events))
+        self.assertEqual(
+            [
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_RECORDED",
+                "ROOM_FINDING_STATE_CHANGED",
+            ],
+            [event["payload"]["type"] for event in events],
+        )
+
+        with self.assertRaises(MultiRoomError) as missing_source:
+            self.store.record_finding(
+                room_id,
+                {
+                    "finding_type": "RAG_FINDING",
+                    "summary": "Unsourced claim",
+                    "author_role": "USER",
+                },
+            )
+        self.assertEqual("ROOM_FINDING_EVIDENCE_REQUIRED", missing_source.exception.code)
 
     def test_round_robin_meeting_is_bounded_and_incremental(self) -> None:
         created = self.store.create_meeting_room(
@@ -192,6 +382,109 @@ class MultiRoomStoreTests(unittest.TestCase):
                     if event["event_type"] == "MEETING_SUMMARY"
                 ]
             ),
+        )
+
+    def test_role_meeting_proposals_are_independent_before_shared_review(self) -> None:
+        created = self.store.create_meeting_room(
+            {
+                "title": "Role council",
+                "models": [
+                    {"provider": "GROK", "display_name": "Visionary"},
+                    {"provider": "CLAUDE", "display_name": "Architect"},
+                    {"provider": "CODEX", "display_name": "Implementer"},
+                ],
+            }
+        )
+        room_id = created["room"]["room_id"]
+        bindings = sorted(
+            [item for item in self.store.list_bindings(room_id) if item["slot_role"] == "MODEL"],
+            key=lambda item: (item["created_at"], item["binding_id"]),
+        )
+        briefs = {
+            binding["binding_id"]: {
+                "role": role,
+                "mandate": mandate,
+                "assistants": assistants,
+            }
+            for binding, role, mandate, assistants in zip(
+                bindings,
+                ("Visionary", "Architect", "Implementer"),
+                ("invent", "protect boundaries", "ship slices"),
+                (["Web Scout"], ["RAG Librarian"], ["Code Archaeologist"]),
+                strict=True,
+            )
+        }
+        received: list[dict[str, object]] = []
+
+        def invoke(binding, turn):
+            received.append(
+                {
+                    "binding_id": binding["binding_id"],
+                    "phase": turn["phase"],
+                    "role": turn["meeting_role"],
+                    "delta": turn["delta"]["body_text"],
+                }
+            )
+            return {
+                "status": "COMPLETED",
+                "body_text": f"proposal-{turn['turn_number']}-{turn['meeting_role']}",
+            }
+
+        summary = MultiRoomMeetingCoordinator(self.store, invoke).run(
+            room_id,
+            prompt="same original brief",
+            max_turns=6,
+            run_id="role-council-1",
+            protocol="INDEPENDENT_PROPOSAL_REVIEW",
+            participant_briefs=briefs,
+        )
+
+        self.assertEqual("INDEPENDENT_PROPOSAL_REVIEW", summary["protocol"])
+        self.assertEqual(["PROPOSAL"] * 3, [item["phase"] for item in received[:3]])
+        self.assertTrue(all("same original brief" in str(item["delta"]) for item in received[:3]))
+        self.assertTrue(all("proposal-" not in str(item["delta"]) for item in received[:3]))
+        self.assertEqual(["REVIEW"] * 3, [item["phase"] for item in received[3:]])
+        self.assertTrue(all("proposal-0-Visionary" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all("proposal-1-Architect" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all("proposal-2-Implementer" in str(item["delta"]) for item in received[3:]))
+        self.assertTrue(all(item["artifact_id"] for item in summary["turns"]))
+        model_messages = [
+            item
+            for item in self.store.list_messages(room_id)
+            if item.get("author_role") == "MODEL"
+            and item.get("correlation_id") == "role-council-1"
+        ]
+        self.assertEqual(6, len(model_messages))
+        self.assertTrue(
+            all(json.loads(item["body_text"])["artifact_ref"] for item in model_messages)
+        )
+        first_artifact = self.store.get_artifact(
+            room_id, summary["turns"][0]["artifact_id"]
+        )
+        self.assertEqual("proposal-0-Visionary", first_artifact["body_text"])
+
+    def test_meeting_failure_preserves_provider_error_code_and_detail(self) -> None:
+        room_id = self.store.create_meeting_room(
+            {
+                "title": "Failure detail",
+                "models": [{"provider": "CLAUDE", "display_name": "Architect"}],
+            }
+        )["room"]["room_id"]
+
+        def fail_provider(_binding, _turn):
+            raise MultiRoomError("CLAUDE_OUTPUT_TOO_LARGE", "output exceeds room limit")
+
+        summary = MultiRoomMeetingCoordinator(self.store, fail_provider).run(
+            room_id,
+            prompt="compare routes",
+            max_turns=1,
+            run_id="meeting-failure-detail",
+        )
+
+        self.assertEqual("FAILED", summary["status"])
+        self.assertEqual(
+            "PROVIDER_ERROR:CLAUDE_OUTPUT_TOO_LARGE:output exceeds room limit",
+            summary["turns"][0]["reason"],
         )
 
     def test_round_robin_meeting_cancels_at_turn_boundary(self) -> None:
@@ -344,6 +637,61 @@ class MultiRoomStoreTests(unittest.TestCase):
         )
         self.assertEqual(2, codex_result["cursor"]["delivery_sequence"])
         self.assertEqual(2, claude_result["cursor"]["delivery_sequence"])
+
+    def test_targeted_message_delivers_only_to_selected_participants(self) -> None:
+        room = self.store.create_meeting_room(
+            {
+                "title": "Targeted",
+                "models": [
+                    {"provider": "CODEX", "display_name": "Codex"},
+                    {"provider": "CLAUDE", "display_name": "Claude"},
+                ],
+            }
+        )["room"]
+        codex, claude = [
+            binding
+            for binding in self.store.list_bindings(room["room_id"])
+            if binding["slot_role"] == "MODEL"
+        ]
+        self.store.set_participant_state(codex["binding_id"], "LIVE")
+        self.store.set_participant_state(claude["binding_id"], "LIVE")
+        message = self.store.post_message(
+            room["room_id"],
+            {
+                "author_role": "USER",
+                "body_text": "Claude only",
+                "target_binding_ids": [claude["binding_id"]],
+            },
+        )
+        delivered_to: list[str] = []
+        coordinator = MultiRoomDeliveryCoordinator(
+            self.store,
+            lambda binding, _event: (
+                delivered_to.append(binding["binding_id"])
+                or {"status": "ACCEPTED"}
+            ),
+        )
+
+        codex_result = coordinator.deliver_binding(codex["binding_id"])
+        claude_result = coordinator.deliver_binding(claude["binding_id"])
+
+        self.assertEqual([claude["binding_id"]], message["target_binding_ids"])
+        self.assertEqual([], codex_result["delivered"])
+        self.assertEqual(
+            [message["room_event_id"]],
+            [item["room_event_id"] for item in claude_result["delivered"]],
+        )
+        self.assertEqual([claude["binding_id"]], delivered_to)
+        with self.assertRaises(MultiRoomError) as context:
+            self.store.post_message(
+                room["room_id"],
+                {
+                    "author_role": "USER",
+                    "body_text": "Missing target",
+                    "target_binding_ids": ["bind_missing"],
+                },
+            )
+        self.assertEqual("TARGET_BINDING_INVALID", context.exception.code)
 
     def test_uncertain_delivery_blocks_retry_until_explicit_resolution(self) -> None:
         room = self.store.create_meeting_room(
@@ -867,6 +1215,75 @@ class MultiRoomStoreTests(unittest.TestCase):
         )
         self.assertFalse(again["supervisor_session_created"])
         self.assertEqual(expected_id, again["binding"]["supervisor_session_id"])
+
+    def test_pty_session_start_can_bind_before_provider_identity_exists(self) -> None:
+        injected = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "proj_pty_start",
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": "CLAUDE",
+                "supervisor_session_id": "session_pty_start_1",
+                "state": "STARTING",
+            },
+        )
+        self.assertEqual("SESSION_REF_INJECTED", injected["status"])
+        self.assertEqual(
+            "SUPERVISOR_OBSERVED", injected["provider_identity_state"]
+        )
+        self.assertEqual(
+            "session_pty_start_1", injected["supervisor_session"]["session_id"]
+        )
+        self.assertIsNone(injected["supervisor_session"]["provider_session_ref"])
+        self.assertEqual(
+            "session_pty_start_1", injected["binding"]["supervisor_session_id"]
+        )
+        self.assertIsNone(injected["binding"]["provider_session_ref"])
+
+    def test_cross_mode_reinject_binds_room_to_effective_provider_identity(self) -> None:
+        conductor = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "session_ref": "codex-shared-mode-identity-001",
+                "make_default": False,
+            },
+        )
+
+        master = perform_session_ref_inject(
+            session_supervisor=self.supervisor,
+            multi_rooms=self.store,
+            body={
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "session_ref": "codex-shared-mode-identity-001",
+                "make_default": False,
+            },
+        )
+
+        effective_session_id = conductor["supervisor_session"]["session_id"]
+        self.assertEqual(
+            effective_session_id, master["supervisor_session"]["session_id"]
+        )
+        self.assertEqual(effective_session_id, master["binding"]["supervisor_session_id"])
+        self.assertEqual("MASTER", master["supervisor_session"]["mode"])
+        self.assertEqual(
+            master["supervisor_session"]["session_anchor_ref"],
+            master["binding"]["session_anchor_ref"],
+        )
+        self.assertEqual(
+            ["CONDUCTOR", "MASTER"],
+            [
+                location["mode"]
+                for location in master["supervisor_session"]["location_history"]
+            ],
+        )
 
     def test_inject_model_slot_skips_default_by_default(self) -> None:
         room = self.store.create_meeting_room(

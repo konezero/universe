@@ -182,6 +182,7 @@ $itemStatus = $menu.Items.Add("Refresh status")
 $itemStart = $menu.Items.Add("Start service")
 $itemStop = $menu.Items.Add("Stop service")
 $itemRestart = $menu.Items.Add("Restart service")
+$itemRestartPty = $menu.Items.Add("Restart PTY Supervisor (ends terminals)")
 [void]$menu.Items.Add("-")
 $itemRemoteStart = $menu.Items.Add("Start saved remote access")
 $itemRemoteOpen = $menu.Items.Add("Open mobile URL")
@@ -232,6 +233,24 @@ $itemStop.Add_Click({
 $itemRestart.Add_Click({
     Invoke-UniverseCli -Args @("restart", "--no-open-ui") | Out-Null
     Update-TrayStatus | Out-Null
+  })
+
+$itemRestartPty.Add_Click({
+    $choice = [System.Windows.Forms.MessageBox]::Show(
+      "Restarting the PTY Supervisor closes every active terminal and provider CLI. Continue?",
+      "Restart PTY Supervisor",
+      [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($choice -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $result = Invoke-UniverseCli -Args @("pty-restart")
+    $notify.BalloonTipTitle = "PTY Supervisor"
+    $notify.BalloonTipText = if ($result.ExitCode -eq 0) {
+      "PTY Supervisor restarted. Active terminals were closed."
+    } else {
+      "PTY Supervisor restart failed: $($result.StdErr)"
+    }
+    $notify.ShowBalloonTip(3000)
   })
 
 $itemRemoteStart.Add_Click({

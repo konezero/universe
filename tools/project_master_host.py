@@ -71,6 +71,7 @@ from universe_runtime_worker_dispatch import (
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
 )
+from universe_session_inject_hook import patch_mode_current_anchor
 from worker_failure_evidence import WorkerFailureEvidenceStore
 
 
@@ -87,10 +88,20 @@ TASK_FRAME_PROFILE_RELATIVE_PATH = Path(
 TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json"
 )
+WRITE_ENABLED_WORKER_MAX_TURNS = 1
+READ_ONLY_WORKER_MAX_TURNS = 16
 
 
 class ProjectMasterHostError(RuntimeError):
     pass
+
+
+def _task_frame_child_max_turns(*, write_enabled: bool) -> int:
+    return (
+        WRITE_ENABLED_WORKER_MAX_TURNS
+        if write_enabled
+        else READ_ONLY_WORKER_MAX_TURNS
+    )
 
 
 _WindowsKillOnCloseJob = WindowsKillOnCloseJob
@@ -133,6 +144,7 @@ NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
+RetrievalContextResolver = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
 RoomPermissionObserver = Callable[
     [Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]],
@@ -197,62 +209,29 @@ class ProjectModeCoordinator:
         )
 
     def prepare(self) -> Mapping[str, Any]:
-        definition = self._mode_definition()
-        self._mode_role = definition["role"]
-        source = self._resolved_source_binding()
-        request = {
-            "command": "BOOT",
-            "source_state": "SOURCE_READY",
-            "source_ref": source["source_ref"],
-            "source_commit": source["source_commit"],
-            "source_repository": source["source_repository"],
-            "mode": self.requested_mode,
-            "role": definition["role"],
-            "scope": definition["scope"],
-            "host_session_ref": self.host_session_ref,
-            "anchor_snapshot_ref": "UNKNOWN",
-            "host_executable_capability": "AVAILABLE",
-            "mode_profile": definition["mode_profile"],
-            "task_requirement": "NONE",
-            "evidence_profile": "NONE",
-        }
-        result = self._invoke(
-            ("prepare-session", "--repo-root", str(self.project_root)),
-            request,
-        )
-        anchor = result.get("mode_current_anchor")
-        anchor_status = anchor.get("status") if isinstance(anchor, Mapping) else None
-        if result.get("status") != "SESSION_PREPARED" or anchor_status not in {
-            "MODE_CURRENT_ANCHOR_CREATED",
-            "MODE_CURRENT_ANCHOR_OBSERVED",
-        }:
-            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_PREPARATION_FAILED")
-        _mode_boot_binding(
-            result,
-            expected_mode=self.requested_mode,
-            expected_role=definition["role"],
-        )
-        self._prepared = dict(result)
-        return result
+        """Prepare the live conversation coordinate without starting Runtime Boot.
+
+        A resident provider is already observed by ``SessionSupervisorStore``
+        before this method is called.  That Session Anchor is the coordinate a
+        chat needs; launching the legacy ``prepare-session`` Runtime merely to
+        open the chat made an otherwise healthy provider session depend on a
+        second process, a Release selection, and a Mode Boot binding.
+
+        """
+        anchor_preparation = self._anchor_graph_preparation()
+        if anchor_preparation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        self._prepared = dict(anchor_preparation)
+        return anchor_preparation
 
     def observe(self, message: Mapping[str, Any]) -> Mapping[str, Any]:
         message_id = _text(message.get("message_id"), "message.message_id")
-        result = self._invoke(
-            (
-                "mode-anchor",
-                "observe-commander-input",
-                "--repo-root",
-                str(self.project_root),
-            ),
-            {
-                "mode": self.requested_mode,
-                "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (f"universe://project-room/messages/{message_id}"),
-            },
+        anchor_observation = self._anchor_graph_observation(
+            evidence_ref=f"universe://project-room/messages/{message_id}"
         )
-        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
-            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
-        return result
+        if anchor_observation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        return anchor_observation
 
     def observe_room_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
         room_id = _text(event.get("room_id"), "event.room_id")
@@ -260,24 +239,102 @@ class ProjectModeCoordinator:
         message = event.get("message")
         if not isinstance(message, Mapping) or message.get("author_role") != "USER":
             raise ProjectMasterHostError("PROJECT_COMMANDER_ROOM_EVENT_INVALID")
-        result = self._invoke(
-            (
-                "mode-anchor",
-                "observe-commander-input",
-                "--repo-root",
-                str(self.project_root),
-            ),
-            {
-                "mode": self.requested_mode,
-                "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (
-                    f"universe://rooms/{room_id}/events/{room_event_id}"
-                ),
-            },
+        anchor_observation = self._anchor_graph_observation(
+            evidence_ref=f"universe://rooms/{room_id}/events/{room_event_id}"
         )
-        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
-            raise ProjectMasterHostError("PROJECT_COMMANDER_SURFACE_OBSERVATION_FAILED")
-        return result
+        if anchor_observation is None:
+            raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+        return anchor_observation
+
+    def _anchor_graph_preparation(self) -> dict[str, Any] | None:
+        """Return the exact observed Session Anchor for a resident provider.
+
+        ``None`` means no exact supervised Session Anchor owns this provider
+        coordinate.  The caller must stop instead of manufacturing one through
+        legacy Runtime Boot or a Mode Current Anchor.
+        """
+        session = self._anchor_graph_session()
+        if session is None:
+            return None
+        anchor_ref = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        mode = _text(session.get("mode"), "session.mode").upper()
+        if mode != self.requested_mode:
+            raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_MODE_MISMATCH")
+        observed_at = utc_now()
+        return {
+            "schema": "universe.anchor-graph-session-preparation.v1",
+            "status": "SESSION_PREPARED",
+            "preparation_path": "ANCHOR_GRAPH",
+            "project_id": self.project_id,
+            "mode": mode,
+            "session_id": _text(session.get("session_id"), "session_id"),
+            "session_anchor_ref": anchor_ref,
+            "mode_current_anchor": {
+                "status": "MODE_CURRENT_ANCHOR_OBSERVED",
+                "snapshot": {
+                    "anchor_id": anchor_ref,
+                    "observed_at": observed_at,
+                    "snapshot": {
+                        "anchor_id": anchor_ref,
+                        "coordinates": {
+                            "mode": mode,
+                            "commander_surface": "UNIVERSE_UI",
+                        },
+                    },
+                },
+            },
+        }
+
+    def _anchor_graph_observation(
+        self, *, evidence_ref: str
+    ) -> dict[str, Any] | None:
+        session = self._anchor_graph_session()
+        if session is None:
+            return None
+        anchor_ref = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        mode = _text(session.get("mode"), "session.mode").upper()
+        if mode != self.requested_mode:
+            raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_MODE_MISMATCH")
+        observed_at = utc_now()
+        return {
+            "schema": "universe.anchor-graph-commander-observation.v1",
+            "status": "COMMANDER_INPUT_OBSERVED",
+            "anchor_mode": mode,
+            "evidence_ref": _text(evidence_ref, "evidence_ref"),
+            "snapshot": {
+                "anchor_id": anchor_ref,
+                "observed_at": observed_at,
+                "snapshot": {
+                    "anchor_id": anchor_ref,
+                    "coordinates": {
+                        "mode": mode,
+                        "commander_surface": "UNIVERSE_UI",
+                    },
+                },
+            },
+        }
+
+    def _anchor_graph_session(self) -> Mapping[str, Any] | None:
+        if self.session_supervisor is None:
+            return None
+        candidates = [
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=self.session_node,
+                mode=self.requested_mode,
+                include_hidden=True,
+            )
+            if str(item.get("provider") or "").upper()
+            in SUPPORTED_PROVIDERS
+            and _same_provider_session_ref(
+                str(item.get("provider") or ""),
+                item.get("provider_session_ref"),
+                self.host_session_ref,
+            )
+        ]
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
 
     def apply_file(
         self,
@@ -594,7 +651,7 @@ class ProjectModeCoordinator:
             "mutation_scope": normalized_frame["mutation_scope"],
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
-            "turns": normalized_frame["turns"],
+            "turns": self._runtime_execution_turns(normalized_frame["turns"]),
         }
         proposal_result = self._invoke(
             (
@@ -755,6 +812,9 @@ class ProjectModeCoordinator:
                 "write_operations": ["CREATE", "MODIFY"],
             },
         )
+        repository_write_scope = (
+            "BOUNDED" if normalized_frame["mutation_scope"]["operations"] else "NONE"
+        )
         binding = self._ensure_runtime()
         origin_session_anchor_ref = self._origin_session_anchor_ref(binding)
         instruction_assignment_ref = "instruction:" + normalized_frame["instruction_id"]
@@ -772,18 +832,18 @@ class ProjectModeCoordinator:
             "origin_session_id": binding["session_id"],
             "origin_frame_id": binding["frame_id"],
             "task_summary_ref": instruction_ref,
-            "source_ref": "NONE",
+            "source_ref": normalized_frame["source_ref"],
             "candidate_source_ref": normalized_frame["candidate_source_ref"],
             "source_review_result": normalized_frame["source_review_result"],
             "parent_actor_ref": normalized_frame["parent_actor_ref"],
             "commander_surface": "UNIVERSE_UI",
             "execution_assignment_ref": instruction_assignment_ref,
             "host_worker_capability": "AVAILABLE",
-            "repository_write_scope": "BOUNDED",
+            "repository_write_scope": repository_write_scope,
             "mutation_scope": normalized_frame["mutation_scope"],
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
-            "turns": normalized_frame["turns"],
+            "turns": self._runtime_execution_turns(normalized_frame["turns"]),
         }
         proposal_result = self._invoke(
             (
@@ -813,7 +873,7 @@ class ProjectModeCoordinator:
                     "origin_frame_id": binding["frame_id"],
                     "origin_governance_session_ref": "UNKNOWN",
                     "task_summary_ref": instruction_ref,
-                    "source_ref": "NONE",
+                    "source_ref": normalized_frame["source_ref"],
                     "execution_assignment_ref": instruction_assignment_ref,
                     "task_frame_execution_proposal": dict(execution_proposal),
                     # No approval artifact: task-frame-instruction-v2 derives
@@ -825,7 +885,7 @@ class ProjectModeCoordinator:
                         "user_instruction_raw": normalized_frame["instruction_text"],
                         "constraints": normalized_frame["constraints"],
                         "expected_output": normalized_frame["expected_output"],
-                        "repository_write_scope": "BOUNDED",
+                        "repository_write_scope": repository_write_scope,
                         "mutation_scope": normalized_frame["mutation_scope"],
                     },
                     "parent_observation": {
@@ -878,6 +938,10 @@ class ProjectModeCoordinator:
             "task_frame_id": normalized_frame["frame_id"],
             "profile": str(TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH),
             "origin_session_anchor_ref": origin_session_anchor_ref,
+            "turns": [
+                {"turn_id": turn["turn_id"], "role": turn["role"]}
+                for turn in normalized_frame["turns"]
+            ],
             "repository_write": False,
         }
 
@@ -887,7 +951,7 @@ class ProjectModeCoordinator:
         task_frame_id: str,
         primary_proposal_id: str,
         primary_proposal_digest: str,
-        approval_evidence_ref: str,
+        approval_evidence_ref: str | None,
     ) -> Mapping[str, Any]:
         """Run one approved Frame through the Host-owned worker dispatcher.
 
@@ -898,7 +962,11 @@ class ProjectModeCoordinator:
         frame_id = _text(task_frame_id, "task_frame_id")
         primary_id = _text(primary_proposal_id, "primary_proposal_id")
         _text(primary_proposal_digest, "primary_proposal_digest")
-        approval_ref = _text(approval_evidence_ref, "approval_evidence_ref")
+        approval_ref = (
+            _text(approval_evidence_ref, "approval_evidence_ref")
+            if approval_evidence_ref is not None
+            else None
+        )
         binding = self._ensure_runtime(recover_task_frame_id=frame_id)
         self._validate_task_frame_session_lineage(
             task_frame_id=frame_id,
@@ -922,11 +990,16 @@ class ProjectModeCoordinator:
         gate = execution.get("execution_gate")
         if not isinstance(gate, Mapping):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_GATE_UNAVAILABLE")
-        if gate.get("approval_ref") != approval_ref:
-            raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_LINEAGE_MISMATCH")
+        if approval_ref is not None:
+            if gate.get("approval_ref") != approval_ref:
+                raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_LINEAGE_MISMATCH")
+        elif gate.get("approval_ref") not in {None, "NONE"}:
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_LINEAGE_MISMATCH")
         plan = gate.get("execution_plan")
         if not isinstance(plan, Mapping):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_INVALID")
+        if approval_ref is None and plan.get("profile_id") != "task-frame-instruction-v2":
+            raise ProjectMasterHostError("INSTRUCTION_TASK_FRAME_PROFILE_MISMATCH")
         if _text(plan.get("frame_id"), "execution_plan.frame_id") != frame_id:
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_PLAN_MISMATCH")
         parent_actor_ref = _text(
@@ -985,7 +1058,9 @@ class ProjectModeCoordinator:
                 "execution_plan": dict(plan),
                 "input_bundle": boss_input,
             },
-            "output_contract": self._boss_allocation_output_contract(turns),
+            "output_contract": self._boss_allocation_output_contract(
+                turns, parent_mutation_scope=parent_mutation_scope
+            ),
             "max_turns": 1,
             "result_mode": "STRUCTURED_JSON",
             "defer_terminal_result": True,
@@ -1082,7 +1157,9 @@ class ProjectModeCoordinator:
                     "output_contract": self._child_result_output_contract(
                         mutation_evidence_required=write_enabled
                     ),
-                    "max_turns": 1,
+                    "max_turns": _task_frame_child_max_turns(
+                        write_enabled=write_enabled
+                    ),
                     "result_mode": "STRUCTURED_JSON",
                 }
                 try:
@@ -1103,7 +1180,24 @@ class ProjectModeCoordinator:
                     raise ProjectMasterHostError(
                         "DESCENDANT_TASK_FRAME_CHILD_RESULT_INVALID"
                     )
-                child_results.append({"turn_id": turn_id, "status": terminal_status})
+                child_results.append(
+                    {
+                        "turn_id": turn_id,
+                        "role": role,
+                        "status": terminal_status,
+                        "result": {
+                            key: child_payload[key]
+                            for key in (
+                                "outcome",
+                                "summary",
+                                "evidence_refs",
+                                "validation",
+                                "mutation_evidence_refs",
+                            )
+                            if key in child_payload
+                        },
+                    }
+                )
         except ProjectMasterHostError as error:
             self._recover_captured_boss_claim(
                 boss_request=boss_request,
@@ -1121,7 +1215,11 @@ class ProjectModeCoordinator:
         if boss_completion.get("status") != "TASK_COMPLETED":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_COMPLETION_FAILED")
         return {
-            "status": "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED",
+            "status": (
+                "APPROVED_DESCENDANT_TASK_FRAME_COMPLETED"
+                if approval_ref is not None
+                else "INSTRUCTION_TASK_FRAME_COMPLETED"
+            ),
             "project_id": self.project_id,
             "primary_proposal_id": primary_id,
             "task_frame_id": frame_id,
@@ -1175,7 +1273,7 @@ class ProjectModeCoordinator:
             _text(value, "execution_plan.mutation_scope.targets")
             for value in parent_targets
         }
-        if not normalized_parent_operations or not normalized_parent_targets:
+        if bool(normalized_parent_operations) != bool(normalized_parent_targets):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
 
         if not isinstance(raw_allocations, list):
@@ -1326,19 +1424,17 @@ class ProjectModeCoordinator:
     @staticmethod
     def _boss_allocation_output_contract(
         turns: Sequence[Mapping[str, Any]],
+        *,
+        parent_mutation_scope: Mapping[str, Any],
     ) -> dict[str, Any]:
-        mutation_scope = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["operations", "targets"],
-            "properties": {
-                "operations": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["CREATE", "MODIFY", "DELETE"]},
-                },
-                "targets": {"type": "array", "items": {"type": "string"}},
-            },
-        }
+        parent_operations = [
+            str(value).strip().upper()
+            for value in parent_mutation_scope.get("operations", [])
+        ]
+        parent_targets = [
+            str(value).strip()
+            for value in parent_mutation_scope.get("targets", [])
+        ]
         supported_roles = {
             "IMPLEMENTER",
             "SECURITY_REVIEWER",
@@ -1369,6 +1465,36 @@ class ProjectModeCoordinator:
                 "execution_plan.turn.worker_slot_ref",
             )
             worker_path = f"/root/boss/{leaf}"
+            if role == "IMPLEMENTER":
+                mutation_scope = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["operations", "targets"],
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "enum": parent_operations},
+                        },
+                        "targets": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "enum": parent_targets},
+                        },
+                    },
+                }
+            else:
+                mutation_scope = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["operations", "targets"],
+                    "properties": {
+                        "operations": {"type": "array", "maxItems": 0},
+                        "targets": {"type": "array", "maxItems": 0},
+                    },
+                }
             allocation_variants.append(
                 {
                     "type": "object",
@@ -1394,6 +1520,7 @@ class ProjectModeCoordinator:
                         "mutation_scope": mutation_scope,
                         "skill_bindings": {
                             "type": "array",
+                            "maxItems": 0,
                             "items": {"type": "object"},
                         },
                     },
@@ -1493,6 +1620,22 @@ class ProjectModeCoordinator:
         ):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_OPERATION_FAILED")
         return dict(output)
+
+    @staticmethod
+    def _runtime_execution_turns(
+        turns: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Preserve Host metadata while projecting semantic workers to Runtime Sub roles."""
+
+        projected: list[dict[str, Any]] = []
+        for turn in turns:
+            runtime_turn = dict(turn)
+            runtime_turn["role"] = (
+                "BOSS" if str(turn.get("role") or "").strip().upper() == "BOSS"
+                else "SUB_REVIEWER"
+            )
+            projected.append(runtime_turn)
+        return projected
 
     @staticmethod
     def _sequential_declared_turns(turns: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1647,8 +1790,7 @@ class ProjectModeCoordinator:
             for item in operations_value
         ]
         if (
-            not operations
-            or len(set(operations)) != len(operations)
+            len(set(operations)) != len(operations)
             or not set(operations).issubset(set(source_work["write_operations"]))
         ):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
@@ -1664,7 +1806,7 @@ class ProjectModeCoordinator:
             if target_text in normalized_targets:
                 raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
             normalized_targets.append(target_text)
-        if not normalized_targets:
+        if bool(operations) != bool(normalized_targets):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
         turns = task_frame.get("turns")
         if (
@@ -1956,50 +2098,25 @@ class ProjectModeCoordinator:
                 and self._runtime_process.poll() is None
             ):
                 return dict(self._runtime_binding)
-            prepared = self._prepared or dict(self.prepare())
-            anchor = prepared.get("mode_current_anchor")
-            snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
-            payload = (
-                snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
+            # A resident Host attaches directly to the exact Session Anchor
+            # observed by the Supervisor.  Mode Boot bindings remain only for
+            # already-running compatibility callers; creating one here would
+            # reintroduce the legacy prepare-session gate.
+            session = self._anchor_graph_session()
+            if session is None:
+                raise ProjectMasterHostError("PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE")
+            anchor_id = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+            session_id = _text(session.get("session_id"), "session_id")
+            frame_id = _text(
+                recover_task_frame_id or "current", "project_runtime.frame_id"
             )
-            anchor_id = (
-                _text(payload.get("anchor_id"), "mode_current_anchor.anchor_id")
-                if isinstance(payload, Mapping)
-                else ""
-            )
-            if not anchor_id:
-                raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
-            prepared_binding = prepared.get("mode_boot_binding")
-            prepared_role = (
-                str(prepared_binding.get("role") or "").strip().upper()
-                if isinstance(prepared_binding, Mapping)
-                else ""
-            )
-            expected_role = (
-                self._mode_role
-                or prepared_role
-                or self._mode_definition()["role"]
-            )
-            mode_boot_binding = _mode_boot_binding(
-                prepared,
-                expected_mode=self.requested_mode,
-                expected_role=expected_role,
-            )
-            self._mode_role = expected_role
-            if mode_boot_binding["anchor_id"] != anchor_id:
-                raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_MISMATCH")
-            frame_id = mode_boot_binding["frame_id"]
-            session_id = self._runtime_session_id(
-                anchor_id=anchor_id,
-                frame_id=frame_id,
-                recover_task_frame_id=recover_task_frame_id,
-            )
+            self._mode_role = "UNASSIGNED"
             token = secrets.token_urlsafe(32)
             python = _required_host_executable("python")
             command = [
                 str(python),
                 str(self.runtime_cli),
-                "session-boot",
+                "project-runtime",
                 "serve",
                 "--repo-root",
                 str(self.project_root),
@@ -2009,10 +2126,10 @@ class ProjectModeCoordinator:
                 frame_id,
                 "--anchor-id",
                 anchor_id,
-                "--boot-binding-id",
-                mode_boot_binding["binding_id"],
+                "--mode",
+                self.requested_mode,
                 "--host-action",
-                "PROJECT_MASTER_SEED_APPLY",
+                "PERSISTENT_SESSION_ATTACH",
                 "--session-location",
                 "PROJECT_MASTER_HOST",
                 "--commander-surface",
@@ -2045,17 +2162,15 @@ class ProjectModeCoordinator:
                 host_adapter = startup.get("host_adapter")
                 runtime_state = startup.get("runtime_state")
                 if (
-                    startup.get("status") != "SESSION_BOOT_IMAGE_CREATED"
+                    startup.get("status") != "PERSISTENT_SESSION_ATTACHED"
                     or not isinstance(host_adapter, Mapping)
                     or not isinstance(runtime_state, Mapping)
                     or runtime_state.get("anchor_id") != anchor_id
                     or runtime_state.get("mode") != self.requested_mode
-                    or runtime_state.get("role") != self._mode_role
+                    or runtime_state.get("role") != "UNASSIGNED"
                     or runtime_state.get("executable_runtime_currentness") != "CURRENT"
-                    or not isinstance(startup.get("mode_boot_binding"), Mapping)
-                    or startup["mode_boot_binding"].get("binding_id")
-                    != mode_boot_binding["binding_id"]
-                    or startup["mode_boot_binding"].get("status") != "ACTIVE"
+                    or startup.get("attachment_path") != "ANCHOR_GRAPH"
+                    or "mode_boot_binding" in startup
                 ):
                     raise ProjectMasterHostError(
                         "PROJECT_MASTER_RUNTIME_START_RESULT_INVALID"
@@ -2080,7 +2195,7 @@ class ProjectModeCoordinator:
                 "session_id": session_id,
                 "frame_id": frame_id,
                 "anchor_id": anchor_id,
-                "mode_boot_binding_id": mode_boot_binding["binding_id"],
+                "attachment_path": "ANCHOR_GRAPH",
                 "runtime_currentness_observation": str(
                     runtime_state["executable_runtime_currentness"]
                 ),
@@ -2174,6 +2289,19 @@ class ProjectModeCoordinator:
         if session is None:
             return "UNKNOWN"
         return str(session.get("session_anchor_ref") or "UNKNOWN")
+
+    def session_anchor_ref(self) -> str:
+        """Return only the Supervisor-verified Session Anchor for this Host."""
+
+        with self._runtime_lock:
+            binding = (
+                dict(self._runtime_binding)
+                if self._runtime_binding is not None
+                else None
+            )
+        if binding is None:
+            return "UNKNOWN"
+        return self._origin_session_anchor_ref(binding)
 
     def _task_frame_session_lineage(self, task_frame_id: str) -> dict[str, str] | None:
         path = self._task_frame_session_lineage_path
@@ -2599,7 +2727,7 @@ class ProjectModeCoordinator:
                     "Task Frame Runtime"
                 ),
                 "bounded_summary": (
-                    "Project Master Task Frame Session Boot executor"
+                    "Project Master persistent Task Frame runtime host"
                 ),
             }
         )
@@ -3090,9 +3218,24 @@ class ProjectMasterSessionStore:
                 node=self.session_node,
                 mode=self.requested_mode,
             )
+            with self._connection() as connection:
+                owned_row = connection.execute(
+                    "SELECT value FROM host_metadata WHERE key = ?",
+                    ("supervisor_session_id:PROJECT_MASTER",),
+                ).fetchone()
+            owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
             selected = next(
-                (session for session in sessions if session["is_default"]), None
+                (
+                    session
+                    for session in sessions
+                    if owned_id and str(session.get("session_id") or "") == owned_id
+                ),
+                None,
             )
+            if selected is None:
+                selected = next(
+                    (session for session in sessions if session["is_default"]), None
+                )
             if selected is not None and selected["provider_session_ref"]:
                 return {
                     "provider": str(selected["provider"]),
@@ -3128,10 +3271,92 @@ class ProjectMasterSessionStore:
             return None
         return coordinate["session_ref"]
 
-    def ensure_supervisor_session(self, provider: str) -> dict[str, Any] | None:
+    def ensure_supervisor_session(
+        self,
+        provider: str,
+        *,
+        new_session: bool = False,
+        owner_key: str = "",
+    ) -> dict[str, Any] | None:
         """Create the persistent Mode-session slot before its processes start."""
         if self.session_supervisor is None:
             return None
+        normalized_provider = _provider(provider)
+        normalized_owner = str(owner_key or "").strip().upper()
+        if normalized_owner:
+            metadata_key = f"supervisor_session_id:{normalized_owner}"
+            existing_id = ""
+            if not new_session:
+                with self._connection() as connection:
+                    row = connection.execute(
+                        "SELECT value FROM host_metadata WHERE key = ?",
+                        (metadata_key,),
+                    ).fetchone()
+                existing_id = str(row["value"] or "") if row is not None else ""
+            if existing_id:
+                try:
+                    existing = self.session_supervisor.get_session(existing_id)
+                except SessionSupervisorError:
+                    existing = None
+                if (
+                    isinstance(existing, Mapping)
+                    and str(existing.get("node") or "") == self.session_node
+                    and str(existing.get("mode") or "").upper()
+                    == self.requested_mode
+                    and str(existing.get("provider") or "").upper()
+                    in {"", normalized_provider}
+                ):
+                    return dict(existing)
+            supervisor_session_id = "session_" + secrets.token_hex(12)
+            session, _ = self.session_supervisor.register_session(
+                {
+                    "session_id": supervisor_session_id,
+                    "node": self.session_node,
+                    "mode": self.requested_mode,
+                    "provider": normalized_provider,
+                    "provider_session_ref": None,
+                    "state": "REGISTERED",
+                    "currentness": "UNKNOWN",
+                    "activity_state": "BOOTSTRAPPING",
+                    "location_evidence_ref": (
+                        "universe://owned-mode-session/"
+                        f"{normalized_owner}/{self.session_node}/{self.requested_mode}"
+                    ),
+                }
+            )
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO host_metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (metadata_key, supervisor_session_id),
+                )
+            return session
+        if new_session:
+            supervisor_session_id = "session_" + secrets.token_hex(12)
+            session, _ = self.session_supervisor.register_session(
+                {
+                    "session_id": supervisor_session_id,
+                    "node": self.session_node,
+                    "mode": self.requested_mode,
+                    "provider": normalized_provider,
+                    "provider_session_ref": None,
+                    "state": "REGISTERED",
+                    "currentness": "UNKNOWN",
+                    "activity_state": "BOOTSTRAPPING",
+                    "location_evidence_ref": (
+                        "universe://mode-session-new/"
+                        f"{self.session_node}/{self.requested_mode}"
+                    ),
+                }
+            )
+            self.session_supervisor.set_default(
+                supervisor_session_id,
+                expected_pointer_version=session["default_pointer_version"],
+            )
+            return self.session_supervisor.get_session(supervisor_session_id)
         sessions = self.session_supervisor.list_sessions(
             node=self.session_node,
             mode=self.requested_mode,
@@ -3162,7 +3387,6 @@ class ProjectMasterSessionStore:
             )
         if selected is not None:
             return selected
-        normalized_provider = _provider(provider)
         supervisor_session_id = self._supervisor_session_id(normalized_provider, "")
         session, _ = self.session_supervisor.register_session(
             {
@@ -3208,45 +3432,73 @@ class ProjectMasterSessionStore:
         else:
             state = "REPLACED"
         if self.session_supervisor is not None:
-            sessions = self.session_supervisor.list_sessions(
-                node=self.session_node,
-                mode=self.requested_mode,
-            )
-            selected = next(
-                (session for session in sessions if session["is_default"]),
-                None,
-            )
-            if selected is not None:
+            with self._connection() as connection:
+                owned_row = connection.execute(
+                    "SELECT value FROM host_metadata WHERE key = ?",
+                    ("supervisor_session_id:PROJECT_MASTER",),
+                ).fetchone()
+            owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
+            # Host startup can advance the same Supervisor row while the
+            # provider coordinate is being observed. Re-read and retry only
+            # that optimistic bind; never switch away from the owned slot.
+            for bind_attempt in range(3):
+                sessions = self.session_supervisor.list_sessions(
+                    node=self.session_node,
+                    mode=self.requested_mode,
+                )
+                selected = next(
+                    (
+                        session
+                        for session in sessions
+                        if owned_id
+                        and str(session.get("session_id") or "") == owned_id
+                    ),
+                    None,
+                )
+                if selected is None:
+                    selected = next(
+                        (session for session in sessions if session["is_default"]),
+                        None,
+                    )
+                if selected is None:
+                    supervisor_session_id = self._supervisor_session_id(
+                        normalized_provider, normalized_session
+                    )
+                    candidate, _ = self.session_supervisor.register_session(
+                        {
+                            "session_id": supervisor_session_id,
+                            "node": self.session_node,
+                            "mode": self.requested_mode,
+                            "provider": normalized_provider,
+                            "provider_session_ref": normalized_session,
+                            "state": "LIVE",
+                            "currentness": "UNKNOWN",
+                        }
+                    )
+                    break
                 supervisor_session_id = str(selected["session_id"])
                 if (
                     selected.get("provider") == normalized_provider
                     and selected.get("provider_session_ref") == normalized_session
                 ):
                     candidate = selected
-                else:
+                    break
+                try:
                     candidate = self.session_supervisor.bind_provider_session(
                         supervisor_session_id,
                         provider=normalized_provider,
                         provider_session_ref=normalized_session,
                         expected_version=selected["row_version"],
                     )
-            else:
-                supervisor_session_id = self._supervisor_session_id(
-                    normalized_provider, normalized_session
-                )
-                candidate, _ = self.session_supervisor.register_session(
-                    {
-                        "session_id": supervisor_session_id,
-                        "node": self.session_node,
-                        "mode": self.requested_mode,
-                        "provider": normalized_provider,
-                        "provider_session_ref": normalized_session,
-                        "state": "LIVE",
-                        "currentness": "UNKNOWN",
-                    }
-                )
+                    break
+                except SessionSupervisorError as error:
+                    if (
+                        error.code != "SESSION_VERSION_CONFLICT"
+                        or bind_attempt == 2
+                    ):
+                        raise
             supervisor_session_id = str(candidate["session_id"])
-            if not candidate["is_default"]:
+            if not owned_id and not candidate["is_default"]:
                 self.session_supervisor.set_default(
                     supervisor_session_id,
                     expected_pointer_version=candidate["default_pointer_version"],
@@ -3304,7 +3556,13 @@ class ProjectMasterSessionStore:
         if candidate is None:
             raise ProjectMasterHostError("MODE_SESSION_SUPERVISOR_SESSION_UNAVAILABLE")
         supervisor_session_id = str(candidate["session_id"])
-        if not candidate["is_default"]:
+        with self._connection() as connection:
+            owned_row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                ("supervisor_session_id:PROJECT_MASTER",),
+            ).fetchone()
+        owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
+        if not owned_id and not candidate["is_default"]:
             self.session_supervisor.set_default(
                 supervisor_session_id,
                 expected_pointer_version=candidate["default_pointer_version"],
@@ -3344,26 +3602,50 @@ class ProjectMasterSessionStore:
     def observe_current_anchor(self, anchor_ref: str) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
-        selected = next(
-            (
-                session
-                for session in self.session_supervisor.list_sessions(
-                    node=self.session_node,
-                    mode=self.requested_mode,
+        with self._connection() as connection:
+            owned_row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                ("supervisor_session_id:PROJECT_MASTER",),
+            ).fetchone()
+        owned_id = str(owned_row["value"] or "") if owned_row is not None else ""
+        for bind_attempt in range(3):
+            sessions = self.session_supervisor.list_sessions(
+                node=self.session_node,
+                mode=self.requested_mode,
+            )
+            selected = next(
+                (
+                    session
+                    for session in sessions
+                    if owned_id
+                    and str(session.get("session_id") or "") == owned_id
+                ),
+                None,
+            )
+            if selected is None:
+                selected = next(
+                    (session for session in sessions if session["is_default"]),
+                    None,
                 )
-                if session["is_default"]
-            ),
-            None,
-        )
-        if selected is None:
-            raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
-        if selected.get("anchor_ref") == anchor_ref:
-            return selected
-        return self.session_supervisor.bind_current_anchor(
-            selected["session_id"],
-            anchor_ref=anchor_ref,
-            expected_version=selected["row_version"],
-        )
+            if selected is None:
+                raise ProjectMasterHostError(
+                    "SUPERVISOR_PROJECT_SESSION_UNAVAILABLE"
+                )
+            if selected.get("anchor_ref") == anchor_ref:
+                return selected
+            try:
+                return self.session_supervisor.bind_current_anchor(
+                    selected["session_id"],
+                    anchor_ref=anchor_ref,
+                    expected_version=selected["row_version"],
+                )
+            except SessionSupervisorError as error:
+                if (
+                    error.code != "SESSION_VERSION_CONFLICT"
+                    or bind_attempt == 2
+                ):
+                    raise
+        raise ProjectMasterHostError("SUPERVISOR_PROJECT_SESSION_UNAVAILABLE")
 
     def _migrate_legacy_provider_sessions(self) -> None:
         current = self._legacy_provider_session()
@@ -3859,7 +4141,7 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "the Commander again. If scope or boundary changes, stop and create a new primary "
         "Task Proposal instead of inheriting approval. "
         "When both Task and Evidence require executable proof, "
-        "request or attach the Session Boot executor with "
+        "request or attach the persistent project runtime host with "
         "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
         "declared Task Frame Workers. Route every mutation through Execution Guard and "
         "a receipt-aware write path. Never substitute a raw write, raw subordinate "
@@ -3882,17 +4164,29 @@ class GrokProjectMasterRuntime:
         model: str = "",
         effort: str = "AUTO",
         max_turns: int = 8,
+        response_timeout_seconds: float = 900.0,
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": requested_mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
         self.model = model.strip()
         self.effort = str(effort or "AUTO").strip().upper()
         self.max_turns = max(1, int(max_turns))
+        self.response_timeout_seconds = float(response_timeout_seconds)
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
         self.actor_label = (
             _text(actor_label, "actor_label")
@@ -3906,6 +4200,11 @@ class GrokProjectMasterRuntime:
             None
         )
         self._gateway: UniverseAcpGateway | None = None
+        # Provider startup can publish its session id from a background
+        # reader while the host is being replaced.  Advancing this epoch
+        # before closing the old gateway makes those late callbacks inert;
+        # otherwise a stale provider id can be bound to the fresh NEW slot.
+        self._observer_epoch = 0
 
     @property
     def session_ref(self) -> str:
@@ -3953,6 +4252,11 @@ class GrokProjectMasterRuntime:
         self.project_root = Path(rebound)
         return rebound
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        if self._gateway is None:
+            return []
+        return self._gateway.drain_work_statuses()
+
     def runtime_observation(self) -> dict[str, Any]:
         if self._gateway is not None:
             return self._gateway.runtime_observation()
@@ -3966,6 +4270,7 @@ class GrokProjectMasterRuntime:
         }
 
     def close(self) -> None:
+        self._observer_epoch += 1
         if self._gateway is not None:
             self._gateway.close()
             self._gateway = None
@@ -3992,7 +4297,11 @@ class GrokProjectMasterRuntime:
             raise ProjectMasterHostError("GROK_CLI_UNAVAILABLE")
         model = self.model or default_model
 
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
             self.connection_state = self.store.observe_provider_session(
                 "GROK", session_id
@@ -4008,8 +4317,10 @@ class GrokProjectMasterRuntime:
                 effort=self.effort,
                 system_prompt=self._system_prompt(),
                 session_id=self.session_id,
+                response_timeout_seconds=self.response_timeout_seconds,
                 permission_requester=self._permission_requester,
                 session_observer=observe_session,
+                **self._supervisor_transport,
             )
         )
         return self._gateway
@@ -4048,6 +4359,11 @@ class GrokProjectMasterRuntime:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        retrieval_text = json.dumps(
+            message.get("retrieval_context", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
@@ -4056,6 +4372,7 @@ class GrokProjectMasterRuntime:
             f"project_runtime_context: {context_text}\n\n"
             f"project_skill_plan_context: {skill_plan_text}\n\n"
             f"project_skill_binding_proposals: {skill_binding_text}\n\n"
+            f"project_retrieval_context: {retrieval_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -4073,8 +4390,18 @@ class CodexProjectMasterRuntime:
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": requested_mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.project_id = _text(project_id, "project_id")
         self.store = store
         self.native_runner = native_runner
@@ -4093,6 +4420,11 @@ class CodexProjectMasterRuntime:
             None
         )
         self._gateway: UniverseAcpGateway | None = None
+        # Provider startup can publish its session id from a background
+        # reader while the host is being replaced.  Advancing this epoch
+        # before closing the old gateway makes those late callbacks inert;
+        # otherwise a stale provider id can be bound to the fresh NEW slot.
+        self._observer_epoch = 0
 
     @property
     def session_ref(self) -> str:
@@ -4104,6 +4436,11 @@ class CodexProjectMasterRuntime:
 
     def reply(self, message: Mapping[str, Any]) -> str:
         return self.reply_stream(message, lambda _delta: None)
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        if self._gateway is None:
+            return []
+        return self._gateway.drain_work_statuses()
 
     def runtime_observation(self) -> dict[str, Any]:
         if self._gateway is not None:
@@ -4203,7 +4540,11 @@ class CodexProjectMasterRuntime:
             raise ProjectMasterHostError("CODEX_CLI_UNAVAILABLE")
         model = self.model or default_model
 
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
             self.connection_state = self.store.observe_provider_session(
                 "CODEX", session_id
@@ -4221,6 +4562,7 @@ class CodexProjectMasterRuntime:
                 session_id=self.session_id,
                 permission_requester=self._permission_requester,
                 session_observer=observe_session,
+                **self._supervisor_transport,
             )
         )
         return self._gateway
@@ -4260,6 +4602,11 @@ class CodexProjectMasterRuntime:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        retrieval_text = json.dumps(
+            message.get("retrieval_context", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             "Universe Project Room message\n"
             f"message_id: {_text(message.get('message_id'), 'message.message_id')}\n"
@@ -4268,6 +4615,7 @@ class CodexProjectMasterRuntime:
             f"project_runtime_context: {context_text}\n\n"
             f"project_skill_plan_context: {skill_plan_text}\n\n"
             f"project_skill_binding_proposals: {skill_binding_text}\n\n"
+            f"project_retrieval_context: {retrieval_text}\n\n"
             f"{_text(message.get('body'), 'message.body')}"
         )
 
@@ -4286,6 +4634,9 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         requested_mode: str = "MASTER",
         actor_label: str | None = None,
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         super().__init__(
             project_root,
@@ -4297,8 +4648,16 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
             requested_mode=requested_mode,
             actor_label=actor_label,
             new_session=new_session,
+            terminal_host=terminal_host,
+            supervisor_session_id=supervisor_session_id,
+            session_anchor_ref=session_anchor_ref,
         )
-        self.session_id = None if new_session else store.session_ref_for("CLAUDE")
+        stored_session_ref = None if new_session else store.session_ref_for("CLAUDE")
+        self.session_id = (
+            stored_session_ref.removeprefix("claude-code:")
+            if stored_session_ref
+            else None
+        )
         self.max_turns = max(1, int(max_turns))
         self._permission_broker: ClaudePermissionBroker | None = None
         self._mcp_config_root: Path | None = None
@@ -4388,10 +4747,29 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         executable, environment, default_model = _resolve_claude()
         if executable is None:
             raise ProjectMasterHostError("CLAUDE_CLI_UNAVAILABLE")
+        environment = dict(environment)
+        environment["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
         model = self.model or default_model
 
+        # A NEW Claude resident has only a local pending coordinate until the
+        # provider emits its ``system/init`` session id. Bind the permission
+        # bridge and broker to that real id before the first prompt.
+        bridge = ClaudePermissionBridge(
+            session_ref=self.session_ref,
+            permission_requester=self._permission_requester,
+        )
+        broker: ClaudePermissionBroker | None = None
+
+        observer_epoch = self._observer_epoch
+
         def observe_session(session_id: str) -> None:
+            if observer_epoch != self._observer_epoch:
+                return
             self.session_id = session_id
+            if broker is not None:
+                broker.bind_session_ref(self.session_ref)
+            else:
+                bridge.bind_session_ref(self.session_ref)
             self.connection_state = self.store.observe_provider_session(
                 "CLAUDE", session_id
             )
@@ -4400,11 +4778,6 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
         # Resident Claude: one long-lived stream-json process for this target,
         # with permission prompts routed to the existing requester through the
         # loopback MCP bridge.
-        bridge = ClaudePermissionBridge(
-            session_ref=self.session_ref,
-            permission_requester=self._permission_requester,
-        )
-        broker: ClaudePermissionBroker | None = None
         config_root: Path | None = None
         try:
             broker = ClaudePermissionBroker(
@@ -4427,6 +4800,7 @@ class ClaudeProjectMasterRuntime(CodexProjectMasterRuntime):
                 permission_bridge=bridge,
                 permission_ready=broker.wait_for_registration,
                 permission_failure=broker.close,
+                **self._supervisor_transport,
             )
         except Exception:
             if broker is not None:
@@ -4652,6 +5026,14 @@ class ResidentModeSessionHost:
             result["runtime_observation"] = self._runtime_observation(active)
             return result
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        with self._lock:
+            provider = self._provider
+            reader = getattr(provider, "drain_work_statuses", None)
+            if not callable(reader):
+                return []
+            return [dict(item) for item in reader() if isinstance(item, Mapping)]
+
     def close(self) -> None:
         with self._lock:
             provider = self._provider
@@ -4871,6 +5253,11 @@ class ResidentModeSessionHost:
             close = getattr(previous, "close", None)
             if callable(close):
                 close()
+        if force_new_session:
+            # NEW owns a fresh Supervisor Session Anchor before the provider
+            # reports its vendor session id. The provider observation binds to
+            # this slot instead of rewriting the previous default session.
+            self.store.ensure_supervisor_session(provider, new_session=True)
         if self._custom_provider_factory is None:
             active = self._default_provider(
                 provider,
@@ -4920,6 +5307,18 @@ class ResidentModeSessionHost:
             self._provider_session_ref = raw_session_id.strip()
         else:
             self._provider_session_ref = self.store.session_ref_for(provider)
+        if self._provider_session_ref:
+            # App-server thread/start exposes the provider id before the
+            # first turn. Project it immediately so CLI attach and the
+            # browser session card observe the same Mode coordinate.
+            patch_mode_current_anchor(
+                self.repository_root,
+                provider=provider,
+                session_ref=_provider_session_identity(
+                    provider, self._provider_session_ref
+                ),
+                mode=self.requested_mode,
+            )
         return active
 
     def save_idle(self, idle_seconds: float) -> Mapping[str, Any] | None:
@@ -5265,6 +5664,12 @@ class RoomParticipantConversationWorker:
             accept_once()
             observe("DELTA", delta=str(delta))
 
+        def observe_reset() -> None:
+            accept_once()
+            observe("RESET")
+
+        observe_delta.reset = observe_reset  # type: ignore[attr-defined]
+
         provider_message = {
             "schema": "universe.native-room-input.v1",
             "message_id": room_event_id,
@@ -5541,6 +5946,7 @@ class ProjectMasterConversationWorker:
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
         governance_context: Mapping[str, Any] | None = None,
+        retrieval_context_resolver: RetrievalContextResolver | None = None,
         room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
         self.provider = provider
@@ -5557,6 +5963,7 @@ class ProjectMasterConversationWorker:
         self.governance_context = (
             dict(governance_context) if governance_context is not None else None
         )
+        self.retrieval_context_resolver = retrieval_context_resolver
         self.room_event_observer = room_event_observer
         self._last_completion: dict[str, Any] | None = None
         self._last_completion_at = 0.0
@@ -5708,6 +6115,15 @@ class ProjectMasterConversationWorker:
             provider_message["skill_binding_proposals"] = (
                 self.store.skill_binding_proposals()
             )
+            if self.retrieval_context_resolver is not None:
+                retrieval = self.retrieval_context_resolver(
+                    self.project_id, provider_message
+                )
+                if not isinstance(retrieval, Mapping):
+                    raise ProjectMasterHostError(
+                        "PROJECT_RETRIEVAL_CONTEXT_UNAVAILABLE"
+                    )
+                provider_message["retrieval_context"] = dict(retrieval)
             governance_context = self._governance_context_for_message()
             if governance_context is not None:
                 provider_message["governance_context"] = governance_context
@@ -5759,6 +6175,7 @@ class ProjectMasterConversationWorker:
                     "message_id": message_id,
                     "provider_session_ref": self.provider.session_ref,
                     "runtime_context": provider_message.get("runtime_context", {}),
+                    "work_statuses": self._drain_work_statuses(),
                 }
                 self._last_completion = completion
                 self._last_completion_at = time.monotonic()
@@ -5767,6 +6184,45 @@ class ProjectMasterConversationWorker:
                 pass
         self._active_bridge_id = ""
         self._active_message_id = ""
+
+    def _drain_work_statuses(self) -> list[dict[str, Any]]:
+        """Return only redacted Git Trace2 milestones from the provider host."""
+
+        reader = getattr(self.provider, "drain_work_statuses", None)
+        if not callable(reader):
+            return []
+        try:
+            raw_statuses = reader()
+        except Exception:
+            return []
+        if not isinstance(raw_statuses, list):
+            return []
+        statuses: list[dict[str, Any]] = []
+        for raw in raw_statuses:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("schema") or "") != "universe.git-trace2-work-status.v1":
+                continue
+            operation = str(raw.get("operation") or "").upper()
+            state = str(raw.get("state") or "").upper()
+            exit_code = raw.get("exit_code")
+            if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+                continue
+            if not isinstance(exit_code, int):
+                continue
+            status = {
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": operation,
+                "state": state,
+                "exit_code": exit_code,
+            }
+            for key in ("commit_sha", "short_sha", "branch", "remote"):
+                value = raw.get(key)
+                if isinstance(value, str) and value.strip():
+                    status[key] = value.strip()
+            statuses.append(status)
+        return statuses
 
     def _process_room_event(self, job: Mapping[str, Any]) -> None:
         binding = job["binding"]
@@ -5828,6 +6284,15 @@ class ProjectMasterConversationWorker:
                     "correlation_id": event.get("correlation_id"),
                 },
             }
+            if self.retrieval_context_resolver is not None:
+                retrieval = self.retrieval_context_resolver(
+                    self.project_id, provider_message
+                )
+                if not isinstance(retrieval, Mapping):
+                    raise ProjectMasterHostError(
+                        "PROJECT_RETRIEVAL_CONTEXT_UNAVAILABLE"
+                    )
+                provider_message["retrieval_context"] = dict(retrieval)
             governance_context = self._governance_context_for_message()
             if governance_context is not None:
                 provider_message["governance_context"] = governance_context
@@ -6098,6 +6563,32 @@ class LiveProjectMasterBridgeHost(ProjectMasterBridgeHost):
         except ProjectMasterHostError as error:
             raise ProjectMasterBridgeError(str(error)) from error
 
+    def run_instruction_authorized_task_frame(self, request: Any) -> dict[str, Any]:
+        if not isinstance(request, Mapping) or set(request) != {
+            "task_frame_id",
+            "primary_proposal_id",
+            "primary_proposal_digest",
+        }:
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_RUN_REQUEST_INVALID"
+            )
+        run = getattr(self._coordinator, "run_approved_descendant_task_frame", None)
+        if not callable(run):
+            raise ProjectMasterBridgeError(
+                "INSTRUCTION_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
+            )
+        try:
+            return dict(
+                run(
+                    task_frame_id=request["task_frame_id"],
+                    primary_proposal_id=request["primary_proposal_id"],
+                    primary_proposal_digest=request["primary_proposal_digest"],
+                    approval_evidence_ref=None,
+                )
+            )
+        except ProjectMasterHostError as error:
+            raise ProjectMasterBridgeError(str(error)) from error
+
     def run_approved_descendant_task_frame(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping) or set(request) != {
             "task_frame_id",
@@ -6189,6 +6680,7 @@ class ResidentProjectMasterHostManager:
         bridge_registrar: BridgeRegistrar,
         session_supervisor: SessionSupervisorStore | None = None,
         continuity_coordinator: ContinuitySaver | None = None,
+        terminal_host: Any | None = None,
         provider_factory: Callable[
             [Path, str, ProjectMasterSessionStore], MasterProvider
         ]
@@ -6199,6 +6691,7 @@ class ResidentProjectMasterHostManager:
         coordinator_factory: Callable[[Path, str, str], CommanderSurfaceObserver]
         | None = None,
         governance_context_resolver: GovernanceContextResolver | None = None,
+        retrieval_context_resolver: RetrievalContextResolver | None = None,
         release_source_binding_resolver: GovernanceContextResolver | None = None,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         room_event_observer: NativeRoomObserver | None = None,
@@ -6207,6 +6700,7 @@ class ResidentProjectMasterHostManager:
         self.bridge_registrar = bridge_registrar
         self.session_supervisor = session_supervisor
         self.continuity_coordinator = continuity_coordinator
+        self.terminal_host = terminal_host
         self.provider_factory = provider_factory
         self.provider_resolver = provider_resolver or (lambda _project_id: "GROK")
         self.model_resolver = model_resolver or (lambda _project_id, _provider: "")
@@ -6215,6 +6709,7 @@ class ResidentProjectMasterHostManager:
         )
         self.coordinator_factory = coordinator_factory or self._default_coordinator
         self.governance_context_resolver = governance_context_resolver
+        self.retrieval_context_resolver = retrieval_context_resolver
         self.release_source_binding_resolver = release_source_binding_resolver
         self.completion_observer = completion_observer
         self.room_event_observer = room_event_observer
@@ -6339,6 +6834,39 @@ class ResidentProjectMasterHostManager:
 
             credential_env = _managed_credential_env(project_id)
             os.environ[credential_env] = secrets.token_urlsafe(32)
+            # Reserve the Project Master's own durable Supervisor coordinate
+            # before any provider process starts. Never borrow the Mode default:
+            # that may belong to the interactive Conductor or another client.
+            if self.provider_factory is None:
+                supervisor_session = store.ensure_supervisor_session(
+                    selected_provider,
+                    new_session=force_new_session,
+                    owner_key="PROJECT_MASTER",
+                )
+            else:
+                # Injected adapters own their test/integration lifecycle and
+                # retain the historical Mode-default reservation contract.
+                supervisor_session = store.ensure_supervisor_session(
+                    selected_provider,
+                    new_session=force_new_session,
+                )
+            supervisor_session_id = (
+                str(supervisor_session.get("session_id") or "")
+                if isinstance(supervisor_session, Mapping)
+                else ""
+            )
+            session_anchor_ref = (
+                str(supervisor_session.get("session_anchor_ref") or "")
+                if isinstance(supervisor_session, Mapping)
+                else ""
+            )
+            if self.terminal_host is not None and (
+                not supervisor_session_id or not session_anchor_ref
+            ):
+                os.environ.pop(credential_env, None)
+                raise ProjectMasterHostError(
+                    "PROJECT_MASTER_SUPERVISOR_COORDINATE_UNAVAILABLE"
+                )
             provider = (
                 self.provider_factory(project_root, project_id, store)
                 if self.provider_factory is not None
@@ -6350,20 +6878,26 @@ class ResidentProjectMasterHostManager:
                     model=selected_model,
                     effort=selected_effort,
                     new_session=force_new_session,
+                    terminal_host=self.terminal_host,
+                    supervisor_session_id=supervisor_session_id,
+                    session_anchor_ref=session_anchor_ref,
                 )
             )
             try:
-                # A fresh Project has no provider coordinate yet, but the Boot
-                # executor must acquire its lease before a provider can report
-                # one. Reserve only the persistent node/mode slot here; the
-                # real provider session replaces the UNKNOWN binding later.
-                store.ensure_supervisor_session(selected_provider)
+                # A fresh Project has no provider coordinate yet. Reserve only
+                # the persistent node/mode slot; the provider hook replaces
+                # the UNKNOWN binding with its exact vendor session later.
                 bind_permission = getattr(provider, "set_permission_requester", None)
                 if callable(bind_permission):
                     bind_permission(self._permission_before_worker)
                 prepare_provider = getattr(provider, "prepare_session", None)
                 if callable(prepare_provider):
                     prepare_provider()
+                # A provider adapter may create or resume its vendor session
+                # during preparation.  Persist that exact coordinate before
+                # the lease and Room connection are reported, so Room binding
+                # never has to infer an anchor from title, workspace, or mode.
+                store.observe_provider_session(selected_provider, provider.session_ref)
                 coordinator = self.coordinator_factory(
                     project_root,
                     project_id,
@@ -6398,6 +6932,7 @@ class ResidentProjectMasterHostManager:
                 # for every user or room message.
                 governance_context_resolver=None,
                 governance_context=governance_context,
+                retrieval_context_resolver=self.retrieval_context_resolver,
                 room_event_observer=self.room_event_observer,
             )
             host = LiveProjectMasterBridgeHost(
@@ -6430,6 +6965,7 @@ class ResidentProjectMasterHostManager:
                 thread=thread,
                 governance_context_key=governance_context_key,
                 session_supervisor=self.session_supervisor,
+                supervisor_session_id=supervisor_session_id or None,
             )
             try:
                 lease = self._register_provider_process_lease(
@@ -6437,6 +6973,7 @@ class ResidentProjectMasterHostManager:
                     provider=provider,
                     endpoint=endpoint,
                     handshake_token=os.environ[credential_env],
+                    supervisor_session_id=supervisor_session_id,
                 )
                 if lease is not None:
                     handle.supervisor_session_id = lease["supervisor_session_id"]
@@ -6545,11 +7082,16 @@ class ResidentProjectMasterHostManager:
             )
         ):
             return True
+        if not handle.supervisor_session_id:
+            raise ProjectMasterHostError(
+                "PROJECT_MASTER_SUPERVISOR_SESSION_UNAVAILABLE"
+            )
         lease = self._register_provider_process_lease(
             project_id=handle.project_id,
             provider=handle.worker.provider,
             endpoint=handle.endpoint,
             handshake_token=handshake_token,
+            supervisor_session_id=handle.supervisor_session_id,
         )
         if lease is None:
             return True
@@ -6593,6 +7135,7 @@ class ResidentProjectMasterHostManager:
         provider: MasterProvider,
         endpoint: str,
         handshake_token: str,
+        supervisor_session_id: str,
     ) -> dict[str, Any] | None:
         if self.session_supervisor is None:
             return None
@@ -6607,27 +7150,28 @@ class ResidentProjectMasterHostManager:
             )
         try:
             self.session_supervisor.sweep_stale_live_sessions()
-            sessions = self.session_supervisor.list_sessions(
-                node=project_id, mode="MASTER"
-            )
-            selected = next(
-                (item for item in sessions if item.get("is_default")),
-                None,
-            )
-            if not isinstance(selected, Mapping):
-                raise ProjectMasterHostError(
-                    "PROJECT_MASTER_SUPERVISOR_SESSION_UNAVAILABLE"
-                )
-            supervisor_session_id = _text(
-                selected.get("session_id"),
+            normalized_supervisor_session_id = _text(
+                supervisor_session_id,
                 "supervisor_session_id",
             )
+            selected = self.session_supervisor.get_session(
+                normalized_supervisor_session_id
+            )
+            if (
+                str(selected.get("node") or "") != project_id
+                or str(selected.get("mode") or "").upper() != "MASTER"
+            ):
+                raise ProjectMasterHostError(
+                    "PROJECT_MASTER_SUPERVISOR_SESSION_MISMATCH"
+                )
             identity = resolver(endpoint, handshake_token)
             if not isinstance(identity, Mapping):
                 raise ProjectMasterHostError(
                     "PROJECT_MASTER_PROCESS_IDENTITY_INVALID"
                 )
-            current = self.session_supervisor.get_session(supervisor_session_id)
+            current = self.session_supervisor.get_session(
+                normalized_supervisor_session_id
+            )
             lease = current.get("process_lease")
             expected_version = (
                 int(lease.get("lease_version", 0))
@@ -6635,7 +7179,7 @@ class ResidentProjectMasterHostManager:
                 else 0
             )
             acquired = self.session_supervisor.acquire_lease(
-                supervisor_session_id,
+                normalized_supervisor_session_id,
                 dict(identity),
                 expected_lease_version=expected_version,
                 stop_capability=handshake_token,
@@ -6653,7 +7197,7 @@ class ResidentProjectMasterHostManager:
                 "PROJECT_MASTER_PROCESS_LEASE_IDENTITY_MISSING"
             )
         return {
-            "supervisor_session_id": supervisor_session_id,
+            "supervisor_session_id": normalized_supervisor_session_id,
             "lease_token": _text(acquired.get("lease_token"), "lease_token"),
             "lease_version": int(acquired_lease["lease_version"]),
             "process_identity": dict(identity),
@@ -7062,8 +7606,8 @@ class ResidentProjectMasterHostManager:
         except Exception:
             return None
 
-    @staticmethod
     def _handle_connection(
+        self,
         handle: ResidentProjectMasterHandle,
     ) -> dict[str, Any]:
         active = handle.worker.provider
@@ -7081,6 +7625,11 @@ class ResidentProjectMasterHostManager:
         connection["runtime_observation"] = (
             ProjectMasterConversationWorker._runtime_observation(active)
         )
+        connection["session_anchor_ref"] = self._session_anchor_ref_for_connection(
+            project_id=handle.project_id,
+            provider=str(connection.get("last_provider") or ""),
+            provider_session_ref=str(connection.get("last_session_ref") or ""),
+        )
         context = handle.worker.governance_context
         if context is None:
             connection["governance_context"] = {"status": "ABSENT"}
@@ -7094,6 +7643,35 @@ class ResidentProjectMasterHostManager:
             }
         return connection
 
+    def _session_anchor_ref_for_connection(
+        self,
+        *,
+        project_id: str,
+        provider: str,
+        provider_session_ref: str,
+    ) -> str:
+        """Resolve only an exact Supervisor session identity to its anchor."""
+
+        if self.session_supervisor is None or not provider or not provider_session_ref:
+            return "UNKNOWN"
+        candidates = [
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=project_id,
+                mode="MASTER",
+                include_hidden=True,
+            )
+            if str(item.get("provider") or "").upper() == provider.upper()
+            and _same_provider_session_ref(
+                provider,
+                item.get("provider_session_ref"),
+                provider_session_ref,
+            )
+        ]
+        if len(candidates) != 1:
+            return "UNKNOWN"
+        return str(candidates[0].get("session_anchor_ref") or "UNKNOWN")
+
     @staticmethod
     def _default_provider(
         provider: str,
@@ -7103,6 +7681,9 @@ class ResidentProjectMasterHostManager:
         model: str = "",
         effort: str = "AUTO",
         new_session: bool = False,
+        terminal_host: Any | None = None,
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> MasterProvider:
         if provider == "GROK":
             return GrokProjectMasterRuntime(
@@ -7112,6 +7693,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         if provider == "CODEX":
             return CodexProjectMasterRuntime(
@@ -7121,6 +7705,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         if provider == "CLAUDE":
             return ClaudeProjectMasterRuntime(
@@ -7130,6 +7717,9 @@ class ResidentProjectMasterHostManager:
                 model=model,
                 effort=effort,
                 new_session=new_session,
+                terminal_host=terminal_host,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
             )
         raise ProjectMasterHostError("PROJECT_MASTER_PROVIDER_UNSUPPORTED")
 
@@ -7255,29 +7845,6 @@ def _mode_current_anchor_ref(preparation: Mapping[str, Any]) -> str:
     if not isinstance(anchor_ref, str) or not anchor_ref.strip():
         raise ProjectMasterHostError("PROJECT_MASTER_ANCHOR_UNAVAILABLE")
     return anchor_ref.strip()
-
-
-def _mode_boot_binding(
-    preparation: Mapping[str, Any],
-    *,
-    expected_mode: str,
-    expected_role: str,
-) -> dict[str, str]:
-    binding = preparation.get("mode_boot_binding")
-    if not isinstance(binding, Mapping) or binding.get("status") != "PREPARED":
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE")
-    normalized = {
-        field: _text(binding.get(field), f"mode_boot_binding.{field}")
-        for field in ("binding_id", "mode", "role", "frame_id", "anchor_id")
-    }
-    if (
-        normalized["mode"] != expected_mode
-        or normalized["role"] != expected_role
-    ):
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
-    if normalized["anchor_id"] != _mode_current_anchor_ref(preparation):
-        raise ProjectMasterHostError("PROJECT_MASTER_MODE_BOOT_BINDING_MISMATCH")
-    return normalized
 
 
 def _path_is_within(target: Path, root: Path) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -9,7 +10,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from run_test_tier import build_suite, load_manifest, selected_test_names  # noqa: E402
+from run_test_tier import (  # noqa: E402
+    build_suite,
+    load_manifest,
+    publish_test_observation,
+    selected_test_names,
+)
 
 
 class TestTierManifestTests(unittest.TestCase):
@@ -62,6 +68,17 @@ class TestTierManifestTests(unittest.TestCase):
             set(self.manifest["tiers"]),
         )
         json.dumps(self.manifest)
+
+    def test_test_observation_is_noop_without_universe_connection(self) -> None:
+        previous = {key: os.environ.pop(key, None) for key in (
+            "UNIVERSE_PROJECT_ID", "UNIVERSE_ENDPOINT", "UNIVERSE_TOKEN"
+        )}
+        try:
+            publish_test_observation({"schema": "universe.test-tier-result.v1"})
+        finally:
+            for key, value in previous.items():
+                if value is not None:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

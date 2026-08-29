@@ -98,45 +98,21 @@ class UniverseConductorRuntime:
             self._binding = None
             self._process = None
 
-        definition = self._mode_definition()
-        self._mode_role = definition["role"]
+        session = self._anchor_graph_session()
+        if session is None:
+            raise UniverseConductorRuntimeError(
+                "UNIVERSE_CONDUCTOR_SESSION_ANCHOR_UNAVAILABLE"
+            )
         source = self._resolved_source_binding()
-        host_session_ref = (
-            f"universe://local-service/{self.requested_mode.lower()}/{uuid4().hex}"
-        )
-        prepared = self._invoke(
-            ("prepare-session", "--repo-root", str(self.repository_root)),
-            {
-                "command": "BOOT",
-                "source_state": "SOURCE_READY",
-                "source_ref": source["source_ref"],
-                "source_commit": source["source_commit"],
-                "source_repository": source["source_repository"],
-                "mode": self.requested_mode,
-                "role": definition["role"],
-                "scope": definition["scope"],
-                "host_session_ref": host_session_ref,
-                "anchor_snapshot_ref": "UNKNOWN",
-                "host_executable_capability": "AVAILABLE",
-                "mode_profile": definition["mode_profile"],
-                "task_requirement": "NONE",
-                "evidence_profile": "NONE",
-            },
-        )
-        anchor_id = self._prepared_anchor_id(prepared)
-        mode_boot_binding = self._prepared_mode_boot_binding(
-            prepared,
-            anchor_id=anchor_id,
-            expected_mode=self.requested_mode,
-            expected_role=definition["role"],
-        )
-        session_id = f"universe-conductor-{uuid4().hex}"
-        frame_id = mode_boot_binding["frame_id"]
+        anchor_id = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        session_id = _text(session.get("session_id"), "session_id")
+        frame_id = "current"
+        self._mode_role = "UNASSIGNED"
         token = secrets.token_urlsafe(32)
         command = [
             str(_required_host_executable("python")),
             str(self.runtime_cli),
-            "session-boot",
+            "project-runtime",
             "serve",
             "--repo-root",
             str(self.repository_root),
@@ -146,10 +122,10 @@ class UniverseConductorRuntime:
             frame_id,
             "--anchor-id",
             anchor_id,
-            "--boot-binding-id",
-            mode_boot_binding["binding_id"],
+            "--mode",
+            self.requested_mode,
             "--host-action",
-            "UNIVERSE_LOCAL_SERVICE",
+            "PERSISTENT_SESSION_ATTACH",
             "--session-location",
             "UNIVERSE_LOCAL_SERVICE",
             "--commander-surface",
@@ -189,17 +165,15 @@ class UniverseConductorRuntime:
             host_adapter = startup.get("host_adapter")
             runtime_state = startup.get("runtime_state")
             if (
-                startup.get("status") != "SESSION_BOOT_IMAGE_CREATED"
+                startup.get("status") != "PERSISTENT_SESSION_ATTACHED"
                 or not isinstance(host_adapter, Mapping)
                 or not isinstance(runtime_state, Mapping)
                 or runtime_state.get("anchor_id") != anchor_id
                 or runtime_state.get("mode") != self.requested_mode
-                or runtime_state.get("role") != self._mode_role
+                or runtime_state.get("role") != "UNASSIGNED"
                 or runtime_state.get("executable_runtime_currentness") != "CURRENT"
-                or not isinstance(startup.get("mode_boot_binding"), Mapping)
-                or startup["mode_boot_binding"].get("binding_id")
-                != mode_boot_binding["binding_id"]
-                or startup["mode_boot_binding"].get("status") != "ACTIVE"
+                or startup.get("attachment_path") != "ANCHOR_GRAPH"
+                or "mode_boot_binding" in startup
             ):
                 raise UniverseConductorRuntimeError(
                     "UNIVERSE_RUNTIME_START_RESULT_INVALID:"
@@ -227,12 +201,11 @@ class UniverseConductorRuntime:
                 "runtime_currentness_observation": str(
                     runtime_state["executable_runtime_currentness"]
                 ),
-                "parent_actor_ref": (
-                    "universe-" + self._mode_role.lower()
-                    if self._mode_role
-                    else "universe-mode"
+                "attachment_path": "ANCHOR_GRAPH",
+                "parent_actor_ref": "universe-conductor",
+                "parent_evidence_ref": (
+                    f"session-anchor://{self.session_node}/{self.requested_mode}/{anchor_id}"
                 ),
-                "parent_evidence_ref": host_session_ref,
                 "binding_evidence_ref": (
                     "process-local://"
                     f"{self.session_node}/{self.requested_mode.lower()}-runtime/{session_id}"
@@ -249,28 +222,40 @@ class UniverseConductorRuntime:
             self.stop()
             raise
 
+    def _anchor_graph_session(self) -> Mapping[str, Any] | None:
+        """Resolve the one default supervised session for this Universe Mode."""
+
+        if self.session_supervisor is None:
+            return None
+        candidates = [
+            item
+            for item in self.session_supervisor.list_sessions(
+                node=self.session_node,
+                mode=self.requested_mode,
+                include_hidden=True,
+            )
+            if bool(item.get("is_default"))
+        ]
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
     def observe(self, message_id: str) -> Mapping[str, Any]:
         normalized_id = _text(message_id, "message_id")
-        result = self._invoke(
-            (
-                "mode-anchor",
-                "observe-commander-input",
-                "--repo-root",
-                str(self.repository_root),
-            ),
-            {
-                "mode": self.requested_mode,
-                "commander_surface": "UNIVERSE_UI",
-                "evidence_ref": (
-                    f"universe://conductor-room/messages/{normalized_id}"
-                ),
-            },
-        )
-        if result.get("status") != "COMMANDER_INPUT_OBSERVED":
+        session = self._anchor_graph_session()
+        if session is None:
             raise UniverseConductorRuntimeError(
-                "UNIVERSE_COMMANDER_SURFACE_OBSERVATION_FAILED"
+                "UNIVERSE_CONDUCTOR_SESSION_ANCHOR_UNAVAILABLE"
             )
-        return result
+        anchor_id = _text(session.get("session_anchor_ref"), "session_anchor_ref")
+        return {
+            "schema": "universe.anchor-graph-commander-observation.v1",
+            "status": "COMMANDER_INPUT_OBSERVED",
+            "mode": self.requested_mode,
+            "session_id": _text(session.get("session_id"), "session_id"),
+            "session_anchor_ref": anchor_id,
+            "evidence_ref": f"universe://conductor-room/messages/{normalized_id}",
+        }
 
     def stop(self) -> None:
         process = self._process
@@ -529,85 +514,6 @@ class UniverseConductorRuntime:
                 "UNIVERSE_RUNTIME_RESULT_INVALID"
             )
         return payload
-
-    def _mode_definition(self) -> Mapping[str, str]:
-        registry_path = (
-            self.repository_root
-            / ".ai"
-            / "runtime"
-            / "project_instance"
-            / "mode_registry.json"
-        )
-        try:
-            registry = json.loads(registry_path.read_text(encoding="utf-8"))
-            definition = registry["modes"][self.requested_mode]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
-            raise UniverseConductorRuntimeError(
-                "CONDUCTOR_MODE_UNAVAILABLE"
-            ) from error
-        if not isinstance(definition, Mapping):
-            raise UniverseConductorRuntimeError("CONDUCTOR_MODE_UNAVAILABLE")
-        role = _text(
-            definition.get("role"), f"{self.requested_mode}.role"
-        ).upper()
-        return {
-            "role": role,
-            "scope": _text(
-                definition.get("scope"), f"{self.requested_mode}.scope"
-            ),
-            "mode_profile": _text(
-                definition.get("mode_profile"),
-                f"{self.requested_mode}.mode_profile",
-            ),
-        }
-
-    # Compatibility for callers that still use the old private helper name.
-    def _conductor_definition(self) -> Mapping[str, str]:
-        return self._mode_definition()
-
-    @staticmethod
-    def _prepared_anchor_id(prepared: Mapping[str, Any]) -> str:
-        anchor = prepared.get("mode_current_anchor")
-        snapshot = anchor.get("snapshot") if isinstance(anchor, Mapping) else None
-        payload = snapshot.get("snapshot") if isinstance(snapshot, Mapping) else None
-        anchor_id = payload.get("anchor_id") if isinstance(payload, Mapping) else None
-        if (
-            prepared.get("status") != "SESSION_PREPARED"
-            or not isinstance(anchor, Mapping)
-            or anchor.get("status")
-            not in {"MODE_CURRENT_ANCHOR_CREATED", "MODE_CURRENT_ANCHOR_OBSERVED"}
-        ):
-            raise UniverseConductorRuntimeError(
-                "UNIVERSE_SESSION_PREPARATION_FAILED"
-            )
-        return _text(anchor_id, "mode_current_anchor.anchor_id")
-
-    @staticmethod
-    def _prepared_mode_boot_binding(
-        prepared: Mapping[str, Any],
-        *,
-        anchor_id: str,
-        expected_mode: str = "CONDUCTOR",
-        expected_role: str = "CONDUCTOR",
-    ) -> dict[str, str]:
-        binding = prepared.get("mode_boot_binding")
-        if not isinstance(binding, Mapping) or binding.get("status") != "PREPARED":
-            raise UniverseConductorRuntimeError(
-                "UNIVERSE_MODE_BOOT_BINDING_UNAVAILABLE"
-            )
-        normalized = {
-            field: _text(binding.get(field), f"mode_boot_binding.{field}")
-            for field in ("binding_id", "mode", "role", "frame_id", "anchor_id")
-        }
-        if (
-            normalized["mode"] != expected_mode
-            or normalized["role"] != expected_role
-            or normalized["anchor_id"] != anchor_id
-        ):
-            raise UniverseConductorRuntimeError(
-                "UNIVERSE_MODE_BOOT_BINDING_MISMATCH"
-            )
-        return normalized
 
     def _resolved_source_binding(self) -> dict[str, str]:
         if self._source_binding is not None:

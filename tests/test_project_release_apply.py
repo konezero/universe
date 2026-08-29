@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -16,12 +17,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 from core_release import build_release  # noqa: E402
 from project_release_apply import (  # noqa: E402
     ProjectReleaseApplyError,
+    apply_project_release_plan,
     apply_project_release_proposal,
     build_project_release_approval,
     plan_project_release_lifecycle,
 )
 from release_runtime import ReleaseRuntime  # noqa: E402
-from windows_native_cli import NativeCliResult  # noqa: E402
 
 
 def digest(value: Any) -> str:
@@ -116,7 +117,10 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 sort_keys=True,
             ),
         )
-        self._write(installer, "INSTALLER = True\n")
+        self._write(
+            installer,
+            "raise SystemExit(\"release database installation must not invoke runtime installer\")\n",
+        )
         self._write(host, "HOST = True\n")
         self._write(core, "# Core\n")
         self._write(
@@ -184,52 +188,13 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual("OS_INSTALL", proposal["plan"]["user_command"])
         self.assertEqual("ABSENT", proposal["plan"]["installed_runtime"]["state"])
 
-    def test_applies_exact_approval_through_lifecycle_host(self) -> None:
+    def test_fresh_install_writes_release_files(self) -> None:
         proposal = self._proposal()
         approval = build_project_release_approval(
             project_id="demo",
             proposal=proposal,
             evidence_ref="universe://approval/demo",
         )
-        observed: dict[str, Any] = {}
-
-        def runner(request: Any) -> NativeCliResult:
-            request_path = Path(request.arguments[2])
-            lifecycle_request = json.loads(request_path.read_text(encoding="utf-8"))
-            observed.update(lifecycle_request)
-            bundle = Path(lifecycle_request["source"]["path"])
-            source_bundle = json.loads(
-                (bundle / "SOURCE_BUNDLE.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                "universe-release-db",
-                source_bundle["source"]["provider"],
-            )
-            payload = {
-                "result": "PASS",
-                "operation": "FRESH_INSTALL",
-                "user_command": "OS_INSTALL",
-                "repository_runtime": "VERIFIED",
-                "target": str(self.project.resolve()),
-                "source": {
-                    "provider": "universe-release-db",
-                    "binding": "provider-attested",
-                    "commit": self.commit,
-                },
-                "validate": {"validation_id": "validation-fixture"},
-                "boot_handoff": {"status": "READY_FOR_BOOT"},
-                "permit_receipt": {"receipt_id": "permit-fixture"},
-            }
-            return NativeCliResult(
-                contract="windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(payload),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
 
         receipt = apply_project_release_proposal(
             project_root=self.project,
@@ -238,58 +203,110 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             approval=approval,
             database_path=self.database,
             manifest_path=self.manifest,
-            native_runner=runner,
         )
 
         self.assertEqual("PROJECT_RELEASE_APPLIED", receipt["status"])
-        self.assertEqual("OS_INSTALL", receipt["user_command"])
-        self.assertEqual("universe-project-lifecycle-host", observed["host"])
+        self.assertEqual("FRESH_INSTALL", receipt["operation"])
+        self.assertIn("changed_count", receipt)
+        self.assertGreater(receipt["changed_count"], 0)
         self.assertEqual(
-            "provider-attested",
-            receipt["lifecycle_result"]["source"]["binding"],
+            "PROJECT_INDEX_RELEASE_EVENT_DEFERRED",
+            receipt["project_index"]["status"],
+        )
+        state_file = (
+            self.project
+            / ".ai"
+            / "runtime"
+            / "project_instance"
+            / "UNIVERSE_RELEASE_INSTALL.json"
+        )
+        self.assertTrue(state_file.exists())
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(proposal["release_id"], state["release_id"])
+        core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        self.assertTrue(core_file.exists())
+        self.assertFalse((self.project / ".ai" / "START_HERE.md").exists())
+        self.assertNotIn("runtime_surface_result", receipt)
+
+    def test_direct_plan_application_returns_no_proposal_or_approval_evidence(self) -> None:
+        proposal = self._proposal()
+
+        receipt = apply_project_release_plan(
+            project_root=self.project,
+            project_id="demo",
+            plan=proposal["plan"],
+            release_database_sha256=proposal["release_database_sha256"],
+            instruction_ref="universe://direct-command/project-connections/test",
+            database_path=self.database,
+            manifest_path=self.manifest,
         )
 
-    def test_project_state_change_rejects_stale_proposal_before_execution(self) -> None:
+        self.assertEqual("PROJECT_RUNTIME_LIFECYCLE_APPLIED", receipt["status"])
+        self.assertEqual(
+            "universe://direct-command/project-connections/test",
+            receipt["instruction_ref"],
+        )
+        self.assertNotIn("proposal_id", receipt)
+        self.assertNotIn("proposal_digest", receipt)
+        self.assertNotIn("approval_evidence_ref", receipt)
+
+    def test_release_event_indexes_changed_ai_text_when_anchor_exists(self) -> None:
+        state = self.project / ".ai" / "runtime" / "state"
+        state.mkdir(parents=True)
+        connection = sqlite3.connect(state / "project_runtime.sqlite3")
+        connection.execute(
+            "CREATE TABLE mode_current_anchor (mode TEXT PRIMARY KEY, frame_id TEXT, anchor_id TEXT, state TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO mode_current_anchor VALUES ('MASTER', 'current', 'MASTER-CURRENT-1', 'CURRENT')"
+        )
+        connection.commit()
+        connection.close()
         proposal = self._proposal()
         approval = build_project_release_approval(
             project_id="demo",
             proposal=proposal,
             evidence_ref="universe://approval/demo",
         )
-        manifest = (
-            self.project
-            / ".ai"
-            / "runtime"
-            / "project_instance"
-            / "DISTRIBUTION_MANIFEST.json"
-        )
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text(
-            json.dumps(
-                {
-                    "schema": "ai-career.project-runtime-installation.v1",
-                    "installation": {"project": "demo"},
-                    "source": {"commit": self.commit},
-                }
-            ),
-            encoding="utf-8",
-        )
-        update_plan = plan_project_release_lifecycle(
+
+        receipt = apply_project_release_proposal(
             project_root=self.project,
             project_id="demo",
-            release_id=proposal["release_id"],
-            source_commit=self.commit,
+            proposal=proposal,
+            approval=approval,
+            database_path=self.database,
+            manifest_path=self.manifest,
         )
-        self.assertEqual("RUNTIME_UPDATE", update_plan["operation"])
-        self.assertEqual("OS_UPDATE", update_plan["user_command"])
-        called = False
 
-        def runner(_: Any) -> NativeCliResult:
-            nonlocal called
-            called = True
-            raise AssertionError("stale proposal must not execute")
+        self.assertEqual(
+            "PROJECT_INDEX_RELEASE_EVENT_SYNCED",
+            receipt["project_index"]["status"],
+        )
+        index = sqlite3.connect(
+            self.project / ".ai" / "runtime" / "state" / "project_file_index.sqlite3"
+        )
+        try:
+            row = index.execute(
+                "SELECT text_excerpt FROM project_file_index WHERE relative_path = ?",
+                (".ai/core/CORE_SURFACE_REGISTRY.md",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIn("# Core", row[0])
+        finally:
+            index.close()
 
-        with self.assertRaisesRegex(ProjectReleaseApplyError, "state changed"):
+    def test_collision_blocks_apply_for_unmanaged_modified_file(self) -> None:
+        proposal = self._proposal()
+        approval = build_project_release_approval(
+            project_id="demo",
+            proposal=proposal,
+            evidence_ref="universe://approval/demo",
+        )
+        core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        core_file.parent.mkdir(parents=True)
+        core_file.write_text("# UNMANAGED DIFFERENT CONTENT\n", encoding="utf-8")
+
+        with self.assertRaises(ProjectReleaseApplyError) as ctx:
             apply_project_release_proposal(
                 project_root=self.project,
                 project_id="demo",
@@ -297,9 +314,8 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 approval=approval,
                 database_path=self.database,
                 manifest_path=self.manifest,
-                native_runner=runner,
             )
-        self.assertFalse(called)
+        self.assertEqual("UNMANAGED_TARGET_COLLISION", ctx.exception.code)
 
 
 if __name__ == "__main__":

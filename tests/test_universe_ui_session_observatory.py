@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
 HTML = (ROOT / "tools" / "universe_ui" / "index.html").read_text(encoding="utf-8")
 CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8")
+TERM = (ROOT / "tools" / "universe_ui" / "terminals.js").read_text(encoding="utf-8")
 
 
 class SessionObservatoryUiContractTests(unittest.TestCase):
@@ -24,7 +25,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
     def test_goal_plan_editor_preserves_revision_and_selection(self) -> None:
         self.assertIn('class="goal-plan-toolbar"', HTML)
         self.assertIn('id="edit-selected-goal"', HTML)
-        self.assertIn('state.selectedGoalId = state.goals[0]?.goal_id || null;', APP)
+        self.assertIn('state.selectedGoalId = contextualGoals[0]?.goal_id || null;', APP)
         self.assertIn(
             'revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision',
             APP,
@@ -60,33 +61,344 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("function normalizeNodeModeNode(nodeId)", APP)
         self.assertIn("function nodeModeCatalog(project)", APP)
         self.assertIn('const modes = isUniverseHome ? ["MASTER", "CONDUCTOR"] : ["MASTER"];', APP)
+        self.assertIn("const terminalProject = mode === \"CONDUCTOR\" ? universeProject : project;", APP)
+        self.assertIn("await startNewNodeModeSession({", APP)
         self.assertIn("function nodeModeSessionIsActive(session)", APP)
-        self.assertIn('if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;', APP)
+        self.assertIn("function nodeModeSessionIsCurrent(session)", APP)
+        self.assertIn("function vendorStreamStateForSession(session)", APP)
+        self.assertIn("function startNewNodeModeSession(coordinate)", APP)
+        self.assertIn("function bindNodeModeSessionPty(coordinate, session)", APP)
+        self.assertIn("function openNodeModeSessionActions(coordinate, session)", APP)
+        self.assertIn("function inspectNodeModeSession(coordinate, session)", APP)
+        self.assertIn("function endNodeModePtySession(session)", APP)
+        self.assertIn('id="node-session-action-dialog"', HTML)
+        self.assertIn(">Inspector<", HTML)
+        self.assertIn(">Inbox<", HTML)
+        self.assertIn(">PTY Binding<", HTML)
+        self.assertIn(">End session<", HTML)
+        self.assertIn("function openSessionBusInbox", APP)
+        self.assertIn("/v1/session-bus/messages", APP)
+        self.assertIn('data-session-bus-projection="INBOX"', HTML)
+        self.assertIn('data-session-bus-projection="ACTIVITY"', HTML)
+        self.assertIn('data-session-bus-projection="RESULTS"', HTML)
+        self.assertIn('state.sessionBusProjection || "INBOX"', APP)
+        self.assertIn("function sessionBusEvidenceRows", APP)
+        self.assertIn("function renderSessionBusEvidence", APP)
+        self.assertIn("message?.event_context", APP)
+        self.assertIn("context.projection_state", APP)
+        self.assertIn('"Source event"', APP)
+        self.assertIn('"Session Anchor"', APP)
+        self.assertIn('"Task Frame"', APP)
+        self.assertIn("lifecycle.result_ref", APP)
+        self.assertIn("session_anchor_ref", APP[APP.index("function sessionBusTarget") : APP.index("async function refreshSessionBusMessages")])
+        self.assertIn("openSessionSummaryForNew(coordinate);", APP)
+        self.assertIn("sessionSummaryInspectOnly", APP)
+        self.assertIn("function openPtySessionInspectSummary(coordinate, session)", APP)
+        self.assertIn("revealInspector: same", APP)
+        self.assertIn("createTerminalTab(coordinate)", APP)
+        self.assertIn("/v1/terminals", TERM)
+        self.assertIn('id="terminal-tabs"', HTML)
+        self.assertNotIn("terminal-input-form", HTML)
+        self.assertNotIn("sendRemoteTerminalChat", TERM)
+        self.assertNotIn("function sendTerminalInput(text)", TERM)
+        self.assertNotIn("term.options.disableStdin = true", TERM)
+        self.assertIn("function applyCliDockTitle(session)", TERM)
+        self.assertIn("function terminalDockVisible(session)", TERM)
+        self.assertIn("terminalDockVisible(item)", TERM)
+        self.assertIn('state.activeTerminalId = null;', TERM)
+        terminal_label = TERM[
+            TERM.index("function terminalLabel(session)") : TERM.index(
+                "function applyCliDockTitle(session)"
+            )
+        ]
+        self.assertIn('session?.provider || ""', terminal_label)
+        self.assertIn('provider !== "AUTO"', terminal_label)
+        self.assertIn("function focusTerminalForSession(coordinate, session)", TERM)
+        focus_slice = TERM[
+            TERM.index("function focusTerminalForSession(coordinate, session)") : TERM.index(
+                "async function loadTerminalTabs()"
+            )
+        ]
+        self.assertIn("terminalDockVisible(item)", focus_slice)
+        self.assertIn("dismissedTerminalIds", TERM)
+        self.assertIn("function refitActiveTerminal()", TERM)
+        self.assertNotIn("window.setTimeout(run, 220)", TERM)
+        self.assertIn("function captureTerminalViewport(surface)", TERM)
+        self.assertIn("function restoreTerminalViewport(surface)", TERM)
+        self.assertIn("async function loadOlderTerminalHistory(surface, session)", TERM)
+        self.assertIn('"/history?limit=100"', TERM)
+        self.assertIn("historyBeforeCursor", TERM)
+        self.assertIn("screen_snapshot_base64", TERM)
+        self.assertIn("rebuilt.baseY - distanceFromBottom", TERM)
+        self.assertIn(
+            "surface.historyLoading = true;\n  surface.rebuildingHistory = true;",
+            TERM,
+        )
+        self.assertIn("function trimHistoryCoveredLiveTail(historyChunks, retainedLiveChunks)", TERM)
+        self.assertIn("surface.retainedLiveChunks.push({", TERM)
+        self.assertIn("await writeUndisplayedLiveTail(surface)", TERM)
+        self.assertIn("fitAddon.proposeDimensions()", TERM)
+        self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
+        self.assertIn("surface.notifySize?.(0)", TERM)
+        self.assertIn("attachCustomKeyEventHandler", TERM)
+        self.assertIn("event.isComposing", TERM)
+        self.assertIn("function bindTerminalIme(term, socket)", TERM)
+        self.assertIn('data.normalize("NFC")', TERM)
+        self.assertIn("compositionend", TERM)
+        self.assertNotIn("function HangulBuffer()", TERM)
+        self.assertNotIn("keyCode === 229", TERM)
+        self.assertIn(".xterm-helper-textarea", CSS)
+        self.assertIn("async function stopTerminalSession(terminalId)", TERM)
+        self.assertIn('method: "DELETE"', TERM)
+        self.assertIn("sessionProvider !== provider", TERM)
+        self.assertIn('stripped.startsWith("term_")', TERM)
+        self.assertIn("item.provider === provider", TERM)
+        self.assertIn("const tab = created.terminal || created;", TERM)
+        self.assertNotIn("const session = created.terminal || created;", TERM)
+        self.assertIn("resume_session_ref", TERM)
+        self.assertIn("pty_binding_anchor_ref", TERM)
+        self.assertIn("supervisor_session_id", TERM)
+        self.assertIn("function terminalSupervisorSessionId(session)", TERM)
+        supervisor_slice = TERM[
+            TERM.index("function terminalSupervisorSessionId") : TERM.index(
+                "function terminalResumeRef"
+            )
+        ]
+        self.assertIn("state.supervisorSessions", supervisor_slice)
+        self.assertIn("session?.universe_session_id", supervisor_slice)
+        self.assertIn("item?.universe_session_id || item?.session_id", supervisor_slice)
+        self.assertIn("supervised.universe_session_id || supervised.session_id", supervisor_slice)
+        create_slice = TERM[
+            TERM.index("async function createTerminalTab") : TERM.index(
+                "function refitActiveTerminal"
+            )
+        ]
+        self.assertIn(
+            "supervisor_session_id: terminalSupervisorSessionId(session)",
+            create_slice,
+        )
+        resume_slice = TERM[
+            TERM.index("function terminalResumeRef") : TERM.index(
+                "async function createTerminalTab"
+            )
+        ]
+        self.assertNotIn("session.session_id", resume_slice)
+        self.assertNotIn("session.observer_session_ref", resume_slice)
+        self.assertIn("createTerminalTab(coordinate, session)", APP)
+        mobile_session_nav = APP[
+            APP.index('elements.mobileWorkTabs?.addEventListener("click"') : APP.index(
+                "const activeGoal ="
+            )
+        ]
+        self.assertIn(
+            'else if (view === "sessions") showGraphView("sessions");',
+            mobile_session_nav,
+        )
+        self.assertNotIn("sessionObservatoryDialog?.showModal()", mobile_session_nav)
+        self.assertNotIn("function projectMasterSetting(projectId)", TERM)
+        self.assertIn("session?.provider || session?.current_provider", TERM)
+        self.assertIn('throw new Error("Choose a provider for this session")', TERM)
+        self.assertIn("function observerProvider(session)", TERM)
+        self.assertIn("session?.observer_session_ref", TERM)
+        self.assertNotIn("last_session_ref", TERM)
+        self.assertNotIn("last_provider", TERM)
+        self.assertIn("if (showTerminal) return;", APP)
+        self.assertNotIn(".terminal-input-form", CSS)
+        self.assertIn("function projectForVendorWorkspace(room)", APP)
+        self.assertIn("function unboundVendorSessionFromRoom(room, project, mode)", APP)
+        self.assertIn("async function attachProviderChatRoom(room, coordinate)", APP)
+        self.assertIn("/v1/session-observer/chat-rooms/", APP)
+        self.assertIn("vendor_unbound:", APP)
+        self.assertIn('=== "INDEPENDENT"', APP)
+        self.assertIn('currentness === "CURRENT"', APP)
+        self.assertIn("state.projectAnchorSessions", APP)
+        self.assertIn("chatCatalog.anchor_sessions", APP)
+        self.assertIn("...(state.projectAnchorSessions || [])", APP)
+        self.assertIn("...(state.supervisorSessions || [])", APP)
+        self.assertIn("function providerSessionObservedProjectId(room)", APP)
         self.assertIn("coordinate.sessions.push(source.session)", APP)
+        coords = APP[
+            APP.index("function nodeModeCoordinates") : APP.index("function nodeModeStatusLabel")
+        ]
+        self.assertNotIn("unboundByCoordinate", coords)
+        self.assertNotIn('["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"]', coords)
+        self.assertIn("nodeModeSessionIsCurrent(session)", coords)
+        self.assertIn("nodeModeSessionIsWorking(session)", APP)
         self.assertIn("node-mode-item", CSS)
         self.assertIn(".node-mode-node", CSS)
         self.assertIn('data-active="false"', CSS)
+        self.assertNotIn(
+            ".filter((project) => !isProjectContainer(project))",
+            APP[APP.index("function nodeModeCoordinates") : APP.index("function nodeModeStatusLabel")],
+        )
+        self.assertIn("function renderNodeModeGroup", APP)
+        self.assertIn("node-mode-group-nested", APP)
+        self.assertIn("childrenByParent.get(group.nodeId)", APP)
+        self.assertIn(".node-mode-group-nested", CSS)
 
-    def test_mode_click_expands_persistent_session_cards_without_auto_routing(self) -> None:
+    def test_mode_cards_show_live_ptys_and_five_recent_anchor_sessions(self) -> None:
         self.assertIn("selectedModeCoordinateKey: null", APP)
         self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
         self.assertIn("node-mode-session-card", APP)
-        self.assertIn("if (modeSelected)", APP)
-        self.assertIn("list.append(renderNodeModeSessionCards(coordinate));", APP)
+        self.assertIn("if (modeSelected || sessionCount)", APP)
+        self.assertIn("renderNodeModeSessionCards(coordinate)", APP)
+        self.assertIn("function nodeModePanelSessionBuckets", APP)
+        self.assertIn("working: live.filter(nodeModeSessionIsWorking)", APP)
+        self.assertIn("current_activity_state: supervised?.current_activity_state", APP)
+        self.assertIn("No live or recent sessions in this mode", APP)
+        self.assertIn("const NODE_MODE_RECENT_SESSION_LIMIT = 5", APP)
+        self.assertIn("function recentAnchorSessionsForCoordinate", APP)
+        self.assertIn("recentCandidates.slice(0, recentSlots)", APP)
+        self.assertIn("seenAnchorKeys.has(anchorKey)", APP)
+        self.assertIn("sessions: [...live, ...recent]", APP)
+        self.assertIn('statusLabel = `${offlineState} · OFFLINE`', APP)
+        self.assertIn('statusLabel = "CURRENT · OFFLINE"', APP)
+        self.assertNotIn("idle PTY session", APP)
+        self.assertIn("function ptyLiveTerminalsForCoordinate", APP)
+        self.assertIn("state.supervisorTerminals", APP)
+        self.assertIn("state.supervisorTerminals", TERM)
+        self.assertIn("function nodeModePanelSessions", APP)
+        self.assertIn('session_kind: "PTY_LIVE"', APP)
+        self.assertIn("terminal.session_anchor_ref", APP)
+        self.assertIn('api("/v1/terminals")', TERM)
         open_slice = APP[
             APP.index("function openNodeModeCoordinate") : APP.index(
                 "function renderNodeModes"
             )
         ]
         self.assertIn("state.selectedModeCoordinateKey = coordinate.key", open_slice)
+        self.assertIn("state.selectedModeCoordinateKey = null", open_slice)
         self.assertNotIn("openProviderChatSummary", open_slice)
         self.assertIn("node-mode-session-cards", CSS)
         self.assertIn("node-mode-session-card", CSS)
+        self.assertIn("createTerminalTab(coordinate)", APP)
+        self.assertIn("focusTerminalForSession(coordinate, session)", APP)
+        self.assertIn("bindNodeModeSessionPty(pending.coordinate, pending.session)", APP)
+        self.assertNotIn("await bindNodeModeSessionPty(coordinate, session)", APP)
+        self.assertIn("New session", APP)
+        card_slice = APP[APP.index("function renderNodeModeSessionCards") : APP.index("function selectNodeModeNode")]
+        self.assertNotIn("Delegate here", card_slice)
+
+    def test_goal_plan_hides_done_todos_but_keeps_completion_metrics(self) -> None:
+        plan_slice = APP[APP.index("function openPlanTodos") : APP.index("function renderTodos")]
+        self.assertIn('todo.state !== "DONE"', plan_slice)
+        self.assertIn("openPlanTodos(milestone.todos)", plan_slice)
+        self.assertIn("openPlanTodos(goal.todos)", plan_slice)
+        self.assertIn('todos.filter((todo) => todo.state === "DONE")', plan_slice)
+
+    def test_sessions_are_diagnostics_not_primary_navigation(self) -> None:
+        self.assertNotIn('data-primary-view="sessions"', HTML)
+        self.assertIn('data-primary-view="fleet"', HTML)
+        self.assertIn('id="session-observatory-topbar-button"', HTML)
+        self.assertIn('api("/v1/session-graph")', APP)
+        self.assertIn("function buildSessionGraph()", APP)
+        self.assertIn("function sessionGraphNodeLabel(item)", APP)
+        self.assertIn('item?.entity_type || ""', APP)
+        self.assertIn('item?.provider || ""', APP)
+        self.assertIn('currentness === "CURRENT"', APP)
+        self.assertIn("label: sessionGraphNodeLabel(item)", APP)
+        self.assertIn("item.y = -270 + depth * 85;", APP)
+        self.assertIn('state.view === "sessions"', APP)
+        self.assertIn('item.kind === "session_anchor"', APP)
+        self.assertIn("selectNodeModeSession(coordinate, session)", APP)
+        self.assertIn("MODE_ANCHOR", APP)
+        self.assertIn("SESSION_ANCHOR", APP)
+        self.assertIn("TASK_FRAME", APP)
+        self.assertIn('id="graph-legend"', HTML)
+        self.assertIn('if (view === "sessions") fitGraphView();', APP)
+        self.assertIn('state.view === "sessions" ? 0.12 : 0.5', APP)
+        self.assertIn('state.selectedProject?.project_id', APP)
+        self.assertIn('visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to)', APP)
+        self.assertIn(".node-key.session-anchor", CSS)
+
+    def test_chat_toggle_has_no_message_count_badge(self) -> None:
+        self.assertNotIn('id="conversation-badge"', HTML)
+        self.assertNotIn("conversationBadge:", APP)
+        self.assertNotIn("function updateConversationBadge", APP)
+
+    def test_project_entry_is_unified_and_planning_is_project_scoped(self) -> None:
+        self.assertIn('id="add-project-rail-button"', HTML)
+        self.assertNotIn('id="fresh-project-rail-button"', HTML)
+        self.assertNotIn('id="import-project-rail-button"', HTML)
+        self.assertIn('id="plan-project-button"', HTML)
+        self.assertIn("addProjectRailButton:", APP)
+        self.assertIn("planProjectButton:", APP)
+        self.assertIn('/v1/project-connections/prepare', APP)
+        self.assertIn('/v1/project-connections/apply', APP)
+        self.assertIn("elements.projectDialog.showModal()", APP)
+
+    def test_import_project_root_uses_native_directory_picker(self) -> None:
+        self.assertIn('id="project-root-browse"', HTML)
+        self.assertIn('class="project-root-picker"', HTML)
+        self.assertIn("projectRootBrowse:", APP)
+        self.assertIn('api("/v1/host/select-directory"', APP)
+        self.assertIn('elements.projectForm.elements.namedItem("project_root")', APP)
+        self.assertIn('result.status === "DIRECTORY_SELECTED"', APP)
+        self.assertIn(".project-root-picker", CSS)
+
+    def test_fresh_project_directory_uses_native_directory_picker(self) -> None:
+        fresh_dialog = HTML[HTML.index('id="fresh-project-dialog"') :]
+        self.assertIn('name="project_root"', fresh_dialog)
+        self.assertIn('id="fresh-project-root-browse"', fresh_dialog)
+        self.assertIn("freshProjectRootBrowse:", APP)
+        self.assertIn("function selectFreshProjectRoot()", APP)
+        self.assertIn(
+            'elements.freshProjectForm.elements.namedItem("project_root")', APP
+        )
+        self.assertIn(
+            'project_root: String(form.get("project_root") || "").trim()', APP
+        )
+
+    def test_release_import_uses_native_file_pickers(self) -> None:
+        release_dialog = HTML[HTML.index('id="release-dialog"') :]
+        self.assertIn('id="release-database-browse"', release_dialog)
+        self.assertIn('id="release-manifest-browse"', release_dialog)
+        self.assertIn('class="host-path-picker"', release_dialog)
+        self.assertIn('api("/v1/host/select-file"', APP)
+        self.assertIn('"RELEASE_DATABASE"', APP)
+        self.assertIn('"RELEASE_MANIFEST"', APP)
+        self.assertIn(".host-path-picker", CSS)
+
+    def test_release_proposal_renders_current_lifecycle_plan_shape(self) -> None:
+        start = APP.index("function showReleaseProposal(proposal)")
+        end = APP.index("async function proposeProjectRelease", start)
+        renderer = APP[start:end]
+        self.assertIn("Array.isArray(plan.actions)", renderer)
+        self.assertIn("Array.isArray(plan.collisions)", renderer)
+        self.assertIn("plan.installed_runtime?.state", renderer)
+        self.assertIn("plan.project_host_preflight", renderer)
+        self.assertNotIn("for (const action of proposal.plan.actions)", renderer)
+
+    def test_release_catalog_selects_target_and_exposes_apply(self) -> None:
+        release_dialog = HTML[HTML.index('id="release-dialog"') :]
+        self.assertIn('id="release-target-project"', release_dialog)
+        catalog_start = APP.index("function renderReleaseCatalog()")
+        catalog_end = APP.index("function showReleaseProposal", catalog_start)
+        catalog = APP[catalog_start:catalog_end]
+        self.assertIn("state.selectedReleaseTargetProjectId", catalog)
+        self.assertIn("visibleProjects()", catalog)
+        self.assertIn("project.project_root", catalog)
+        self.assertNotIn("action.disabled = !state.selectedProject", catalog)
+        self.assertNotIn("state.selectedProject?.project_id", catalog)
+        proposal_start = APP.index("function showReleaseProposal(proposal)")
+        proposal_end = APP.index("async function proposeProjectRelease", proposal_start)
+        proposal_renderer = APP[proposal_start:proposal_end]
+        self.assertIn("applyProjectRelease(proposal, applyButton)", proposal_renderer)
+        self.assertIn("async function applyProjectRelease", APP)
+        self.assertIn("/release-proposals/apply`,", APP)
+        self.assertIn('approval: "APPROVED"', APP)
+        self.assertIn("proposal.release_database_sha256", APP)
 
     def test_right_chat_dock_and_sliding_inspector_contract(self) -> None:
         self.assertIn('class="conductor-panel glass-panel"', HTML)
         self.assertIn('id="conversation-layer"', HTML)
         self.assertIn('id="action-inbox-button"', HTML)
+        self.assertNotIn('id="project-room-button"', HTML)
+        self.assertIn('kind: "NONE"', APP)
+        self.assertIn('state.conversationSurface === "CLI"', APP)
+        self.assertIn("async function openPreparedProviderSession", APP)
+        self.assertNotIn("function openProjectRoomSurface()", APP)
+        self.assertIn('state.conversationSurface = "CLI"', TERM)
         self.assertIn('id="close-inspector"', HTML)
         header_start = HTML.index('<header class="conversation-layer-header">')
         self.assertLess(
@@ -107,7 +419,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         )
         self.assertIn('id="chat-resize-handle"', HTML)
         self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
-        self.assertIn("await openProviderChatSession(room, { session });", APP)
+        self.assertIn("id=\"terminal-tabs\"", HTML)
+        self.assertIn("createTerminalTab(coordinate)", APP)
         self.assertIn("initChatPanelResize()", APP)
         self.assertIn("--chat-panel-width: 380px", CSS)
         self.assertIn("chat-resize-handle", CSS)
@@ -135,7 +448,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
                 "function openNodeModeCoordinate"
             )
         ]
-        self.assertIn("revealInspector: false", node_mode_slice)
+        self.assertIn("revealInspector: same", node_mode_slice)
 
         universe_slice = APP[
             APP.index('if (selected.kind === "universe")') : APP.index(
@@ -213,6 +526,32 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         )
         self.assertIn("session-summary-connection", CSS)
 
+    def test_prepared_master_and_conductor_open_provider_sessions_not_room_chat(self) -> None:
+        helper = APP[
+            APP.index("async function openPreparedProviderSession") : APP.index(
+                "async function callUniverseConductor"
+            )
+        ]
+        self.assertIn("providerChatRoomForSupervisorSession(session)", helper)
+        self.assertIn("await openProviderChatSession(room, { session })", helper)
+        self.assertIn("showSessionSelection(\"Session is ready. Select it from the session card.\")", helper)
+        conductor = APP[
+            APP.index("async function callUniverseConductor") : APP.index(
+                "async function callProjectMaster"
+            )
+        ]
+        master = APP[
+            APP.index("async function callProjectMaster") : APP.index(
+                "async function attachSelectedMasterSession"
+            )
+        ]
+        for route in (conductor, master):
+            self.assertIn("await openPreparedProviderSession({", route)
+            self.assertNotIn("openProjectRoomStream", route)
+            self.assertNotIn('kind: \"PROJECT_MASTER\"', route)
+            self.assertNotIn("returnToUniverseConductor", route)
+        self.assertEqual(1, APP.count("openProjectRoomStream(projectId)"))
+
     def test_session_popup_separates_resume_and_new_provider_session(self) -> None:
         connection_slice = APP[
             APP.index("function renderSessionSummaryConnection") : APP.index(
@@ -261,17 +600,19 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('"Provider setup required"', APP)
         self.assertIn('"LLM connected / Auto-approve " + autoApprove', APP)
 
-    def test_provider_profiles_use_one_provider_model_effort_dialog(self) -> None:
-        self.assertIn('id="provider-profile-dialog"', HTML)
-        self.assertIn('id="provider-profile-provider"', HTML)
-        self.assertIn('id="provider-profile-model"', HTML)
-        self.assertIn('id="provider-profile-model-custom"', HTML)
-        self.assertIn('id="provider-profile-effort"', HTML)
-        self.assertIn("function openProviderProfileDialog", APP)
-        self.assertIn("async function submitProviderProfile", APP)
-        self.assertIn("body: { provider, model_ref: modelRef, effort }", APP)
-        self.assertIn("provider-profile-row", CSS)
-        self.assertIn("provider-profile-dialog", CSS)
+    def test_provider_settings_expose_models_and_worker_bindings(self) -> None:
+        providers_panel = HTML[
+            HTML.index('data-settings-panel="providers"') :
+            HTML.index('data-settings-panel="host"')
+        ]
+        self.assertIn("<strong>Provider models</strong>", providers_panel)
+        self.assertIn("<strong>Worker bindings</strong>", providers_panel)
+        self.assertIn('id="worker-binding-scope"', providers_panel)
+        self.assertIn('id="worker-binding-settings"', providers_panel)
+        self.assertNotIn("Universe Conductor", providers_panel)
+        self.assertNotIn("Project Masters", providers_panel)
+        self.assertNotIn('id="project-provider-settings"', HTML)
+        self.assertNotIn('id="provider-profile-dialog"', HTML)
 
     def test_hidden_view_and_bounded_tail_are_wired(self) -> None:
         self.assertIn('id="session-rail-show-hidden"', HTML)
@@ -297,7 +638,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("state.providerLiveDelivery[room.chat_key]", tail_slice)
+        self.assertIn("mergeProviderLiveDeltasIntoRoom(room.chat_key)", tail_slice)
+        self.assertIn("renderRoomMessages()", tail_slice)
         self.assertIn("renderSelectedSessionDetail();", tail_slice)
+        self.assertIn("function mergeProviderLiveDeltasIntoRoom(chatKey)", APP)
         self.assertIn("session-detail-live-feed", CSS)
         self.assertLess(
             HTML.index('id="session-observatory-detail"'),
@@ -316,41 +660,68 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn("expected_version: session.row_version", rebind_slice)
-        self.assertIn("await refreshSupervisorSessions()", rebind_slice)
+        self.assertIn("await openPreparedProviderSession({", rebind_slice)
+        self.assertNotIn("openProjectRoomStream", rebind_slice)
         self.assertIn("session?.provider_session_attached", APP)
         self.assertIn("session-working-directory", CSS)
         self.assertIn(".session-working-directory.hidden", CSS)
 
-    def test_approval_uses_server_owned_canonical_route(self) -> None:
-        self.assertIn("/v1/governance/proposals/", APP)
-        decision_slice = APP[
-            APP.index("async function decideGovernanceProposal") :
-            APP.index("function requestedPermissionSummary")
-        ]
-        self.assertNotIn("commander_surface", decision_slice)
-        self.assertNotIn("idempotency_key", decision_slice)
-        self.assertIn('decideGovernanceProposal(proposal, "APPROVE")', APP)
-        self.assertIn('decideGovernanceProposal(proposal, "CANCEL")', APP)
-        self.assertIn('"proposal-cancel", "Cancel"', APP)
+    def test_action_inbox_excludes_governance_approval_controls(self) -> None:
+        self.assertNotIn("/v1/governance/proposals/", APP)
+        self.assertNotIn("async function decideGovernanceProposal", APP)
+        self.assertNotIn('decideGovernanceProposal(proposal, "APPROVE")', APP)
+        self.assertNotIn('decideGovernanceProposal(proposal, "CANCEL")', APP)
+        self.assertNotIn('"proposal-cancel", "Cancel"', APP)
 
     def test_actions_are_separate_from_chat_and_keep_scroll_stable(self) -> None:
         self.assertIn('id="action-inbox-button"', HTML)
         self.assertIn('id="action-inbox-dialog"', HTML)
+        self.assertIn('aria-labelledby="action-inbox-title"', HTML)
         self.assertIn('id="action-inbox-list"', HTML)
+        self.assertIn('aria-label="Actions by category"', HTML)
+        self.assertIn('data-mobile-work-view="actions"', HTML)
+        self.assertIn('id="mobile-action-inbox-badge"', HTML)
         self.assertIn("function renderActionInbox", APP)
+        self.assertIn("function openActionInbox", APP)
         self.assertIn("function pendingActionItems", APP)
+        self.assertIn("function pendingConversationPermissions", APP)
+        self.assertIn("pendingConversationPermissions())", APP)
         self.assertIn("function finishRoomMessageRender", APP)
+        self.assertNotIn('"Pending approvals"', APP)
+        self.assertIn('"Active work"', APP)
+        self.assertNotIn('"Recent activity"', APP)
+        self.assertIn('"No active work."', APP)
+        self.assertIn("Cross-session delivery is internal automation state", APP)
+        self.assertIn("delegations: []", APP)
+        self.assertIn("history: []", APP)
+        self.assertIn("function renderProviderReplyActionCard", APP)
+        self.assertIn("cancelProviderSessionTurn", APP)
         self.assertIn("CANCELLATION_REQUESTED", APP)
         self.assertIn("/v1/conductor-room/delegations/", APP)
+        mobile_slice = APP[
+            APP.index('elements.mobileWorkTabs?.addEventListener("click"') :
+            APP.index("const activeGoal")
+        ]
+        self.assertIn('view === "actions"', mobile_slice)
+        self.assertIn("openActionInbox()", mobile_slice)
+        self.assertNotIn('openInspectorSurface("activity")', mobile_slice)
+        provider_reply_slice = APP[
+            APP.index("function renderProviderReplyActionCard") :
+            APP.index("function renderActionInbox")
+        ]
+        self.assertNotIn("reply.content", provider_reply_slice)
         message_slice = APP[
             APP.index("function renderRoomMessages") : APP.index(
-                "function renderGovernanceProposalCard"
+                "function renderComposerState"
             )
         ]
         self.assertNotIn("renderGovernanceProposalCard(proposal)", message_slice)
         self.assertNotIn("renderPermissionCard(permission)", message_slice)
         self.assertNotIn("scrollRoomToPendingAction", APP)
-        self.assertIn("action-inbox-dialog", CSS)
+        self.assertIn("action-inbox-dialog[open]", CSS)
+        self.assertIn("width: 100vw", CSS)
+        self.assertIn("height: 100dvh", CSS)
+        self.assertIn("overscroll-behavior-y: contain", CSS)
 
     def test_project_master_delivery_labels_distinguish_queue_and_acceptance(
         self,
@@ -358,6 +729,105 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('deliveryState === "QUEUED_FOR_MASTER"', APP)
         self.assertIn('deliveryState === "ACCEPTED_BY_MASTER"', APP)
         self.assertNotIn("DELIVERED_TO_MASTER", APP)
+
+
+    def test_meeting_room_feature_expected_path_ui_is_explicit_and_non_authoritative(
+        self,
+    ) -> None:
+        self.assertIn('id="meeting-feature-controls"', HTML)
+        self.assertIn('id="meeting-feature-select"', HTML)
+        self.assertIn('id="meeting-feature-rationale"', HTML)
+        self.assertIn("async function createFeatureForActiveMeeting", APP)
+        self.assertIn("async function addArtifactAsExpectedPath", APP)
+        self.assertIn("async function startExpectedPathGoal", APP)
+        self.assertIn("async function materializeFeatureGoal", APP)
+        self.assertIn("async function runActiveGoalWorkPlans", APP)
+        self.assertIn("async function adoptGoalWorkPlan", APP)
+        self.assertIn("async function applyGoalWorkPlan", APP)
+        self.assertIn("async function attachMeetingProviderSession", APP)
+        self.assertIn("async function runActiveFeatureMeeting", APP)
+        self.assertIn("async function cancelActiveFeatureMeeting", APP)
+        self.assertIn('id="meeting-provider-session-select"', HTML)
+        self.assertIn('id="start-meeting-run-button"', HTML)
+        self.assertIn('/provider-sessions', APP)
+        self.assertIn('/meeting-runs', APP)
+        self.assertIn('/feature-nodes', APP)
+        self.assertIn('/expected-paths', APP)
+        self.assertIn('/goal-start-receipts', APP)
+        feature_slice = APP[
+            APP.index("async function refreshActiveRoomFeatures") : APP.index(
+                "async function openMultiRoom"
+            )
+        ]
+        self.assertIn("expected_feature_revision: feature.revision", feature_slice)
+        self.assertIn("expected_path_digest: path.route_digest", feature_slice)
+        self.assertIn('push_policy: "PUSH_PROHIBITED"', feature_slice)
+        self.assertIn("Adopt + Start Goal", feature_slice)
+        self.assertIn("result.automation?.surface?.automation_state", feature_slice)
+        self.assertIn("path.artifact_revision", APP)
+        self.assertIn("path.route?.steps?.length", APP)
+        self.assertIn('"EXPECTED_PATH_STEP"', APP)
+        self.assertIn('kind: "route-step"', APP)
+        self.assertIn(".feature-path-route", CSS)
+        self.assertIn("Generate Work Plans", feature_slice)
+        self.assertIn("Apply Adopted Plan", feature_slice)
+        self.assertIn("/work-plan-runs", feature_slice)
+        self.assertIn("/work-plan-adoptions", feature_slice)
+        self.assertIn("/work-plan-applications", feature_slice)
+        self.assertIn("PLANNED Milestones and BACKLOG Todos", APP)
+        self.assertIn("It never runs a Task Frame or changes Todo state.", APP)
+        self.assertIn('/goals', feature_slice)
+        self.assertIn('Create Goal', feature_slice)
+        self.assertNotIn('/todos', feature_slice)
+        self.assertIn(".meeting-feature-controls", CSS)
+
+    def test_boss_room_history_and_task_frame_conversation_are_visible(self) -> None:
+        self.assertIn('<small>Rooms</small>', HTML)
+        self.assertIn('api("/v1/rooms?state=ALL")', APP)
+        self.assertIn('multiRoomStateFilter: "OPEN"', APP)
+        self.assertIn('function renderTaskFrameTimeline', APP)
+        self.assertIn('source.addEventListener("task-frame"', APP)
+        self.assertIn('snap.task_frame_timeline', APP)
+        self.assertIn('.task-frame-timeline', CSS)
+
+    def test_semantic_project_graph_is_separate_from_session_graph(self) -> None:
+        self.assertIn('/semantic-graph', APP)
+        self.assertIn('function buildSemanticProjectGraph', APP)
+        self.assertIn('const galaxyEntityTypes = new Set([', APP)
+        self.assertIn('galaxyEntityTypes.has(String(item.entity_type', APP)
+        self.assertIn('elements.graphHint.textContent = `Galaxy ·', APP)
+        self.assertIn('projection only', APP)
+        self.assertIn('if (state.view === "semantic")', APP)
+
+    def test_galaxy_and_fleet_project_shared_lineage_state(self) -> None:
+        self.assertIn("function semanticDescendantIds", APP)
+        self.assertIn("function semanticTodoIdsForGraphNode", APP)
+        self.assertIn("const todoIds = semanticTodoIdsForGraphNode(state.selectedNode)", APP)
+        self.assertIn("function todoProjectionForGraphNode", APP)
+        self.assertIn("item.dataset.state = todo.state", APP)
+        self.assertIn("todoLineageLabel(todo)", APP)
+        self.assertIn('todo-item[data-state="IN_PROGRESS"]', CSS)
+        self.assertIn("function semanticActivityItemsForGraphNode", APP)
+        self.assertIn("Project activity ledger · filtered by semantic lineage", APP)
+        self.assertIn("renderSemanticNodeActivity(state.selectedNode)", APP)
+        self.assertIn(".activity-context", CSS)
+        self.assertIn("...state.goalAutomationSurfaces", APP)
+        self.assertIn("function todoOwnershipProjection", APP)
+        self.assertIn("TASK_FRAME_TARGETS_SESSION_ANCHOR", APP)
+        self.assertIn("renderTodoOwnership(todo)", APP)
+        self.assertIn('row.dataset.bound = "false"', APP)
+        self.assertIn("unbound_in_progress_count", APP)
+        self.assertIn("Work ownership / ${ownershipSummary.task_frame_count}", APP)
+        self.assertIn("function todoAutomationControlProjection", APP)
+        self.assertIn("GOAL_LINK_REQUIRED", APP)
+        self.assertIn("WORK_PLAN_SCOPE_MISMATCH", APP)
+        self.assertIn('surface.automation_state === "TASK_FRAME_READY"', APP)
+        self.assertIn("A live Conductor Rust Host bridge is required", APP)
+        self.assertIn("/automation/todo-selection", APP)
+        self.assertIn('approval: "SELECT_TODOS"', APP)
+        self.assertIn("renderTodoAutomationControl(todo)", APP)
+        self.assertIn(".todo-ownership", CSS)
+        self.assertIn(".todo-automation-control", CSS)
 
     def test_project_graph_labels_functional_nodes_with_seed_provenance(self) -> None:
         self.assertIn("Project Seed node", HTML)
@@ -386,6 +856,23 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("binding.anchor_temporality", rail_slice)
 
 
+    def test_provider_session_stream_requires_attached_identity(self) -> None:
+        eligible_slice = APP[
+            APP.index("function providerSessionRoomIsEligible") : APP.index(
+                "function providerSessionRoomCacheFor"
+            )
+        ]
+        openable_slice = APP[
+            APP.index("function providerSessionRoomIsOpenable") : APP.index(
+                "function providerSessionUnreadCount"
+            )
+        ]
+        self.assertIn('identityState === "VERIFIED"', eligible_slice)
+        self.assertIn("function providerSessionRoomIdentityIsAttached", eligible_slice)
+        self.assertIn('identityState !== "SUPERVISOR_OBSERVED"', eligible_slice)
+        self.assertIn('currentness === "CURRENT"', eligible_slice)
+        self.assertIn("providerSessionRoomIdentityIsAttached(room)", openable_slice)
+
     def test_provider_session_background_events_keep_selected_transcript_focused(self) -> None:
         selection_slice = APP[
             APP.index("function syncSelectedProviderSessionState") : APP.index(
@@ -412,6 +899,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("if (providerSessionRoomIsSelected(key))", stream_slice)
         self.assertIn("renderRoomMessages()", stream_slice)
         self.assertIn("renderSessionRail()", stream_slice)
+        self.assertIn("providerSessionRoomIsOpenable(room)", stream_slice)
         self.assertNotIn(
             "state.providerSessionMessages = dedupeProviderSessionMessages",
             stream_slice,
@@ -419,6 +907,153 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("syncProviderSessionSubscriptions();", APP)
         self.assertIn("providerSessionActivityState(room)", APP)
         self.assertIn("providerSessionUnreadCount(room)", APP)
+
+    def test_initial_refresh_does_not_wait_for_observatory_or_duplicate_terminal_discovery(
+        self,
+    ) -> None:
+        refresh_slice = APP[
+            APP.index("async function refresh(") : APP.index("function projectDisplayName")
+        ]
+        self.assertLess(
+            refresh_slice.index("renderProjects();"),
+            refresh_slice.index("void refreshSupervisorSessions().catch"),
+        )
+        self.assertNotIn("await refreshSupervisorSessions()", refresh_slice)
+        self.assertEqual(refresh_slice.count("void loadTerminalTabs();"), 1)
+
+        supervisor_slice = APP[
+            APP.index("async function refreshSupervisorSessions") : APP.index(
+                "async function tailProviderSessions"
+            )
+        ]
+        self.assertNotIn('api("/v1/terminals")', supervisor_slice)
+        startup_slice = APP[APP.index("refresh().finally(() => {") :]
+        self.assertNotIn("loadTerminalTabs()", startup_slice)
+
+    def test_selected_projection_is_reused_and_completed_todos_leave_planning_inbox(
+        self,
+    ) -> None:
+        select_slice = APP[
+            APP.index("async function selectProject(") : APP.index(
+                "function mergeGovernanceProposalInbox"
+            )
+        ]
+        self.assertIn("state.projectionsByProject?.[projectId]", select_slice)
+        self.assertIn(
+            '(goalPlanResult.unassigned_todos || []).filter(',
+            select_slice,
+        )
+        refresh_goal_slice = APP[
+            APP.index("async function refreshGoalPlan()") : APP.index(
+                "function planTodoRow"
+            )
+        ]
+        self.assertIn('(result.unassigned_todos || []).filter(', refresh_goal_slice)
+        self.assertIn('todo.state !== "DONE"', select_slice)
+        self.assertIn('todo.state !== "DONE"', refresh_goal_slice)
+
+    def test_mobile_conversation_launcher_stays_inside_the_composer_dock(
+        self,
+    ) -> None:
+        selector = (
+            "  .app-shell.mockup-shell > .graph-workspace > .conductor-panel "
+            "> .conversation-layer {"
+        )
+        start = CSS.rindex(selector)
+        block = CSS[start : CSS.index("  }", start)]
+        self.assertIn("position: relative;", block)
+        self.assertIn("inset: auto;", block)
+        self.assertIn("width: 100%;", block)
+        self.assertIn("min-width: 0;", block)
+        self.assertIn("max-width: 100%;", block)
+
+    def test_terminal_selection_preserves_the_explicit_chat_panel_width(self) -> None:
+        self.assertNotIn("autoWidenForTerminal", TERM)
+        self.assertNotIn('--chat-panel-width", "680px', TERM)
+        self.assertIn("initChatPanelResize()", APP)
+
+    def test_supervisor_refreshes_are_coalesced_and_recent_open_reuses_cache(
+        self,
+    ) -> None:
+        refresh_slice = APP[
+            APP.index("async function refreshSupervisorSessions") : APP.index(
+                "async function tailProviderSessions"
+            )
+        ]
+        self.assertIn(
+            "if (state.supervisorRefreshPromise) return state.supervisorRefreshPromise",
+            refresh_slice,
+        )
+        self.assertIn("state.supervisorRefreshedAt = Date.now();", refresh_slice)
+        self.assertIn("state.supervisorRefreshPromise = refreshPromise;", refresh_slice)
+        self.assertIn("state.supervisorRefreshPromise = null;", refresh_slice)
+        open_start = APP.index("const openSessionObservatory = async () =>")
+        open_slice = APP[open_start : APP.index("if (elements.sessionObservatoryDialog)", open_start)]
+        self.assertIn(
+            "refreshSupervisorSessions({ maxAgeMs: 10_000 })",
+            open_slice,
+        )
+
+    def test_rooms_dialog_opens_before_settings_requests_finish(self) -> None:
+        helper = APP[
+            APP.index("async function openProviderSettings") : APP.index(
+                "function setDialogCategoryTab"
+            )
+        ]
+        self.assertLess(
+            helper.index("elements.settingsDialog.showModal()"),
+            helper.index("await Promise.all"),
+        )
+        self.assertIn("if (!elements.settingsDialog.open)", helper)
+
+    def test_mobile_observatory_is_labeled_opaque_and_single_scroll(self) -> None:
+        self.assertIn(
+            'id="session-observatory-dialog" class="session-observatory-dialog wide-dialog" aria-labelledby="session-observatory-title"',
+            HTML,
+        )
+        self.assertIn('id="session-observatory-title"', HTML)
+        tab_helper = APP[
+            APP.index("function setDialogCategoryTab") : APP.index(
+                "function setSettingsTab"
+            )
+        ]
+        self.assertIn('tab.setAttribute("aria-controls", panel.id)', tab_helper)
+        self.assertIn('panel.setAttribute("aria-labelledby", tab.id)', tab_helper)
+
+        open_selector = ".session-observatory-dialog[open] {"
+        open_start = CSS.index(open_selector)
+        open_block = CSS[open_start : CSS.index("}", open_start)]
+        self.assertIn("display: flex;", open_block)
+        self.assertIn("overflow: hidden;", open_block)
+        self.assertIn("background: #071413;", CSS)
+
+        panels_selector = ".session-observatory-dialog > .observatory-tab-panels {"
+        panels_start = CSS.index(panels_selector)
+        panels_block = CSS[panels_start : CSS.index("}", panels_start)]
+        self.assertIn("min-height: 0;", panels_block)
+        self.assertIn("max-height: none;", panels_block)
+        self.assertIn("overflow-y: auto;", panels_block)
+
+        list_start = CSS.index(".session-observatory-list {")
+        list_block = CSS[list_start : CSS.index("}", list_start)]
+        self.assertIn("max-height: none;", list_block)
+        self.assertIn("overflow: visible;", list_block)
+
+        mobile_dialog_start = CSS.index("  .session-observatory-dialog[open] {")
+        mobile_dialog_block = CSS[
+            mobile_dialog_start : CSS.index("  }", mobile_dialog_start)
+        ]
+        self.assertIn("width: 100vw;", mobile_dialog_block)
+        self.assertIn("height: 100dvh;", mobile_dialog_block)
+        mobile_tabs_start = CSS.index(
+            "  .session-observatory-dialog > .dialog-tabs {",
+            mobile_dialog_start,
+        )
+        mobile_tabs_block = CSS[
+            mobile_tabs_start : CSS.index("  }", mobile_tabs_start)
+        ]
+        self.assertIn("flex-wrap: nowrap;", mobile_tabs_block)
+        self.assertIn("overflow-x: auto;", mobile_tabs_block)
 
 if __name__ == "__main__":
     unittest.main()

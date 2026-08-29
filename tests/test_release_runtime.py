@@ -341,6 +341,74 @@ class ReleaseRuntimeTests(unittest.TestCase):
             ),
         )
 
+    def test_legacy_migration_updates_core_without_deleting_legacy_paths(self) -> None:
+        core_path = self.target / ".ai/core/CORE_SURFACE_REGISTRY.md"
+        core_path.parent.mkdir(parents=True, exist_ok=True)
+        core_path.write_text("# Legacy Core\n", encoding="utf-8")
+        retained_path = (
+            self.target / ".ai/runtime/project_instance/project_anchor.md"
+        )
+        retained_path.parent.mkdir(parents=True, exist_ok=True)
+        retained_path.write_text("# Project anchor\n", encoding="utf-8")
+        legacy_manifest = (
+            self.target
+            / ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
+        )
+        legacy_manifest.write_text(
+            json.dumps(
+                {
+                    "schema": "ai-career.project-runtime-installation.v1",
+                    "release_id": "legacy-core",
+                    "managed_paths": [
+                        {
+                            "target_path": ".ai/core/CORE_SURFACE_REGISTRY.md",
+                            "local_sha256": "0" * 64,
+                        },
+                        {
+                            "target_path": (
+                                ".ai/runtime/project_instance/project_anchor.md"
+                            ),
+                            "local_sha256": hashlib.sha256(
+                                retained_path.read_bytes()
+                            ).hexdigest(),
+                        },
+                    ],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        with ReleaseRuntime(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        ) as runtime:
+            plan = runtime.plan_project_install(self.target)
+            result = runtime.apply_project_install(
+                target_root=self.target,
+                approved_plan_digest=plan["plan_digest"],
+            )
+
+        self.assertEqual("PROJECT_RELEASE_PLAN_READY", plan["status"])
+        self.assertNotIn(
+            ".ai/runtime/project_instance/project_anchor.md",
+            [action["path"] for action in plan["actions"]],
+        )
+        self.assertIn(
+            {
+                "operation": "UPDATE",
+                "path": ".ai/core/CORE_SURFACE_REGISTRY.md",
+            },
+            result["changed"],
+        )
+        self.assertEqual(
+            "# Core v1\n", core_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "# Project anchor\n", retained_path.read_text(encoding="utf-8")
+        )
+        self.assertTrue(legacy_manifest.is_file())
+
     def test_modified_managed_file_is_an_unmanaged_collision(self) -> None:
         with ReleaseRuntime(
             database_path=self.database,

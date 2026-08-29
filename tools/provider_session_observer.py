@@ -39,6 +39,8 @@ DEFAULT_SCAN_TIME_LIMIT_SECONDS = 0.25
 SEMANTIC_EXCERPT_LIMIT = 256
 SEMANTIC_EXCERPT_CHAR_LIMIT = 2000
 SEMANTIC_TOTAL_CHAR_LIMIT = 32000
+VISIBLE_TRANSCRIPT_BYTE_LIMIT = 512 * 1024
+VISIBLE_TRANSCRIPT_MESSAGE_LIMIT = 40
 SECRET_PATTERNS = (
     re.compile(r"\b(?:sk|xai|ghp|github_pat)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
@@ -83,10 +85,15 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _redact_semantic_text(value: str) -> str:
-    redacted = value.replace("\x00", " ").strip()
+def _redact_secrets_only(value: str) -> str:
+    redacted = value.replace("\x00", " ")
     for pattern in SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _redact_semantic_text(value: str) -> str:
+    redacted = _redact_secrets_only(value).strip()
     return " ".join(redacted.split())[:SEMANTIC_EXCERPT_CHAR_LIMIT]
 
 
@@ -123,6 +130,106 @@ def _codex_semantic_messages(event: Mapping[str, Any]) -> list[tuple[str, str]]:
     return messages
 
 
+def _visible_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "message", "content"):
+            text = _visible_text(value.get(key))
+            if text.strip():
+                return text
+        return ""
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            text = _visible_text(item)
+            if text.strip():
+                chunks.append(text)
+        return "\n".join(chunks)
+    return ""
+
+
+def _claude_semantic_messages(event: Mapping[str, Any]) -> list[tuple[str, str]]:
+    type_name = str(event.get("type") or "").strip().lower()
+    if type_name in {"tool_result", "tool_use", "progress", "queue-operation"}:
+        return []
+    role = str(event.get("role") or "").strip().upper()
+    if type_name in {"user", "human"}:
+        role = "USER"
+    elif type_name in {"assistant", "agent"}:
+        role = "ASSISTANT"
+    message = event.get("message")
+    text = ""
+    if isinstance(message, Mapping):
+        if role not in {"USER", "ASSISTANT"}:
+            role = str(message.get("role") or "").strip().upper()
+        text = _visible_text(message.get("content") or message.get("text"))
+    if not text:
+        text = _visible_text(event.get("text") or event.get("content"))
+    if role not in {"USER", "ASSISTANT"} or not text.strip():
+        return []
+    return [(role, text)]
+
+
+def _grok_semantic_messages(event: Mapping[str, Any]) -> list[tuple[str, str]]:
+    params = event.get("params")
+    update = params.get("update") if isinstance(params, Mapping) else event.get("update")
+    if not isinstance(update, Mapping):
+        return []
+    kind = str(update.get("sessionUpdate") or "").strip()
+    if kind in {
+        "agent_thought_chunk",
+        "available_commands_update",
+        "tool_call",
+        "tool_call_update",
+        "hook_execution",
+    }:
+        return []
+    if kind in {"user_message_chunk", "user_message"}:
+        role = "USER"
+    elif kind in {"agent_message_chunk", "agent_message"}:
+        role = "ASSISTANT"
+    else:
+        return []
+    text = _visible_text(update.get("content"))
+    if not text.strip():
+        return []
+    return [(role, text)]
+
+
+def _provider_semantic_messages(
+    provider: str, event: Mapping[str, Any]
+) -> list[tuple[str, str]]:
+    normalized = str(provider or "").strip().upper()
+    if normalized == "CODEX":
+        return _codex_semantic_messages(event)
+    if normalized == "CLAUDE":
+        return _claude_semantic_messages(event)
+    if normalized == "GROK":
+        return _grok_semantic_messages(event)
+    return []
+
+
+def _coalesce_semantic_pairs(
+    pairs: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    coalesced: list[tuple[str, str]] = []
+    for role, raw_text in pairs:
+        text = _redact_secrets_only(raw_text)
+        if not text.strip():
+            continue
+        if coalesced and coalesced[-1][0] == role:
+            coalesced[-1] = (role, coalesced[-1][1] + text)
+            continue
+        coalesced.append((role, text))
+    normalized: list[tuple[str, str]] = []
+    for role, text in coalesced:
+        cleaned = _redact_semantic_text(text)
+        if cleaned:
+            normalized.append((role, cleaned))
+    return normalized
+
+
 def _file_identity(path: Path) -> str:
     stat = path.stat()
     # Do not include ctime: Unix updates it when a transcript is appended.
@@ -152,6 +259,16 @@ def _event_type(event: Mapping[str, Any]) -> str:
         value = event.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    params = event.get("params")
+    if isinstance(params, Mapping):
+        update = params.get("update")
+        if isinstance(update, Mapping):
+            session_update = update.get("sessionUpdate")
+            if isinstance(session_update, str) and session_update.strip():
+                return session_update.strip()
+    method = event.get("method")
+    if isinstance(method, str) and method.strip():
+        return method.strip()
     raise ProviderSessionObserverError(
         "SOURCE_SCHEMA_UNSUPPORTED", "event has no supported type field"
     )
@@ -600,7 +717,7 @@ class ProviderSessionObserverStore:
         source_id: str,
         activity_refs: list[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Read exact selected Codex message events without persisting text."""
+        """Read exact selected provider message events without persisting text."""
 
         if not activity_refs or len(activity_refs) > 512:
             raise ProviderSessionObserverError(
@@ -614,10 +731,7 @@ class ProviderSessionObserverStore:
             ).fetchone()
             if source is None:
                 raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
-            if str(source["provider"]) != "CODEX":
-                raise ProviderSessionObserverError(
-                    "SEMANTIC_PROVIDER_UNSUPPORTED", "Codex source required"
-                )
+            provider = str(source["provider"])
             path = Path(str(source["source_path"]))
             if not path.is_file() or _file_identity(path) != str(source["file_identity"]):
                 raise ProviderSessionObserverError(
@@ -672,19 +786,27 @@ class ProviderSessionObserverStore:
                     raise ProviderSessionObserverError(
                         "SEMANTIC_SOURCE_NOT_CURRENT", "event is not an object"
                     )
+                parent_id = None
+                if provider == "CLAUDE":
+                    parent = event.get("parentUuid")
+                    parent_id = (
+                        parent.strip()
+                        if isinstance(parent, str) and parent.strip()
+                        else None
+                    )
                 safe = {
                     "source_id": source_id,
                     "provider_event_id": _event_id(event, f"offset-{byte_offset}"),
                     "ordinal": int(row["ordinal"]),
                     "event_type": _event_type(event)[:96],
-                    "parent_id": None,
+                    "parent_id": parent_id,
                 }
                 if _sha256(_canonical_json(safe)) != str(row["activity_digest"]):
                     raise ProviderSessionObserverError(
                         "SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"])
                     )
-                for role, raw_text in _codex_semantic_messages(event):
-                    text = _redact_semantic_text(raw_text)
+                for role, raw_text in _provider_semantic_messages(provider, event):
+                    text = _redact_secrets_only(raw_text)
                     if not text:
                         continue
                     remaining = SEMANTIC_TOTAL_CHAR_LIMIT - total_chars
@@ -719,7 +841,7 @@ class ProviderSessionObserverStore:
                 "SEMANTIC_EVIDENCE_EMPTY",
                 "selected Activity has no bounded user or assistant text",
             )
-        return excerpts
+        return self._coalesce_excerpts(excerpts)
 
     def build_transient_live_deltas(
         self,
@@ -753,13 +875,6 @@ class ProviderSessionObserverStore:
                 "delivery": "NO_NEW_ACTIVITY",
                 "deltas": [],
             }
-        if str(source["provider"]) != "CODEX":
-            return {
-                "schema": "universe.provider-live-delta.v1",
-                "source": public_source,
-                "delivery": "ACTIVITY_ONLY",
-                "deltas": [],
-            }
         activities = self.list_activities(source_id)[: min(added_count, SEMANTIC_EXCERPT_LIMIT)]
         activity_refs = [
             {
@@ -781,6 +896,145 @@ class ProviderSessionObserverStore:
             "delivery": "TRANSIENT_REDACTED" if excerpts else "ACTIVITY_ONLY",
             "deltas": excerpts,
         }
+
+    def build_transient_visible_transcript(
+        self,
+        source_id: str,
+        *,
+        max_bytes: int = VISIBLE_TRANSCRIPT_BYTE_LIMIT,
+        max_messages: int = VISIBLE_TRANSCRIPT_MESSAGE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Return recent redacted user/assistant excerpts without persisting them."""
+
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+            raise ProviderSessionObserverError(
+                "SEMANTIC_EVIDENCE_INVALID", "max_bytes must be a positive integer"
+            )
+        if (
+            isinstance(max_messages, bool)
+            or not isinstance(max_messages, int)
+            or max_messages <= 0
+        ):
+            raise ProviderSessionObserverError(
+                "SEMANTIC_EVIDENCE_INVALID", "max_messages must be a positive integer"
+            )
+        max_bytes = min(max_bytes, MAX_SINGLE_EVENT_BYTE_LIMIT)
+        max_messages = min(max_messages, SEMANTIC_EXCERPT_LIMIT)
+        with self._connection() as connection:
+            source = connection.execute(
+                "SELECT * FROM provider_session_source WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        if source is None:
+            raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
+        path = Path(str(source["source_path"]))
+        if not path.is_file() or (
+            source["file_identity"]
+            and _file_identity(path) != str(source["file_identity"])
+        ):
+            raise ProviderSessionObserverError("SEMANTIC_SOURCE_NOT_CURRENT", source_id)
+        activities = self.list_activities(
+            source_id, active_only=False
+        )[:SEMANTIC_EXCERPT_LIMIT]
+        if activities:
+            activity_refs = [
+                {
+                    "activity_id": activity["activity_id"],
+                    "activity_digest": activity["activity_digest"],
+                    "ordinal": activity["ordinal"],
+                }
+                for activity in reversed(activities)
+            ]
+            try:
+                excerpts = self.build_transient_semantic_evidence(source_id, activity_refs)
+                if excerpts:
+                    return excerpts[-max_messages:]
+            except ProviderSessionObserverError as error:
+                if error.code not in {
+                    "SEMANTIC_EVIDENCE_EMPTY",
+                    "SEMANTIC_SOURCE_NOT_CURRENT",
+                    "SEMANTIC_ACTIVITY_NOT_ATTESTED",
+                }:
+                    raise
+        return self._tail_visible_excerpts(
+            str(source["provider"]),
+            path,
+            max_bytes=max_bytes,
+            max_messages=max_messages,
+        )
+
+    @staticmethod
+    def _coalesce_excerpts(excerpts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        coalesced: list[dict[str, Any]] = []
+        for excerpt in excerpts:
+            role = str(excerpt.get("role") or "").strip().upper()
+            text = _redact_secrets_only(str(excerpt.get("text") or ""))
+            if role not in {"USER", "ASSISTANT"} or not text.strip():
+                continue
+            if coalesced and coalesced[-1]["role"] == role:
+                coalesced[-1] = {
+                    **coalesced[-1],
+                    "text": str(coalesced[-1]["text"]) + text,
+                    "ordinal": excerpt.get("ordinal", coalesced[-1].get("ordinal")),
+                }
+                continue
+            coalesced.append({**excerpt, "role": role, "text": text})
+        normalized: list[dict[str, Any]] = []
+        for excerpt in coalesced:
+            cleaned = _redact_semantic_text(str(excerpt.get("text") or ""))
+            if not cleaned:
+                continue
+            digest = _sha256(_canonical_json(cleaned))
+            normalized.append(
+                {
+                    **excerpt,
+                    "text": cleaned,
+                    "text_digest": digest,
+                    "excerpt_id": "semantic_" + digest[:24],
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _tail_visible_excerpts(
+        provider: str,
+        path: Path,
+        *,
+        max_bytes: int,
+        max_messages: int,
+    ) -> list[dict[str, Any]]:
+        size = path.stat().st_size
+        start = max(0, size - max_bytes)
+        pairs: list[tuple[str, str]] = []
+        with path.open("rb") as handle:
+            handle.seek(start)
+            if start:
+                handle.readline()
+            while True:
+                raw_line = handle.readline()
+                if not raw_line or not raw_line.endswith(b"\n"):
+                    break
+                try:
+                    event = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, Mapping):
+                    continue
+                pairs.extend(_provider_semantic_messages(provider, event))
+        excerpts: list[dict[str, Any]] = []
+        for role, text in _coalesce_semantic_pairs(pairs):
+            digest = _sha256(_canonical_json(text))
+            excerpts.append(
+                {
+                    "excerpt_id": "semantic_" + digest[:24],
+                    "activity_digest": None,
+                    "ordinal": len(excerpts) + 1,
+                    "role": role,
+                    "text": text,
+                    "text_digest": digest,
+                }
+            )
+        return excerpts[-max_messages:]
 
     def scan(
         self,
@@ -948,7 +1202,7 @@ class ProviderSessionObserverStore:
         provider = str(source["provider"])
         event_type = _event_type(event)
         event_kind, activity_state = _safe_event_kind(event_type)
-        if provider == "CODEX" and _codex_semantic_messages(event):
+        if _provider_semantic_messages(provider, event):
             event_kind, activity_state = "TURN_COMPLETED", "COMPLETED"
         event_id = _event_id(event, f"offset-{byte_offset}")
         parent_id: str | None = None

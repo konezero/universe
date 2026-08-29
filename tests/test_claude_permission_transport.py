@@ -123,6 +123,24 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual("deny", result["behavior"])
         self.assertIn("SESSION_MISMATCH", result["message"])
 
+    def test_pending_broker_identity_binds_with_provider_session(self) -> None:
+        bridge = ClaudePermissionBridge(
+            session_ref="claude-code:pending:GCS",
+            permission_requester=lambda _request: "allow-once",
+        )
+        broker = ClaudePermissionBroker(bridge=bridge, target="GCS/MASTER")
+        self.brokers.append(broker)
+        broker.bind_session_ref("claude-code:vendor-session")
+        result = broker.handle_payload(
+            _prompt(session_ref="claude-code:vendor-session"),
+            presented_token=broker.token.value,
+        )
+        self.assertEqual("allow", result["behavior"])
+        self.assertEqual(
+            "claude-code:vendor-session",
+            broker.token.identity()["session_ref"],
+        )
+
     def test_closed_broker_fails_closed_and_revokes(self) -> None:
         broker = self._broker("allow-once")
         token = broker.token.value
@@ -423,8 +441,11 @@ class BootstrapExchangeTests(unittest.TestCase):
         with self.assertRaises(ClaudeResidentError) as caught:
             session.send_message("go", lambda _d: None)
         self.assertIn("MCP_NOT_REGISTERED", str(caught.exception))
-        # The prompt must never have been written.
-        self.assertEqual([], built[0].sent)
+        # Streaming input must trigger Claude's MCP initialization before the
+        # broker can register.  The failed registration still closes the turn
+        # and its result is never accepted.
+        self.assertEqual(["probe\n\ngo"], built[0].sent)
+        self.assertFalse(built[0].alive)
 
     def test_provider_launch_failure_cleans_permission_config_and_broker(self) -> None:
         from claude_resident_session import ClaudeResidentSession

@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-9">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-12">
+  <link rel="stylesheet" href="/xterm.min.css">
 </head>
 <body>
   <div class="app-shell mockup-shell">
@@ -17,6 +18,7 @@
       <nav id="primary-nav" class="primary-nav" aria-label="Workspace surfaces">
         <button type="button" class="selected" data-primary-view="work" title="Project goal plan">Work Spine</button>
         <button type="button" data-primary-view="timeline" title="Project timeline graph">Timeline</button>
+        <button type="button" data-primary-view="fleet" title="Kanban execution board">Fleet</button>
         <button type="button" data-primary-view="documents" title="Document graph">Documents</button>
         <button type="button" data-primary-view="memory" title="Project memory (inspector)">Memory</button>
         <button type="button" data-primary-view="future" title="Future paths (inspector)">Future</button>
@@ -42,11 +44,13 @@
 
     <nav class="utility-rail" aria-label="Universe tools">
       <button class="selected" type="button" data-primary-view="work" title="Home"><span aria-hidden="true">&#8962;</span><small>Home</small></button>
-      <button type="button" data-primary-view="map" title="Graph"><span aria-hidden="true">&#9675;</span><small>Graph</small></button>
+      <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true">&#9675;</span><small>Galaxy</small></button>
+      <button type="button" data-primary-view="fleet" title="Kanban execution board"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
       <button type="button" data-primary-view="memory" title="Memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
-      <button type="button" data-primary-view="meeting" title="Meeting Room"><span aria-hidden="true">&#9672;</span><small>Meeting</small></button>
+      <button type="button" data-primary-view="meeting" title="Collaboration Rooms"><span aria-hidden="true">&#9672;</span><small>Rooms</small></button>
+      <button id="add-project-rail-button" type="button" title="Add project"><span aria-hidden="true">&#43;</span><small>Project</small></button>
     </nav>
 
     <aside class="project-rail universe-rail">
@@ -84,6 +88,7 @@
         <small class="network-latency" id="network-latency">Local · loopback</small>
       </div>
       <div class="rail-quick-actions legacy-rail-surface">
+        <button id="quick-new-session-button" type="button"><span aria-hidden="true">+</span> New session</button>
         <button id="quick-conductor-button" type="button"><span aria-hidden="true">+</span> New Conductor conversation</button>
         <button id="quick-task-button" type="button"><span aria-hidden="true">&#9745;</span> Create task</button>
       </div>
@@ -93,16 +98,20 @@
       <nav class="mobile-work-tabs" aria-label="Project workspace">
         <button class="selected" type="button" data-mobile-work-view="goals">Goals</button>
         <button type="button" data-mobile-work-view="sessions">Sessions</button>
-        <button type="button" data-mobile-work-view="activity">Activity</button>
+        <button type="button" data-mobile-work-view="bench">Bench</button>
+        <button type="button" data-mobile-work-view="actions" aria-haspopup="dialog" aria-controls="action-inbox-dialog">
+          Actions <span id="mobile-action-inbox-badge" class="chat-badge hidden" aria-hidden="true"></span>
+        </button>
       </nav>
       <section id="goal-plan-workspace" class="goal-plan-workspace" aria-label="Project goal plan">
         <header class="goal-plan-header">
           <div>
             <span id="goal-plan-breadcrumb" class="goal-plan-kicker">Project &gt; Goal Plan</span>
             <h1 id="goal-plan-title">Goal Plan</h1>
-            <p id="goal-plan-subtitle">Goal &rarr; Milestone / Phase &rarr; Todo</p>
+            <p id="goal-plan-subtitle">Universe Goal &rarr; Project Goal &rarr; Milestone / Phase &rarr; Todo</p>
           </div>
           <div class="goal-plan-actions">
+            <button id="plan-project-button" class="secondary-button" type="button">Plan project</button>
             <button id="goal-plan-map" class="secondary-button" type="button">Open map</button>
             <button id="add-goal-button" class="primary-button" type="button">Add goal</button>
           </div>
@@ -137,7 +146,7 @@
           </div>
           <button id="prepare-project-button" class="secondary-button" type="button" title="Queue project-map discovery">Request Project Map</button>
         </div>
-        <div class="toolbar-legend graph-legend" aria-hidden="true">
+        <div id="graph-legend" class="toolbar-legend graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Project</span>
           <span><i class="node-key system"></i>Project Seed node</span>
           <span><i class="node-key predicted"></i>Predicted</span>
@@ -158,7 +167,7 @@
       </div>
 
       <section class="conductor-panel glass-panel" aria-label="Universe Conductor">
-        <div id="chat-resize-handle" class="chat-resize-handle" role="separator" aria-orientation="vertical" aria-valuemin="300" aria-valuemax="560" aria-valuenow="380" aria-label="Resize chat panel" tabindex="0"></div>
+        <div id="chat-resize-handle" class="chat-resize-handle" role="separator" aria-orientation="vertical" aria-valuemin="300" aria-valuemax="900" aria-valuenow="380" aria-label="Resize chat panel" tabindex="0"></div>
         <div id="conductor-summary" class="conductor-summary collapsed">
           <button id="conductor-summary-toggle" class="summary-dock-toggle" type="button" title="Expand overview" aria-label="Expand overview" aria-expanded="false">
             <span class="summary-dock-icon" aria-hidden="true">&#9638;</span>
@@ -190,17 +199,16 @@
             </div>
           </div>
         </div>
-        <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Project Room conversation">
+        <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Session conversation">
           <header class="conversation-layer-header">
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse conversation" aria-label="Collapse conversation" aria-expanded="true">
               <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
-              <span class="chat-dock-label">Chat</span>
-              <span id="conversation-badge" class="chat-badge hidden">0</span>
+              <span class="chat-dock-label">CLI</span>
               <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
             </button>
             <div class="conversation-title-wrap">
-              <strong id="conversation-title">Conversation</strong>
-              <small id="conversation-target-label">Universe Conductor</small>
+              <strong id="conversation-title">CLI</strong>
+              <small id="conversation-target-label">No terminal tab</small>
             </div>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
             <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
@@ -212,10 +220,12 @@
               <input id="conversation-opacity" type="range" min="25" max="100" value="92">
             </label>
           </header>
-          <div id="room-message-list" class="room-message-list"></div>
+          <div id="room-message-list" class="room-message-list hidden"></div>
+          <div id="terminal-tabs" class="terminal-tabs" role="tablist"></div>
+          <div id="terminal-stage" class="terminal-stage"></div>
         </section>
 
-        <form id="dispatch-form" class="command-composer project-room conductor-composer">
+        <form id="dispatch-form" class="command-composer project-room conductor-composer hidden">
           <input id="dispatch-title" name="title" maxlength="120" value="QUESTION" hidden>
           <div class="composer-action-wrap">
             <button id="composer-action-button" class="composer-action-button" type="button" title="Conversation actions" aria-expanded="false">+</button>
@@ -227,7 +237,7 @@
               <div id="project-master-actions" class="project-master-actions"></div>
             </div>
           </div>
-          <textarea id="dispatch-instruction" name="instruction" rows="1" placeholder="Message Universe Conductor…" required></textarea>
+          <textarea id="dispatch-instruction" name="instruction" rows="1" placeholder="Message Universe Conductor…" required autocomplete="off" spellcheck="false"></textarea>
           <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send" aria-label="Send">&#8593;</button>
           <div class="room-actions">
             <span id="room-context" class="room-context">Universe Conductor</span>
@@ -282,7 +292,7 @@
   <dialog id="project-dialog">
     <form id="project-form" method="dialog">
       <div class="dialog-heading">
-        <h2>Connect project</h2>
+        <h2>Add project</h2>
         <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
       </div>
       <label>
@@ -291,11 +301,14 @@
       </label>
       <label>
         Project root
-        <input name="project_root" autocomplete="off" required>
+        <span class="project-root-picker">
+          <input name="project_root" autocomplete="off" required>
+          <button id="project-root-browse" type="button" class="secondary-button">Browse…</button>
+        </span>
       </label>
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
-        <button type="submit" class="primary-button">Connect</button>
+        <button id="project-submit" type="submit" class="primary-button">Inspect project</button>
       </div>
       <p id="project-form-error" class="form-error" role="alert"></p>
     </form>
@@ -310,6 +323,8 @@
       <label>Goal title<input name="title" maxlength="160" required></label>
       <label>Outcome<textarea name="description" rows="4" maxlength="4000" required></textarea></label>
       <div class="form-grid two-columns">
+        <label>Scope<select name="scope_kind"><option value="UNIVERSE">Universe (global)</option><option value="PROJECT">Selected project</option><option value="NODE">Selected node</option></select></label>
+        <label>Global parent<select name="universe_goal_id"><option value="">No global parent</option></select></label>
         <label>Owner<input name="owner" maxlength="80" value="Project Master" required></label>
         <label>State<select name="state"><option value="DESIGNING">Designing</option><option value="READY">Ready</option><option value="ACTIVE">Active</option><option value="BLOCKED">Blocked</option><option value="DONE">Done</option></select></label>
       </div>
@@ -498,8 +513,8 @@
           <section class="settings-section remote-access-section">
             <div class="settings-section-heading">
               <div>
-                <strong>Multi-room</strong>
-                <small>Project / Boss / Meeting — inject and post without Observatory</small>
+                <strong>Collaboration Rooms</strong>
+                <small>Live and historical Project / Boss / Meeting conversations</small>
               </div>
             </div>
             <p class="settings-help">
@@ -541,10 +556,119 @@
             </div>
             <div id="multi-room-list" class="remote-access-list"></div>
             <div id="multi-room-detail" class="remote-access-endpoint"></div>
+            <section id="meeting-feature-controls" class="meeting-feature-controls" hidden>
+              <div class="settings-section-heading">
+                <div>
+                  <strong>Feature route planning</strong>
+                  <small>Feature → Meeting specifications → Expected Paths → explicit USER adoption</small>
+                </div>
+              </div>
+              <div class="meeting-feature-grid">
+                <label for="meeting-feature-select">
+                  Active Feature
+                  <select id="meeting-feature-select"><option value="">Create a Feature below</option></select>
+                </label>
+                <label for="meeting-feature-title">
+                  New Feature title
+                  <input id="meeting-feature-title" type="text" maxlength="200" placeholder="What capability are we designing?" autocomplete="off" />
+                </label>
+                <label class="meeting-feature-wide" for="meeting-feature-intent">
+                  Feature intent
+                  <textarea id="meeting-feature-intent" rows="2" placeholder="Outcome and user value; no Todo decomposition yet"></textarea>
+                </label>
+                <div class="remote-access-actions meeting-feature-wide">
+                  <button id="create-meeting-feature-button" type="button" class="secondary-button">Create Feature Node</button>
+                  <small class="settings-help">The active Meeting Room is linked automatically.</small>
+                </div>
+                <label class="meeting-feature-wide" for="meeting-provider-session-select">
+                  Attached provider sessions
+                  <select id="meeting-provider-session-select"><option value="">Choose an attached project session</option></select>
+                </label>
+                <div class="remote-access-actions meeting-feature-wide">
+                  <button id="attach-meeting-provider-button" type="button" class="secondary-button">Attach as meeting model</button>
+                  <button id="create-fresh-meeting-sessions-button" type="button" class="primary-button">Create fresh reviewers</button>
+                  <button id="end-meeting-button" type="button" class="secondary-button">End meeting</button>
+                  <small class="settings-help">Fresh reviewers are independent and are archived when the meeting ends. Existing sessions remain reusable.</small>
+                </div>
+                <label class="meeting-feature-wide" for="meeting-run-prompt">
+                  Meeting direction
+                  <textarea id="meeting-run-prompt" rows="2" placeholder="Optional comparison focus or constraints"></textarea>
+                </label>
+                <label for="meeting-run-turns">
+                  Bounded turns
+                  <input id="meeting-run-turns" type="number" min="2" max="24" value="4" />
+                </label>
+                <div class="remote-access-actions">
+                  <button id="start-meeting-run-button" type="button" class="primary-button">Generate Expected Paths</button>
+                  <button id="cancel-meeting-run-button" type="button" class="secondary-button" disabled>Stop after current turn</button>
+                </div>
+                <small id="meeting-run-status" class="settings-help meeting-feature-wide">Attach two provider sessions to begin.</small>
+                <label class="meeting-feature-wide" for="meeting-expected-path-summary">
+                  Candidate summary override
+                  <input id="meeting-expected-path-summary" type="text" maxlength="500" placeholder="Optional; otherwise uses the specification body" autocomplete="off" />
+                </label>
+                <label class="meeting-feature-wide" for="meeting-feature-rationale">
+                  Adoption rationale
+                  <textarea id="meeting-feature-rationale" rows="2" placeholder="Required when adopting one Expected Path"></textarea>
+                </label>
+              </div>
+            </section>
             <label for="multi-room-message">
               Message (role enforced server-side)
               <textarea id="multi-room-message" rows="2" placeholder="User interrupt or worker report text"></textarea>
             </label>
+            <label for="multi-room-finding-type">
+              Structured finding (meeting rooms)
+              <select id="multi-room-finding-type">
+                <option value="RAG_FINDING">RAG_FINDING</option>
+                <option value="CROSS_FEATURE_DEPENDENCY">CROSS_FEATURE_DEPENDENCY</option>
+                <option value="ESCALATION_REQUEST">ESCALATION_REQUEST</option>
+              </select>
+            </label>
+            <label for="multi-room-finding-summary">
+              Finding summary
+              <input id="multi-room-finding-summary" type="text" placeholder="Source-linked finding" autocomplete="off" />
+            </label>
+            <label for="multi-room-finding-features">
+              Feature refs (one per line)
+              <textarea id="multi-room-finding-features" rows="2" placeholder="feature://source and feature://target"></textarea>
+            </label>
+            <label for="multi-room-finding-owner">
+              Escalation owner
+              <select id="multi-room-finding-owner">
+                <option value="">Not an escalation</option>
+                <option value="CONDUCTOR">CONDUCTOR</option>
+                <option value="MASTER">MASTER</option>
+                <option value="BOSS">BOSS</option>
+              </select>
+            </label>
+            <div class="remote-access-actions">
+              <button id="record-room-finding-button" type="button" class="secondary-button">
+                Record finding from Message
+              </button>
+            </div>
+            <label for="multi-room-artifact-type">
+              Room artifact (meeting rooms)
+              <select id="multi-room-artifact-type">
+                <option value="SPECIFICATION">SPECIFICATION</option>
+                <option value="PROPOSAL">PROPOSAL</option>
+                <option value="COMPARISON">COMPARISON</option>
+                <option value="DECISION_CANDIDATE">DECISION_CANDIDATE</option>
+              </select>
+            </label>
+            <label for="multi-room-artifact-title">
+              Artifact title
+              <input id="multi-room-artifact-title" type="text" placeholder="Specification title" autocomplete="off" />
+            </label>
+            <label for="multi-room-artifact-evidence">
+              Evidence refs (one per line)
+              <textarea id="multi-room-artifact-evidence" rows="2" placeholder="universe://... or repository evidence ref"></textarea>
+            </label>
+            <div class="remote-access-actions">
+              <button id="create-room-artifact-button" type="button" class="secondary-button">
+                Create artifact from Message
+              </button>
+            </div>
             <div class="remote-access-actions">
               <button id="post-room-message-button" type="button" class="primary-button">
                 Post as USER
@@ -558,29 +682,11 @@
 
         <!-- Providers -->
         <div class="settings-tab-panel" data-settings-panel="providers" role="tabpanel" hidden>
-          <section class="settings-section">
-            <div class="provider-profile-row" data-provider-profile-scope="UNIVERSE_CONDUCTOR">
-              <div class="provider-profile-copy">
-                <strong>Universe Conductor</strong>
-                <small id="universe-provider-status" class="provider-setting-status"></small>
-              </div>
-              <button id="universe-provider-setting" class="secondary-button provider-profile-button" type="button">
-                Configure
-              </button>
-            </div>
-          </section>
-          <section class="settings-section">
-            <div class="settings-section-heading">
-              <strong>Project Masters</strong>
-              <small>Overrides apply when the Project Master is next called.</small>
-            </div>
-            <div id="project-provider-settings" class="project-provider-settings"></div>
-          </section>
           <section class="settings-section worker-binding-section">
             <div class="settings-section-heading">
               <div>
                 <strong>Worker bindings</strong>
-                <small>Defaults are sealed into the next Task Frame proposal snapshot.</small>
+                <small>Task defaults for implementation, review, QA, scouting, and routine work.</small>
               </div>
               <label class="worker-binding-scope-label" for="worker-binding-scope">
                 Scope
@@ -604,6 +710,10 @@
               <button id="refresh-provider-models-button" class="secondary-button" type="button">
                 Refresh models
               </button>
+              <button id="setup-provider-hooks-button" class="secondary-button" type="button" title="Write Grok, Codex, and Claude SessionStart inject hooks. Grok compat must not stamp Claude.">
+                Setup CLI Hooks
+              </button>
+              <small id="setup-provider-hooks-status" class="setup-provider-hooks-status"></small>
             </div>
             <div id="provider-model-catalog" class="provider-model-catalog"></div>
           </section>
@@ -643,37 +753,38 @@
     </form>
   </dialog>
 
-  <dialog id="provider-profile-dialog" class="provider-profile-dialog">
-    <form id="provider-profile-form" method="dialog">
-      <div class="dialog-heading">
-        <div>
-          <span class="inspector-kicker">Runtime profile</span>
-          <h2 id="provider-profile-title">Provider profile</h2>
-          <p id="provider-profile-subtitle">Choose one consistent session profile.</p>
-        </div>
-        <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+  <dialog id="new-session-dialog" class="new-session-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Launch</span>
+        <h2>New session</h2>
       </div>
-      <div class="provider-profile-fields">
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <form id="new-session-form">
+      <div class="new-session-fields">
+        <label>
+          <span>Mode</span>
+          <select id="new-session-mode">
+            <option value="CONDUCTOR">Conductor</option>
+            <option value="MASTER">Project Master</option>
+          </select>
+        </label>
+        <label id="new-session-project-row">
+          <span>Project</span>
+          <select id="new-session-project"></select>
+        </label>
         <label>
           <span>Provider</span>
-          <select id="provider-profile-provider">
-            <option value="AUTO">Auto</option>
-            <option value="GROK">Grok</option>
-            <option value="CODEX">Codex</option>
-            <option value="CLAUDE">Claude</option>
-          </select>
+          <select id="new-session-provider"></select>
         </label>
         <label>
           <span>Model</span>
-          <select id="provider-profile-model"></select>
-        </label>
-        <label>
-          <span>Custom model</span>
-          <input id="provider-profile-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="Optional provider model id">
+          <select id="new-session-model"></select>
         </label>
         <label>
           <span>Effort</span>
-          <select id="provider-profile-effort">
+          <select id="new-session-effort">
             <option value="AUTO">Auto</option>
             <option value="LOW">Low</option>
             <option value="MEDIUM">Medium</option>
@@ -682,11 +793,54 @@
           </select>
         </label>
       </div>
-      <p id="provider-profile-status" class="provider-setting-status" role="status"></p>
-      <p id="provider-profile-error" class="form-error" role="alert"></p>
+      <p id="new-session-status" class="provider-setting-status" role="status"></p>
+      <p id="new-session-error" class="form-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="secondary-button" data-close-dialog>Cancel</button>
-        <button id="provider-profile-submit" type="submit" class="primary-button">Apply profile</button>
+        <button id="new-session-submit" type="submit" class="primary-button">Start session</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="node-session-action-dialog" class="node-session-action-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Session</span>
+        <h2 id="node-session-action-title">Session</h2>
+        <p id="node-session-action-subtitle"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="dialog-actions node-session-action-buttons">
+      <button id="node-session-inspect" class="secondary-button" type="button">Inspector</button>
+      <button id="node-session-inbox" class="secondary-button" type="button">Inbox</button>
+      <button id="node-session-open" class="primary-button" type="button">PTY Binding</button>
+      <button id="node-session-stop" class="secondary-button" type="button">End session</button>
+    </div>
+  </dialog>
+
+  <dialog id="session-bus-dialog" class="session-bus-dialog">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker">Session bus</span>
+        <h2 id="session-bus-title">Inbox</h2>
+        <p id="session-bus-subtitle"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="session-bus-tabs" role="tablist" aria-label="Session event projection">
+      <button class="secondary-button active" type="button" role="tab" aria-selected="true" data-session-bus-projection="INBOX">Inbox</button>
+      <button class="secondary-button" type="button" role="tab" aria-selected="false" data-session-bus-projection="ACTIVITY">Activity</button>
+      <button class="secondary-button" type="button" role="tab" aria-selected="false" data-session-bus-projection="RESULTS">Results</button>
+    </div>
+    <div id="session-bus-messages" class="session-bus-messages"></div>
+    <form id="session-bus-compose" class="session-bus-compose">
+      <label>
+        <span class="sr-only">Message</span>
+        <textarea id="session-bus-body" rows="4" placeholder="Send without pasting into the CLI" autocomplete="off" spellcheck="false"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button class="secondary-button" type="submit">Send</button>
       </div>
     </form>
   </dialog>
@@ -742,22 +896,22 @@
     </div>
   </dialog>
 
-  <dialog id="action-inbox-dialog" class="action-inbox-dialog">
+  <dialog id="action-inbox-dialog" class="action-inbox-dialog" aria-labelledby="action-inbox-title">
     <div class="dialog-heading">
       <div>
-        <span class="inspector-kicker">Inbox</span>
+        <span class="inspector-kicker">Approvals &amp; activity</span>
         <h2 id="action-inbox-title">Actions</h2>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
     </div>
-    <div id="action-inbox-list" class="action-inbox-list"></div>
+    <div id="action-inbox-list" class="action-inbox-list" role="region" aria-label="Actions by category" aria-live="polite" aria-atomic="false"></div>
   </dialog>
 
-  <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog">
+  <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog" aria-labelledby="session-observatory-title">
     <div class="dialog-heading">
       <div>
         <span class="inspector-kicker">Local Supervisor</span>
-        <h2>Session Observatory</h2>
+        <h2 id="session-observatory-title">Session Observatory</h2>
         <p>Sessions keep one identity while their provider and Universe location change.</p>
       </div>
       <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
@@ -869,11 +1023,6 @@
           <div class="section-heading"><span>Runtime audit</span></div>
           <div id="runtime-audit-grid" class="runtime-audit-grid"></div>
         </section>
-        <section class="legacy-executor-section">
-          <div class="section-heading"><span>Legacy executors</span></div>
-          <p class="section-note">Observed only. Partial identity never permits adoption or stop.</p>
-          <div id="legacy-executor-list" class="legacy-executor-list"></div>
-        </section>
         <section class="session-event-section">
           <div class="section-heading"><span>Recent Supervisor events</span></div>
           <div id="session-event-list" class="session-event-list"></div>
@@ -903,6 +1052,13 @@
             <input name="kind" autocomplete="off" placeholder="desktop-app" required>
           </label>
         </div>
+        <label>
+          Project directory
+          <span class="project-root-picker">
+            <input name="project_root" autocomplete="off" required>
+            <button id="fresh-project-root-browse" type="button" class="secondary-button">Browse…</button>
+          </span>
+        </label>
         <label>
           Goal
           <textarea name="goal" rows="3" required></textarea>
@@ -1107,8 +1263,9 @@
             </label>
             <label>
               Priority
-              <select name="priority">
-                <option value="P0">P0 Critical</option>
+                <select name="priority">
+                  <option value="AUTO" selected>Auto recommend</option>
+                  <option value="P0">P0 Critical</option>
                 <option value="P1" selected>P1 High</option>
                 <option value="P2">P2 Normal</option>
                 <option value="P3">P3 Low</option>
@@ -1146,17 +1303,29 @@
       <div class="release-layout">
         <section>
           <h3>Imported releases</h3>
+          <label class="release-target-field">
+            Target project
+            <select id="release-target-project">
+              <option value="">Select a project</option>
+            </select>
+          </label>
           <div id="release-list" class="release-list"></div>
         </section>
         <section class="release-import">
           <h3>Import immutable Release DB</h3>
           <label>
             Database path
-            <input name="database_path" autocomplete="off" required>
+            <span class="host-path-picker">
+              <input name="database_path" autocomplete="off" required>
+              <button id="release-database-browse" type="button" class="secondary-button">Browse&hellip;</button>
+            </span>
           </label>
           <label>
             Manifest path
-            <input name="manifest_path" autocomplete="off" required>
+            <span class="host-path-picker">
+              <input name="manifest_path" autocomplete="off" required>
+              <button id="release-manifest-browse" type="button" class="secondary-button">Browse&hellip;</button>
+            </span>
           </label>
           <label>
             Mode
@@ -1176,6 +1345,9 @@
 
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/app.js?v=work-spine-9" defer></script>
+  <script src="/xterm.min.js"></script>
+  <script src="/xterm-addon-fit.min.js"></script>
+  <script src="/terminals.js?v=term-12" defer></script>
+  <script src="/app.js?v=work-spine-16" defer></script>
 </body>
 </html>

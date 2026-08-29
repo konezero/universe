@@ -7,6 +7,19 @@ node link/unlink, search, and propose-links
 Not: Candidate auto-adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
+## LLM retrieval context
+
+Every resident Project Master message receives a bounded, project-local
+`universe.project-llm-retrieval-context.v1` projection. Retrieval includes
+only `LINKED` Memory, ranking Node and token matches first and using a bounded
+recent fallback when no explicit match exists. It also ranks matching
+project-local Bench observations first, then falls back to bounded successful
+project-local Skills. Bench recommendations remain `CANDIDATE_ONLY` with
+`TASK_FRAME_SELECTION_REQUIRED`; they create no skill binding, authority, or
+execution assignment. Explicit Context Packs carry the same retrieval
+projection for downstream planning. Unlinked or merely proposed Memory is not
+injected.
+
 ## Invariant
 
 ```text
@@ -35,15 +48,27 @@ provider is reported as unavailable; only an explicitly configured
 `DETERMINISTIC` fallback can run without an available provider. The catalog
 snapshot and resolution status are returned with the configuration.
 
-The current product slice persists and validates schedule policy, but does not
-yet run these four stages from a wall-clock scheduler. Stage execution is
-manual through the API/UI. `FAST_EXTRACT` is the governed exception: it may
+The Runtime persists one scheduler state per enabled stage and executes due
+stages from a wall-clock worker. Schedule claims use a durable due-slot key,
+lease owner and generation so restart recovery cannot duplicate a successful
+slot. Failed attempts use deterministic exponential backoff with a bounded
+attempt count; expired claims return to retry state exactly once. Quota windows
+are UTC epoch-aligned and their consumption is persisted with the claim.
+Quota counts started attempts, including retries, so a failing provider cannot
+bypass the window limit by repeatedly retrying. Exhausted slots advance to the
+next cadence while retaining `last_outcome: FAILED_EXHAUSTED` and their attempt
+history for operator review.
+Shutdown stops new claims before waiting for the scheduler worker. Current
+state, next due time, attempt count, last outcome, and lease state are exposed
+through the project configuration and Work Loop projections. Operators may
+still trigger a stage manually through the API/UI. `FAST_EXTRACT` is the
+governed exception: it may
 execute only through a claimed Task Frame, with Provider `CODEX`, model
 `gpt-5.6-luna`, effort `MAX`, and `fallback: NONE`. The remaining stages and
 an explicitly configured `DETERMINISTIC` fallback retain the deterministic
-route and report `provider_invocation: NOT_RUN`. This slice enforces
-`max_runs`; token, cost, and window budgets fail closed until Provider usage
-telemetry is connected.
+route and report `provider_invocation: NOT_RUN`. This slice enforces total
+`max_runs` and `{ "max_runs": N, "window_hours": H }` quota windows. Token
+and cost budgets fail closed until Provider usage telemetry is connected.
 
 ```text
 GET  /v1/settings/memory-batch/catalog

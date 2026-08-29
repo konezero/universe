@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.client import HTTPConnection
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import html
 import ipaddress
 import json
@@ -14,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import struct
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -118,6 +121,39 @@ def load_gateway_state(path: Path) -> dict[str, Any]:
             "REMOTE_GATEWAY_STATE_INVALID", "remote gateway state is invalid"
         )
     return value
+
+
+def _read_http_head(sock: socket.socket) -> tuple[bytes, bytes]:
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return buf, b""
+        buf += chunk
+    idx = buf.index(b"\r\n\r\n") + 4
+    return buf[:idx], buf[idx:]
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept_key(key: str) -> str:
+    digest = hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _ws_frame(payload: bytes, opcode: int = 2) -> bytes:
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(127)
+        header.extend(struct.pack("!Q", n))
+    return bytes(header) + payload
 
 
 def _load_upstream_state(path: Path) -> tuple[str, Path]:
@@ -441,18 +477,27 @@ universes</strong>, use the public list.</p>
             HTTPStatus.OK, {"status": "REMOTE_PAIRING_STATUS", "state": result["state"]}
         )
 
+    def _ws_upgrade_key(self) -> str:
+        if (self.headers.get("Upgrade") or "").lower() != "websocket":
+            return ""
+        return str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+
     def _authorize_remote_browser(
         self, *, path: str | None = None
     ) -> dict[str, Any] | None:
+        ws_key = self._ws_upgrade_key()
         token = self._cookies().get(SESSION_COOKIE, "")
         if not token:
             # Browser navigations should re-enter pairing, not a raw JSON error.
-            if self._wants_html_navigation():
+            if not ws_key and self._wants_html_navigation():
                 self._redirect_to_pair(clear_session=True)
                 return None
-            self._send_error_payload(
-                401, "REMOTE_DEVICE_PAIRING_REQUIRED", "pair this browser first"
-            )
+            if ws_key:
+                self._send_ws_diagnostic(ws_key, "REMOTE_DEVICE_PAIRING_REQUIRED: pair this browser first (no session cookie)")
+            else:
+                self._send_error_payload(
+                    401, "REMOTE_DEVICE_PAIRING_REQUIRED", "pair this browser first"
+                )
             return None
         try:
             return self.server.remote_access.authorize_device(
@@ -466,8 +511,11 @@ universes</strong>, use the public list.</p>
                 "REMOTE_DEVICE_SESSION_EXPIRED",
                 "REMOTE_DEVICE_SESSION_MISMATCH",
             }
-            if recoverable and self._wants_html_navigation():
+            if recoverable and not ws_key and self._wants_html_navigation():
                 self._redirect_to_pair(clear_session=True)
+                return None
+            if ws_key:
+                self._send_ws_diagnostic(ws_key, f"{error.code}: {error.detail}")
                 return None
             if recoverable:
                 secure = urlsplit(self.server.public_base_url).scheme == "https"
@@ -551,6 +599,10 @@ universes</strong>, use the public list.</p>
                 403, "REMOTE_SERVICE_CONTROL_FORBIDDEN", "desktop control is required"
             )
             return
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            self._proxy_websocket(device)
+            self.close_connection = True
+            return
         connection: HTTPConnection | None = None
         response_started = False
         try:
@@ -608,6 +660,109 @@ universes</strong>, use the public list.</p>
         finally:
             if connection is not None:
                 connection.close()
+
+    def _send_ws_diagnostic(self, key: str, message: str) -> None:
+        """Complete the WebSocket handshake and send an error message as a terminal frame."""
+        if not key:
+            return
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", _ws_accept_key(key))
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except OSError:
+            return
+        text = f"\r\n\x1b[91m[gateway: {message}]\x1b[0m\r\n"
+        try:
+            self.connection.sendall(_ws_frame(text.encode("utf-8"), opcode=2))
+        except OSError:
+            return
+        try:
+            self.connection.sendall(_ws_frame(b"\x03\xf3", opcode=8))
+        except OSError:
+            pass
+
+    def _proxy_websocket(self, device: dict[str, Any]) -> None:
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        try:
+            upstream, _ = _load_upstream_state(self.server.upstream_state)
+        except GatewayError as error:
+            self._send_ws_diagnostic(key, f"{error.code}: {error.detail}")
+            return
+        parsed = urlsplit(upstream)
+        try:
+            upstream_sock = socket.create_connection(
+                (parsed.hostname, parsed.port), timeout=10
+            )
+        except OSError as error:
+            self._send_ws_diagnostic(key, f"HOST_OFFLINE: {error}")
+            return
+        request_parts = [f"{self.command} {self.path} HTTP/1.1\r\n"]
+        request_parts.append(f"Host: {parsed.hostname}:{parsed.port}\r\n")
+        for name, value in self.headers.items():
+            if name.lower() == "host":
+                continue
+            request_parts.append(f"{name}: {value}\r\n")
+        request_parts.append("X-Universe-Access-Surface: REMOTE_BROWSER\r\n")
+        request_parts.append(f"X-Universe-Remote-Device: {device['device_id']}\r\n")
+        request_parts.append("\r\n")
+        try:
+            upstream_sock.sendall("".join(request_parts).encode("latin-1"))
+        except OSError as error:
+            upstream_sock.close()
+            self._send_ws_diagnostic(key, f"HOST_OFFLINE (send): {error}")
+            return
+        head, leftover = _read_http_head(upstream_sock)
+        if not head:
+            upstream_sock.close()
+            self.log_message("WS-PROXY: empty response from upstream for %s", self.path)
+            self._send_ws_diagnostic(key, "UPSTREAM_EMPTY: no response from universe server")
+            return
+        first_line = head.split(b"\r\n", 1)[0]
+        self.log_message("WS-PROXY: upstream first line: %r leftover=%d bytes", first_line, len(leftover))
+        if b" 101 " not in first_line:
+            upstream_sock.close()
+            snippet = first_line.decode("latin-1", errors="replace")
+            self.log_message("WS-PROXY: non-101 from upstream: %s", snippet)
+            self._send_ws_diagnostic(key, f"UPSTREAM non-101: {snippet!r}")
+            return
+        self.wfile.write(head)
+        if leftover:
+            self.wfile.write(leftover)
+        self.wfile.flush()
+        client_sock = self.connection
+        client_sock.settimeout(0.5)
+        upstream_sock.settimeout(0.5)
+        stop = threading.Event()
+
+        def relay(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                while not stop.is_set():
+                    try:
+                        data = src.recv(8192)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                stop.set()
+
+        t_up = threading.Thread(target=relay, args=(client_sock, upstream_sock), daemon=True)
+        t_down = threading.Thread(target=relay, args=(upstream_sock, client_sock), daemon=True)
+        t_up.start()
+        t_down.start()
+        stop.wait()
+        t_up.join(timeout=2)
+        t_down.join(timeout=2)
+        try:
+            upstream_sock.close()
+        except OSError:
+            pass
 
     def _read_body(self, *, optional: bool = False) -> bytes:
         try:

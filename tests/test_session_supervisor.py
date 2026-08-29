@@ -146,7 +146,7 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual(2, len(moved["location_history"]))
         self.assertEqual(1, sum(item["is_current"] for item in moved["location_history"]))
 
-    def test_provider_identity_moves_one_canonical_session(self) -> None:
+    def test_provider_identity_reuse_preserves_canonical_session_location(self) -> None:
         first, created = self.store.register_session(self.session("session-origin"))
         moved_candidate = self.session("session-derived-location")
         moved_candidate.update(
@@ -163,10 +163,17 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertFalse(created_again)
         self.assertEqual(first["universe_session_id"], moved["universe_session_id"])
-        self.assertEqual("universe", moved["current_project_id"])
+        self.assertEqual("GCS", moved["current_project_id"])
         self.assertEqual("MASTER", moved["mode"])
         self.assertEqual("Universe Main Master", moved["alias"])
         self.assertEqual(1, len(self.store.list_sessions()))
+        self.assertEqual(1, len(moved["location_history"]))
+        events = self.store.list_events(session_id=first["session_id"])
+        self.assertTrue(events[0]["details"]["identity_reused"])
+        self.assertTrue(events[0]["details"]["passive_location_preserved"])
+        self.assertEqual(
+            "universe", events[0]["details"]["requested_location"]["project_id"]
+        )
 
     def test_initialize_deduplicates_legacy_current_provider_identity(self) -> None:
         first, _ = self.store.register_session(self.session("legacy-first"))
@@ -674,6 +681,38 @@ class SessionSupervisorStoreTests(unittest.TestCase):
 
         self.assertEqual("STOPPED", rebound["state"])
         self.assertEqual("RELEASED", rebound["process_lease"]["lease_state"])
+
+    def test_rebinding_same_provider_identity_is_idempotent(self) -> None:
+        session, _ = self.store.register_session(self.session())
+        before = self.store.get_session(session["session_id"])
+        rebound = self.store.bind_provider_session(
+            session["session_id"],
+            provider=session["provider"],
+            provider_session_ref=session["provider_session_ref"],
+            expected_version=session["row_version"],
+        )
+        self.assertEqual(before["row_version"], rebound["row_version"])
+        self.assertEqual(
+            len(before["binding_history"]), len(rebound["binding_history"])
+        )
+        self.assertEqual(
+            before["current_provider_binding_id"],
+            rebound["current_provider_binding_id"],
+        )
+
+    def test_binding_provider_identity_owned_by_other_session_is_domain_conflict(
+        self,
+    ) -> None:
+        owner, _ = self.store.register_session(self.session("session-owner"))
+        candidate, _ = self.store.register_session(self.session("session-candidate"))
+        with self.assertRaises(SessionSupervisorError) as raised:
+            self.store.bind_provider_session(
+                candidate["session_id"],
+                provider=owner["provider"],
+                provider_session_ref=owner["provider_session_ref"],
+                expected_version=candidate["row_version"],
+            )
+        self.assertEqual("PROVIDER_SESSION_ALREADY_BOUND", raised.exception.code)
 
     def test_stale_lease_requires_reacquisition_and_rotates_capability(self) -> None:
         session, _ = self.store.register_session(self.session("stale-reacquire"))

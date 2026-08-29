@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python tools/universe_session_inject_hook.py --repo-root . --from-stdin --trigger session_start"
+            "command": "python -m tools.universe_session_inject_hook --repo-root . --provider CLAUDE --from-stdin --trigger session_start"
           }
         ]
       }

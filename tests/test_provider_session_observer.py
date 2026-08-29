@@ -464,6 +464,113 @@ class ProviderSessionObserverTests(unittest.TestCase):
             self.store.open_cursor(str(source["source_id"]))["cursor"]["ordinal"],
         )
 
+    def test_grok_method_events_scan_and_expose_visible_chunks(self) -> None:
+        source_path = self.root / "updates.jsonl"
+        self.write(
+            source_path,
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-live",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"text": "hello "},
+                    },
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-live",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"text": "world"},
+                    },
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-live",
+                    "update": {
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"text": "secret thought"},
+                    },
+                },
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-live",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"text": "visible answer"},
+                    },
+                },
+            },
+        )
+        source = self.register("GROK", source_path)
+        scan = self.store.scan(str(source["source_id"]))
+        self.assertEqual("ACTIVE", scan["source"]["status"])
+        self.assertEqual(4, scan["added"])
+        delta = self.store.build_transient_live_deltas(
+            str(source["source_id"]), added_count=scan["added"]
+        )
+        self.assertEqual("TRANSIENT_REDACTED", delta["delivery"])
+        self.assertEqual(["USER", "ASSISTANT"], [item["role"] for item in delta["deltas"]])
+        self.assertEqual("hello world", delta["deltas"][0]["text"])
+        self.assertEqual("visible answer", delta["deltas"][1]["text"])
+        persisted = json.dumps(self.store.list_activities(str(source["source_id"])))
+        self.assertNotIn("hello world", persisted)
+        self.assertNotIn("secret thought", persisted)
+
+    def test_visible_transcript_reads_recent_claude_and_grok_text(self) -> None:
+        claude_path = self.root / "claude-chat.jsonl"
+        self.write(
+            claude_path,
+            {
+                "type": "user",
+                "uuid": "claude-user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "ask claude"}]},
+            },
+            {
+                "type": "assistant",
+                "uuid": "claude-assistant",
+                "parentUuid": "claude-user",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "claude reply"}],
+                },
+            },
+        )
+        claude = self.register("CLAUDE", claude_path)
+        self.store.scan(str(claude["source_id"]))
+        claude_excerpts = self.store.build_transient_visible_transcript(
+            str(claude["source_id"])
+        )
+        self.assertEqual(["USER", "ASSISTANT"], [item["role"] for item in claude_excerpts])
+        self.assertEqual("ask claude", claude_excerpts[0]["text"])
+        self.assertEqual("claude reply", claude_excerpts[1]["text"])
+
+        grok_path = self.root / "updates.jsonl"
+        self.write(
+            grok_path,
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "grok-resume",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"text": "resume me"},
+                    },
+                },
+            },
+        )
+        grok = self.register("GROK", grok_path, start_at_end=True)
+        excerpts = self.store.build_transient_visible_transcript(str(grok["source_id"]))
+        self.assertEqual(["USER"], [item["role"] for item in excerpts])
+        self.assertEqual("resume me", excerpts[0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

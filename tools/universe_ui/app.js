@@ -11,15 +11,22 @@ const state = {
   expandedGoals: {},
   selectedProject: null,
   projection: null,
+  /** Read-only Mode Anchor → Session Anchor → Task Frame projection. */
+  sessionGraph: null,
+  /** Read-only typed projection from existing project stores. */
+  semanticGraph: null,
   /** project_id -> projection; multiverse always expands from this cache */
   projectionsByProject: {},
   dispatches: [],
   releases: [],
   releaseProposals: [],
+  selectedReleaseTargetProjectId: null,
   masterHandoffs: [],
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
+  skillGapSummary: null,
+  skillCandidates: [],
   experienceCases: [],
   benchComparisons: [],
   experiencePatterns: [],
@@ -30,6 +37,7 @@ const state = {
   memoryBatchRuns: [],
   memoryCandidates: [],
   memoryCandidateFilters: { stage: "", kind: "", state: "REVIEW_REQUIRED" },
+  workLoop: null,
   selectedNode: null,
   focusedNodeId: null,
   view: "universe",
@@ -50,19 +58,24 @@ const state = {
   projectPermissions: [],
   governanceProposals: [],
   governanceProposalInbox: [],
+  /** COMMIT/PUSH milestones for the selected Actions target. */
+  gitWorkHistory: [],
   masterBridge: null,
   modeContract: null,
   providerSettings: null,
-  providerProfileTarget: null,
+
   /** CLI+preset model catalog from /v1/settings/provider-models */
   providerModels: null,
   workerBindings: null,
   hostTools: null,
   runtimePreflight: null,
   runtimeAudit: null,
+  supervisorRefreshPromise: null,
+  supervisorRefreshedAt: 0,
   remoteAccess: null,
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
+  supervisorTerminals: [],
   roomSessionBindings: [],
   selectedSupervisorAnchorKey: null,
   /** A mode can expose many persistent sessions; this is its one chat selection. */
@@ -72,6 +85,9 @@ const state = {
   sessionDelegations: [],
   /** Expanded left-rail mode whose persistent session cards are visible. */
   selectedModeCoordinateKey: null,
+  sessionBusUnread: {},
+  pendingSessionBus: null,
+  sessionBusProjection: "INBOX",
   observatoryShowAll: false,
   /** Expanded (node|mode) groups so operators can pick an alternate 1:1 session. */
   observatoryExpandedCoords: {},
@@ -79,10 +95,13 @@ const state = {
   observatoryTab: "sessions",
   todoTab: "board",
   supervisorEvents: [],
-  legacyExecutors: [],
   providerActivitySources: [],
   providerActivityDiscoveries: [],
   providerChatRooms: [],
+  projectAnchorSessions: [],
+  terminals: [],
+  activeTerminalId: null,
+  terminalSurfaces: {},
   providerChatSearch: "",
   providerChatShowWorkers: false,
   providerChatShowHidden: false,
@@ -94,8 +113,19 @@ const state = {
   /** Last delivery mode observed for each opaque provider chat key. */
   providerLiveDelivery: {},
   multiRooms: [],
+  multiRoomStateFilter: "OPEN",
   activeMultiRoomId: null,
   activeMultiRoomSnapshot: null,
+  multiRoomTargetBindingIds: [],
+  multiRoomArtifactDraft: null,
+  multiRoomFeatures: [],
+  activeMultiRoomFeatureId: null,
+  multiRoomFeatureCreateKey: null,
+  multiRoomMeetingRunId: null,
+  multiRoomMeetingRunBusy: false,
+  goalWorkPlanRunId: null,
+  goalWorkPlanRunBusy: false,
+  goalAutomationSurfaces: {},
   multiRoomStream: null,
   multiRoomLiveOutput: {},
   providerTailTimer: null,
@@ -109,8 +139,9 @@ const state = {
   providerSessionPermissions: [],
   providerSessionConnection: null,
   providerSessionStreamState: "IDLE",
+  conversationSurface: "CHAT",
   conversationTarget: {
-    kind: "UNIVERSE_CONDUCTOR",
+    kind: "NONE",
     projectId: null,
   },
   freshProject: {
@@ -145,6 +176,7 @@ const elements = {
   workspaceSubtitle: document.querySelector("#workspace-subtitle"),
   canvas: document.querySelector("#universe-graph"),
   graphEmpty: document.querySelector("#graph-empty"),
+  graphLegend: document.querySelector("#graph-legend"),
   graphHint: document.querySelector("#graph-hint"),
   graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
@@ -168,6 +200,7 @@ const elements = {
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
+  projectRootBrowse: document.querySelector("#project-root-browse"),
   settingsButton: document.querySelector("#settings-button"),
   sessionObservatoryButton: document.querySelector("#session-observatory-button"),
   sessionObservatoryTopbarButton: document.querySelector(
@@ -196,6 +229,20 @@ const elements = {
   sessionSummaryNew: document.querySelector("#session-summary-new"),
   sessionSummaryOpen: document.querySelector("#session-summary-open"),
   sessionSummaryManage: document.querySelector("#session-summary-manage"),
+  nodeSessionActionDialog: document.querySelector("#node-session-action-dialog"),
+  nodeSessionActionTitle: document.querySelector("#node-session-action-title"),
+  nodeSessionActionSubtitle: document.querySelector("#node-session-action-subtitle"),
+  nodeSessionInspect: document.querySelector("#node-session-inspect"),
+  nodeSessionInbox: document.querySelector("#node-session-inbox"),
+  nodeSessionOpen: document.querySelector("#node-session-open"),
+  nodeSessionStop: document.querySelector("#node-session-stop"),
+  sessionBusDialog: document.querySelector("#session-bus-dialog"),
+  sessionBusTitle: document.querySelector("#session-bus-title"),
+  sessionBusSubtitle: document.querySelector("#session-bus-subtitle"),
+  sessionBusMessages: document.querySelector("#session-bus-messages"),
+  sessionBusTabs: Array.from(document.querySelectorAll("[data-session-bus-projection]")),
+  sessionBusCompose: document.querySelector("#session-bus-compose"),
+  sessionBusBody: document.querySelector("#session-bus-body"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
@@ -215,7 +262,6 @@ const elements = {
   ),
   observatoryShowAllToggle: document.querySelector("#observatory-show-all"),
   cleanupSessionsButton: document.querySelector("#cleanup-sessions-button"),
-  legacyExecutorList: document.querySelector("#legacy-executor-list"),
   sessionEventList: document.querySelector("#session-event-list"),
   runtimeAuditGrid: document.querySelector("#runtime-audit-grid"),
   refreshSessionsButton: document.querySelector("#refresh-sessions-button"),
@@ -232,12 +278,27 @@ const elements = {
   goalPlanMap: document.querySelector("#goal-plan-map"),
   editSelectedGoal: document.querySelector("#edit-selected-goal"),
   utilityRail: document.querySelector(".utility-rail"),
+  addProjectRailButton: document.querySelector("#add-project-rail-button"),
+  planProjectButton: document.querySelector("#plan-project-button"),
+  projectSubmit: document.querySelector("#project-submit"),
   mobileWorkTabs: document.querySelector(".mobile-work-tabs"),
   mobileDelegateGoal: document.querySelector("#mobile-delegate-goal"),
   mobileEditPlan: document.querySelector("#mobile-edit-plan"),
   mobileAddMilestone: document.querySelector("#mobile-add-milestone"),
+  quickNewSessionButton: document.querySelector("#quick-new-session-button"),
   quickConductorButton: document.querySelector("#quick-conductor-button"),
   quickTaskButton: document.querySelector("#quick-task-button"),
+  newSessionDialog: document.querySelector("#new-session-dialog"),
+  newSessionForm: document.querySelector("#new-session-form"),
+  newSessionMode: document.querySelector("#new-session-mode"),
+  newSessionProjectRow: document.querySelector("#new-session-project-row"),
+  newSessionProject: document.querySelector("#new-session-project"),
+  newSessionProvider: document.querySelector("#new-session-provider"),
+  newSessionModel: document.querySelector("#new-session-model"),
+  newSessionEffort: document.querySelector("#new-session-effort"),
+  newSessionStatus: document.querySelector("#new-session-status"),
+  newSessionError: document.querySelector("#new-session-error"),
+  newSessionSubmit: document.querySelector("#new-session-submit"),
   goalDialog: document.querySelector("#goal-dialog"),
   goalForm: document.querySelector("#goal-form"),
   goalFormError: document.querySelector("#goal-form-error"),
@@ -265,28 +326,14 @@ const elements = {
   settingsForm: document.querySelector("#settings-form"),
   settingsError: document.querySelector("#settings-error"),
   localServiceStatus: document.querySelector("#local-service-status"),
-  universeProviderSetting: document.querySelector("#universe-provider-setting"),
-  providerProfileDialog: document.querySelector("#provider-profile-dialog"),
-  providerProfileForm: document.querySelector("#provider-profile-form"),
-  providerProfileTitle: document.querySelector("#provider-profile-title"),
-  providerProfileSubtitle: document.querySelector("#provider-profile-subtitle"),
-  providerProfileProvider: document.querySelector("#provider-profile-provider"),
-  providerProfileModel: document.querySelector("#provider-profile-model"),
-  providerProfileModelCustom: document.querySelector(
-    "#provider-profile-model-custom"
-  ),
-  providerProfileEffort: document.querySelector("#provider-profile-effort"),
-  providerProfileStatus: document.querySelector("#provider-profile-status"),
-  providerProfileError: document.querySelector("#provider-profile-error"),
-  providerProfileSubmit: document.querySelector("#provider-profile-submit"),
   memoryMaintainInterval: document.querySelector("#memory-maintain-interval"),
   memoryMaintainStatus: document.querySelector("#memory-maintain-status"),
-  universeProviderStatus: document.querySelector("#universe-provider-status"),
-  projectProviderSettings: document.querySelector("#project-provider-settings"),
   workerBindingScope: document.querySelector("#worker-binding-scope"),
   workerBindingSettings: document.querySelector("#worker-binding-settings"),
   providerModelCatalog: document.querySelector("#provider-model-catalog"),
   refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
+  setupProviderHooks: document.querySelector("#setup-provider-hooks-button"),
+  setupProviderHooksStatus: document.querySelector("#setup-provider-hooks-status"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -317,6 +364,31 @@ const elements = {
   multiRoomList: document.querySelector("#multi-room-list"),
   multiRoomDetail: document.querySelector("#multi-room-detail"),
   multiRoomMessage: document.querySelector("#multi-room-message"),
+  multiRoomArtifactType: document.querySelector("#multi-room-artifact-type"),
+  multiRoomArtifactTitle: document.querySelector("#multi-room-artifact-title"),
+  multiRoomArtifactEvidence: document.querySelector("#multi-room-artifact-evidence"),
+  createRoomArtifact: document.querySelector("#create-room-artifact-button"),
+  meetingFeatureControls: document.querySelector("#meeting-feature-controls"),
+  meetingFeatureSelect: document.querySelector("#meeting-feature-select"),
+  meetingFeatureTitle: document.querySelector("#meeting-feature-title"),
+  meetingFeatureIntent: document.querySelector("#meeting-feature-intent"),
+  meetingExpectedPathSummary: document.querySelector("#meeting-expected-path-summary"),
+  meetingFeatureRationale: document.querySelector("#meeting-feature-rationale"),
+  createMeetingFeature: document.querySelector("#create-meeting-feature-button"),
+  meetingProviderSession: document.querySelector("#meeting-provider-session-select"),
+  attachMeetingProvider: document.querySelector("#attach-meeting-provider-button"),
+  createFreshMeetingSessions: document.querySelector("#create-fresh-meeting-sessions-button"),
+  endMeeting: document.querySelector("#end-meeting-button"),
+  meetingRunPrompt: document.querySelector("#meeting-run-prompt"),
+  meetingRunTurns: document.querySelector("#meeting-run-turns"),
+  startMeetingRun: document.querySelector("#start-meeting-run-button"),
+  cancelMeetingRun: document.querySelector("#cancel-meeting-run-button"),
+  meetingRunStatus: document.querySelector("#meeting-run-status"),
+  multiRoomFindingType: document.querySelector("#multi-room-finding-type"),
+  multiRoomFindingSummary: document.querySelector("#multi-room-finding-summary"),
+  multiRoomFindingFeatures: document.querySelector("#multi-room-finding-features"),
+  multiRoomFindingOwner: document.querySelector("#multi-room-finding-owner"),
+  recordRoomFinding: document.querySelector("#record-room-finding-button"),
   refreshRooms: document.querySelector("#refresh-rooms-button"),
   createMeetingRoom: document.querySelector("#create-meeting-room-button"),
   postRoomMessage: document.querySelector("#post-room-message-button"),
@@ -338,6 +410,7 @@ const elements = {
   roomSessionBindingList: document.querySelector("#room-session-binding-list"),
   freshProjectDialog: document.querySelector("#fresh-project-dialog"),
   freshProjectForm: document.querySelector("#fresh-project-form"),
+  freshProjectRootBrowse: document.querySelector("#fresh-project-root-browse"),
   freshProjectStep: document.querySelector("#fresh-project-step"),
   freshProjectIntent: document.querySelector("#fresh-project-intent"),
   freshProjectRoutes: document.querySelector("#fresh-project-routes"),
@@ -366,6 +439,9 @@ const elements = {
   adoptCompositionButton: document.querySelector("#adopt-composition-button"),
   releaseDialog: document.querySelector("#release-dialog"),
   releaseForm: document.querySelector("#release-form"),
+  releaseDatabaseBrowse: document.querySelector("#release-database-browse"),
+  releaseManifestBrowse: document.querySelector("#release-manifest-browse"),
+  releaseTargetProject: document.querySelector("#release-target-project"),
   releaseList: document.querySelector("#release-list"),
   releaseFormError: document.querySelector("#release-form-error"),
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
@@ -373,14 +449,18 @@ const elements = {
   chatResizeHandle: document.querySelector("#chat-resize-handle"),
   conversationToggle: document.querySelector("#conversation-toggle"),
   conversationExpand: document.querySelector("#conversation-expand"),
-  conversationBadge: document.querySelector("#conversation-badge"),
   actionInboxButton: document.querySelector("#action-inbox-button"),
   actionInboxBadge: document.querySelector("#action-inbox-badge"),
+  mobileActionInboxBadge: document.querySelector("#mobile-action-inbox-badge"),
   actionInboxDialog: document.querySelector("#action-inbox-dialog"),
   actionInboxTitle: document.querySelector("#action-inbox-title"),
   actionInboxList: document.querySelector("#action-inbox-list"),
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
+  terminalTabs: document.querySelector("#terminal-tabs"),
+  terminalStage: document.querySelector("#terminal-stage"),
+  conversationTitle: document.querySelector("#conversation-title"),
+  conversationTargetLabel: document.querySelector("#conversation-target-label"),
   roomContext: document.querySelector("#room-context"),
   roomHint: document.querySelector("#room-hint"),
   closeInspector: document.querySelector("#close-inspector"),
@@ -561,9 +641,13 @@ function sessionActivityMs(session) {
 
 function sessionObservatoryRank(session) {
   const stateName = String(session?.state || "").toUpperCase();
+  const currentness = String(session?.currentness || "").toUpperCase();
   const live = stateName === "LIVE" ? 3 : stateName === "STARTING" ? 2 : 1;
-  const isDefault = session?.is_default ? 1 : 0;
-  return live * 1e15 + isDefault * 1e14 + sessionActivityMs(session);
+  // CURRENT sessions should surface above stale-but-is_default ones.
+  const isCurrent = currentness === "CURRENT" ? 1 : 0;
+  // is_default only counts when the session is not stale.
+  const isDefault = session?.is_default && currentness !== "STALE" ? 1 : 0;
+  return live * 1e15 + isCurrent * 1e14 + isDefault * 1e13 + sessionActivityMs(session);
 }
 
 function observatoryEligibleSessions(sessions) {
@@ -575,7 +659,7 @@ function observatoryEligibleSessions(sessions) {
     if (stateName === "STOPPED") return false;
     if (stateName === "LIVE" || session.is_default) return true;
     const activity = parseSessionDate(
-      session.last_activity_at || session.updated_at
+      session.last_activity_at || session.updated_at || session.last_seen_at
     );
     if (!activity) return stateName !== "DISCONNECTED";
     return Date.now() - activity.getTime() < 7 * 86_400_000;
@@ -824,6 +908,35 @@ function nodeModeCoordinateKey(nodeId, mode) {
     .toUpperCase()}`;
 }
 
+function projectForVendorWorkspace(room) {
+  const workspaceName = String(room?.workspace_name || "").trim().toLowerCase();
+  if (!workspaceName) return null;
+  return (
+    visibleProjects().find((project) => {
+      const id = String(project.project_id || "").toLowerCase();
+      const root = String(project.project_root || "").replaceAll("\\", "/").toLowerCase();
+      const rootName = root.split("/").filter(Boolean).pop() || "";
+      return id === workspaceName || rootName === workspaceName;
+    }) || null
+  );
+}
+
+function unboundVendorSessionFromRoom(room, project, mode) {
+  const chatKey = String(room?.chat_key || "").trim();
+  return {
+    provider: String(room?.provider || "UNKNOWN").toUpperCase(),
+    node: project.project_id,
+    mode,
+    currentness: String(room?.binding?.observer_currentness || "UNKNOWN").toUpperCase(),
+    observer_currentness: String(room?.binding?.observer_currentness || "UNKNOWN").toUpperCase(),
+    session_anchor_ref: room?.binding?.session_anchor_ref || `vendor:${chatKey}`,
+    last_seen_at: room?.last_activity_at || null,
+    alias: room?.binding?.alias || `${String(room?.provider || "Vendor").toUpperCase()} ${room?.workspace_name || project.project_id}`,
+    chat_key: chatKey,
+    vendor_unbound: String(room?.binding?.state || "").toUpperCase() === "INDEPENDENT",
+  };
+}
+
 function markdownBody(text) {
   const root = node("div", "markdown-body");
   const lines = String(text || "").replaceAll("\r\n", "\n").split("\n");
@@ -1027,12 +1140,11 @@ async function rebindSelectedSessionWorkingDirectory() {
       }
     );
     await selectProject(projectId);
-    state.conversationTarget = { kind: "PROJECT_MASTER", projectId };
-    openProjectRoomStream(projectId);
-    await refreshSupervisorSessions();
-    renderComposerActions();
-    renderComposerState();
-    renderRoomMessages();
+    await openPreparedProviderSession({
+      mode: "MASTER",
+      projectId,
+      anchorKey: anchorSessionKey(session),
+    });
     toast(`Session moved to ${projectId}`);
   } finally {
     elements.sessionWorkingDirectoryApply.disabled = false;
@@ -1059,51 +1171,77 @@ async function api(path, options = {}) {
   return payload;
 }
 
-async function refreshSupervisorSessions() {
-  const [audit, legacy, activity, chatCatalog] = await Promise.all([
-    api("/v1/runtime/audit"),
-    api("/v1/supervisor/legacy-executors"),
-    api("/v1/session-observer/sources"),
-    api("/v1/session-observer/chat-rooms"),
-  ]);
-  state.runtimeAudit = audit;
-  state.runtimePreflight = audit.preflight || null;
-  state.supervisorSessions = audit.sessions || [];
+async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
+  if (state.supervisorRefreshPromise) return state.supervisorRefreshPromise;
+  const maxAge = Math.max(0, Number(maxAgeMs) || 0);
   if (
-    !state.selectedSupervisorAnchorKey ||
-    !state.supervisorSessions.some(
-      (session) =>
-        anchorSessionKey(session) === state.selectedSupervisorAnchorKey
-    )
+    maxAge > 0 &&
+    state.supervisorRefreshedAt > 0 &&
+    Date.now() - state.supervisorRefreshedAt < maxAge
   ) {
-    const preferred =
-      state.supervisorSessions.find(
-        (session) =>
-          session.is_default &&
-          ((state.conversationTarget.kind === "PROJECT_MASTER" &&
-            session.node === state.conversationTarget.projectId &&
-            session.mode === "MASTER") ||
-            (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR" &&
-              session.mode === "CONDUCTOR"))
-      ) ||
-      state.supervisorSessions.find((session) => session.is_default) ||
-      state.supervisorSessions[0];
-    state.selectedSupervisorAnchorKey = preferred
-      ? anchorSessionKey(preferred)
-      : null;
+    return state.runtimeAudit;
   }
-  state.roomSessionBindings = audit.room_session_bindings || [];
-  state.supervisorEvents = audit.recent_events || [];
-  state.legacyExecutors = legacy.executors || [];
-  state.providerActivitySources = activity.sources || [];
-  state.providerChatRooms = chatCatalog.rooms || [];
-  syncProviderSessionSubscriptions();
-  prefillsObservatoryInjectForm();
-  renderRuntimePreflight();
-  renderSessionObservatory();
-  renderSessionRail();
-  renderNodeModes();
-  renderProviderActivitySources();
+
+  const refreshPromise = (async () => {
+    const [audit, activity, chatCatalog, sessionGraph, busUnread] = await Promise.all([
+      api("/v1/runtime/audit"),
+      api("/v1/session-observer/sources"),
+      api("/v1/session-observer/chat-rooms"),
+      api("/v1/session-graph").catch(() => null),
+      api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
+    ]);
+    state.sessionBusUnread = busUnread?.counts || {};
+    state.runtimeAudit = audit;
+    state.runtimePreflight = audit.preflight || null;
+    state.supervisorSessions = audit.sessions || [];
+    if (
+      !state.selectedSupervisorAnchorKey ||
+      !state.supervisorSessions.some(
+        (session) =>
+          anchorSessionKey(session) === state.selectedSupervisorAnchorKey
+      )
+    ) {
+      const preferred =
+        state.supervisorSessions.find(
+          (session) =>
+            session.is_default &&
+            ((state.conversationTarget.kind === "PROJECT_MASTER" &&
+              session.node === state.conversationTarget.projectId &&
+              session.mode === "MASTER") ||
+              (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR" &&
+                session.mode === "CONDUCTOR"))
+        ) ||
+        state.supervisorSessions.find((session) => session.is_default) ||
+        state.supervisorSessions[0];
+      state.selectedSupervisorAnchorKey = preferred
+        ? anchorSessionKey(preferred)
+        : null;
+    }
+    state.roomSessionBindings = audit.room_session_bindings || [];
+    state.supervisorEvents = audit.recent_events || [];
+    state.providerActivitySources = activity.sources || [];
+    state.providerChatRooms = chatCatalog.rooms || [];
+    state.projectAnchorSessions = chatCatalog.anchor_sessions || [];
+    state.sessionGraph = sessionGraph?.graph || state.sessionGraph;
+    syncProviderSessionSubscriptions();
+    prefillsObservatoryInjectForm();
+    renderRuntimePreflight();
+    renderSessionObservatory();
+    renderSessionRail();
+    renderNodeModes();
+    renderProviderActivitySources();
+    if (state.view === "sessions") buildSessionGraph();
+    state.supervisorRefreshedAt = Date.now();
+    return audit;
+  })();
+  state.supervisorRefreshPromise = refreshPromise;
+  try {
+    return await refreshPromise;
+  } finally {
+    if (state.supervisorRefreshPromise === refreshPromise) {
+      state.supervisorRefreshPromise = null;
+    }
+  }
 }
 
 async function tailProviderSessions() {
@@ -1115,6 +1253,9 @@ async function tailProviderSessions() {
       body: {},
     });
     state.providerChatRooms = result.catalog?.rooms || state.providerChatRooms;
+    if (result.catalog?.anchor_sessions) {
+      state.projectAnchorSessions = result.catalog.anchor_sessions;
+    }
     syncProviderSessionSubscriptions();
     for (const delta of result.deltas || []) {
       const sourceId = String(delta.source?.source_id || "");
@@ -1132,12 +1273,20 @@ async function tailProviderSessions() {
       );
       if (fresh.length) {
         state.providerLiveDeltas[room.chat_key] = [...existing, ...fresh].slice(-80);
+        mergeProviderLiveDeltasIntoRoom(room.chat_key);
       }
+    }
+    if (typeof loadTerminalTabs === "function") {
+      await loadTerminalTabs();
     }
     renderSessionRail();
     renderNodeModes();
     renderProviderChatSummary();
     renderSelectedSessionDetail();
+    if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+      renderRoomMessages();
+      renderComposerState();
+    }
   } catch (_error) {
     // The next bounded poll retries. UNKNOWN remains visible instead of being
     // promoted to a guessed live state.
@@ -1472,6 +1621,11 @@ function supervisorSessionForRoom(room) {
 
 function providerChatRoomForSupervisorSession(session) {
   if (!session) return null;
+  const chatKey = String(session.chat_key || "").trim();
+  if (chatKey) {
+    const byKey = providerSessionRoomForChatKey(chatKey);
+    if (byKey) return byKey;
+  }
   const sessionKey = anchorSessionKey(session);
   const anchorRef = sessionAnchorRef(session);
   const matches = (state.providerChatRooms || []).filter((room) => {
@@ -1507,7 +1661,9 @@ function providerLiveDeliveryLabel(room) {
 
 function sessionRailProjectIdentity(room) {
   const binding = room?.binding || {};
-  const anchored = ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state);
+  const anchored = ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(
+    binding.state
+  );
   const boundProject = String(
     binding.current_project_id || binding.node || ""
   ).trim();
@@ -1676,16 +1832,33 @@ function renderSessionSummaryConnection(room, project, boundSession) {
   }
 }
 
+function applySessionSummaryInspectOnly() {
+  if (!state.sessionSummaryInspectOnly) return;
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = true;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = true;
+  if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = true;
+  if (elements.sessionSummaryNew) elements.sessionSummaryNew.hidden = true;
+  if (elements.sessionSummaryConnection) elements.sessionSummaryConnection.hidden = true;
+}
+
 function renderProviderChatSummary() {
   if (!elements.sessionSummaryDialog) return;
   const room = (state.providerChatRooms || []).find(
     (item) => item.chat_key === state.selectedProviderChatKey
   );
   if (!room) {
-    if (elements.sessionSummaryDialog.open) elements.sessionSummaryDialog.close();
+    // Keep the dialog open when it was explicitly opened for a new session
+    // (selectedProviderChatKey is null but pendingNewSessionCoordinate is set).
+    if (elements.sessionSummaryDialog.open && !state.sessionSummaryInspectOnly && !state.pendingNewSessionCoordinate) {
+      elements.sessionSummaryDialog.close();
+    }
     return;
   }
   const binding = room.binding || { state: "UNBOUND" };
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = false;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = false;
+  if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = false;
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = false;
   const project = sessionRailProjectIdentity(room);
   const boundSession = supervisorSessionForRoom(room);
   const mode = String(binding.mode || "").toUpperCase();
@@ -1740,7 +1913,7 @@ function renderProviderChatSummary() {
     }
   }
   const canOpenDirect =
-    ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+    ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(binding.state) &&
     room.session_kind !== "WORKER";
   elements.sessionSummaryOpen.disabled = !canOpenDirect;
   elements.sessionSummaryOpen.textContent = canOpenDirect
@@ -1755,14 +1928,88 @@ function renderProviderChatSummary() {
     : isAnchored && ["MASTER", "CONDUCTOR"].includes(mode)
       ? "View activity"
       : "Register session";
+  applySessionSummaryInspectOnly();
 }
 
-function openProviderChatSummary(room) {
+function openProviderChatSummary(room, options = {}) {
+  state.sessionSummaryInspectOnly = options.inspectOnly === true;
   state.selectedProviderChatKey = room.chat_key;
+  state.pendingNewSessionCoordinate = null;
   markProviderSessionRead(room.chat_key);
   renderSessionRail();
   renderNodeModes();
   renderProviderChatSummary();
+  if (!elements.sessionSummaryDialog.open) {
+    elements.sessionSummaryDialog.showModal();
+  }
+}
+
+function openSessionSummaryForNew(coordinate) {
+  state.sessionSummaryInspectOnly = false;
+  const mode = String(coordinate?.mode || "").toUpperCase();
+  const project = coordinate?.project;
+  const projectId = String(project?.project_id || "").trim();
+  if (!["MASTER", "CONDUCTOR"].includes(mode)) return;
+  if (mode === "MASTER" && (!projectId || !project?.project_root)) {
+    toast("Project is not registered", true);
+    return;
+  }
+  state.pendingNewSessionCoordinate = coordinate;
+  state.selectedProviderChatKey = null;
+  elements.sessionSummaryTitle.textContent =
+    mode === "CONDUCTOR" ? "New Conductor session" : `New session · ${projectId}`;
+  elements.sessionSummarySubtitle.textContent =
+    mode === "CONDUCTOR" ? "Universe Conductor" : `${projectId} · Master`;
+  if (elements.sessionSummaryFacts) elements.sessionSummaryFacts.replaceChildren();
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = true;
+  if (elements.sessionSummaryOpen) elements.sessionSummaryOpen.hidden = true;
+  if (elements.sessionSummaryManage) elements.sessionSummaryManage.hidden = true;
+  const section = elements.sessionSummaryConnection;
+  if (section) {
+    section.hidden = false;
+    const providers = state.providerSettings?.available_providers || [];
+    elements.sessionSummaryProvider.replaceChildren();
+    const placeholder = node("option", "", "Choose provider");
+    placeholder.value = "";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    elements.sessionSummaryProvider.append(placeholder);
+    for (const provider of providers) {
+      const key = String(provider.provider || "").toUpperCase();
+      if (!key) continue;
+      const option = node(
+        "option",
+        "",
+        key === "CODEX" ? "Codex" : key === "CLAUDE" ? "Claude" : "Grok"
+      );
+      option.value = key;
+      option.disabled = provider.status === "UNAVAILABLE";
+      if (provider.reason) option.title = provider.reason;
+      elements.sessionSummaryProvider.append(option);
+    }
+    if (elements.sessionSummaryProvider.options.length === 1) {
+      for (const key of ["CODEX", "CLAUDE", "GROK"]) {
+        const option = node("option", "", key);
+        option.value = key;
+        elements.sessionSummaryProvider.append(option);
+      }
+    }
+    elements.sessionSummaryProvider.value = "";
+    fillSessionSummaryModelSelect("", "");
+    elements.sessionSummaryProvider.onchange = () => {
+      fillSessionSummaryModelSelect(elements.sessionSummaryProvider.value, "");
+    };
+    if (elements.sessionSummaryEffort) elements.sessionSummaryEffort.value = "AUTO";
+    if (elements.sessionSummaryConnectionStatus) {
+      elements.sessionSummaryConnectionStatus.textContent =
+        "Choose provider settings for the new session";
+    }
+    if (elements.sessionSummaryConnect) elements.sessionSummaryConnect.hidden = true;
+    if (elements.sessionSummaryNew) {
+      elements.sessionSummaryNew.hidden = false;
+      elements.sessionSummaryNew.textContent = "Start new session";
+    }
+  }
   if (!elements.sessionSummaryDialog.open) {
     elements.sessionSummaryDialog.showModal();
   }
@@ -1790,7 +2037,7 @@ function nodeModeCatalog(project) {
       .filter((room) => {
         const binding = room.binding || {};
         return (
-          ["BOUND", "ANCHOR_OBSERVED"].includes(binding.state) &&
+          ["BOUND", "ANCHOR_OBSERVED", "INDEPENDENT"].includes(binding.state) &&
           normalizeNodeModeNode(
             binding.current_project_id || binding.node
           ).toLowerCase() === projectId
@@ -1807,25 +2054,85 @@ function nodeModeCatalog(project) {
     });
 }
 
-function nodeModeSessionIsActive(session) {
-  return ["LIVE", "STARTING"].includes(
-    String(session?.state || "").trim().toUpperCase()
+function nodeModeSessionIsCurrent(session) {
+  const currentness = String(
+    session?.currentness ||
+      session?.observer_currentness ||
+      session?.anchor_session?.currentness ||
+      ""
+  ).toUpperCase();
+  if (currentness === "CURRENT") return true;
+  return session?.is_default === true && currentness !== "STALE";
+}
+
+function vendorStreamStateForSession(session) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (terminalId) {
+    const live = (state.supervisorTerminals || state.terminals || []).find(
+      (item) => item.terminal_id === terminalId && String(item.state || "").toUpperCase() === "LIVE"
+    );
+    if (live) return "LIVE";
+  }
+  const room =
+    providerSessionRoomForChatKey(session?.chat_key) ||
+    providerChatRoomForSupervisorSession(session);
+  const key = String(room?.chat_key || session?.chat_key || "").trim();
+  if (!key) return "NO_VENDOR";
+  const cache = providerSessionRoomCacheFor(key);
+  return String(
+    state.providerSessionStreamStates[key] || cache?.streamState || "IDLE"
+  ).toUpperCase();
+}
+
+const NODE_MODE_WORKING_ACTIVITY_STATES = new Set([
+  "ACTIVE",
+  "STARTING",
+  "RUNNING",
+  "WORKING",
+  "EXECUTING",
+  "BOOTING",
+  "INDEXING",
+  "INSTALLING",
+  "VALIDATING",
+  "SYNCING",
+  "CHECKPOINTING",
+  "REBUILDING",
+  "WAITING_USER",
+  "WAITING_COMMANDER",
+]);
+
+function nodeModeSessionActivityState(session) {
+  return String(
+    session?.current_activity_state ||
+      (session?.active_ing === true ? session?.state : "") ||
+      "IDLE"
+  ).trim().toUpperCase();
+}
+
+function nodeModeSessionIsWorking(session) {
+  return (
+    session?.active_ing === true ||
+    NODE_MODE_WORKING_ACTIVITY_STATES.has(nodeModeSessionActivityState(session))
   );
 }
 
+function nodeModeSessionIsActive(session) {
+  return nodeModeSessionIsWorking(session);
+}
+
 function nodeModeRoomIsActive(room) {
-  const boundSession = supervisorSessionForRoom(room);
+  const key = String(room?.chat_key || "").trim();
+  if (!key) return false;
+  const cache = providerSessionRoomCacheFor(key);
   return (
-    nodeModeSessionIsActive(boundSession) ||
-    ["LIVE", "STARTING"].includes(
-      String(room?.activity_state || "").trim().toUpperCase()
-    )
+    String(
+      state.providerSessionStreamStates[key] || cache?.streamState || ""
+    ).toUpperCase() === "LIVE"
   );
 }
 
 function nodeModeCoordinates() {
   const projects = visibleProjects()
-    .filter((project) => !isProjectContainer(project))
     .sort((left, right) =>
       projectSortKey(left).localeCompare(projectSortKey(right))
     );
@@ -1880,33 +2187,32 @@ function nodeModeCoordinates() {
     coordinates.set(key, coordinate);
   };
 
-  for (const room of state.providerChatRooms || []) {
-    const binding = room.binding || {};
-    if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) continue;
-    const boundSession = supervisorSessionForRoom(room);
-    record(binding.current_project_id || binding.node, binding.mode, {
-      room,
-      session: boundSession,
-      active: nodeModeRoomIsActive(room),
-      hasSession: Boolean(binding.universe_session_id || boundSession),
-      current: binding.is_default === true && binding.observer_currentness === "CURRENT",
-    });
-  }
-  for (const session of state.supervisorSessions || []) {
-    const room = providerChatRoomForSupervisorSession(session);
-    record(session.node, session.mode, {
-      room,
-      session,
-      active: nodeModeSessionIsActive(session),
+  for (const terminal of state.supervisorTerminals || state.terminals || []) {
+    if (String(terminal.state || "").toUpperCase() !== "LIVE") continue;
+    const terminalSession = sessionFromPtyTerminal(terminal);
+    record(terminal.project_id, terminal.mode, {
       hasSession: true,
-      current:
-        session.is_default === true &&
-        ["CURRENT"].includes(
-          String(session.observer_currentness || session.currentness || "").toUpperCase()
-        ),
+      active: nodeModeSessionIsWorking(terminalSession),
     });
   }
-
+  for (const session of [
+    ...(state.projectAnchorSessions || []),
+    ...(state.supervisorSessions || []),
+  ]) {
+    const projectId = String(session.project_id || session.node || "").trim();
+    const mode = String(session.mode || "").trim().toUpperCase();
+    if (!projectId || !mode) continue;
+    const room =
+      providerSessionRoomForChatKey(session.chat_key) ||
+      providerChatRoomForSupervisorSession(session);
+    record(projectId, mode, {
+      session,
+      room,
+      hasSession: true,
+      current: nodeModeSessionIsCurrent(session),
+      active: room ? nodeModeRoomIsActive(room) : false,
+    });
+  }
   const groups = projects.map((project) => {
     const nodeId = project.project_id;
     const modes = nodeModeCatalog(project).map((mode) =>
@@ -1924,14 +2230,23 @@ function nodeModeCoordinates() {
         sessions: [],
       }
     );
-    return { nodeId, project, modes };
+    return {
+      nodeId,
+      project,
+      modes,
+      parentProjectId: String(project.metadata?.parent_project_id || ""),
+    };
   });
   return groups;
 }
 
 function nodeModeStatusLabel(coordinate) {
-  if (coordinate.active) return coordinate.current ? "ACTIVE · CURRENT" : "ACTIVE";
-  return coordinate.hasSession ? "INACTIVE" : "NO SESSION";
+  const buckets = nodeModePanelSessionBuckets(coordinate);
+  if (coordinate.current && buckets.working.length) return "CURRENT · WORKING";
+  if (buckets.working.length) return "WORKING";
+  if (coordinate.current) return "CURRENT";
+  if (buckets.idle.length) return "IDLE";
+  return coordinate.hasSession ? "SAVED" : "NO SESSION";
 }
 
 function nodeModeSelectedSession(coordinate) {
@@ -1939,6 +2254,292 @@ function nodeModeSelectedSession(coordinate) {
   const selectedKey = state.selectedSupervisorAnchorKeysByMode[coordinate?.key];
   // A default/current/active observation may be shown, but never chooses chat.
   return sessions.find((session) => anchorSessionKey(session) === selectedKey) || null;
+}
+
+async function attachProviderChatRoom(room, coordinate) {
+  const key = String(room?.chat_key || "").trim();
+  if (!key) throw new Error("This vendor session has no chat key");
+  const result = await api(
+    "/v1/session-observer/chat-rooms/" + encodeURIComponent(key) + "/attach",
+    {
+      method: "POST",
+      body: {
+        project_id: coordinate?.project?.project_id || coordinate?.nodeId,
+        mode: coordinate?.mode || "MASTER",
+        make_default: true,
+      },
+    }
+  );
+  if (result.catalog?.rooms) state.providerChatRooms = result.catalog.rooms;
+  if (result.catalog?.anchor_sessions) {
+    state.projectAnchorSessions = result.catalog.anchor_sessions;
+  }
+  await refreshSupervisorSessions();
+  return providerSessionRoomForChatKey(key);
+}
+
+async function bindNodeModeSessionPty(coordinate, session) {
+  if (focusTerminalForSession(coordinate, session)) {
+    expandConversationLayer();
+    return;
+  }
+  await createTerminalTab(coordinate, session);
+  await refreshSupervisorSessions();
+  expandConversationLayer();
+}
+
+async function startNewNodeModeSession(coordinate) {
+  const project = coordinate?.project;
+  const mode = String(coordinate?.mode || "").toUpperCase();
+  const projectId = String(project?.project_id || "").trim();
+  const cwd = String(project?.project_root || "").trim();
+  if (!projectId || !cwd || !mode) {
+    throw new Error("New sessions require a registered project and Mode");
+  }
+  const selectedProvider = String(coordinate?.provider || "").trim().toUpperCase();
+  if (selectedProvider) coordinate.provider = selectedProvider;
+  await createTerminalTab(coordinate);
+  await refreshSupervisorSessions();
+  expandConversationLayer();
+}
+
+function openNodeModeSessionActions(coordinate, session) {
+  state.pendingNodeSessionAction = { coordinate, session };
+  if (elements.nodeSessionActionTitle) {
+    elements.nodeSessionActionTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.nodeSessionActionSubtitle) {
+    const live = session.terminal_id
+      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
+      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
+    elements.nodeSessionActionSubtitle.textContent = live;
+  }
+  if (elements.nodeSessionStop) {
+    elements.nodeSessionStop.disabled = !String(session.terminal_id || "").trim();
+  }
+  if (elements.nodeSessionInbox) {
+    elements.nodeSessionInbox.disabled = !String(session.terminal_id || "").trim();
+  }
+  if (elements.nodeSessionOpen) {
+    elements.nodeSessionOpen.textContent = session.terminal_id
+      ? "Open PTY"
+      : "PTY Binding";
+  }
+  if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
+    elements.nodeSessionActionDialog.showModal();
+  }
+}
+
+function sessionBusTarget(session, coordinate) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  const anchorRef = sessionAnchorRef(session);
+  if (terminalId || anchorRef) {
+    return {
+      ...(terminalId ? { terminal_id: terminalId } : {}),
+      ...(anchorRef ? { session_anchor_ref: anchorRef } : {}),
+    };
+  }
+  return {
+    project_id: String(session?.project_id || coordinate?.project?.project_id || ""),
+    mode: String(session?.mode || coordinate?.mode || "").toUpperCase(),
+    provider: String(session?.provider || "").toUpperCase(),
+  };
+}
+
+function sessionBusEvidenceRows(message) {
+  const context = message?.event_context || {};
+  const provenance = message?.provenance || {};
+  const lifecycle = message?.lifecycle || {};
+  const target = message?.to || {};
+  const artifactRefs = Array.isArray(context.artifact_refs)
+    ? context.artifact_refs
+    : [
+        ...(Array.isArray(provenance.artifact_refs) ? provenance.artifact_refs : []),
+        lifecycle.result_ref,
+      ];
+  return [
+    ["Event", message?.message_id],
+    ["Source event", context.source_event_id || message?.in_reply_to || message?.message_id],
+    ["Session Anchor", context.session_anchor_ref || message?.recipient_anchor_ref || message?.session_anchor_ref],
+    ["Thread", context.thread_id || message?.thread_id],
+    ["Room", context.room_id || message?.room_id],
+    ["Task Frame", context.task_frame_ref || provenance.task_frame_ref || lifecycle.task_frame_ref],
+    ["Node", context.node_ref || target.node_ref || target.project_id],
+    ["State", context.projection_state || message?.lifecycle_state],
+    ["Artifacts", [...new Set(artifactRefs.map((value) => String(value || "").trim()).filter(Boolean))].join(", ")],
+  ].filter(([, value]) => String(value || "").trim());
+}
+
+function renderSessionBusEvidence(message) {
+  const details = node("details", "session-bus-evidence");
+  details.append(node("summary", "", "Event coordinates"));
+  for (const [label, value] of sessionBusEvidenceRows(message)) {
+    const row = node("div", "session-bus-evidence-row");
+    row.append(node("span", "", label), node("code", "", String(value)));
+    details.append(row);
+  }
+  return details;
+}
+
+async function refreshSessionBusMessages() {
+  const pending = state.pendingSessionBus;
+  if (!pending || !elements.sessionBusMessages) return;
+  const terminalId = String(pending.session?.terminal_id || "").trim();
+  const anchorRef = sessionAnchorRef(pending.session);
+  const projection = String(state.sessionBusProjection || "INBOX").toUpperCase();
+  const coordinateQuery = anchorRef
+    ? "?session_anchor_ref=" + encodeURIComponent(anchorRef)
+    : terminalId
+      ? "?terminal_id=" + encodeURIComponent(terminalId)
+    : "?project_id=" +
+      encodeURIComponent(pending.session?.project_id || pending.coordinate?.project?.project_id || "") +
+      "&mode=" +
+      encodeURIComponent(pending.session?.mode || pending.coordinate?.mode || "") +
+      "&provider=" +
+      encodeURIComponent(pending.session?.provider || "");
+  const payload = await api(
+    "/v1/session-bus/inbox" + coordinateQuery + "&projection=" + encodeURIComponent(projection)
+  );
+  const rows = payload.messages || [];
+  elements.sessionBusMessages.replaceChildren();
+  if (!rows.length) {
+    const emptyLabel = projection === "INBOX" ? "No inbox events" : `No ${projection.toLowerCase()} events`;
+    elements.sessionBusMessages.append(node("p", "session-bus-empty", emptyLabel));
+    return;
+  }
+  for (const message of rows) {
+    const item = node("article", "session-bus-item");
+    const from = message.from || {};
+    const heading = node(
+      "header",
+      "session-bus-item-head",
+      `${message.kind || "NOTE"} · ${message.lifecycle_state || message.delivery_state || "UNKNOWN"} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
+    );
+    const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
+    item.append(heading, body, renderSessionBusEvidence(message));
+    const messageTerminalId = String(message.terminal_id || terminalId).trim();
+    if (projection === "INBOX" && messageTerminalId) {
+      const ack = node("button", "secondary-button", "Ack");
+      ack.type = "button";
+      ack.addEventListener("click", () => {
+        ackSessionBusMessage(message.message_id, messageTerminalId).catch((error) =>
+          toast(error.message, true)
+        );
+      });
+      item.append(ack);
+    }
+    elements.sessionBusMessages.append(item);
+  }
+}
+
+async function openSessionBusInbox(coordinate, session) {
+  state.pendingSessionBus = { coordinate, session };
+  state.sessionBusProjection = "INBOX";
+  for (const tab of elements.sessionBusTabs || []) {
+    const active = tab.dataset.sessionBusProjection === "INBOX";
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  }
+  if (elements.sessionBusTitle) {
+    elements.sessionBusTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.sessionBusSubtitle) {
+    elements.sessionBusSubtitle.textContent = `${session.project_id || coordinate?.project?.project_id || "session"} / ${String(session.mode || coordinate?.mode || "").toUpperCase()} / ${String(session.provider || "UNKNOWN").toUpperCase()}`;
+  }
+  if (elements.sessionBusBody) elements.sessionBusBody.value = "";
+  await refreshSessionBusMessages();
+  if (elements.sessionBusDialog && !elements.sessionBusDialog.open) {
+    elements.sessionBusDialog.showModal();
+  }
+}
+
+async function ackSessionBusMessage(messageId, terminalId) {
+  await api("/v1/session-bus/messages/" + encodeURIComponent(messageId) + "/ack", {
+    method: "POST",
+    body: { terminal_id: terminalId },
+  });
+  await refreshSupervisorSessions();
+  renderNodeModes();
+  await refreshSessionBusMessages();
+}
+
+async function sendSessionBusCompose(event) {
+  event.preventDefault();
+  const pending = state.pendingSessionBus;
+  const body = String(elements.sessionBusBody?.value || "").trim();
+  if (!pending || !body) return;
+  await api("/v1/session-bus/messages", {
+    method: "POST",
+    body: {
+      to: sessionBusTarget(pending.session, pending.coordinate),
+      from: {
+        project_id: pending.coordinate?.project?.project_id || pending.session?.project_id || "",
+        mode: pending.coordinate?.mode || pending.session?.mode || "",
+        provider: "UI",
+      },
+      kind: "INSTRUCTION",
+      notify: "HEADER",
+      body_text: body,
+    },
+  });
+  if (elements.sessionBusBody) elements.sessionBusBody.value = "";
+  toast("Sent on the session bus");
+  await refreshSupervisorSessions();
+  renderNodeModes();
+  await refreshSessionBusMessages();
+}
+
+function openPtySessionInspectSummary(coordinate, session) {
+  state.sessionSummaryInspectOnly = true;
+  state.selectedProviderChatKey = null;
+  if (elements.sessionSummaryTitle) {
+    elements.sessionSummaryTitle.textContent = sessionDisplayName(session);
+  }
+  if (elements.sessionSummarySubtitle) {
+    elements.sessionSummarySubtitle.textContent = `${coordinate?.project?.project_id || session.project_id || "session"} · inspect`;
+  }
+  if (elements.sessionSummaryFacts) {
+    elements.sessionSummaryFacts.replaceChildren();
+    const facts = [
+      ["Project", String(session.project_id || session.node || coordinate?.project?.project_id || "")],
+      ["Mode", String(session.mode || coordinate?.mode || "").toUpperCase()],
+      ["Provider", String(session.provider || "UNKNOWN").toUpperCase()],
+      ["PTY", session.terminal_id ? `${session.terminal_id}${session.pid ? ` / ${session.pid}` : ""}` : "none"],
+      ["State", String(session.state || vendorStreamStateForSession(session) || "")],
+    ];
+    for (const [label, value] of facts) {
+      const fact = node("div", "session-summary-fact");
+      fact.append(node("span", "", label), node("strong", "", value || "—"));
+      elements.sessionSummaryFacts.append(fact);
+    }
+  }
+  if (elements.sessionSummaryLive) elements.sessionSummaryLive.hidden = true;
+  applySessionSummaryInspectOnly();
+  if (elements.sessionSummaryDialog && !elements.sessionSummaryDialog.open) {
+    elements.sessionSummaryDialog.showModal();
+  }
+}
+
+async function inspectNodeModeSession(coordinate, session) {
+  const room = providerChatRoomForSupervisorSession(session);
+  if (room) {
+    openProviderChatSummary(room, { inspectOnly: true });
+    return;
+  }
+  openPtySessionInspectSummary(coordinate, session);
+}
+
+async function endNodeModePtySession(session) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (!terminalId) throw new Error("No live PTY session to end");
+  if (typeof stopTerminalSession === "function") {
+    await stopTerminalSession(terminalId);
+  } else {
+    await api("/v1/terminals/" + encodeURIComponent(terminalId), { method: "DELETE" });
+  }
+  await refreshSupervisorSessions();
+  if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
+  renderNodeModes();
 }
 
 async function selectNodeModeSession(coordinate, session) {
@@ -1952,28 +2553,133 @@ async function selectNodeModeSession(coordinate, session) {
   renderNodeModes();
   renderSessionRail();
   renderSessionObservatory();
+  openNodeModeSessionActions(coordinate, session);
+}
 
-  const room = providerChatRoomForSupervisorSession(session);
-  if (!room) {
-    toast("This persistent session has no attached provider chat", true);
-    return;
-  }
-  await openProviderChatSession(room, { session });
-  expandConversationLayer();
+function ptyLiveTerminalsForCoordinate(coordinate) {
+  const projectId = String(coordinate?.project?.project_id || coordinate?.nodeId || "").trim();
+  const mode = String(coordinate?.mode || "").trim().toUpperCase();
+  if (!projectId || !mode) return [];
+  return (state.supervisorTerminals || state.terminals || []).filter(
+    (item) =>
+      String(item.state || "").toUpperCase() === "LIVE" &&
+      String(item.project_id || "") === projectId &&
+      String(item.mode || "").toUpperCase() === mode
+  );
+}
+
+function sessionFromPtyTerminal(terminal) {
+  const supervisorSessionId = String(terminal?.supervisor_session_id || "").trim();
+  const supervised = (state.supervisorSessions || []).find(
+    (session) => String(session.session_id || "") === supervisorSessionId
+  );
+  return {
+    ...(supervised || {}),
+    terminal_id: terminal.terminal_id,
+    supervisor_session_id: supervisorSessionId,
+    project_id: terminal.project_id,
+    node: terminal.project_id,
+    mode: terminal.mode,
+    provider: terminal.provider,
+    alias: supervised?.alias || `${terminal.project_id} ${terminal.mode}`,
+    terminal_state: terminal.state || "LIVE",
+    state: supervised?.state || "UNKNOWN",
+    current_activity_state: supervised?.current_activity_state || "IDLE",
+    pid: terminal.pid,
+    executable: terminal.executable,
+    cwd: terminal.cwd,
+    session_kind: "PTY_LIVE",
+    last_seen_at: supervised?.last_seen_at || terminal.created_at,
+    session_anchor_ref:
+      supervised?.session_anchor_ref ||
+      terminal.session_anchor_ref ||
+      `pty:${terminal.terminal_id}`,
+  };
+}
+
+const NODE_MODE_RECENT_SESSION_LIMIT = 5;
+
+function recentAnchorSessionsForCoordinate(coordinate) {
+  const projectId = String(
+    coordinate?.project?.project_id || coordinate?.nodeId || ""
+  ).trim();
+  const mode = String(coordinate?.mode || "").trim().toUpperCase();
+  if (!projectId || !mode) return [];
+  return (state.projectAnchorSessions || [])
+    .filter(
+      (session) =>
+        String(session.project_id || session.node || "").trim() === projectId &&
+        String(session.mode || "").trim().toUpperCase() === mode
+    )
+    .sort((left, right) => {
+      const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
+      const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
+      if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
+      return String(right.last_seen_at || "").localeCompare(
+        String(left.last_seen_at || "")
+      );
+    });
+}
+
+function nodeModePanelSessionBuckets(coordinate) {
+  // LIVE PTYs always win. Durable anchors fill the remaining recent slots.
+  const live = ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
+  const seenAnchorKeys = new Set(live.map(anchorSessionKey).filter(Boolean));
+  const recentCandidates = recentAnchorSessionsForCoordinate(coordinate).filter(
+    (session) => {
+      const anchorKey = anchorSessionKey(session);
+      if (!anchorKey || seenAnchorKeys.has(anchorKey)) return false;
+      seenAnchorKeys.add(anchorKey);
+      return true;
+    }
+  );
+  const recentSlots = Math.max(0, NODE_MODE_RECENT_SESSION_LIMIT - live.length);
+  const recent = recentCandidates.slice(0, recentSlots);
+  return {
+    working: live.filter(nodeModeSessionIsWorking),
+    idle: live.filter((session) => !nodeModeSessionIsWorking(session)),
+    recent,
+    sessions: [...live, ...recent],
+  };
+}
+
+function nodeModePanelSessions(coordinate) {
+  return nodeModePanelSessionBuckets(coordinate).sessions;
 }
 
 function renderNodeModeSessionCards(coordinate) {
   const cards = node("div", "node-mode-session-cards");
   cards.dataset.coordinateKey = coordinate.key;
-  const sessions = coordinate.sessions || [];
+  const buckets = nodeModePanelSessionBuckets(coordinate);
+  const sessions = nodeModePanelSessions(coordinate);
+  const selected = nodeModeSelectedSession(coordinate);
+  const ordered = [...sessions].sort((left, right) => {
+    const leftLive = left.terminal_id ? 0 : 1;
+    const rightLive = right.terminal_id ? 0 : 1;
+    if (leftLive !== rightLive) return leftLive - rightLive;
+    const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
+    const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
+    if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
+    return String(right.last_seen_at || right.updated_at || "").localeCompare(
+      String(left.last_seen_at || left.updated_at || "")
+    );
+  });
+  const create = node("button", "node-mode-session-new", "New session");
+  create.type = "button";
+  create.title = "Start a new vendor session for this Mode";
+  create.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openSessionSummaryForNew(coordinate);
+  });
+  cards.append(create);
   if (!sessions.length) {
     cards.append(
-      node("p", "node-mode-session-empty", "No persistent sessions in this mode")
+      node("p", "node-mode-session-empty", "No live or recent sessions in this mode")
     );
     return cards;
   }
-  const selected = nodeModeSelectedSession(coordinate);
-  for (const session of sessions) {
+  for (const session of ordered) {
     const room = providerChatRoomForSupervisorSession(session);
     const row = node("div", "node-mode-session-row");
     const card = node("button", "node-mode-session-card");
@@ -1988,49 +2694,62 @@ function renderNodeModeSessionCards(coordinate) {
       String(Boolean(selected && anchorSessionKey(selected) === anchorSessionKey(session)))
     );
     const label = node("span", "node-mode-session-copy");
+    const detail = session.terminal_id
+      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
+      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
     label.append(
       node("strong", "", sessionDisplayName(session)),
-      node(
-        "small",
-        "",
-        `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`
-      )
+      node("small", "", detail)
     );
-    const status = node(
-      "span",
-      "node-mode-session-status",
-      room ? "CHAT" : String(session.state || "UNKNOWN")
-    );
-    status.dataset.state = String(session.state || "UNKNOWN").toUpperCase();
+    const activityState = nodeModeSessionActivityState(session);
+    const current = nodeModeSessionIsCurrent(session);
+    const livePty = Boolean(session.terminal_id);
+    let visualState = "RECENT";
+    let statusLabel = "RECENT";
+    if (livePty) {
+      visualState = nodeModeSessionIsWorking(session) ? activityState : "IDLE";
+      statusLabel = visualState === "ACTIVE" ? "WORKING" : visualState;
+    } else if (session.active_ing === true) {
+      const offlineState = String(session.state || "ING").toUpperCase();
+      visualState = "OFFLINE";
+      statusLabel = `${offlineState} · OFFLINE`;
+    } else if (current) {
+      visualState = "OFFLINE";
+      statusLabel = "CURRENT · OFFLINE";
+    }
+    const status = node("span", "node-mode-session-status", statusLabel);
+    status.dataset.state = visualState;
+    status.dataset.current = String(current);
+    const unread = Number(state.sessionBusUnread?.[session.terminal_id] || 0);
     card.append(label, status);
-    card.title = room
-      ? "Open this exact persistent session chat"
-      : "This persistent session has no attached provider chat";
+    if (unread > 0) {
+      card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
+    }
+    card.title = livePty
+      ? current
+        ? "Inspect the DB Current connected session"
+        : "Inspect this connected session"
+      : current
+        ? "Inspect the DB Current session anchor (PTY offline)"
+        : "Inspect this recent session anchor";
+    card.dataset.current = String(nodeModeSessionIsCurrent(session));
     card.addEventListener("click", () => {
       selectNodeModeSession(coordinate, session).catch((error) =>
         toast(error.message, true)
       );
     });
     row.append(card);
-    if (room && state.conversationTarget.kind === "PROVIDER_SESSION") {
-      const delegate = node("button", "node-mode-session-delegate", "Delegate here");
-      delegate.type = "button";
-      delegate.dataset.targetAnchorRef = sessionAnchorRef(session);
-      delegate.title = "Delegate bounded work from the selected direct session";
-      delegate.disabled =
-        String(state.conversationTarget.session_anchor_ref || "").trim() ===
-        sessionAnchorRef(session);
-      delegate.addEventListener("click", () => beginCrossSessionDelegation(session));
-      row.append(delegate);
-    }
     cards.append(row);
   }
   return cards;
 }
 
 function selectNodeModeNode(nodeId) {
+  const same =
+    String(state.selectedProject?.project_id || "").toLowerCase() ===
+    String(nodeId || "").toLowerCase();
   selectProject(nodeId, {
-    revealInspector: false,
+    revealInspector: same,
   })
     .then(() => renderNodeModes())
     .catch((error) => toast(error.message, true));
@@ -2038,35 +2757,24 @@ function selectNodeModeNode(nodeId) {
 
 function openNodeModeCoordinate(coordinate) {
   // ACTIVE/attached is observed state. It must not select or route a chat.
+  if (state.selectedModeCoordinateKey === coordinate.key) {
+    state.selectedModeCoordinateKey = null;
+    renderNodeModes();
+    return;
+  }
   state.selectedModeCoordinateKey = coordinate.key;
   selectNodeModeNode(coordinate.nodeId);
   renderNodeModes();
 }
 
-function renderNodeModes() {
-  if (!elements.nodeModeList) return;
-  const groups = nodeModeCoordinates();
-  const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
-  const activeModeCount = groups.reduce(
-    (total, group) => total + group.modes.filter((mode) => mode.active).length,
-    0
-  );
-  elements.nodeModeList.replaceChildren();
-  if (elements.nodeModeCount) {
-    elements.nodeModeCount.textContent = `${activeModeCount}/${modeCount}`;
-    elements.nodeModeCount.title = `${activeModeCount} active sessions / ${modeCount} node modes`;
-  }
-  if (!groups.length) {
-    elements.nodeModeList.append(
-      node("p", "node-mode-empty", "No nodes registered")
+function renderNodeModeGroup(group, { nested = false } = {}) {
+    const section = node(
+      "section",
+      nested ? "node-mode-group node-mode-group-nested" : "node-mode-group"
     );
-    return;
-  }
-
-  for (const group of groups) {
-    const section = node("section", "node-mode-group");
     section.dataset.nodeId = group.nodeId;
-    const activeCount = group.modes.filter((mode) => mode.active).length;
+    section.dataset.nodeKind = String(group.project.metadata?.node_kind || "PROJECT");
+    const currentCount = group.modes.filter((mode) => mode.current).length;
     const heading = node("button", "node-mode-group-heading node-mode-node");
     heading.type = "button";
     heading.dataset.nodeId = group.nodeId;
@@ -2076,7 +2784,7 @@ function renderNodeModes() {
     heading.title = `Select ${projectDisplayName(group.project)} node`;
     heading.append(
       node("strong", "", projectDisplayName(group.project)),
-      node("small", "", `${activeCount}/${group.modes.length} active`)
+      node("small", "", `${currentCount}/${group.modes.length} current`)
     );
     heading.addEventListener("click", () => selectNodeModeNode(group.nodeId));
     section.append(heading);
@@ -2100,12 +2808,55 @@ function renderNodeModes() {
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
-      if (modeSelected) {
+      const sessionCount = nodeModePanelSessions(coordinate).length;
+      // Collapsed modes keep LIVE and bounded recent sessions discoverable.
+      if (modeSelected || sessionCount) {
         list.append(renderNodeModeSessionCards(coordinate));
       }
     }
     section.append(list);
-    elements.nodeModeList.append(section);
+    return section;
+}
+
+function renderNodeModes() {
+  if (!elements.nodeModeList) return;
+  const groups = nodeModeCoordinates();
+  const modeCount = groups.reduce((total, group) => total + group.modes.length, 0);
+  const currentModeCount = groups.reduce(
+    (total, group) => total + group.modes.filter((mode) => mode.current).length,
+    0
+  );
+  elements.nodeModeList.replaceChildren();
+  if (elements.nodeModeCount) {
+    elements.nodeModeCount.textContent = `${currentModeCount}/${modeCount}`;
+    elements.nodeModeCount.title = `${currentModeCount} DB Current modes / ${modeCount} node modes`;
+  }
+  if (!groups.length) {
+    elements.nodeModeList.append(
+      node("p", "node-mode-empty", "No nodes registered")
+    );
+    return;
+  }
+
+  const groupsById = new Map(groups.map((group) => [group.nodeId, group]));
+  const childrenByParent = new Map();
+  for (const group of groups) {
+    if (!group.parentProjectId || !groupsById.has(group.parentProjectId)) continue;
+    const children = childrenByParent.get(group.parentProjectId) || [];
+    children.push(group);
+    childrenByParent.set(group.parentProjectId, children);
+  }
+  const roots = groups.filter(
+    (group) => !group.parentProjectId || !groupsById.has(group.parentProjectId)
+  );
+  const appendGroup = (group, nested = false) => {
+    elements.nodeModeList.append(renderNodeModeGroup(group, { nested }));
+    for (const child of childrenByParent.get(group.nodeId) || []) {
+      appendGroup(child, true);
+    }
+  };
+  for (const group of roots) {
+    appendGroup(group);
   }
 }
 
@@ -2154,8 +2905,15 @@ function renderSessionRail() {
     if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) {
       group.unbound.push(room);
     } else if (
-      binding.is_default === true &&
-      binding.observer_currentness === "CURRENT"
+      (binding.is_default === true &&
+        binding.observer_currentness === "CURRENT") ||
+      (state.supervisorTerminals || []).some(
+        (t) =>
+          String(t.state || "").toUpperCase() === "LIVE" &&
+          String(t.project_id || "") === String(binding.node || binding.current_project_id || "") &&
+          String(t.mode || "").toUpperCase() === String(binding.mode || "").toUpperCase() &&
+          String(t.provider || "").toUpperCase() === String(room.provider || "").toUpperCase()
+      )
     ) {
       group.current.push(room);
     } else {
@@ -2489,17 +3247,16 @@ function renderSessionObservatory() {
         );
         state.selectedSupervisorAnchorKey = anchorSessionKey(session);
         elements.sessionObservatoryDialog.close();
-        if (project && session.mode === "MASTER") {
-          await callProjectMaster(project.project_id, {
-            anchorKey: state.selectedSupervisorAnchorKey,
-          });
-        } else if (session.mode === "CONDUCTOR") {
-          await callUniverseConductor({
-            provider: session.provider,
-            anchorKey: state.selectedSupervisorAnchorKey,
-          });
+        if ((project && session.mode === "MASTER") || session.mode === "CONDUCTOR") {
+          await activateAnchorSession(
+            session,
+            providerChatRoomForSupervisorSession(session)
+          );
         } else {
-          returnToUniverseConductor();
+          state.conversationSurface = "CHAT";
+          state.conversationTarget = { kind: "NONE", projectId: null };
+          renderComposerState();
+          renderRoomMessages();
         }
         await refreshSupervisorSessions();
       } catch (error) {
@@ -2546,28 +3303,6 @@ function renderSessionObservatory() {
   }
   renderSelectedSessionDetail();
   renderSessionRail();
-
-  if (elements.legacyExecutorList) {
-    elements.legacyExecutorList.replaceChildren();
-    for (const executor of state.legacyExecutors || []) {
-      const observation = executor.observation || {};
-      const row = node("article", "legacy-executor-row");
-      row.dataset.state = executor.status || "UNKNOWN";
-      const command = observation.command_profile || "Command unavailable";
-      row.append(
-        node("strong", "", executor.status || "UNKNOWN"),
-        node("span", "", `PID ${observation.pid || "UNKNOWN"}`),
-        node("code", "", command),
-        node("small", "", executor.reason || executor.required_route || "Observed")
-      );
-      elements.legacyExecutorList.append(row);
-    }
-    if (!(state.legacyExecutors || []).length) {
-      elements.legacyExecutorList.append(
-        node("p", "empty-copy", "No legacy Session Boot executor was observed.")
-      );
-    }
-  }
 
   elements.sessionEventList.replaceChildren();
   for (const event of (state.supervisorEvents || []).slice(0, 20)) {
@@ -2751,8 +3486,8 @@ function renderComposerActions() {
           : bridgeRegistered
             ? "Bridge registered / awaiting delivery"
           : isCurrent
-            ? "Project Room only"
-            : "Open Project Room"
+            ? "Master session selected"
+            : "Prepare Master session"
       )
     );
     action.addEventListener("click", async () => {
@@ -2771,16 +3506,80 @@ function renderComposerActions() {
 }
 
 function returnToUniverseConductor() {
+  showSessionSelection("");
+}
+
+function applyNewSessionCoordinates(
+  prepareBody,
+  options,
+  fallbackProjectId,
+  fallbackMode
+) {
+  if (options.sessionAction !== "NEW") return;
+  const projectId = String(options.projectId || fallbackProjectId || "").trim();
+  const cwd = String(options.cwd || "").trim();
+  const requestedMode = String(
+    options.requestedMode || fallbackMode || ""
+  ).trim().toUpperCase();
+  if (!projectId || !cwd || !requestedMode) {
+    throw new Error("New sessions require project, cwd, and Mode coordinates");
+  }
+  prepareBody.project_id = projectId;
+  prepareBody.cwd = cwd;
+  prepareBody.requested_mode = requestedMode;
+}
+
+function preparedSupervisorSession({ mode, projectId = "", connection = {}, anchorKey = "" }) {
+  const normalizedMode = String(mode || "").toUpperCase();
+  const normalizedProject = String(projectId || "").toLowerCase();
+  const expectedProvider = String(connection.last_provider || "").toUpperCase();
+  const expectedRef = String(connection.last_session_ref || "").trim();
+  const sessions = (state.supervisorSessions || []).filter((session) => {
+    if (String(session.mode || "").toUpperCase() !== normalizedMode) return false;
+    return !normalizedProject || String(session.node || "").toLowerCase() === normalizedProject;
+  });
+  const sessionRefMatches = (session) => [
+    session.provider_session_ref,
+    session.provider_session_id,
+    session.observer_session_ref,
+    session.session_ref,
+  ].some((value) => String(value || "").trim() === expectedRef);
+  return (
+    sessions.find((session) => anchorKey && anchorSessionKey(session) === anchorKey) ||
+    sessions.find((session) => expectedRef && sessionRefMatches(session)) ||
+    sessions.find((session) => session.is_default && (!expectedProvider || String(session.provider || "").toUpperCase() === expectedProvider)) ||
+    sessions.find((session) => session.is_default) ||
+    sessions.find((session) => !expectedProvider || String(session.provider || "").toUpperCase() === expectedProvider) ||
+    sessions[0] ||
+    null
+  );
+}
+
+function showSessionSelection(message = "Select a session to chat.") {
+  state.conversationSurface = "CHAT";
   closeProjectRoomStream();
-  state.conversationTarget = {
-    kind: "UNIVERSE_CONDUCTOR",
-    projectId: null,
-  };
+  state.conversationTarget = { kind: "NONE", projectId: null };
   closeComposerActionMenu();
   renderComposerActions();
   renderComposerState();
   renderRoomMessages();
-  elements.dispatchInstruction.focus();
+  if (message) toast(message);
+}
+
+async function openPreparedProviderSession({ mode, projectId = "", connection = {}, anchorKey = "" }) {
+  try {
+    await refreshSupervisorSessions();
+  } catch (error) {
+    console.warn("Provider session refresh after prepare failed", error);
+  }
+  const session = preparedSupervisorSession({ mode, projectId, connection, anchorKey });
+  const room = providerChatRoomForSupervisorSession(session);
+  if (session && room) {
+    await openProviderChatSession(room, { session });
+    return true;
+  }
+  showSessionSelection("Session is ready. Select it from the session card.");
+  return false;
 }
 
 async function callUniverseConductor(options = {}) {
@@ -2796,6 +3595,12 @@ async function callUniverseConductor(options = {}) {
   if (options.sessionAction) {
     prepareBody.session_action = options.sessionAction;
   }
+  applyNewSessionCoordinates(
+    prepareBody,
+    options,
+    options.projectId,
+    "CONDUCTOR"
+  );
   const prepared = await api("/v1/conductor-session/prepare", {
     method: "POST",
     body: prepareBody,
@@ -2825,19 +3630,12 @@ async function callUniverseConductor(options = {}) {
     throw new Error("Selected effort did not become the active Conductor connection");
   }
   state.providerSettings = await api("/v1/settings/providers");
-  returnToUniverseConductor();
-  if (options.anchorKey) {
-    state.selectedSupervisorAnchorKey = options.anchorKey;
-  }
-  try {
-    await refreshSupervisorSessions();
-  } catch (error) {
-    console.warn("Anchor Session refresh after Conductor prepare failed", error);
-  }
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.focus();
+  await openPreparedProviderSession({
+    mode: "CONDUCTOR",
+    projectId: options.projectId,
+    connection,
+    anchorKey: options.anchorKey,
+  });
   return connection;
 }
 
@@ -2857,6 +3655,12 @@ async function callProjectMaster(projectId, options = {}) {
   if (options.sessionAction) {
     prepareBody.session_action = options.sessionAction;
   }
+  applyNewSessionCoordinates(
+    prepareBody,
+    options,
+    projectId,
+    "MASTER"
+  );
   const prepared = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
     {
@@ -2893,23 +3697,12 @@ async function callProjectMaster(projectId, options = {}) {
   }
   state.providerSettings = await api("/v1/settings/providers");
   await selectProject(projectId);
-  state.conversationTarget = {
-    kind: "PROJECT_MASTER",
+  await openPreparedProviderSession({
+    mode: "MASTER",
     projectId,
-  };
-  if (options.anchorKey) {
-    state.selectedSupervisorAnchorKey = options.anchorKey;
-  }
-  openProjectRoomStream(projectId);
-  try {
-    await refreshSupervisorSessions();
-  } catch (error) {
-    console.warn("Anchor Session refresh after Project Master prepare failed", error);
-  }
-  renderComposerActions();
-  renderComposerState();
-  renderRoomMessages();
-  elements.dispatchInstruction.focus();
+    connection,
+    anchorKey: options.anchorKey,
+  });
 }
 
 async function attachSelectedMasterSession(session) {
@@ -2941,14 +3734,27 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
   const room = (state.providerChatRooms || []).find(
     (item) => item.chat_key === state.selectedProviderChatKey
   );
+  const pendingCoord = state.pendingNewSessionCoordinate;
   const session = supervisorSessionForRoom(room);
-  const project = sessionRailProjectIdentity(room);
-  const mode = String(room?.binding?.mode || "").toUpperCase();
+  const project = room
+    ? sessionRailProjectIdentity(room)
+    : { projectId: String(pendingCoord?.project?.project_id || ""), label: "" };
+  const mode = String(room?.binding?.mode || pendingCoord?.mode || "").toUpperCase();
+  const registeredProject = room
+    ? (state.projects || []).find(
+        (item) =>
+          String(item.project_id || "").toLowerCase() ===
+          String(project.projectId || "").toLowerCase()
+      )
+    : (pendingCoord?.project?.project_root
+        ? { project_id: pendingCoord.project.project_id, project_root: pendingCoord.project.project_root }
+        : null);
   if (
-    !room ||
+    (!room && !pendingCoord) ||
     !["MASTER", "CONDUCTOR"].includes(mode) ||
     (sessionAction !== "NEW" && !session) ||
-    (mode === "MASTER" && !project.projectId)
+    (mode === "MASTER" && !project.projectId) ||
+    (sessionAction === "NEW" && !registeredProject?.project_root)
   ) {
     throw new Error("Only an anchored Master or Conductor room can choose a provider and model");
   }
@@ -2964,21 +3770,41 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       `Connecting ${provider} / ${modelRef || "host default"} / ${effort}...`;
   }
   try {
+    // For NEW sessions the Claude process hasn't reported its session id yet
+    // when prepare returns, so last_provider is still UNKNOWN. Skip the
+    // provider/model/effort assertions — they only make sense on RESUME.
+    const isNew = String(sessionAction || "").toUpperCase() === "NEW";
     const options = {
       provider,
       modelRef,
       effort,
       sessionAction,
-      expectedProvider: provider,
-      expectedModel: modelRef,
-      expectedEffort: effort,
+      projectId: registeredProject?.project_id,
+      cwd: registeredProject?.project_root,
+      requestedMode: mode,
+      expectedProvider: isNew ? undefined : provider,
+      expectedModel: isNew ? undefined : modelRef,
+      expectedEffort: isNew ? undefined : effort,
     };
-    if (mode === "CONDUCTOR") {
+    if (isNew) {
+      // New sessions must first create the PTY-backed CLI surface.  Provider
+      // session identity is then observed and bound by the terminal Hook.
+      await startNewNodeModeSession({
+        ...(pendingCoord || {}),
+        project: registeredProject || pendingCoord?.project,
+        nodeId: registeredProject?.project_id || pendingCoord?.nodeId || project.projectId,
+        mode,
+        provider,
+        modelRef,
+        effort,
+      });
+    } else if (mode === "CONDUCTOR") {
       await callUniverseConductor(options);
     } else {
       await callProjectMaster(project.projectId, options);
     }
     elements.sessionSummaryDialog.close();
+    state.pendingNewSessionCoordinate = null;
     const targetLabel = mode === "CONDUCTOR" ? "Conductor" : "Project Master";
     const actionLabel = sessionAction === "NEW" ? "new session started" : "connected";
     toast(
@@ -3019,6 +3845,42 @@ function sessionUsageLabel(connection) {
 }
 
 function renderComposerState() {
+  const activeTerminal = typeof activeTerminalSession === "function"
+    ? activeTerminalSession()
+    : (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId);
+  const showTerminal =
+    state.conversationSurface === "CLI" && Boolean(activeTerminal);
+  const showConversation =
+    !showTerminal && state.conversationTarget.kind !== "NONE";
+  elements.roomMessageList.classList.toggle("hidden", !showConversation);
+  elements.dispatchForm.classList.toggle("hidden", !showConversation);
+  elements.terminalTabs.classList.toggle("hidden", !showTerminal);
+  elements.terminalStage.classList.toggle("hidden", !showTerminal);
+  const dockLabel = elements.conversationToggle?.querySelector(".chat-dock-label");
+  if (dockLabel) {
+    dockLabel.textContent = showTerminal
+      ? "CLI"
+      : state.conversationTarget.kind === "PROVIDER_SESSION"
+        ? "Chat"
+        : state.conversationTarget.kind === "NONE"
+          ? "Chat"
+          : "Project Room";
+  }
+  if (typeof applyCliDockTitle === "function") {
+    applyCliDockTitle(showTerminal ? activeTerminal : null);
+  }
+  if (showTerminal) return;
+  if (!showConversation) {
+    elements.conversationTitle.textContent = "Chat";
+    elements.conversationTargetLabel.textContent = "Select a session";
+    return;
+  }
+  elements.conversationTitle.textContent =
+    state.conversationTarget.kind === "PROVIDER_SESSION" ? "Session Chat" : "Project Room";
+  elements.conversationTargetLabel.textContent =
+    state.conversationTarget.kind === "PROVIDER_SESSION"
+      ? "Anchor-bound provider session"
+      : "Anchor-bound room conversation";
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
     const originAnchorRef = String(draft.origin_anchor_ref || "UNKNOWN");
@@ -3027,13 +3889,6 @@ function renderComposerState() {
     elements.roomHint.textContent =
       "Cross-session delegation / origin and target anchors are explicit / not direct chat";
     elements.dispatchInstruction.placeholder = "Instruction for the target session";
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Delegation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent =
-        `Origin ${originAnchorRef} → Target ${targetAnchorRef}`;
-    }
     return;
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
@@ -3047,13 +3902,6 @@ function renderComposerState() {
       `Direct Provider Session / ${connection.connection_state || state.providerSessionStreamState}`;
     elements.dispatchInstruction.placeholder =
       `Message ${target.alias || target.projectId}`;
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Conversation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent =
-        `${target.alias || target.projectId} / ${provider} / ${model}`;
-    }
     return;
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
@@ -3084,12 +3932,6 @@ function renderComposerState() {
         ? "LLM connected / Auto-approve " + autoApprove + (usage ? " / " + usage : "")
         : "Waiting for Runtime binding" + (usage ? " / " + usage : "");
     elements.dispatchInstruction.placeholder = "Message Universe Conductor";
-    if (elements.conversationTitle) {
-      elements.conversationTitle.textContent = "Conversation";
-    }
-    if (elements.conversationTargetLabel) {
-      elements.conversationTargetLabel.textContent = "Universe Conductor";
-    }
     return;
   }
   const projectId = state.conversationTarget.projectId;
@@ -3116,12 +3958,6 @@ function renderComposerState() {
       ? "Bridge registered / awaiting first delivery" + (usage ? " / " + usage : "")
       : "Project Room only" + (usage ? " / " + usage : "");
   elements.dispatchInstruction.placeholder = `Message ${projectId} Master`;
-  if (elements.conversationTitle) {
-    elements.conversationTitle.textContent = "Conversation";
-  }
-  if (elements.conversationTargetLabel) {
-    elements.conversationTargetLabel.textContent = `${projectId} Master`;
-  }
 }
 
 function setGraphScale(nextScale) {
@@ -3131,7 +3967,7 @@ function setGraphScale(nextScale) {
 
 /** Graph canvas modes only (not inspector tabs). */
 function showGraphView(view) {
-  const allowed = new Set(["universe", "timeline", "documents", "implementation"]);
+  const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
   state.view = view;
   document.body.classList.add("graph-mode");
@@ -3139,9 +3975,18 @@ function showGraphView(view) {
   state.focusedNodeId = null;
   elements.nodeBreadcrumb?.classList.add("hidden");
   syncPrimaryNavSelection(
-    view === "universe" ? "map" : view
+    ["universe", "semantic"].includes(view) ? "map" : view
   );
+  if (view !== "sessions") {
+    setGraphLegend([
+      { kind: "project", label: "Project" },
+      { kind: "system", label: "Project Seed node" },
+      { kind: "predicted", label: "Predicted" },
+      { kind: "document", label: "Document" },
+    ]);
+  }
   buildGraph();
+  if (view === "sessions") fitGraphView();
   renderDetails();
 }
 
@@ -3154,12 +3999,14 @@ function showGoalPlanView() {
 
 /** Highlight top nav without toast placeholders. */
 function syncPrimaryNavSelection(primaryView) {
-  if (!elements.primaryNav) return;
-  for (const item of elements.primaryNav.querySelectorAll("[data-primary-view]")) {
-    item.classList.toggle(
-      "selected",
-      item.getAttribute("data-primary-view") === primaryView
-    );
+  for (const root of [elements.primaryNav, elements.utilityRail]) {
+    if (!root) continue;
+    for (const item of root.querySelectorAll("[data-primary-view]")) {
+      item.classList.toggle(
+        "selected",
+        item.getAttribute("data-primary-view") === primaryView
+      );
+    }
   }
 }
 
@@ -3199,7 +4046,11 @@ function fitGraphView() {
   const viewportHeight = height / ratio;
   const spanX = Math.max(180, maxX - minX + 160);
   const spanY = Math.max(140, maxY - minY + 140);
-  const scale = Math.min(1.6, Math.max(0.5, Math.min(viewportWidth / spanX, viewportHeight / spanY)));
+  const minimumScale = state.view === "sessions" ? 0.12 : 0.5;
+  const scale = Math.min(
+    1.6,
+    Math.max(minimumScale, Math.min(viewportWidth / spanX, viewportHeight / spanY))
+  );
   state.graph.scale = scale;
   state.graph.x = -((minX + maxX) / 2) * scale;
   state.graph.y = -((minY + maxY) / 2) * scale;
@@ -3244,8 +4095,26 @@ async function refresh({ syncSelectedProject = false } = {}) {
         state.accessSurface === "REMOTE_BROWSER" ? "목록 · 다른 유니버스" : "목록";
     }
 
+    // Project navigation is the first usable UI surface after a server
+    // restart.  Do not hold its first render behind optional catalog,
+    // provider, and room requests: one slow request used to display an empty
+    // Node Modes panel for several seconds even though the project DB had
+    // already responded.
+    const projectResultPromise = api("/v1/projects");
+    const todoResultPromise = api("/v1/todos");
+    const releaseResultPromise = api("/v1/releases");
+    const conductorRoomResultPromise = api("/v1/conductor-room/messages");
+    const governanceProposalInboxResultPromise = api("/v1/governance-proposals");
+    const providerSettingsPromise = api("/v1/settings/providers");
+    const hostToolsPromise = api("/v1/settings/host-tools");
+    const providerModelsResultPromise = api("/v1/settings/provider-models").catch(
+      () => null
+    );
+    const projectResult = await projectResultPromise;
+    state.projects = projectResult.projects;
+    renderProjects();
+    renderNodeModes();
     const [
-      projectResult,
       todoResult,
       releaseResult,
       conductorRoomResult,
@@ -3253,18 +4122,15 @@ async function refresh({ syncSelectedProject = false } = {}) {
       providerSettings,
       hostTools,
       providerModelsResult,
-    ] =
-      await Promise.all([
-      api("/v1/projects"),
-      api("/v1/todos"),
-      api("/v1/releases"),
-      api("/v1/conductor-room/messages"),
-      api("/v1/governance-proposals"),
-      api("/v1/settings/providers"),
-      api("/v1/settings/host-tools"),
-      api("/v1/settings/provider-models").catch(() => null),
+    ] = await Promise.all([
+      todoResultPromise,
+      releaseResultPromise,
+      conductorRoomResultPromise,
+      governanceProposalInboxResultPromise,
+      providerSettingsPromise,
+      hostToolsPromise,
+      providerModelsResultPromise,
     ]);
-    state.projects = projectResult.projects;
     state.todos = todoResult.todos;
     state.releases = releaseResult.releases;
     state.conductorMessages = conductorRoomResult.messages || [];
@@ -3277,20 +4143,22 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.providerSettings = providerSettings;
     state.providerModels = providerModelsResult?.catalog || providerModelsResult;
     state.hostTools = hostTools;
-    try {
-      await refreshSupervisorSessions();
-    } catch (error) {
+    // Core project navigation must become interactive without waiting for the
+    // slower Session Observatory catalog and Runtime audit.
+    renderProjects();
+    renderNodeModes();
+    renderComposerActions();
+    renderReleaseCatalog();
+    void refreshSupervisorSessions().catch((error) => {
       state.supervisorSessions = [];
       state.supervisorEvents = [];
-      state.legacyExecutors = [];
       renderSessionObservatory();
       console.warn("Session Supervisor refresh failed", error);
-    }
+    });
     // Multiverse keeps every project tree expanded — load all projections first.
     await loadAllProjectProjections();
     renderProjects();
-    renderComposerActions();
-    renderReleaseCatalog();
+    renderNodeModes();
     const preferred =
       state.selectedProject &&
       state.projects.find(
@@ -3302,7 +4170,10 @@ async function refresh({ syncSelectedProject = false } = {}) {
         syncAssets: syncSelectedProject,
       });
     } else if (state.projects.length) {
-      await selectProject(state.projects[0].project_id, {
+      const initialProject =
+        state.projects.find((project) => project.project_id === "universe") ||
+        state.projects[0];
+      await selectProject(initialProject.project_id, {
         revealInspector: false,
         syncAssets: syncSelectedProject,
       });
@@ -3312,6 +4183,9 @@ async function refresh({ syncSelectedProject = false } = {}) {
       state.dispatches = [];
       state.masterBridge = null;
       renderEmpty();
+    }
+    if (typeof loadTerminalTabs === "function") {
+      void loadTerminalTabs();
     }
   } catch (error) {
     elements.serviceStatus.dataset.state = "error";
@@ -3464,6 +4338,28 @@ function renderProjects() {
 }
 
 function renderReleaseCatalog() {
+  const previousTarget =
+    state.selectedReleaseTargetProjectId ||
+    elements.releaseTargetProject.value ||
+    "";
+  elements.releaseTargetProject.replaceChildren(
+    new Option("Select a project", "")
+  );
+  const targetProjects = visibleProjects();
+  for (const project of targetProjects) {
+    elements.releaseTargetProject.append(
+      new Option(
+        `${projectDisplayName(project)} · ${project.project_root}`,
+        project.project_id
+      )
+    );
+  }
+  const targetExists = targetProjects.some(
+    (project) => project.project_id === previousTarget
+  );
+  elements.releaseTargetProject.value = targetExists ? previousTarget : "";
+  state.selectedReleaseTargetProjectId = elements.releaseTargetProject.value || null;
+
   elements.releaseList.replaceChildren();
   if (!state.releases.length) {
     elements.releaseList.append(
@@ -3491,12 +4387,14 @@ function renderReleaseCatalog() {
     const action = node(
       "button",
       "secondary-button",
-      state.selectedProject ? "Plan project update" : "Select a project first"
+      state.selectedReleaseTargetProjectId
+        ? "Plan project update"
+        : "Select a target project"
     );
     action.type = "button";
-    action.disabled = !state.selectedProject;
+    action.disabled = !state.selectedReleaseTargetProjectId;
     action.addEventListener("click", () =>
-      proposeProjectRelease(release.release_id)
+      proposeProjectRelease(release.release_id, action)
     );
     card.append(action);
     elements.releaseList.append(card);
@@ -3510,45 +4408,75 @@ function showReleaseProposal(proposal) {
     "blocked",
     proposal.status === "PROJECT_RELEASE_PROPOSAL_BLOCKED"
   );
+  const plan = proposal.plan && typeof proposal.plan === "object"
+    ? proposal.plan
+    : {};
+  const actions = Array.isArray(plan.actions) ? plan.actions : [];
+  const collisions = Array.isArray(plan.collisions) ? plan.collisions : [];
   const actionCounts = {};
-  for (const action of proposal.plan.actions) {
+  for (const action of actions) {
     actionCounts[action.action] = (actionCounts[action.action] || 0) + 1;
   }
+  const legacySummary = actions.length || collisions.length
+    ? `collisions ${collisions.length} / actions ${Object.entries(actionCounts)
+        .map(([name, count]) => `${name}:${count}`)
+        .join(", ") || "none"}`
+    : `installed Runtime ${plan.installed_runtime?.state || "UNKNOWN"} / Host preflight ${
+        plan.project_host_preflight || "UNKNOWN"
+      }`;
   elements.releaseProposalOutput.append(
     node("h3", "", proposal.status),
     node(
       "p",
       "",
       `${proposal.release_id} → ${proposal.project_id} / ${
-        proposal.plan.operation
+        plan.operation || "UNKNOWN"
       }`
     ),
     node(
       "p",
       "",
-      `Plan ${proposal.plan.plan_digest} / collisions ${
-        proposal.plan.collisions.length
-      } / actions ${Object.entries(actionCounts)
-        .map(([name, count]) => `${name}:${count}`)
-        .join(", ")}`
+      `Plan ${plan.plan_digest || "UNKNOWN"} / ${legacySummary}`
     ),
     node(
       "p",
       "",
-      "No project files were changed. Approval and Project Host apply are separate."
+      "No project files were changed. Apply runs the displayed Runtime lifecycle plan."
     )
   );
+  if (proposal.status !== "PROJECT_RELEASE_PROPOSAL_BLOCKED") {
+    const applyButton = node(
+      "button",
+      "primary-button release-apply-button",
+      `Apply ${plan.operation || "project update"}`
+    );
+    applyButton.type = "button";
+    applyButton.addEventListener("click", () =>
+      applyProjectRelease(proposal, applyButton)
+    );
+    elements.releaseProposalOutput.append(applyButton);
+  }
 }
 
-async function proposeProjectRelease(releaseId) {
-  if (!state.selectedProject) {
-    toast("Select a project", true);
+function releasePlanErrorMessage(error) {
+  const detail = error && typeof error.message === "string"
+    ? error.message.trim()
+    : "";
+  return detail || "Project update plan could not be created";
+}
+
+async function proposeProjectRelease(releaseId, button = null) {
+  const projectId = state.selectedReleaseTargetProjectId;
+  if (!projectId) {
+    toast("Select a target project", true);
     return;
   }
+  elements.releaseFormError.textContent = "";
+  if (button) button.disabled = true;
   try {
     const result = await api(
       `/v1/projects/${encodeURIComponent(
-        state.selectedProject.project_id
+        projectId
       )}/release-proposals`,
       {
         method: "POST",
@@ -3564,7 +4492,11 @@ async function proposeProjectRelease(releaseId) {
     showReleaseProposal(result.proposal);
     toast("Project update plan recorded");
   } catch (error) {
-    elements.releaseFormError.textContent = error.message;
+    const detail = releasePlanErrorMessage(error);
+    elements.releaseFormError.textContent = detail;
+    toast(detail, true);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -3596,6 +4528,8 @@ async function selectProject(
     handoffResult,
     skillPlanAdoptionResult,
     observationResult,
+    skillGapResult,
+    skillCandidateResult,
     benchResult,
     benchCompareResult,
     experienceResult,
@@ -3606,12 +4540,17 @@ async function selectProject(
     memoryBatchConfigResult,
     memoryBatchRunResult,
     memoryCandidateResult,
+    featureProposalResult,
+    workLoopResult,
+    semanticGraphResult,
   ] = await Promise.all([
-    project.projection_available === false
-      ? Promise.resolve(null)
-      : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
-          () => null
-        ),
+    state.projectionsByProject?.[projectId]
+      ? Promise.resolve({ projection: state.projectionsByProject[projectId] })
+      : project.projection_available === false
+        ? Promise.resolve(null)
+        : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
+            () => null
+          ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
@@ -3631,6 +4570,12 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/skill-observations`
     ).catch(() => ({ observations: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-gap-summary`
+    ).catch(() => ({ summary: { groups: [], observation_count: 0 } })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/skill-candidates`
+    ).catch(() => ({ candidates: [] })),
     api("/v1/bench/skills").catch(() => ({ bench: [] })),
     api("/v1/bench/compare?group_by=worker&limit=20").catch(() => ({
       comparisons: [],
@@ -3659,6 +4604,21 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
     ).catch(() => ({ candidates: [] })),
+    api(
+      `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
+    ).catch(() => ({ proposals: [] })),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/work-loop`).catch(
+      () => ({
+        predictions: [],
+        result_fanouts: [],
+        review_candidates: [],
+        memory_schedules: [],
+        document_automation: null,
+      })
+    ),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`).catch(
+      () => ({ nodes: [], edges: [], invariants: { projection_only: true } })
+    ),
   ]);
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
@@ -3683,6 +4643,8 @@ async function selectProject(
   state.masterHandoffs = handoffResult.handoffs || [];
   state.skillPlanAdoptions = skillPlanAdoptionResult.adoptions || [];
   state.skillObservations = observationResult.observations || [];
+  state.skillGapSummary = skillGapResult.summary || { groups: [], observation_count: 0 };
+  state.skillCandidates = skillCandidateResult.candidates || [];
   state.skillBench = benchResult.bench || [];
   state.benchComparisons = benchCompareResult.comparisons || [];
   state.experienceCases = experienceResult.cases || [];
@@ -3693,11 +4655,29 @@ async function selectProject(
   state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
+  state.featureNodeProposals = featureProposalResult.proposals || [];
+  state.workLoop = workLoopResult || null;
+  state.semanticGraph = semanticGraphResult || null;
+  const universeGoalResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   const goalPlanResult = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
   ).catch(() => ({ goals: [], unassigned_todos: [] }));
   state.goals = goalPlanResult.goals || [];
-  state.unassignedTodos = goalPlanResult.unassigned_todos || [];
+  const automationEntries = await Promise.all(
+    state.goals.map(async (goal) => {
+      const surface = await api(
+        `/v1/goals/${encodeURIComponent(goal.goal_id)}/automation`
+      ).catch(() => null);
+      return [goal.goal_id, surface];
+    })
+  );
+  state.goalAutomationSurfaces = Object.fromEntries(
+    automationEntries.filter(([, surface]) => surface)
+  );
+  state.universeGoals = universeGoalResult.goals || [];
+  state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
+    (todo) => todo.state !== "DONE"
+  );
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -3733,31 +4713,6 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 }
 
 
-function conversationMessageCount() {
-  if (state.conversationTarget.kind === "SESSION_DELEGATION") {
-    return state.sessionDelegationDraft ? 1 : 0;
-  }
-  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
-    return (state.providerSessionMessages || []).length;
-  }
-  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
-    return (state.conductorMessages || []).length;
-  }
-  return (state.roomMessages || []).length;
-}
-
-function updateConversationBadge() {
-  if (!elements.conversationBadge) return;
-  const count = conversationMessageCount();
-  if (count > 0) {
-    elements.conversationBadge.textContent = count > 99 ? "99+" : String(count);
-    elements.conversationBadge.classList.remove("hidden");
-  } else {
-    elements.conversationBadge.textContent = "0";
-    elements.conversationBadge.classList.add("hidden");
-  }
-}
-
 function syncConversationToggle(collapsed) {
   if (!elements.conversationToggle) return;
   const title = collapsed ? "Expand conversation" : "Collapse conversation";
@@ -3771,11 +4726,12 @@ function expandConversationLayer() {
   if (elements.conversationLayer.classList.contains("collapsed")) {
     elements.conversationLayer.classList.remove("collapsed");
     syncConversationToggle(false);
+    if (typeof refitActiveTerminal === "function") refitActiveTerminal();
   }
 }
 
 const CHAT_PANEL_MIN_WIDTH = 300;
-const CHAT_PANEL_MAX_WIDTH = 560;
+const CHAT_PANEL_MAX_WIDTH = 900;
 
 function clampChatPanelWidth(width) {
   const requested = Number(width);
@@ -3808,6 +4764,55 @@ function setChatPanelWidth(width, { persist = false } = {}) {
     } catch (_error) {
       // Local preference storage is optional.
     }
+  }
+}
+
+async function applyProjectRelease(proposal, button) {
+  const projectId = String(proposal.project_id || "");
+  if (!projectId) {
+    toast("Release proposal has no target project", true);
+    return;
+  }
+  button.disabled = true;
+  elements.releaseFormError.textContent = "";
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/release-proposals/apply`,
+      {
+        method: "POST",
+        body: {
+          approval: "APPROVED",
+          proposal_id: proposal.proposal_id,
+          proposal_digest: proposal.proposal_digest,
+        },
+      }
+    );
+    const receipt = result.receipt || {};
+    elements.releaseProposalOutput.replaceChildren(
+      node("h3", "", result.status || "PROJECT_RELEASE_APPLICATION_COMPLETED"),
+      node("p", "", `${proposal.release_id} → ${projectId}`),
+      node(
+        "p",
+        "",
+        `Release ${receipt.release_id || proposal.release_id} / DB ${
+          receipt.release_database_sha256 ||
+          proposal.release_database_sha256 ||
+          "UNKNOWN"
+        }`
+      ),
+      node(
+        "p",
+        "",
+        `Project Host ${result.master_host?.status || "UNKNOWN"}`
+      )
+    );
+    toast(`Runtime update applied to ${projectId}`);
+    await refresh({ syncSelectedProject: false });
+  } catch (error) {
+    const detail = releasePlanErrorMessage(error);
+    elements.releaseFormError.textContent = detail;
+    toast(detail, true);
+    button.disabled = false;
   }
 }
 
@@ -3863,58 +4868,75 @@ function initChatPanelResize() {
   });
 }
 
+function pendingConversationPermissions() {
+  if (state.conversationTarget.kind === "PROVIDER_SESSION") {
+    return (state.providerSessionPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
+    return (state.conductorPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  if (state.conversationTarget.kind === "PROJECT_MASTER") {
+    return (state.projectPermissions || []).filter(
+      (item) => item.state === "PENDING"
+    );
+  }
+  return [];
+}
+
 function pendingActionItems() {
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
-    return { proposals: [], permissions: [], delegations: [] };
+    return { delegations: [], activities: [] };
   }
   if (state.conversationTarget.kind === "PROVIDER_SESSION") {
     return {
-      proposals: [],
-      permissions: (state.providerSessionPermissions || []).filter(
-        (item) => item.state === "PENDING"
-      ),
       delegations: [],
+      activeReply: activeProviderSessionReply(),
+      activities: [],
     };
   }
   if (state.conversationTarget.kind === "UNIVERSE_CONDUCTOR") {
     return {
-      proposals: (state.governanceProposalInbox || []).filter(
-        (item) => item.state === "PROPOSED"
-      ),
-      permissions: (state.conductorPermissions || []).filter(
-        (item) => item.state === "PENDING"
-      ),
-      delegations: (state.conductorDelegations || []).filter((item) =>
-        ["QUEUED", "RUNNING", "CANCELLATION_REQUESTED"].includes(item.state)
-      ),
+      // Cross-session delivery is internal automation state.  A user chats
+      // with the selected Session Card; it is not a generic work queue.
+      delegations: [],
+      history: [],
+      activities: [],
     };
   }
-  return {
-    proposals: (state.governanceProposals || []).filter(
-      (item) => item.state === "PROPOSED"
-    ),
-    permissions: (state.projectPermissions || []).filter(
-      (item) => item.state === "PENDING"
-    ),
-    delegations: [],
-  };
+  return { delegations: [], activities: [] };
 }
 
 function actionInboxCount() {
   const items = pendingActionItems();
-  return items.proposals.length + items.permissions.length + items.delegations.length;
+  return (
+    items.delegations.length +
+    (items.activeReply ? 1 : 0) +
+    items.activities.length
+  );
 }
 
 function updateActionInboxBadge() {
-  if (!elements.actionInboxBadge) return;
   const count = actionInboxCount();
-  elements.actionInboxBadge.textContent = count > 99 ? "99+" : String(count);
-  elements.actionInboxBadge.classList.toggle("hidden", count === 0);
+  const label = count > 99 ? "99+" : String(count);
+  for (const badge of [elements.actionInboxBadge, elements.mobileActionInboxBadge]) {
+    if (!badge) continue;
+    badge.textContent = label;
+    badge.classList.toggle("hidden", count === 0);
+  }
 }
 
 function renderDelegationActionCard(delegation) {
   const item = node("article", "action-inbox-card delegation-action-card");
-  const summary = delegation.request?.summary || "Bounded delegated work";
+  const stateValue = String(delegation.state || "UNKNOWN").toUpperCase();
+  item.dataset.state = stateValue;
+  const summary = String(
+    delegation.request?.summary || "Bounded delegated work"
+  ).replace(/\s+/g, " " ).trim();
+  const preview = summary.length > 240 ? `${summary.slice(0, 237)}...` : summary;
   const progress = delegation.progress?.summary || "Awaiting coordinator progress";
   item.append(
     node(
@@ -3922,10 +4944,19 @@ function renderDelegationActionCard(delegation) {
       "",
       `DELEGATION / ${delegation.request?.worker_role || "WORKER"}`
     ),
-    node("p", "", summary),
-    node("small", "", `${delegation.state} / ${progress}`)
+    node("p", "delegation-action-summary", preview),
+    node("small", "delegation-action-state", stateValue),
+    node("p", "delegation-action-progress", `Last update: ${progress}`)
   );
-  if (["QUEUED", "RUNNING"].includes(delegation.state)) {
+  if (summary.length > 240) {
+    const disclosure = node("details", "action-inbox-disclosure");
+    disclosure.append(
+      node("summary", "", "View full request"),
+      node("p", "delegation-action-full", summary)
+    );
+    item.append(disclosure);
+  }
+  if (["QUEUED", "RUNNING"].includes(stateValue)) {
     const actions = node("div", "proposal-actions");
     const cancel = node("button", "secondary-button", "Cancel");
     cancel.type = "button";
@@ -3963,38 +4994,172 @@ async function cancelConductorDelegation(delegation) {
   }
 }
 
+function renderProviderReplyActionCard(reply) {
+  const item = node("article", "action-inbox-card provider-reply-action-card");
+  const stateValue = String(reply?.state || "STARTING").toUpperCase();
+  item.append(
+    node("strong", "", "PROVIDER REPLY / ACTIVE"),
+    node("p", "", "A Provider reply is still running for this room."),
+    node("small", "", stateValue.replaceAll("_", " "))
+  );
+  const actions = node("div", "proposal-actions");
+  const cancel = node("button", "secondary-button",
+    stateValue === "CANCELLATION_REQUESTED" ? "Cancellation requested" : "Cancel reply"
+  );
+  cancel.type = "button";
+  cancel.disabled = stateValue === "CANCELLATION_REQUESTED";
+  cancel.addEventListener("click", cancelProviderSessionTurn);
+  actions.append(cancel);
+  item.append(actions);
+  return item;
+}
+
+function actionInboxTitle() {
+  const target = state.conversationTarget || {};
+  if (target.kind === "UNIVERSE_CONDUCTOR") return "Universe actions";
+  if (target.kind === "SESSION_DELEGATION") return "Delegation actions";
+  // A redacted provider-session target can arrive without an alias or a
+  // project id.  Fall back through the remaining coordinates instead of
+  // interpolating a missing value into the heading.
+  const label = [target.alias, target.projectId, target.node, target.mode]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .find((value) => value && value !== "null" && value !== "undefined");
+  return label ? `${label} actions` : "Actions";
+}
+
+function actionInboxApprovals() {
+  // Approvals are this session's own pending permission prompts.  Governance
+  // Proposals stay out of the Actions surface; it is not a generic work queue.
+  return pendingConversationPermissions();
+}
+
+function actionInboxHistory() {
+  return Array.isArray(state.gitWorkHistory) ? state.gitWorkHistory : [];
+}
+
+async function loadActionInboxHistory() {
+  const target = state.conversationTarget || {};
+  const projectId = target.projectId || target.node;
+  if (!projectId) {
+    state.gitWorkHistory = [];
+    return;
+  }
+  const anchorRef = target.session_anchor_ref || target.current_anchor_ref || "";
+  const query = anchorRef
+    ? `?session_anchor_ref=${encodeURIComponent(anchorRef)}`
+    : "";
+  try {
+    const payload = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/git-work-history${query}`
+    );
+    state.gitWorkHistory = Array.isArray(payload.entries) ? payload.entries : [];
+  } catch (error) {
+    // History is observational.  A failed read must not break the dialog.
+    state.gitWorkHistory = [];
+  }
+}
+
+function renderGitHistoryActionCard(entry) {
+  const item = node("article", "action-inbox-card git-history-action-card");
+  const operation = String(entry.operation || "GIT").toUpperCase();
+  const stateValue = String(entry.state || "OBSERVED").toUpperCase();
+  item.dataset.state = stateValue;
+  item.append(node("strong", "", `${operation} · ${stateValue}`));
+  const detail = [entry.short_sha || entry.commit_sha, entry.branch, entry.remote]
+    .filter(Boolean)
+    .join(" · ");
+  if (detail) item.append(node("p", "action-inbox-card-detail", detail));
+  item.append(
+    node(
+      "small",
+      "action-inbox-card-attribution",
+      entry.attribution === "EXACT"
+        ? `${entry.session_anchor_ref} · ${entry.terminal_id || "terminal UNKNOWN"}`
+        : "UNATTRIBUTED · no exact Session Anchor recorded"
+    )
+  );
+  if (entry.created_at) {
+    item.append(node("small", "action-inbox-card-time", entry.created_at));
+  }
+  return item;
+}
+
+function renderApprovalActionCard(permission) {
+  const item = node("article", "action-inbox-card approval-action-card");
+  item.dataset.state = String(permission.state || "PENDING").toUpperCase();
+  item.append(
+    node(
+      "strong",
+      "",
+      `${permission.provider || "UNKNOWN"} / APPROVAL REQUIRED`
+    )
+  );
+  if (permission.title) {
+    item.append(node("p", "action-inbox-card-detail", permission.title));
+  }
+  item.append(
+    node(
+      "small",
+      "action-inbox-card-attribution",
+      String(permission.state || "PENDING").toUpperCase()
+    )
+  );
+  return item;
+}
+
 function renderActionInbox() {
   updateActionInboxBadge();
   if (!elements.actionInboxList) return;
   const items = pendingActionItems();
   elements.actionInboxList.replaceChildren();
-  const title = state.conversationTarget.kind === "UNIVERSE_CONDUCTOR"
-    ? "Universe actions"
-    : state.conversationTarget.kind === "SESSION_DELEGATION"
-      ? "Delegation actions"
-    : state.conversationTarget.kind === "PROVIDER_SESSION"
-      ? `${state.conversationTarget.alias || state.conversationTarget.projectId} actions`
-      : `${state.conversationTarget.projectId} actions`;
-  if (elements.actionInboxTitle) elements.actionInboxTitle.textContent = title;
-  for (const proposal of items.proposals) {
-    elements.actionInboxList.append(renderGovernanceProposalCard(proposal));
+  if (elements.actionInboxTitle) {
+    elements.actionInboxTitle.textContent = actionInboxTitle();
   }
-  for (const permission of items.permissions) {
-    elements.actionInboxList.append(renderPermissionCard(permission));
-  }
-  for (const delegation of items.delegations) {
-    elements.actionInboxList.append(renderDelegationActionCard(delegation));
-  }
+
+  const appendSection = (label, cards) => {
+    if (!cards.length) return;
+    const section = node("section", "action-inbox-section");
+    section.setAttribute("aria-label", label);
+    section.append(node("h3", "action-inbox-section-title", label));
+    const list = node("div", "action-inbox-section-list");
+    list.append(...cards);
+    section.append(list);
+    elements.actionInboxList.append(section);
+  };
+
+  const activeWork = items.delegations.map((delegation) =>
+    renderDelegationActionCard(delegation)
+  );
+  if (items.activeReply) activeWork.push(renderProviderReplyActionCard(items.activeReply));
+  appendSection("Active work", activeWork);
+  appendSection(
+    "History",
+    actionInboxHistory().map((entry) => renderGitHistoryActionCard(entry))
+  );
+  appendSection(
+    "Approvals",
+    actionInboxApprovals().map((proposal) => renderApprovalActionCard(proposal))
+  );
   if (!elements.actionInboxList.childElementCount) {
-    elements.actionInboxList.append(node("p", "empty-copy", "No pending actions"));
+    elements.actionInboxList.append(
+      node("p", "empty-copy", "No active work.")
+    );
   }
+}
+
+async function openActionInbox() {
+  renderActionInbox();
+  if (elements.actionInboxDialog && !elements.actionInboxDialog.open) {
+    elements.actionInboxDialog.showModal();
+  }
+  await loadActionInboxHistory();
+  renderActionInbox();
 }
 
 function finishRoomMessageRender(previousScrollTop, stickToBottom = false) {
   elements.roomMessageList.scrollTop = stickToBottom
     ? elements.roomMessageList.scrollHeight
     : previousScrollTop;
-  updateConversationBadge();
   renderActionInbox();
 }
 
@@ -4009,6 +5174,16 @@ function renderRoomMessages() {
       elements.conversationExpand?.checked
   );
   elements.roomMessageList.replaceChildren();
+  if (state.conversationTarget.kind === "NONE") {
+    elements.roomMessageList.append(
+      node("p", "empty-copy", "Select a session to chat.")
+    );
+    finishRoomMessageRender(previousScrollTop, stickToBottom);
+    return;
+  }
+  for (const permission of pendingConversationPermissions()) {
+    elements.roomMessageList.append(renderPermissionCard(permission));
+  }
   if (state.conversationTarget.kind === "SESSION_DELEGATION") {
     const draft = state.sessionDelegationDraft || state.conversationTarget;
     const delegation = (state.sessionDelegations || []).find(
@@ -4163,102 +5338,6 @@ function renderRoomMessages() {
     elements.roomMessageList.append(item);
   }
   finishRoomMessageRender(previousScrollTop, stickToBottom);
-}
-
-function renderGovernanceProposalCard(proposal) {
-  const item = node("article", "room-message governance-proposal-request");
-  const summary = proposal.task_summary || "Project task proposal";
-  const digest = String(proposal.proposal_digest || "UNKNOWN");
-  const scope = proposal.scope && Object.keys(proposal.scope).length
-    ? JSON.stringify(proposal.scope)
-    : proposal.boundary || "Project scope";
-  item.append(
-    node(
-      "strong",
-      "",
-      `GOVERNANCE / ${proposal.project_id} / APPROVAL REQUIRED`
-    ),
-    node("p", "proposal-title", summary),
-    node("small", "proposal-boundary", proposal.boundary || "Scope recorded"),
-    node("small", "proposal-coordinate", `ID ${proposal.proposal_id}`),
-    node("small", "proposal-coordinate", `Digest ${digest.slice(0, 16)}...`),
-    node("small", "proposal-scope", scope)
-  );
-  const actions = node("div", "proposal-actions");
-  const approve = node("button", "proposal-approve", "Approve");
-  approve.type = "button";
-  approve.title = `Approve ${proposal.proposal_id}`;
-  approve.addEventListener("click", () =>
-    decideGovernanceProposal(proposal, "APPROVE")
-  );
-  const cancel = node("button", "proposal-cancel", "Cancel");
-  cancel.type = "button";
-  cancel.title = `Cancel ${proposal.proposal_id}`;
-  cancel.addEventListener("click", () =>
-    decideGovernanceProposal(proposal, "CANCEL")
-  );
-  actions.append(cancel, approve);
-  item.append(actions);
-  return item;
-}
-
-async function decideGovernanceProposal(proposal, decision) {
-  if (!state.projects.some((project) => project.project_id === proposal.project_id)) {
-    toast("Proposal project is no longer attached", true);
-    return false;
-  }
-  try {
-    const result = await api(
-      `/v1/governance/proposals/${encodeURIComponent(
-        proposal.proposal_id
-      )}/decision`,
-      {
-        method: "POST",
-        body: {
-          decision,
-          proposal_digest: proposal.proposal_digest,
-        },
-      }
-    );
-    state.governanceProposals = [
-      ...(state.selectedProject?.project_id === result.proposal.project_id
-        ? [result.proposal]
-        : []),
-      ...state.governanceProposals.filter(
-        (item) => item.proposal_id !== result.proposal.proposal_id
-      ),
-    ];
-    mergeGovernanceProposalInbox(result.proposal.project_id, [
-      result.proposal,
-      ...state.governanceProposalInbox.filter(
-        (item) =>
-          item.project_id === result.proposal.project_id &&
-          item.proposal_id !== result.proposal.proposal_id
-      ),
-    ]);
-    if (
-      result.message &&
-      state.selectedProject?.project_id === result.proposal.project_id
-    ) {
-      state.roomMessages = dedupeRoomMessages([
-        ...state.roomMessages.filter(
-          (message) => message.message_id !== result.message.message_id
-        ),
-        result.message,
-      ]);
-    }
-    renderProjects();
-    renderRoomMessages();
-    toast(
-      decision === "CANCEL"
-        ? "Governance Proposal cancelled"
-        : "Governance Proposal approved and delivered to Project Master"
-    );
-    return true;
-  } catch (error) {
-    toast(error.message, true);
-    return false;
-  }
 }
 
 function requestedPermissionSummary(value) {
@@ -4439,59 +5518,6 @@ function providerStatusText(setting) {
   )}`;
 }
 
-function providerProfileSetting(scopeKind, scopeId) {
-  if (scopeKind === "UNIVERSE_CONDUCTOR") {
-    return state.providerSettings?.universe_conductor || null;
-  }
-  return (
-    state.providerSettings?.project_masters?.find(
-      (item) => item.scope_id === scopeId
-    ) || null
-  );
-}
-
-function renderProviderSettings() {
-  const settings = state.providerSettings;
-  if (!settings) return;
-  const conductor = settings.universe_conductor;
-  elements.universeProviderSetting.textContent = "Configure";
-  elements.universeProviderStatus.textContent = providerStatusText(conductor);
-  elements.projectProviderSettings.replaceChildren();
-  for (const project of operableProjects()) {
-    const setting =
-      settings.project_masters?.find(
-        (item) => item.scope_id === project.project_id
-      ) || { provider: "AUTO", resolved_provider: "UNAVAILABLE" };
-    const row = node("div", "project-provider-row provider-profile-row");
-    row.dataset.projectId = project.project_id;
-    const copy = node("div", "project-provider-copy provider-profile-copy");
-    copy.append(
-      node("strong", "", `${project.project_id} Master`),
-      node("small", "", providerStatusText(setting))
-    );
-    const configure = node(
-      "button",
-      "secondary-button provider-profile-button",
-      "Configure"
-    );
-    configure.type = "button";
-    configure.addEventListener("click", () => {
-      openProviderProfileDialog({
-        scopeKind: "PROJECT_MASTER",
-        scopeId: project.project_id,
-        label: `${project.project_id} Master`,
-      });
-    });
-    row.append(copy, configure);
-    elements.projectProviderSettings.append(row);
-  }
-  if (!state.projects.length) {
-    elements.projectProviderSettings.append(
-      node("p", "empty-copy", "Connect a project to configure its Master CLI.")
-    );
-  }
-}
-
 function providerCatalogModels(provider) {
   const key = String(provider || "").toUpperCase();
   if (!key || key === "AUTO") return [];
@@ -4499,87 +5525,129 @@ function providerCatalogModels(provider) {
   return Array.isArray(entry?.models) ? entry.models : [];
 }
 
-function fillProviderProfileModelSelect(provider, selectedValue = "") {
-  const select = elements.providerProfileModel;
-  const custom = elements.providerProfileModelCustom;
-  if (!select || !custom) return;
-  const key = String(provider || "AUTO").toUpperCase();
-  const disabled = key === "AUTO";
-  const models = providerCatalogModels(key);
-  const selected = String(selectedValue || "").trim();
-  select.replaceChildren();
-  const hostDefault = node("option", "", disabled ? "Auto provider default" : "Host default");
-  hostDefault.value = "";
-  select.append(hostDefault);
-  for (const modelId of models) {
-    const option = node("option", "", modelId);
-    option.value = modelId;
-    select.append(option);
+function openNewSessionDialog() {
+  if (!elements.newSessionDialog) return;
+  const providers = state.providerSettings?.available_providers || [];
+  elements.newSessionProvider.replaceChildren();
+  for (const p of providers) {
+    const key = String(p.provider || "").toUpperCase();
+    if (!key) continue;
+    const option = node("option", "", key === "CODEX" ? "Codex" : key === "CLAUDE" ? "Claude" : "Grok");
+    option.value = key;
+    option.disabled = p.status === "UNAVAILABLE";
+    elements.newSessionProvider.append(option);
   }
-  const catalogSelection = selected && models.includes(selected) ? selected : "";
-  select.value = catalogSelection;
-  custom.value = selected && !catalogSelection ? selected : "";
-  select.disabled = disabled;
-  custom.disabled = disabled;
-  if (disabled) custom.value = "";
-}
-
-function openProviderProfileDialog({ scopeKind, scopeId, label }) {
-  const setting = providerProfileSetting(scopeKind, scopeId) || {
-    provider: "AUTO",
-    model_ref: "",
-    effort: "AUTO",
+  if (!elements.newSessionProvider.options.length) {
+    for (const key of ["CODEX", "CLAUDE", "GROK"]) {
+      const option = node("option", "", key);
+      option.value = key;
+      elements.newSessionProvider.append(option);
+    }
+  }
+  const fillNewSessionModelSelect = (provider) => {
+    const key = String(provider || "").toUpperCase();
+    const models = [
+      ...new Set(
+        [
+          ...providerCatalogModels(key),
+          providerCapability(key)?.model,
+          state.providerModels?.providers?.[key]?.default,
+        ].filter(Boolean)
+      ),
+    ];
+    elements.newSessionModel.replaceChildren();
+    for (const modelId of models) {
+      const option = node("option", "", modelId);
+      option.value = modelId;
+      elements.newSessionModel.append(option);
+    }
+    if (!models.length) {
+      const option = node("option", "", "Host default");
+      option.value = "";
+      elements.newSessionModel.append(option);
+    }
+    elements.newSessionModel.value = models[0] || "";
   };
-  state.providerProfileTarget = { scopeKind, scopeId, label };
-  elements.providerProfileTitle.textContent = label;
-  elements.providerProfileSubtitle.textContent =
-    scopeKind === "UNIVERSE_CONDUCTOR"
-      ? "Applied to the persistent Universe Conductor session."
-      : "Applied when this Project Master is opened or resumed.";
-  elements.providerProfileProvider.value = setting.provider || "AUTO";
-  elements.providerProfileEffort.value = setting.effort || "AUTO";
-  fillProviderProfileModelSelect(
-    elements.providerProfileProvider.value,
-    setting.model_ref || ""
-  );
-  elements.providerProfileStatus.textContent = providerStatusText(setting);
-  elements.providerProfileError.textContent = "";
-  elements.providerProfileDialog.showModal();
+  fillNewSessionModelSelect(elements.newSessionProvider.value);
+  elements.newSessionProvider.onchange = () => fillNewSessionModelSelect(elements.newSessionProvider.value);
+
+  const projects = state.projects || [];
+  elements.newSessionProject.replaceChildren();
+  for (const project of projects) {
+    const option = node("option", "", project.project_id);
+    option.value = project.project_id;
+    elements.newSessionProject.append(option);
+  }
+  const currentProjectId = state.selectedProject?.project_id || projects[0]?.project_id || "";
+  elements.newSessionProject.value = currentProjectId;
+
+  const updateProjectRowVisibility = () => {
+    if (elements.newSessionProjectRow) {
+      elements.newSessionProjectRow.hidden = elements.newSessionMode.value === "CONDUCTOR";
+    }
+  };
+  elements.newSessionMode.value = "CONDUCTOR";
+  updateProjectRowVisibility();
+  elements.newSessionMode.onchange = updateProjectRowVisibility;
+
+  if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
+  if (elements.newSessionError) elements.newSessionError.textContent = "";
+  if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
+  elements.newSessionDialog.showModal();
 }
 
-async function submitProviderProfile(event) {
+async function submitNewSession(event) {
   event.preventDefault();
-  const target = state.providerProfileTarget;
-  if (!target) return;
-  elements.providerProfileError.textContent = "";
-  elements.providerProfileSubmit.disabled = true;
-  const provider = String(elements.providerProfileProvider.value || "AUTO").toUpperCase();
-  const modelRef = provider === "AUTO"
-    ? ""
-    : String(
-        elements.providerProfileModelCustom.value ||
-        elements.providerProfileModel.value ||
-        ""
-      ).trim();
-  const effort = String(elements.providerProfileEffort.value || "AUTO").toUpperCase();
-  const endpoint = target.scopeKind === "UNIVERSE_CONDUCTOR"
-    ? "/v1/settings/providers/universe"
-    : `/v1/projects/${encodeURIComponent(target.scopeId)}/provider-setting`;
+  if (!elements.newSessionSubmit) return;
+  const mode = String(elements.newSessionMode?.value || "CONDUCTOR").toUpperCase();
+  const projectId = String(elements.newSessionProject?.value || "").trim();
+  const provider = String(elements.newSessionProvider?.value || "").toUpperCase();
+  const modelRef = String(elements.newSessionModel?.value || "").trim();
+  const effort = String(elements.newSessionEffort?.value || "AUTO").toUpperCase();
+  if (!provider) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Choose a provider first";
+    return;
+  }
+  if (mode === "MASTER" && !projectId) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Choose a project first";
+    return;
+  }
+  const project = (state.projects || []).find(
+    (item) => String(item.project_id || "").toLowerCase() === projectId.toLowerCase()
+  );
+  const universeProject = (state.projects || []).find((item) =>
+    String(item.project_id || "").toLowerCase() === "universe" ||
+    String(item.metadata?.network_role || "").toUpperCase() === "UNIVERSE_HOME"
+  );
+  if (mode === "MASTER" && !project?.project_root) {
+    if (elements.newSessionError) elements.newSessionError.textContent = "Project has no registered root path";
+    return;
+  }
+  elements.newSessionSubmit.disabled = true;
+  if (elements.newSessionStatus) {
+    elements.newSessionStatus.textContent = `Starting ${provider} / ${modelRef || "host default"} / ${effort}...`;
+  }
+  if (elements.newSessionError) elements.newSessionError.textContent = "";
   try {
-    await api(endpoint, {
-      method: "POST",
-      body: { provider, model_ref: modelRef, effort },
+    const terminalProject = mode === "CONDUCTOR" ? universeProject : project;
+    if (!terminalProject?.project_root) {
+      throw new Error("Universe home has no registered root path");
+    }
+    await startNewNodeModeSession({
+      project: terminalProject,
+      nodeId: terminalProject.project_id,
+      mode,
+      provider,
+      modelRef,
+      effort,
     });
-    state.providerSettings = await api("/v1/settings/providers");
-    renderProviderSettings();
-    renderComposerState();
-    if (elements.sessionSummaryDialog?.open) renderProviderChatSummary();
-    elements.providerProfileDialog.close();
-    toast(`${target.label} profile updated`);
+    elements.newSessionDialog.close();
+    toast(`New ${mode === "CONDUCTOR" ? "Conductor" : "Master"} session started: ${provider} / ${modelRef || "host default"} / ${effort}`);
   } catch (error) {
-    elements.providerProfileError.textContent = error.message;
+    if (elements.newSessionError) elements.newSessionError.textContent = error.message;
   } finally {
-    elements.providerProfileSubmit.disabled = false;
+    if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
+    if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
   }
 }
 
@@ -4656,11 +5724,7 @@ function renderWorkerBindingSettings() {
     }
     provider.value = profile?.provider || "AUTO";
     const model = node("select", "worker-binding-model");
-    fillWorkerBindingModelSelect(
-      model,
-      provider.value,
-      profile?.model_ref || ""
-    );
+    fillWorkerBindingModelSelect(model, provider.value, profile?.model_ref || "");
     provider.addEventListener("change", () => {
       fillWorkerBindingModelSelect(model, provider.value, model.value);
     });
@@ -4683,7 +5747,6 @@ function renderWorkerBindingSettings() {
     row.append(copy, provider, model, modelCustom, effort, skills);
     elements.workerBindingSettings.append(row);
   }
-  renderProviderModelCatalog();
 }
 
 function renderProviderModelCatalog() {
@@ -4792,6 +5855,37 @@ async function refreshProviderModels() {
     toast("Provider models refreshed");
   } catch (error) {
     elements.settingsError.textContent = error.message;
+  }
+}
+
+async function setupProviderHooks(opts = {}) {
+  const button = elements.setupProviderHooks;
+  const status = elements.setupProviderHooksStatus;
+  if (elements.settingsError) elements.settingsError.textContent = "";
+  if (status) status.textContent = "Writing hook files…";
+  if (button) button.disabled = true;
+  try {
+    const result = await api("/v1/settings/setup-provider-hooks", {
+      method: "POST",
+      body: { providers: ["CODEX", "GROK", "CLAUDE"], global: true, ...opts },
+    });
+    const lines = Object.entries(result.providers || {})
+      .map(([p, r]) => `${p}: ${r.status || r}`)
+      .join(", ");
+    const repaired = (result.repairs || []).filter((item) => item.status === "REPAIRED");
+    const suffix = repaired.length
+      ? `; repaired ${repaired.map((item) => item.mode || "mode").join(", ")} to GROK`
+      : "";
+    const message = `CLI hooks: ${lines || "done"}${suffix}`;
+    if (status) status.textContent = message;
+    toast(message);
+  } catch (error) {
+    const message = error.message || "CLI hook setup failed";
+    if (status) status.textContent = message;
+    if (elements.settingsError) elements.settingsError.textContent = message;
+    toast(message, true);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -5390,19 +6484,58 @@ function startRendezvousRefreshTimer() {
 
 async function refreshMultiRooms() {
   if (!elements.multiRoomList) return;
-  const data = await api("/v1/rooms");
+  const data = await api("/v1/rooms?state=ALL");
   state.multiRooms = data.rooms || [];
+  const stateFilter = state.multiRoomStateFilter || "OPEN";
+  const showAll = state.multiRoomShowAll || false;
+  const stateRooms = state.multiRooms.filter((room) => room.state === stateFilter);
+  const emptyMeeting = stateRooms.filter(
+    (room) => room.room_type === "MEETING" && (room.participant_count || 0) === 0
+  );
+  const visible = showAll
+    ? stateRooms
+    : stateRooms.filter(
+        (room) => room.room_type !== "MEETING" || (room.participant_count || 0) > 0
+      );
   elements.multiRoomList.replaceChildren();
-  if (!state.multiRooms.length) {
-    elements.multiRoomList.append(node("p", "empty-copy", "No multi-rooms yet"));
+  const header = node("div", "multi-room-list-header");
+  const stateTabs = node("div", "room-state-tabs");
+  for (const [value, label] of [["OPEN", "Live"], ["CLOSED", "History"]]) {
+    const tab = node("button", "secondary-button compact-action", label);
+    tab.type = "button";
+    tab.classList.toggle("selected", stateFilter === value);
+    tab.setAttribute("aria-pressed", stateFilter === value ? "true" : "false");
+    tab.addEventListener("click", () => {
+      state.multiRoomStateFilter = value;
+      refreshMultiRooms().catch(() => {});
+    });
+    stateTabs.append(tab);
+  }
+  const toggle = node("button", "secondary-button compact-action");
+  toggle.type = "button";
+  toggle.textContent = showAll
+    ? "Hide empty rooms"
+    : `Show empty (${emptyMeeting.length})`;
+  toggle.style.display = emptyMeeting.length || showAll ? "" : "none";
+  toggle.addEventListener("click", () => {
+    state.multiRoomShowAll = !showAll;
+    refreshMultiRooms().catch(() => {});
+  });
+  header.append(stateTabs, toggle);
+  elements.multiRoomList.append(header);
+  if (!visible.length) {
+    elements.multiRoomList.append(
+      node("p", "empty-copy", stateFilter === "CLOSED" ? "No room history yet" : "No active rooms")
+    );
     return;
   }
-  for (const room of state.multiRooms) {
+  for (const room of visible) {
+    const isLive = (room.participant_count || 0) > 0;
     const row = node("div", "remote-access-row");
     const copy = node("div", "remote-access-copy");
     copy.append(
       node("strong", "", `${room.room_type} · ${room.title}`),
-      node("small", "", room.room_id)
+      node("small", "", `${isLive ? `${room.participant_count} live` : "empty"} · ${room.room_id}`)
     );
     const open = node("button", "secondary-button compact-action", "Open");
     open.type = "button";
@@ -5411,18 +6544,741 @@ async function refreshMultiRooms() {
         elements.settingsError.textContent = error.message;
       });
     });
-    row.append(copy, open);
+    const del = node("button", "secondary-button compact-action danger-action", "Delete");
+    del.type = "button";
+    del.disabled = isLive;
+    del.title = isLive ? "Cannot delete a room with active participants" : "Delete this room";
+    del.addEventListener("click", async () => {
+      try {
+        await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`, { method: "DELETE" });
+        await refreshMultiRooms();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+    row.append(copy, open, del);
     elements.multiRoomList.append(row);
   }
 }
 
+
+async function refreshActiveRoomFeatures({ render = true } = {}) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || !room.project_id) {
+    state.multiRoomFeatures = [];
+    state.activeMultiRoomFeatureId = null;
+    if (render) renderActiveMultiRoom();
+    return;
+  }
+  const listed = await api(
+    `/v1/projects/${encodeURIComponent(room.project_id)}/feature-nodes`
+  );
+  const linked = (listed.features || []).filter(
+    (feature) => feature.meeting_room_id === room.room_id
+  );
+  state.multiRoomFeatures = await Promise.all(
+    linked.map((feature) =>
+      api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}`).then(
+        (result) => result.feature
+      )
+    )
+  );
+  const goalIds = state.multiRoomFeatures
+    .map((feature) => feature.goal_derivation?.goal?.goal_id)
+    .filter(Boolean);
+  const automationEntries = await Promise.all(
+    goalIds.map(async (goalId) => {
+      const surface = await api(
+        `/v1/goals/${encodeURIComponent(goalId)}/automation`
+      ).catch(() => null);
+      return [goalId, surface];
+    })
+  );
+  state.goalAutomationSurfaces = {
+    ...state.goalAutomationSurfaces,
+    ...Object.fromEntries(automationEntries.filter(([, surface]) => surface)),
+  };
+  if (
+    !state.multiRoomFeatures.some(
+      (feature) => feature.feature_id === state.activeMultiRoomFeatureId
+    )
+  ) {
+    state.activeMultiRoomFeatureId = state.multiRoomFeatures[0]?.feature_id || null;
+  }
+  if (render) renderActiveMultiRoom();
+}
+
+function activeMeetingFeature() {
+  return (state.multiRoomFeatures || []).find(
+    (feature) => feature.feature_id === state.activeMultiRoomFeatureId
+  ) || null;
+}
+
+async function refreshFeatureSemanticGraph(projectId) {
+  if (!projectId || state.selectedProject?.project_id !== projectId) return;
+  state.semanticGraph = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`
+  ).catch(() => state.semanticGraph);
+  buildGraph();
+}
+
+async function createFeatureForActiveMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || !room.project_id) {
+    throw new Error("Open a project Meeting Room first");
+  }
+  const title = elements.meetingFeatureTitle?.value.trim() || "";
+  const intentText = elements.meetingFeatureIntent?.value.trim() || "";
+  if (!title || !intentText) throw new Error("Feature title and intent are required");
+  state.multiRoomFeatureCreateKey ||= `ui-${room.room_id}-${crypto.randomUUID()}`;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(room.project_id)}/feature-nodes`,
+    {
+      method: "POST",
+      body: {
+        idempotency_key: state.multiRoomFeatureCreateKey,
+        title,
+        intent_text: intentText,
+        meeting_room_id: room.room_id,
+        evidence_refs: [`universe://chat-rooms/${room.room_id}`],
+      },
+    }
+  );
+  state.multiRoomFeatureCreateKey = null;
+  state.activeMultiRoomFeatureId = result.feature.feature_id;
+  elements.meetingFeatureTitle.value = "";
+  elements.meetingFeatureIntent.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Feature Node created");
+}
+
+
+function availableMeetingProviderSessions(room) {
+  const attached = new Set(
+    (state.activeMultiRoomSnapshot?.bindings || [])
+      .map((binding) => binding.metadata?.provider_chat_key)
+      .filter(Boolean)
+  );
+  return (state.providerChatRooms || []).filter((providerRoom) => {
+    const binding = providerRoom.binding || {};
+    const projectId = binding.current_project_id || binding.node || null;
+    return (
+      providerRoom.session_kind !== "WORKER" &&
+      ["BOUND", "ANCHOR_OBSERVED"].includes(String(binding.state || "").toUpperCase()) &&
+      projectId === room.project_id &&
+      !attached.has(providerRoom.chat_key)
+    );
+  });
+}
+
+async function attachMeetingProviderSession() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const chatKey = elements.meetingProviderSession?.value || "";
+  if (!room || room.room_type !== "MEETING") throw new Error("Open a Meeting Room first");
+  if (!chatKey) throw new Error("Choose a provider session to attach");
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/provider-sessions`, {
+    method: "POST",
+    body: { chat_key: chatKey },
+  });
+  state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+  renderActiveMultiRoom();
+  toast("Provider session attached to Meeting Room");
+}
+
+async function createFreshMeetingSessions() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || room.state !== "OPEN") {
+    throw new Error("Open a live Meeting Room first");
+  }
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/fresh-provider-sessions`, {
+    method: "POST",
+    body: { providers: ["CODEX", "CLAUDE", "GROK"] },
+  });
+  state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+  renderActiveMultiRoom();
+  toast("Fresh meeting reviewers created");
+}
+
+async function endActiveMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  if (!room || room.room_type !== "MEETING" || room.state !== "OPEN") {
+    throw new Error("Open a live Meeting Room first");
+  }
+  await api(`/v1/rooms/${encodeURIComponent(room.room_id)}/close`, {
+    method: "POST",
+    body: {},
+  });
+  await refreshMultiRooms();
+  toast("Meeting ended; fresh reviewers were archived");
+}
+
+async function runActiveFeatureMeeting() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select a Feature in a Meeting Room first");
+  const modelCount = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) =>
+      binding.slot_role === "MODEL" &&
+      binding.provider_session_ref &&
+      binding.metadata?.provider_chat_key
+  ).length;
+  if (modelCount < 2) throw new Error("Attach at least two verified provider sessions");
+  const maxTurns = Number(elements.meetingRunTurns?.value || modelCount * 2);
+  if (!Number.isInteger(maxTurns) || maxTurns < 2 || maxTurns > 24) {
+    throw new Error("Bounded turns must be between 2 and 24");
+  }
+  const runId = `feature-meeting-${feature.feature_id}-${crypto.randomUUID()}`;
+  state.multiRoomMeetingRunId = runId;
+  state.multiRoomMeetingRunBusy = true;
+  renderActiveMultiRoom();
+  try {
+    const result = await api(
+      `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/meeting-runs`,
+      {
+        method: "POST",
+        body: {
+          run_id: runId,
+          max_turns: maxTurns,
+          prompt: elements.meetingRunPrompt?.value.trim() || "",
+        },
+      }
+    );
+    state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+    await refreshActiveRoomFeatures({ render: false });
+    await refreshFeatureSemanticGraph(room.project_id);
+    toast(`${result.candidates?.length || 0} Expected Path candidates generated`);
+    return result;
+  } finally {
+    state.multiRoomMeetingRunBusy = false;
+    renderActiveMultiRoom();
+  }
+}
+
+async function cancelActiveFeatureMeeting() {
+  const feature = activeMeetingFeature();
+  const runId = state.multiRoomMeetingRunId;
+  if (!feature || !runId || !state.multiRoomMeetingRunBusy) return;
+  await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/meeting-runs/${encodeURIComponent(runId)}/cancel`,
+    { method: "POST", body: { reason: "user stop" } }
+  );
+  toast("Meeting will stop after the current provider turn");
+}
+
+async function addArtifactAsExpectedPath(artifact) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select or create a Feature first");
+  if (artifact.artifact_type !== "SPECIFICATION") {
+    throw new Error("Only SPECIFICATION artifacts can become Expected Paths");
+  }
+  const summaryOverride = elements.meetingExpectedPathSummary?.value.trim() || "";
+  const summary = summaryOverride || String(artifact.body_text || artifact.title || "").trim().slice(0, 500);
+  if (!summary) throw new Error("Expected Path summary is required");
+  await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/expected-paths`,
+    {
+      method: "POST",
+      body: {
+        room_id: room.room_id,
+        artifact_id: artifact.artifact_id,
+        summary,
+      },
+    }
+  );
+  if (elements.meetingExpectedPathSummary) {
+    elements.meetingExpectedPathSummary.value = "";
+  }
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Expected Path candidate added");
+}
+
+async function startExpectedPathGoal(expectedPathId) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature) throw new Error("Select a Feature first");
+  const rationale = elements.meetingFeatureRationale?.value.trim() || "";
+  if (!rationale) throw new Error("Adoption rationale is required");
+  const path = (feature.expected_paths || []).find((item) => item.expected_path_id === expectedPathId);
+  if (!path?.route_digest) throw new Error("A structured Expected Path route is required");
+  if (!window.confirm("Adopt this Expected Path and create its bounded Goal Start Receipt?")) {
+    return;
+  }
+  const result = await api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/goal-start-receipts`, {
+    method: "POST",
+    body: {
+      expected_path_id: expectedPathId,
+      expected_feature_revision: feature.revision,
+      expected_path_digest: path.route_digest,
+      approved_scope: { project_id: feature.project_id, node_refs: [], write_roots: [] },
+      constraints: [
+        "Conductor execution stays within the adopted Expected Path and approved project scope",
+        "Scope expansion stops for USER approval",
+      ],
+      validation: path.route.acceptance_conditions?.length
+        ? path.route.acceptance_conditions
+        : ["Validate the selected Expected Path before Goal completion"],
+      local_commit_policy: "LOCAL_COMMITS_ALLOWED",
+      push_policy: "PUSH_PROHIBITED",
+      rationale,
+      evidence_refs: [`universe://chat-rooms/${room.room_id}`],
+    },
+  });
+  elements.meetingFeatureRationale.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  const automationState = result.automation?.surface?.automation_state || "GOAL_STARTED";
+  toast(`Goal started · ${result.goal.title} · ${automationState}`);
+}
+
+async function materializeFeatureGoal() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  if (!room || !feature || feature.state !== "ADOPTED") {
+    throw new Error("Adopt an Expected Path first");
+  }
+  if (!window.confirm("Create one DESIGNING Goal from this adopted path?")) return;
+  const result = await api(
+    `/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/goals`,
+    {
+      method: "POST",
+      body: { expected_feature_revision: feature.revision },
+    }
+  );
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast(`Goal created · ${result.goal.title}`);
+}
+
+async function runActiveGoalWorkPlans() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!room || !feature || !goal) throw new Error("Create a provenance-bound Goal first");
+  const verifiedModels = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) => binding.slot_role === "MODEL" && binding.provider_session_ref && binding.metadata?.provider_chat_key
+  );
+  if (verifiedModels.length < 2) throw new Error("Attach at least two verified provider sessions");
+  const maxTurns = Math.max(2, Math.min(24, Number(elements.meetingRunTurns?.value || verifiedModels.length * 2)));
+  const runId = `goal-work-plan-${goal.goal_id}-${crypto.randomUUID()}`;
+  state.goalWorkPlanRunId = runId;
+  state.goalWorkPlanRunBusy = true;
+  renderActiveMultiRoom();
+  try {
+    const result = await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-runs`, {
+      method: "POST",
+      body: { run_id: runId, max_turns: maxTurns },
+    });
+    state.activeMultiRoomSnapshot = await api(`/v1/rooms/${encodeURIComponent(room.room_id)}`);
+    await refreshActiveRoomFeatures({ render: false });
+    await refreshFeatureSemanticGraph(room.project_id);
+    toast(`${result.candidates?.length || 0} Work Plan candidates generated`);
+  } finally {
+    state.goalWorkPlanRunBusy = false;
+    renderActiveMultiRoom();
+  }
+}
+
+async function adoptGoalWorkPlan(workPlanId) {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  const rationale = elements.meetingFeatureRationale?.value.trim() || "";
+  if (!room || !goal) throw new Error("Create a Goal first");
+  if (!rationale) throw new Error("Adoption rationale is required");
+  if (!window.confirm("Adopt this Work Plan? Other candidates will be marked not selected.")) return;
+  await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-adoptions`, {
+    method: "POST",
+    body: { work_plan_id: workPlanId, expected_goal_revision: goal.revision, rationale },
+  });
+  elements.meetingFeatureRationale.value = "";
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast("Work Plan adopted");
+}
+
+async function applyGoalWorkPlan() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!room || !goal) throw new Error("Create a Goal first");
+  if (!window.confirm("Create PLANNED Milestones and BACKLOG Todos from the adopted Work Plan?")) return;
+  const result = await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/work-plan-applications`, {
+    method: "POST",
+    body: { expected_goal_revision: goal.revision },
+  });
+  await refreshActiveRoomFeatures({ render: false });
+  await refreshFeatureSemanticGraph(room.project_id);
+  renderActiveMultiRoom();
+  toast(`Created ${result.application.created_items.milestone_count} milestone(s) and ${result.application.created_items.todo_count} Todo(s)`);
+}
+
+async function advanceGoalAutomation() {
+  const room = state.activeMultiRoomSnapshot?.room;
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  const application = feature?.goal_derivation?.work_plans?.application;
+  if (!room || !goal || !application) throw new Error("Apply a Work Plan first");
+  if (!window.confirm("Advance the Conductor Goal loop to its next governed stop?")) return;
+  const result = await api(`/v1/goals/${encodeURIComponent(goal.goal_id)}/automation/advance`, {
+    method: "POST",
+    body: {
+      approval: "ADVANCE",
+      expected_goal_revision: goal.revision,
+    },
+  });
+  const surface = result.surface || {};
+  state.goalAutomationSurfaces[goal.goal_id] = surface;
+  renderActiveMultiRoom();
+  toast(`Conductor · ${surface.automation_state || result.status} · next ${surface.next_operation || "WAIT"}`);
+}
+
+function liveConductorHostSession() {
+  const candidates = (state.supervisorSessions || []).filter((session) => {
+    const binding = session.pty_binding || {};
+    return (
+      String(session.mode || "").toUpperCase() === "CONDUCTOR" &&
+      String(session.state || "").toUpperCase() === "LIVE" &&
+      String(binding.pty_state || "").toUpperCase() === "LIVE" &&
+      String(binding.backend_owner || "").toUpperCase() === "RUST_RECONNECTION_HOST" &&
+      String(binding.reconnection_host_id || "").trim() &&
+      String(session.provider || "").trim() &&
+      String(session.provider_session_ref || "").trim() &&
+      String(session.session_id || "").trim() &&
+      String(session.session_anchor_ref || "").trim()
+    );
+  });
+  candidates.sort((left, right) => sessionObservatoryRank(right) - sessionObservatoryRank(left));
+  return candidates[0] || null;
+}
+
+async function setGoalAutomationScheduler(action) {
+  const feature = activeMeetingFeature();
+  const goal = feature?.goal_derivation?.goal;
+  if (!goal) throw new Error("Create a Goal first");
+  const session = liveConductorHostSession();
+  if (!session) {
+    throw new Error("A live Conductor Rust Host bridge is required");
+  }
+  const normalized = String(action || "").toUpperCase();
+  const prompt = normalized === "START"
+    ? "Start the durable Conductor scheduler until its next governed stop?"
+    : "Pause the Conductor scheduler?";
+  if (!window.confirm(prompt)) return;
+  const mutation = {
+    schema: "universe.goal-automation-scheduler-mutation-request.v1",
+    provider: String(session.provider).toUpperCase(),
+    provider_session_ref: session.provider_session_ref,
+    session_id: session.session_id,
+    session_anchor_ref: session.session_anchor_ref,
+    instruction_ref: `ui://goal-automation-scheduler/${goal.goal_id}/${normalized}/${crypto.randomUUID()}`,
+    goal_id: goal.goal_id,
+    scheduler: {
+        action: normalized,
+        expected_goal_revision: goal.revision,
+        interval_seconds: 5,
+    },
+    ttl_seconds: 120,
+  };
+  const prepared = await api(
+    "/v1/goal-automation-scheduler-mutation-receipts",
+    { method: "POST", body: mutation }
+  );
+  const result = await api(
+    `/v1/goal-automation-scheduler-mutation-receipts/${encodeURIComponent(prepared.receipt.receipt_id)}/consume`,
+    { method: "POST", body: mutation }
+  );
+  state.goalAutomationSurfaces[goal.goal_id] = result.surface || {};
+  renderActiveMultiRoom();
+  toast(`Scheduler · ${result.scheduler?.status || result.status}`);
+}
+
+function renderMeetingFeaturePanel(room) {
+  const panel = node("section", "feature-path-list");
+  if (room.room_type !== "MEETING") return panel;
+  const features = state.multiRoomFeatures || [];
+  const feature = activeMeetingFeature();
+  if (elements.meetingFeatureControls) elements.meetingFeatureControls.hidden = false;
+  if (elements.meetingFeatureSelect) {
+    elements.meetingFeatureSelect.replaceChildren();
+    if (!features.length) {
+      const empty = node("option", "", "Create a Feature below");
+      empty.value = "";
+      elements.meetingFeatureSelect.append(empty);
+    }
+    for (const item of features) {
+      const option = node("option", "", `${item.title} · ${item.state}`);
+      option.value = item.feature_id;
+      option.selected = item.feature_id === state.activeMultiRoomFeatureId;
+      elements.meetingFeatureSelect.append(option);
+    }
+  }
+  const availableSessions = availableMeetingProviderSessions(room);
+  if (elements.meetingProviderSession) {
+    elements.meetingProviderSession.replaceChildren();
+    const empty = node("option", "", availableSessions.length ? "Choose a project session" : "No unattached project sessions");
+    empty.value = "";
+    elements.meetingProviderSession.append(empty);
+    for (const providerRoom of availableSessions) {
+      const option = node(
+        "option",
+        "",
+        `${providerRoom.provider} · ${providerRoom.display_name || providerRoom.workspace_name || "Session"}`
+      );
+      option.value = providerRoom.chat_key;
+      elements.meetingProviderSession.append(option);
+    }
+  }
+  const verifiedModels = (state.activeMultiRoomSnapshot?.bindings || []).filter(
+    (binding) =>
+      binding.slot_role === "MODEL" &&
+      binding.provider_session_ref &&
+      binding.metadata?.provider_chat_key
+  );
+  if (elements.attachMeetingProvider) {
+    elements.attachMeetingProvider.disabled = room.state !== "OPEN" || !availableSessions.length || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.createFreshMeetingSessions) {
+    elements.createFreshMeetingSessions.disabled = room.state !== "OPEN" || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.endMeeting) {
+    elements.endMeeting.disabled = room.state !== "OPEN" || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.startMeetingRun) {
+    elements.startMeetingRun.disabled = !feature || feature.state === "ADOPTED" || verifiedModels.length < 2 || state.multiRoomMeetingRunBusy;
+  }
+  if (elements.cancelMeetingRun) {
+    elements.cancelMeetingRun.disabled = !state.multiRoomMeetingRunBusy;
+  }
+  if (elements.meetingRunStatus) {
+    elements.meetingRunStatus.textContent = state.multiRoomMeetingRunBusy
+      ? `Meeting ${state.multiRoomMeetingRunId} is running · stop applies at a turn boundary`
+      : feature?.state === "ADOPTED"
+        ? feature.goal_derivation
+          ? "Adopted path has a provenance-bound DESIGNING Goal"
+          : "Adopted path is ready for explicit Goal creation"
+        : `${verifiedModels.length} verified model session(s) attached · candidates remain unadopted`;
+  }
+  if (!feature) {
+    panel.append(node("p", "empty-copy", "Create a Feature Node to turn room specifications into comparable Expected Paths."));
+    return panel;
+  }
+  const header = node("article", "remote-access-row");
+  const headerCopy = node("div", "remote-access-copy");
+  headerCopy.append(
+    node("strong", "", `FEATURE · ${feature.title}`),
+    node("small", "", `${feature.state} · revision ${feature.revision} · paths ${(feature.expected_paths || []).length}`),
+    node("small", "", feature.intent_text || "")
+  );
+  header.append(headerCopy);
+  panel.append(header);
+  for (const path of feature.expected_paths || []) {
+    const row = node("article", "remote-access-row feature-path-card");
+    row.dataset.state = path.state;
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${path.state} · ${path.title}`),
+      node(
+        "small",
+        "",
+        `artifact revision ${path.artifact_revision} · route ${path.route?.steps?.length || 0} steps · evidence ${(path.evidence_refs || []).length}`
+      ),
+      node("small", "", path.summary || ""),
+      node("small", "feature-path-digest", `sha256 ${String(path.specification_digest || "").slice(0, 16)}…`)
+    );
+    if (path.route?.steps?.length) {
+      const routeSummary = node("div", "feature-path-route");
+      for (const [index, step] of path.route.steps.entries()) {
+        routeSummary.append(
+          node(
+            "small",
+            "",
+            `${index + 1}. ${step.title}${step.phase ? ` · ${step.phase}` : ""}`
+          )
+        );
+      }
+      copy.append(routeSummary);
+    }
+    row.append(copy);
+    if (path.state === "CANDIDATE" && feature.state !== "ADOPTED") {
+      const adopt = node("button", "primary-button compact-action", "Adopt + Start Goal");
+      adopt.type = "button";
+      adopt.disabled = (feature.expected_paths || []).filter((item) => item.state === "CANDIDATE").length < 2;
+      adopt.title = adopt.disabled ? "At least two candidate paths are required" : "Pin this path and create the USER Goal Start Receipt";
+      adopt.addEventListener("click", () => {
+        startExpectedPathGoal(path.expected_path_id).catch((error) => toast(error.message, true));
+      });
+      row.append(adopt);
+    }
+    panel.append(row);
+  }
+  if (feature.state === "ADOPTED") {
+    const derivation = feature.goal_derivation;
+    const goalRow = node("article", "remote-access-row feature-path-card");
+    const goalCopy = node("div", "remote-access-copy");
+    if (derivation?.goal) {
+      const workPlans = derivation.work_plans || { candidates: [], adoption: null, application: null };
+      const candidates = workPlans.candidates || [];
+      goalCopy.append(
+        node("strong", "", `GOAL · ${derivation.goal.title}`),
+        node("small", "", `${derivation.goal.state} · owner ${derivation.goal.owner}`),
+        node("small", "", `Pinned to specification revision ${derivation.artifact_revision} · sha256 ${String(derivation.specification_digest || "").slice(0, 16)}…`)
+      );
+      if (feature.goal_start_receipt) {
+        goalCopy.append(
+          node("small", "", `Goal Start · ${String(feature.goal_start_receipt.expected_path_digest || "").slice(0, 16)}… · ${feature.goal_start_receipt.local_commit_policy}`),
+          node("small", "", `Push ${feature.goal_start_receipt.push_policy === "PUSH_PROHIBITED" ? "requires separate approval" : feature.goal_start_receipt.push_policy}`)
+        );
+      }
+      if (!workPlans.adoption) {
+        const generate = node("button", "secondary-button compact-action", state.goalWorkPlanRunBusy ? "Generating…" : "Generate Work Plans");
+        generate.type = "button";
+        generate.disabled = verifiedModels.length < 2 || state.goalWorkPlanRunBusy;
+        generate.title = generate.disabled && !state.goalWorkPlanRunBusy ? "At least two verified provider sessions are required" : "Generate bounded alternative Work Plans";
+        generate.addEventListener("click", () => runActiveGoalWorkPlans().catch((error) => toast(error.message, true)));
+        goalRow.append(generate);
+      }
+      for (const candidate of candidates) {
+        const plan = candidate.plan || {};
+        const milestoneCount = (plan.milestones || []).length;
+        const todoCount = (plan.milestones || []).reduce((count, milestone) => count + (milestone.todos || []).length, 0);
+        const planRow = node("article", "remote-access-row feature-path-card");
+        planRow.dataset.state = candidate.state;
+        const planCopy = node("div", "remote-access-copy");
+        planCopy.append(
+          node("strong", "", `${candidate.state} · ${plan.title || "Work Plan"}`),
+          node("small", "", `${milestoneCount} milestone(s) · ${todoCount} Todo(s)`),
+          node("small", "", plan.summary || ""),
+          node("small", "feature-path-digest", `sha256 ${String(candidate.plan_digest || "").slice(0, 16)}…`)
+        );
+        planRow.append(planCopy);
+        if (candidate.state === "CANDIDATE" && !workPlans.adoption) {
+          const adopt = node("button", "primary-button compact-action", "Adopt Plan");
+          adopt.type = "button";
+          adopt.disabled = candidates.filter((item) => item.state === "CANDIDATE").length < 2;
+          adopt.addEventListener("click", () => adoptGoalWorkPlan(candidate.work_plan_id).catch((error) => toast(error.message, true)));
+          planRow.append(adopt);
+        }
+        panel.append(planRow);
+      }
+      if (workPlans.adoption && !workPlans.application) {
+        const apply = node("button", "primary-button compact-action", "Apply Adopted Plan");
+        apply.type = "button";
+        apply.addEventListener("click", () => applyGoalWorkPlan().catch((error) => toast(error.message, true)));
+        goalRow.append(apply);
+      }
+      if (workPlans.application) {
+        const created = workPlans.application.created_items || {};
+        const automation = state.goalAutomationSurfaces[derivation.goal.goal_id];
+        const todoExecution = automation?.todo_execution || {};
+        goalCopy.append(node("small", "", `APPLIED · ${created.milestone_count || 0} PLANNED milestone(s) · ${created.todo_count || 0} BACKLOG Todo(s)`));
+        if (automation) {
+          const selectedCount = todoExecution.selection?.todo_ids?.length || 0;
+          const receiptCount = todoExecution.action_receipts?.length || 0;
+          const resultCount = todoExecution.task_frame_results?.length || 0;
+          const scheduler = automation.scheduler;
+          goalCopy.append(
+            node("small", "", `CONDUCTOR · ${automation.automation_state} · next ${automation.next_operation}`),
+            node("small", "", `Execution · ${selectedCount}/${todoExecution.eligible_todo_ids?.length || 0} Todo(s) selected · ${resultCount} result(s) · ${receiptCount} receipt(s)`),
+            node("small", "", scheduler ? `Scheduler · ${scheduler.status} · ${scheduler.last_stop_reason || "no stop yet"} · tick ${scheduler.tick_count}` : "Scheduler · not configured")
+          );
+          const schedulerAction = node(
+            "button",
+            "secondary-button compact-action",
+            scheduler?.enabled ? "Pause Scheduler" : "Start Scheduler"
+          );
+          schedulerAction.type = "button";
+          schedulerAction.disabled = !liveConductorHostSession();
+          schedulerAction.title = schedulerAction.disabled
+            ? "A live Conductor Rust Host bridge is required"
+            : "Uses the selected live Host bridge for the bounded mutation";
+          schedulerAction.addEventListener("click", () => {
+            setGoalAutomationScheduler(scheduler?.enabled ? "PAUSE" : "START")
+              .catch((error) => toast(error.message, true));
+          });
+          goalRow.append(schedulerAction);
+        }
+        const deliver = node("button", "primary-button compact-action", "Advance Conductor");
+        deliver.type = "button";
+        deliver.title = "Create or advance the receipt-backed Goal execution loop";
+        deliver.addEventListener("click", () => advanceGoalAutomation().catch((error) => toast(error.message, true)));
+        goalRow.append(deliver);
+      }
+    } else {
+      goalCopy.append(
+        node("strong", "", "Adopted path is ready for Goal planning"),
+        node("small", "", "Goal creation is an explicit USER action and remains non-executable.")
+      );
+      const createGoal = node("button", "primary-button compact-action", "Create Goal");
+      createGoal.type = "button";
+      createGoal.addEventListener("click", () => {
+        materializeFeatureGoal().catch((error) => toast(error.message, true));
+      });
+      goalRow.append(createGoal);
+    }
+    goalRow.prepend(goalCopy);
+    panel.append(goalRow);
+  }
+  panel.append(node("small", "settings-help", "Goal creation and Work Plan adoption are explicit USER actions. Advance Conductor creates or delivers the durable Master handoff, then stops at WAIT, proposal input, or Task Frame readiness. It never runs a Task Frame or changes Todo state."));
+  return panel;
+}
+
 async function openMultiRoom(roomId) {
   state.activeMultiRoomId = roomId;
+  state.multiRoomTargetBindingIds = [];
+  state.multiRoomArtifactDraft = null;
+  state.multiRoomFeatures = [];
+  state.activeMultiRoomFeatureId = null;
+  state.multiRoomFeatureCreateKey = null;
+  state.multiRoomMeetingRunId = null;
+  state.multiRoomMeetingRunBusy = false;
+  state.goalWorkPlanRunId = null;
+  state.goalWorkPlanRunBusy = false;
   state.multiRoomLiveOutput = {};
+  if (elements.createRoomArtifact) {
+    elements.createRoomArtifact.textContent = "Create artifact from Message";
+  }
   const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
   state.activeMultiRoomSnapshot = snap;
+  await refreshActiveRoomFeatures({ render: false });
   renderActiveMultiRoom();
   openMultiRoomStream(roomId);
+}
+
+function renderTaskFrameTimeline(timeline) {
+  const panel = node("section", "task-frame-timeline");
+  const entries = timeline?.entries || [];
+  const heading = node("div", "task-frame-timeline-heading");
+  heading.append(
+    node("strong", "", "Task Frame collaboration"),
+    node("small", "", `${timeline?.task_state || "UNKNOWN"} · ${entries.length} events`)
+  );
+  panel.append(heading);
+  if (!entries.length) {
+    panel.append(node("p", "empty-copy", "No Task Frame conversation evidence yet"));
+    return panel;
+  }
+  for (const entry of entries) {
+    const item = node("article", `task-frame-entry ${String(entry.entry_kind || "lifecycle").toLowerCase()}`);
+    const meta = node("div", "task-frame-entry-meta");
+    meta.append(
+      node("strong", "", `${entry.author_role || "SYSTEM"} · ${entry.title || entry.state || "Event"}`),
+      node("small", "", [entry.turn_id, entry.state, entry.outcome, entry.observed_at]
+        .filter(Boolean)
+        .join(" · "))
+    );
+    item.append(meta);
+    if (entry.body_text) item.append(node("pre", "task-frame-entry-body", entry.body_text));
+    panel.append(item);
+  }
+  return panel;
 }
 
 function renderActiveMultiRoom() {
@@ -5433,6 +7289,12 @@ function renderActiveMultiRoom() {
     cursors.map((cursor) => [cursor.binding_id, cursor])
   );
   const room = snap.room || {};
+  const targetCount = state.multiRoomTargetBindingIds.length;
+  if (elements.postRoomMessage) {
+    elements.postRoomMessage.textContent = targetCount
+      ? `Post to ${targetCount} participant${targetCount === 1 ? "" : "s"}`
+      : "Post to room";
+  }
   const summary = node("div", "remote-access-copy");
   summary.append(
     node("strong", "", room.title || room.room_type || "Room"),
@@ -5470,12 +7332,29 @@ function renderActiveMultiRoom() {
       binding.slot_role !== "USER" &&
       !dedicatedProjectMaster &&
       Boolean(binding.provider && binding.provider_session_ref);
+    if (room.room_type === "MEETING" && controllable) {
+      const selected = state.multiRoomTargetBindingIds.includes(binding.binding_id);
+      const target = node(
+        "button",
+        "secondary-button compact-action",
+        selected ? "Targeted" : "Target"
+      );
+      target.type = "button";
+      target.setAttribute("aria-pressed", selected ? "true" : "false");
+      target.addEventListener("click", () => {
+        state.multiRoomTargetBindingIds = selected
+          ? state.multiRoomTargetBindingIds.filter((item) => item !== binding.binding_id)
+          : [...state.multiRoomTargetBindingIds, binding.binding_id];
+        renderActiveMultiRoom();
+      });
+      row.append(target);
+    }
     if (controllable) {
       const connected = ["CONTROLLED", "LIVE"].includes(participantState);
       const control = node(
         "button",
         "secondary-button compact-action",
-        connected ? "Disconnect" : "Connect native"
+        connected ? "Disconnect" : "Connect session"
       );
       control.type = "button";
       control.addEventListener("click", () => {
@@ -5498,17 +7377,120 @@ function renderActiveMultiRoom() {
   for (const permission of pendingPermissions) {
     permissionList.append(renderPermissionCard(permission));
   }
-  const transcript = node("pre", "remote-access-endpoint");
-  transcript.textContent = (snap.messages || [])
-    .slice(-5)
-    .map((message) => `${message.author_role}: ${message.body_text}`)
-    .join("\n");
-  elements.multiRoomDetail.replaceChildren(
-    summary,
-    participantList,
-    permissionList,
-    transcript
-  );
+  const findingList = node("div", "remote-access-list");
+  const findings = snap.findings || [];
+  if (room.room_type === "MEETING" && !findings.length) {
+    findingList.append(node("p", "empty-copy", "No structured findings yet"));
+  }
+  for (const finding of findings) {
+    const row = node("article", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${finding.finding_type} | ${finding.summary}`),
+      node(
+        "small",
+        "",
+        `${finding.resolution_state} | evidence ${(finding.evidence_refs || []).length} | features ${(finding.feature_refs || []).length}`
+      ),
+      node("small", "", finding.requested_owner_role ? `owner ${finding.requested_owner_role}` : finding.detail_text || "")
+    );
+    row.append(copy);
+    if (room.room_type === "MEETING" && snap.user_may_write && finding.state !== "RESOLVED") {
+      const resolve = node("button", "secondary-button compact-action", "Resolve");
+      resolve.type = "button";
+      resolve.addEventListener("click", () =>
+        setActiveRoomFindingState(finding.finding_id, "RESOLVED")
+      );
+      row.append(resolve);
+    }
+    findingList.append(row);
+  }
+  if (elements.meetingFeatureControls) {
+    elements.meetingFeatureControls.hidden = room.room_type !== "MEETING";
+  }
+  const featurePanel = renderMeetingFeaturePanel(room);
+  const artifactList = node("div", "remote-access-list");
+  const artifacts = snap.artifacts || [];
+  if (room.room_type === "MEETING" && !artifacts.length) {
+    artifactList.append(node("p", "empty-copy", "No room artifacts yet"));
+  }
+  for (const artifact of artifacts) {
+    const row = node("article", "remote-access-row");
+    const copy = node("div", "remote-access-copy");
+    copy.append(
+      node("strong", "", `${artifact.artifact_type} · ${artifact.title}`),
+      node(
+        "small",
+        "",
+        `${artifact.state} · revision ${artifact.current_revision} · evidence ${(artifact.evidence_refs || []).length}`
+      ),
+      node("small", "", artifact.body_text || "")
+    );
+    row.append(copy);
+    if (room.room_type === "MEETING" && snap.user_may_write) {
+      const revise = node(
+        "button",
+        "secondary-button compact-action",
+        "Revise"
+      );
+      revise.type = "button";
+      revise.addEventListener("click", () => {
+        state.multiRoomArtifactDraft = {
+          artifactId: artifact.artifact_id,
+          expectedRevision: artifact.current_revision,
+          state: artifact.state,
+        };
+        elements.multiRoomArtifactType.value = artifact.artifact_type;
+        elements.multiRoomArtifactTitle.value = artifact.title;
+        elements.multiRoomArtifactEvidence.value = (
+          artifact.evidence_refs || []
+        ).join("\n");
+        elements.multiRoomMessage.value = artifact.body_text || "";
+        elements.createRoomArtifact.textContent =
+          `Save revision ${artifact.current_revision + 1}`;
+        toast("Artifact revision loaded");
+      });
+      row.append(revise);
+      const feature = activeMeetingFeature();
+      const alreadyLinked = (feature?.expected_paths || []).some(
+        (path) =>
+          path.artifact_id === artifact.artifact_id &&
+          path.artifact_revision === artifact.current_revision
+      );
+      if (artifact.artifact_type === "SPECIFICATION" && feature && feature.state !== "ADOPTED") {
+        const addPath = node(
+          "button",
+          "secondary-button compact-action",
+          alreadyLinked ? "Path added" : "Add Expected Path"
+        );
+        addPath.type = "button";
+        addPath.disabled = alreadyLinked;
+        addPath.addEventListener("click", () => {
+          addArtifactAsExpectedPath(artifact).catch((error) => toast(error.message, true));
+        });
+        row.append(addPath);
+      }
+    }
+    artifactList.append(row);
+  }
+  const transcript = node("section", "room-message-transcript");
+  transcript.append(node("strong", "", "Room messages"));
+  const messages = snap.messages || [];
+  if (!messages.length) transcript.append(node("p", "empty-copy", "No room messages yet"));
+  for (const message of messages) {
+    const item = node("article", "task-frame-entry message");
+    item.append(
+      node("strong", "", message.author_role || "ROOM"),
+      node("pre", "task-frame-entry-body", message.body_text || "")
+    );
+    transcript.append(item);
+  }
+  const detail = [summary, participantList, permissionList];
+  if (room.room_type === "BOSS") {
+    detail.push(renderTaskFrameTimeline(snap.task_frame_timeline));
+  }
+  detail.push(featurePanel, findingList, artifactList, transcript);
+  elements.multiRoomDetail.replaceChildren(...detail);
 }
 
 async function setRoomParticipantControl(roomId, bindingId, action) {
@@ -5534,19 +7516,31 @@ function openMultiRoomStream(roomId) {
   source.addEventListener("snapshot", (event) => {
     if (state.activeMultiRoomId !== roomId) return;
     const payload = JSON.parse(event.data);
+    const previous = state.activeMultiRoomSnapshot;
     state.activeMultiRoomSnapshot = {
       status: "ROOM_SNAPSHOT",
       room: payload.room,
       bindings: payload.bindings || [],
       messages: payload.messages || [],
+      artifacts: payload.artifacts ?? previous?.artifacts ?? [],
+      findings: payload.findings ?? previous?.findings ?? [],
       events: payload.events || [],
       participant_cursors: payload.participant_cursors || [],
       bridge_line: payload.bridge_line || "",
       permissions:
         payload.permissions || state.activeMultiRoomSnapshot?.permissions || [],
+      task_frame_timeline:
+        payload.task_frame_timeline || state.activeMultiRoomSnapshot?.task_frame_timeline,
       write_roles: state.activeMultiRoomSnapshot?.write_roles || [],
       user_may_write: state.activeMultiRoomSnapshot?.user_may_write || false,
     };
+    renderActiveMultiRoom();
+  });
+  source.addEventListener("task-frame", (event) => {
+    if (state.activeMultiRoomId !== roomId) return;
+    const timeline = JSON.parse(event.data);
+    if (!state.activeMultiRoomSnapshot) return;
+    state.activeMultiRoomSnapshot.task_frame_timeline = timeline;
     renderActiveMultiRoom();
   });
   source.addEventListener("room", (event) => {
@@ -5569,6 +7563,12 @@ function openMultiRoomStream(roomId) {
         );
       }
       state.activeMultiRoomSnapshot = snapshot;
+      renderActiveMultiRoom();
+      return;
+    }
+    if (payload.type === "PARTICIPANT_RESET") {
+      const bindingId = payload.binding_id || "provider";
+      state.multiRoomLiveOutput[bindingId] = "";
       renderActiveMultiRoom();
       return;
     }
@@ -5624,27 +7624,123 @@ async function createMeetingRoomThin() {
     body: {
       room_type: "MEETING",
       title: "Meeting",
-      topic: "function-first debate",
+      topic: "Feature specification collaboration",
       project_id: project,
-      models: [
-        { provider: "GROK", display_name: "Grok" },
-        { provider: "CLAUDE", display_name: "Claude" },
-      ],
+      models: [],
     },
   });
   await refreshMultiRooms();
   toast("Meeting room created");
 }
 
+async function setActiveRoomFindingState(findingId, findingState) {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  await api(
+    `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/findings/${encodeURIComponent(findingId)}/state`,
+    { method: "POST", body: { state: findingState } }
+  );
+  await openMultiRoom(snapshot.room.room_id);
+  toast(`Finding ${findingState.toLowerCase()}`);
+}
+
+async function recordActiveRoomFinding() {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  if (snapshot.room.room_type !== "MEETING") {
+    throw new Error("Structured findings are currently available in meeting rooms");
+  }
+  const summary = elements.multiRoomFindingSummary?.value?.trim() || "";
+  const detailText = elements.multiRoomMessage?.value?.trim() || "";
+  if (!summary) throw new Error("Finding summary required");
+  const evidenceRefs = (elements.multiRoomArtifactEvidence?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const featureRefs = (elements.multiRoomFindingFeatures?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const findingType = elements.multiRoomFindingType?.value || "RAG_FINDING";
+  const requestedOwnerRole = elements.multiRoomFindingOwner?.value || "";
+  await api(`/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/findings`, {
+    method: "POST",
+    body: {
+      finding_type: findingType,
+      summary,
+      detail_text: detailText,
+      author_role: "USER",
+      evidence_refs: evidenceRefs,
+      feature_refs: featureRefs,
+      ...(requestedOwnerRole ? { requested_owner_role: requestedOwnerRole } : {}),
+    },
+  });
+  elements.multiRoomFindingSummary.value = "";
+  elements.multiRoomFindingFeatures.value = "";
+  elements.multiRoomArtifactEvidence.value = "";
+  elements.multiRoomMessage.value = "";
+  await openMultiRoom(snapshot.room.room_id);
+  toast("Room finding recorded");
+}
+
+async function createActiveRoomArtifact() {
+  const snapshot = state.activeMultiRoomSnapshot;
+  if (!snapshot?.room?.room_id) throw new Error("Open a meeting room first");
+  if (snapshot.room.room_type !== "MEETING") {
+    throw new Error("Room artifacts are currently available in meeting rooms");
+  }
+  const title = elements.multiRoomArtifactTitle?.value?.trim() || "";
+  const bodyText = elements.multiRoomMessage?.value?.trim() || "";
+  if (!title) throw new Error("Artifact title required");
+  if (!bodyText) throw new Error("Artifact body required in Message");
+  const evidenceRefs = (elements.multiRoomArtifactEvidence?.value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const draft = state.multiRoomArtifactDraft;
+  const endpoint = draft
+    ? `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts/${encodeURIComponent(draft.artifactId)}/revisions`
+    : `/v1/rooms/${encodeURIComponent(snapshot.room.room_id)}/artifacts`;
+  const body = draft
+    ? {
+        expected_revision: draft.expectedRevision,
+        title,
+        body_text: bodyText,
+        state: draft.state,
+        author_role: "USER",
+        evidence_refs: evidenceRefs,
+      }
+    : {
+        artifact_type:
+          elements.multiRoomArtifactType?.value || "SPECIFICATION",
+        title,
+        body_text: bodyText,
+        author_role: "USER",
+        evidence_refs: evidenceRefs,
+      };
+  await api(endpoint, { method: "POST", body });
+  state.multiRoomArtifactDraft = null;
+  elements.multiRoomArtifactTitle.value = "";
+  elements.multiRoomArtifactEvidence.value = "";
+  elements.multiRoomMessage.value = "";
+  elements.createRoomArtifact.textContent = "Create artifact from Message";
+  await openMultiRoom(snapshot.room.room_id);
+  toast(draft ? "Room artifact revised" : "Room artifact created");
+}
 async function postActiveRoomAsUser() {
   if (!state.activeMultiRoomId) {
     throw new Error("Open a room first");
   }
   const text = elements.multiRoomMessage?.value?.trim() || "";
   if (!text) throw new Error("Message required");
+  const targetBindingIds = [...state.multiRoomTargetBindingIds];
   await api(`/v1/rooms/${encodeURIComponent(state.activeMultiRoomId)}/messages`, {
     method: "POST",
-    body: { author_role: "USER", body_text: text },
+    body: {
+      author_role: "USER",
+      body_text: text,
+      ...(targetBindingIds.length ? { target_binding_ids: targetBindingIds } : {}),
+    },
   });
   elements.multiRoomMessage.value = "";
   await openMultiRoom(state.activeMultiRoomId);
@@ -5715,6 +7811,9 @@ async function injectSessionRefThin() {
 
 async function openProviderSettings() {
   elements.settingsError.textContent = "";
+  setSettingsTab(state.settingsTab || "service");
+  if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
+  startRendezvousRefreshTimer();
   [
     state.providerSettings,
     state.workerBindings,
@@ -5748,7 +7847,7 @@ async function openProviderSettings() {
         (worker.last_run?.ran_at ? ` · last ${worker.last_run.ran_at}` : "")
       : "0 = off. Server runs HEURISTIC maintain when > 0.";
   }
-  renderProviderSettings();
+  renderProviderModelCatalog();
   renderWorkerBindingSettings();
   renderHostToolSettings();
   renderRuntimePreflight();
@@ -5757,20 +7856,31 @@ async function openProviderSettings() {
   renderRendezvousSettings();
   refreshMultiRooms().catch(() => {});
   setSettingsTab(state.settingsTab || "service");
-  elements.settingsDialog.showModal();
-  startRendezvousRefreshTimer();
 }
 
 function setDialogCategoryTab(root, { tabAttr, panelAttr, stateKey, allowed, fallback }) {
   if (!root) return;
   const activeId = allowed.has(state[stateKey]) ? state[stateKey] : fallback;
   state[stateKey] = activeId;
-  for (const tab of root.querySelectorAll(`[${tabAttr}]`)) {
-    const active = tab.getAttribute(tabAttr) === activeId;
+  const tabs = Array.from(root.querySelectorAll(`[${tabAttr}]`));
+  const panels = Array.from(root.querySelectorAll(`[${panelAttr}]`));
+  const panelsById = new Map(
+    panels.map((panel) => [panel.getAttribute(panelAttr), panel])
+  );
+  for (const tab of tabs) {
+    const tabId = tab.getAttribute(tabAttr);
+    const panel = panelsById.get(tabId);
+    if (root.id && tabId && panel) {
+      if (!tab.id) tab.id = `${root.id}-${tabId}-tab`;
+      if (!panel.id) panel.id = `${root.id}-${tabId}-panel`;
+      tab.setAttribute("aria-controls", panel.id);
+      panel.setAttribute("aria-labelledby", tab.id);
+    }
+    const active = tabId === activeId;
     tab.classList.toggle("is-active", active);
     tab.setAttribute("aria-selected", active ? "true" : "false");
   }
-  for (const panel of root.querySelectorAll(`[${panelAttr}]`)) {
+  for (const panel of panels) {
     const active = panel.getAttribute(panelAttr) === activeId;
     panel.classList.toggle("is-active", active);
     if (active) panel.removeAttribute("hidden");
@@ -5861,7 +7971,6 @@ async function submitProviderSettings(event) {
       api("/v1/settings/providers"),
       api("/v1/settings/worker-bindings"),
     ]);
-    renderProviderSettings();
     renderWorkerBindingSettings();
     renderComposerState();
     elements.settingsDialog.close();
@@ -6095,21 +8204,45 @@ function providerSessionRoomForChatKey(chatKey) {
   ) || null;
 }
 
-function providerSessionRoomIsEligible(room) {
+function providerSessionObservedProjectId(room) {
   const binding = room?.binding || {};
-  const chatKey = String(room?.chat_key || "").trim();
-  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
-  const bindingState = String(binding.state || "").toUpperCase();
-  const currentness = String(binding.observer_currentness || "").toUpperCase();
-  const projectId = String(
+  const boundProject = String(
     binding.current_project_id || binding.node || ""
   ).trim();
+  if (boundProject) return boundProject;
+  return String(projectForVendorWorkspace(room)?.project_id || "").trim();
+}
+
+function providerSessionRoomIsEligible(room) {
+  const chatKey = String(room?.chat_key || "").trim();
+  const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
+  const bindingState = String(room?.binding?.state || "").toUpperCase();
+  const currentness = String(
+    room?.binding?.observer_currentness || ""
+  ).toUpperCase();
+  const identityState = String(room?.identity_state || "").toUpperCase();
+  const projectId = providerSessionObservedProjectId(room);
+  const identityAttached = providerSessionRoomIdentityIsAttached(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
+      identityAttached &&
       ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
       currentness === "CURRENT"
+  );
+}
+
+function providerSessionRoomIdentityIsAttached(room) {
+  const identityState = String(room?.identity_state || "").toUpperCase();
+  if (identityState === "VERIFIED") return true;
+  if (identityState !== "SUPERVISOR_OBSERVED") return false;
+  const binding = room?.binding || {};
+  const bindingState = String(binding.state || "").toUpperCase();
+  return Boolean(
+    ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState) &&
+      String(binding.universe_session_id || "").trim() &&
+      String(binding.session_anchor_ref || "").trim()
   );
 }
 
@@ -6122,6 +8255,8 @@ function providerSessionRoomCacheFor(chatKey) {
       chat_key: key,
       messages: [],
       permissions: [],
+      workStatus: null,
+      actions: [],
       connection: null,
       target: null,
       streamState: "IDLE",
@@ -6174,6 +8309,21 @@ function mergeProviderSessionMessages(chatKey, messages) {
   syncSelectedProviderSessionState(chatKey);
 }
 
+function mergeProviderLiveDeltasIntoRoom(chatKey) {
+  const key = String(chatKey || "").trim();
+  const deltas = state.providerLiveDeltas[key] || [];
+  if (!key || !deltas.length) return;
+  mergeProviderSessionMessages(
+    key,
+    deltas.map((delta) => ({
+      message_id: delta.excerpt_id,
+      role: delta.role,
+      body: delta.text,
+      state: "COMPLETED",
+    }))
+  );
+}
+
 function mergeProviderSessionPermission(chatKey, permission) {
   const safe = redactProviderSessionPermission(permission);
   const cache = providerSessionRoomCacheFor(chatKey);
@@ -6218,18 +8368,14 @@ function providerSessionActivityState(room) {
 }
 
 function providerSessionRoomIsOpenable(room) {
-  const binding = room?.binding || {};
   const chatKey = String(room?.chat_key || "").trim();
   const sessionKind = String(room?.session_kind || "CHAT").toUpperCase();
-  const bindingState = String(binding.state || "").toUpperCase();
-  const projectId = String(
-    binding.current_project_id || binding.node || ""
-  ).trim();
+  const projectId = providerSessionObservedProjectId(room);
   return Boolean(
     chatKey &&
       projectId &&
       sessionKind !== "WORKER" &&
-      ["BOUND", "ANCHOR_OBSERVED"].includes(bindingState)
+      providerSessionRoomIdentityIsAttached(room)
   );
 }
 
@@ -6255,6 +8401,10 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
     .map((permission) => redactProviderSessionPermission(permission))
     .filter(Boolean);
   cache.connection = redactProviderSessionObject(snapshot.connection || null);
+  cache.workStatus = redactProviderSessionObject(snapshot.work_status || null);
+  cache.actions = (Array.isArray(snapshot.actions) ? snapshot.actions : [])
+    .map((action) => redactProviderSessionObject(action))
+    .filter(Boolean);
   cache.target = redactProviderSessionTarget(snapshot.target) || cache.target;
   if (providerSessionRoomIsSelected(key) && cache.target) {
     state.conversationTarget = {
@@ -6263,8 +8413,25 @@ function applyProviderSessionSnapshot(snapshot, chatKey = null) {
       kind: "PROVIDER_SESSION",
     };
   }
+  if (!cache.messages.length) mergeProviderLiveDeltasIntoRoom(key);
   syncSelectedProviderSessionState(key);
   return true;
+}
+
+function workStatusNotificationText(workStatus) {
+  const stateValue = String(workStatus?.state || "UNKNOWN").toUpperCase();
+  const operation = String(workStatus?.operation || "WORK").replaceAll("_", " ");
+  if (stateValue === "STARTED") return `${operation} started`;
+  if (stateValue === "COMPLETED") {
+    const shortSha = String(workStatus?.details?.short_sha || "").trim();
+    return `${operation} completed${shortSha ? ` · ${shortSha}` : ""}`;
+  }
+  if (stateValue === "CANCELLED") return `${operation} cancelled`;
+  if (stateValue === "FAILED") {
+    const code = String(workStatus?.error_code || "UNKNOWN");
+    return `${operation} failed (${code})`;
+  }
+  return `${operation} ${stateValue.toLowerCase()}`;
 }
 
 function applyProviderSessionPayload(chatKey, payload, envelope) {
@@ -6292,6 +8459,30 @@ function applyProviderSessionPayload(chatKey, payload, envelope) {
         : message
     );
     syncSelectedProviderSessionState(key);
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_WORK_STATUS") {
+    cache.workStatus = redactProviderSessionObject(payload.work_status || null);
+    if (cache.workStatus) {
+      toast(
+        workStatusNotificationText(cache.workStatus),
+        String(cache.workStatus.state || "").toUpperCase() === "FAILED"
+      );
+    }
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_ACTION") {
+    const action = redactProviderSessionObject(payload.action || null);
+    if (action) {
+      cache.actions = [
+        ...(cache.actions || []).filter((item) => item.action_id !== action.action_id),
+        action,
+      ];
+    }
+    handled = true;
+  } else if (type === "PROVIDER_SESSION_ACTION_DELETED") {
+    const actionId = String(payload.action_id || "").trim();
+    cache.actions = (cache.actions || []).filter(
+      (item) => item.action_id !== actionId
+    );
     handled = true;
   } else if (
     type === "PROVIDER_SESSION_PERMISSION" ||
@@ -6342,12 +8533,15 @@ function syncProviderSessionSubscriptions() {
   for (const key of Object.keys(state.providerSessionStreams)) {
     if (eligible.has(key)) continue;
     closeProviderSessionStream(key);
-    delete state.providerSessionRoomCaches[key];
-    delete state.providerSessionStreamStates[key];
+    if (!providerSessionRoomIsSelected(key)) {
+      delete state.providerSessionRoomCaches[key];
+      delete state.providerSessionStreamStates[key];
+    }
   }
   for (const key of Object.keys(state.providerSessionRoomCaches)) {
-    if (eligible.has(key)) continue;
+    if (eligible.has(key) || providerSessionRoomIsSelected(key)) continue;
     delete state.providerSessionRoomCaches[key];
+    delete state.providerSessionStreamStates[key];
   }
   for (const key of eligible) {
     openProviderSessionStream(key);
@@ -6375,7 +8569,12 @@ async function refreshProviderSession(chatKey) {
 function openProviderSessionStream(chatKey) {
   const key = String(chatKey || "").trim();
   const room = providerSessionRoomForChatKey(key);
-  if (!providerSessionRoomIsEligible(room)) return null;
+  // Background subscriptions remain currentness-gated by
+  // providerSessionRoomIsEligible().  An explicitly selected attached
+  // Supervisor session may have no provider source-file observation (and thus
+  // UNKNOWN observer currentness), but it is still streamable after the
+  // private resolver attests its persistent target.
+  if (!providerSessionRoomIsOpenable(room)) return null;
   if (state.providerSessionStreams[key]) {
     syncSelectedProviderSessionState(key);
     return state.providerSessionStreams[key];
@@ -6431,6 +8630,10 @@ function openProviderSessionStream(chatKey) {
 }
 
 async function openProviderChatSession(room, options = {}) {
+  state.conversationSurface = "CHAT";
+  const isCurrent =
+    typeof options.isCurrent === "function" ? options.isCurrent : () => true;
+  if (!isCurrent()) return false;
   const binding = room?.binding || {};
   const projectId = String(
     binding.current_project_id || binding.node || ""
@@ -6442,6 +8645,7 @@ async function openProviderChatSession(room, options = {}) {
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
+  if (!isCurrent()) return false;
   closeProjectRoomStream();
   state.selectedProviderChatKey = chatKey;
   const selectedSession = options.session || supervisorSessionForRoom(room);
@@ -6487,12 +8691,14 @@ async function openProviderChatSession(room, options = {}) {
   clearProviderSessionUnread(chatKey);
   syncSelectedProviderSessionState(chatKey);
   await refreshProviderSession(chatKey);
+  mergeProviderLiveDeltasIntoRoom(chatKey);
   openProviderSessionStream(chatKey);
   closeComposerActionMenu();
   renderComposerActions();
   renderComposerState();
   renderRoomMessages();
   elements.dispatchInstruction.focus();
+  return true;
 }
 
 function closeProjectRoomStream() {
@@ -6638,6 +8844,14 @@ function buildGraph() {
     buildMultiverseGraph();
     return;
   }
+  if (state.view === "sessions") {
+    buildSessionGraph();
+    return;
+  }
+  if (state.view === "semantic") {
+    buildSemanticProjectGraph();
+    return;
+  }
   if (state.view === "implementation") {
     if (state.selectedProject) {
       buildProjectInteriorGraph({ mode: "implementation" });
@@ -6662,6 +8876,185 @@ function buildGraph() {
     return;
   }
   buildProjectInteriorGraph({ mode: state.view });
+}
+
+function setGraphLegend(items) {
+  if (!elements.graphLegend) return;
+  elements.graphLegend.replaceChildren();
+  for (const item of items) {
+    const row = node("span");
+    row.append(node("i", `node-key ${item.kind}`), document.createTextNode(item.label));
+    elements.graphLegend.append(row);
+  }
+}
+
+function buildSemanticProjectGraph() {
+  const projection = state.semanticGraph || {};
+  const galaxyEntityTypes = new Set([
+    "PROJECT",
+    "FEATURE_NODE",
+    "EXPECTED_PATH",
+    "EXPECTED_PATH_STEP",
+    "GOAL",
+    "MILESTONE",
+    "TODO",
+    "PREDICTION",
+  ]);
+  const sourceNodes = (projection.nodes || []).filter((item) =>
+    galaxyEntityTypes.has(String(item.entity_type || "").toUpperCase())
+  );
+  const layerByType = {
+    PROJECT: 0,
+    FEATURE_NODE: 1,
+    EXPECTED_PATH: 2,
+    EXPECTED_PATH_STEP: 3,
+    GOAL: 4,
+    MILESTONE: 5,
+    TODO: 6,
+    PREDICTION: 2,
+  };
+  const kindByType = {
+    PROJECT: "project",
+    FEATURE_NODE: "feature",
+    EXPECTED_PATH: "expected-path",
+    EXPECTED_PATH_STEP: "route-step",
+    GOAL: "goal",
+    MILESTONE: "milestone",
+    TODO: "todo",
+    PREDICTION: "predicted",
+  };
+  setGraphLegend([
+    { kind: "project", label: "Project" },
+    { kind: "feature", label: "Feature" },
+    { kind: "expected-path", label: "Expected Path" },
+    { kind: "route-step", label: "Predicted Route Step" },
+    { kind: "goal", label: "Goal" },
+    { kind: "milestone", label: "Milestone" },
+    { kind: "todo", label: "Todo" },
+    { kind: "predicted", label: "Prediction" },
+  ]);
+  const graphNodes = sourceNodes.map((item) => ({
+    id: item.id,
+    label: item.label,
+    kind: kindByType[item.entity_type] || "related",
+    depth: layerByType[item.entity_type] ?? 4,
+    data: item,
+    x: 0,
+    y: 0,
+  }));
+  const layers = [...new Set(graphNodes.map((item) => item.depth))].sort((a, b) => a - b);
+  for (const depth of layers) {
+    const layer = graphNodes.filter((item) => item.depth === depth);
+    layer.forEach((item, index) => {
+      item.x = (index - (layer.length - 1) / 2) * 150;
+      item.y = (depth - 1.5) * 130;
+    });
+  }
+  const visible = new Set(graphNodes.map((item) => item.id));
+  state.graph.nodes = graphNodes;
+  state.graph.edges = (projection.edges || [])
+    .filter((edge) => visible.has(edge.from) && visible.has(edge.to))
+    .map((edge) => ({ from: edge.from, to: edge.to, kind: edge.edge_type, data: edge }));
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  if (elements.graphHint) {
+    elements.graphHint.classList.toggle("hidden", !graphNodes.length);
+    elements.graphHint.textContent = `Galaxy · ${state.selectedProject?.project_id || "Unknown"} · ${graphNodes.length} typed node(s) · projection only`;
+  }
+  drawGraph();
+}
+
+function sessionGraphNodeLabel(item) {
+  const fallback = String(item?.label || item?.project_id || "Session").trim();
+  if (String(item?.entity_type || "").toUpperCase() !== "SESSION_ANCHOR") {
+    return fallback;
+  }
+  const provider = String(item?.provider || "").trim().toUpperCase();
+  if (!provider) return fallback;
+  const currentness = String(item?.currentness || "").trim().toUpperCase();
+  return currentness === "CURRENT" ? `${provider} CURRENT` : provider;
+}
+
+function buildSessionGraph() {
+  setGraphLegend([
+    { kind: "mode", label: "Mode" },
+    { kind: "mode-anchor", label: "Mode Anchor" },
+    { kind: "session-anchor", label: "Session Anchor" },
+    { kind: "task-frame", label: "Task Frame" },
+  ]);
+  const projection = state.sessionGraph || { nodes: [], edges: [] };
+  const selectedProjectId = String(state.selectedProject?.project_id || "").trim();
+  const projectedNodes = projection.nodes || [];
+  const sourceNodes = selectedProjectId
+    ? projectedNodes.filter((item) => item.project_id === selectedProjectId)
+    : projectedNodes;
+  const visibleNodeIds = new Set(sourceNodes.map((item) => item.id));
+  const projectIds = [...new Set(sourceNodes.map((item) => item.project_id).filter(Boolean))].sort();
+  const layerByType = {
+    PROJECT: 0,
+    MODE: 1,
+    MODE_ANCHOR: 2,
+    SESSION_ANCHOR: 3,
+    TASK_FRAME: 4,
+  };
+  const graphNodes = sourceNodes.map((item) => ({
+    id: item.id,
+    label: sessionGraphNodeLabel(item),
+    kind: String(item.entity_type || "UNKNOWN").toLowerCase(),
+    depth: layerByType[item.entity_type] ?? 5,
+    projectId: item.project_id || null,
+    data: item,
+    x: 0,
+    y: 0,
+  }));
+  projectIds.forEach((projectId, projectIndex) => {
+    const group = graphNodes.filter((item) => item.projectId === projectId);
+    const maxLayerCount = Math.max(
+      1,
+      ...Object.values(layerByType).map(
+        (depth) => group.filter((item) => item.depth === depth).length
+      )
+    );
+    const groupWidth = Math.max(360, maxLayerCount * 86);
+    const centerX =
+      (projectIndex - (projectIds.length - 1) / 2) * (groupWidth + 90);
+    for (const depth of Object.values(layerByType)) {
+      const layer = group
+        .filter((item) => item.depth === depth)
+        .sort((left, right) => left.id.localeCompare(right.id));
+      layer.forEach((item, index) => {
+        item.x = centerX + (index - (layer.length - 1) / 2) * 82;
+        item.y = -270 + depth * 85;
+      });
+    }
+  });
+  state.graph.nodes = graphNodes;
+  state.graph.edges = (projection.edges || [])
+    .filter((edge) => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to))
+    .map((edge) => ({
+      from: edge.from,
+      to: edge.to,
+      kind: String(edge.edge_type || "related").toLowerCase().replaceAll("_", "-"),
+      data: edge,
+    }));
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  if (elements.graphEmpty && !graphNodes.length) {
+    elements.graphEmpty.textContent = "No Mode or Session Anchor lineage is available";
+  }
+  if (elements.graphHint) {
+    const sessions = graphNodes.filter((item) => item.kind === "session_anchor").length;
+    const frames = graphNodes.filter((item) => item.kind === "task_frame").length;
+    elements.graphHint.classList.toggle("hidden", !graphNodes.length);
+    const scopeLabel = selectedProjectId || "All projects";
+    elements.graphHint.textContent =
+      `Session Graph · ${scopeLabel} · ${sessions} Session Anchor(s) · ${frames} Task Frame(s) · click a Session Anchor to bind its exact chat`;
+  }
+  drawGraph();
 }
 
 /** Fetch projections for every attached project so multiverse can stay fully expanded. */
@@ -6705,6 +9098,12 @@ function projectionForProject(projectId) {
  * Selection never hides nodes; drawGraph uses dim alpha for current depth.
  */
 function buildMultiverseGraph() {
+  setGraphLegend([
+    { kind: "project", label: "Project" },
+    { kind: "system", label: "Project Seed node" },
+    { kind: "predicted", label: "Predicted" },
+    { kind: "document", label: "Document" },
+  ]);
   const hub = {
     id: "universe:hub",
     label: "Universe",
@@ -7694,12 +10093,30 @@ function drawGraph() {
 /** Colors express node meaning. Do not derive semantic UI state from an ID hash. */
 function graphAccentColor(item) {
   const networkRole = String(item?.data?.network_role || "");
+  if (item.kind === "feature") {
+    return { fill: "rgba(76, 45, 112, 0.94)", stroke: "#c084fc", soft: "rgba(192, 132, 252, 0.24)" };
+  }
+  if (item.kind === "expected-path") {
+    return { fill: "rgba(105, 66, 20, 0.94)", stroke: "#f59e0b", soft: "rgba(245, 158, 11, 0.24)" };
+  }
   if (item.kind === "predicted") {
     return {
       fill: "rgba(74, 48, 112, 0.92)",
       stroke: "#bd9cff",
       soft: "rgba(177, 139, 255, 0.28)",
     };
+  }
+  if (item.kind === "mode") {
+    return { fill: "rgba(56, 45, 96, 0.94)", stroke: "#b9a3ff", soft: "rgba(185, 163, 255, 0.24)" };
+  }
+  if (item.kind === "mode_anchor") {
+    return { fill: "rgba(24, 63, 105, 0.94)", stroke: "#73b9ff", soft: "rgba(115, 185, 255, 0.24)" };
+  }
+  if (item.kind === "session_anchor") {
+    return { fill: "rgba(18, 82, 72, 0.94)", stroke: "#67ddc3", soft: "rgba(103, 221, 195, 0.24)" };
+  }
+  if (item.kind === "task_frame") {
+    return { fill: "rgba(91, 55, 24, 0.94)", stroke: "#f1ae66", soft: "rgba(241, 174, 102, 0.24)" };
   }
   if (item.kind === "setup") {
     return {
@@ -7742,10 +10159,31 @@ function graphNodeMetrics(item) {
   if (item.kind === "project") {
     return { shape: "project", radius: 22, hitR: 28 };
   }
+  if (["mode", "mode_anchor", "session_anchor", "task_frame"].includes(item.kind)) {
+    return { shape: "system", radius: item.kind === "session_anchor" ? 17 : 15, hitR: 22 };
+  }
   if (item.kind === "system" || item.kind === "related" || item.kind === "focus") {
     return { shape: "system", radius: 14, hitR: 18 };
   }
   return { shape: "other", radius: 16, hitR: 20 };
+}
+
+function todoStateColor(todoState) {
+  return {
+    BLOCKED: "#fb7185",
+    IN_PROGRESS: "#22d3ee",
+    READY: "#a3e635",
+    BACKLOG: "#94a3b8",
+  }[todoState] || "#f6c76a";
+}
+
+function todoProjectionForGraphNode(graphNode) {
+  const todos = openTodosForGraphNode(graphNode);
+  if (!todos.length) return null;
+  const rank = { BLOCKED: 0, IN_PROGRESS: 1, READY: 2, BACKLOG: 3 };
+  const stateName = [...todos]
+    .sort((left, right) => (rank[left.state] ?? 9) - (rank[right.state] ?? 9))[0]?.state;
+  return { count: todos.length, state: stateName, color: todoStateColor(stateName) };
 }
 
 function drawGraphNodeIcon(context, item, depthStyle) {
@@ -7764,6 +10202,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   const metrics = graphNodeMetrics(item);
   const accent = graphAccentColor(item);
   const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
+  const todoProjection = todoProjectionForGraphNode(item);
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
     context.shadowColor = "rgba(61, 224, 255, 0.8)";
@@ -7814,6 +10253,14 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.stroke();
   }
 
+  if (todoProjection) {
+    context.beginPath();
+    context.arc(item.x, item.y, r + 4, 0, Math.PI * 2);
+    context.strokeStyle = todoProjection.color;
+    context.lineWidth = 2.5;
+    context.stroke();
+  }
+
   context.shadowBlur = 0;
   context.fillStyle = selected || hovered ? "#f2fbff" : "#e6f2ff";
   context.font = `${metrics.shape === "system" ? "600 10px" : "700 12px"} Segoe UI`;
@@ -7821,17 +10268,16 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   context.textBaseline = "middle";
   context.fillText(nodeMonogram(item), item.x, item.y + 0.5);
 
-  const todoCount = openTodosForGraphNode(item).length;
-  if (todoCount) {
+  if (todoProjection) {
     const badgeX = item.x + r * 0.72;
     const badgeY = item.y - r * 0.72;
     context.beginPath();
     context.arc(badgeX, badgeY, 8, 0, Math.PI * 2);
-    context.fillStyle = "#f6c76a";
+    context.fillStyle = todoProjection.color;
     context.fill();
     context.fillStyle = "#111827";
     context.font = "700 9px Segoe UI";
-    context.fillText(String(Math.min(todoCount, 99)), badgeX, badgeY + 0.5);
+    context.fillText(String(Math.min(todoProjection.count, 99)), badgeX, badgeY + 0.5);
   }
 }
 
@@ -7875,6 +10321,10 @@ function graphNodeKindLabel(item) {
   if (item.kind === "universe") return "Universe";
   if (item.kind === "project") return "Project";
   if (item.kind === "system") return "System";
+  if (item.kind === "mode") return "Mode";
+  if (item.kind === "mode_anchor") return "Mode Anchor";
+  if (item.kind === "session_anchor") return "Session Anchor";
+  if (item.kind === "task_frame") return "Task Frame";
   return item.kind || "Node";
 }
 
@@ -7936,6 +10386,35 @@ function selectGraphNode(event) {
   const selected = hitTestGraphNode(point);
   if (!selected) return;
   state.inspectorDismissed = false;
+  if (state.view === "sessions") {
+    state.selectedNode = selected;
+    drawGraph();
+    renderDetails();
+    showInspectorTab("details");
+    if (selected.kind === "session_anchor") {
+      const anchorRef = String(selected.data?.ref || "");
+      const session = (state.supervisorSessions || []).find(
+        (item) => sessionAnchorRef(item) === anchorRef
+      );
+      if (!session) {
+        toast("This Session Anchor has no observable provider session", true);
+        return;
+      }
+      const coordinate = nodeModeCoordinates()
+        .flatMap((group) => group.modes)
+        .find((item) => item.sessions.some(
+          (candidate) => anchorSessionKey(candidate) === anchorSessionKey(session)
+        ));
+      if (!coordinate) {
+        toast("This Session Anchor has no visible Mode coordinate", true);
+        return;
+      }
+      selectNodeModeSession(coordinate, session).catch((error) =>
+        toast(error.message, true)
+      );
+    }
+    return;
+  }
   if (selected.kind === "universe") {
     // Depth 0 focus — tree stays fully expanded; only dim shifts.
     state.focusedNodeId = null;
@@ -8020,7 +10499,513 @@ function selectGraphNode(event) {
   state.selectedNode = selected;
   drawGraph();
   renderDetails();
+  renderActivity();
   showInspectorTab("details");
+}
+
+async function refreshFeatureNodeProposals() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
+  );
+  state.featureNodeProposals = result.proposals || [];
+}
+
+async function generateFeatureNodeProposals() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals/generate`,
+    { method: "POST", body: {} }
+  );
+  state.featureNodeProposals = result.proposals || [];
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(
+    result.created_count
+      ? `${result.created_count} Proposed Node candidate(s) recorded`
+      : "Proposed Nodes already current"
+  );
+}
+
+async function startFeatureNodePlanning(proposal) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/feature-node-proposals/${encodeURIComponent(proposal.proposal_id)}/explorations`,
+    {
+      method: "POST",
+      body: { expected_proposal_digest: proposal.proposal_digest },
+    }
+  );
+  await refreshFeatureNodeProposals();
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(
+    result.status === "FEATURE_NODE_EXPLORATION_STARTED"
+      ? "Feature Node and planning room created"
+      : "Feature planning already active"
+  );
+}
+
+async function reviewFeatureNodeProposal(proposalId, decision, rationale) {
+  const projectId = state.selectedProject?.project_id;
+  const reviewRationale = String(rationale || "").trim();
+  if (!projectId || !reviewRationale) return;
+  await api(
+    `/v1/feature-node-proposals/${encodeURIComponent(proposalId)}/reviews`,
+    { method: "POST", body: { decision, rationale: reviewRationale } }
+  );
+  await refreshFeatureNodeProposals();
+  await refreshFeatureSemanticGraph(projectId);
+  renderDetails();
+  toast(decision === "EXPLORE" ? "Feature exploration recorded" : "Feature proposal rejected");
+}
+
+function appendFeatureProposalReview(card, proposal) {
+  const actions = node("div", "detail-heading-actions");
+  const editor = node("div", "proposal-review-editor hidden");
+  const prompt = node("label", "proposal-review-prompt", "");
+  const rationale = node("textarea", "proposal-review-rationale");
+  rationale.rows = 3;
+  const error = node("small", "proposal-review-error", "");
+  const editorActions = node("div", "detail-heading-actions");
+  const submit = node("button", "primary-button compact-action", "Submit review");
+  const cancel = node("button", "secondary-button compact-action", "Cancel");
+  submit.type = "button";
+  cancel.type = "button";
+  let selectedDecision = "";
+
+  function openEditor(decision) {
+    selectedDecision = decision;
+    const rejecting = decision === "REJECT";
+    prompt.textContent = rejecting
+      ? "Why should Universe reject this proposal?"
+      : "Why should Universe explore this Feature?";
+    rationale.placeholder = rejecting
+      ? "Explain why this should not become a Feature Node."
+      : "Explain why this is worth exploring.";
+    submit.textContent = rejecting ? "Submit rejection" : "Submit exploration";
+    error.textContent = "";
+    editor.classList.remove("hidden");
+    rationale.focus();
+  }
+
+  for (const decision of ["EXPLORE", "REJECT"]) {
+    const button = node(
+      "button",
+      "secondary-button compact-action",
+      decision === "EXPLORE" ? "Explore" : "Reject"
+    );
+    button.type = "button";
+    button.addEventListener("click", () => openEditor(decision));
+    actions.append(button);
+  }
+
+  cancel.addEventListener("click", () => {
+    selectedDecision = "";
+    rationale.value = "";
+    error.textContent = "";
+    editor.classList.add("hidden");
+  });
+  submit.addEventListener("click", async () => {
+    if (!selectedDecision || !rationale.value.trim()) {
+      error.textContent = "A rationale is required.";
+      return;
+    }
+    submit.disabled = true;
+    cancel.disabled = true;
+    try {
+      await reviewFeatureNodeProposal(
+        proposal.proposal_id,
+        selectedDecision,
+        rationale.value
+      );
+    } catch (reviewError) {
+      toast(reviewError.message, true);
+      submit.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+
+  editorActions.append(submit, cancel);
+  editor.append(prompt, rationale, error, editorActions);
+  card.append(actions, editor);
+}
+
+function featureProposalEvidenceItems(proposal) {
+  const memoriesById = new Map(
+    (state.memories || []).map((memory) => [memory.memory_id, memory])
+  );
+  const candidatesById = new Map(
+    (state.memoryCandidates || []).map((candidate) => [
+      candidate.candidate_id,
+      candidate,
+    ])
+  );
+  return (proposal.evidence_refs || []).map((evidenceRef) => {
+    const evidenceId = String(evidenceRef || "").split("/").filter(Boolean).pop() || "";
+    const memory = memoriesById.get(evidenceId);
+    if (memory) {
+      return {
+        kind: "Memory",
+        title: memory.title || evidenceId,
+        meta: [memory.state, memory.link_state].filter(Boolean).join(" · "),
+        detail: truncate(memory.body || "Memory body unavailable.", 360),
+        hasSourceBody: Boolean(String(memory.body || "").trim()),
+      };
+    }
+    const candidate = candidatesById.get(evidenceId);
+    if (candidate) {
+      const upstream = (candidate.relations || [])
+        .map((relation) => candidatesById.get(relation.candidate_id))
+        .filter(Boolean)
+        .map((source) => source.summary)
+        .filter(Boolean);
+      const upstreamText = upstream.length
+        ? `Upstream summaries: ${upstream.join(" | ")}`
+        : "No upstream summary is available.";
+      return {
+        kind: "Memory candidate",
+        title: candidate.summary || evidenceId,
+        meta: [candidate.kind, candidate.stage, candidate.state]
+          .filter(Boolean)
+          .join(" · "),
+        detail: truncate(upstreamText, 360),
+        hasSourceBody: false,
+      };
+    }
+    return {
+      kind: "Evidence",
+      title: evidenceId || "Unknown evidence",
+      meta: "Reference only",
+      detail: String(evidenceRef || "Evidence reference unavailable."),
+      hasSourceBody: false,
+    };
+  });
+}
+
+function appendFeatureProposalEvidence(card, proposal) {
+  const evidenceItems = featureProposalEvidenceItems(proposal);
+  const evidence = node("details", "proposal-evidence");
+  evidence.open = true;
+  evidence.append(
+    node(
+      "summary",
+      "",
+      `Why this was proposed · ${evidenceItems.length} source${evidenceItems.length === 1 ? "" : "s"}`
+    )
+  );
+  if (!evidenceItems.length) {
+    evidence.append(node("p", "empty-copy", "No source evidence is available."));
+  }
+  for (const item of evidenceItems) {
+    const row = node("div", "proposal-evidence-item");
+    row.append(
+      node("small", "proposal-evidence-meta", `${item.kind} · ${item.meta}`),
+      node("strong", "", item.title),
+      node("p", "empty-copy", item.detail)
+    );
+    evidence.append(row);
+  }
+  if (evidenceItems.length && !evidenceItems.some((item) => item.hasSourceBody)) {
+    evidence.append(
+      node(
+        "p",
+        "proposal-evidence-warning",
+        "Review warning · Source evidence is candidate-only; no original Memory body is attached."
+      )
+    );
+  }
+  card.append(evidence);
+}
+
+function renderFeatureNodeProposalDetails() {
+  const proposals = state.featureNodeProposals || [];
+  const group = node("div", "detail-group");
+  const heading = node("div", "detail-heading-row");
+  heading.append(node("h3", "", `Proposed Nodes (${proposals.length})`));
+  const generate = node("button", "secondary-button compact-action", "Discover");
+  generate.type = "button";
+  generate.title = "Build review-only Feature Node proposals from selected project evidence";
+  generate.addEventListener("click", () =>
+    generateFeatureNodeProposals().catch((error) => toast(error.message, true))
+  );
+  heading.append(generate);
+  group.append(heading);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      "Read the source evidence before choosing Explore or Reject. Start planning creates one Feature Node, bounded Planning Context, and Meeting Room; it never creates a Goal, Todo, Task Frame, authority, or RAG adoption."
+    )
+  );
+  if (!proposals.length) {
+    group.append(node("p", "empty-copy", "No Proposed Nodes yet."));
+    return group;
+  }
+  for (const proposal of proposals.slice(0, 12)) {
+    const card = node("div", "context-card proposal-card");
+    card.append(
+      node("strong", "", `${proposal.state} · ${proposal.proposal_kind} · ${proposal.title}`),
+      node(
+        "small",
+        "",
+        `${Math.round(Number(proposal.confidence || 0) * 100)}% · ${(proposal.evidence_refs || []).length} evidence · ${proposal.proposal_id}`
+      )
+    );
+    if (proposal.intent_text && proposal.intent_text !== proposal.title) {
+      card.append(node("p", "empty-copy", proposal.intent_text));
+    }
+    if (proposal.target_node_ref) {
+      card.append(node("small", "", `Existing target · ${proposal.target_node_ref}`));
+    }
+    appendFeatureProposalEvidence(card, proposal);
+    if (proposal.state === "PROPOSAL_ONLY") {
+      appendFeatureProposalReview(card, proposal);
+    } else {
+      if (proposal.review?.rationale) {
+        card.append(node("small", "", `Rationale · ${proposal.review.rationale}`));
+      }
+      if (proposal.state === "EXPLORE" && !proposal.planning_context) {
+        const actions = node("div", "detail-heading-actions");
+        const start = node(
+          "button",
+          "primary-button compact-action",
+          "Start planning"
+        );
+        start.type = "button";
+        start.addEventListener("click", () =>
+          startFeatureNodePlanning(proposal).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        actions.append(start);
+        card.append(actions);
+      } else if (proposal.planning_context) {
+        card.append(
+          node(
+            "small",
+            "",
+            `Planning · ${proposal.planning_context.feature_id} · ${proposal.planning_context.room_id}`
+          )
+        );
+      }
+    }
+    group.append(card);
+  }
+  return group;
+}
+
+async function refreshSelectedWorkLoop() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  state.workLoop = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop`
+  );
+  renderDetails();
+}
+
+async function generateWorkLoopPrediction() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/predictions`,
+    { method: "POST", body: {} }
+  );
+  await refreshSelectedWorkLoop();
+  toast(
+    result.status === "WORK_LOOP_PREDICTION_RECORDED"
+      ? "Prediction proposal recorded"
+      : "Prediction proposal already current"
+  );
+}
+
+async function reviewWorkLoopPrediction(proposalId, decision) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/predictions/review`,
+    { method: "POST", body: { proposal_id: proposalId, decision } }
+  );
+  await refreshSelectedWorkLoop();
+  toast(`Prediction ${decision === "KEEP" ? "kept" : "rejected"}`);
+}
+
+async function reviewWorkLoopCandidate(candidateId, decision) {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/review-candidates/review`,
+    { method: "POST", body: { candidate_id: candidateId, decision } }
+  );
+  await refreshSelectedWorkLoop();
+  toast(`Result candidate ${decision === "KEEP" ? "kept" : "rejected"}`);
+}
+
+async function recoverWorkLoopTodos() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) return;
+  const result = await api(
+    `/v1/projects/${encodeURIComponent(projectId)}/work-loop/recover`,
+    { method: "POST", body: {} }
+  );
+  await refresh();
+  if (state.selectedProject?.project_id === projectId) {
+    await selectProject(projectId, { revealInspector: true });
+  }
+  toast(`Recovered ${(result.recovered || []).length} interrupted Todo`);
+}
+
+function renderWorkLoopDetails() {
+  const workLoop = state.workLoop || {};
+  const predictions = workLoop.predictions || [];
+  const group = node("div", "detail-group");
+  const heading = node("div", "detail-heading-row");
+  heading.append(node("h3", "", `Work Loop (${predictions.length})`));
+  const actions = node("div", "detail-heading-actions");
+  const generate = node("button", "secondary-button compact-action", "Predict");
+  generate.type = "button";
+  generate.title = "Generate a review-only Goal / Plan / Milestone / risk proposal";
+  generate.addEventListener("click", () =>
+    generateWorkLoopPrediction().catch((error) => toast(error.message, true))
+  );
+  const recover = node("button", "secondary-button compact-action", "Recover");
+  recover.type = "button";
+  recover.title = "Return interrupted Todo work to READY when recovery evidence matches";
+  recover.addEventListener("click", () =>
+    recoverWorkLoopTodos().catch((error) => toast(error.message, true))
+  );
+  actions.append(generate, recover);
+  heading.append(actions);
+  group.append(heading);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      "Predictions are evidence-backed proposals only. They never auto-adopt Goals or Todos."
+    )
+  );
+  if (!predictions.length) {
+    group.append(node("p", "empty-copy", "No prediction proposal yet."));
+  }
+  for (const prediction of predictions.slice(0, 5)) {
+    const card = node("div", "context-card");
+    card.append(
+      node(
+        "strong",
+        "",
+        `${prediction.review_state || "PROPOSAL_ONLY"} · ${prediction.proposal_id}`
+      )
+    );
+    const list = node("ul", "context-list");
+    for (const suggestion of (prediction.suggestions || []).slice(0, 8)) {
+      const provenance = (suggestion.provenance || [])
+        .map((item) => `${item.kind}:${item.ref}`)
+        .join(", ");
+      list.append(
+        node(
+          "li",
+          "",
+          `${suggestion.kind} · ${Math.round(Number(suggestion.confidence || 0) * 100)}% · ${suggestion.title}${provenance ? ` · ${provenance}` : ""}`
+        )
+      );
+    }
+    for (const rejected of (prediction.rejected || []).slice(0, 5)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `REJECTED · ${rejected.reason} · ${rejected.title || "No supported candidate"}`
+        )
+      );
+    }
+    card.append(list);
+    if ((prediction.review_state || "PROPOSAL_ONLY") === "PROPOSAL_ONLY") {
+      const reviewActions = node("div", "detail-heading-actions");
+      for (const decision of ["KEEP", "REJECT"]) {
+        const button = node(
+          "button",
+          "secondary-button compact-action",
+          decision === "KEEP" ? "Keep" : "Reject"
+        );
+        button.type = "button";
+        button.addEventListener("click", () =>
+          reviewWorkLoopPrediction(prediction.proposal_id, decision).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        reviewActions.append(button);
+      }
+      card.append(reviewActions);
+    }
+    group.append(card);
+  }
+  const reviewCandidates = workLoop.review_candidates || [];
+  if (reviewCandidates.length) {
+    group.append(node("h4", "", `Result Review (${reviewCandidates.length})`));
+  }
+  for (const candidate of reviewCandidates.slice(0, 10)) {
+    const card = node("div", "context-card");
+    card.append(
+      node(
+        "strong",
+        "",
+        `${candidate.sink_kind} · ${candidate.review_state || "PENDING_REVIEW"}`
+      ),
+      node(
+        "p",
+        "empty-copy",
+        `${candidate.outcome || "UNKNOWN"} · Todo ${candidate.todo_id || "unknown"}`
+      )
+    );
+    if ((candidate.review_state || "PENDING_REVIEW") === "PENDING_REVIEW") {
+      const reviewActions = node("div", "detail-heading-actions");
+      for (const decision of ["KEEP", "REJECT"]) {
+        const button = node(
+          "button",
+          "secondary-button compact-action",
+          decision === "KEEP" ? "Keep" : "Reject"
+        );
+        button.type = "button";
+        button.addEventListener("click", () =>
+          reviewWorkLoopCandidate(candidate.candidate_id, decision).catch((error) =>
+            toast(error.message, true)
+          )
+        );
+        reviewActions.append(button);
+      }
+      card.append(reviewActions);
+    }
+    group.append(card);
+  }
+  const memorySchedules = workLoop.memory_schedules || [];
+  if (memorySchedules.length) {
+    group.append(node("h4", "", `Memory Scheduler (${memorySchedules.length})`));
+  }
+  for (const schedule of memorySchedules.slice(0, 8)) {
+    group.append(
+      node(
+        "p",
+        "empty-copy",
+        `${schedule.stage || "MEMORY"} · ${schedule.state || "UNKNOWN"} · last ${schedule.last_outcome || "NONE"} · next ${schedule.next_due_at || "not scheduled"} · attempts ${Number(schedule.attempt_count || 0)}/${Number(schedule.max_attempts || 0)}`
+      )
+    );
+  }
+  const fanoutCount = (workLoop.result_fanouts || []).length;
+  const pendingReviewCount = reviewCandidates.filter(
+    (candidate) => (candidate.review_state || "PENDING_REVIEW") === "PENDING_REVIEW"
+  ).length;
+  const documentCount = Number(workLoop.document_automation?.proposal_count || 0);
+  group.append(
+    node(
+      "p",
+      "empty-copy",
+      `Result fan-out ${fanoutCount} · Pending reviews ${pendingReviewCount} · Memory schedules ${memorySchedules.length} · Document proposals ${documentCount} · auto-apply off`
+    )
+  );
+  return group;
 }
 
 function renderDetails() {
@@ -8116,6 +11101,19 @@ function renderDetails() {
   addTodo.addEventListener("click", () => openTodoDialog(true));
   todoHeading.append(addTodo);
   todoGroup.append(todoHeading);
+  const ownershipSummary = todoOwnershipSummary(matchingTodos);
+  if (
+    ownershipSummary.task_frame_count ||
+    ownershipSummary.unbound_in_progress_count
+  ) {
+    todoGroup.append(
+      node(
+        "p",
+        "todo-context-ownership",
+        `Work ownership / ${ownershipSummary.task_frame_count} Task Frame(s) / ${ownershipSummary.session_count} target Session Anchor(s) / ${ownershipSummary.live_pty_count} live PTY / ${ownershipSummary.unbound_in_progress_count} unbound active`
+      )
+    );
+  }
   if (!matchingTodos.length) {
     todoGroup.append(node("p", "empty-copy", "No open Todo for this context"));
   } else {
@@ -8136,6 +11134,11 @@ function renderDetails() {
     todoGroup.append(list);
   }
   elements.details.append(todoGroup);
+
+  if (state.selectedProject) {
+    elements.details.append(renderFeatureNodeProposalDetails());
+    elements.details.append(renderWorkLoopDetails());
+  }
 
   if (state.selectedProject) {
     const handoffGroup = node("div", "detail-group");
@@ -8259,10 +11262,62 @@ function addDetail(list, key, value) {
   list.append(node("dt", "", key), node("dd", "", String(value)));
 }
 
+function semanticActivityItemsForGraphNode(graphNode) {
+  const activityTypes = new Set([
+    "EVENT",
+    "ROOM_CONTROL_EVENT",
+    "ROOM_MESSAGE",
+    "TASK_FRAME_RESULT",
+  ]);
+  const reachable = semanticDescendantIds(graphNode?.id);
+  return (state.semanticGraph?.nodes || [])
+    .filter((item) => reachable.has(item.id) && activityTypes.has(item.entity_type))
+    .sort((left, right) =>
+      String(right.data?.created_at || "").localeCompare(String(left.data?.created_at || ""))
+    )
+    .slice(0, 40);
+}
+
+function renderSemanticNodeActivity(graphNode) {
+  const context = node("div", "activity-context");
+  context.append(
+    node("strong", "", graphNode.label || "Selected node"),
+    node("small", "", "Project activity ledger · filtered by semantic lineage")
+  );
+  elements.activity.append(context);
+  const activityItems = semanticActivityItemsForGraphNode(graphNode);
+  if (!activityItems.length) {
+    elements.activity.append(
+      node("p", "empty-copy", "No activity is linked to this node lineage yet")
+    );
+    return;
+  }
+  const timeline = node("div", "timeline");
+  for (const item of activityItems) {
+    const copy = node("div", "timeline-copy");
+    copy.append(
+      node("strong", "", item.label || item.data?.event_type || item.entity_type),
+      node("small", "", `${item.lifecycle_state || "RECORDED"} · ${item.data?.created_at || "Unknown time"}`)
+    );
+    const row = node("div", "timeline-item semantic-activity-item");
+    row.append(copy);
+    timeline.append(row);
+  }
+  elements.activity.append(timeline);
+}
+
 function renderActivity() {
   elements.activity.replaceChildren();
   if (!state.selectedProject) {
     elements.activity.append(node("p", "empty-copy", "No project selected"));
+    return;
+  }
+  if (
+    state.view === "semantic" &&
+    state.selectedNode &&
+    state.selectedNode.kind !== "project"
+  ) {
+    renderSemanticNodeActivity(state.selectedNode);
     return;
   }
   if (
@@ -8577,7 +11632,7 @@ async function submitDispatch(event) {
       renderReleaseCatalog();
       renderComposerState();
       renderRoomMessages();
-      toast("Choose one imported Release DB before OS_UPDATE", true);
+      toast("Choose one imported Release DB before applying the project runtime", true);
       showInspectorTab("activity");
       return;
     }
@@ -8668,6 +11723,14 @@ function conductorUiContext() {
 
 
 function todosForSelectedContext() {
+  if (
+    state.view === "semantic" &&
+    state.selectedNode &&
+    state.selectedNode.kind !== "project"
+  ) {
+    const todoIds = semanticTodoIdsForGraphNode(state.selectedNode);
+    return state.todos.filter((todo) => todoIds.has(todo.todo_id));
+  }
   const nodeRef = selectedNodeRef();
   if (nodeRef && state.selectedProject) {
     return state.todos.filter(
@@ -8688,6 +11751,59 @@ function todosForSelectedContext() {
   );
 }
 
+let semanticLineageCache = {
+  graph: null,
+  nodesById: new Map(),
+  outgoing: new Map(),
+  descendants: new Map(),
+};
+
+function prepareSemanticLineageCache() {
+  const graph = state.semanticGraph;
+  if (semanticLineageCache.graph === graph) return semanticLineageCache;
+  const nodesById = new Map((graph?.nodes || []).map((item) => [item.id, item]));
+  const outgoing = new Map();
+  for (const edge of graph?.edges || []) {
+    const targets = outgoing.get(edge.from) || [];
+    targets.push(edge.to);
+    outgoing.set(edge.from, targets);
+  }
+  semanticLineageCache = { graph, nodesById, outgoing, descendants: new Map() };
+  return semanticLineageCache;
+}
+
+function semanticGraphNode(nodeId) {
+  return prepareSemanticLineageCache().nodesById.get(nodeId) || null;
+}
+
+function semanticDescendantIds(seedId) {
+  const cache = prepareSemanticLineageCache();
+  if (!seedId || !cache.nodesById.has(seedId)) return new Set();
+  const cached = cache.descendants.get(seedId);
+  if (cached) return cached;
+  const visited = new Set([seedId]);
+  const pending = [seedId];
+  while (pending.length) {
+    const current = pending.shift();
+    for (const target of cache.outgoing.get(current) || []) {
+      if (visited.has(target)) continue;
+      visited.add(target);
+      pending.push(target);
+    }
+  }
+  cache.descendants.set(seedId, visited);
+  return visited;
+}
+
+function semanticTodoIdsForGraphNode(graphNode) {
+  const reachable = semanticDescendantIds(graphNode?.id);
+  return new Set(
+    [...reachable]
+      .filter((nodeId) => semanticGraphNode(nodeId)?.entity_type === "TODO")
+      .map((nodeId) => nodeId.replace(/^todo:/, ""))
+  );
+}
+
 function openTodosForGraphNode(graphNode) {
   if (graphNode?.kind === "project") {
     // Count against the graph project's id, not the currently selected one.
@@ -8698,6 +11814,12 @@ function openTodosForGraphNode(graphNode) {
     return state.todos.filter(
       (todo) =>
         todoBelongsToProject(todo, projectId) && todo.state !== "DONE"
+    );
+  }
+  const semanticTodoIds = semanticTodoIdsForGraphNode(graphNode);
+  if (semanticTodoIds.size) {
+    return state.todos.filter(
+      (todo) => semanticTodoIds.has(todo.todo_id) && todo.state !== "DONE"
     );
   }
   const nodeRef = graphNode?.data?.node_id;
@@ -8865,6 +11987,241 @@ function todoScopeLabel(todo) {
   return `${todo.project_id} / ${todo.node_ref}`;
 }
 
+function semanticTaskFrameOwner(taskFrameId) {
+  if (!taskFrameId) return { anchor: null, session: null, terminal: null };
+  const frameNodeId = `task_frame:${taskFrameId}`;
+  const graph = state.semanticGraph || {};
+  const targetEdge = (graph.edges || []).find(
+    (edge) =>
+      edge.from === frameNodeId &&
+      edge.edge_type === "TASK_FRAME_TARGETS_SESSION_ANCHOR"
+  );
+  const anchorNode = semanticGraphNode(targetEdge?.to);
+  const anchorRef = String(anchorNode?.data?.session_anchor_ref || "");
+  const session = (state.supervisorSessions || []).find(
+    (item) => String(item.session_anchor_ref || "") === anchorRef
+  ) || null;
+  const terminal = (state.supervisorTerminals || state.terminals || []).find(
+    (item) =>
+      String(item.active_session_anchor_ref || item.session_anchor_ref || "") ===
+      anchorRef
+  ) || null;
+  return { anchor: anchorRef || null, session, terminal };
+}
+
+function todoOwnershipProjection(todo) {
+  const surface = state.goalAutomationSurfaces?.[todo.goal_id];
+  const selection = surface?.todo_execution?.selection;
+  if (!(selection?.todo_ids || []).includes(todo.todo_id)) return null;
+  const taskFrameId = String(surface?.binding?.task_frame_id || "");
+  if (!taskFrameId) return null;
+  const owner = semanticTaskFrameOwner(taskFrameId);
+  return {
+    task_frame_id: taskFrameId,
+    anchor_ref: owner.anchor,
+    session_id: owner.session?.session_id || null,
+    provider: owner.session?.provider || null,
+    mode: owner.session?.mode || null,
+    session_state: owner.session?.state || "UNKNOWN",
+    terminal_id: owner.terminal?.terminal_id || null,
+    pty_state: owner.terminal?.state || "DETACHED",
+  };
+}
+
+function todoOwnershipSummary(todos) {
+  const projections = todos.map(todoOwnershipProjection).filter(Boolean);
+  return {
+    projections,
+    task_frame_count: new Set(projections.map((item) => item.task_frame_id)).size,
+    session_count: new Set(
+      projections.map((item) => item.anchor_ref).filter(Boolean)
+    ).size,
+    live_pty_count: projections.filter((item) => item.pty_state === "LIVE").length,
+    unbound_in_progress_count: todos.filter(
+      (todo) => todo.state === "IN_PROGRESS" && !todoOwnershipProjection(todo)
+    ).length,
+  };
+}
+
+const todoAutomationNextStepLabels = {
+  APPLY_ADOPTED_WORK_PLAN: "Apply adopted Work Plan",
+  CREATE_AND_DELIVER_MASTER_HANDOFF: "Create and deliver Master handoff",
+  DELIVER_MASTER_HANDOFF: "Deliver Master handoff",
+  WAIT: "Waiting for Master proposal",
+  USER_RESOLUTION_REQUIRED: "Resolve Master proposal ambiguity",
+  BIND_INSTRUCTION_TASK_FRAME: "Bind instruction to Task Frame",
+  SELECT_TODOS_FOR_EXECUTION: "Select Todo for Task Frame run",
+  RUN_TASK_FRAME: "Run assigned Task Frame",
+  APPLY_TASK_FRAME_RESULT: "Apply Task Frame result",
+};
+
+function todoAutomationControlProjection(todo) {
+  if (!todo || (todo.state !== "IN_PROGRESS" && !todo.goal_id)) return null;
+  const goalId = String(todo.goal_id || "");
+  if (!goalId) {
+    return {
+      code: "GOAL_LINK_REQUIRED",
+      label: "Connect this Todo to a Goal",
+      detail: "No Goal owns this in-progress work, so automation cannot assign it.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const surface = state.goalAutomationSurfaces?.[goalId];
+  if (!surface?.goal) {
+    return {
+      code: "GOAL_AUTOMATION_STATE_UNAVAILABLE",
+      label: "Load Goal automation state",
+      detail: "The Goal link exists, but its automation surface is not available yet.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const todoExecution = surface.todo_execution || {};
+  const eligibleTodoIds = todoExecution.eligible_todo_ids || [];
+  const selectedTodoIds = todoExecution.selection?.todo_ids || [];
+  if (selectedTodoIds.includes(todo.todo_id)) return null;
+  if (surface.application && !eligibleTodoIds.includes(todo.todo_id)) {
+    return {
+      code: "WORK_PLAN_SCOPE_MISMATCH",
+      label: "Add this Todo through an adopted Work Plan",
+      detail: "The applied Work Plan did not create this Todo, so its Task Frame cannot select it.",
+      actionable: false,
+      enabled: false,
+    };
+  }
+  const operation = String(surface.next_operation || "WAIT");
+  if (
+    surface.automation_state === "TASK_FRAME_READY" &&
+    operation === "SELECT_TODOS_FOR_EXECUTION" &&
+    eligibleTodoIds.includes(todo.todo_id)
+  ) {
+    const enabled = Boolean(liveConductorHostSession());
+    return {
+      code: operation,
+      label: todoAutomationNextStepLabels[operation],
+      detail: enabled
+        ? "The governed Task Frame is ready to own and start this Todo."
+        : "A live Conductor Rust Host bridge is required to perform the selection.",
+      actionable: true,
+      enabled,
+    };
+  }
+  return {
+    code: operation,
+    label: todoAutomationNextStepLabels[operation] || operation.replaceAll("_", " "),
+    detail: `Goal automation is ${surface.automation_state || "UNKNOWN"}; this gate is not bypassed.`,
+    actionable: false,
+    enabled: false,
+  };
+}
+
+async function selectTodoForGoalExecution(todo) {
+  const surface = state.goalAutomationSurfaces?.[todo.goal_id];
+  const session = liveConductorHostSession();
+  if (!surface?.goal) throw new Error("Goal automation state is unavailable");
+  if (!session) throw new Error("A live Conductor Rust Host bridge is required");
+  if (!window.confirm(`Select this Todo for the bound Task Frame?\n\n${todo.title}`)) return;
+  const result = await api(
+    `/v1/goals/${encodeURIComponent(todo.goal_id)}/automation/todo-selection`,
+    {
+      method: "POST",
+      body: {
+        approval: "SELECT_TODOS",
+        expected_goal_revision: surface.goal.revision,
+        provider: String(session.provider).toUpperCase(),
+        provider_session_ref: session.provider_session_ref,
+        session_id: session.session_id,
+        session_anchor_ref: session.session_anchor_ref,
+        todo_ids: [todo.todo_id],
+        ttl_seconds: 120,
+      },
+    }
+  );
+  state.goalAutomationSurfaces[todo.goal_id] = result.surface || surface;
+  for (const action of result.actions || []) {
+    const updatedTodo = action.todo;
+    if (!updatedTodo) continue;
+    state.todos = state.todos.map((item) =>
+      item.todo_id === updatedTodo.todo_id ? updatedTodo : item
+    );
+  }
+  renderProjects();
+  renderTodos();
+  renderDetails();
+  renderActivity();
+  drawGraph();
+  renderActiveMultiRoom();
+  toast("Todo selected for the governed Task Frame");
+}
+
+function renderTodoAutomationControl(todo) {
+  const projection = todoAutomationControlProjection(todo);
+  if (!projection) return null;
+  const row = node("div", "todo-automation-control");
+  row.dataset.code = projection.code;
+  const copy = node("div", "todo-automation-copy");
+  copy.append(
+    node("strong", "", projection.label),
+    node("small", "", projection.detail)
+  );
+  row.append(copy);
+  if (projection.actionable) {
+    const action = node("button", "secondary-button compact-action", "Assign");
+    action.type = "button";
+    action.disabled = !projection.enabled;
+    action.title = projection.enabled
+      ? "Select this Todo for the bound Task Frame"
+      : projection.detail;
+    action.addEventListener("click", () =>
+      selectTodoForGoalExecution(todo).catch((error) => toast(error.message, true))
+    );
+    row.append(action);
+  }
+  return row;
+}
+
+function renderTodoOwnership(todo) {
+  const ownership = todoOwnershipProjection(todo);
+  if (!ownership && todo.state !== "IN_PROGRESS") return null;
+  const row = node("div", "todo-ownership");
+  if (!ownership) {
+    row.dataset.bound = "false";
+    row.append(
+      node("span", "todo-ownership-chip", "No Task Frame owner"),
+      node("span", "todo-ownership-chip", "PTY unbound")
+    );
+    return row;
+  }
+  row.dataset.bound = "true";
+  row.dataset.live = ownership.pty_state === "LIVE" ? "true" : "false";
+  row.append(
+    node("span", "todo-ownership-chip", `Task Frame ${ownership.task_frame_id}`),
+    node(
+      "span",
+      "todo-ownership-chip",
+      ownership.provider
+        ? `${ownership.mode || "SESSION"} / ${ownership.provider}`
+        : ownership.anchor_ref
+          ? "Target Session Anchor"
+          : "Target owner pending"
+    ),
+    node("span", "todo-ownership-chip", `PTY ${ownership.pty_state}`)
+  );
+  return row;
+}
+
+function todoLineageLabel(todo) {
+  const labels = [];
+  const goal = todo.goal_id ? semanticGraphNode(`goal:${todo.goal_id}`) : null;
+  const milestone = todo.milestone_id
+    ? semanticGraphNode(`milestone:${todo.milestone_id}`)
+    : null;
+  if (goal?.label) labels.push(goal.label);
+  if (milestone?.label) labels.push(milestone.label);
+  return labels.length ? labels.join(" / ") : todoScopeLabel(todo);
+}
+
 function normalizeTodoProjectId(value) {
   if (value == null || value === "" || value === "UNKNOWN" || value === "NONE") {
     return null;
@@ -8959,9 +12316,21 @@ function goalProgress(goal) {
   return Math.round((todos.filter((todo) => todo.state === "DONE").length / todos.length) * 100);
 }
 
+function goalsForSelectedContext() {
+  const nodeRef = selectedNodeRef();
+  if (nodeRef && state.selectedProject) {
+    return state.goals.filter(
+      (goal) => goal.scope_kind === "NODE" && goal.node_ref === nodeRef
+    );
+  }
+  return state.goals.filter((goal) => (goal.scope_kind || "PROJECT") === "PROJECT");
+}
+
+
 async function refreshGoalPlan() {
   if (!state.selectedProject) {
     state.goals = [];
+    state.universeGoals = [];
     state.unassignedTodos = [];
     renderGoalPlan();
     return;
@@ -8969,22 +12338,94 @@ async function refreshGoalPlan() {
   const result = await api(
     `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`
   );
+  const universeResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   state.goals = result.goals || [];
-  state.unassignedTodos = result.unassigned_todos || [];
-  if (!state.goals.some((goal) => goal.goal_id === state.selectedGoalId)) {
-    state.selectedGoalId = state.goals[0]?.goal_id || null;
+  state.universeGoals = universeResult.goals || [];
+  state.unassignedTodos = (result.unassigned_todos || []).filter(
+    (todo) => todo.state !== "DONE"
+  );
+  const contextualGoals = goalsForSelectedContext();
+  if (!contextualGoals.some((goal) => goal.goal_id === state.selectedGoalId)) {
+    state.selectedGoalId = contextualGoals[0]?.goal_id || null;
   }
   renderGoalPlan();
 }
 
 function planTodoRow(todo) {
   const row = node("article", "plan-todo-row");
+  const priority = todoSelect(
+    [["P0", "P0"], ["P1", "P1"], ["P2", "P2"], ["P3", "P3"]],
+    todo.priority,
+    "plan-todo-priority"
+  );
+  priority.title = "Change priority";
+  priority.addEventListener("change", async () => {
+    await updateTodo(todo, { ...todo, priority: priority.value });
+    await refreshGoalPlan();
+  });
+  const recommendation = todo.priority_recommendation || null;
+  const suggested = recommendation && recommendation.priority !== todo.priority
+    ? node("button", "secondary-button compact", `Use ${recommendation.priority}`)
+    : null;
+  if (suggested) {
+    suggested.type = "button";
+    suggested.title = `${recommendation.method}: ${(recommendation.reasons || []).join(", ")}`;
+    suggested.addEventListener("click", async () => {
+      await updateTodo(todo, { ...todo, priority: recommendation.priority });
+      await refreshGoalPlan();
+    });
+  }
   row.append(
     node("span", `todo-priority ${String(todo.priority).toLowerCase()}`, todo.priority),
     node("span", "plan-todo-title", todo.title),
-    node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state))
+    node("span", `plan-state ${String(todo.state).toLowerCase()}`, planStateLabel(todo.state)),
+    priority
   );
+  if (suggested) row.append(suggested);
   return row;
+}
+
+function openPlanTodos(todos) {
+  return (todos || []).filter((todo) => todo.state !== "DONE");
+}
+
+function renderUniverseGoalCard(goal) {
+  const card = node("article", "goal-card universe-goal-card");
+  const header = node("header", "goal-card-header");
+  header.append(
+    node("span", "goal-index", "U"),
+    node("h2", "", goal.title),
+    node("span", `plan-state ${String(goal.state).toLowerCase()}`, planStateLabel(goal.state))
+  );
+  card.append(header, node("p", "goal-card-description", goal.description || "No global outcome yet."));
+  const linked = node("div", "milestone-list");
+  for (const todo of openPlanTodos(goal.todos)) linked.append(planTodoRow(todo));
+  for (const projectGoal of goal.project_goals || []) {
+    const item = node("div", "milestone-block");
+    item.append(
+      node("strong", "", `${projectGoal.project_id} — ${projectGoal.title}`),
+      node("span", `plan-state ${String(projectGoal.state).toLowerCase()}`, planStateLabel(projectGoal.state))
+    );
+    linked.append(item);
+  }
+  const globalCandidates = (state.todos || []).filter(
+    (todo) => todo.scope_kind === "UNIVERSE" && !todo.universe_goal_id && todo.state !== "DONE"
+  );
+  if (globalCandidates.length) {
+    const assign = node("select", "goal-assign-select");
+    assign.append(new Option("Attach global Todo...", ""));
+    for (const todo of globalCandidates) assign.append(new Option(todo.title, todo.todo_id));
+    assign.addEventListener("change", async () => {
+      const todo = globalCandidates.find((item) => item.todo_id === assign.value);
+      if (!todo) return;
+      await updateTodo(todo, { ...todo, universe_goal_id: goal.universe_goal_id });
+      await refreshGoalPlan();
+    });
+    linked.append(assign);
+  }
+  if (!linked.childElementCount) linked.append(node("small", "empty-copy", "Connect global or project work to this goal."));
+  card.append(linked);
+  return card;
 }
 
 function renderGoalInspector(goal, index) {
@@ -9055,6 +12496,10 @@ function openGoalEditor(goal) {
   elements.goalForm.elements.description.value = goal.description || "";
   elements.goalForm.elements.owner.value = goal.owner || "Project Master";
   elements.goalForm.elements.state.value = goal.state || "DESIGNING";
+  prepareGoalHierarchyFields({
+    scopeKind: goal.scope_kind || "PROJECT",
+    universeGoalId: goal.universe_goal_id || "",
+  });
   elements.goalDialog.querySelector("h2").textContent = "Edit goal";
   elements.goalDialog.querySelector('[type="submit"]').textContent = "Save goal";
   elements.goalDialog.showModal();
@@ -9066,6 +12511,7 @@ function renderGoalPlan() {
     syncPrimaryNavSelection("work");
   }
   const project = state.selectedProject;
+  const projectGoals = goalsForSelectedContext();
   elements.goalPlanTitle.textContent = "Goal Plan";
   if (elements.goalPlanBreadcrumb) {
     elements.goalPlanBreadcrumb.textContent = project
@@ -9073,19 +12519,19 @@ function renderGoalPlan() {
       : "Project > Goal Plan";
   }
   elements.goalPlanSubtitle.textContent = project
-    ? "Goal -> Milestone / Phase -> Todo"
+    ? "Universe Goal -> Project Goal -> Milestone / Phase -> Todo"
     : "Select a project to shape its delivery plan.";
   elements.addGoalButton.disabled = !project;
-  const todos = state.goals.flatMap((goal) => [
+  const todos = projectGoals.flatMap((goal) => [
     ...(goal.todos || []),
     ...(goal.milestones || []).flatMap((milestone) => milestone.todos || []),
   ]);
   const done = todos.filter((todo) => todo.state === "DONE").length;
   const progress = todos.length ? Math.round((done / todos.length) * 100) : 0;
-  const readyGoals = state.goals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
-  const readiness = state.goals.length ? Math.round((readyGoals / state.goals.length) * 100) : 0;
-  const milestoneCount = state.goals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
-  const owner = state.goals[0]?.owner || "Project Master";
+  const readyGoals = projectGoals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
+  const readiness = projectGoals.length ? Math.round((readyGoals / projectGoals.length) * 100) : 0;
+  const milestoneCount = projectGoals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
+  const owner = projectGoals[0]?.owner || "Project Master";
   elements.goalPlanSummary.replaceChildren();
   const needsYou = state.unassignedTodos.length + todos.filter((todo) => todo.state === "BLOCKED").length;
   for (const [label, value] of [
@@ -9101,7 +12547,12 @@ function renderGoalPlan() {
   elements.goalPlanList.replaceChildren();
   if (!project) {
     elements.goalPlanList.append(node("div", "goal-plan-empty", "Choose a project to begin planning."));
-  } else if (!state.goals.length) {
+  } else {
+    for (const universeGoal of state.universeGoals || []) {
+      elements.goalPlanList.append(renderUniverseGoalCard(universeGoal));
+    }
+  }
+  if (project && !projectGoals.length) {
     const empty = node("div", "goal-plan-empty");
     empty.append(
       node("strong", "", "No goals yet"),
@@ -9113,7 +12564,7 @@ function renderGoalPlan() {
     empty.append(add);
     elements.goalPlanList.append(empty);
   }
-  state.goals.forEach((goal, goalIndex) => {
+  projectGoals.forEach((goal, goalIndex) => {
     const card = node("article", "goal-card");
     card.tabIndex = 0;
     card.classList.toggle("selected", state.selectedGoalId === goal.goal_id);
@@ -9171,12 +12622,12 @@ function renderGoalPlan() {
       item.append(itemHeader);
       if (milestone.description) item.append(node("p", "milestone-description", milestone.description));
       const list = node("div", "milestone-todos");
-      for (const todo of milestone.todos || []) list.append(planTodoRow(todo));
+      for (const todo of openPlanTodos(milestone.todos)) list.append(planTodoRow(todo));
       if (!list.childElementCount) list.append(node("small", "empty-copy", "No work assigned to this milestone."));
       item.append(list);
       milestones.append(item);
     }
-    for (const todo of goal.todos || []) milestones.append(planTodoRow(todo));
+    for (const todo of openPlanTodos(goal.todos)) milestones.append(planTodoRow(todo));
     if (!milestones.childElementCount) milestones.append(node("div", "milestone-empty", "Add a milestone to shape the delivery path."));
     milestones.hidden = state.expandedGoals[goal.goal_id] === false;
     card.append(header, progressBar, progressLabel, milestones);
@@ -9193,8 +12644,8 @@ function renderGoalPlan() {
     const row = planTodoRow(todo);
     const select = node("select", "goal-assign-select");
     select.append(new Option("Add to goal...", ""));
-    for (const goal of state.goals) select.append(new Option(goal.title, goal.goal_id));
-    select.disabled = !state.goals.length;
+    for (const goal of projectGoals) select.append(new Option(goal.title, goal.goal_id));
+    select.disabled = !projectGoals.length;
     select.addEventListener("change", async () => {
       const goalId = select.value;
       if (!goalId) return;
@@ -9230,10 +12681,11 @@ function renderTodos() {
   for (const todo of todos) {
     const item = node("article", "todo-item");
     item.dataset.todoId = todo.todo_id;
+    item.dataset.state = todo.state;
     const header = node("div", "todo-item-header");
     header.append(
       node("span", `todo-priority ${todo.priority.toLowerCase()}`, todo.priority),
-      node("span", "todo-location", todoScopeLabel(todo)),
+      node("span", "todo-location", todoLineageLabel(todo)),
       node("small", "", `r${todo.revision}`)
     );
     const title = node("input", "todo-item-title");
@@ -9278,7 +12730,12 @@ function renderTodos() {
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => deleteTodo(todo));
     controls.append(priority, todoState, save, remove);
-    item.append(header, title, detail, controls);
+    const ownership = renderTodoOwnership(todo);
+    const automationControl = renderTodoAutomationControl(todo);
+    item.append(header);
+    if (ownership) item.append(ownership);
+    if (automationControl) item.append(automationControl);
+    item.append(title, detail, controls);
     elements.todoList.append(item);
   }
 }
@@ -9333,6 +12790,7 @@ async function updateTodo(todo, changes) {
     scope_kind: todo.scope_kind,
     project_id: todo.project_id,
     node_ref: todo.node_ref,
+    universe_goal_id: changes.universe_goal_id ?? todo.universe_goal_id ?? null,
     title: changes.title.trim(),
     detail: changes.detail,
     priority: changes.priority,
@@ -9345,6 +12803,7 @@ async function updateTodo(todo, changes) {
   };
   if (body.project_id === null) delete body.project_id;
   if (body.node_ref === null) delete body.node_ref;
+  if (body.universe_goal_id === null) delete body.universe_goal_id;
   try {
     const result = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}`, {
       method: "PATCH",
@@ -9644,6 +13103,7 @@ async function submitFreshProjectIntent(event) {
   const form = new FormData(elements.freshProjectForm);
   const intent = {
     project: String(form.get("project") || "").trim(),
+    project_root: String(form.get("project_root") || "").trim(),
     kind: String(form.get("kind") || "").trim(),
     technologies: commaList(form.get("technologies")),
     goal: String(form.get("goal") || "").trim(),
@@ -9806,7 +13266,7 @@ async function loadFreshProjectPlanningOptions() {
   } else if (!available) {
     elements.planningRunStatus.textContent =
       "No planning provider is currently available.";
-  } else {
+  } else if (project) {
     elements.planningRunStatus.textContent =
       "Ready to create a proposal. No model has been called.";
   }
@@ -10037,21 +13497,113 @@ async function submitProject(event) {
   elements.projectFormError.textContent = "";
   const form = new FormData(elements.projectForm);
   try {
-    await api("/v1/projects/register", {
+    const request = {
+      project_id: form.get("project_id"),
+      project_root: form.get("project_root"),
+      release_id: state.releases[0]?.release_id || null,
+    };
+    if (!state.projectConnectionPlan) {
+      const planned = await api("/v1/project-connections/prepare", {
+        method: "POST",
+        body: request,
+      });
+      state.projectConnectionPlan = planned;
+      elements.projectSubmit.textContent = planned.action_label;
+      elements.projectFormError.textContent = planned.detail;
+      return;
+    }
+    await api("/v1/project-connections/apply", {
       method: "POST",
       body: {
-        project_id: form.get("project_id"),
-        project_root: form.get("project_root"),
+        ...request,
+        plan_digest: state.projectConnectionPlan.plan_digest,
+        command: "CONNECT_PROJECT",
       },
     });
+    state.projectConnectionPlan = null;
     elements.projectDialog.close();
     elements.projectForm.reset();
+    elements.projectSubmit.textContent = "Inspect project";
     toast("Project connected");
     await refresh();
     await selectProject(String(form.get("project_id")));
   } catch (error) {
     elements.projectFormError.textContent = error.message;
   }
+}
+
+async function selectHostDirectory(input, button, errorOutput) {
+  button.disabled = true;
+  errorOutput.textContent = "";
+  try {
+    const result = await api("/v1/host/select-directory", {
+      method: "POST",
+      body: {},
+    });
+    if (result.status === "DIRECTORY_SELECTED" && result.directory) {
+      input.value = result.directory;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    }
+  } catch (error) {
+    errorOutput.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectProjectRoot() {
+  return selectHostDirectory(
+    elements.projectForm.elements.namedItem("project_root"),
+    elements.projectRootBrowse,
+    elements.projectFormError
+  );
+}
+
+function selectFreshProjectRoot() {
+  return selectHostDirectory(
+    elements.freshProjectForm.elements.namedItem("project_root"),
+    elements.freshProjectRootBrowse,
+    elements.freshProjectError
+  );
+}
+
+async function selectHostFile(input, button, kind, errorOutput) {
+  button.disabled = true;
+  errorOutput.textContent = "";
+  try {
+    const result = await api("/v1/host/select-file", {
+      method: "POST",
+      body: { kind },
+    });
+    if (result.status === "FILE_SELECTED" && result.file) {
+      input.value = result.file;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    }
+  } catch (error) {
+    errorOutput.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectReleaseDatabase() {
+  return selectHostFile(
+    elements.releaseForm.elements.namedItem("database_path"),
+    elements.releaseDatabaseBrowse,
+    "RELEASE_DATABASE",
+    elements.releaseFormError
+  );
+}
+
+function selectReleaseManifest() {
+  return selectHostFile(
+    elements.releaseForm.elements.namedItem("manifest_path"),
+    elements.releaseManifestBrowse,
+    "RELEASE_MANIFEST",
+    elements.releaseFormError
+  );
 }
 
 async function submitRelease(event) {
@@ -10162,6 +13714,53 @@ function renderBench() {
     obsGroup.append(record);
   }
   elements.benchPanel.append(obsGroup);
+
+  const gapGroup = node("div", "detail-group");
+  const gapSummary = state.skillGapSummary || { groups: [], observation_count: 0 };
+  gapGroup.append(
+    node("h3", "", `Fallback gaps (${gapSummary.observation_count || 0})`)
+  );
+  if (!(gapSummary.groups || []).length) {
+    gapGroup.append(
+      node(
+        "p",
+        "empty-copy",
+        "No redacted fallback gaps yet. Dedicated Skill misses remain separate from installed Skill observations."
+      )
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const row of gapSummary.groups.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${row.capability || "CAPABILITY"} / ${row.effect_class || "NONE"} / n=${row.observation_count || 0} / validated=${row.validated_success_count || 0} / failed=${row.failed_count || 0} / contexts=${row.distinct_context_count || 0}`
+        )
+      );
+    }
+    gapGroup.append(list);
+  }
+  const candidates = state.skillCandidates || [];
+  gapGroup.append(node("h3", "", `Skill candidates (${candidates.length})`));
+  if (!candidates.length) {
+    gapGroup.append(
+      node("p", "empty-copy", "No Candidate has been derived from threshold-bound fallback evidence.")
+    );
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const candidate of candidates.slice(0, 8)) {
+      list.append(
+        node(
+          "li",
+          "",
+          `${candidate.candidate_state || "OBSERVED"} / ${candidate.capability || "CAPABILITY"} / support=${candidate.evidence?.observation_count || 0} / installed=${candidate.installation_state || "NOT_INSTALLED"}`
+        )
+      );
+    }
+    gapGroup.append(list);
+  }
+  elements.benchPanel.append(gapGroup);
 
   const benchGroup = node("div", "detail-group");
   const benchRows = projectBenchRows();
@@ -11178,30 +14777,22 @@ function bindEvents() {
       renderReleaseCatalog();
       elements.releaseDialog.showModal();
     });
+  elements.releaseTargetProject.addEventListener("change", () => {
+    state.selectedReleaseTargetProjectId =
+      elements.releaseTargetProject.value || null;
+    elements.releaseProposalOutput.replaceChildren();
+    elements.releaseProposalOutput.classList.add("hidden");
+    renderReleaseCatalog();
+  });
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });
-  elements.universeProviderSetting.addEventListener("click", () => {
-    openProviderProfileDialog({
-      scopeKind: "UNIVERSE_CONDUCTOR",
-      scopeId: "CONDUCTOR",
-      label: "Universe Conductor",
-    });
-  });
-  elements.providerProfileProvider.addEventListener("change", () => {
-    fillProviderProfileModelSelect(elements.providerProfileProvider.value, "");
-  });
-  elements.providerProfileModel.addEventListener("change", () => {
-    if (elements.providerProfileModel.value) {
-      elements.providerProfileModelCustom.value = "";
-    }
-  });
-  elements.providerProfileForm.addEventListener("submit", submitProviderProfile);
   if (elements.actionInboxButton && elements.actionInboxDialog) {
-    elements.actionInboxButton.addEventListener("click", () => {
-      renderActionInbox();
-      if (!elements.actionInboxDialog.open) {
-        elements.actionInboxDialog.showModal();
+    elements.actionInboxButton.addEventListener("click", openActionInbox);
+    elements.actionInboxDialog.addEventListener("close", () => {
+      if (!elements.mobileWorkTabs || window.innerWidth > 720) return;
+      for (const item of elements.mobileWorkTabs.querySelectorAll("button")) {
+        item.classList.toggle("selected", item.dataset.mobileWorkView === "goals");
       }
     });
   }
@@ -11215,7 +14806,7 @@ function bindEvents() {
   }
   const openSessionObservatory = async () => {
     try {
-      await refreshSupervisorSessions();
+      await refreshSupervisorSessions({ maxAgeMs: 10_000 });
       setObservatoryTab(state.observatoryTab || "sessions");
       elements.sessionObservatoryDialog.showModal();
     } catch (error) {
@@ -11341,6 +14932,69 @@ function bindEvents() {
       });
     });
   }
+  if (elements.nodeSessionInbox) {
+    elements.nodeSessionInbox.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      openSessionBusInbox(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.sessionBusCompose) {
+    elements.sessionBusCompose.addEventListener("submit", (event) => {
+      sendSessionBusCompose(event).catch((error) => toast(error.message, true));
+    });
+  }
+  for (const tab of elements.sessionBusTabs || []) {
+    tab.addEventListener("click", () => {
+      state.sessionBusProjection = String(tab.dataset.sessionBusProjection || "INBOX").toUpperCase();
+      for (const peer of elements.sessionBusTabs || []) {
+        const active = peer === tab;
+        peer.classList.toggle("active", active);
+        peer.setAttribute("aria-selected", String(active));
+      }
+      refreshSessionBusMessages().catch((error) => toast(error.message, true));
+    });
+  }
+  if (elements.sessionBusBody) {
+    elements.sessionBusBody.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      if (event.isComposing || event.keyCode === 229) { event.preventDefault(); return; }
+      if (event.shiftKey) return;
+      event.preventDefault();
+      elements.sessionBusCompose?.requestSubmit();
+    });
+  }
+  if (elements.nodeSessionInspect) {
+    elements.nodeSessionInspect.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      inspectNodeModeSession(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.nodeSessionOpen) {
+    elements.nodeSessionOpen.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      bindNodeModeSessionPty(pending.coordinate, pending.session).catch((error) =>
+        toast(error.message, true)
+      );
+    });
+  }
+  if (elements.nodeSessionStop) {
+    elements.nodeSessionStop.addEventListener("click", () => {
+      const pending = state.pendingNodeSessionAction;
+      if (!pending) return;
+      elements.nodeSessionActionDialog?.close();
+      endNodeModePtySession(pending.session).catch((error) => toast(error.message, true));
+    });
+  }
   if (elements.discoverProviderActivity) {
     elements.discoverProviderActivity.addEventListener("click", () => {
       discoverProviderActivitySources().catch((error) => toast(error.message, true));
@@ -11352,6 +15006,11 @@ function bindEvents() {
   if (elements.refreshProviderModels) {
     elements.refreshProviderModels.addEventListener("click", () => {
       refreshProviderModels().catch((error) => toast(error.message, true));
+    });
+  }
+  if (elements.setupProviderHooks) {
+    elements.setupProviderHooks.addEventListener("click", () => {
+      setupProviderHooks().catch((error) => toast(error.message, true));
     });
   }
   elements.remoteAccessTransport.addEventListener("change", () => {
@@ -11431,6 +15090,74 @@ function bindEvents() {
       });
     });
   }
+  if (elements.meetingFeatureSelect) {
+    elements.meetingFeatureSelect.addEventListener("change", () => {
+      state.activeMultiRoomFeatureId = elements.meetingFeatureSelect.value || null;
+      renderActiveMultiRoom();
+    });
+  }
+  if (elements.createMeetingFeature) {
+    elements.createMeetingFeature.addEventListener("click", () => {
+      createFeatureForActiveMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.attachMeetingProvider) {
+    elements.attachMeetingProvider.addEventListener("click", () => {
+      attachMeetingProviderSession().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.createFreshMeetingSessions) {
+    elements.createFreshMeetingSessions.addEventListener("click", () => {
+      createFreshMeetingSessions().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.endMeeting) {
+    elements.endMeeting.addEventListener("click", () => {
+      endActiveMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.startMeetingRun) {
+    elements.startMeetingRun.addEventListener("click", () => {
+      runActiveFeatureMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.cancelMeetingRun) {
+    elements.cancelMeetingRun.addEventListener("click", () => {
+      cancelActiveFeatureMeeting().catch((error) => {
+        elements.settingsError.textContent = error.message;
+        toast(error.message, true);
+      });
+    });
+  }
+  if (elements.recordRoomFinding) {
+    elements.recordRoomFinding.addEventListener("click", () => {
+      recordActiveRoomFinding().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
+  if (elements.createRoomArtifact) {
+    elements.createRoomArtifact.addEventListener("click", () => {
+      createActiveRoomArtifact().catch((error) => {
+        elements.settingsError.textContent = error.message;
+      });
+    });
+  }
   if (elements.postRoomMessage) {
     elements.postRoomMessage.addEventListener("click", () => {
       postActiveRoomAsUser().catch((error) => {
@@ -11503,7 +15230,23 @@ function bindEvents() {
   document
     .querySelector("#start-project-topbar-button")
     .addEventListener("click", openFreshProjectWizard);
+  elements.addProjectRailButton.addEventListener("click", () => {
+    state.projectConnectionPlan = null;
+    elements.projectSubmit.textContent = "Inspect project";
+    elements.projectDialog.showModal();
+  });
+  elements.planProjectButton.addEventListener("click", () => {
+    if (!state.selectedProject) return toast("Select a project first", true);
+    openFreshProjectWizard();
+  });
   elements.dispatchForm.addEventListener("submit", submitDispatch);
+  elements.dispatchInstruction.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    if (event.isComposing || event.keyCode === 229) { event.preventDefault(); return; }
+    if (event.shiftKey) return;
+    event.preventDefault();
+    elements.dispatchForm.requestSubmit();
+  });
   elements.composerActionButton.addEventListener("click", () =>
     toggleComposerActionMenu()
   );
@@ -11537,6 +15280,7 @@ function bindEvents() {
   elements.conversationToggle.addEventListener("click", () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
     syncConversationToggle(collapsed);
+    if (!collapsed && typeof refitActiveTerminal === "function") refitActiveTerminal();
   });
   elements.conversationOpacity.addEventListener("input", () => {
     elements.conversationLayer.style.setProperty(
@@ -11545,6 +15289,10 @@ function bindEvents() {
     );
   });
   elements.projectForm.addEventListener("submit", submitProject);
+  elements.projectRootBrowse.addEventListener("click", selectProjectRoot);
+  elements.freshProjectRootBrowse.addEventListener("click", selectFreshProjectRoot);
+  elements.releaseDatabaseBrowse.addEventListener("click", selectReleaseDatabase);
+  elements.releaseManifestBrowse.addEventListener("click", selectReleaseManifest);
   elements.workerBindingScope.addEventListener("change", renderWorkerBindingSettings);
   elements.settingsForm.addEventListener("submit", submitProviderSettings);
 
@@ -11560,7 +15308,7 @@ function bindEvents() {
       else if (["memory", "future", "bench", "activity", "details"].includes(view)) {
         openInspectorSurface(view);
       } else if (view === "map" || view === "universe") {
-        showGraphView("universe");
+        showGraphView(state.selectedProject ? "semantic" : "universe");
       }
     });
   });
@@ -11587,20 +15335,25 @@ function bindEvents() {
       const button = event.target.closest("[data-primary-view]");
       if (!button) return;
       const view = button.getAttribute("data-primary-view");
-      // Graph surfaces (single place — not also on left rail / toolbar).
+      // Galaxy is the semantic product map; Fleet owns execution navigation.
       if (view === "work") {
         showGoalPlanView();
         return;
       }
+      if (view === "fleet") {
+        openTodoDialog(false);
+        syncPrimaryNavSelection("fleet");
+        return;
+      }
       if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
-        showGraphView("universe");
+        showGraphView(state.selectedProject ? "semantic" : "universe");
         if (view === "ecosystem") {
           // Project list lives in the left rail — just focus map + list context.
           elements.projectList?.focus?.();
         }
         return;
       }
-      if (view === "timeline" || view === "documents") {
+      if (view === "sessions" || view === "timeline" || view === "documents") {
         showGraphView(view);
         return;
       }
@@ -11621,6 +15374,22 @@ function syncConductorSummaryToggle(collapsed) {
   elements.conductorSummaryToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
 }
 
+function prepareGoalHierarchyFields({ scopeKind = "UNIVERSE", universeGoalId = "" } = {}) {
+  const form = elements.goalForm;
+  if (!form) return;
+  const scope = form.elements.scope_kind;
+  const parent = form.elements.universe_goal_id;
+  const nodeOption = [...scope.options].find((option) => option.value === "NODE");
+  if (nodeOption) nodeOption.disabled = !selectedNodeRef();
+  scope.value = scopeKind === "NODE" && !selectedNodeRef() ? "PROJECT" : scopeKind;
+  parent.replaceChildren(new Option("No global parent", ""));
+  for (const goal of state.universeGoals || []) {
+    parent.append(new Option(goal.title, goal.universe_goal_id));
+  }
+  parent.value = universeGoalId || "";
+  parent.disabled = scope.value === "UNIVERSE";
+}
+
 function bindGoalPlanEvents() {
   elements.addGoalButton?.addEventListener("click", () => {
     if (!state.selectedProject) return;
@@ -11629,8 +15398,15 @@ function bindGoalPlanEvents() {
     elements.goalDialog.querySelector("h2").textContent = "New goal";
     elements.goalDialog.querySelector('[type="submit"]').textContent = "Create goal";
     elements.goalForm.elements.owner.value = "Project Master";
+    prepareGoalHierarchyFields({ scopeKind: selectedNodeRef() ? "NODE" : "PROJECT" });
     elements.goalFormError.textContent = "";
     elements.goalDialog.showModal();
+  });
+  elements.goalForm?.elements.scope_kind?.addEventListener("change", () => {
+    prepareGoalHierarchyFields({
+      scopeKind: elements.goalForm.elements.scope_kind.value,
+      universeGoalId: elements.goalForm.elements.universe_goal_id.value,
+    });
   });
   if (elements.conversationExpand) {
     let parent = elements.conversationLayer.parentElement;
@@ -11654,7 +15430,7 @@ function bindGoalPlanEvents() {
       renderRoomMessages();
     });
   }
-  elements.goalPlanMap?.addEventListener("click", () => showGraphView("universe"));
+  elements.goalPlanMap?.addEventListener("click", () => showGraphView("semantic"));
   elements.editSelectedGoal?.addEventListener("click", () => {
     const goal = state.goals.find((item) => item.goal_id === state.selectedGoalId);
     if (goal) openGoalEditor(goal);
@@ -11664,15 +15440,22 @@ function bindGoalPlanEvents() {
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
     if (view === "work") showGoalPlanView();
-    else if (view === "map") showGraphView("universe");
+    else if (view === "fleet") {
+      openTodoDialog(false);
+      syncPrimaryNavSelection("fleet");
+    }
+    else if (view === "map") showGraphView(state.selectedProject ? "semantic" : "universe");
     else if (view === "documents") showGraphView("documents");
+    else if (view === "sessions") showGraphView("sessions");
     else if (view === "meeting") {
       state.settingsTab = "rooms";
-      openSettings().catch((error) => toast(error.message, true));
+      openProviderSettings().catch((error) => toast(error.message, true));
     }
     else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
+  elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);
+  elements.newSessionForm?.addEventListener("submit", submitNewSession);
   elements.quickConductorButton?.addEventListener("click", () => elements.dispatchInstruction?.focus());
   elements.quickTaskButton?.addEventListener("click", () => openTodoDialog(true));
   elements.mobileWorkTabs?.addEventListener("click", (event) => {
@@ -11681,8 +15464,12 @@ function bindGoalPlanEvents() {
     for (const item of elements.mobileWorkTabs.querySelectorAll("button")) item.classList.toggle("selected", item === button);
     const view = button.getAttribute("data-mobile-work-view");
     if (view === "goals") showGoalPlanView();
-    else if (view === "sessions") elements.sessionObservatoryDialog?.showModal();
-    else openInspectorSurface("activity");
+    else if (view === "sessions") showGraphView("sessions");
+    // Bench is project context, not a graph canvas mode. On mobile the
+    // Inspector becomes the focused surface so the comparison data remains
+    // reachable instead of silently falling back to the Universe graph.
+    else if (view === "bench") openInspectorSurface("bench");
+    else if (view === "actions") openActionInbox();
   });
   const activeGoal = () => state.goals.find((goal) => goal.goal_id === state.selectedGoalId) || state.goals[0];
   elements.mobileDelegateGoal?.addEventListener("click", () => {
@@ -11704,8 +15491,17 @@ function bindGoalPlanEvents() {
     const data = new FormData(elements.goalForm);
     try {
       const goalId = elements.goalForm.dataset.goalId;
+      const scopeKind = String(data.get("scope_kind") || "UNIVERSE");
+      const globalGoal = scopeKind === "UNIVERSE";
+      if (goalId && globalGoal) throw new Error("Existing project goals stay in the selected project scope.");
+      const parentGoalId = String(data.get("universe_goal_id") || "");
+      if (scopeKind === "NODE" && !selectedNodeRef()) {
+        throw new Error("Select a graph node before creating a Node goal.");
+      }
       await api(
-        goalId
+        globalGoal
+          ? "/v1/universe-goals"
+          : goalId
           ? `/v1/goals/${encodeURIComponent(goalId)}`
           : `/v1/projects/${encodeURIComponent(state.selectedProject.project_id)}/goals`, {
         method: goalId ? "PATCH" : "POST",
@@ -11714,9 +15510,16 @@ function bindGoalPlanEvents() {
           description: String(data.get("description") || "").trim(),
           owner: String(data.get("owner") || "").trim(),
           state: String(data.get("state") || "DESIGNING"),
-          sort_order: goalId
+          sort_order: globalGoal
+            ? (state.universeGoals || []).length
+            : goalId
             ? state.goals.find((goal) => goal.goal_id === goalId)?.sort_order || 0
             : state.goals.length,
+          ...(!globalGoal ? {
+            scope_kind: scopeKind,
+            ...(scopeKind === "NODE" ? { node_ref: selectedNodeRef() } : {}),
+          } : {}),
+          ...(!globalGoal && parentGoalId ? { universe_goal_id: parentGoalId } : {}),
           ...(goalId ? { revision: state.goals.find((goal) => goal.goal_id === goalId)?.revision } : {}),
         },
       });

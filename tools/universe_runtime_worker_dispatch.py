@@ -37,6 +37,7 @@ PROVIDER_ALIASES = {
 }
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS = 90
+READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS = 240
 
 
 @dataclass(frozen=True)
@@ -356,7 +357,14 @@ class RuntimeWorkerDispatcher:
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
             "max_turns": request["max_turns"],
-            "response_timeout_seconds": self.worker_response_timeout_seconds,
+            "response_timeout_seconds": (
+                max(
+                    self.worker_response_timeout_seconds,
+                    READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS,
+                )
+                if request["repository_write_scope"] == "NONE"
+                else self.worker_response_timeout_seconds
+            ),
             "result_mode": request["result_mode"],
         }
 
@@ -437,25 +445,8 @@ class RuntimeWorkerDispatcher:
             recorded_result: Any = worker.get("result")
             structured_result: dict[str, Any] | None = None
             if request["result_mode"] == "STRUCTURED_JSON":
-                result_object = _mapping(worker.get("result"), "worker.result")
-                text = _required_text(result_object.get("text"), "worker.result.text")
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError as error:
-                    raise WorkerDispatchError(
-                        "WORKER_STRUCTURED_RESULT_INVALID",
-                        "WORKER_ADAPTER",
-                        "WORKER_RESULT_JSON_INVALID",
-                    ) from error
-                if not isinstance(parsed, dict):
-                    raise WorkerDispatchError(
-                        "WORKER_STRUCTURED_RESULT_INVALID",
-                        "WORKER_ADAPTER",
-                        "WORKER_RESULT_OBJECT_REQUIRED",
-                    )
-                structured_result = parsed
-                self._validate_structured_result(
-                    structured_result,
+                structured_result = self._parse_structured_worker_result(
+                    worker,
                     request["output_contract"],
                 )
                 recorded_result = structured_result
@@ -867,10 +858,11 @@ class RuntimeWorkerDispatcher:
             )
 
         max_turns = raw.get("max_turns", 1)
+        max_turn_limit = 16 if repository_write_scope == "NONE" else 8
         if (
             not isinstance(max_turns, int)
             or isinstance(max_turns, bool)
-            or not 1 <= max_turns <= 8
+            or not 1 <= max_turns <= max_turn_limit
         ):
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
@@ -902,6 +894,92 @@ class RuntimeWorkerDispatcher:
             "result_mode": result_mode,
             "defer_terminal_result": defer_terminal_result,
         }
+
+    @classmethod
+    def _parse_structured_worker_result(
+        cls,
+        worker: Mapping[str, Any],
+        output_contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        result_object = _mapping(worker.get("result"), "worker.result")
+        text = _required_text(result_object.get("text"), "worker.result.text")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "WORKER_ADAPTER",
+                "WORKER_RESULT_JSON_INVALID",
+            ) from error
+        if not isinstance(parsed, dict):
+            raise WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "WORKER_ADAPTER",
+                "WORKER_RESULT_OBJECT_REQUIRED",
+            )
+        cls._validate_json_schema_subset(parsed, output_contract.get("json_schema"))
+        cls._validate_structured_result(parsed, output_contract)
+        return parsed
+
+    @classmethod
+    def _validate_json_schema_subset(cls, value: Any, raw_schema: Any) -> None:
+        if not isinstance(raw_schema, Mapping):
+            return
+
+        def invalid(reason: str) -> None:
+            raise WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_INVALID",
+                "WORKER_ADAPTER",
+                reason,
+            )
+
+        expected = raw_schema.get("type")
+        type_checks = {
+            "object": lambda item: isinstance(item, Mapping),
+            "array": lambda item: isinstance(item, list),
+            "string": lambda item: isinstance(item, str),
+            "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": lambda item: isinstance(item, bool),
+            "null": lambda item: item is None,
+        }
+        if isinstance(expected, str) and expected in type_checks and not type_checks[expected](value):
+            invalid("WORKER_RESULT_SCHEMA_TYPE_INVALID")
+        if isinstance(value, Mapping):
+            required = raw_schema.get("required")
+            if isinstance(required, list):
+                for key in required:
+                    if isinstance(key, str) and key not in value:
+                        invalid("WORKER_RESULT_SCHEMA_REQUIRED_FIELD_MISSING")
+            properties = raw_schema.get("properties")
+            if isinstance(properties, Mapping):
+                for key, child_schema in properties.items():
+                    if key in value:
+                        cls._validate_json_schema_subset(value[key], child_schema)
+                if raw_schema.get("additionalProperties") is False:
+                    if any(key not in properties for key in value):
+                        invalid("WORKER_RESULT_SCHEMA_ADDITIONAL_PROPERTY")
+        if isinstance(value, list) and isinstance(raw_schema.get("items"), Mapping):
+            for item in value:
+                cls._validate_json_schema_subset(item, raw_schema["items"])
+
+    def invoke_structured_provider(
+        self,
+        provider: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        # Validate a claimed provider turn without bypassing the output contract.
+        normalized = PROVIDER_ALIASES.get(str(provider).strip().upper(), str(provider).strip().upper())
+        if str(request.get("result_mode", "")).upper() != "STRUCTURED_JSON":
+            raise WorkerDispatchError(
+                "WORKER_STRUCTURED_RESULT_REQUIRED",
+                "WORKER_ADAPTER",
+                "STRUCTURED_JSON_RESULT_MODE_REQUIRED",
+            )
+        output_contract = _mapping(request.get("output_contract"), "output_contract")
+        worker = self._invoke_provider(normalized, request)
+        structured_result = self._parse_structured_worker_result(worker, output_contract)
+        return {**worker, "structured_result": structured_result}
 
     @staticmethod
     def _validate_structured_result(
@@ -935,6 +1013,10 @@ class RuntimeWorkerDispatcher:
         if not isinstance(validation, list) or not validation:
             invalid("WORKER_VALIDATION_REQUIRED")
         pass_seen = False
+        fail_seen = False
+        mutation_evidence_required = (
+            output_contract.get("mutation_evidence_required") is True
+        )
         for item in validation:
             if not isinstance(item, Mapping):
                 invalid("WORKER_VALIDATION_ENTRY_INVALID")
@@ -947,16 +1029,21 @@ class RuntimeWorkerDispatcher:
                 item.get("evidence_refs"),
                 "WORKER_VALIDATION_EVIDENCE_REQUIRED",
             )
-            if state == "FAIL":
+            if state == "FAIL" and mutation_evidence_required:
                 invalid("WORKER_VALIDATION_FAILED")
             pass_seen = pass_seen or state == "PASS"
-        if not pass_seen:
+            fail_seen = fail_seen or state == "FAIL"
+        if mutation_evidence_required and not pass_seen:
             invalid("WORKER_VALIDATION_PASS_REQUIRED")
-        if output_contract.get("mutation_evidence_required") is True:
-            evidence_refs(
+        if not mutation_evidence_required and not (pass_seen or fail_seen):
+            invalid("WORKER_REVIEW_CONCLUSION_REQUIRED")
+        if mutation_evidence_required:
+            mutation_evidence = evidence_refs(
                 result.get("mutation_evidence_refs"),
                 "WORKER_MUTATION_EVIDENCE_REQUIRED",
             )
+            if any("no-mutation-performed" in item for item in mutation_evidence):
+                invalid("WORKER_MUTATION_NOT_PERFORMED")
     @staticmethod
     def _skill_bindings(
         planned_invocation: Mapping[str, Any],
@@ -1155,6 +1242,7 @@ class RuntimeWorkerDispatcher:
                     permission_requester=self._reject_task_frame_permission,
                     session_observer=session_ids.append,
                     ephemeral=True,
+                    allow_read_only_tools=False,
                     max_turns=int(request.get("max_turns", 8)),
                     response_timeout_seconds=float(
                         request["response_timeout_seconds"]

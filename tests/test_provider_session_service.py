@@ -43,6 +43,7 @@ class FakeProviderHost:
         self.status_calls = 0
         self.block_started = threading.Event()
         self.block_release = threading.Event()
+        self.work_statuses: list[dict[str, Any]] = []
 
     def set_permission_requester(
         self, requester: Callable[[Mapping[str, Any]], str | None]
@@ -74,6 +75,22 @@ class FakeProviderHost:
                 "quota_state": "AVAILABLE",
                 "rate_limit_status": "allowed",
                 "usage": {"input_tokens": 10, "private": "drop-me"},
+                "quota": {
+                    "schema": "universe.provider-quota-snapshot.v1",
+                    "provider": "CODEX",
+                    "source": "account/rateLimits/read",
+                    "state": "AVAILABLE",
+                    "secret": "drop-me",
+                    "windows": [
+                        {
+                            "name": "PRIMARY",
+                            "used_percent": 25,
+                            "window_minutes": 300,
+                            "resets_at": 1788220800,
+                            "secret": "drop-me",
+                        }
+                    ],
+                },
             },
         }
 
@@ -122,12 +139,81 @@ class FakeProviderHost:
             text = f"selected:{selected or 'none'}"
             on_delta(text)
             return {"text": text, "session_ref": "provider-secret-session-ref"}
+        if message["body"] == "git milestones":
+            self.work_statuses = [
+                {
+                    "operation": "COMMIT",
+                    "state": "COMPLETED",
+                    "exit_code": 0,
+                    "source": "GIT_TRACE2",
+                    "commit_sha": "d" * 40,
+                    "short_sha": "ddddddd",
+                    "commit_message": "Describe Git action",
+                    "branch": "codex/action-history",
+                    "changed_files": 3,
+                },
+                {
+                    "operation": "PUSH",
+                    "state": "FAILED",
+                    "exit_code": 1,
+                    "source": "GIT_TRACE2",
+                },
+            ]
         on_delta("hello ")
         on_delta("world")
         return {"text": "hello world", "session_ref": "provider-secret-session-ref"}
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        statuses, self.work_statuses = self.work_statuses, []
+        return statuses
+
     def close(self) -> None:
         self.closed = True
+
+
+class FakeRepositoryGitObserver:
+    def __init__(self) -> None:
+        self.milestones: list[dict[str, Any]] = []
+        self.closed = False
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        milestones, self.milestones = self.milestones, []
+        return milestones
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeActionStore:
+    def __init__(self) -> None:
+        self.todo_actions: list[tuple[str, dict[str, Any]]] = []
+        self.actions: list[dict[str, Any]] = []
+
+    def apply_todo_action(
+        self, todo_id: str, value: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        self.todo_actions.append((todo_id, dict(value)))
+        return {
+            "status": "TODO_ACTION_APPLIED",
+            "todo": {"todo_id": todo_id, "state": "IN_PROGRESS"},
+        }
+
+    def record_provider_session_action(
+        self, _chat_key: str, action: Mapping[str, Any], *, retain: int
+    ) -> Mapping[str, Any]:
+        self.actions.append(dict(action))
+        self.actions = self.actions[-retain:]
+        return dict(action)
+
+    def list_provider_session_actions(
+        self, _chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        return self.actions[-limit:]
+
+    def delete_provider_session_action(
+        self, _chat_key: str, _action_id: str
+    ) -> Mapping[str, Any] | None:
+        return None
 
 
 class ProviderSessionServiceTests(unittest.TestCase):
@@ -169,6 +255,9 @@ class ProviderSessionServiceTests(unittest.TestCase):
         *,
         retained_idempotency: int | None = None,
         retained_permissions: int | None = None,
+        repository_git_observer_factory: Callable[[Path], Any] | None = None,
+        action_store: Any = None,
+        action_observer: Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
     ) -> ProviderSessionService:
         return ProviderSessionService(
             resolver=self.resolver,
@@ -176,10 +265,66 @@ class ProviderSessionServiceTests(unittest.TestCase):
             permission_timeout_seconds=2,
             retained_idempotency=retained_idempotency,
             retained_permissions=retained_permissions,
+            action_store=action_store,
+            action_observer=action_observer,
+            repository_git_observer_factory=repository_git_observer_factory,
+            repository_git_poll_seconds=0.01,
         )
 
     def tearDown(self) -> None:
         self.service.close()
+
+    def test_common_message_channel_envelope_routes_codex_and_grok(self) -> None:
+        for index, provider in enumerate(("CODEX", "GROK"), start=1):
+            with self.subTest(provider=provider):
+                self.descriptor_overrides["provider"] = provider
+                message_id = f"msg-channel-{index}"
+                accepted = self.service.submit_channel(
+                    CHAT_KEY,
+                    {
+                        "schema": "universe.host-message-channel.v1",
+                        "message_id": message_id,
+                        "session_anchor_ref": "anchor-channel-test",
+                        "content": f"hello {provider.lower()}",
+                        "meta": {"provider": provider, "kind": "INSTRUCTION"},
+                    },
+                )
+                self.assertEqual(
+                    "PROVIDER_SESSION_INPUT_ACCEPTED", accepted["status"]
+                )
+                self.assertEqual(
+                    {
+                        "schema": "universe.host-message-channel.v1",
+                        "message_id": message_id,
+                        "session_anchor_ref": "anchor-channel-test",
+                        "adapter": "PROVIDER_NATIVE",
+                    },
+                    accepted["message_channel"],
+                )
+                self.assertTrue(self.service.wait_idle(CHAT_KEY))
+                self.assertEqual(
+                    f"hello {provider.lower()}",
+                    self.service.snapshot(CHAT_KEY)["messages"][-2]["body"],
+                )
+                self.service.close()
+                self.service = self._new_service()
+
+    def test_common_message_channel_rejects_unknown_schema(self) -> None:
+        with self.assertRaises(ProviderSessionError) as raised:
+            self.service.submit_channel(
+                CHAT_KEY,
+                {
+                    "schema": "unknown.channel.v1",
+                    "message_id": "msg-invalid-schema",
+                    "session_anchor_ref": "anchor-channel-test",
+                    "content": "must not dispatch",
+                    "meta": {},
+                },
+            )
+        self.assertEqual(
+            "PROVIDER_CHANNEL_SCHEMA_UNSUPPORTED", raised.exception.code
+        )
+        self.assertEqual([], self.hosts)
 
     def test_direct_turn_streams_without_room_queue_or_secret_projection(self) -> None:
         accepted = self.service.submit(
@@ -194,6 +339,16 @@ class ProviderSessionServiceTests(unittest.TestCase):
         self.assertEqual(["USER", "ASSISTANT"], [m["role"] for m in snapshot["messages"]])
         self.assertEqual("hello world", snapshot["messages"][-1]["body"])
         self.assertEqual("COMPLETED", snapshot["messages"][-1]["state"])
+        self.assertEqual("COMPLETED", snapshot["work_status"]["state"])
+        self.assertEqual("PROVIDER_TURN", snapshot["work_status"]["operation"])
+        event_states = [
+            event["payload"]["work_status"]["state"]
+            for event in self.service.events.wait(
+                CHAT_KEY, after_event_id=0, timeout_seconds=0.1
+            )
+            if event["payload"].get("type") == "PROVIDER_SESSION_WORK_STATUS"
+        ]
+        self.assertEqual(["STARTED", "COMPLETED"], event_states)
         self.assertEqual(
             [("CODEX", "provider-secret-session-ref")],
             self.hosts[0].store.observed,
@@ -208,7 +363,196 @@ class ProviderSessionServiceTests(unittest.TestCase):
             {"input_tokens": 10},
             snapshot["connection"]["runtime_observation"]["usage"],
         )
+        self.assertEqual(
+            {
+                "schema": "universe.provider-quota-snapshot.v1",
+                "provider": "CODEX",
+                "source": "account/rateLimits/read",
+                "state": "AVAILABLE",
+                "windows": [
+                    {
+                        "name": "PRIMARY",
+                        "used_percent": 25,
+                        "window_minutes": 300,
+                        "resets_at": 1788220800,
+                    }
+                ],
+            },
+            snapshot["connection"]["runtime_observation"]["quota"],
+        )
         self.assertFalse(snapshot["room_queue_used"])
+
+    def test_supervisor_attested_target_is_accepted_as_persistent_session(self) -> None:
+        self.descriptor_overrides.update(
+            {
+                "identity_state": "VERIFIED",
+                "identity_source": "SESSION_SUPERVISOR",
+            }
+        )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual("PROVIDER_SESSION_SNAPSHOT_COLLECTED", snapshot["status"])
+
+    def test_git_trace2_milestones_publish_without_command_arguments(self) -> None:
+        self.service.submit(
+            CHAT_KEY,
+            {"body": "git milestones", "idempotency_key": "turn-git-001"},
+        )
+        self.assertTrue(self.service.wait_idle(CHAT_KEY))
+
+        events = self.service.events.wait(
+            CHAT_KEY, after_event_id=0, timeout_seconds=0.1
+        )
+        statuses = [
+            event["payload"]["work_status"]
+            for event in events
+            if event["payload"].get("type") == "PROVIDER_SESSION_WORK_STATUS"
+        ]
+        self.assertEqual(
+            ["PROVIDER_TURN", "PROVIDER_TURN", "COMMIT", "PUSH"],
+            [status["operation"] for status in statuses],
+        )
+        self.assertEqual("GIT_EXIT_1", statuses[-1]["error_code"])
+        self.assertEqual(
+            {"source": "GIT_TRACE2", "exit_code": 1}, statuses[-1]["details"]
+        )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual(["COMMIT", "PUSH"], [item["operation"] for item in snapshot["actions"]])
+        commit_action = snapshot["actions"][0]
+        self.assertEqual("INFORMATIONAL", commit_action["kind"])
+        self.assertEqual("ddddddd · Describe Git action · 3 files", commit_action["summary"])
+        deleted = self.service.delete_action(CHAT_KEY, commit_action["action_id"])
+        self.assertEqual("PROVIDER_SESSION_ACTION_DELETED", deleted["status"])
+        self.assertEqual(["PUSH"], [item["operation"] for item in self.service.snapshot(CHAT_KEY)["actions"]])
+        public = json.dumps(statuses)
+        self.assertNotIn("argv", public)
+        self.assertNotIn("repository_root", public)
+
+    def test_terminal_git_action_records_event_projection(self) -> None:
+        observed: list[tuple[str, Mapping[str, Any]]] = []
+
+        def observe(chat_key: str, action: Mapping[str, Any]) -> Mapping[str, Any]:
+            observed.append((chat_key, dict(action)))
+            return {"status": "EVENT_PROJECTED", "message_id": "msg_result_001"}
+
+        self.service.close()
+        self.service = self._new_service(action_observer=observe)
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-event-001",
+            "COMPLETED",
+            operation="COMMIT",
+            details={"source": "GIT_TRACE2", "commit_sha": "a" * 40},
+        )
+
+        self.assertEqual(CHAT_KEY, observed[0][0])
+        self.assertEqual("COMMIT", observed[0][1]["operation"])
+        self.assertEqual(
+            {"status": "EVENT_PROJECTED", "message_id": "msg_result_001"},
+            self.service.snapshot(CHAT_KEY)["actions"][0]["event_projection"],
+        )
+
+    def test_explicit_git_todo_marker_starts_but_does_not_complete_todo(
+        self,
+    ) -> None:
+        action_store = FakeActionStore()
+        self.service.close()
+        self.service = self._new_service(action_store=action_store)
+
+        commit_sha = "f" * 40
+        marked = self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-001",
+            "COMPLETED",
+            operation="COMMIT",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": commit_sha,
+                "short_sha": "fffffff",
+                "commit_message": "feat: hook [Universe-Todo: todo_hook_001]",
+                "branch": "main",
+                "changed_files": 2,
+            },
+        )
+        self.assertEqual("todo_hook_001", marked["details"]["todo_id"])
+        self.assertEqual(
+            "IN_PROGRESS", action_store.actions[0]["todo_transition"]["state"]
+        )
+        self.assertEqual(
+            [
+                (
+                    "todo_hook_001",
+                    {
+                        "action_id": "git-commit-" + commit_sha,
+                        "outcome": "STARTED",
+                        "source": "GIT_TRACE2",
+                        "evidence_ref": "git://commit/" + commit_sha,
+                    },
+                )
+            ],
+            action_store.todo_actions,
+        )
+
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-002",
+            "COMPLETED",
+            operation="COMMIT",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": "e" * 40,
+                "short_sha": "eeeeeee",
+                "commit_message": "feat: unrelated",
+            },
+        )
+        self.service._publish_work_status(
+            CHAT_KEY,
+            "message-git-hook-003",
+            "COMPLETED",
+            operation="PUSH",
+            details={
+                "source": "GIT_TRACE2",
+                "exit_code": 0,
+                "commit_sha": commit_sha,
+                "short_sha": "fffffff",
+                "commit_message": "feat: hook [Universe-Todo: todo_hook_001]",
+                "branch": "main",
+                "remote": "origin",
+            },
+        )
+        self.assertEqual(1, len(action_store.todo_actions))
+
+    def test_repository_git_milestone_reaches_registered_session_without_turn(self) -> None:
+        observer = FakeRepositoryGitObserver()
+        self.service.close()
+        self.service = self._new_service(
+            repository_git_observer_factory=lambda _root: observer
+        )
+        self.service.snapshot(CHAT_KEY)
+        observer.milestones = [
+            {
+                "operation": "PUSH",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "source": "GIT_TRACE2",
+                "commit_sha": "e" * 40,
+                "short_sha": "eeeeeee",
+                "commit_message": "External push",
+                "branch": "codex/external",
+                "remote": "origin",
+                "changed_files": 1,
+            }
+        ]
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            actions = self.service.snapshot(CHAT_KEY)["actions"]
+            if actions:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(["PUSH"], [item["operation"] for item in actions])
+        self.assertEqual("codex/external -> origin · eeeeeee", actions[0]["summary"])
 
     def test_internal_callbacks_bind_reply_before_terminal_event(self) -> None:
         observed: list[tuple[str, str]] = []
@@ -483,6 +827,24 @@ class ProviderSessionServiceTests(unittest.TestCase):
             self.service.resolve_permission(CHAT_KEY, request_id, "reject-once")
             self.assertTrue(self.service.wait_idle(CHAT_KEY))
         self.assertLessEqual(len(self.service._permissions), 2)
+
+    def test_observer_excerpts_fill_empty_snapshot_without_room_queue(self) -> None:
+        created = self.service.observe_excerpts(
+            CHAT_KEY,
+            [
+                {"excerpt_id": "semantic_user", "role": "USER", "text": "from vendor"},
+                {"excerpt_id": "semantic_assistant", "role": "ASSISTANT", "text": "reply"},
+            ],
+            replace_observer=True,
+        )
+        snapshot = self.service.snapshot(CHAT_KEY)
+        self.assertEqual(2, len(created))
+        self.assertEqual(
+            ["from vendor", "reply"],
+            [item["body"] for item in snapshot["messages"]],
+        )
+        self.assertTrue(all(item["origin"] == "PROVIDER_OBSERVER" for item in created))
+        self.assertFalse(snapshot["room_queue_used"])
 
 
 if __name__ == "__main__":

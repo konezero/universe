@@ -1,0 +1,902 @@
+<title>Universe Architecture</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap">
+<style>
+:root {
+  --bg: #0a0f1a;
+  --bg-surface: #111827;
+  --bg-card: #172033;
+  --bg-card-hover: #1d2842;
+  --border: #1e2d4a;
+  --border-bright: #2a3f6a;
+  --text: #c8d6e5;
+  --text-muted: #6b7fa3;
+  --text-heading: #e8f0fc;
+  --accent: #4e9af5;
+  --accent-dim: #2a5a9e;
+  --accent-glow: rgba(78, 154, 245, 0.08);
+  --node-server: #f59e42;
+  --node-ui: #4ecdc4;
+  --node-session: #a78bfa;
+  --node-terminal: #f472b6;
+  --node-permission: #facc15;
+  --node-memory: #34d399;
+  --node-goal: #fb923c;
+  --node-release: #60a5fa;
+  --node-remote: #c084fc;
+  --node-conductor: #f87171;
+  --node-room: #38bdf8;
+  --node-runtime: #fbbf24;
+  --font-body: 'Inter', -apple-system, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f0f2f7;
+    --bg-surface: #ffffff;
+    --bg-card: #f7f8fb;
+    --bg-card-hover: #eef1f8;
+    --border: #d4dae6;
+    --border-bright: #b8c4da;
+    --text: #2d3748;
+    --text-muted: #6b7fa3;
+    --text-heading: #111827;
+    --accent: #2563eb;
+    --accent-dim: #93b4f5;
+    --accent-glow: rgba(37, 99, 235, 0.06);
+    --node-server: #d97706;
+    --node-ui: #0d9488;
+    --node-session: #7c3aed;
+    --node-terminal: #db2777;
+    --node-permission: #ca8a04;
+    --node-memory: #059669;
+    --node-goal: #ea580c;
+    --node-release: #2563eb;
+    --node-remote: #9333ea;
+    --node-conductor: #dc2626;
+    --node-room: #0284c7;
+    --node-runtime: #d97706;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0a0f1a;
+  --bg-surface: #111827;
+  --bg-card: #172033;
+  --bg-card-hover: #1d2842;
+  --border: #1e2d4a;
+  --border-bright: #2a3f6a;
+  --text: #c8d6e5;
+  --text-muted: #6b7fa3;
+  --text-heading: #e8f0fc;
+  --accent: #4e9af5;
+  --accent-dim: #2a5a9e;
+  --accent-glow: rgba(78, 154, 245, 0.08);
+  --node-server: #f59e42;
+  --node-ui: #4ecdc4;
+  --node-session: #a78bfa;
+  --node-terminal: #f472b6;
+  --node-permission: #facc15;
+  --node-memory: #34d399;
+  --node-goal: #fb923c;
+  --node-release: #60a5fa;
+  --node-remote: #c084fc;
+  --node-conductor: #f87171;
+  --node-room: #38bdf8;
+  --node-runtime: #fbbf24;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page { max-width: 1280px; margin: 0 auto; padding: 48px 32px 80px; }
+
+header.hero {
+  text-align: center;
+  padding: 56px 0 48px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 48px;
+}
+header.hero h1 {
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--text-heading);
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+  margin-bottom: 8px;
+}
+header.hero .subtitle {
+  color: var(--text-muted);
+  font-size: 15px;
+  max-width: 600px;
+  margin: 0 auto;
+}
+header.hero .meta {
+  margin-top: 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+
+.toc {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  margin-bottom: 56px;
+  padding: 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.toc a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+  border-radius: 5px;
+  transition: background 0.15s;
+}
+.toc a:hover { background: var(--accent-glow); color: var(--accent); }
+.toc .dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+section.node {
+  margin-bottom: 48px;
+  scroll-margin-top: 32px;
+}
+section.node > .node-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.node-dot {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+section.node h2 {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-heading);
+  letter-spacing: -0.01em;
+}
+section.node h2 .node-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+section.node p.desc {
+  color: var(--text-muted);
+  font-size: 14px;
+  max-width: 72ch;
+  margin-bottom: 16px;
+}
+
+.file-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.file-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.file-card:hover {
+  border-color: var(--border-bright);
+  background: var(--bg-card-hover);
+}
+.file-card .path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+.file-card .role {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+}
+.file-card .lines {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.conn-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.conn-list li {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+}
+.conn-list li .arrow { color: var(--accent-dim); margin: 0 4px; }
+
+.api-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 8px;
+}
+.api-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 13px;
+  border-radius: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+}
+.api-method {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  width: 36px;
+  flex-shrink: 0;
+}
+.api-method.get { color: var(--node-ui); }
+.api-method.post { color: var(--node-server); }
+.api-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.flow-diagram {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin: 16px 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  line-height: 2;
+}
+.flow-diagram .fl { color: var(--accent); }
+.flow-diagram .fr { color: var(--text-muted); }
+
+.stat-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.stat {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 18px;
+  min-width: 120px;
+}
+.stat .label {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.stat .value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-heading);
+  font-variant-numeric: tabular-nums;
+}
+
+.hierarchy {
+  padding: 16px 20px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 2;
+  overflow-x: auto;
+}
+.hierarchy .h-indent { color: var(--border-bright); user-select: none; }
+.hierarchy .h-label { color: var(--text-heading); font-weight: 600; }
+.hierarchy .h-note { color: var(--text-muted); font-weight: 400; }
+
+@media (max-width: 720px) {
+  .page { padding: 24px 16px 60px; }
+  header.hero { padding: 32px 0 28px; }
+  header.hero h1 { font-size: 24px; }
+  .file-grid, .api-grid { grid-template-columns: 1fr; }
+  .toc { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+
+<div class="page">
+  <header class="hero">
+    <h1>Universe Project Architecture</h1>
+    <p class="subtitle">Local-first work-spine command center connecting independent software projects with AI provider sessions, knowledge lineage, and deployment governance.</p>
+    <p class="meta">Windows &middot; Python + Browser UI &middot; SQLite &middot; ConPTY &middot; ~33k LOC server</p>
+  </header>
+
+  <div class="stat-row">
+    <div class="stat"><div class="label">Server</div><div class="value">33k</div></div>
+    <div class="stat"><div class="label">App modules</div><div class="value">16</div></div>
+    <div class="stat"><div class="label">Test files</div><div class="value">~75</div></div>
+    <div class="stat"><div class="label">API routes</div><div class="value">80+</div></div>
+    <div class="stat"><div class="label">Providers</div><div class="value">3</div></div>
+    <div class="stat"><div class="label">Design docs</div><div class="value">36</div></div>
+  </div>
+
+  <section aria-labelledby="functional-catalog-title" style="margin-bottom:48px;padding:24px;border:1px solid var(--border-bright);border-radius:10px;background:var(--bg-surface)">
+    <p style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:6px">Start here</p>
+    <h2 id="functional-catalog-title" style="font-size:24px;color:var(--text-heading);margin-bottom:8px">What are you trying to do?</h2>
+    <p class="desc" style="margin-bottom:20px">Choose a product capability first. Each card names the user-facing outcome, then links to the technical nodes that make it work.</p>
+    <div class="file-grid">
+      <article class="file-card">
+        <div class="path">01 · Structure a project</div>
+        <div class="role">Attach a project, describe its goals and functional Seed nodes, then see that structure in the work map.</div>
+        <ul class="conn-list"><li><a style="color:var(--accent)" href="#server">Project registry</a></li><li><a style="color:var(--accent)" href="#goal">Goals / Todo</a></li><li><a style="color:var(--accent)" href="#ui">Work map</a></li></ul>
+      </article>
+      <article class="file-card">
+        <div class="path">02 · Keep AI sessions connected</div>
+        <div class="role">Start provider sessions, keep each provider conversation distinct, and coordinate them in the right project room.</div>
+        <ul class="conn-list"><li><a style="color:var(--accent)" href="#terminal">CLI terminal</a></li><li><a style="color:var(--accent)" href="#session">Supervisor</a></li><li><a style="color:var(--accent)" href="#room">Rooms</a></li><li><a style="color:var(--accent)" href="#permission">Permission</a></li></ul>
+      </article>
+      <article class="file-card">
+        <div class="path">03 · Turn intent into work</div>
+        <div class="role">Capture a Todo, let Master/Conductor prepare a bounded handoff, then dispatch verified work to the selected runtime.</div>
+        <ul class="conn-list"><li><a style="color:var(--accent)" href="#goal">Todo</a></li><li><a style="color:var(--accent)" href="#conductor">Conductor / Master</a></li><li><a style="color:var(--accent)" href="#runtime">Runtime / Dispatch</a></li></ul>
+      </article>
+      <article class="file-card">
+        <div class="path">04 · Find context and learn</div>
+        <div class="role">Search attached-project files, recall approved memory, and compare skill or provider evidence without mixing it with source authority.</div>
+        <ul class="conn-list"><li><a style="color:var(--accent)" href="#server">Local query / index</a></li><li><a style="color:var(--accent)" href="#memory">Memory / Bench</a></li><li><a style="color:var(--accent)" href="#ui">Context surfaces</a></li></ul>
+      </article>
+      <article class="file-card">
+        <div class="path">05 · Ship and connect safely</div>
+        <div class="role">Package immutable releases, install or update deliberately, and expose a local Universe through paired remote access.</div>
+        <ul class="conn-list"><li><a style="color:var(--accent)" href="#release">Release / Deploy</a></li><li><a style="color:var(--accent)" href="#remote">Remote access</a></li><li><a style="color:var(--accent)" href="#server">Host service</a></li></ul>
+      </article>
+    </div>
+  </section>
+
+  <p style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin:0 0 8px">Technical node catalog</p>
+  <nav class="toc" aria-label="Technical nodes">
+    <a href="#server"><span class="dot" style="background:var(--node-server)"></span>Main Server</a>
+    <a href="#ui"><span class="dot" style="background:var(--node-ui)"></span>Browser UI</a>
+    <a href="#session"><span class="dot" style="background:var(--node-session)"></span>Session / Supervisor</a>
+    <a href="#terminal"><span class="dot" style="background:var(--node-terminal)"></span>CLI Terminal</a>
+    <a href="#permission"><span class="dot" style="background:var(--node-permission)"></span>Permission / Auth</a>
+    <a href="#goal"><span class="dot" style="background:var(--node-goal)"></span>Goal / Planning</a>
+    <a href="#memory"><span class="dot" style="background:var(--node-memory)"></span>Memory</a>
+    <a href="#release"><span class="dot" style="background:var(--node-release)"></span>Release / Deploy</a>
+    <a href="#remote"><span class="dot" style="background:var(--node-remote)"></span>Remote Access</a>
+    <a href="#conductor"><span class="dot" style="background:var(--node-conductor)"></span>Conductor / Master</a>
+    <a href="#room"><span class="dot" style="background:var(--node-room)"></span>Multi-Room Chat</a>
+    <a href="#runtime"><span class="dot" style="background:var(--node-runtime)"></span>Runtime / Dispatch</a>
+  </nav>
+
+  <!-- SERVER -->
+  <section class="node" id="server">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-server)"></span>
+      <h2>Main Server <span class="node-tag">universe_server.py</span></h2>
+    </div>
+    <p class="desc">Monolithic Python HTTP server (~33k lines). Contains the SQLite-backed data store (<code>UniverseStore</code>), the threaded HTTP server (<code>UniverseHTTPServer</code>), and the request handler with all 80+ API routes. The central hub that every other component connects to.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_server.py</div>
+        <div class="role"><strong>UniverseStore</strong> (L4600) &mdash; SQLite persistence for all domain entities. Composes RemoteAccessStore, SessionSupervisorStore, MultiRoomStore, TaskFrameLineageStore, MemoryBatchExecutionService.</div>
+        <div class="lines">~14,000 lines of store methods</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_server.py</div>
+        <div class="role"><strong>UniverseHTTPServer</strong> (L18696) &mdash; ThreadingHTTPServer. Composes store, terminal host, session bus, memory scheduler, conductor runtime, project master hosts. ~25 constructor params.</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_server.py</div>
+        <div class="role"><strong>UniverseRequestHandler</strong> (L26989) &mdash; BaseHTTPRequestHandler implementing all REST routes, SSE streams, and WebSocket upgrades.</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_server.py</div>
+        <div class="role"><strong>ConductorPermissionBridge</strong> (L18347) / <strong>RoomParticipantPermissionRegistry</strong> (L18489) &mdash; Server-level permission gates.</div>
+      </div>
+    </div>
+
+    <details>
+      <summary style="cursor:pointer;font-size:14px;font-weight:600;color:var(--text-heading);margin-bottom:12px;">Key API Routes (selection)</summary>
+      <div class="api-grid">
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/health</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/terminals</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/sessions</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/supervisor/sessions</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/projects</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/universe-goals</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/todos</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/rooms</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/releases</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/bench/skills</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/conductor-room/stream</span></div>
+        <div class="api-row"><span class="api-method get">GET</span><span class="api-path">/v1/session-bus/directory</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/terminals</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/sessions/inject</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/projects/register</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/session-bus/messages</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/conductor-room/messages</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/releases/import</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/settings/setup-provider-hooks</span></div>
+        <div class="api-row"><span class="api-method post">POST</span><span class="api-path">/v1/service/shutdown</span></div>
+      </div>
+    </details>
+  </section>
+
+  <!-- UI -->
+  <section class="node" id="ui">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-ui)"></span>
+      <h2>Browser UI <span class="node-tag">universe_ui/</span></h2>
+    </div>
+    <p class="desc">Single-page application served as static files. Dark-themed command center with multiple workspace surfaces: Work Spine, Timeline, Sessions, Documents, Memory, Future, Bench. Communicates with the server via REST, SSE, and WebSocket.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_ui/index.html</div>
+        <div class="role">SPA shell. Topbar with primary nav, utility rail, project sidebar, main canvas, conductor panel, terminal dock, 10+ dialog overlays.</div>
+        <div class="lines">1,220 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_ui/app.js</div>
+        <div class="role">Core application logic. 250+ functions: project management, session observatory, conductor/master room chat, graph views, settings, goal/todo/release/memory management.</div>
+        <div class="lines">13,599 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_ui/terminals.js</div>
+        <div class="role">Terminal dock. xterm.js integration, tab management, WebSocket to <code>/v1/terminals/{id}/stream</code>, ConPTY resize, IME input binding, provider-aware resume.</div>
+        <div class="lines">532 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_ui/styles.css</div>
+        <div class="role">Full UI styling. CSS variables, responsive layout, terminal dock, session cards, graph canvas, dialog overlays.</div>
+        <div class="lines">6,953 lines</div>
+      </div>
+    </div>
+
+    <ul class="conn-list">
+      <li>app.js <span class="arrow">&rarr;</span> REST api()</li>
+      <li>app.js <span class="arrow">&rarr;</span> SSE /conductor-room/stream</li>
+      <li>terminals.js <span class="arrow">&rarr;</span> WS /terminals/{id}/stream</li>
+    </ul>
+  </section>
+
+  <!-- SESSION -->
+  <section class="node" id="session">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-session)"></span>
+      <h2>Session / Supervisor <span class="node-tag">session system</span></h2>
+    </div>
+    <p class="desc">Tracks session descriptors across providers (Claude, Grok, Codex). The inject hook fires on CLI session start, resolves provider + ref, and registers with the supervisor. Sessions keep one identity while their provider and Universe location change.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/session_supervisor.py</div>
+        <div class="role"><strong>SessionSupervisorStore</strong> &mdash; SQLite-backed session tracking with process identities and lifecycle state.</div>
+        <div class="lines">~300 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_session_inject_hook.py</div>
+        <div class="role">Session injection hook. Resolves provider + session ref, patches mode current anchor, sets up provider hooks. Entry point for <code>--on-session-start</code>.</div>
+        <div class="lines">~1,250 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/provider_session_service.py</div>
+        <div class="role"><strong>ProviderSessionService</strong> &mdash; Provider session lifecycle, action execution, event routing, streaming hub.</div>
+        <div class="lines">1,347 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/provider_session_observer.py</div>
+        <div class="role"><strong>ProviderSessionObserverStore</strong> &mdash; Observes and indexes provider sessions, extracts semantic messages and file identity.</div>
+        <div class="lines">~420 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/agent_session_gateway.py</div>
+        <div class="role"><strong>UniverseAcpGateway</strong> + per-provider session classes (GrokAcpSession, CodexAppServerSession, ClaudeCodeSession). JSON-RPC stdio bridge.</div>
+        <div class="lines">~1,720 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/session_bus.py</div>
+        <div class="role"><strong>SessionBus</strong> &mdash; Inter-session messaging with mailboxes, direct targeting, meeting fanout.</div>
+        <div class="lines">683 lines</div>
+      </div>
+    </div>
+
+    <div class="flow-diagram">
+      <span class="fr">Provider CLI hook</span> <span class="fl">&rarr;</span>
+      <span class="fr">universe_session_inject_hook.py</span> <span class="fl">&rarr;</span>
+      <span class="fr">POST /v1/sessions/inject</span> <span class="fl">&rarr;</span>
+      <span class="fr">SessionSupervisorStore</span> <span class="fl">&rarr;</span>
+      <span class="fr">UI Session Observatory</span>
+    </div>
+  </section>
+
+  <!-- TERMINAL -->
+  <section class="node" id="terminal">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-terminal)"></span>
+      <h2>CLI Terminal <span class="node-tag">ConPTY + xterm.js</span></h2>
+    </div>
+    <p class="desc">Process-local tabbed CLI terminals rendered in the browser dock. Spawns provider CLIs (claude, grok, codex) via Windows ConPTY, streams I/O over WebSocket to xterm.js. Supports session resume, model/effort selection, and channel-based automation.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_app/terminal_host.py</div>
+        <div class="role"><strong>TerminalHost</strong> &mdash; Session registry. Spawn, resume, stop. <code>startup_argv()</code> builds provider-specific CLI commands. <code>ClaudeChannelBroker</code> integration for automation.</div>
+        <div class="lines">623 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/windows_conpty.py</div>
+        <div class="role"><strong>WindowsConPTY</strong> &mdash; pywinpty wrapper. Manages pseudoterminal lifecycle, read/write/resize, TERM=xterm-256color.</div>
+        <div class="lines">166 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/terminal_ws.py</div>
+        <div class="role">RFC 6455 WebSocket pump. <code>pump_terminal_socket()</code> bridges HTTP socket to PTY fan-out queue. Frame encode/decode, resize JSON commands.</div>
+        <div class="lines">160 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/pty_supervisor.py</div>
+        <div class="role"><strong>SupervisedTerminalHost</strong> &mdash; Health-check, lifecycle management, session state tracking on top of TerminalHost.</div>
+        <div class="lines">418 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/claude_channel_broker.py</div>
+        <div class="role"><strong>ClaudeChannelBroker</strong> &mdash; Loopback HTTP broker for Claude Code channel notifications. One-time bootstrap token, authenticated poll queue.</div>
+        <div class="lines">360 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/claude_channel_mcp.py</div>
+        <div class="role">MCP stdio server loaded by Claude Code. Exchanges bootstrap credential, polls broker, emits <code>notifications/claude/channel</code> events.</div>
+        <div class="lines">197 lines</div>
+      </div>
+    </div>
+
+    <div class="flow-diagram">
+      <span class="fr">Browser xterm.js</span> <span class="fl">&rarr;</span>
+      <span class="fr">WebSocket /terminals/{id}/stream</span> <span class="fl">&rarr;</span>
+      <span class="fr">pump_terminal_socket()</span> <span class="fl">&rarr;</span>
+      <span class="fr">WindowsConPTY</span> <span class="fl">&rarr;</span>
+      <span class="fr">claude.exe / grok.exe / codex.exe</span>
+    </div>
+  </section>
+
+  <!-- PERMISSION -->
+  <section class="node" id="permission">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-permission)"></span>
+      <h2>Permission / Auth <span class="node-tag">capability tokens</span></h2>
+    </div>
+    <p class="desc">MCP-based permission bridge between provider CLI sessions and Universe. Permission requests flow from the CLI process through a stdio MCP server to the Universe server, where the browser UI presents them for user approval.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/claude_permission_bridge.py</div>
+        <div class="role"><strong>ClaudePermissionBridge</strong> &mdash; Bridge between Claude sessions and Universe permission system.</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/claude_permission_broker.py</div>
+        <div class="role"><strong>ClaudePermissionBroker</strong> + <strong>CapabilityToken</strong> &mdash; Brokers permission requests with approval flow and token management.</div>
+        <div class="lines">~380 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/claude_permission_mcp.py</div>
+        <div class="role">MCP stdio integration. <code>register()</code>, <code>ask_universe()</code>, <code>handle_message()</code> &mdash; routes permission queries through the loopback endpoint.</div>
+        <div class="lines">~200 lines</div>
+      </div>
+    </div>
+
+    <div class="flow-diagram">
+      <span class="fr">Provider CLI</span> <span class="fl">&rarr;</span>
+      <span class="fr">claude_permission_mcp.py (stdio)</span> <span class="fl">&rarr;</span>
+      <span class="fr">POST /v1/sessions/inject</span> <span class="fl">&rarr;</span>
+      <span class="fr">UniverseStore</span> <span class="fl">&rarr;</span>
+      <span class="fr">Browser UI approval</span> <span class="fl">&rarr;</span>
+      <span class="fr">response back</span>
+    </div>
+  </section>
+
+  <!-- GOAL -->
+  <section class="node" id="goal">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-goal)"></span>
+      <h2>Goal / Planning / Todo <span class="node-tag">work spine</span></h2>
+    </div>
+    <p class="desc">Hierarchical planning system: Universe Goal &rarr; Project Goal &rarr; Milestone &rarr; Todo. Work-loop predictions combine seed, experience, todos, memories, and bench hits into scored prediction bundles for the next iteration.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_server.py (UniverseStore)</div>
+        <div class="role">Goal CRUD (L8923), milestone CRUD (L9030), todo tracking (L9147) with plan binding validation, todo actions and work-loop result fanout (L13855).</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/work_loop_prediction.py</div>
+        <div class="role"><code>build_work_loop_predictions()</code> &mdash; Scores and ranks next work items. <code>build_result_fanout()</code> processes completed work. <code>retrieve_recurrence_prevention()</code>.</div>
+        <div class="lines">521 lines</div>
+      </div>
+    </div>
+
+    <div class="hierarchy">
+      <div><span class="h-label">Universe Goal</span> <span class="h-note">&mdash; global objective</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&#x2514; </span><span class="h-label">Project Goal</span> <span class="h-note">&mdash; scoped to one project</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&ensp;&ensp;&ensp;&#x2514; </span><span class="h-label">Milestone</span> <span class="h-note">&mdash; definition of done</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&#x2514; </span><span class="h-label">Todo</span> <span class="h-note">&mdash; actionable work item (P0-P3, state machine)</span></div>
+    </div>
+  </section>
+
+  <!-- MEMORY -->
+  <section class="node" id="memory">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-memory)"></span>
+      <h2>Memory <span class="node-tag">RAG pipeline</span></h2>
+    </div>
+    <p class="desc">Background memory batch pipeline. Scheduler claims due runs, execution service reserves and processes candidates through extraction &rarr; consolidation &rarr; synthesis &rarr; promotion to project memories. Runs on a configurable cadence.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_memory.py</div>
+        <div class="role">Core memory logic. <code>run_nightly_memory_rag_batch()</code>, candidate extraction, consolidation, synthesis, heuristic link proposals, batch scheduling.</div>
+        <div class="lines">~1,500 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/memory_scheduler.py</div>
+        <div class="role"><strong>MemoryBatchScheduler</strong> &mdash; Cron-like scheduler with retry delays, cadence tracking, quota windows.</div>
+        <div class="lines">181 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/memory_execution_service.py</div>
+        <div class="role"><strong>MemoryBatchExecutionService</strong> &mdash; Reserve, execute, persist memory batch runs.</div>
+        <div class="lines">293 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/memory_batch_service.py</div>
+        <div class="role"><strong>MemoryBatchConfigurationService</strong> &mdash; Config and provider model catalog for memory processing.</div>
+        <div class="lines">198 lines</div>
+      </div>
+    </div>
+
+    <div class="flow-diagram">
+      <span class="fr">Scheduler (background thread)</span> <span class="fl">&rarr;</span>
+      <span class="fr">claim due schedule</span> <span class="fl">&rarr;</span>
+      <span class="fr">ExecutionService.reserve()</span> <span class="fl">&rarr;</span>
+      <span class="fr">extract &rarr; consolidate &rarr; synthesize</span> <span class="fl">&rarr;</span>
+      <span class="fr">project memories</span>
+    </div>
+  </section>
+
+  <!-- RELEASE -->
+  <section class="node" id="release">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-release)"></span>
+      <h2>Release / Deploy <span class="node-tag">immutable artifacts</span></h2>
+    </div>
+    <p class="desc">Cryptographically-verified releases built from git trees into SQLite databases with SHA-256 manifests. Governance selectors validate application. Portable Windows distribution with optional embedded Python.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/core_release.py</div>
+        <div class="role"><code>build_release()</code>, <code>verify_release()</code> &mdash; Git blob reader, SHA-256 manifest builder, SQLite artifact packaging.</div>
+        <div class="lines">~1,420 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/release_runtime.py</div>
+        <div class="role"><strong>ReleaseRuntime</strong> &mdash; Applies releases to project file systems. Governance selector validation, install state management.</div>
+        <div class="lines">~830 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/build_portable.py</div>
+        <div class="role"><code>build_portable()</code> &mdash; Portable Windows distribution builder with embedded Python.</div>
+        <div class="lines">~330 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">packaging/windows/</div>
+        <div class="role">Start-Universe.cmd, install-user.ps1, Universe-Tray.ps1 &mdash; Windows launchers, installer, system tray.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REMOTE -->
+  <section class="node" id="remote">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-remote)"></span>
+      <h2>Remote Access <span class="node-tag">pairing + gateway</span></h2>
+    </div>
+    <p class="desc">Remote access to the local Universe via LAN gateway or SSH reverse tunnel. One-time pairing with desktop approval. Rendezvous service for discovering remote universes with X25519 key exchange.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_remote_gateway.py</div>
+        <div class="role"><strong>RemoteGatewayServer</strong> &mdash; HTTP/WS gateway. LAN IPv4 discovery, request proxying to local universe, attempt rate limiting.</div>
+        <div class="lines">~1,020 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_remote_connector.py</div>
+        <div class="role"><strong>ConnectorControlServer</strong> &mdash; SSH tunnel connector. Builds SSH commands, manages tunnel lifecycle for internet access.</div>
+        <div class="lines">~630 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_rendezvous_client.py</div>
+        <div class="role"><strong>UniverseRendezvousService</strong> &mdash; Discovery and connection to remote universes. X25519 key exchange, HKDF-derived keys.</div>
+        <div class="lines">~780 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/remote_access.py</div>
+        <div class="role"><strong>RemoteAccessStore</strong> &mdash; SQLite store for pairing codes and device registrations.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONDUCTOR -->
+  <section class="node" id="conductor">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-conductor)"></span>
+      <h2>Conductor / Master <span class="node-tag">agent hierarchy</span></h2>
+    </div>
+    <p class="desc">Multi-level agent hierarchy: Universe Conductor delegates to Project Masters, which manage Bosses and Workers. Each level has per-provider runtime implementations (Grok, Codex, Claude). Bridge HTTP servers route replies and permission requests.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_conductor_runtime.py</div>
+        <div class="role"><strong>UniverseConductorRuntime</strong> &mdash; Conductor agent process lifecycle management.</div>
+        <div class="lines">~570 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/project_master_host.py</div>
+        <div class="role">Largest tools-level file. <strong>ProjectModeCoordinator</strong>, per-provider master runtimes (Grok/Codex/Claude), conversation workers, bridge hosting, resident session management.</div>
+        <div class="lines">~7,730 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/project_master_bridge.py</div>
+        <div class="role"><strong>ProjectMasterBridgeHost</strong> &mdash; HTTP bridge for master communication. Routes replies, stream events, permission requests.</div>
+        <div class="lines">~500 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_dispatch.py</div>
+        <div class="role">Dispatch system. <strong>LocalInboxConnector</strong>, wake adapters, master bridge &mdash; routes work to projects.</div>
+        <div class="lines">~950 lines</div>
+      </div>
+    </div>
+
+    <div class="hierarchy">
+      <div><span class="h-label">Universe Conductor</span> <span class="h-note">&mdash; top-level orchestrator</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&#x2514; </span><span class="h-label">Project Master</span> <span class="h-note">&mdash; per-project session coordinator</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&ensp;&ensp;&ensp;&#x2514; </span><span class="h-label">Boss</span> <span class="h-note">&mdash; task-level delegation</span></div>
+      <div><span class="h-indent">&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&ensp;&#x2514; </span><span class="h-label">Worker</span> <span class="h-note">&mdash; execution unit</span></div>
+    </div>
+  </section>
+
+  <!-- ROOM -->
+  <section class="node" id="room">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-room)"></span>
+      <h2>Multi-Room Chat <span class="node-tag">project rooms</span></h2>
+    </div>
+    <p class="desc">Multi-participant chat rooms for project coordination. Delivery coordination ensures messages reach the right sessions. Meeting rooms support real-time multi-participant flows.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_multi_room.py</div>
+        <div class="role"><strong>MultiRoomStore</strong>, <strong>MultiRoomEventHub</strong>, <strong>MultiRoomDeliveryCoordinator</strong>, <strong>MultiRoomMeetingCoordinator</strong> &mdash; Full room implementation.</div>
+        <div class="lines">~2,070 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_app/streaming.py</div>
+        <div class="role"><strong>ProjectRoomEventHub</strong>, <strong>ConductorRoomEventHub</strong> &mdash; SSE-style streaming for room events.</div>
+        <div class="lines">143 lines</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RUNTIME -->
+  <section class="node" id="runtime">
+    <div class="node-header">
+      <span class="node-dot" style="background:var(--node-runtime)"></span>
+      <h2>Runtime / Dispatch <span class="node-tag">worker execution</span></h2>
+    </div>
+    <p class="desc">Runtime host manages conductor-chat invocations with JSON-schema normalization and record redaction. Worker dispatcher resolves provider-specific executables and dispatches work via HTTP.</p>
+
+    <div class="file-grid">
+      <div class="file-card">
+        <div class="path">tools/universe_runtime_host.py</div>
+        <div class="role"><strong>UniverseRuntimeHost</strong> &mdash; Runtime invocation management, conductor chat, request normalization, invocation redaction.</div>
+        <div class="lines">~1,230 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">tools/universe_runtime_worker_dispatch.py</div>
+        <div class="role"><strong>RuntimeWorkerDispatcher</strong> &mdash; Dispatches work to provider-specific workers. Resolves executables, posts JSON.</div>
+        <div class="lines">~215 lines</div>
+      </div>
+      <div class="file-card">
+        <div class="path">.ai/core/</div>
+        <div class="role">Core contracts: AI_CORE.md, RUNTIME_MODEL.md, MODE_REGISTRY.md, PERSISTENCE_MODEL.md, RUNTIME_LIFECYCLE.md &mdash; governance and lifecycle specs.</div>
+      </div>
+      <div class="file-card">
+        <div class="path">.ai/runtime/</div>
+        <div class="role">Runtime state: SQLite anchor_store, task_frames, session_store. Reference runtime implementations, project instance data.</div>
+      </div>
+    </div>
+  </section>
+
+  <section style="margin-top:56px;padding-top:32px;border-top:1px solid var(--border);">
+    <h2 style="font-size:18px;color:var(--text-heading);margin-bottom:16px;">Provider Abstraction</h2>
+    <p class="desc">Three AI providers are supported through parallel implementations at every layer.</p>
+    <div class="file-grid">
+      <div class="file-card" style="border-left:3px solid var(--node-terminal);">
+        <div class="path">Terminal Layer</div>
+        <div class="role"><code>resolve_cli_executable()</code> resolves claude/grok/codex. <code>startup_argv()</code> builds provider-specific flags. ConPTY spawns any of the three.</div>
+      </div>
+      <div class="file-card" style="border-left:3px solid var(--node-session);">
+        <div class="path">Session Gateway</div>
+        <div class="role"><code>GrokAcpSession</code>, <code>CodexAppServerSession</code>, <code>ClaudeCodeSession</code> &mdash; JSON-RPC stdio bridges per provider.</div>
+      </div>
+      <div class="file-card" style="border-left:3px solid var(--node-conductor);">
+        <div class="path">Master Runtime</div>
+        <div class="role"><code>GrokProjectMasterRuntime</code>, <code>CodexProjectMasterRuntime</code>, <code>ClaudeProjectMasterRuntime</code> &mdash; per-provider master implementations.</div>
+      </div>
+    </div>
+  </section>
+
+  <section style="margin-top:40px;padding-top:24px;border-top:1px solid var(--border);">
+    <h2 style="font-size:18px;color:var(--text-heading);margin-bottom:16px;">Directory Layout</h2>
+    <div class="hierarchy">
+<div><span class="h-label">C:\workspace\universe\</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">tools/</span> <span class="h-note">&mdash; Python backend (server, services, CLI tools)</span></div>
+<div><span class="h-indent">  &#x2502;  &#x251C; </span><span class="h-label">universe_server.py</span> <span class="h-note">&mdash; monolithic server (33k lines)</span></div>
+<div><span class="h-indent">  &#x2502;  &#x251C; </span><span class="h-label">universe_app/</span> <span class="h-note">&mdash; 16 application-layer modules</span></div>
+<div><span class="h-indent">  &#x2502;  &#x251C; </span><span class="h-label">universe_ui/</span> <span class="h-note">&mdash; browser frontend (SPA)</span></div>
+<div><span class="h-indent">  &#x2502;  &#x251C; </span><span class="h-label">*_bridge.py / *_broker.py</span> <span class="h-note">&mdash; permission &amp; channel bridges</span></div>
+<div><span class="h-indent">  &#x2502;  &#x251C; </span><span class="h-label">project_master_host.py</span> <span class="h-note">&mdash; master runtime (~7.7k lines)</span></div>
+<div><span class="h-indent">  &#x2502;  &#x2514; </span><span class="h-label">core_release.py / build_portable.py</span> <span class="h-note">&mdash; release &amp; packaging</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">tests/</span> <span class="h-note">&mdash; ~75 test files mirroring tools/ structure</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">docs/</span> <span class="h-note">&mdash; 36 design documents</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">.ai/</span> <span class="h-note">&mdash; core contracts, runtime state, adapters, skills, memory</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">packaging/</span> <span class="h-note">&mdash; Windows installers and launchers</span></div>
+<div><span class="h-indent">  &#x251C; </span><span class="h-label">dist/</span> <span class="h-note">&mdash; built releases and portable distribution</span></div>
+<div><span class="h-indent">  &#x2514; </span><span class="h-label">seed/</span> <span class="h-note">&mdash; development seed data (JSON)</span></div>
+    </div>
+  </section>
+</div>

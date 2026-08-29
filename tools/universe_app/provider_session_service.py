@@ -11,19 +11,33 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import uuid
 
-from agent_session_gateway import AgentSessionError, normalize_permission_request
+from agent_session_gateway import (
+    AgentSessionError,
+    GitTrace2RepositoryObserver,
+    normalize_permission_request,
+)
 
 
 PROVIDER_SESSION_STREAM_SCHEMA = "universe.provider-session-stream.v1"
 PROVIDER_SESSION_MESSAGE_SCHEMA = "universe.provider-session-message.v1"
+HOST_MESSAGE_CHANNEL_SCHEMA = "universe.host-message-channel.v1"
 PROVIDER_SESSION_SNAPSHOT_SCHEMA = "universe.provider-session-snapshot.v1"
+WORK_STATUS_SCHEMA = "universe.work-status-notification.v1"
+PROVIDER_ACTION_SCHEMA = "universe.provider-session-action.v1"
 CHAT_KEY_PATTERN = re.compile(r"^provider_chat_[0-9a-f]{24}$")
+ACTION_ID_PATTERN = re.compile(r"^provider_action_[0-9a-f]{24}$")
+TODO_ID_PATTERN = re.compile(r"^todo_[A-Za-z0-9_-]+$")
+TODO_COMMIT_MARKER_PATTERN = re.compile(
+    r"(?:^|[\s\[])Universe-Todo\s*[:=]\s*(todo_[A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
 
 
 def _utc_now() -> str:
@@ -51,6 +65,28 @@ def _chat_key(value: Any) -> str:
             400,
         )
     return key
+
+
+def _action_id(value: Any) -> str:
+    action_id = _text(value, "action_id")
+    if not ACTION_ID_PATTERN.fullmatch(action_id):
+        raise ProviderSessionError(
+            "PROVIDER_SESSION_ACTION_ID_INVALID",
+            "action_id is not a valid Provider Session Action identifier",
+            400,
+        )
+    return action_id
+
+
+def _explicit_todo_id(details: Mapping[str, Any] | None) -> str | None:
+    if details is None:
+        return None
+    direct = str(details.get("todo_id") or "").strip()
+    if direct and TODO_ID_PATTERN.fullmatch(direct):
+        return direct
+    message = str(details.get("commit_message") or "")
+    match = TODO_COMMIT_MARKER_PATTERN.search(message)
+    return match.group(1) if match is not None else None
 
 
 def _json_copy(value: Any) -> Any:
@@ -84,6 +120,25 @@ class ProviderSessionHost(Protocol):
     ) -> None: ...
 
     def close(self) -> None: ...
+
+
+class ProviderActionStore(Protocol):
+    def record_provider_session_action(
+        self, chat_key: str, action: Mapping[str, Any], *, retain: int
+    ) -> Mapping[str, Any]: ...
+
+    def list_provider_session_actions(
+        self, chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]: ...
+
+    def delete_provider_session_action(
+        self, chat_key: str, action_id: str
+    ) -> Mapping[str, Any] | None: ...
+
+
+    def apply_todo_action(
+        self, todo_id: str, value: Mapping[str, Any]
+    ) -> Mapping[str, Any]: ...
 
 
 class ProviderSessionEventHub:
@@ -162,9 +217,19 @@ class ProviderSessionService:
         retained_idempotency: int | None = None,
         retained_permissions: int | None = None,
         permission_timeout_seconds: float = 600.0,
+        action_store: ProviderActionStore | None = None,
+        action_observer: (
+            Callable[[str, Mapping[str, Any]], Mapping[str, Any] | None] | None
+        ) = None,
+        repository_git_observer_factory: Callable[[Path], Any] | None = (
+            GitTrace2RepositoryObserver
+        ),
+        repository_git_poll_seconds: float = 0.5,
     ) -> None:
         self.resolver = resolver
         self.host_factory = host_factory
+        self.action_store = action_store
+        self.action_observer = action_observer
         self.events = ProviderSessionEventHub()
         self.retained_messages = max(16, int(retained_messages))
         self.retained_idempotency = max(
@@ -184,11 +249,15 @@ class ProviderSessionService:
             ),
         )
         self.permission_timeout_seconds = max(0.1, float(permission_timeout_seconds))
+        self.repository_git_observer_factory = repository_git_observer_factory
+        self.repository_git_poll_seconds = max(0.05, float(repository_git_poll_seconds))
         self._lock = threading.RLock()
         self._handles: dict[str, _HostHandle] = {}
         self._messages: dict[str, deque[dict[str, Any]]] = {}
         self._permissions: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._permission_waiters: dict[str, dict[str, Any]] = {}
+        self._work_statuses: dict[str, dict[str, Any]] = {}
+        self._actions: dict[str, deque[dict[str, Any]]] = {}
         self._active_threads: dict[str, threading.Thread] = {}
         self._active_message_ids: dict[str, str] = {}
         self._cancelled_message_ids: set[str] = set()
@@ -196,6 +265,16 @@ class ProviderSessionService:
             tuple[str, str], dict[str, Any]
         ] = OrderedDict()
         self._closed = threading.Event()
+        self._repository_git_observers: dict[str, Any] = {}
+        self._repository_git_chat_keys: dict[str, set[str]] = {}
+        self._repository_git_thread: threading.Thread | None = None
+        if self.repository_git_observer_factory is not None:
+            self._repository_git_thread = threading.Thread(
+                target=self._poll_repository_git,
+                name="provider-session-repository-git",
+                daemon=True,
+            )
+            self._repository_git_thread.start()
 
     def snapshot(self, chat_key: str) -> dict[str, Any]:
         key = _chat_key(chat_key)
@@ -214,6 +293,14 @@ class ProviderSessionService:
                 if item["chat_key"] == key
             ]
             active_message_id = self._active_message_ids.get(key)
+            work_status = _json_copy(self._work_statuses.get(key))
+            actions = _json_copy(
+                self.action_store.list_provider_session_actions(
+                    key, limit=self.retained_messages
+                )
+                if self.action_store is not None
+                else list(self._actions.get(key, ()))
+            )
             state = (
                 "CANCELLATION_REQUESTED"
                 if active_message_id in self._cancelled_message_ids
@@ -226,10 +313,116 @@ class ProviderSessionService:
             "target": self._public_target(descriptor),
             "messages": _json_copy(messages),
             "permissions": _json_copy(permissions),
+            "work_status": work_status,
+            "actions": actions,
             "connection": connection,
             "transcript_owner": "PROVIDER",
             "room_queue_used": False,
         }
+
+    def observe_excerpts(
+        self,
+        chat_key: str,
+        excerpts: Sequence[Mapping[str, Any]],
+        *,
+        publish: bool = False,
+        replace_observer: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Merge transient observer excerpts into process-local room messages."""
+
+        key = _chat_key(chat_key)
+        now = _utc_now()
+        created: list[dict[str, Any]] = []
+        with self._lock:
+            existing = list(self._messages.get(key, ()))
+            if replace_observer:
+                existing = [
+                    item
+                    for item in existing
+                    if item.get("origin") != "PROVIDER_OBSERVER"
+                ]
+                self._messages[key] = deque(existing, maxlen=self.retained_messages)
+            known = {str(item.get("message_id") or "") for item in existing}
+            for excerpt in excerpts:
+                excerpt_id = str(excerpt.get("excerpt_id") or "").strip()
+                role = str(excerpt.get("role") or "").strip().upper()
+                text = str(excerpt.get("text") or "").strip()
+                if not excerpt_id or role not in {"USER", "ASSISTANT"} or not text:
+                    continue
+                if excerpt_id in known:
+                    continue
+                message = {
+                    "schema": PROVIDER_SESSION_MESSAGE_SCHEMA,
+                    "message_id": excerpt_id,
+                    "chat_key": key,
+                    "role": role,
+                    "body": text,
+                    "state": "COMPLETED",
+                    "created_at": now,
+                    "updated_at": now,
+                    "origin": "PROVIDER_OBSERVER",
+                }
+                self._append_message(key, message)
+                known.add(excerpt_id)
+                created.append(message)
+        if publish:
+            for message in created:
+                self.events.publish(
+                    key, {"type": "PROVIDER_SESSION_MESSAGE", "message": message}
+                )
+        return created
+
+    def submit_channel(
+        self,
+        chat_key: str,
+        value: Mapping[str, Any],
+        *,
+        on_accepted: Callable[[Mapping[str, Any]], None] | None = None,
+        on_terminal: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Translate one common Host message envelope into a provider-native turn."""
+
+        if not isinstance(value, Mapping):
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_REQUEST_INVALID",
+                "channel payload must be an object",
+                400,
+            )
+        schema = _text(value.get("schema"), "schema")
+        if schema != HOST_MESSAGE_CHANNEL_SCHEMA:
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_SCHEMA_UNSUPPORTED",
+                "channel payload schema is unsupported",
+                400,
+            )
+        message_id = _text(value.get("message_id"), "message_id")
+        session_anchor_ref = _text(
+            value.get("session_anchor_ref"), "session_anchor_ref"
+        )
+        content = _text(value.get("content"), "content")
+        meta = value.get("meta")
+        if not isinstance(meta, Mapping):
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_META_INVALID",
+                "channel payload meta must be an object",
+                400,
+            )
+        result = self.submit(
+            chat_key,
+            {
+                "body": content,
+                "idempotency_key": f"host-channel:{message_id}",
+            },
+            on_accepted=on_accepted,
+            on_terminal=on_terminal,
+        )
+        result["message_channel"] = {
+            "schema": HOST_MESSAGE_CHANNEL_SCHEMA,
+            "message_id": message_id,
+            "session_anchor_ref": session_anchor_ref,
+            "adapter": "PROVIDER_NATIVE",
+        }
+        return result
 
     def submit(
         self,
@@ -320,6 +513,7 @@ class ProviderSessionService:
                 ) from error
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": user_message})
         self.events.publish(key, {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message})
+        self._publish_work_status(key, reply_message["message_id"], "STARTED")
         try:
             worker.start()
         except RuntimeError as error:
@@ -332,6 +526,12 @@ class ProviderSessionService:
             self.events.publish(
                 key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
+            )
+            self._publish_work_status(
+                key,
+                reply_message["message_id"],
+                "FAILED",
+                error_code="PROVIDER_SESSION_THREAD_START_FAILED",
             )
             if on_terminal is not None:
                 try:
@@ -498,9 +698,19 @@ class ProviderSessionService:
             self._permission_waiters.clear()
             handles = list(self._handles.values())
             workers = list(self._active_threads.values())
+            repository_git_observers = list(self._repository_git_observers.values())
             self._handles.clear()
+            self._repository_git_observers.clear()
+            self._repository_git_chat_keys.clear()
+        if self._repository_git_thread is not None:
+            self._repository_git_thread.join(timeout=5)
         for handle in handles:
             handle.host.close()
+        for observer in repository_git_observers:
+            try:
+                observer.close()
+            except Exception:
+                pass
         for worker in workers:
             worker.join(timeout=5)
 
@@ -550,7 +760,79 @@ class ProviderSessionService:
                 "Provider Session identity is not verified",
                 409,
             )
+        self._register_repository_git(chat_key, descriptor)
         return descriptor
+
+    def _register_repository_git(
+        self, chat_key: str, descriptor: Mapping[str, Any]
+    ) -> None:
+        factory = self.repository_git_observer_factory
+        if factory is None:
+            return
+        root = Path(str(descriptor["repository_root"])).expanduser().resolve()
+        repository_key = str(root).casefold()
+        with self._lock:
+            observer = self._repository_git_observers.get(repository_key)
+            if observer is not None:
+                self._repository_git_chat_keys.setdefault(repository_key, set()).add(
+                    chat_key
+                )
+                return
+        try:
+            candidate = factory(root)
+        except Exception:
+            return
+        with self._lock:
+            observer = self._repository_git_observers.get(repository_key)
+            if observer is None:
+                self._repository_git_observers[repository_key] = candidate
+                observer = candidate
+            self._repository_git_chat_keys.setdefault(repository_key, set()).add(chat_key)
+        if observer is not candidate:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+
+    def _poll_repository_git(self) -> None:
+        while not self._closed.wait(self.repository_git_poll_seconds):
+            with self._lock:
+                entries = [
+                    (
+                        repository_key,
+                        observer,
+                        tuple(self._repository_git_chat_keys.get(repository_key, ())),
+                    )
+                    for repository_key, observer in self._repository_git_observers.items()
+                ]
+            for _repository_key, observer, chat_keys in entries:
+                try:
+                    milestones = observer.drain_work_statuses()
+                except Exception:
+                    continue
+                for milestone in milestones:
+                    operation = str(milestone.get("operation") or "").upper()
+                    state = str(milestone.get("state") or "").upper()
+                    if operation not in {"COMMIT", "PUSH"} or state not in {
+                        "COMPLETED",
+                        "FAILED",
+                    }:
+                        continue
+                    exit_code = milestone.get("exit_code")
+                    message_id = "repository_git_" + uuid.uuid4().hex[:24]
+                    for chat_key in chat_keys:
+                        self._publish_work_status(
+                            chat_key,
+                            message_id,
+                            state,
+                            operation=operation,
+                            error_code=(
+                                f"GIT_EXIT_{exit_code}"
+                                if state == "FAILED" and isinstance(exit_code, int)
+                                else None
+                            ),
+                            details=milestone,
+                        )
 
     def _ensure_handle(
         self, chat_key: str, descriptor: Mapping[str, Any]
@@ -648,6 +930,53 @@ class ProviderSessionService:
             )
         )
 
+    def delete_action(self, chat_key: str, action_id: str) -> dict[str, Any]:
+        key = _chat_key(chat_key)
+        normalized_action_id = _action_id(action_id)
+        if self.action_store is not None:
+            removed = self.action_store.delete_provider_session_action(
+                key, normalized_action_id
+            )
+        else:
+            self._resolve(key)
+            with self._lock:
+                actions = self._actions.get(key)
+                removed = next(
+                    (
+                        action
+                        for action in actions or ()
+                        if action["action_id"] == normalized_action_id
+                    ),
+                    None,
+                )
+                if removed is not None:
+                    self._actions[key] = deque(
+                        (
+                            action
+                            for action in actions or ()
+                            if action["action_id"] != normalized_action_id
+                        ),
+                        maxlen=self.retained_messages,
+                    )
+        if removed is None:
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_ACTION_NOT_FOUND",
+                "Provider Session Action does not exist",
+                404,
+            )
+        self.events.publish(
+            key,
+            {
+                "type": "PROVIDER_SESSION_ACTION_DELETED",
+                "action_id": normalized_action_id,
+            },
+        )
+        return {
+            "schema": PROVIDER_ACTION_SCHEMA,
+            "status": "PROVIDER_SESSION_ACTION_DELETED",
+            "action": _json_copy(removed),
+        }
+
     def _prune_idempotency_locked(self) -> None:
         while len(self._idempotency) > self.retained_idempotency:
             self._idempotency.popitem(last=False)
@@ -666,6 +995,146 @@ class ProviderSessionService:
             if removable is None:
                 return
             self._permissions.pop(removable, None)
+
+    def _publish_work_status(
+        self,
+        chat_key: str,
+        message_id: str,
+        state: str,
+        *,
+        operation: str = "PROVIDER_TURN",
+        error_code: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        updated_at = _utc_now()
+        safe_details = {
+            key: details[key]
+            for key in (
+                "source",
+                "exit_code",
+                "commit_sha",
+                "short_sha",
+                "commit_message",
+                "branch",
+                "remote",
+                "changed_files",
+            )
+            if details is not None and key in details
+        }
+        todo_id = _explicit_todo_id(details)
+        if todo_id is not None:
+            safe_details["todo_id"] = todo_id
+        status = {
+            "schema": WORK_STATUS_SCHEMA,
+            "operation": operation,
+            "state": state,
+            "message_id": message_id,
+            "error_code": error_code,
+            "updated_at": updated_at,
+        }
+        if safe_details:
+            status["details"] = safe_details
+        action = None
+        if operation in {"COMMIT", "PUSH"} and state in {"COMPLETED", "FAILED"}:
+            short_sha = str(safe_details.get("short_sha") or "").strip()
+            commit_message = str(safe_details.get("commit_message") or "").strip()
+            branch = str(safe_details.get("branch") or "").strip()
+            remote = str(safe_details.get("remote") or "").strip()
+            changed_files = safe_details.get("changed_files")
+            if operation == "COMMIT" and state == "COMPLETED":
+                summary_parts = [part for part in (short_sha, commit_message) if part]
+                if isinstance(changed_files, int):
+                    summary_parts.append(f"{changed_files} files")
+            elif operation == "PUSH" and state == "COMPLETED":
+                destination = f"{branch} -> {remote}" if branch and remote else branch
+                summary_parts = [part for part in (destination, short_sha) if part]
+            else:
+                exit_code = safe_details.get("exit_code")
+                summary_parts = [
+                    f"Git exit {exit_code}" if isinstance(exit_code, int) else "Git operation failed"
+                ]
+            action = {
+                "schema": PROVIDER_ACTION_SCHEMA,
+                "action_id": "provider_action_" + uuid.uuid4().hex[:24],
+                "kind": "INFORMATIONAL",
+                "category": "GIT",
+                "operation": operation,
+                "state": state,
+                "title": f"{operation.title()} {state.lower()}",
+                "summary": " · ".join(summary_parts),
+                "details": safe_details,
+                "message_id": message_id,
+                "created_at": updated_at,
+            }
+        if (
+            action is not None
+            and self.action_store is not None
+            and operation == "COMMIT"
+            and state == "COMPLETED"
+            and todo_id is not None
+        ):
+            commit_sha = str(safe_details.get("commit_sha") or "").strip().lower()
+            updater = getattr(self.action_store, "apply_todo_action", None)
+            if commit_sha and callable(updater):
+                try:
+                    transition = updater(
+                        todo_id,
+                        {
+                            "action_id": f"git-commit-{commit_sha}",
+                            "outcome": "STARTED",
+                            "source": "GIT_TRACE2",
+                            "evidence_ref": f"git://commit/{commit_sha}",
+                        },
+                    )
+                except Exception as error:  # noqa: BLE001 - hook failure stays informational
+                    action["todo_transition"] = {
+                        "status": "BLOCKED",
+                        "error_code": str(
+                            getattr(error, "code", type(error).__name__)
+                        ).upper()[:120],
+                    }
+                else:
+                    transition_todo = transition.get("todo", {})
+                    action["todo_transition"] = {
+                        "status": str(transition.get("status") or "UNKNOWN"),
+                        "todo_id": todo_id,
+                        "state": str(transition_todo.get("state") or "UNKNOWN"),
+                    }
+        if action is not None and self.action_observer is not None:
+            try:
+                projection = self.action_observer(chat_key, action)
+            except Exception as error:  # noqa: BLE001 - projection failure stays visible
+                action["event_projection"] = {
+                    "status": "FAILED",
+                    "error_code": str(
+                        getattr(error, "code", type(error).__name__)
+                    ).upper()[:120],
+                }
+            else:
+                action["event_projection"] = dict(projection or {"status": "SKIPPED"})
+        if action is not None and self.action_store is not None:
+            action = dict(
+                self.action_store.record_provider_session_action(
+                    chat_key, action, retain=self.retained_messages
+                )
+            )
+        with self._lock:
+            self._work_statuses[chat_key] = status
+            if action is not None and self.action_store is None:
+                actions = self._actions.setdefault(
+                    chat_key, deque(maxlen=self.retained_messages)
+                )
+                actions.append(action)
+        self.events.publish(
+            chat_key,
+            {"type": "PROVIDER_SESSION_WORK_STATUS", "work_status": status},
+        )
+        if action is not None:
+            self.events.publish(
+                chat_key,
+                {"type": "PROVIDER_SESSION_ACTION", "action": action},
+            )
+        return _json_copy(status)
 
     def _run_turn(
         self,
@@ -710,6 +1179,11 @@ class ProviderSessionService:
                 chat_key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
             )
+            self._publish_work_status(
+                chat_key,
+                reply_message["message_id"],
+                "CANCELLED" if cancelled else "COMPLETED",
+            )
         except Exception as error:  # noqa: BLE001 - provider boundary is normalized
             code = str(getattr(error, "code", type(error).__name__)).upper()
             with self._lock:
@@ -722,7 +1196,39 @@ class ProviderSessionService:
                 chat_key,
                 {"type": "PROVIDER_SESSION_MESSAGE", "message": reply_message},
             )
+            self._publish_work_status(
+                chat_key,
+                reply_message["message_id"],
+                "CANCELLED" if cancelled else "FAILED",
+                error_code=None if cancelled else code[:120],
+            )
         finally:
+            try:
+                reader = getattr(handle.host, "drain_work_statuses", None)
+                milestones = reader() if callable(reader) else []
+                for milestone in milestones:
+                    operation = str(milestone.get("operation") or "").upper()
+                    state = str(milestone.get("state") or "").upper()
+                    if operation not in {"COMMIT", "PUSH"} or state not in {
+                        "COMPLETED",
+                        "FAILED",
+                    }:
+                        continue
+                    exit_code = milestone.get("exit_code")
+                    self._publish_work_status(
+                        chat_key,
+                        reply_message["message_id"],
+                        state,
+                        operation=operation,
+                        error_code=(
+                            f"GIT_EXIT_{exit_code}"
+                            if state == "FAILED" and isinstance(exit_code, int)
+                            else None
+                        ),
+                        details=milestone,
+                    )
+            except Exception:
+                pass
             try:
                 refreshed_connection = self._public_connection(handle.host.status())
             except Exception:  # noqa: BLE001 - retain the last safe snapshot
@@ -897,6 +1403,34 @@ class ProviderSessionService:
                     for key, item in usage.items()
                     if isinstance(item, (int, float)) and not isinstance(item, bool)
                 }
+            quota = observation.get("quota")
+            if isinstance(quota, Mapping):
+                public_quota = {
+                    key: quota[key]
+                    for key in ("schema", "provider", "source", "state")
+                    if isinstance(quota.get(key), str)
+                }
+                windows = quota.get("windows")
+                if isinstance(windows, list):
+                    public_windows: list[dict[str, Any]] = []
+                    for window in windows[:4]:
+                        if not isinstance(window, Mapping):
+                            continue
+                        public_window = {
+                            key: window[key]
+                            for key in (
+                                "name",
+                                "used_percent",
+                                "window_minutes",
+                                "resets_at",
+                            )
+                            if isinstance(window.get(key), (str, int, float))
+                            and not isinstance(window.get(key), bool)
+                        }
+                        if public_window:
+                            public_windows.append(public_window)
+                    public_quota["windows"] = public_windows
+                public_observation["quota"] = public_quota
             public["runtime_observation"] = public_observation
         return _json_copy(public)
 

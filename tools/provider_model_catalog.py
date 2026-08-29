@@ -38,8 +38,20 @@ DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
         ],
     },
     "CLAUDE": {
-        "default": "sonnet",
-        "models": ["default", "sonnet", "opus", "haiku"],
+        "default": "claude-sonnet-5",
+        "models": [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "default",
+            "sonnet",
+            "opus",
+            "haiku",
+        ],
     },
 }
 
@@ -374,7 +386,19 @@ class ProviderModelCatalogStore:
                 timeout_seconds=15,
             )
         )
-        return "sonnet", ["sonnet", "opus", "haiku", "default"], "claude CLI aliases (no list command)"
+        return "claude-sonnet-5", [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "default",
+            "sonnet",
+            "opus",
+            "haiku",
+        ], "claude CLI aliases + versioned model IDs"
 
     def _load(self, *, allow_absent: bool = False) -> dict[str, Any]:
         if not self.path.is_file():

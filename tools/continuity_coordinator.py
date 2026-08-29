@@ -197,11 +197,13 @@ class ProjectContinuityCoordinator:
         backend: ContinuityBackend,
         *,
         clock: Callable[[], str] = utc_now,
+        coordinate_resolver: Callable[[Path], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.backend = backend
         self.clock = clock
+        self.coordinate_resolver = coordinate_resolver
         self._lock = threading.RLock()
         self._initialize()
 
@@ -269,7 +271,9 @@ class ProjectContinuityCoordinator:
         coordinate = (
             self._normalize_runtime_coordinate(runtime_coordinate)
             if runtime_coordinate is not None
-            else self._coordinates(root)
+            else self._normalize_runtime_coordinate(self.coordinate_resolver(root))
+            if self.coordinate_resolver is not None
+            else None
         )
         if coordinate is None:
             return self._record_skip(
@@ -487,36 +491,12 @@ class ProjectContinuityCoordinator:
             "separate_git_approval_required": True,
         }
 
-    def _coordinates(self, root: Path) -> dict[str, str] | None:
-        session = self._state_fields(root / ".ai" / "runtime" / "state" / "session.md")
-        anchor = self._state_fields(
-            root / ".ai" / "runtime" / "state" / "current_anchor_frame.md"
-        )
-        values = {
-            "node": session.get("Node", "UNKNOWN"),
-            "mode": session.get("Mode", "UNKNOWN").upper(),
-            "session_id": anchor.get("Session ID", session.get("Session ID", "UNKNOWN")),
-            "frame_id": anchor.get("Frame ID", session.get("Frame ID", "UNKNOWN")),
-            "anchor_id": anchor.get("Anchor ID", "UNKNOWN"),
-            "currentness": anchor.get(
-                "Executable Runtime Currentness",
-                session.get("Executable Runtime Currentness", "UNKNOWN"),
-            ),
-            "source_commit": session.get("Source Commit", "UNKNOWN"),
-        }
-        if any(
-            not value or value.upper() == "UNKNOWN"
-            for key, value in values.items()
-            if key not in {"currentness"}
-        ):
-            return None
-        values["source_ref"] = f"git://{root.as_posix()}@{values['source_commit']}"
-        return values
-
     @staticmethod
     def _normalize_runtime_coordinate(
-        value: Mapping[str, Any],
+        value: Mapping[str, Any] | None,
     ) -> dict[str, str] | None:
+        if value is None:
+            return None
         required = (
             "node",
             "mode",
@@ -540,17 +520,6 @@ class ProjectContinuityCoordinator:
         ):
             return None
         return normalized
-
-    @staticmethod
-    def _state_fields(path: Path) -> dict[str, str]:
-        if not path.is_file() or path.is_symlink():
-            return {}
-        fields: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition(":")
-            if separator and key.strip() and value.strip():
-                fields[key.strip()] = value.strip().strip("`")
-        return fields
 
     def _record_skip(self, root: Path, trigger: str, reason: str) -> dict[str, Any]:
         with self._connection() as connection:

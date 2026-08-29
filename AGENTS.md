@@ -17,8 +17,13 @@ Read `REPOSITORY_MANIFEST.md`, then `.ai/START_HERE.md`, then
 `.ai/runtime/project_instance/boot_command_entry.md`.
 
 Runtime contracts are indexed by `.ai/core/README.md`.
-Current values come from `.ai/runtime/state/session.md` and
-`.ai/runtime/state/current_anchor_frame.md`.
+`.ai/runtime/state/session.md` and
+`.ai/runtime/state/current_anchor_frame.md` are companion refs only.
+Do not treat their Mode, Role, or Anchor fields as current. Use the Mode
+Current Anchor in `.ai/runtime/state/project_runtime.sqlite3` for the
+requested Mode. Open the session SQL under `.ai/runtime/session_store/`
+bound to that Current Anchor. Create that session SQL only when it is
+absent; do not start a new session that ignores the Current Anchor.
 
 For source-only `OS_STATUS`, those state files and any checkpoint,
 Resume Archive, validation, or Runtime Image documents are observed
@@ -27,10 +32,13 @@ references only. Follow
 evidence, restore is `NOT_PERFORMED`, validation is `NOT_RUN`, and
 Runtime / Mode Current Anchor fields remain `UNKNOWN`.
 
-Mode intent must resolve through
-`.ai/runtime/project_instance/mode_registry.json` before Role, Scope,
-session preparation, or Mode Current Anchor access. The project
-Registry is `MASTER_MANAGED`; MASTER cannot delete itself.
+Mode intent must resolve through the Registry snapshot in
+`.ai/runtime/state/project_runtime.sqlite3` before Role, Scope,
+session preparation, or Mode Current Anchor access. Standalone and
+Universe-attached Hosts use that same store. Do not walk git or Core
+markdown for live Mode. The installed `mode_registry.json` is a Release
+seed only when the snapshot is absent. The project Registry is
+`MASTER_MANAGED`; MASTER cannot delete itself.
 
 ## Common Agent Policy
 
@@ -117,18 +125,17 @@ state exception in execution-guard. Follow
 create Authority or Execution Assignment.
 
 After completed, validated work, ordinary local Git staging, commit, and
-push remain outside the Runtime. The immutable Git commit SHA may be
-appended to the approved Task Proposal's Result Receipt as work evidence.
-It does not create Runtime authority, Binding, or an execution receipt.
+push remain outside the Runtime. Emit commit and push notifications with
+the immutable Git SHA; they do not create Runtime authority, Binding,
+approval evidence, or an execution receipt.
 
 ## Normal Runtime Route
 
-For a requested mutation, execute
-`.ai/skills/common/task-assignment/SKILL.md`, display the resulting
-candidate, obtain exact approval, and execute
-`.ai/skills/common/execution-binding/SKILL.md`. Binding carries verified
-approval and authority context into process-local state; it does not
-create canonical authority or final execution permission.
+For a direct user mutation instruction, execute
+`.ai/skills/common/task-assignment/SKILL.md` and activate its bounded
+instruction Work Receipt without a second approval prompt. Use the strict
+Proposal / Binding route only for agent-initiated work, unresolved material
+choices, ambiguous destructive targets, or scope outside the instruction.
 
 Use `.ai/skills/common/task-frame-debate/SKILL.md` for the default
 bounded Boss/reviewer route. A Result Packet remains a Parent candidate.
@@ -139,3 +146,7 @@ Role: MASTER
 Authority: UNASSIGNED
 Execution Assignment: UNASSIGNED
 <!-- ai-career-project-runtime-overlay:end -->
+
+## Browser test artifacts
+
+Playwright and browser-test screenshots must use `.artifacts/ui/` as their explicit output directory. Do not write test captures into the repository root.

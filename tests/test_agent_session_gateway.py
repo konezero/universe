@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,9 @@ from agent_session_gateway import (  # noqa: E402
     ClaudeCodeSession,
     CodexAppServerSession,
     GrokAcpSession,
+    GitTrace2Observer,
+    GitTrace2RepositoryObserver,
+    _supervised_json_lines,
     build_platform_approval_evidence,
     cli_auto_approve_status,
     normalize_permission_request,
@@ -58,6 +62,16 @@ class FakeJsonRpcTransport:
                     "authMethods": [{"id": "cached_token"}],
                     "agentCapabilities": {"loadSession": True},
                 }
+            if method == "_x.ai/billing":
+                return {
+                    "config": {
+                        "creditUsagePercent": 25,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2026-09-01T00:00:00Z",
+                        },
+                    }
+                }
             if method in {"authenticate", "session/load"}:
                 if method == "session/load":
                     if params["sessionId"] == "grok-load-empty":
@@ -78,6 +92,21 @@ class FakeJsonRpcTransport:
                     },
                 )
                 return {"stopReason": "end_turn"}
+        if method == "account/rateLimits/read":
+            return {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 25,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1788220800,
+                    },
+                    "secondary": {
+                        "usedPercent": 70,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788739200,
+                    },
+                }
+            }
         if method == "initialize":
             return {"serverInfo": {"name": "codex"}}
         if method == "thread/resume":
@@ -124,6 +153,114 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_supervised_json_lines_rejoins_conpty_soft_wraps(self) -> None:
+        waiter: queue.Queue = queue.Queue()
+        waiter.put(b'\x1b]0;claude\x07{"type":"result","result":"CLAUDE_\r\n')
+        waiter.put(b'\x1b[39;')
+        waiter.put(b'240H_MCP_OK"}\r\n{"type":"system","subtype":"done"}\r\n')
+        waiter.put(None)
+
+        self.assertEqual(
+            [
+                '{"type":"result","result":"CLAUDE_MCP_OK"}',
+                '{"type":"system","subtype":"done"}',
+            ],
+            list(_supervised_json_lines(waiter)),
+        )
+
+        resident_waiter: queue.Queue = queue.Queue()
+        resident_waiter.put(b'{"type":"result","subtype":"success"}\r\n')
+        self.assertEqual(
+            '{"type":"result","subtype":"success"}',
+            next(_supervised_json_lines(resident_waiter)),
+        )
+
+    def test_git_trace2_observer_emits_terminal_commit_and_push_once(self) -> None:
+        observer = GitTrace2Observer(
+            self.root,
+            metadata_reader=lambda operation: {
+                "commit_sha": "d" * 40,
+                "short_sha": "ddddddd",
+                "commit_message": "Describe Git action",
+                "branch": "codex/action-history",
+                "remote": "origin" if operation == "PUSH" else "ignored",
+                "changed_files": 3,
+            },
+        )
+        environment = observer.environment({"EXISTING": "value"})
+        self.assertEqual("value", environment["EXISTING"])
+        self.assertEqual(str(observer.path), environment["GIT_TRACE2_EVENT"])
+        observer.path.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {"event": "cmd_name", "sid": "commit-1", "name": "commit"},
+                    {"event": "exit", "sid": "commit-1", "code": 0},
+                    {"event": "atexit", "sid": "commit-1", "code": 0},
+                    {"event": "cmd_name", "sid": "push-1", "name": "push"},
+                    {"event": "exit", "sid": "push-1", "code": 1},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        milestones = observer.drain_work_statuses()
+
+        self.assertEqual(["COMMIT", "PUSH"], [item["operation"] for item in milestones])
+        self.assertEqual(["COMPLETED", "FAILED"], [item["state"] for item in milestones])
+        self.assertEqual("ddddddd", milestones[0]["short_sha"])
+        self.assertEqual("Describe Git action", milestones[0]["commit_message"])
+        self.assertEqual(3, milestones[0]["changed_files"])
+        self.assertNotIn("commit_sha", milestones[1])
+        self.assertEqual([], observer.drain_work_statuses())
+        self.assertNotIn("argv", json.dumps(milestones))
+        observer.close()
+        self.assertFalse(observer.path.exists())
+
+    def test_repository_git_trace2_observer_collects_external_process_file(self) -> None:
+        observer = GitTrace2RepositoryObserver(
+            self.root,
+            metadata_reader=lambda _operation: {
+                "commit_sha": "a" * 40,
+                "short_sha": "aaaaaaa",
+                "commit_message": "External commit",
+                "branch": "codex/external",
+                "changed_files": 2,
+            },
+            register=False,
+        )
+        environment = observer.environment({})
+        self.assertEqual(str(observer.event_root), environment["GIT_TRACE2_EVENT"])
+        trace = observer.event_root / "external-process"
+        trace.write_text(
+            "\n".join(
+                json.dumps(record)
+                for record in (
+                    {
+                        "event": "start",
+                        "sid": "external-commit",
+                        "argv": ["git", "commit", "secret message"],
+                    },
+                    {
+                        "event": "cmd_name",
+                        "sid": "external-commit",
+                        "name": "commit",
+                    },
+                    {"event": "exit", "sid": "external-commit", "code": 0},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        milestones = observer.drain_work_statuses()
+
+        self.assertEqual(["COMMIT"], [item["operation"] for item in milestones])
+        self.assertEqual("External commit", milestones[0]["commit_message"])
+        self.assertNotIn("argv", json.dumps(milestones))
+        self.assertFalse(trace.exists())
 
     def test_permission_request_uses_acp_option_contract(self) -> None:
         request = normalize_permission_request(
@@ -190,7 +327,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         def runner(request):
             requests.append(request)
-            self.assertIn("System\n\nQuestion", request.stdin_path.read_text("utf-8"))
+            self.assertEqual("Question\n", request.stdin_path.read_text("utf-8"))
             return NativeCliResult(
                 contract="test",
                 status="COMPLETED",
@@ -278,8 +415,43 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn("--bare", arguments)
         self.assertIn("--no-session-persistence", arguments)
         self.assertEqual("default", arguments[arguments.index("--model") + 1])
+        self.assertEqual("System", arguments[arguments.index("--system-prompt") + 1])
         self.assertEqual("", arguments[arguments.index("--tools") + 1])
         self.assertEqual([], sessions)
+
+    def test_claude_ephemeral_review_can_enable_read_only_tools(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps({"result": "Reviewed", "is_error": False}),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="Review",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            allow_read_only_tools=True,
+            native_runner=runner,
+        )
+        session.prompt("Review", lambda _delta: None)
+
+        arguments = requests[0].arguments
+        self.assertIn("--no-session-persistence", arguments)
+        self.assertEqual("Read,Glob,Grep", arguments[arguments.index("--tools") + 1])
 
     def test_claude_structured_session_binds_schema_and_uses_structured_output(
         self,
@@ -335,6 +507,109 @@ class AgentSessionGatewayTests(unittest.TestCase):
             json.loads(arguments[arguments.index("--json-schema") + 1]),
         )
 
+    def test_claude_structured_session_salvages_valid_output_from_tool_use_exit(
+        self,
+    ) -> None:
+        schema = {
+            "type": "object",
+            "required": ["value"],
+            "properties": {"value": {"type": "string"}},
+        }
+
+        def runner(_request):
+            return NativeCliResult(
+                contract="test",
+                status="FAILED",
+                return_code=1,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "structured_output": {"value": "recovered"},
+                        "session_id": "ephemeral-tool-use-session",
+                        "is_error": True,
+                        "stop_reason": "tool_use",
+                        "num_turns": 2,
+                    }
+                ),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            json_schema=schema,
+            native_runner=runner,
+        )
+
+        self.assertEqual(
+            '{"value":"recovered"}',
+            session.prompt("Question", lambda _delta: None),
+        )
+        self.assertEqual("FAILED", session.last_result_observation["native_status"])
+        self.assertEqual(1, session.last_result_observation["return_code"])
+        self.assertEqual("tool_use", session.last_result_observation["stop_reason"])
+        self.assertTrue(session.last_result_observation["structured_output_present"])
+
+    def test_claude_structured_failure_preserves_bounded_result_observation(
+        self,
+    ) -> None:
+        schema = {"type": "object", "properties": {}}
+
+        def runner(_request):
+            return NativeCliResult(
+                contract="test",
+                status="FAILED",
+                return_code=1,
+                duration_ms=1,
+                stdout=json.dumps(
+                    {
+                        "result": "sensitive prose must not enter the error",
+                        "session_id": "failed-structured-session",
+                        "is_error": True,
+                        "stop_reason": "tool_use",
+                        "num_turns": 2,
+                    }
+                ),
+                stderr="private stderr",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="System",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            json_schema=schema,
+            native_runner=runner,
+        )
+
+        with self.assertRaisesRegex(
+            AgentSessionError,
+            r"^CLAUDE_CODE_RESULT_FAILED:",
+        ) as captured:
+            session.prompt("Question", lambda _delta: None)
+
+        self.assertNotIn("sensitive prose", str(captured.exception))
+        self.assertNotIn("private stderr", str(captured.exception))
+        self.assertEqual(
+            "failed-structured-session",
+            session.last_result_observation["session_id"],
+        )
+        self.assertFalse(session.last_result_observation["structured_output_present"])
+
     def test_grok_runs_as_acp_session_and_forwards_permission(self) -> None:
         selected: list[dict[str, Any]] = []
         sessions: list[str] = []
@@ -355,6 +630,9 @@ class AgentSessionGatewayTests(unittest.TestCase):
             )
             deltas: list[str] = []
             answer = session.prompt("Question", deltas.append)
+            observation = session.runtime_observation()
+            self.assertEqual("AVAILABLE", observation["quota_state"])
+            self.assertEqual(25.0, observation["quota"]["windows"][0]["used_percent"])
             permission = session._handle_request(
                 "session/request_permission",
                 {
@@ -395,6 +673,105 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("allow-once", permission["outcome"]["optionId"])
         self.assertEqual("GROK", selected[0]["provider"])
         self.assertTrue(transport.closed)
+
+    def test_grok_local_billing_fallback_reads_official_log_shape(self) -> None:
+        profile = self.root / "profile"
+        log_dir = profile / ".grok" / "logs"
+        log_dir.mkdir(parents=True)
+        payload = {
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "config": {
+                    "creditUsagePercent": 91.5,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2026-09-01T00:00:00Z",
+                    },
+                }
+            },
+        }
+        (log_dir / "unified.jsonl").write_text(
+            json.dumps(payload) + "\n", encoding="utf-8"
+        )
+
+        with patch.dict(
+            "agent_session_gateway.os.environ",
+            {"USERPROFILE": str(profile)},
+            clear=False,
+        ):
+            observed = GrokAcpSession._read_local_billing_log()
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(91.5, observed["config"]["creditUsagePercent"])
+
+    def test_grok_returns_only_the_post_tool_assistant_message(self) -> None:
+        class MultiMessageTransport(FakeJsonRpcTransport):
+            def request(
+                self,
+                method: str,
+                params: Mapping[str, Any],
+                *,
+                timeout_seconds: float = 300,
+            ) -> Any:
+                if method != "session/prompt":
+                    return super().request(
+                        method, params, timeout_seconds=timeout_seconds
+                    )
+                self.requests.append((method, dict(params)))
+                for update in (
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "Planning"},
+                    },
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-001",
+                        "title": "Read",
+                    },
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "text",
+                            "text": '{"value":"final"}',
+                        },
+                    },
+                ):
+                    self.notification_handler(
+                        "session/update",
+                        {"sessionId": params["sessionId"], "update": update},
+                    )
+                return {"stopReason": "end_turn"}
+
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            MultiMessageTransport,
+        ):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            deltas: list[str] = []
+            resets: list[str] = []
+
+            def receive(delta: str) -> None:
+                deltas.append(delta)
+
+            def reset() -> None:
+                resets.append("RESET")
+                deltas.clear()
+
+            receive.reset = reset  # type: ignore[attr-defined]
+            answer = session.prompt("Question", receive)
+            session.close()
+
+        self.assertEqual('{"value":"final"}', answer)
+        self.assertEqual(['{"value":"final"}'], deltas)
+        self.assertEqual(["RESET"], resets)
 
     def test_grok_bootstraps_once_and_passes_effort(self) -> None:
         with patch(
@@ -550,6 +927,9 @@ class AgentSessionGatewayTests(unittest.TestCase):
             )
             deltas: list[str] = []
             answer = session.prompt("Question", deltas.append)
+            observation = session.runtime_observation()
+            self.assertEqual("AVAILABLE", observation["quota_state"])
+            self.assertEqual(70, observation["quota"]["windows"][1]["used_percent"])
             decision = session._handle_request(
                 "item/commandExecution/requestApproval",
                 {
@@ -610,7 +990,8 @@ class AgentSessionGatewayTests(unittest.TestCase):
             session.close()
 
         transport = FakeJsonRpcTransport.instances[0]
-        self.assertIn('model_reasoning_effort="max"', transport.arguments)
+        self.assertIn("model_reasoning_effort=max", transport.arguments)
+        self.assertNotIn('model_reasoning_effort="max"', transport.arguments)
         started = next(
             params for method, params in transport.requests if method == "thread/start"
         )

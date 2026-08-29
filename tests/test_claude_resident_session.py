@@ -270,6 +270,9 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         session = self._session(process_factory=factory)
         self.assertEqual("fine", session.send_message("go", lambda _d: None))
         self.assertEqual(SESSION_READY, session.session_status())
+        observation = session.runtime_observation()
+        self.assertEqual("WARNING", observation["quota_state"])
+        self.assertEqual(92.0, observation["quota"]["windows"][0]["used_percent"])
 
     def test_allowed_rate_limit_telemetry_does_not_stop_the_turn(self) -> None:
         """A normal turn emits rate_limit_event with status 'allowed'."""

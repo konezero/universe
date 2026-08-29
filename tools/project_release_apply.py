@@ -3,25 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-import tempfile
 from typing import Any, Mapping
 
-from host_profile import resolve_host_tool
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
-from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 
 
 RELEASE_APPROVAL_SCHEMA = "universe.project-release-approval.v1"
 RELEASE_APPLY_RECEIPT_SCHEMA = "universe.project-release-apply-receipt.v1"
+DIRECT_LIFECYCLE_RECEIPT_SCHEMA = "universe.project-runtime-lifecycle-receipt.v1"
 LIFECYCLE_PLAN_SCHEMA = "universe.project-runtime-lifecycle-plan.v1"
 INSTALLATION_MANIFEST_PATH = (
     ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
-)
-HOST_LIFECYCLE_SOURCE_PATH = (
-    ".ai/distribution/context_management_runtime_pack/host_fresh_install.py"
-)
-PROJECT_INSTALLER_SOURCE_PATH = (
-    ".ai/distribution/context_management_runtime_pack/project_runtime_installer.py"
 )
 
 
@@ -38,16 +30,6 @@ class ProjectReleaseApplyError(ValueError):
         self.lifecycle_result = (
             dict(lifecycle_result) if lifecycle_result is not None else None
         )
-
-
-def _required_host_executable(tool: str) -> Path:
-    resolved = resolve_host_tool(tool)
-    if resolved is None:
-        raise ProjectReleaseApplyError(
-            "HOST_TOOL_UNAVAILABLE",
-            f"{tool.upper()}_HOST_TOOL_UNAVAILABLE",
-        )
-    return resolved.executable
 
 
 def plan_project_release_lifecycle(
@@ -168,8 +150,6 @@ def apply_project_release_proposal(
     approval: Any,
     database_path: Path,
     manifest_path: Path,
-    native_runner: Any = run_native_cli,
-    timeout_seconds: float = 900,
 ) -> dict[str, Any]:
     root = _project_root(project_root)
     normalized_proposal = _proposal(project_id, proposal)
@@ -193,61 +173,17 @@ def apply_project_release_proposal(
                     "PROJECT_RELEASE_ARTIFACT_MISMATCH",
                     "release database digest does not match the proposal",
                 )
-            current_plan = plan_project_release_lifecycle(
-                project_root=root,
-                project_id=project_id,
-                release_id=runtime.release_id,
-                source_commit=runtime.metadata["source_commit"],
-            )
-            if current_plan != normalized_proposal["plan"]:
+            install_plan = runtime.plan_project_install(root)
+            if install_plan["collisions"]:
+                collision = install_plan["collisions"][0]
                 raise ProjectReleaseApplyError(
-                    "PROJECT_RELEASE_PROPOSAL_STALE",
-                    "project lifecycle state changed after the proposal was created",
+                    "UNMANAGED_TARGET_COLLISION",
+                    f"unmanaged file at {collision['path']}",
                 )
-
-            with tempfile.TemporaryDirectory(
-                prefix="universe-project-release-"
-            ) as temporary:
-                working = Path(temporary)
-                bundle = working / "source-bundle"
-                bundle.mkdir()
-                bundle_evidence = runtime.materialize_source_bundle(bundle)
-                runner_root = working / "runner"
-                runner_root.mkdir()
-                host_script = runner_root / "host_fresh_install.py"
-                installer_script = runner_root / "project_runtime_installer.py"
-                host_script.write_bytes(
-                    runtime.release_file(HOST_LIFECYCLE_SOURCE_PATH).content
-                )
-                installer_script.write_bytes(
-                    runtime.release_file(PROJECT_INSTALLER_SOURCE_PATH).content
-                )
-                lifecycle_request = _lifecycle_request(
-                    project_root=root,
-                    project_id=project_id,
-                    proposal=normalized_proposal,
-                    approval=normalized_approval,
-                    bundle=bundle,
-                )
-                request_path = working / "lifecycle-request.json"
-                request_path.write_text(
-                    json.dumps(lifecycle_request, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                    newline="\n",
-                )
-                result = native_runner(
-                    NativeCliRequest(
-                        executable=_required_host_executable("python"),
-                        arguments=(
-                            str(host_script),
-                            "--request",
-                            str(request_path),
-                        ),
-                        cwd=working,
-                        timeout_seconds=timeout_seconds,
-                        max_output_chars=2_000_000,
-                    )
-                )
+            install_result = runtime.apply_project_install(
+                target_root=root,
+                approved_plan_digest=install_plan["plan_digest"],
+            )
     except ProjectReleaseApplyError:
         raise
     except (OSError, ReleaseRuntimeError) as error:
@@ -256,54 +192,12 @@ def apply_project_release_proposal(
             str(error),
         ) from error
 
-    lifecycle_result = _native_result(result)
-    if (
-        result.status != "COMPLETED"
-        or lifecycle_result.get("result") != "PASS"
-        or lifecycle_result.get("repository_runtime") != "VERIFIED"
-    ):
-        lifecycle_error = lifecycle_result.get("error")
-        error_code = (
-            str(lifecycle_error.get("code"))
-            if isinstance(lifecycle_error, Mapping) and lifecycle_error.get("code")
-            else "PROJECT_RUNTIME_LIFECYCLE_FAILED"
-        )
-        raise ProjectReleaseApplyError(
-            error_code,
-            "Project Runtime lifecycle did not complete",
-            lifecycle_result=lifecycle_result,
-        )
-    source_result = lifecycle_result.get("source")
-    if (
-        lifecycle_result.get("target") != str(root)
-        or lifecycle_result.get("operation")
-        != normalized_proposal["plan"]["operation"]
-        or lifecycle_result.get("user_command")
-        != normalized_proposal["plan"]["user_command"]
-        or not isinstance(source_result, Mapping)
-        or source_result.get("provider") != "universe-release-db"
-        or source_result.get("binding") != "provider-attested"
-        or source_result.get("commit")
-        != normalized_proposal["plan"]["source_commit"]
-    ):
-        raise ProjectReleaseApplyError(
-            "PROJECT_RUNTIME_LIFECYCLE_RESULT_MISMATCH",
-            "Project Runtime lifecycle result does not match the approved proposal",
-            lifecycle_result=lifecycle_result,
-        )
-    boot_handoff = lifecycle_result.get("boot_handoff")
-    if (
-        not isinstance(boot_handoff, Mapping)
-        or boot_handoff.get("status") != "READY_FOR_BOOT"
-    ):
-        raise ProjectReleaseApplyError(
-            "PROJECT_RUNTIME_BOOT_HANDOFF_INVALID",
-            "Project Runtime lifecycle did not produce READY_FOR_BOOT",
-            lifecycle_result=lifecycle_result,
-        )
+    project_index = _sync_project_index_after_release(
+        project_root=root,
+        project_id=normalized_proposal["project_id"],
+        changed=[*install_result["changed"], {"path": install_result["state_path"]}],
+    )
 
-    validate_result = lifecycle_result.get("validate")
-    permit_receipt = lifecycle_result.get("permit_receipt")
     material = {
         "project_id": normalized_proposal["project_id"],
         "proposal_id": normalized_proposal["proposal_id"],
@@ -311,76 +205,139 @@ def apply_project_release_proposal(
         "release_id": normalized_proposal["release_id"],
         "plan_digest": normalized_proposal["plan"]["plan_digest"],
         "approval_evidence_ref": normalized_approval["evidence_ref"],
-        "operation": lifecycle_result["operation"],
-        "user_command": lifecycle_result["user_command"],
-        "repository_runtime": lifecycle_result["repository_runtime"],
-        "validation_id": (
-            str(validate_result.get("validation_id", "UNKNOWN"))
-            if isinstance(validate_result, Mapping)
-            else "UNKNOWN"
-        ),
-        "boot_handoff": "READY_FOR_BOOT",
-        "bundle_manifest_sha256": bundle_evidence["bundle_manifest_sha256"],
-        "permit_receipt_id": (
-            str(permit_receipt.get("receipt_id", "UNKNOWN"))
-            if isinstance(permit_receipt, Mapping)
-            else "UNKNOWN"
-        ),
+        "operation": install_result["operation"],
+        "changed_count": install_result["changed_count"],
+        "changed": install_result["changed"],
     }
     return {
         "schema": RELEASE_APPLY_RECEIPT_SCHEMA,
         "status": "PROJECT_RELEASE_APPLIED",
         **material,
         "receipt_digest": _digest(material),
-        "lifecycle_result": lifecycle_result,
+        "project_index": project_index,
     }
 
 
-def _lifecycle_request(
+def _sync_project_index_after_release(
     *,
     project_root: Path,
     project_id: str,
-    proposal: Mapping[str, Any],
-    approval: Mapping[str, str],
-    bundle: Path,
+    changed: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    operation = str(proposal["plan"]["operation"])
-    request: dict[str, Any] = {
-        "schema": "ai-career.host-runtime-lifecycle-request.v1",
-        "operation": operation,
-        "source": {
-            "kind": "source-bundle",
-            "path": str(bundle.resolve()),
-            "commit": proposal["plan"]["source_commit"],
-        },
-        "target": str(project_root),
-        "project": project_id,
-        "node": project_id,
+    """Best-effort incremental handoff after the Release writer is complete."""
+    try:
+        from universe_file_index import (
+            resolve_mode_current_anchor,
+            sync_project_index_from_hook,
+        )
+
+        anchor = resolve_mode_current_anchor(project_root, preferred_mode="MASTER")
+        paths = [
+            str(item.get("path") or "").strip()
+            for item in changed
+            if str(item.get("path") or "").strip()
+        ]
+        result = sync_project_index_from_hook(
+            project_id=project_id,
+            project_root=project_root,
+            mode=anchor["mode"],
+            anchor_id=anchor["anchor_id"],
+            changed_paths=paths,
+        )
+        return {
+            "status": "PROJECT_INDEX_RELEASE_EVENT_SYNCED",
+            "changed_paths": paths,
+            "result": result,
+        }
+    except Exception as error:  # noqa: BLE001 - install remains authoritative
+        return {
+            "status": "PROJECT_INDEX_RELEASE_EVENT_DEFERRED",
+            "detail": f"{type(error).__name__}: {error}",
+        }
+
+
+def apply_project_release_plan(
+    *,
+    project_root: Path,
+    project_id: str,
+    plan: Mapping[str, Any],
+    release_database_sha256: str,
+    instruction_ref: str,
+    database_path: Path,
+    manifest_path: Path,
+) -> dict[str, Any]:
+    """Apply an inspected lifecycle plan from a direct user command.
+
+    Universe callers exchange only the immutable plan, the selected Release DB
+    digest, and the direct instruction reference; no Proposal or approval
+    evidence is returned or persisted by this route.
+    """
+    normalized_project = _text(project_id, "project_id")
+    normalized_instruction_ref = _text(instruction_ref, "instruction_ref")
+    normalized_database_sha256 = _sha256(
+        release_database_sha256,
+        "release_database_sha256",
+    )
+    if not isinstance(plan, Mapping):
+        raise ProjectReleaseApplyError(
+            "PROJECT_RELEASE_PLAN_INVALID",
+            "lifecycle plan must be an object",
+        )
+    material = {
+        "schema": "universe.project-release-proposal.v1",
+        "project_id": normalized_project,
+        "release_id": _text(plan.get("release_id"), "plan.release_id"),
         "mode": "MASTER",
-        "host": "universe-project-lifecycle-host",
-        "commander_surface": "UNIVERSE_UI",
-        "execution_surface": "LOCAL_PROJECT_LIFECYCLE_HOST",
-        "repository_location": str(project_root),
-        "approval": {
-            "status": "APPROVED",
-            "operation": operation,
-            "target": str(project_root),
-            "source_commit": proposal["plan"]["source_commit"],
-            "project": project_id,
-            "node": project_id,
-            "mode": "MASTER",
-            "evidence_ref": approval["evidence_ref"],
-        },
+        "release_database_sha256": normalized_database_sha256,
+        "plan": dict(plan),
+        "approval": "REQUIRED",
+        "execution_owner": "PROJECT_HOST",
+        "effects": {"project_write": "NONE", "files_changed": 0},
+        "next_operation": "USER_APPROVAL_AND_PROJECT_HOST_APPLY",
     }
-    if operation == "RUNTIME_UPDATE":
-        force_collisions: list[str] = []
-        request["force_collisions"] = force_collisions
-        request["approval"]["force_collisions_sha256"] = hashlib.sha256(
-            (json.dumps(force_collisions, indent=2, sort_keys=True) + "\n").encode(
-                "utf-8"
-            )
-        ).hexdigest()
-    return request
+    compatibility_digest = _digest(material)
+    compatibility_payload = {
+        **material,
+        "proposal_digest": compatibility_digest,
+        "proposal_id": "release_proposal_" + compatibility_digest[:20],
+        "status": "PROJECT_RELEASE_PROPOSAL_READY",
+    }
+    compatibility_approval = build_project_release_approval(
+        project_id=normalized_project,
+        proposal=compatibility_payload,
+        evidence_ref=normalized_instruction_ref,
+    )
+    legacy_receipt = apply_project_release_proposal(
+        project_root=project_root,
+        project_id=normalized_project,
+        proposal=compatibility_payload,
+        approval=compatibility_approval,
+        database_path=database_path,
+        manifest_path=manifest_path,
+    )
+    direct_material = {
+        key: value
+        for key, value in legacy_receipt.items()
+        if key
+        not in {
+            "schema",
+            "status",
+            "receipt_digest",
+            "proposal_id",
+            "proposal_digest",
+            "approval_evidence_ref",
+            "project_index",
+        }
+    }
+    direct_material["instruction_ref"] = normalized_instruction_ref
+    return {
+        "schema": DIRECT_LIFECYCLE_RECEIPT_SCHEMA,
+        "status": "PROJECT_RUNTIME_LIFECYCLE_APPLIED",
+        **direct_material,
+        "receipt_digest": _digest(direct_material),
+        "project_index": legacy_receipt["project_index"],
+    }
+
 
 
 def _proposal(expected_project_id: str, value: Any) -> dict[str, Any]:
@@ -519,26 +476,6 @@ def _approval(proposal: Mapping[str, Any], value: Any) -> dict[str, str]:
         )
     return normalized
 
-
-def _native_result(result: NativeCliResult) -> dict[str, Any]:
-    if result.stdout_truncated:
-        raise ProjectReleaseApplyError(
-            "PROJECT_RUNTIME_LIFECYCLE_OUTPUT_TRUNCATED",
-            "Project Runtime lifecycle output exceeded the Host bound",
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise ProjectReleaseApplyError(
-            "PROJECT_RUNTIME_LIFECYCLE_RESULT_INVALID",
-            result.stderr[:500] or str(error),
-        ) from error
-    if not isinstance(payload, dict):
-        raise ProjectReleaseApplyError(
-            "PROJECT_RUNTIME_LIFECYCLE_RESULT_INVALID",
-            "Project Runtime lifecycle result must be an object",
-        )
-    return payload
 
 
 def _project_root(value: Path) -> Path:

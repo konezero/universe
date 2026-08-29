@@ -31,7 +31,9 @@ Project
    identity or chat key, and its Task Frame descendants.
 4. The left panel lists all Session Anchors belonging to the selected Mode. The
    selected card is per-Mode navigation state; selecting it attaches the chat to
-   that exact Session Anchor and vendor chat coordinate.
+   that exact Session Anchor and vendor chat coordinate. Selecting an expanded
+   Mode again collapses its cards without changing the stored per-Mode chat
+   selection.
 5. `ACTIVE`, process liveness, currentness, and selected chat are separate
    states. None may silently rewrite another.
 6. A direct user chat message is delivered only to the selected session chat,
@@ -46,6 +48,12 @@ Project
 9. Project Room is the fixed project-wide conversation. A Meeting Room is a
    separate room identity with explicit invited sessions. Neither is a session
    chat or a work queue.
+10. The Session Anchor and Mode Anchor databases are the only live currentness
+    sources. `.ai/runtime/state/session.md` and
+    `.ai/runtime/state/current_anchor_frame.md`, when installed, are
+    compatibility notices and schema-entry references. Their bytes never
+    establish current Mode, Session Anchor, frame, authority, assignment, or
+    process liveness.
 
 ## Local work authorization
 
@@ -55,10 +63,31 @@ work described by that instruction. The execution guard verifies the current
 instruction coordinate, roots, operations, concrete target, payload digest, and
 Task Frame lineage without creating or requiring a separate approval event.
 
-Local edits, tests, Task Frames, staging, and commits do not require another
-approval prompt. Publishing with `git push` requires a fresh user confirmation
-immediately before the push. Destructive or external effects remain outside an
-instruction unless they are explicitly named.
+Local edits, tests, Task Frames, staging, commits, and pushes do not require
+another approval prompt. The selected Session Anchor receives bounded work-status
+notifications (`STARTED`, `COMPLETED`, `FAILED`, or `CANCELLED`). Commit and push
+are notification-only milestones such as `COMMIT_COMPLETED`, `COMMIT_FAILED`,
+`PUSH_COMPLETED`, and `PUSH_FAILED`; they never create approval evidence.
+Destructive effects remain outside an instruction unless explicitly named.
+
+Provider processes inherit a session-scoped Git Trace2 event target for exact
+Session Anchor attribution. Universe also installs a repository-scoped Trace2
+target through Git's global conditional include for the verified repository,
+so commits and pushes made by an attached Codex, Claude, or terminal process are
+observable even when Universe did not launch that process. Repository-scoped
+events fan out only to the repository's registered session chats because Git
+does not expose a trustworthy vendor-session coordinate for an external
+process; provider-scoped events retain exact attribution.
+
+Universe parses terminal `commit` and `push` command names plus exit codes,
+then enriches successful milestones with a bounded Git snapshot: commit SHA,
+subject, branch, configured remote name, and changed-file count. The selected
+Session exposes these notification-only records in its Action inbox until the
+user deletes them. Deleting an Action removes only that informational record;
+it does not mutate Git history, approval evidence, or Task Proposal history.
+Trace argv, repository paths, remote URLs, and credentials are never projected
+into Provider Session events. Completed raw trace files are removed after
+collection.
 
 ## Selection and delivery
 

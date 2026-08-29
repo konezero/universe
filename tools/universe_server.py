@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from core_release import CoreReleaseError, verify_release
@@ -60,7 +60,7 @@ from session_anchor_transport import (
     SessionAnchorTransport,
     SessionAnchorTransportError,
 )
-from task_frame_lineage import TaskFrameLineageStore
+from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -78,6 +78,36 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from project_work_model import (
+    WORK_SURFACE_SCHEMA,
+    backfill_template_instances,
+    ensure_schema as ensure_project_work_model_schema,
+    ensure_template_instance,
+    list_template_instances,
+)
+from project_rag_freshness import (
+    ProjectRagError,
+    STALE_AFTER_SECONDS,
+    canonical_source_ref,
+    freshness_metadata,
+    normalize_lineage_memory_event,
+    parse_timestamp as parse_rag_timestamp,
+    retrieval_state as rag_retrieval_state,
+)
+from intent_skill_routing import (
+    IntentRoutingError,
+    SKILL_RELEASE_ADOPTION_SCHEMA,
+    canonical_skill_pack_artifact_bytes,
+    build_adopted_registry_snapshot,
+    build_skill_candidate,
+    execute_plan_fallback,
+    normalize_gap_observation,
+    normalize_intent_decision,
+    normalize_registry_snapshot,
+    normalize_skill_pack_artifact,
+    normalize_skill_pack_manifest,
+    resolve_skill,
+)
 from project_seed_apply import build_project_seed_asset_approval
 from project_integration_catalog import (
     ProjectIntegrationCatalogError,
@@ -90,7 +120,9 @@ from project_skill_plan_apply import (
     build_project_skill_plan_approval,
 )
 from project_release_apply import (
+    INSTALLATION_MANIFEST_PATH,
     ProjectReleaseApplyError,
+    apply_project_release_plan,
     apply_project_release_proposal,
     build_project_release_approval,
     plan_project_release_lifecycle,
@@ -100,7 +132,6 @@ from project_master_host import (
     ProjectTaskProposalAdapter,
     ResidentModeSessionHost,
     ResidentProjectMasterHostManager,
-    ResidentRoomParticipantHostManager,
     normalize_session_action,
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
@@ -174,6 +205,7 @@ from universe_rendezvous_client import (
 from universe_multi_room import (
     MultiRoomDeliveryCoordinator,
     MultiRoomError,
+    MultiRoomMeetingCoordinator,
     MultiRoomNativeControlRegistry,
     MultiRoomStore,
 )
@@ -213,21 +245,69 @@ from universe_app.bench_service import (
 from universe_app.bench_repository import BenchObservationRepository
 from universe_app.memory_batch_service import MemoryBatchConfigurationService
 from universe_app.memory_execution_service import MemoryBatchExecutionService
+from universe_app.memory_scheduler import (
+    MemoryBatchScheduler,
+    format_utc as format_scheduler_utc,
+    next_cadence_due,
+    parse_utc as parse_scheduler_utc,
+    quota_window,
+    retry_delay_seconds,
+)
 from universe_app.streaming import (
     ConductorRoomEventHub,
     ProjectRoomEventHub,
 )
+from universe_app.pty_supervisor import (
+    SupervisedTerminalHost,
+    default_state_path as default_pty_supervisor_state_path,
+    restart_supervisor,
+)
+from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting_bus
+from universe_app.terminal_host import TerminalHost, TerminalHostError
+from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
+    HOST_MESSAGE_CHANNEL_SCHEMA,
     PROVIDER_SESSION_STREAM_SCHEMA,
     ProviderSessionError,
     ProviderSessionService,
 )
+from session_broker_host import SessionBrokerClient, SessionBrokerError
+from universe_app.work_loop_prediction import (
+    WORK_LOOP_PREDICTION_SCHEMA,
+    WORK_LOOP_RESULT_FANOUT_SCHEMA,
+    build_result_fanout,
+    build_work_loop_predictions,
+)
+from universe_app.feature_node_proposal import (
+    FEATURE_NODE_PROPOSAL_DECISIONS,
+    FEATURE_NODE_PROPOSAL_SCHEMA,
+    build_feature_node_proposals,
+)
+from runtime_state_trust_gate import is_active_ing_state
+from universe_file_index import (
+    FileIndexError,
+    coordinate_from_request,
+    index_status,
+    list_graph_candidates,
+    open_project_index_readonly,
+    project_index_path,
+    require_mode_current_anchor,
+    search_index,
+)
 
 API_SCHEMA = "universe.local-service.v1"
+_RETRIEVAL_TOKEN_RE = re.compile(r"[\w-]{2,}", flags=re.UNICODE)
 _AMBIENT_BROWSER_CONTEXT_RE = re.compile(
     r"<in-app-browser-context\b[^>]*>.*?(?:</in-app-browser-context>|\Z)",
     flags=re.IGNORECASE | re.DOTALL,
 )
+
+
+def _retrieval_tokens(value: Any) -> frozenset[str]:
+    return frozenset(
+        token.casefold()
+        for token in _RETRIEVAL_TOKEN_RE.findall(str(value or ""))
+    )
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
@@ -237,6 +317,7 @@ RUNTIME_LEASE_OPERATION_SCHEMA = "universe.shared-runtime-lease-operation.v1"
 EVENT_SCHEMA = "universe.project-event.v1"
 TODO_SCHEMA = "universe.todo.v1"
 GOAL_SCHEMA = "universe.goal.v1"
+UNIVERSE_GOAL_SCHEMA = "universe.universe-goal.v1"
 MILESTONE_SCHEMA = "universe.milestone.v1"
 PROJECT_SEED_SCHEMA = "universe.project-seed.v1"
 PROJECT_SEED_ASSET_PROPOSAL_SCHEMA = "universe.project-seed-asset-proposal.v1"
@@ -291,9 +372,9 @@ PROJECT_RELEASE_ROOM_COMMAND_PATTERN = re.compile(
     r"(?<![A-Z0-9])OS[_ -]?UPDATE(?![A-Z0-9])",
     re.IGNORECASE,
 )
-RBOOT_ROOM_COMMAND_PATTERN = re.compile(r"^/rboot$", re.IGNORECASE)
 GOVERNANCE_PROPOSAL_DECISION_SCHEMA = "universe.governance-proposal-decision.v1"
 ACTIVE_WORK_REFERENCE_SCHEMA = "universe.active-work-reference.v1"
+WORK_LOOP_PREDICTION_REVIEW_STATES = frozenset({"PROPOSAL_ONLY", "KEPT", "REJECTED"})
 DIRECT_COMMANDER_ACCESS_SURFACES = frozenset(
     {"LOCAL_BROWSER", "REMOTE_BROWSER", "CODEX_DESKTOP"}
 )
@@ -324,6 +405,13 @@ FRESH_PROJECT_REFINEMENT_WORKER_OUTPUT_SCHEMA = (
 FRESH_PROJECT_REFINEMENT_RUN_SCHEMA = "universe.fresh-project-refinement-run.v1"
 PLANNING_RUNTIME_BINDING_SCHEMA = "universe.planning-runtime-binding.v1"
 PROJECT_MASTER_HANDOFF_SCHEMA = "universe.project-master-handoff.v1"
+PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA = (
+    "universe.project-master-handoff-task-frame-binding.v1"
+)
+GOAL_TODO_EXECUTION_SELECTION_SCHEMA = (
+    "universe.goal-todo-execution-selection.v1"
+)
+GOAL_AUTOMATION_SCHEDULER_SCHEMA = "universe.goal-automation-scheduler.v1"
 PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
     "universe.project-skill-plan-master-application.v1"
 )
@@ -381,6 +469,46 @@ TODO_STATES = frozenset({"BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 GOAL_STATES = frozenset({"DESIGNING", "READY", "ACTIVE", "BLOCKED", "DONE"})
 MILESTONE_STATES = frozenset({"PLANNED", "READY", "IN_PROGRESS", "BLOCKED", "DONE"})
 TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
+TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
+TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
+TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
+FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
+NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
+EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
+EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
+FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
+FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
+FEATURE_GOAL_START_RECEIPT_SCHEMA = "universe.feature-goal-start-receipt.v1"
+FEATURE_MEETING_ROLE_TEMPLATES = (
+    {
+        "role": "Visionary and Trend Scout",
+        "mandate": (
+            "Challenge current assumptions, propose an ambitious product experience, and identify "
+            "technology or interaction trends that could make the design stale before delivery. "
+            "Keep the proposal implementable in stages and label evidence gaps."
+        ),
+        "assistants": ["Web Research Scout", "RAG Librarian"],
+    },
+    {
+        "role": "Architecture Steward and Veteran QA",
+        "mandate": (
+            "Protect ownership boundaries and invariants, retrieve analogous past failures, ask what "
+            "changed since the last failed attempt, and require restart, recovery, and regression proof."
+        ),
+        "assistants": ["RAG Librarian", "Code Archaeologist", "Reproduction Assistant"],
+    },
+    {
+        "role": "Pragmatic Implementer and Acting Conductor",
+        "mandate": (
+            "Translate useful ideas into the smallest vertical slices, name migration and test costs, "
+            "preserve incompatible alternatives, and package choices without hiding implementation pain."
+        ),
+        "assistants": ["Code Archaeologist", "Effort Estimator"],
+    },
+)
+GOAL_WORK_PLAN_SCHEMA = "universe.goal-work-plan.v1"
+GOAL_WORK_PLAN_ADOPTION_SCHEMA = "universe.goal-work-plan-adoption.v1"
+GOAL_WORK_PLAN_APPLICATION_SCHEMA = "universe.goal-work-plan-application.v1"
 FRESH_PROJECT_REFINEMENT_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
 SKILL_METRIC_KEYS = frozenset(
     {"duration_ms", "input_tokens", "output_tokens", "cost_units"}
@@ -784,6 +912,338 @@ def _provider_source_key(value: Mapping[str, Any]) -> str:
     return "provider_source_" + _json_sha256(identity)[:24]
 
 
+
+
+def _unwrap_anchor_snapshot(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    inner = payload.get("snapshot")
+    if isinstance(inner, Mapping):
+        merged = dict(payload)
+        merged.update(inner)
+        return merged
+    return dict(payload)
+
+
+def _session_store_digest(session_id: str) -> str:
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:24]
+
+
+def _vendor_identity_from_observer(observer_ref: str) -> tuple[str, str] | None:
+    raw = str(observer_ref or "").strip()
+    lowered = raw.lower()
+    prefixed = (
+        ("grok-acp:", "GROK"),
+        ("grok-cli:", "GROK"),
+        ("claude-code:", "CLAUDE"),
+        ("codex-app-server:", "CODEX"),
+        ("codex-app:", "CODEX"),
+        ("codex:", "CODEX"),
+        ("cli-terminal:", "CODEX"),
+    )
+    for prefix, provider in prefixed:
+        if lowered.startswith(prefix):
+            vendor_id = raw[len(prefix) :].strip()
+            return (provider, vendor_id) if vendor_id else None
+    return None
+
+
+def _verified_provider_identity_index(
+    sources: Iterable[Mapping[str, Any]],
+) -> tuple[
+    dict[tuple[str, str], Mapping[str, Any]],
+    dict[str, list[tuple[str, str]]],
+]:
+    provider_identities: dict[tuple[str, str], Mapping[str, Any]] = {}
+    exact_identities: dict[str, list[tuple[str, str]]] = {}
+    for source in sources:
+        provider = str(source.get("provider") or "").upper()
+        provider_session_id = str(source.get("provider_session_id") or "").strip()
+        if (
+            source.get("identity_state") != "VERIFIED"
+            or str(source.get("session_kind") or "CHAT").upper() == "WORKER"
+            or provider not in {"CODEX", "CLAUDE", "GROK"}
+            or not provider_session_id
+        ):
+            continue
+        identity = (provider, provider_session_id)
+        provider_identities.setdefault(identity, source)
+        exact_identities.setdefault(provider_session_id, []).append(identity)
+    return provider_identities, exact_identities
+
+
+def _resolve_verified_provider_identity(
+    observer_ref: Any,
+    provider_identities: Mapping[tuple[str, str], Mapping[str, Any]],
+    exact_identities: Mapping[str, list[tuple[str, str]]],
+) -> tuple[str, str] | None:
+    raw = str(observer_ref or "").strip()
+    if not raw or raw.upper() in {"UNKNOWN", "UNASSIGNED", "NONE"}:
+        return None
+    prefixed = (
+        ("claude-code:", "CLAUDE"),
+        ("grok-acp:", "GROK"),
+        ("grok-cli:", "GROK"),
+        ("codex-app-server:", "CODEX"),
+        ("codex-app:", "CODEX"),
+        ("codex:", "CODEX"),
+    )
+    lowered = raw.lower()
+    for prefix, provider in prefixed:
+        if lowered.startswith(prefix):
+            identity = (provider, raw[len(prefix) :].strip())
+            return identity if identity in provider_identities else None
+    exact = exact_identities.get(raw) or []
+    return exact[0] if len(exact) == 1 else None
+
+
+def _vendor_chat_key(provider: str, provider_session_id: str) -> str:
+    identity = {
+        "provider": str(provider or "UNKNOWN").upper(),
+        "provider_session_id": str(provider_session_id or ""),
+        "source_path": "",
+    }
+    return "provider_chat_" + _provider_source_key(identity).removeprefix(
+        "provider_source_"
+    )
+
+
+def _read_project_runtime_anchors(
+    store: Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    current_by_mode: dict[str, dict[str, Any]] = {}
+    beyond_by_anchor: dict[str, dict[str, Any]] = {}
+    if not store.is_file():
+        return current_by_mode, beyond_by_anchor
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{store.resolve().as_posix()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "mode_current_anchor" in tables:
+            for row in connection.execute(
+                """
+                SELECT mode, frame_id, anchor_id, state, observed_at, snapshot_json
+                FROM mode_current_anchor
+                """
+            ):
+                try:
+                    payload = json.loads(str(row["snapshot_json"] or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                inner = _unwrap_anchor_snapshot(payload)
+                mode = str(row["mode"] or "").strip().upper()
+                if not mode:
+                    continue
+                current_by_mode[mode] = {
+                    "mode": mode,
+                    "frame_id": str(row["frame_id"] or "current"),
+                    "anchor_id": str(row["anchor_id"] or ""),
+                    "state": str(
+                        row["state"] or inner.get("state") or "CURRENT"
+                    ).upper(),
+                    "observed_at": str(row["observed_at"] or ""),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                }
+        if "beyond_anchor" in tables:
+            for row in connection.execute(
+                """
+                SELECT mode, frame_id, anchor_id, observed_at, retired_at,
+                       snapshot_json
+                FROM beyond_anchor
+                """
+            ):
+                try:
+                    payload = json.loads(str(row["snapshot_json"] or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                inner = _unwrap_anchor_snapshot(payload)
+                coordinates = inner.get("coordinates")
+                if not isinstance(coordinates, Mapping):
+                    coordinates = {}
+                mode = str(
+                    row["mode"] or coordinates.get("mode") or ""
+                ).strip().upper()
+                anchor_id = str(row["anchor_id"] or "").strip()
+                if not anchor_id:
+                    continue
+                beyond_by_anchor[anchor_id] = {
+                    "mode": mode,
+                    "frame_id": str(row["frame_id"] or "current"),
+                    "anchor_id": anchor_id,
+                    "observed_at": str(row["observed_at"] or ""),
+                    "retired_at": str(row["retired_at"] or ""),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                    "state": str(inner.get("state") or "UNKNOWN").upper(),
+                }
+    except (OSError, sqlite3.Error):
+        return current_by_mode, beyond_by_anchor
+    finally:
+        if connection is not None:
+            connection.close()
+    return current_by_mode, beyond_by_anchor
+
+
+def _read_session_store_rows(session_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not session_dir.is_dir():
+        return rows
+    for path in sorted(session_dir.glob("session-*.sqlite3")):
+        if path.name.endswith(("-wal", "-shm")):
+            continue
+        digest = path.stem.removeprefix("session-")
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.resolve().as_posix()}?mode=ro",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "anchor_snapshot" not in tables:
+                rows.append({"digest": digest, "present": True})
+                continue
+            row = connection.execute(
+                "SELECT * FROM anchor_snapshot WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                rows.append({"digest": digest, "present": True})
+                continue
+            try:
+                payload = json.loads(str(row["snapshot_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            inner = _unwrap_anchor_snapshot(payload)
+            coordinates = inner.get("coordinates")
+            if not isinstance(coordinates, Mapping):
+                coordinates = {}
+            rows.append(
+                {
+                    "digest": digest,
+                    "present": True,
+                    "anchor_id": str(row["anchor_id"] or "").strip(),
+                    "state": str(
+                        row["state"] or inner.get("state") or ""
+                    ).upper(),
+                    "observed_at": str(row["observed_at"] or ""),
+                    "session_id": str(inner.get("session_id") or "").strip(),
+                    "observer_session_ref": str(
+                        inner.get("observer_session_ref") or ""
+                    ).strip(),
+                    "mode": str(coordinates.get("mode") or "").strip().upper(),
+                }
+            )
+        except (OSError, sqlite3.Error):
+            continue
+        finally:
+            if connection is not None:
+                connection.close()
+    return rows
+
+
+def _chat_key_for_observer(observer_ref: str) -> tuple[str, str | None]:
+    identity = _vendor_identity_from_observer(observer_ref)
+    if identity is None:
+        return "UNKNOWN", None
+    return identity[0], _vendor_chat_key(identity[0], identity[1])
+
+
+PTY_BINDING_UNBOUND: dict[str, Any] = {
+    "status": "UNBOUND",
+    "terminal_id": None,
+    "pty_state": None,
+    "pid": None,
+    "provider": None,
+}
+
+
+def _public_pty_binding(binding: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Render the PTY side of one session record.
+
+    Liveness and binding are observations about a terminal.  They never imply
+    Authority, Execution Assignment, or Mode Current Anchor currentness, so
+    this projection stays separate from the currentness fields.
+    """
+
+    if not isinstance(binding, Mapping):
+        return dict(PTY_BINDING_UNBOUND)
+    return {
+        "status": str(binding.get("status") or "UNBOUND").upper(),
+        "terminal_id": str(binding.get("terminal_id") or "") or None,
+        "pty_state": str(binding.get("pty_state") or "") or None,
+        "pid": binding.get("pid"),
+        "provider": str(binding.get("provider") or "") or None,
+        "backend_owner": str(binding.get("backend_owner") or "") or None,
+        "reconnection_host_id": str(binding.get("reconnection_host_id") or "") or None,
+    }
+
+
+def _public_anchor_session(
+    *,
+    project_id: str,
+    mode: str,
+    session_id: str,
+    provider: str,
+    session_anchor_ref: str,
+    current_anchor_ref: str,
+    origin_anchor_ref: str,
+    temporality: str,
+    currentness: str,
+    currentness_source: str,
+    state: str,
+    last_seen_at: str,
+    chat_key: str | None,
+    store_present: bool,
+    observer_session_ref: str = "",
+    pty_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    universe_id = session_id if str(session_id).startswith("UNIVERSE-") else None
+    observer = str(observer_session_ref or "").strip()
+    return {
+        "schema": "universe.project-anchor-session.v1",
+        "project_id": project_id,
+        "node": project_id,
+        "mode": mode,
+        "session_id": session_id,
+        "universe_session_id": universe_id,
+        "alias": session_id if universe_id else f"{project_id} {mode}",
+        "provider": provider,
+        "observer_session_ref": observer,
+        "session_anchor_ref": session_anchor_ref,
+        "current_anchor_ref": current_anchor_ref,
+        "origin_anchor_ref": origin_anchor_ref,
+        "temporality": temporality,
+        "currentness": currentness,
+        "observer_currentness": currentness,
+        "currentness_source": currentness_source,
+        "state": state,
+        "active_ing": is_active_ing_state(state),
+        "last_seen_at": last_seen_at or None,
+        "chat_key": chat_key,
+        "store_present": store_present,
+        "pty_binding": _public_pty_binding(pty_binding),
+    }
+
+
 def _public_provider_source(value: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(value)
     source["source_key"] = _provider_source_key(source)
@@ -1003,6 +1463,7 @@ def _node_candidate_from_manifest(
         "display_name": display_name,
         "label": _required_text(manifest.get("label", node_kind.title()), "label"),
         "legacy_project_ids": legacy_project_ids,
+        "runtime_ownership": "OWNED",
     }
     if parent_project_id is not None:
         metadata["parent_project_id"] = parent_project_id
@@ -1257,7 +1718,10 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
         field="todo",
         required=frozenset(required),
         optional=frozenset(
-            {"todo_id", "project_id", "node_ref", "goal_id", "milestone_id"}
+            {
+                "todo_id", "project_id", "node_ref", "goal_id", "milestone_id",
+                "universe_goal_id",
+            }
         ),
     )
     scope_kind = _required_text(request["scope_kind"], "scope_kind").upper()
@@ -1276,10 +1740,10 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
             "detail must be a string no longer than 4000 characters",
         )
     priority = _required_text(request["priority"], "priority").upper()
-    if priority not in TODO_PRIORITIES:
+    if priority != "AUTO" and priority not in TODO_PRIORITIES:
         raise UniverseError(
             "TODO_PRIORITY_INVALID",
-            "priority must be P0, P1, P2, or P3",
+            "priority must be AUTO, P0, P1, P2, or P3",
         )
     state = _required_text(request["state"], "state").upper()
     if state not in TODO_STATES:
@@ -1330,6 +1794,9 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
         "source_kind": source_kind,
         "sort_order": sort_order,
         "goal_id": _optional_identifier(request.get("goal_id"), "goal_id"),
+        "universe_goal_id": _optional_identifier(
+            request.get("universe_goal_id"), "universe_goal_id"
+        ),
         "milestone_id": _optional_identifier(
             request.get("milestone_id"), "milestone_id"
         ),
@@ -1347,6 +1814,206 @@ def normalize_todo(value: Any, *, updating: bool = False) -> dict[str, Any]:
     return normalized
 
 
+def normalize_todo_mutation_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="todo_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "todo",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    instruction_ref = _required_text(request["instruction_ref"], "instruction_ref")
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "TODO_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "TODO_MUTATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "instruction_ref": instruction_ref,
+        "todo": request["todo"],
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def normalize_todo_action_payload(todo_id: Any, value: Any) -> dict[str, Any]:
+    normalized_todo_id = _identifier(todo_id, "todo_id")
+    request = _exact_object_fields(
+        value,
+        field="todo action",
+        required=frozenset({"action_id", "outcome", "source", "evidence_ref"}),
+        optional=frozenset({"validation"}),
+    )
+    action_id = _required_text(request["action_id"], "action_id")
+    if len(action_id) > 160:
+        raise UniverseError("TODO_ACTION_ID_INVALID", "action_id is too long")
+    outcome = _required_text(request["outcome"], "outcome").upper()
+    desired_state = {
+        "STARTED": "IN_PROGRESS",
+        "COMPLETED": "DONE",
+        "FAILED": "BLOCKED",
+        "REOPENED": "READY",
+    }.get(outcome)
+    if desired_state is None:
+        raise UniverseError(
+            "TODO_ACTION_OUTCOME_INVALID",
+            "outcome must be STARTED, COMPLETED, FAILED, or REOPENED",
+        )
+    source = _required_text(request["source"], "source").upper()
+    if len(source) > 80:
+        raise UniverseError("TODO_ACTION_SOURCE_INVALID", "source is too long")
+    evidence_ref = _required_text(request["evidence_ref"], "evidence_ref")
+    if len(evidence_ref) > 1000:
+        raise UniverseError("TODO_ACTION_EVIDENCE_INVALID", "evidence_ref is too long")
+    validation_value = request.get("validation")
+    if validation_value is None:
+        validation: dict[str, str] = {}
+    else:
+        if not isinstance(validation_value, Mapping) or set(validation_value) != {
+            "status",
+            "evidence_ref",
+        }:
+            raise UniverseError(
+                "TODO_ACTION_VALIDATION_INVALID",
+                "validation must contain only status and evidence_ref",
+            )
+        validation = {
+            "status": _required_text(
+                validation_value["status"], "validation.status"
+            ).upper(),
+            "evidence_ref": _required_text(
+                validation_value["evidence_ref"], "validation.evidence_ref"
+            ),
+        }
+    if outcome == "COMPLETED" and validation.get("status") != "PASSED":
+        raise UniverseError(
+            "TODO_COMPLETION_VALIDATION_REQUIRED",
+            "COMPLETED requires validation.status PASSED and validation evidence",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        "todo_id": normalized_todo_id,
+        "action_id": action_id,
+        "outcome": outcome,
+        "source": source,
+        "evidence_ref": evidence_ref,
+        "validation": validation,
+        "state": desired_state,
+    }
+
+
+def normalize_todo_action_mutation_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="todo_action_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "todo_id",
+                "action",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "TODO_MUTATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    instruction_ref = _required_text(request["instruction_ref"], "instruction_ref")
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "TODO_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "TODO_MUTATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    normalized_todo_id = _identifier(request["todo_id"], "todo_id")
+    action = normalize_todo_action_payload(normalized_todo_id, request["action"])
+    normalized_action = {
+        key: action[key]
+        for key in ("action_id", "outcome", "source", "evidence_ref")
+    }
+    # STARTED/FAILED/REOPENED actions do not require validation.  Keep the
+    # canonical payload idempotent across the HTTP normalizer and the Store's
+    # second defensive normalization instead of turning an absent value into
+    # an invalid empty object.
+    if action["validation"]:
+        normalized_action["validation"] = action["validation"]
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "instruction_ref": instruction_ref,
+        "todo_id": normalized_todo_id,
+        "action": normalized_action,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
 def _optional_identifier(value: Any, field: str) -> str | None:
     if value is None or value == "":
         return None
@@ -1361,7 +2028,7 @@ def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> di
         value,
         field="goal",
         required=frozenset(required),
-        optional=frozenset({"goal_id"}),
+        optional=frozenset({"goal_id", "universe_goal_id", "scope_kind", "node_ref"}),
     )
     title = _required_text(request["title"], "title")
     description = request["description"]
@@ -1373,13 +2040,28 @@ def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> di
     sort_order = request["sort_order"]
     if isinstance(sort_order, bool) or not isinstance(sort_order, int):
         raise UniverseError("GOAL_SORT_ORDER_INVALID", "sort_order must be an integer")
+    scope_kind = _required_text(request.get("scope_kind", "PROJECT"), "scope_kind").upper()
+    if scope_kind not in {"PROJECT", "NODE"}:
+        raise UniverseError("GOAL_SCOPE_INVALID", "scope_kind must be PROJECT or NODE")
+    node_ref = request.get("node_ref")
+    if scope_kind == "PROJECT":
+        if node_ref is not None:
+            raise UniverseError("GOAL_SCOPE_COORDINATE_INVALID", "PROJECT Goal cannot bind a node")
+        normalized_node = None
+    else:
+        normalized_node = _identifier(node_ref, "node_ref")
     normalized = {
         "project_id": _project_id(project_id),
+        "scope_kind": scope_kind,
+        "node_ref": normalized_node,
         "title": title,
         "description": description,
         "owner": _required_text(request["owner"], "owner"),
         "state": state,
         "sort_order": sort_order,
+        "universe_goal_id": _optional_identifier(
+            request.get("universe_goal_id"), "universe_goal_id"
+        ),
     }
     if "goal_id" in request:
         normalized["goal_id"] = _identifier(request["goal_id"], "goal_id")
@@ -1391,6 +2073,106 @@ def normalize_goal(project_id: str, value: Any, *, updating: bool = False) -> di
             )
         normalized["revision"] = revision
     return normalized
+
+
+def normalize_universe_goal(value: Any, *, updating: bool = False) -> dict[str, Any]:
+    required = {"title", "description", "owner", "state", "sort_order"}
+    if updating:
+        required.add("revision")
+    request = _exact_object_fields(
+        value,
+        field="universe_goal",
+        required=frozenset(required),
+        optional=frozenset({"universe_goal_id"}),
+    )
+    title = _required_text(request["title"], "title")
+    description = request["description"]
+    if len(title) > 160 or not isinstance(description, str) or len(description) > 4000:
+        raise UniverseError(
+            "UNIVERSE_GOAL_TEXT_INVALID",
+            "universe goal title or description is too long",
+        )
+    state = _required_text(request["state"], "state").upper()
+    if state not in GOAL_STATES:
+        raise UniverseError("UNIVERSE_GOAL_STATE_INVALID", "unsupported goal state")
+    sort_order = request["sort_order"]
+    if isinstance(sort_order, bool) or not isinstance(sort_order, int):
+        raise UniverseError("UNIVERSE_GOAL_SORT_ORDER_INVALID", "sort_order must be an integer")
+    normalized = {
+        "title": title,
+        "description": description,
+        "owner": _required_text(request["owner"], "owner"),
+        "state": state,
+        "sort_order": sort_order,
+    }
+    if "universe_goal_id" in request:
+        normalized["universe_goal_id"] = _identifier(
+            request["universe_goal_id"], "universe_goal_id"
+        )
+    if updating:
+        revision = request["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise UniverseError(
+                "UNIVERSE_GOAL_REVISION_INVALID", "revision must be a positive integer"
+            )
+        normalized["revision"] = revision
+    return normalized
+
+
+def infer_todo_priority(todo: Mapping[str, Any]) -> dict[str, Any]:
+    """Return an explainable default; a user-selected P0..P3 always wins."""
+
+    text = " ".join(
+        str(todo.get(field) or "") for field in ("title", "detail")
+    ).lower()
+    score = 0
+    reasons: list[str] = []
+    if todo.get("scope_kind") == "UNIVERSE":
+        score += 3
+        reasons.append("universe-wide impact")
+    elif todo.get("scope_kind") == "PROJECT":
+        score += 2
+        reasons.append("project-wide impact")
+    elif todo.get("scope_kind") == "NODE":
+        score += 1
+        reasons.append("node-scoped work")
+    if todo.get("state") in {"READY", "IN_PROGRESS", "BLOCKED"}:
+        score += 1
+        reasons.append("active delivery state")
+    signals = {
+        "failure": 3,
+        "security": 3,
+        "critical": 3,
+        "release": 2,
+        "runtime": 2,
+        "migration": 2,
+        "schema": 2,
+        "anchor": 2,
+        "foundation": 2,
+        "global": 2,
+        "collector": 1,
+        "automation": 1,
+        "documentation": -1,
+        "desktop": -1,
+    }
+    for signal, weight in signals.items():
+        if signal in text:
+            score += weight
+            reasons.append(f"signal: {signal}")
+    if score >= 5:
+        priority = "P0"
+    elif score >= 3:
+        priority = "P1"
+    elif score >= 1:
+        priority = "P2"
+    else:
+        priority = "P3"
+    return {
+        "priority": priority,
+        "confidence": "HIGH" if abs(score) >= 5 else "MEDIUM" if abs(score) >= 3 else "LOW",
+        "method": "STRUCTURED_SIGNAL_V1",
+        "reasons": reasons or ["no material priority signal"],
+    }
 
 
 def normalize_milestone(goal_id: str, value: Any, *, updating: bool = False) -> dict[str, Any]:
@@ -1436,6 +2218,202 @@ def normalize_milestone(goal_id: str, value: Any, *, updating: bool = False) -> 
             )
         normalized["revision"] = revision
     return normalized
+
+
+def normalize_goal_work_plan(value: Any) -> dict[str, Any]:
+    plan = _exact_object_fields(
+        value,
+        field="goal_work_plan",
+        required=frozenset({"title", "summary", "milestones"}),
+        optional=frozenset({"schema"}),
+    )
+    if "schema" in plan and plan["schema"] != GOAL_WORK_PLAN_SCHEMA:
+        raise UniverseError("GOAL_WORK_PLAN_SCHEMA_INVALID", "work plan schema is unsupported")
+    title = _required_text(plan["title"], "goal_work_plan.title")
+    summary = _required_text(plan["summary"], "goal_work_plan.summary")
+    if len(title) > 160 or len(summary) > 1000:
+        raise UniverseError("GOAL_WORK_PLAN_TEXT_INVALID", "work plan title or summary is too long")
+    raw_milestones = plan["milestones"]
+    if not isinstance(raw_milestones, list) or not 1 <= len(raw_milestones) <= 6:
+        raise UniverseError("GOAL_WORK_PLAN_MILESTONES_INVALID", "work plan requires 1 to 6 milestones")
+    milestones: list[dict[str, Any]] = []
+    todo_count = 0
+    for milestone_index, raw_milestone in enumerate(raw_milestones):
+        milestone = _exact_object_fields(
+            raw_milestone,
+            field=f"goal_work_plan.milestones[{milestone_index}]",
+            required=frozenset({"title", "description", "todos"}),
+        )
+        milestone_title = _required_text(milestone["title"], "milestone.title")
+        milestone_description = _required_text(milestone["description"], "milestone.description")
+        if len(milestone_title) > 160 or len(milestone_description) > 4000:
+            raise UniverseError("GOAL_WORK_PLAN_MILESTONE_TEXT_INVALID", "work plan milestone text is too long")
+        raw_todos = milestone["todos"]
+        if not isinstance(raw_todos, list) or not 1 <= len(raw_todos) <= 8:
+            raise UniverseError("GOAL_WORK_PLAN_TODOS_INVALID", "each work plan milestone requires 1 to 8 Todos")
+        todos: list[dict[str, str]] = []
+        for todo_index, raw_todo in enumerate(raw_todos):
+            todo = _exact_object_fields(
+                raw_todo,
+                field=f"goal_work_plan.milestones[{milestone_index}].todos[{todo_index}]",
+                required=frozenset({"title", "detail", "acceptance", "priority"}),
+            )
+            todo_title = _required_text(todo["title"], "todo.title")
+            detail = _required_text(todo["detail"], "todo.detail")
+            acceptance = _required_text(todo["acceptance"], "todo.acceptance")
+            priority = _required_text(todo["priority"], "todo.priority").upper()
+            if len(todo_title) > 160 or len(detail) > 3000 or len(acceptance) > 1000:
+                raise UniverseError("GOAL_WORK_PLAN_TODO_TEXT_INVALID", "work plan Todo text is too long")
+            if priority != "AUTO" and priority not in TODO_PRIORITIES:
+                raise UniverseError("GOAL_WORK_PLAN_PRIORITY_INVALID", "work plan priority must be AUTO or P0 through P3")
+            todos.append({"title": todo_title, "detail": detail, "acceptance": acceptance, "priority": priority})
+            todo_count += 1
+        milestones.append({"title": milestone_title, "description": milestone_description, "todos": todos})
+    if todo_count > 24:
+        raise UniverseError("GOAL_WORK_PLAN_TOO_LARGE", "work plan may contain at most 24 Todos")
+    return {"schema": GOAL_WORK_PLAN_SCHEMA, "title": title, "summary": summary, "milestones": milestones}
+
+
+def normalize_expected_path_route(value: Any) -> dict[str, Any]:
+    route = _exact_object_fields(
+        value,
+        field="expected_path.route",
+        required=frozenset(
+            {
+                "steps",
+                "dependencies",
+                "branches",
+                "architecture_decisions",
+                "implementation_phases",
+                "risks",
+                "acceptance_conditions",
+                "estimates",
+                "evidence_refs",
+            }
+        ),
+        optional=frozenset({"schema"}),
+    )
+    if "schema" in route and route["schema"] != EXPECTED_PATH_ROUTE_SCHEMA:
+        raise UniverseError("EXPECTED_PATH_ROUTE_SCHEMA_INVALID", "Expected Path route schema is unsupported")
+    raw_steps = _array(route["steps"], "expected_path.route.steps")
+    if not 1 <= len(raw_steps) <= 24:
+        raise UniverseError("EXPECTED_PATH_ROUTE_STEPS_INVALID", "Expected Path route requires 1 to 24 steps")
+    steps: list[dict[str, str]] = []
+    step_ids: set[str] = set()
+    for index, raw_step in enumerate(raw_steps):
+        step = _exact_object_fields(
+            raw_step,
+            field=f"expected_path.route.steps[{index}]",
+            required=frozenset({"step_id", "title", "summary"}),
+            optional=frozenset({"phase"}),
+        )
+        step_id = _identifier(step["step_id"], "step_id")
+        if step_id in step_ids:
+            raise UniverseError("EXPECTED_PATH_ROUTE_STEP_DUPLICATE", "Expected Path step IDs must be unique")
+        step_ids.add(step_id)
+        title = _required_text(step["title"], "step.title")
+        summary = _required_text(step["summary"], "step.summary")
+        phase = str(step.get("phase") or "").strip()
+        if len(title) > 160 or len(summary) > 1200 or len(phase) > 160:
+            raise UniverseError("EXPECTED_PATH_ROUTE_STEP_TEXT_INVALID", "Expected Path step text is too long")
+        material = {"step_id": step_id, "title": title, "summary": summary}
+        if phase:
+            material["phase"] = phase
+        steps.append(material)
+
+    dependencies: list[dict[str, str]] = []
+    for index, raw_dependency in enumerate(_array(route["dependencies"], "expected_path.route.dependencies")):
+        dependency = _exact_object_fields(
+            raw_dependency,
+            field=f"expected_path.route.dependencies[{index}]",
+            required=frozenset({"from_step_id", "to_step_id", "kind"}),
+        )
+        source = _identifier(dependency["from_step_id"], "from_step_id")
+        target = _identifier(dependency["to_step_id"], "to_step_id")
+        kind = _identifier(dependency["kind"], "kind").upper()
+        if source not in step_ids or target not in step_ids or source == target:
+            raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCY_INVALID", "dependencies must connect distinct route steps")
+        if kind not in {"REQUIRES", "PRECEDES", "ENABLES"}:
+            raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCY_KIND_INVALID", "unsupported route dependency kind")
+        dependencies.append({"from_step_id": source, "to_step_id": target, "kind": kind})
+    if len(dependencies) > 64:
+        raise UniverseError("EXPECTED_PATH_ROUTE_DEPENDENCIES_INVALID", "Expected Path route has too many dependencies")
+
+    branches: list[dict[str, Any]] = []
+    for index, raw_branch in enumerate(_array(route["branches"], "expected_path.route.branches")):
+        branch = _exact_object_fields(
+            raw_branch,
+            field=f"expected_path.route.branches[{index}]",
+            required=frozenset({"from_step_id", "condition", "to_step_ids"}),
+        )
+        source = _identifier(branch["from_step_id"], "from_step_id")
+        targets = _string_array(branch["to_step_ids"], "to_step_ids")
+        if source not in step_ids or not targets or any(target not in step_ids for target in targets):
+            raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "branches must reference route steps")
+        condition = _required_text(branch["condition"], "branch.condition")
+        if len(condition) > 500:
+            raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "branch condition is too long")
+        branches.append({"from_step_id": source, "condition": condition, "to_step_ids": targets})
+    if len(branches) > 24:
+        raise UniverseError("EXPECTED_PATH_ROUTE_BRANCH_INVALID", "Expected Path route has too many branches")
+
+    phases: list[dict[str, Any]] = []
+    for index, raw_phase in enumerate(_array(route["implementation_phases"], "expected_path.route.implementation_phases")):
+        phase = _exact_object_fields(
+            raw_phase,
+            field=f"expected_path.route.implementation_phases[{index}]",
+            required=frozenset({"title", "step_ids"}),
+        )
+        title = _required_text(phase["title"], "phase.title")
+        phase_steps = _string_array(phase["step_ids"], "phase.step_ids")
+        if len(title) > 160 or not phase_steps or any(item not in step_ids for item in phase_steps):
+            raise UniverseError("EXPECTED_PATH_ROUTE_PHASE_INVALID", "implementation phases must reference route steps")
+        phases.append({"title": title, "step_ids": phase_steps})
+    if not 1 <= len(phases) <= 12:
+        raise UniverseError("EXPECTED_PATH_ROUTE_PHASE_INVALID", "Expected Path route requires 1 to 12 phases")
+
+    risks: list[dict[str, str]] = []
+    for index, raw_risk in enumerate(_array(route["risks"], "expected_path.route.risks")):
+        risk = _exact_object_fields(
+            raw_risk,
+            field=f"expected_path.route.risks[{index}]",
+            required=frozenset({"risk", "mitigation"}),
+        )
+        risk_text = _required_text(risk["risk"], "risk")
+        mitigation = _required_text(risk["mitigation"], "mitigation")
+        if len(risk_text) > 500 or len(mitigation) > 1000:
+            raise UniverseError("EXPECTED_PATH_ROUTE_RISK_INVALID", "Expected Path risk text is too long")
+        risks.append({"risk": risk_text, "mitigation": mitigation})
+    if len(risks) > 16:
+        raise UniverseError("EXPECTED_PATH_ROUTE_RISK_INVALID", "Expected Path route has too many risks")
+
+    decisions = _string_array(route["architecture_decisions"], "architecture_decisions")
+    acceptance = _string_array(route["acceptance_conditions"], "acceptance_conditions")
+    evidence_refs = _string_array(route["evidence_refs"], "evidence_refs")
+    if len(decisions) > 16 or len(acceptance) > 24 or len(evidence_refs) > 50:
+        raise UniverseError("EXPECTED_PATH_ROUTE_LIST_INVALID", "Expected Path route list exceeds its limit")
+    estimates = _exact_object_fields(
+        route["estimates"],
+        field="expected_path.route.estimates",
+        required=frozenset({"effort", "cost", "quota"}),
+    )
+    normalized_estimates = {
+        key: _required_text(estimates[key], f"estimates.{key}") for key in ("effort", "cost", "quota")
+    }
+    if any(len(item) > 500 for item in normalized_estimates.values()):
+        raise UniverseError("EXPECTED_PATH_ROUTE_ESTIMATE_INVALID", "Expected Path estimate is too long")
+    return {
+        "schema": EXPECTED_PATH_ROUTE_SCHEMA,
+        "steps": steps,
+        "dependencies": dependencies,
+        "branches": branches,
+        "architecture_decisions": decisions,
+        "implementation_phases": phases,
+        "risks": risks,
+        "acceptance_conditions": acceptance,
+        "estimates": normalized_estimates,
+        "evidence_refs": evidence_refs,
+    }
 
 
 def _array(value: Any, field: str) -> list[Any]:
@@ -1923,7 +2901,7 @@ def normalize_fresh_project_composition_request(value: Any) -> dict[str, Any]:
         request["intent"],
         field="fresh_project_composition_request.intent",
         required=frozenset({"project", "kind", "technologies", "goal"}),
-        optional=frozenset({"constraints", "target_users"}),
+        optional=frozenset({"constraints", "project_root", "target_users"}),
     )
     normalized_intent = normalize_fresh_project_intent(
         {
@@ -1940,6 +2918,10 @@ def normalize_fresh_project_composition_request(value: Any) -> dict[str, Any]:
             "intent.constraints must contain at most 32 entries",
         )
     normalized_intent["constraints"] = constraints
+    if "project_root" in intent:
+        normalized_intent["project_root"] = str(
+            _canonical_project_root(intent["project_root"])
+        )
     if "target_users" in intent:
         normalized_intent["target_users"] = _required_text(
             intent["target_users"], "intent.target_users"
@@ -2413,20 +3395,26 @@ def normalize_master_handoff_proposal_request(value: Any) -> dict[str, Any]:
     source = _exact_object_fields(
         request["source"],
         field="master_handoff_proposal_request.source",
-        required=frozenset({"kind", "adoption_id"}),
+        required=frozenset({"kind"}),
+        optional=frozenset({"adoption_id", "application_id"}),
     )
     kind = _identifier(source["kind"], "source.kind").upper()
-    if kind not in {"FRESH_PROJECT_COMPOSITION", "SKILL_PLAN"}:
+    if kind not in {"FRESH_PROJECT_COMPOSITION", "SKILL_PLAN", "GOAL_WORK_PLAN"}:
         raise UniverseError(
             "MASTER_HANDOFF_SOURCE_INVALID",
-            "source.kind must be FRESH_PROJECT_COMPOSITION or SKILL_PLAN",
+            "source.kind must be FRESH_PROJECT_COMPOSITION, SKILL_PLAN, or GOAL_WORK_PLAN",
         )
-    normalized: dict[str, Any] = {
-        "source": {
-            "kind": kind,
-            "adoption_id": _identifier(source["adoption_id"], "source.adoption_id"),
-        }
-    }
+    expected_ref = "application_id" if kind == "GOAL_WORK_PLAN" else "adoption_id"
+    unexpected_ref = "adoption_id" if kind == "GOAL_WORK_PLAN" else "application_id"
+    if expected_ref not in source or unexpected_ref in source:
+        raise UniverseError(
+            "MASTER_HANDOFF_SOURCE_REFERENCE_INVALID",
+            f"{kind} requires only source.{expected_ref}",
+        )
+    normalized: dict[str, Any] = {"source": {"kind": kind}}
+    normalized["source"][expected_ref] = _identifier(
+        source[expected_ref], f"source.{expected_ref}"
+    )
     if "purpose" in request:
         normalized["purpose"] = _required_text(request["purpose"], "purpose")
     return normalized
@@ -2445,6 +3433,255 @@ def normalize_master_handoff_delivery_request(value: Any) -> dict[str, Any]:
             HTTPStatus.CONFLICT,
         )
     return {"approval": "DELIVER"}
+
+
+def normalize_master_handoff_task_frame_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="master_handoff_task_frame_request",
+        required=frozenset(
+            {"handoff_digest", "proposal_id", "proposal_digest", "task_frame"}
+        ),
+    )
+    if not isinstance(request["task_frame"], Mapping):
+        raise UniverseError(
+            "MASTER_HANDOFF_TASK_FRAME_INVALID", "task_frame must be an object"
+        )
+    return {
+        "handoff_digest": _sha256(request["handoff_digest"], "handoff_digest"),
+        "proposal_id": _identifier(request["proposal_id"], "proposal_id"),
+        "proposal_digest": _sha256(request["proposal_digest"], "proposal_digest"),
+        "task_frame": dict(request["task_frame"]),
+    }
+
+
+def normalize_goal_automation_advance_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_advance_request",
+        required=frozenset({"approval", "expected_goal_revision"}),
+        optional=frozenset({"task_frame"}),
+    )
+    if request["approval"] != "ADVANCE":
+        raise UniverseError(
+            "GOAL_AUTOMATION_ADVANCE_APPROVAL_REQUIRED",
+            "approval must be ADVANCE",
+            HTTPStatus.CONFLICT,
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    normalized: dict[str, Any] = {
+        "approval": "ADVANCE",
+        "expected_goal_revision": revision,
+    }
+    if "task_frame" in request:
+        if not isinstance(request["task_frame"], Mapping):
+            raise UniverseError(
+                "GOAL_AUTOMATION_TASK_FRAME_INVALID",
+                "task_frame must be an object",
+            )
+        normalized["task_frame"] = dict(request["task_frame"])
+    return normalized
+
+
+def _normalize_goal_automation_actor(request: Mapping[str, Any]) -> dict[str, Any]:
+    provider = _required_text(request["provider"], "provider").upper()
+    if provider not in TODO_MUTATION_PROVIDERS:
+        raise UniverseError(
+            "GOAL_AUTOMATION_PROVIDER_INVALID",
+            "provider must be CODEX, CLAUDE, or GROK",
+        )
+    provider_session_ref = _required_text(
+        request["provider_session_ref"], "provider_session_ref"
+    )
+    if len(provider_session_ref) > 1000:
+        raise UniverseError(
+            "GOAL_AUTOMATION_PROVIDER_SESSION_REF_INVALID",
+            "provider_session_ref is too long",
+        )
+    ttl_seconds = request.get("ttl_seconds", TODO_MUTATION_RECEIPT_TTL_SECONDS)
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds < 1
+        or ttl_seconds > TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS
+    ):
+        raise UniverseError(
+            "GOAL_AUTOMATION_TTL_INVALID",
+            f"ttl_seconds must be between 1 and {TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS}",
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    return {
+        "provider": provider,
+        "provider_session_ref": provider_session_ref,
+        "session_id": _identifier(request["session_id"], "session_id"),
+        "session_anchor_ref": _required_text(
+            request["session_anchor_ref"], "session_anchor_ref"
+        ),
+        "expected_goal_revision": revision,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def normalize_goal_todo_execution_selection_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_todo_execution_selection_request",
+        required=frozenset(
+            {
+                "approval",
+                "expected_goal_revision",
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "todo_ids",
+            }
+        ),
+        optional=frozenset({"ttl_seconds"}),
+    )
+    if request["approval"] != "SELECT_TODOS":
+        raise UniverseError(
+            "GOAL_TODO_SELECTION_APPROVAL_REQUIRED",
+            "approval must be SELECT_TODOS",
+            HTTPStatus.CONFLICT,
+        )
+    todo_ids = [
+        _identifier(item, "todo_ids[]")
+        for item in _array(request["todo_ids"], "todo_ids")
+    ]
+    if not todo_ids or len(todo_ids) > 100 or len(set(todo_ids)) != len(todo_ids):
+        raise UniverseError(
+            "GOAL_TODO_SELECTION_INVALID",
+            "todo_ids must contain 1..100 unique Todo ids",
+        )
+    return {
+        **_normalize_goal_automation_actor(request),
+        "approval": "SELECT_TODOS",
+        "todo_ids": todo_ids,
+    }
+
+
+def normalize_goal_todo_result_projection_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_todo_result_projection_request",
+        required=frozenset(
+            {
+                "approval",
+                "expected_goal_revision",
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "result_ref",
+            }
+        ),
+        optional=frozenset({"ttl_seconds"}),
+    )
+    if request["approval"] != "APPLY_RESULT":
+        raise UniverseError(
+            "GOAL_TODO_RESULT_APPROVAL_REQUIRED",
+            "approval must be APPLY_RESULT",
+            HTTPStatus.CONFLICT,
+        )
+    return {
+        **_normalize_goal_automation_actor(request),
+        "approval": "APPLY_RESULT",
+        "result_ref": _required_text(request["result_ref"], "result_ref"),
+    }
+
+
+def normalize_goal_automation_scheduler_request(value: Any) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_scheduler_request",
+        required=frozenset({"action", "expected_goal_revision"}),
+        optional=frozenset({"interval_seconds"}),
+    )
+    action = _required_text(request["action"], "action").upper()
+    if action not in {"START", "PAUSE"}:
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_ACTION_INVALID",
+            "action must be START or PAUSE",
+        )
+    revision = request["expected_goal_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise UniverseError(
+            "GOAL_REVISION_INVALID",
+            "expected_goal_revision must be a positive integer",
+        )
+    interval_seconds = request.get("interval_seconds", 5)
+    if (
+        isinstance(interval_seconds, bool)
+        or not isinstance(interval_seconds, int)
+        or interval_seconds < 1
+        or interval_seconds > 300
+    ):
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_INTERVAL_INVALID",
+            "interval_seconds must be between 1 and 300",
+        )
+    return {
+        "action": action,
+        "expected_goal_revision": revision,
+        "interval_seconds": interval_seconds,
+    }
+
+
+def normalize_goal_automation_scheduler_mutation_request(
+    value: Any,
+) -> dict[str, Any]:
+    request = _exact_object_fields(
+        value,
+        field="goal_automation_scheduler_mutation_request",
+        required=frozenset(
+            {
+                "provider",
+                "provider_session_ref",
+                "session_id",
+                "session_anchor_ref",
+                "instruction_ref",
+                "goal_id",
+                "scheduler",
+            }
+        ),
+        optional=frozenset({"schema", "ttl_seconds"}),
+    )
+    actor = _normalize_goal_automation_actor(
+        {
+            **request,
+            "expected_goal_revision": request["scheduler"].get(
+                "expected_goal_revision"
+            )
+            if isinstance(request["scheduler"], Mapping)
+            else None,
+        }
+    )
+    instruction_ref = _required_text(
+        request["instruction_ref"], "instruction_ref"
+    )
+    if len(instruction_ref) > 512:
+        raise UniverseError(
+            "GOAL_AUTOMATION_SCHEDULER_MUTATION_INSTRUCTION_REF_INVALID",
+            "instruction_ref is too long",
+        )
+    scheduler = normalize_goal_automation_scheduler_request(request["scheduler"])
+    return {
+        **actor,
+        "instruction_ref": instruction_ref,
+        "goal_id": _identifier(request["goal_id"], "goal_id"),
+        "scheduler": scheduler,
+    }
 
 
 def normalize_experience_case_request(value: Any) -> dict[str, Any]:
@@ -2933,7 +4170,14 @@ def normalize_room_message(project_id: str, value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError("REQUEST_INVALID", "room message body must be an object")
     kind = _identifier(value.get("kind", "QUESTION"), "kind").upper()
-    if kind not in {"QUESTION", "REVIEW", "STATUS", "TASK_DRAFT", "RESULT"}:
+    if kind not in {
+        "QUESTION",
+        "REVIEW",
+        "STATUS",
+        "TASK_DRAFT",
+        "RESULT",
+        "DECISION",
+    }:
         raise UniverseError(
             "ROOM_MESSAGE_KIND_INVALID", "unsupported room message kind"
         )
@@ -3277,6 +4521,7 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         "model_ref",
         "origin_session_anchor_ref",
         "target_session_anchor_ref",
+        "target_session_action",
         "origin_session_chat_key",
     }
     forbidden = {
@@ -3356,12 +4601,25 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
     target_session_anchor_ref = str(
         value.get("target_session_anchor_ref") or ""
     ).strip()
-    if not origin_session_anchor_ref or not target_session_anchor_ref:
+    target_session_action = str(
+        value.get("target_session_action") or "EXISTING"
+    ).strip().upper()
+    if target_session_action not in {"EXISTING", "RESUME", "NEW"}:
+        raise UniverseError(
+            "CONDUCTOR_DELEGATION_TARGET_ACTION_INVALID",
+            "target_session_action must be EXISTING, RESUME, or NEW",
+        )
+    if not origin_session_anchor_ref or (
+        target_session_action == "EXISTING" and not target_session_anchor_ref
+    ):
         raise UniverseError(
             "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
-            "cross-session delegation requires both origin and target Session Anchors",
+            "cross-session delegation requires an origin and an existing target Session Anchor",
         )
-    if origin_session_anchor_ref == target_session_anchor_ref:
+    if (
+        target_session_anchor_ref
+        and origin_session_anchor_ref == target_session_anchor_ref
+    ):
         raise UniverseError(
             "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
             "origin and target Session Anchors must be different",
@@ -3396,7 +4654,8 @@ def normalize_conductor_delegation(value: Any) -> dict[str, Any]:
         # User chat stays attached to its selected vendor Session Anchor.
         "queue_scope": "CROSS_SESSION_DELEGATION",
         "origin_session_anchor_ref": origin_session_anchor_ref,
-        "target_session_anchor_ref": target_session_anchor_ref,
+        "target_session_anchor_ref": target_session_anchor_ref or None,
+        "target_session_action": target_session_action,
         "origin_session_chat_key": origin_session_chat_key,
     }
 
@@ -3569,6 +4828,18 @@ def normalize_permission_decision(value: Any) -> dict[str, str]:
             request["option_id"], "agent_permission_decision.option_id"
         ),
     }
+
+
+def permission_option_is_reject(permission: Mapping[str, Any], option_id: str) -> bool:
+    wanted = str(option_id or "").strip()
+    for option in permission.get("options") or []:
+        if not isinstance(option, Mapping):
+            continue
+        if str(option.get("optionId") or "").strip() != wanted:
+            continue
+        kind = str(option.get("kind") or "").strip().lower()
+        return kind.startswith("reject") or kind in {"deny", "cancel"}
+    return False
 
 
 def normalize_governance_proposal_decision(value: Any) -> dict[str, str]:
@@ -3749,30 +5020,13 @@ def build_fresh_project_composition(
         "implementation_workstreams": implementation_workstreams,
         "document_plan": [
             {
-                "document_id": "project-specification",
-                "role": "SPECIFICATION",
-                "title": "Project specification",
-            },
-            {
-                "document_id": "project-design",
-                "role": "DESIGN",
-                "title": "Project design direction",
-            },
-            {
-                "document_id": "project-architecture",
-                "role": "ARCHITECTURE",
-                "title": "Project architecture and implementation bindings",
-            },
-            {
-                "document_id": "project-decisions",
-                "role": "DECISION",
-                "title": "Selected technology and route decisions",
-            },
-            {
-                "document_id": "project-acceptance",
-                "role": "CONTRACT",
-                "title": "Acceptance and completion conditions",
-            },
+                "document_id": item["document_id"],
+                "role": item["role"],
+                "title": item["title"],
+                "skeleton_sections": item["skeleton_sections"],
+                "materialization_state": "SKELETON_READY",
+            }
+            for item in project_seed_template()["work_model"]["living_documents"]
         ],
         "risk_conditions": route["risk_patterns"],
         "selection_state": "USER_SELECTION_REQUIRED",
@@ -4163,11 +5417,22 @@ class UniverseStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.release_artifact_root = self.database_path.parent / "release-artifacts"
         self.release_artifact_root.mkdir(parents=True, exist_ok=True)
+        self.skill_pack_artifact_root = self.database_path.parent / "skill-pack-artifacts"
+        self.skill_pack_artifact_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.remote_access = RemoteAccessStore(self.database_path)
         self.provider_session_observer = ProviderSessionObserverStore(
             self.database_path
         )
+        self.session_supervisor = SessionSupervisorStore(self.database_path)
+        # The semantic graph is a UniverseStore projection, so its durable
+        # multi-room source must live beside the other project stores.  The
+        # HTTP server reuses this instance for its event/control surface.
+        self.multi_rooms = MultiRoomStore(str(self.database_path))
+        # Task Frame lineage also feeds the semantic project graph.  Keep a
+        # single store instance so projection and delivery observe the same
+        # durable Anchor Graph source.
+        self.task_frame_lineage = TaskFrameLineageStore(self.database_path)
         self.memory_batch_execution_service = MemoryBatchExecutionService(self)
 
     def _connect(self) -> sqlite3.Connection:
@@ -4242,11 +5507,49 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_event_project_time
                 ON project_event(project_id, created_at, event_id);
 
+                CREATE TABLE IF NOT EXISTS semantic_collection_cursor (
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL,
+                    last_event_id TEXT NOT NULL,
+                    last_event_type TEXT NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, source_kind)
+                );
+
+                CREATE INDEX IF NOT EXISTS semantic_collection_cursor_project_time
+                ON semantic_collection_cursor(project_id, updated_at, source_kind);
+
+                CREATE TABLE IF NOT EXISTS universe_goal (
+                    universe_goal_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DESIGNING', 'READY', 'ACTIVE', 'BLOCKED', 'DONE')),
+                    sort_order INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS universe_goal_order
+                ON universe_goal(sort_order, updated_at, universe_goal_id);
+
                 CREATE TABLE IF NOT EXISTS project_goal (
                     goal_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
                         REFERENCES project_connection(project_id)
                         ON DELETE CASCADE,
+                    scope_kind TEXT NOT NULL DEFAULT 'PROJECT'
+                        CHECK(scope_kind IN ('PROJECT', 'NODE')),
+                    node_ref TEXT,
+                    universe_goal_id TEXT
+                        REFERENCES universe_goal(universe_goal_id)
+                        ON DELETE SET NULL,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
                     owner TEXT NOT NULL,
@@ -4286,6 +5589,9 @@ class UniverseStore:
                         REFERENCES project_connection(project_id)
                         ON DELETE CASCADE,
                     node_ref TEXT,
+                    universe_goal_id TEXT
+                        REFERENCES universe_goal(universe_goal_id)
+                        ON DELETE SET NULL,
                     goal_id TEXT REFERENCES project_goal(goal_id) ON DELETE SET NULL,
                     milestone_id TEXT
                         REFERENCES project_milestone(milestone_id)
@@ -4314,6 +5620,346 @@ class UniverseStore:
                 ON project_todo(
                     scope_kind, project_id, node_ref, state, priority,
                     sort_order, updated_at, todo_id
+                );
+
+                CREATE TABLE IF NOT EXISTS feature_node (
+                    feature_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    intent_text TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('DRAFT', 'EXPLORING', 'ADOPTED', 'ARCHIVED')),
+                    meeting_room_id TEXT,
+                    created_by_role TEXT NOT NULL CHECK(created_by_role IN ('USER', 'CONDUCTOR')),
+                    evidence_refs_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_node_project_order
+                ON feature_node(project_id, updated_at DESC, feature_id);
+
+                CREATE TABLE IF NOT EXISTS feature_node_proposal (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('PROPOSAL_ONLY', 'EXPLORE', 'REJECTED', 'SUPERSEDED')),
+                    reviewed_by_role TEXT,
+                    rationale TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(project_id, proposal_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_node_proposal_project_order
+                ON feature_node_proposal(project_id, updated_at DESC, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS node_planning_context (
+                    context_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL UNIQUE REFERENCES feature_node_proposal(proposal_id) ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    context_digest TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS node_planning_context_project_order
+                ON node_planning_context(project_id, created_at DESC, context_id);
+
+                CREATE TABLE IF NOT EXISTS feature_expected_path (
+                    expected_path_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    artifact_revision INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    specification_digest TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('CANDIDATE', 'ADOPTED', 'NOT_SELECTED', 'SUPERSEDED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(feature_id, artifact_id, artifact_revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_expected_path_feature_order
+                ON feature_expected_path(feature_id, created_at, expected_path_id);
+
+                CREATE TABLE IF NOT EXISTS feature_expected_path_route (
+                    expected_path_id TEXT PRIMARY KEY REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    route_digest TEXT NOT NULL,
+                    route_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS feature_path_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    adopted_by_role TEXT NOT NULL CHECK(adopted_by_role = 'USER'),
+                    rationale TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS feature_goal_derivation (
+                    derivation_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES feature_path_adoption(adoption_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE RESTRICT,
+                    artifact_revision INTEGER NOT NULL,
+                    specification_digest TEXT NOT NULL,
+                    created_by_role TEXT NOT NULL CHECK(created_by_role = 'USER'),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS feature_goal_derivation_goal
+                ON feature_goal_derivation(goal_id, feature_id);
+
+                CREATE TABLE IF NOT EXISTS feature_goal_start_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    feature_id TEXT NOT NULL UNIQUE REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES feature_path_adoption(adoption_id) ON DELETE CASCADE,
+                    expected_path_id TEXT NOT NULL UNIQUE REFERENCES feature_expected_path(expected_path_id) ON DELETE CASCADE,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE RESTRICT,
+                    expected_feature_revision INTEGER NOT NULL,
+                    expected_path_digest TEXT NOT NULL,
+                    approved_scope_json TEXT NOT NULL,
+                    constraints_json TEXT NOT NULL,
+                    validation_json TEXT NOT NULL,
+                    local_commit_policy TEXT NOT NULL CHECK(local_commit_policy IN ('LOCAL_COMMITS_ALLOWED', 'LOCAL_COMMITS_PROHIBITED')),
+                    push_policy TEXT NOT NULL CHECK(push_policy = 'PUSH_PROHIBITED'),
+                    rationale TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL,
+                    started_by_role TEXT NOT NULL CHECK(started_by_role = 'USER'),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_candidate (
+                    work_plan_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    feature_id TEXT NOT NULL REFERENCES feature_node(feature_id) ON DELETE CASCADE,
+                    room_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    author_binding_id TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('CANDIDATE', 'ADOPTED', 'NOT_SELECTED', 'APPLIED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(goal_id, run_id, author_binding_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_work_plan_candidate_goal
+                ON goal_work_plan_candidate(goal_id, created_at, work_plan_id);
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    work_plan_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_candidate(work_plan_id) ON DELETE CASCADE,
+                    adopted_by_role TEXT NOT NULL CHECK(adopted_by_role = 'USER'),
+                    rationale TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS goal_work_plan_application (
+                    application_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL UNIQUE REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    adoption_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_adoption(adoption_id) ON DELETE CASCADE,
+                    work_plan_id TEXT NOT NULL UNIQUE REFERENCES goal_work_plan_candidate(work_plan_id) ON DELETE CASCADE,
+                    applied_by_role TEXT NOT NULL CHECK(applied_by_role = 'USER'),
+                    created_items_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS todo_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    todo_id TEXT,
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS todo_mutation_receipt_status_expiry
+                ON todo_mutation_receipt(status, expires_at, receipt_id);
+
+
+
+                CREATE TABLE IF NOT EXISTS todo_action_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    todo_id TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS todo_action_mutation_receipt_status_expiry
+                ON todo_action_mutation_receipt(status, expires_at, receipt_id);
+
+                CREATE TABLE IF NOT EXISTS goal_automation_scheduler_mutation_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    instruction_ref TEXT NOT NULL,
+                    goal_id TEXT NOT NULL REFERENCES project_goal(goal_id) ON DELETE CASCADE,
+                    payload_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PREPARED', 'CONSUMED')),
+                    prepared_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(session_id, instruction_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_automation_scheduler_mutation_receipt_status_expiry
+                ON goal_automation_scheduler_mutation_receipt(status, expires_at, receipt_id);
+
+                CREATE TABLE IF NOT EXISTS skill_registry_snapshot (
+                    snapshot_id TEXT PRIMARY KEY,
+                    registry_digest TEXT NOT NULL UNIQUE,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_pack_artifact (
+                    artifact_sha256 TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    pack_version TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    artifact_json TEXT NOT NULL,
+                    imported_at TEXT NOT NULL,
+                    UNIQUE(pack_id, pack_version)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_release_adoption (
+                    adoption_id TEXT PRIMARY KEY,
+                    manifest_digest TEXT NOT NULL UNIQUE,
+                    pack_id TEXT NOT NULL,
+                    pack_version TEXT NOT NULL,
+                    artifact_digest TEXT NOT NULL,
+                    previous_registry_digest TEXT NOT NULL,
+                    registry_digest TEXT NOT NULL,
+                    adoption_json TEXT NOT NULL,
+                    adopted_at TEXT NOT NULL,
+                    UNIQUE(pack_id, pack_version)
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_registry_current (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    registry_digest TEXT NOT NULL,
+                    adoption_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS intent_decision (
+                    decision_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    frame_id TEXT NOT NULL,
+                    anchor_id TEXT NOT NULL,
+                    project_id TEXT,
+                    node_ref TEXT,
+                    intent_class TEXT NOT NULL,
+                    required_capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS intent_decision_session_time
+                ON intent_decision(session_id, created_at, decision_id);
+
+                CREATE TABLE IF NOT EXISTS skill_resolution (
+                    resolution_id TEXT PRIMARY KEY,
+                    intent_decision_id TEXT NOT NULL
+                        REFERENCES intent_decision(decision_id)
+                        ON DELETE CASCADE,
+                    registry_digest TEXT NOT NULL,
+                    project_id TEXT,
+                    node_ref TEXT,
+                    required_capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    selected_handler_kind TEXT NOT NULL,
+                    resolution_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS skill_resolution_intent_time
+                ON skill_resolution(intent_decision_id, created_at, resolution_id);
+
+                CREATE TABLE IF NOT EXISTS skill_gap_observation (
+                    observation_id TEXT PRIMARY KEY,
+                    observation_digest TEXT NOT NULL,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    node_ref TEXT,
+                    intent_decision_id TEXT NOT NULL
+                        REFERENCES intent_decision(decision_id)
+                        ON DELETE CASCADE,
+                    resolution_id TEXT NOT NULL
+                        REFERENCES skill_resolution(resolution_id)
+                        ON DELETE CASCADE,
+                    capability TEXT NOT NULL,
+                    effect_class TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    validation_state TEXT NOT NULL,
+                    context_fingerprint TEXT NOT NULL,
+                    observation_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS skill_gap_project_capability_time
+                ON skill_gap_observation(project_id, capability, observed_at, observation_id);
+
+                CREATE TABLE IF NOT EXISTS skill_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    candidate_digest TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    capability TEXT NOT NULL,
+                    candidate_state TEXT NOT NULL,
+                    threshold_policy_version TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS skill_candidate_support (
+                    candidate_id TEXT NOT NULL
+                        REFERENCES skill_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    observation_id TEXT NOT NULL
+                        REFERENCES skill_gap_observation(observation_id)
+                        ON DELETE CASCADE,
+                    PRIMARY KEY(candidate_id, observation_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS skill_catalog (
@@ -4539,6 +6185,77 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_master_handoff_project_time
                 ON project_master_handoff(project_id, created_at, handoff_id);
 
+                CREATE TABLE IF NOT EXISTS project_master_handoff_task_frame (
+                    handoff_id TEXT PRIMARY KEY
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    instruction_ref TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    proposal_digest TEXT NOT NULL,
+                    task_frame_id TEXT NOT NULL UNIQUE,
+                    binding_digest TEXT NOT NULL UNIQUE,
+                    bound_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS project_master_handoff_task_frame_project
+                ON project_master_handoff_task_frame(
+                    project_id, bound_at, handoff_id
+                );
+
+                CREATE TABLE IF NOT EXISTS goal_todo_execution_selection (
+                    selection_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    application_id TEXT NOT NULL
+                        REFERENCES goal_work_plan_application(application_id)
+                        ON DELETE CASCADE,
+                    handoff_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    task_frame_id TEXT NOT NULL UNIQUE,
+                    todo_ids_json TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_session_ref_hash TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    session_anchor_ref TEXT NOT NULL,
+                    selection_digest TEXT NOT NULL UNIQUE,
+                    selected_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_todo_execution_selection_goal
+                ON goal_todo_execution_selection(goal_id, selected_at, selection_id);
+
+                CREATE TABLE IF NOT EXISTS goal_automation_scheduler (
+                    goal_id TEXT PRIMARY KEY
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    expected_goal_revision INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    next_tick_at TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    last_tick_at TEXT,
+                    last_stop_reason TEXT,
+                    last_error_code TEXT,
+                    last_error_detail TEXT,
+                    last_surface_json TEXT NOT NULL,
+                    tick_count INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_automation_scheduler_due
+                ON goal_automation_scheduler(
+                    enabled, status, next_tick_at, lease_expires_at, goal_id
+                );
+
                 CREATE TABLE IF NOT EXISTS project_skill_plan_master_application (
                     handoff_id TEXT PRIMARY KEY
                         REFERENCES project_master_handoff(handoff_id)
@@ -4693,6 +6410,61 @@ class UniverseStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS work_loop_prediction (
+                    proposal_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    proposal_digest TEXT NOT NULL UNIQUE,
+                    proposal_json TEXT NOT NULL,
+                    review_state TEXT NOT NULL
+                        CHECK(review_state IN ('PROPOSAL_ONLY', 'KEPT', 'REJECTED')),
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(project_id, proposal_digest)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_prediction_project_time
+                ON work_loop_prediction(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS work_loop_result_fanout (
+                    fanout_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    fanout_digest TEXT NOT NULL UNIQUE,
+                    fanout_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, source_kind, source_id, outcome)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_result_fanout_project_time
+                ON work_loop_result_fanout(project_id, created_at, fanout_id);
+
+                CREATE TABLE IF NOT EXISTS work_loop_review_candidate (
+                    candidate_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    fanout_id TEXT NOT NULL
+                        REFERENCES work_loop_result_fanout(fanout_id)
+                        ON DELETE CASCADE,
+                    sink_kind TEXT NOT NULL
+                        CHECK(sink_kind IN ('GOAL_PLAN', 'EXPERIENCE', 'MEMORY', 'BENCH', 'DOCUMENT_AUTOMATION')),
+                    review_state TEXT NOT NULL
+                        CHECK(review_state IN ('PENDING_REVIEW', 'KEPT', 'REJECTED')),
+                    candidate_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT,
+                    UNIQUE(fanout_id, sink_kind)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_loop_review_candidate_project_time
+                ON work_loop_review_candidate(project_id, created_at, candidate_id);
+
                 CREATE TABLE IF NOT EXISTS project_dispatch (
                     dispatch_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -4775,6 +6547,16 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS governance_proposal_decision_project_time
                 ON governance_proposal_decision(project_id, created_at, decision_id);
 
+                CREATE TABLE IF NOT EXISTS provider_session_action (
+                    action_id TEXT PRIMARY KEY,
+                    chat_key TEXT NOT NULL,
+                    action_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS provider_session_action_chat_time
+                ON provider_session_action(chat_key, created_at, action_id);
+
                 CREATE TABLE IF NOT EXISTS conductor_room_message (
                     message_id TEXT PRIMARY KEY,
                     idempotency_key TEXT NOT NULL UNIQUE,
@@ -4854,6 +6636,64 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS memory_batch_run_project_time
                 ON memory_batch_run(project_id, started_at, run_id);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_schedule_state (
+                    schedule_id TEXT PRIMARY KEY
+                        REFERENCES memory_batch_config(config_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    stage TEXT NOT NULL,
+                    config_revision INTEGER NOT NULL,
+                    schedule_kind TEXT NOT NULL,
+                    interval_minutes INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DISABLED', 'READY', 'CLAIMED', 'RETRY_WAIT', 'QUOTA_DEFERRED')),
+                    next_due_at TEXT,
+                    due_slot_key TEXT,
+                    lease_owner TEXT,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    last_error_code TEXT,
+                    last_outcome TEXT,
+                    last_started_at TEXT,
+                    last_terminal_at TEXT,
+                    last_success_at TEXT,
+                    last_run_id TEXT,
+                    quota_limit INTEGER,
+                    quota_window_hours INTEGER,
+                    quota_window_start TEXT,
+                    quota_window_end TEXT,
+                    quota_consumed INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, stage)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_batch_schedule_due
+                ON memory_batch_schedule_state(state, next_due_at, schedule_id);
+
+                CREATE TABLE IF NOT EXISTS memory_batch_schedule_attempt (
+                    attempt_id TEXT PRIMARY KEY,
+                    schedule_id TEXT NOT NULL
+                        REFERENCES memory_batch_schedule_state(schedule_id)
+                        ON DELETE CASCADE,
+                    due_slot_key TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('STARTED', 'SUCCEEDED', 'FAILED', 'ABANDONED')),
+                    run_id TEXT,
+                    error_code TEXT,
+                    started_at TEXT NOT NULL,
+                    terminal_at TEXT,
+                    UNIQUE(schedule_id, due_slot_key, lease_generation)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS memory_batch_schedule_one_success
+                ON memory_batch_schedule_attempt(schedule_id, due_slot_key)
+                WHERE state = 'SUCCEEDED';
 
                 CREATE TABLE IF NOT EXISTS memory_candidate (
                     candidate_id TEXT PRIMARY KEY,
@@ -5095,11 +6935,40 @@ class UniverseStore:
                     "ALTER TABLE project_todo ADD COLUMN goal_id TEXT "
                     "REFERENCES project_goal(goal_id) ON DELETE SET NULL"
                 )
+            if "universe_goal_id" not in todo_columns:
+                connection.execute(
+                    "ALTER TABLE project_todo ADD COLUMN universe_goal_id TEXT "
+                    "REFERENCES universe_goal(universe_goal_id) ON DELETE SET NULL"
+                )
             if "milestone_id" not in todo_columns:
                 connection.execute(
                     "ALTER TABLE project_todo ADD COLUMN milestone_id TEXT "
                     "REFERENCES project_milestone(milestone_id) ON DELETE SET NULL"
                 )
+            goal_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(project_goal)").fetchall()
+            }
+            if "universe_goal_id" not in goal_columns:
+                connection.execute(
+                    "ALTER TABLE project_goal ADD COLUMN universe_goal_id TEXT "
+                    "REFERENCES universe_goal(universe_goal_id) ON DELETE SET NULL"
+                )
+            if "scope_kind" not in goal_columns:
+                connection.execute(
+                    "ALTER TABLE project_goal ADD COLUMN scope_kind TEXT "
+                    "NOT NULL DEFAULT 'PROJECT'"
+                )
+            if "node_ref" not in goal_columns:
+                connection.execute("ALTER TABLE project_goal ADD COLUMN node_ref TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS project_goal_universe_order "
+                "ON project_goal(universe_goal_id, sort_order, updated_at, goal_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS project_goal_scope_order "
+                "ON project_goal(project_id, scope_kind, node_ref, sort_order, goal_id)"
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO project_release_selection(
@@ -5211,6 +7080,11 @@ class UniverseStore:
                     "PRAGMA table_info(project_connection)"
                 ).fetchall()
             }
+            if "metadata_json" not in project_connection_columns:
+                connection.execute(
+                    "ALTER TABLE project_connection "
+                    "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
             if "attachment_json" not in project_connection_columns:
                 connection.execute(
                     "ALTER TABLE project_connection ADD COLUMN attachment_json TEXT"
@@ -5388,6 +7262,12 @@ class UniverseStore:
                         f"ALTER TABLE skill_run_observation "
                         f"ADD COLUMN {column} {definition}"
                     )
+            ensure_project_work_model_schema(connection)
+            backfill_template_instances(
+                connection,
+                template=project_seed_template()["work_model"],
+                now=utc_now(),
+            )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO universe_identity(
@@ -5795,6 +7675,137 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _memory_batch_schedule_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.memory-batch-schedule-state.v1",
+            "schedule_id": str(row["schedule_id"]),
+            "project_id": str(row["project_id"]),
+            "stage": str(row["stage"]),
+            "config_revision": int(row["config_revision"]),
+            "schedule": {
+                "kind": str(row["schedule_kind"]),
+                "interval_minutes": int(row["interval_minutes"]),
+            },
+            "state": str(row["state"]),
+            "next_due_at": row["next_due_at"],
+            "due_slot_key": row["due_slot_key"],
+            "lease_owner": row["lease_owner"],
+            "lease_generation": int(row["lease_generation"]),
+            "lease_expires_at": row["lease_expires_at"],
+            "attempt_count": int(row["attempt_count"]),
+            "max_attempts": int(row["max_attempts"]),
+            "last_error_code": row["last_error_code"],
+            "last_outcome": row["last_outcome"],
+            "last_started_at": row["last_started_at"],
+            "last_terminal_at": row["last_terminal_at"],
+            "last_success_at": row["last_success_at"],
+            "last_run_id": row["last_run_id"],
+            "quota": {
+                "limit": row["quota_limit"],
+                "window_hours": row["quota_window_hours"],
+                "window_start": row["quota_window_start"],
+                "window_end": row["quota_window_end"],
+                "consumed": int(row["quota_consumed"]),
+            },
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _reconcile_memory_batch_schedule(
+        self,
+        connection: sqlite3.Connection,
+        config: Mapping[str, Any],
+        *,
+        now: str,
+    ) -> None:
+        schedule = config["schedule"]
+        kind = str(schedule["kind"])
+        interval = int(schedule["interval_minutes"])
+        enabled = bool(config["enabled"]) and kind != "MANUAL"
+        existing = connection.execute(
+            "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+            (config["config_id"],),
+        ).fetchone()
+        preserve_due = (
+            existing is not None
+            and str(existing["schedule_kind"]) == kind
+            and int(existing["interval_minutes"]) == interval
+            and existing["next_due_at"]
+            and str(existing["state"]) != "DISABLED"
+        )
+        next_due_at = None
+        if enabled:
+            next_due_at = (
+                str(existing["next_due_at"])
+                if preserve_due
+                else format_scheduler_utc(
+                    parse_scheduler_utc(now) + timedelta(minutes=interval)
+                )
+            )
+        budget = config.get("quota_or_budget")
+        quota_limit = budget.get("max_runs") if isinstance(budget, Mapping) else None
+        window_hours = (
+            budget.get("window_hours") if isinstance(budget, Mapping) else None
+        )
+        window_start = window_end = None
+        quota_consumed = 0
+        if quota_limit is not None and window_hours is not None:
+            window_start, window_end = quota_window(now, int(window_hours))
+            if (
+                existing is not None
+                and existing["quota_window_start"] == window_start
+                and existing["quota_limit"] == quota_limit
+            ):
+                quota_consumed = int(existing["quota_consumed"])
+        connection.execute(
+            """
+            INSERT INTO memory_batch_schedule_state(
+                schedule_id, project_id, stage, config_revision, schedule_kind,
+                interval_minutes, state, next_due_at, due_slot_key, lease_owner,
+                lease_generation, lease_expires_at, attempt_count, max_attempts,
+                last_error_code, last_outcome, last_started_at, last_terminal_at,
+                last_success_at, last_run_id, quota_limit, quota_window_hours,
+                quota_window_start, quota_window_end, quota_consumed, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0, 3,
+                      NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(schedule_id) DO UPDATE SET
+                config_revision = excluded.config_revision,
+                schedule_kind = excluded.schedule_kind,
+                interval_minutes = excluded.interval_minutes,
+                state = CASE
+                    WHEN excluded.state = 'DISABLED' THEN 'DISABLED'
+                    WHEN memory_batch_schedule_state.state = 'DISABLED' THEN 'READY'
+                    ELSE memory_batch_schedule_state.state
+                END,
+                next_due_at = excluded.next_due_at,
+                due_slot_key = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.due_slot_key END,
+                lease_owner = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.lease_owner END,
+                lease_expires_at = CASE WHEN excluded.state = 'DISABLED' THEN NULL ELSE memory_batch_schedule_state.lease_expires_at END,
+                quota_limit = excluded.quota_limit,
+                quota_window_hours = excluded.quota_window_hours,
+                quota_window_start = excluded.quota_window_start,
+                quota_window_end = excluded.quota_window_end,
+                quota_consumed = excluded.quota_consumed,
+                updated_at = excluded.updated_at
+            """,
+            (
+                config["config_id"],
+                config["project_id"],
+                config["stage"],
+                config["revision"],
+                kind,
+                interval,
+                "READY" if enabled else "DISABLED",
+                next_due_at,
+                quota_limit,
+                window_hours,
+                window_start,
+                window_end,
+                quota_consumed,
+                now,
+            ),
+        )
+
+    @staticmethod
     def _memory_batch_config_row(row: sqlite3.Row) -> dict[str, Any]:
         value = json.loads(row["config_json"])
         value["schema"] = MEMORY_BATCH_CONFIG_SCHEMA
@@ -5893,13 +7904,15 @@ class UniverseStore:
                 "SELECT * FROM memory_batch_config WHERE config_id = ?",
                 (config_id,),
             ).fetchone()
-        if row is None:
-            raise UniverseError(
-                "MEMORY_BATCH_CONFIG_UNAVAILABLE",
-                "memory batch config was not persisted",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-        return self._memory_batch_config_row(row)
+            if row is None:
+                raise UniverseError(
+                    "MEMORY_BATCH_CONFIG_UNAVAILABLE",
+                    "memory batch config was not persisted",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            stored = self._memory_batch_config_row(row)
+            self._reconcile_memory_batch_schedule(connection, stored, now=now)
+        return stored
 
     def get_memory_batch_configs(self, project_id: str) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
@@ -5955,6 +7968,322 @@ class UniverseStore:
             if item["stage"] == normalized_stage
         )
 
+    def list_memory_batch_schedule_states(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE project_id = ?
+                ORDER BY stage, schedule_id
+                """,
+                (project["project_id"],),
+            ).fetchall()
+        return [self._memory_batch_schedule_row(row) for row in rows]
+
+    def recover_expired_memory_batch_schedules(self, now: str) -> list[str]:
+        recovered: list[str] = []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE state = 'CLAIMED' AND lease_expires_at <= ?
+                ORDER BY lease_expires_at, schedule_id
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                schedule_id = str(row["schedule_id"])
+                generation = int(row["lease_generation"])
+                connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_attempt
+                    SET state = 'ABANDONED', error_code = 'LEASE_EXPIRED', terminal_at = ?
+                    WHERE schedule_id = ? AND lease_generation = ? AND state = 'STARTED'
+                    """,
+                    (now, schedule_id, generation),
+                )
+                attempts = int(row["attempt_count"])
+                exhausted = attempts >= int(row["max_attempts"])
+                if exhausted:
+                    next_due = next_cadence_due(
+                        str(row["next_due_at"]), int(row["interval_minutes"]), now
+                    )
+                    state = "READY"
+                    due_slot_key = None
+                    attempt_count = 0
+                    outcome = "FAILED_EXHAUSTED"
+                else:
+                    next_due = format_scheduler_utc(
+                        parse_scheduler_utc(now)
+                        + timedelta(seconds=retry_delay_seconds(attempts))
+                    )
+                    state = "RETRY_WAIT"
+                    due_slot_key = row["due_slot_key"]
+                    attempt_count = attempts
+                    outcome = "ABANDONED"
+                updated = connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_state
+                    SET state = ?, next_due_at = ?, due_slot_key = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, attempt_count = ?,
+                        last_error_code = 'LEASE_EXPIRED', last_outcome = ?,
+                        last_terminal_at = ?, updated_at = ?
+                    WHERE schedule_id = ? AND state = 'CLAIMED'
+                      AND lease_generation = ? AND lease_expires_at <= ?
+                    """,
+                    (
+                        state,
+                        next_due,
+                        due_slot_key,
+                        attempt_count,
+                        outcome,
+                        now,
+                        now,
+                        schedule_id,
+                        generation,
+                        now,
+                    ),
+                ).rowcount
+                if updated == 1:
+                    recovered.append(schedule_id)
+        return recovered
+
+    def claim_due_memory_batch_schedule(
+        self,
+        *,
+        now: str,
+        lease_owner: str,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None:
+        owner = _required_text(lease_owner, "lease_owner")
+        expires_at = format_scheduler_utc(
+            parse_scheduler_utc(now) + timedelta(seconds=max(60, int(lease_seconds)))
+        )
+        with self._connection() as connection:
+            candidates = connection.execute(
+                """
+                SELECT * FROM memory_batch_schedule_state
+                WHERE state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                  AND next_due_at IS NOT NULL AND next_due_at <= ?
+                ORDER BY next_due_at, schedule_id
+                LIMIT 32
+                """,
+                (now,),
+            ).fetchall()
+            for row in candidates:
+                schedule_id = str(row["schedule_id"])
+                quota_limit = row["quota_limit"]
+                window_hours = row["quota_window_hours"]
+                quota_consumed = int(row["quota_consumed"])
+                window_start = row["quota_window_start"]
+                window_end = row["quota_window_end"]
+                if quota_limit is not None and window_hours is not None:
+                    current_start, current_end = quota_window(now, int(window_hours))
+                    if window_start != current_start:
+                        window_start, window_end = current_start, current_end
+                        quota_consumed = 0
+                    if quota_consumed >= int(quota_limit):
+                        connection.execute(
+                            """
+                            UPDATE memory_batch_schedule_state
+                            SET state = 'QUOTA_DEFERRED', next_due_at = ?,
+                                quota_window_start = ?, quota_window_end = ?,
+                                quota_consumed = ?, last_error_code = 'MEMORY_BATCH_QUOTA_EXCEEDED',
+                                last_outcome = 'DEFERRED_QUOTA', updated_at = ?
+                            WHERE schedule_id = ? AND state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                            """,
+                            (
+                                current_end,
+                                current_start,
+                                current_end,
+                                quota_consumed,
+                                now,
+                                schedule_id,
+                            ),
+                        )
+                        continue
+                planned_due = str(row["next_due_at"])
+                due_slot_key = row["due_slot_key"] or (
+                    "memory-slot-"
+                    + _json_sha256(
+                        {"schedule_id": schedule_id, "planned_due_at": planned_due}
+                    )[:24]
+                )
+                generation = int(row["lease_generation"]) + 1
+                attempts = int(row["attempt_count"]) + 1
+                updated = connection.execute(
+                    """
+                    UPDATE memory_batch_schedule_state
+                    SET state = 'CLAIMED', due_slot_key = ?, lease_owner = ?,
+                        lease_generation = ?, lease_expires_at = ?, attempt_count = ?,
+                        last_started_at = ?, quota_window_start = ?, quota_window_end = ?,
+                        quota_consumed = ?, updated_at = ?
+                    WHERE schedule_id = ?
+                      AND state IN ('READY', 'RETRY_WAIT', 'QUOTA_DEFERRED')
+                      AND next_due_at = ? AND next_due_at <= ?
+                    """,
+                    (
+                        due_slot_key,
+                        owner,
+                        generation,
+                        expires_at,
+                        attempts,
+                        now,
+                        window_start,
+                        window_end,
+                        quota_consumed + (1 if quota_limit is not None and window_hours is not None else 0),
+                        now,
+                        schedule_id,
+                        planned_due,
+                        now,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    continue
+                attempt_id = "memory-attempt-" + _json_sha256(
+                    {
+                        "schedule_id": schedule_id,
+                        "due_slot_key": due_slot_key,
+                        "lease_generation": generation,
+                    }
+                )[:24]
+                connection.execute(
+                    """
+                    INSERT INTO memory_batch_schedule_attempt(
+                        attempt_id, schedule_id, due_slot_key, lease_generation,
+                        state, started_at
+                    ) VALUES (?, ?, ?, ?, 'STARTED', ?)
+                    """,
+                    (attempt_id, schedule_id, due_slot_key, generation, now),
+                )
+                claimed = connection.execute(
+                    "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                    (schedule_id,),
+                ).fetchone()
+                return self._memory_batch_schedule_row(claimed)
+        return None
+
+    def finish_memory_batch_schedule(
+        self,
+        claim: Mapping[str, Any],
+        *,
+        now: str,
+        outcome: str,
+        run_id: str | None = None,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        schedule_id = _required_text(claim.get("schedule_id"), "schedule_id")
+        owner = _required_text(claim.get("lease_owner"), "lease_owner")
+        generation = int(claim.get("lease_generation", 0))
+        normalized_outcome = str(outcome or "").strip().upper()
+        if normalized_outcome not in {"SUCCEEDED", "FAILED"}:
+            raise UniverseError(
+                "MEMORY_BATCH_SCHEDULE_OUTCOME_INVALID",
+                "schedule outcome must be SUCCEEDED or FAILED",
+            )
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "CLAIMED"
+                or row["lease_owner"] != owner
+                or int(row["lease_generation"]) != generation
+            ):
+                raise UniverseError(
+                    "MEMORY_BATCH_SCHEDULE_LEASE_STALE",
+                    "only the current schedule lease may record a terminal result",
+                    HTTPStatus.CONFLICT,
+                )
+            due_slot_key = str(row["due_slot_key"])
+            attempt_state = "SUCCEEDED" if normalized_outcome == "SUCCEEDED" else "FAILED"
+            connection.execute(
+                """
+                UPDATE memory_batch_schedule_attempt
+                SET state = ?, run_id = ?, error_code = ?, terminal_at = ?
+                WHERE schedule_id = ? AND due_slot_key = ?
+                  AND lease_generation = ? AND state = 'STARTED'
+                """,
+                (
+                    attempt_state,
+                    run_id,
+                    error_code,
+                    now,
+                    schedule_id,
+                    due_slot_key,
+                    generation,
+                ),
+            )
+            attempts = int(row["attempt_count"])
+            exhausted = attempts >= int(row["max_attempts"])
+            if normalized_outcome == "SUCCEEDED" or exhausted:
+                state = "READY"
+                next_due = next_cadence_due(
+                    str(row["next_due_at"]), int(row["interval_minutes"]), now
+                )
+                next_slot = None
+                next_attempt_count = 0
+                terminal_outcome = (
+                    "SUCCEEDED" if normalized_outcome == "SUCCEEDED" else "FAILED_EXHAUSTED"
+                )
+            elif error_code == "MEMORY_BATCH_QUOTA_EXCEEDED" and row["quota_window_end"]:
+                state = "QUOTA_DEFERRED"
+                next_due = str(row["quota_window_end"])
+                next_slot = due_slot_key
+                next_attempt_count = attempts
+                terminal_outcome = "DEFERRED_QUOTA"
+            else:
+                state = "RETRY_WAIT"
+                next_due = format_scheduler_utc(
+                    parse_scheduler_utc(now)
+                    + timedelta(seconds=retry_delay_seconds(attempts))
+                )
+                next_slot = due_slot_key
+                next_attempt_count = attempts
+                terminal_outcome = "FAILED_RETRYABLE"
+            updated = connection.execute(
+                """
+                UPDATE memory_batch_schedule_state
+                SET state = ?, next_due_at = ?, due_slot_key = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, attempt_count = ?, last_error_code = ?,
+                    last_outcome = ?, last_terminal_at = ?,
+                    last_success_at = CASE WHEN ? = 'SUCCEEDED' THEN ? ELSE last_success_at END,
+                    last_run_id = COALESCE(?, last_run_id), updated_at = ?
+                WHERE schedule_id = ? AND state = 'CLAIMED'
+                  AND lease_owner = ? AND lease_generation = ?
+                """,
+                (
+                    state,
+                    next_due,
+                    next_slot,
+                    next_attempt_count,
+                    error_code,
+                    terminal_outcome,
+                    now,
+                    normalized_outcome,
+                    now,
+                    run_id,
+                    now,
+                    schedule_id,
+                    owner,
+                    generation,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise UniverseError(
+                    "MEMORY_BATCH_SCHEDULE_LEASE_STALE",
+                    "schedule lease changed before completion",
+                    HTTPStatus.CONFLICT,
+                )
+            terminal = connection.execute(
+                "SELECT * FROM memory_batch_schedule_state WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        return self._memory_batch_schedule_row(terminal)
+
     def list_memory_batch_runs(
         self, project_id: str, *, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -5990,13 +8319,24 @@ class UniverseStore:
             for row in rows
         ]
 
-    def count_memory_batch_runs(self, project_id: str, stage: str) -> int:
+    def count_memory_batch_runs(
+        self, project_id: str, stage: str, *, since: str | None = None
+    ) -> int:
         project = self.get_project(project_id)
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
-                (project["project_id"], stage),
-            ).fetchone()
+            if since is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM memory_batch_run WHERE project_id = ? AND stage = ?",
+                    (project["project_id"], stage),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM memory_batch_run
+                    WHERE project_id = ? AND stage = ? AND started_at >= ?
+                    """,
+                    (project["project_id"], stage, since),
+                ).fetchone()
         return int(row["count"] or 0)
 
     def get_memory_batch_run(self, run_id: str) -> dict[str, Any] | None:
@@ -6087,6 +8427,32 @@ class UniverseStore:
                         run_id,
                     ),
                 )
+            # Batch output is already a redacted, durable collection result.
+            # Keep only its digest and run coordinate as graph currentness;
+            # never promote candidates or expose collected text from here.
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_id,
+                    f"MEMORY_BATCH_{str(stage).upper()}",
+                    run_id,
+                    str(result["status"]),
+                    output_digest,
+                    now,
+                    now,
+                ),
+            )
 
     @staticmethod
     def memory_batch_run_id(
@@ -6768,6 +9134,15 @@ class UniverseStore:
                     now,
                     now,
                 ),
+            )
+            ensure_template_instance(
+                connection,
+                project_id=project["project_id"],
+                scope_kind="PROJECT",
+                scope_ref=project["project_id"],
+                title=str(project["metadata"].get("display_name") or project["project_id"]),
+                template=project_seed_template()["work_model"],
+                now=now,
             )
         return self.get_project(project["project_id"]), created
 
@@ -7525,6 +9900,42 @@ class UniverseStore:
                     event["created_at"],
                 ),
             )
+            source_kind = {
+                "GIT_WORK_STATUS": "GIT_TRACE2",
+                "HOOK_SESSION_BOUND": "SESSION_HOOK",
+                "TEST_WORK_STATUS": "TEST_RUNNER",
+            }.get(event["event_type"])
+            if source_kind is not None:
+                source_digest = _json_sha256(
+                    {
+                        "event_id": event["event_id"],
+                        "event_type": event["event_type"],
+                        "payload": event["payload"],
+                    }
+                )
+                connection.execute(
+                    """
+                    INSERT INTO semantic_collection_cursor(
+                        project_id, source_kind, last_event_id, last_event_type,
+                        source_digest, observed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                        last_event_id = excluded.last_event_id,
+                        last_event_type = excluded.last_event_type,
+                        source_digest = excluded.source_digest,
+                        observed_at = excluded.observed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        event["project_id"],
+                        source_kind,
+                        event["event_id"],
+                        event["event_type"],
+                        source_digest,
+                        event["created_at"],
+                        utc_now(),
+                    ),
+                )
         return event, True
 
     def register_provider_session_source(
@@ -7685,6 +10096,159 @@ class UniverseStore:
             for row in rows
         ]
 
+    def list_semantic_collection_cursors(
+        self, project_id: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT project_id, source_kind, last_event_id, last_event_type,
+                       source_digest, observed_at, updated_at
+                FROM semantic_collection_cursor
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, source_kind
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_semantic_collection_observation(
+        self,
+        *,
+        project_id: str,
+        source_kind: str,
+        event_id: str,
+        event_type: str,
+        source_material: Mapping[str, Any],
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Advance one collection source without retaining source text.
+
+        The cursor is a currentness coordinate, not an extraction result.  Its
+        caller supplies a redacted material envelope; only its digest is kept.
+        """
+
+        project = self.get_project(project_id)
+        normalized_kind = _required_text(source_kind, "source_kind").upper()
+        normalized_event_id = _required_text(event_id, "event_id")
+        normalized_event_type = _required_text(event_type, "event_type").upper()
+        now = utc_now()
+        cursor = {
+            "project_id": project["project_id"],
+            "source_kind": normalized_kind,
+            "last_event_id": normalized_event_id,
+            "last_event_type": normalized_event_type,
+            "source_digest": _json_sha256(dict(source_material)),
+            "observed_at": observed_at or now,
+            "updated_at": now,
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                tuple(cursor[key] for key in (
+                    "project_id", "source_kind", "last_event_id", "last_event_type",
+                    "source_digest", "observed_at", "updated_at",
+                )),
+            )
+        return cursor
+
+    def list_universe_goals(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM universe_goal "
+                "ORDER BY sort_order, updated_at, universe_goal_id"
+            ).fetchall()
+            project_rows = connection.execute(
+                "SELECT * FROM project_goal WHERE universe_goal_id IS NOT NULL "
+                "ORDER BY sort_order, updated_at, goal_id"
+            ).fetchall()
+            todo_rows = connection.execute(
+                "SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, "
+                "title, detail, priority, state, source_kind, sort_order, revision, created_at, updated_at "
+                "FROM project_todo WHERE universe_goal_id IS NOT NULL "
+                "ORDER BY sort_order, updated_at, todo_id"
+            ).fetchall()
+        projects_by_goal: dict[str, list[dict[str, Any]]] = {}
+        for row in project_rows:
+            goal = self._goal_row(row)
+            projects_by_goal.setdefault(str(goal["universe_goal_id"]), []).append(goal)
+        todos_by_goal: dict[str, list[dict[str, Any]]] = {}
+        for row in todo_rows:
+            todo = self._todo_row(row)
+            todos_by_goal.setdefault(str(todo["universe_goal_id"]), []).append(todo)
+        goals = []
+        for row in rows:
+            goal = self._universe_goal_row(row)
+            goal["project_goals"] = projects_by_goal.get(goal["universe_goal_id"], [])
+            goal["todos"] = todos_by_goal.get(goal["universe_goal_id"], [])
+            goals.append(goal)
+        return goals
+
+    def create_universe_goal(self, value: Any) -> dict[str, Any]:
+        goal = normalize_universe_goal(value)
+        goal_id = goal.get("universe_goal_id") or "ugoal_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO universe_goal(universe_goal_id, title, description, owner, state, "
+                "sort_order, revision, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    goal_id, goal["title"], goal["description"], goal["owner"],
+                    goal["state"], goal["sort_order"], now, now,
+                ),
+            )
+        return self.get_universe_goal(goal_id)
+
+    def get_universe_goal(self, universe_goal_id: str) -> dict[str, Any]:
+        normalized = _identifier(universe_goal_id, "universe_goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM universe_goal WHERE universe_goal_id = ?", (normalized,)
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "UNIVERSE_GOAL_NOT_FOUND",
+                f"Universe Goal does not exist: {normalized}",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._universe_goal_row(row)
+
+    def update_universe_goal(self, universe_goal_id: str, value: Any) -> dict[str, Any]:
+        current = self.get_universe_goal(universe_goal_id)
+        goal = normalize_universe_goal(value, updating=True)
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE universe_goal SET title = ?, description = ?, owner = ?, state = ?, "
+                "sort_order = ?, revision = revision + 1, updated_at = ? "
+                "WHERE universe_goal_id = ? AND revision = ?",
+                (
+                    goal["title"], goal["description"], goal["owner"], goal["state"],
+                    goal["sort_order"], now, current["universe_goal_id"], goal["revision"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise UniverseError(
+                "UNIVERSE_GOAL_REVISION_CONFLICT",
+                "Universe Goal revision changed",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_universe_goal(universe_goal_id)
+
     def list_project_goals(self, project_id: str) -> list[dict[str, Any]]:
         project = self.get_project(project_id)
         with self._connection() as connection:
@@ -7725,20 +10289,131 @@ class UniverseStore:
             goals.append(goal)
         return goals
 
+    def _validate_goal_scope(self, goal: Mapping[str, Any]) -> None:
+        if goal["scope_kind"] != "NODE":
+            return
+        try:
+            seed = self.get_project_seed(str(goal["project_id"]))
+        except UniverseError as error:
+            if error.code == "PROJECT_SEED_NOT_FOUND":
+                raise UniverseError(
+                    "GOAL_NODE_PROJECT_SEED_REQUIRED",
+                    "NODE Goal requires a current Project Seed",
+                    HTTPStatus.CONFLICT,
+                ) from error
+            raise
+        known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
+        if str(goal["node_ref"]) not in known_nodes:
+            raise UniverseError(
+                "GOAL_NODE_UNKNOWN",
+                f"node_ref is not present in the current Project Seed: {goal['node_ref']}",
+                HTTPStatus.CONFLICT,
+            )
+
+    def project_work_surface(
+        self, project_id: str, *, node_ref: str | None = None
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_node = _identifier(node_ref, "node_ref") if node_ref else None
+        goals = self.list_project_goals(project["project_id"])
+        todos = [
+            item for item in self.list_todos()
+            if item.get("project_id") == project["project_id"]
+        ]
+        try:
+            seed = self.get_project_seed(project["project_id"])
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            seed = None
+        if normalized_node is not None:
+            if seed is None:
+                raise UniverseError(
+                    "WORK_SURFACE_PROJECT_SEED_REQUIRED",
+                    "node work surface requires a current Project Seed",
+                    HTTPStatus.CONFLICT,
+                )
+            known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
+            if normalized_node not in known_nodes:
+                raise UniverseError(
+                    "WORK_SURFACE_NODE_UNKNOWN",
+                    f"node_ref is not present in the current Project Seed: {normalized_node}",
+                    HTTPStatus.NOT_FOUND,
+                )
+        documents = list(seed.get("documents") or []) if seed is not None else []
+        project_documents = [item for item in documents if item.get("project_wide", False)]
+        node_documents = (
+            [item for item in documents if normalized_node in (item.get("node_ids") or [])]
+            if normalized_node is not None
+            else []
+        )
+        with self._connection() as connection:
+            templates = list_template_instances(
+                connection, project_id=project["project_id"]
+            )
+        return {
+            "schema": WORK_SURFACE_SCHEMA,
+            "project_id": project["project_id"],
+            "node_ref": normalized_node,
+            "project": {
+                "goals": [item for item in goals if item["scope_kind"] == "PROJECT"],
+                "todos": [item for item in todos if item["scope_kind"] == "PROJECT"],
+                "documents": project_documents,
+            },
+            "node": (
+                {
+                    "node_ref": normalized_node,
+                    "goals": [
+                        item for item in goals
+                        if item["scope_kind"] == "NODE" and item["node_ref"] == normalized_node
+                    ],
+                    "todos": [
+                        item for item in todos
+                        if item["scope_kind"] == "NODE" and item["node_ref"] == normalized_node
+                    ],
+                    "documents": node_documents,
+                }
+                if normalized_node is not None
+                else None
+            ),
+            "template_instances": templates,
+            "effects": {
+                "project_source_write": "NONE",
+                "project_seed_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+        }
+
     def create_goal(self, project_id: str, value: Any) -> dict[str, Any]:
         self.get_project(project_id)
         goal = normalize_goal(project_id, value)
+        self._validate_goal_scope(goal)
+        if goal["universe_goal_id"] is not None:
+            self.get_universe_goal(goal["universe_goal_id"])
         goal_id = goal.get("goal_id") or "goal_" + uuid.uuid4().hex
         now = utc_now()
         with self._connection() as connection:
             connection.execute(
-                "INSERT INTO project_goal(goal_id, project_id, title, description, owner, "
+                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, "
                 "state, sort_order, revision, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (
-                    goal_id, goal["project_id"], goal["title"], goal["description"],
+                    goal_id, goal["project_id"], goal["scope_kind"], goal["node_ref"],
+                    goal["universe_goal_id"], goal["title"], goal["description"],
                     goal["owner"], goal["state"], goal["sort_order"], now, now,
                 ),
+            )
+            ensure_template_instance(
+                connection,
+                project_id=goal["project_id"],
+                scope_kind="GOAL",
+                scope_ref=goal_id,
+                goal_id=goal_id,
+                node_ref=goal["node_ref"],
+                title=goal["title"],
+                template=project_seed_template()["work_model"],
+                now=now,
             )
         return self.get_goal(goal_id)
 
@@ -7754,21 +10429,42 @@ class UniverseStore:
 
     def update_goal(self, goal_id: str, value: Any) -> dict[str, Any]:
         current = self.get_goal(goal_id)
-        goal = normalize_goal(current["project_id"], value, updating=True)
+        body = dict(value) if isinstance(value, Mapping) else value
+        if isinstance(body, dict):
+            body.setdefault("scope_kind", current["scope_kind"])
+            if current["node_ref"] is not None:
+                body.setdefault("node_ref", current["node_ref"])
+        goal = normalize_goal(current["project_id"], body, updating=True)
+        self._validate_goal_scope(goal)
+        if goal["universe_goal_id"] is not None:
+            self.get_universe_goal(goal["universe_goal_id"])
         now = utc_now()
         with self._connection() as connection:
             cursor = connection.execute(
-                "UPDATE project_goal SET title = ?, description = ?, owner = ?, state = ?, "
+                "UPDATE project_goal SET scope_kind = ?, node_ref = ?, universe_goal_id = ?, title = ?, description = ?, owner = ?, state = ?, "
                 "sort_order = ?, revision = revision + 1, updated_at = ? "
                 "WHERE goal_id = ? AND revision = ?",
                 (
+                    goal["scope_kind"], goal["node_ref"], goal["universe_goal_id"],
                     goal["title"], goal["description"], goal["owner"], goal["state"],
                     goal["sort_order"], now, current["goal_id"], goal["revision"],
                 ),
             )
-        if cursor.rowcount != 1:
-            raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT)
+            if cursor.rowcount != 1:
+                raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT)
+            ensure_template_instance(
+                connection,
+                project_id=goal["project_id"],
+                scope_kind="GOAL",
+                scope_ref=current["goal_id"],
+                goal_id=current["goal_id"],
+                node_ref=goal["node_ref"],
+                title=goal["title"],
+                template=project_seed_template()["work_model"],
+                now=now,
+            )
         return self.get_goal(goal_id)
+
 
     def create_milestone(self, goal_id: str, value: Any) -> dict[str, Any]:
         self.get_goal(goal_id)
@@ -7822,6 +10518,9 @@ class UniverseStore:
         return self.get_milestone(milestone_id)
 
     def _validate_todo_plan_binding(self, todo: Mapping[str, Any]) -> None:
+        universe_goal_id = todo.get("universe_goal_id")
+        if universe_goal_id:
+            self.get_universe_goal(str(universe_goal_id))
         goal_id = todo.get("goal_id")
         milestone_id = todo.get("milestone_id")
         if milestone_id and not goal_id:
@@ -7835,6 +10534,11 @@ class UniverseStore:
             raise UniverseError(
                 "TODO_PLAN_COORDINATE_INVALID", "Todo and Goal must belong to the same project"
             )
+        if universe_goal_id and goal["universe_goal_id"] not in {None, universe_goal_id}:
+            raise UniverseError(
+                "TODO_PLAN_COORDINATE_INVALID",
+                "Todo, Project Goal, and Universe Goal must share one hierarchy",
+            )
         if milestone_id:
             milestone = self.get_milestone(str(milestone_id))
             if milestone["goal_id"] != goal["goal_id"]:
@@ -7843,52 +10547,1978 @@ class UniverseStore:
                 )
 
     def create_todo(self, value: Any) -> dict[str, Any]:
+        todo = self._prepare_todo_for_insert(value)
+        todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
+        now = utc_now()
+        with self._connection() as connection:
+            self._insert_todo(connection, todo_id, todo, now)
+        return self.get_todo(todo_id)
+
+    def _prepare_todo_for_insert(self, value: Any) -> dict[str, Any]:
         todo = normalize_todo(value)
+        if todo["priority"] == "AUTO":
+            todo["priority"] = infer_todo_priority(todo)["priority"]
         if todo["project_id"] is not None:
             self.get_project(todo["project_id"])
         self._validate_todo_plan_binding(todo)
-        todo_id = todo.get("todo_id") or "todo_" + uuid.uuid4().hex
+        return todo
+
+    @staticmethod
+    def _insert_todo(
+        connection: sqlite3.Connection,
+        todo_id: str,
+        todo: Mapping[str, Any],
+        now: str,
+    ) -> None:
+        try:
+            connection.execute(
+                """
+                INSERT INTO project_todo(
+                    todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
+                    priority, state, source_kind, sort_order, revision,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    todo_id,
+                    todo["scope_kind"],
+                    todo["project_id"],
+                    todo["node_ref"],
+                    todo["universe_goal_id"],
+                    todo["goal_id"],
+                    todo["milestone_id"],
+                    todo["title"],
+                    todo["detail"],
+                    todo["priority"],
+                    todo["state"],
+                    todo["source_kind"],
+                    todo["sort_order"],
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise UniverseError(
+                "TODO_ID_CONFLICT",
+                "todo_id already exists",
+                HTTPStatus.CONFLICT,
+            ) from error
+
+    @staticmethod
+    def _todo_mutation_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.todo-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "todo_id": row["todo_id"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    def _bound_todo_mutation(
+        self,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str, str]:
+        todo = self._prepare_todo_for_insert(request["todo"])
+        if "todo_id" not in todo:
+            stable_material = {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+                "todo": todo,
+            }
+            todo["todo_id"] = "todo_" + _json_sha256(stable_material)[:32]
+        payload_sha256 = _json_sha256(todo)
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return todo, payload_sha256, provider_ref_hash
+
+    def prepare_todo_mutation_receipt(
+        self,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        _, payload_sha256, provider_ref_hash = self._bound_todo_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "todo_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE session_id = ? AND instruction_ref = ?",
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    payload_sha256,
+                )
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "TODO_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different mutation material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        "UPDATE todo_mutation_receipt SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?",
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return self._todo_mutation_receipt_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO todo_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, payload_sha256,
+                    status, todo_id, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', NULL, ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return self._todo_mutation_receipt_row(row), True
+
+    def consume_todo_mutation_receipt(
+        self,
+        receipt_id: str,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        todo, payload_sha256, provider_ref_hash = self._bound_todo_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+            if receipt is None:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_NOT_FOUND",
+                    "Todo mutation receipt does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            expected = (
+                request["session_id"],
+                request["session_anchor_ref"],
+                request["provider"],
+                provider_ref_hash,
+                request["instruction_ref"],
+                payload_sha256,
+            )
+            actual = (
+                receipt["session_id"],
+                receipt["session_anchor_ref"],
+                receipt["provider"],
+                receipt["provider_session_ref_hash"],
+                receipt["instruction_ref"],
+                receipt["payload_sha256"],
+            )
+            if actual != expected:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "receipt is not bound to this session, Anchor, instruction, and payload",
+                    HTTPStatus.CONFLICT,
+                )
+            if receipt["status"] == "CONSUMED":
+                todo_row = connection.execute(
+                    "SELECT * FROM project_todo WHERE todo_id = ?",
+                    (receipt["todo_id"],),
+                ).fetchone()
+                if todo_row is None:
+                    raise UniverseError(
+                        "TODO_MUTATION_RECEIPT_CORRUPT",
+                        "consumed receipt has no persisted Todo",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._todo_mutation_receipt_row(receipt),
+                    self._todo_row(todo_row),
+                    True,
+                )
+            if datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            ) <= now_datetime:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_EXPIRED",
+                    "Todo mutation receipt expired before consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            todo_id = str(todo["todo_id"])
+            self._insert_todo(connection, todo_id, todo, now)
+            updated = connection.execute(
+                """
+                UPDATE todo_mutation_receipt
+                SET status = 'CONSUMED', todo_id = ?, consumed_at = ?
+                WHERE receipt_id = ? AND status = 'PREPARED'
+                """,
+                (todo_id, now, normalized_receipt_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "TODO_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "Todo mutation receipt changed during consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            receipt = connection.execute(
+                "SELECT * FROM todo_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+            todo_row = connection.execute(
+                "SELECT * FROM project_todo WHERE todo_id = ?",
+                (todo_id,),
+            ).fetchone()
+        return self._todo_mutation_receipt_row(receipt), self._todo_row(todo_row), False
+
+
+    @staticmethod
+    def _todo_action_mutation_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": "universe.todo-action-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "todo_id": row["todo_id"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    def _bound_todo_action_mutation(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], str, str]:
+        action = normalize_todo_action_payload(request["todo_id"], request["action"])
+        payload_sha256 = _json_sha256(action)
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return action, payload_sha256, provider_ref_hash
+
+    def prepare_todo_action_mutation_receipt(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        _, payload_sha256, provider_ref_hash = self._bound_todo_action_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "todo_action_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE session_id = ? AND instruction_ref = ?",
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["todo_id"],
+                    payload_sha256,
+                )
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["todo_id"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "TODO_ACTION_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different Todo action material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        "UPDATE todo_action_mutation_receipt SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?",
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return self._todo_action_mutation_receipt_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO todo_action_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, todo_id,
+                    payload_sha256, status, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    request["todo_id"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+        return self._todo_action_mutation_receipt_row(row), True
+
+    def consume_todo_action_mutation_receipt(
+        self, receipt_id: str, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        action, payload_sha256, provider_ref_hash = self._bound_todo_action_mutation(request)
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        with self._connection() as connection:
+            receipt = connection.execute(
+                "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                (normalized_receipt_id,),
+            ).fetchone()
+        if receipt is None:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_NOT_FOUND",
+                "Todo action mutation receipt does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        expected = (
+            request["session_id"],
+            request["session_anchor_ref"],
+            request["provider"],
+            provider_ref_hash,
+            request["instruction_ref"],
+            request["todo_id"],
+            payload_sha256,
+        )
+        actual = (
+            receipt["session_id"],
+            receipt["session_anchor_ref"],
+            receipt["provider"],
+            receipt["provider_session_ref_hash"],
+            receipt["instruction_ref"],
+            receipt["todo_id"],
+            receipt["payload_sha256"],
+        )
+        if actual != expected:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                "receipt is not bound to this session, Anchor, instruction, Todo, and action",
+                HTTPStatus.CONFLICT,
+            )
+        if receipt["status"] == "PREPARED" and datetime.fromisoformat(
+            str(receipt["expires_at"]).replace("Z", "+00:00")
+        ) <= now_datetime:
+            raise UniverseError(
+                "TODO_ACTION_MUTATION_RECEIPT_EXPIRED",
+                "Todo action mutation receipt expired before consumption",
+                HTTPStatus.CONFLICT,
+            )
+        replayed = receipt["status"] == "CONSUMED"
+        result = self.apply_todo_action(request["todo_id"], request["action"])
+        if not replayed:
+            now = now_datetime.isoformat().replace("+00:00", "Z")
+            with self._connection() as connection:
+                updated = connection.execute(
+                    """
+                    UPDATE todo_action_mutation_receipt
+                    SET status = 'CONSUMED', consumed_at = ?
+                    WHERE receipt_id = ? AND status = 'PREPARED'
+                    """,
+                    (now, normalized_receipt_id),
+                )
+                if updated.rowcount != 1:
+                    current = connection.execute(
+                        "SELECT status FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                        (normalized_receipt_id,),
+                    ).fetchone()
+                    if current is None or current["status"] != "CONSUMED":
+                        raise UniverseError(
+                            "TODO_ACTION_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                            "Todo action mutation receipt changed during consumption",
+                            HTTPStatus.CONFLICT,
+                        )
+                    replayed = True
+                receipt = connection.execute(
+                    "SELECT * FROM todo_action_mutation_receipt WHERE receipt_id = ?",
+                    (normalized_receipt_id,),
+                ).fetchone()
+        return self._todo_action_mutation_receipt_row(receipt), result, replayed
+
+    @staticmethod
+    def _feature_effects() -> dict[str, Any]:
+        return {
+            "authority": "NONE",
+            "execution_assignment": "NONE",
+            "task_frame_created": False,
+            "goal_created": False,
+            "todo_created": False,
+        }
+
+    @staticmethod
+    def _feature_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_NODE_SCHEMA,
+            "feature_id": str(row["feature_id"]),
+            "project_id": str(row["project_id"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "title": str(row["title"]),
+            "intent_text": str(row["intent_text"]),
+            "state": str(row["state"]),
+            "meeting_room_id": row["meeting_room_id"],
+            "created_by_role": str(row["created_by_role"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "revision": int(row["revision"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+
+    @staticmethod
+    def _expected_path_row(
+        row: sqlite3.Row, route_row: sqlite3.Row | None = None
+    ) -> dict[str, Any]:
+        result = {
+            "schema": EXPECTED_PATH_SCHEMA,
+            "expected_path_id": str(row["expected_path_id"]),
+            "feature_id": str(row["feature_id"]),
+            "room_id": str(row["room_id"]),
+            "artifact_id": str(row["artifact_id"]),
+            "artifact_revision": int(row["artifact_revision"]),
+            "title": str(row["title"]),
+            "summary": str(row["summary"]),
+            "specification_digest": str(row["specification_digest"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "state": str(row["state"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+        result["route"] = (
+            json.loads(route_row["route_json"]) if route_row is not None else None
+        )
+        result["route_digest"] = (
+            str(route_row["route_digest"]) if route_row is not None else None
+        )
+        return result
+
+    @staticmethod
+    def _adoption_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_PATH_ADOPTION_SCHEMA,
+            "adoption_id": str(row["adoption_id"]),
+            "feature_id": str(row["feature_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "adopted_by_role": str(row["adopted_by_role"]),
+            "rationale": str(row["rationale"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "adopted_at": str(row["adopted_at"]),
+            "effects": UniverseStore._feature_effects(),
+        }
+
+    @staticmethod
+    def _feature_goal_derivation_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_GOAL_DERIVATION_SCHEMA,
+            "derivation_id": str(row["derivation_id"]),
+            "feature_id": str(row["feature_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "goal_id": str(row["goal_id"]),
+            "artifact_revision": int(row["artifact_revision"]),
+            "specification_digest": str(row["specification_digest"]),
+            "created_by_role": str(row["created_by_role"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    @staticmethod
+    def _feature_goal_start_receipt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": FEATURE_GOAL_START_RECEIPT_SCHEMA,
+            "receipt_id": str(row["receipt_id"]),
+            "feature_id": str(row["feature_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "expected_path_id": str(row["expected_path_id"]),
+            "goal_id": str(row["goal_id"]),
+            "expected_feature_revision": int(row["expected_feature_revision"]),
+            "expected_path_digest": str(row["expected_path_digest"]),
+            "approved_scope": json.loads(row["approved_scope_json"]),
+            "constraints": json.loads(row["constraints_json"]),
+            "validation": json.loads(row["validation_json"]),
+            "local_commit_policy": str(row["local_commit_policy"]),
+            "push_policy": str(row["push_policy"]),
+            "rationale": str(row["rationale"]),
+            "evidence_refs": json.loads(row["evidence_refs_json"]),
+            "started_by_role": str(row["started_by_role"]),
+            "created_at": str(row["created_at"]),
+            "status": "ACTIVE",
+        }
+
+    @staticmethod
+    def _goal_work_plan_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_SCHEMA,
+            "work_plan_id": str(row["work_plan_id"]),
+            "goal_id": str(row["goal_id"]),
+            "feature_id": str(row["feature_id"]),
+            "room_id": str(row["room_id"]),
+            "run_id": str(row["run_id"]),
+            "source_message_id": str(row["source_message_id"]),
+            "author_binding_id": str(row["author_binding_id"]),
+            "plan_digest": str(row["plan_digest"]),
+            "plan": json.loads(row["plan_json"]),
+            "state": str(row["state"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _goal_work_plan_adoption_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_ADOPTION_SCHEMA,
+            "adoption_id": str(row["adoption_id"]),
+            "goal_id": str(row["goal_id"]),
+            "work_plan_id": str(row["work_plan_id"]),
+            "adopted_by_role": str(row["adopted_by_role"]),
+            "rationale": str(row["rationale"]),
+            "adopted_at": str(row["adopted_at"]),
+        }
+
+    @staticmethod
+    def _goal_work_plan_application_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_WORK_PLAN_APPLICATION_SCHEMA,
+            "application_id": str(row["application_id"]),
+            "goal_id": str(row["goal_id"]),
+            "adoption_id": str(row["adoption_id"]),
+            "work_plan_id": str(row["work_plan_id"]),
+            "applied_by_role": str(row["applied_by_role"]),
+            "created_items": json.loads(row["created_items_json"]),
+            "applied_at": str(row["applied_at"]),
+        }
+
+    @staticmethod
+    def _feature_refs(value: Any, field: str) -> list[str]:
+        refs = _string_array(value if value is not None else [], field)
+        if len(refs) > 50:
+            raise UniverseError("FEATURE_EVIDENCE_INVALID", f"{field} exceeds 50 entries")
+        return refs
+
+    def create_feature_node(self, project_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = _exact_object_fields(
+            value,
+            field="feature_node",
+            required=frozenset({"idempotency_key", "title", "intent_text", "created_by_role"}),
+            optional=frozenset({"meeting_room_id", "evidence_refs"}),
+        )
+        key = _identifier(request["idempotency_key"], "idempotency_key")
+        title = _required_text(request["title"], "title")
+        intent_text = _required_text(request["intent_text"], "intent_text")
+        role = _identifier(request["created_by_role"], "created_by_role").upper()
+        if role not in {"USER", "CONDUCTOR"}:
+            raise UniverseError("FEATURE_CREATOR_ROLE_INVALID", "Feature Node creator must be USER or CONDUCTOR")
+        refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+        room_id = None
+        if request.get("meeting_room_id") is not None:
+            room_id = _identifier(request["meeting_room_id"], "meeting_room_id")
+            try:
+                room = self.multi_rooms.get_room(room_id)
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+            if room.get("room_type") != "MEETING" or room.get("project_id") != project["project_id"]:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_INVALID",
+                    "meeting_room_id must identify a MEETING room in the same project",
+                    HTTPStatus.CONFLICT,
+                )
+        feature_id = "feature_" + _json_sha256(
+            {"project_id": project["project_id"], "idempotency_key": key}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM feature_node WHERE project_id = ? AND idempotency_key = ?",
+                (project["project_id"], key),
+            ).fetchone()
+            if existing is not None:
+                material = (title, intent_text, room_id, role, refs)
+                actual = (
+                    existing["title"], existing["intent_text"], existing["meeting_room_id"],
+                    existing["created_by_role"], json.loads(existing["evidence_refs_json"]),
+                )
+                if actual != material:
+                    raise UniverseError(
+                        "FEATURE_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to different Feature Node material",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self._feature_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO feature_node(
+                    feature_id, project_id, idempotency_key, title, intent_text, state,
+                    meeting_room_id, created_by_role, evidence_refs_json, revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    feature_id, project["project_id"], key, title, intent_text,
+                    "EXPLORING" if room_id else "DRAFT", room_id, role,
+                    _canonical_json(refs), now, now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (feature_id,)).fetchone()
+        return self._feature_row(row), True
+
+    def list_feature_nodes(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM feature_node WHERE project_id = ? ORDER BY updated_at DESC, feature_id",
+                (project["project_id"],),
+            ).fetchall()
+        return [self._feature_row(row) for row in rows]
+
+    @staticmethod
+    def _feature_node_proposal_row(row: sqlite3.Row) -> dict[str, Any]:
+        proposal = json.loads(row["proposal_json"])
+        proposal["state"] = str(row["state"])
+        proposal["created_at"] = str(row["created_at"])
+        proposal["updated_at"] = str(row["updated_at"])
+        proposal["review"] = (
+            {
+                "decision": str(row["state"]),
+                "reviewed_by_role": str(row["reviewed_by_role"]),
+                "rationale": str(row["rationale"] or ""),
+                "reviewed_at": str(row["reviewed_at"]),
+            }
+            if row["reviewed_at"] is not None
+            else None
+        )
+        return proposal
+
+    def generate_feature_node_proposals(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        proposals = build_feature_node_proposals(
+            project_id=project["project_id"],
+            memories=self.list_project_memories(project["project_id"], limit=200),
+            memory_candidates=self.list_memory_candidates(
+                project["project_id"], limit=200
+            ),
+            feature_nodes=self.list_feature_nodes(project["project_id"]),
+        )
+        created_count = 0
+        persisted: list[dict[str, Any]] = []
+        now = utc_now()
+        with self._connection() as connection:
+            materialized_rows = connection.execute(
+                """
+                SELECT proposal.*
+                FROM feature_node_proposal proposal
+                JOIN node_planning_context context
+                  ON context.proposal_id = proposal.proposal_id
+                WHERE proposal.project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            materialized_by_evidence = {
+                _canonical_json(
+                    {
+                        "cluster_refs": item.get("cluster_refs") or [],
+                        "evidence_refs": item.get("evidence_refs") or [],
+                    }
+                ): row
+                for row in materialized_rows
+                for item in [self._feature_node_proposal_row(row)]
+            }
+            for proposal in proposals:
+                evidence_key = _canonical_json(
+                    {
+                        "cluster_refs": proposal.get("cluster_refs") or [],
+                        "evidence_refs": proposal.get("evidence_refs") or [],
+                    }
+                )
+                materialized = materialized_by_evidence.get(evidence_key)
+                if materialized is not None:
+                    persisted.append(self._feature_node_proposal_row(materialized))
+                    continue
+                existing = connection.execute(
+                    "SELECT * FROM feature_node_proposal WHERE project_id = ? AND proposal_digest = ?",
+                    (project["project_id"], proposal["proposal_digest"]),
+                ).fetchone()
+                if existing is not None:
+                    persisted.append(self._feature_node_proposal_row(existing))
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO feature_node_proposal(
+                        proposal_id, project_id, proposal_digest, proposal_json, state,
+                        reviewed_by_role, rationale, created_at, updated_at, reviewed_at
+                    ) VALUES (?, ?, ?, ?, 'PROPOSAL_ONLY', NULL, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        proposal["proposal_id"],
+                        project["project_id"],
+                        proposal["proposal_digest"],
+                        _canonical_json(proposal),
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM feature_node_proposal WHERE proposal_id = ?",
+                    (proposal["proposal_id"],),
+                ).fetchone()
+                persisted.append(self._feature_node_proposal_row(row))
+                created_count += 1
+        for proposal in persisted:
+            proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+                proposal["proposal_id"]
+            )
+        return {
+            "schema": "universe.feature-node-proposal-generation.v1",
+            "project_id": project["project_id"],
+            "proposals": persisted,
+            "created_count": created_count,
+            "replayed_count": len(persisted) - created_count,
+            "effects": {
+                "feature_node_created": False,
+                "goal_created": False,
+                "todo_created": False,
+                "task_frame_created": False,
+                "authority_created": False,
+                "execution_assignment_created": False,
+                "rag_adopted": False,
+            },
+            "next_operation": "USER_REVIEW_ONLY",
+        }
+
+    def list_feature_node_proposals(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM feature_node_proposal
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, proposal_id
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 200))),
+            ).fetchall()
+        proposals = [self._feature_node_proposal_row(row) for row in rows]
+        for proposal in proposals:
+            proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+                proposal["proposal_id"]
+            )
+        return proposals
+
+    def get_feature_node_proposal(self, proposal_id: str) -> dict[str, Any]:
+        normalized = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_node_proposal WHERE proposal_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_NOT_FOUND",
+                "Feature Node proposal does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        proposal = self._feature_node_proposal_row(row)
+        proposal["planning_context"] = self.find_node_planning_context_for_proposal(
+            proposal["proposal_id"]
+        )
+        return proposal
+
+    def review_feature_node_proposal(
+        self, proposal_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_node_proposal_review",
+            required=frozenset({"decision", "rationale"}),
+        )
+        decision = _identifier(request["decision"], "decision").upper()
+        if decision not in FEATURE_NODE_PROPOSAL_DECISIONS:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_DECISION_INVALID",
+                "decision must be EXPLORE or REJECT",
+                HTTPStatus.CONFLICT,
+            )
+        next_state = "EXPLORE" if decision == "EXPLORE" else "REJECTED"
+        rationale = _required_text(request["rationale"], "rationale")
+        if len(rationale) > 1000:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_REVIEW_INVALID",
+                "rationale is too long",
+            )
+        current = self.get_feature_node_proposal(proposal_id)
+        if current["state"] == next_state:
+            if (current.get("review") or {}).get("rationale") != rationale:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                    "proposal already has a different rationale",
+                    HTTPStatus.CONFLICT,
+                )
+            return current, False
+        if current["state"] != "PROPOSAL_ONLY":
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                "proposal already has another review decision",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE feature_node_proposal
+                SET state = ?, reviewed_by_role = 'USER', rationale = ?,
+                    updated_at = ?, reviewed_at = ?
+                WHERE proposal_id = ? AND state = 'PROPOSAL_ONLY'
+                """,
+                (next_state, rationale, now, now, current["proposal_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_REVIEW_CONFLICT",
+                    "proposal review state changed",
+                    HTTPStatus.CONFLICT,
+                )
+        return self.get_feature_node_proposal(current["proposal_id"]), True
+
+    @staticmethod
+    def _node_planning_context_row(row: sqlite3.Row) -> dict[str, Any]:
+        context = json.loads(row["context_json"])
+        context["created_at"] = str(row["created_at"])
+        return context
+
+    def find_node_planning_context_for_proposal(
+        self, proposal_id: str
+    ) -> dict[str, Any] | None:
+        normalized = _identifier(proposal_id, "proposal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM node_planning_context WHERE proposal_id = ?",
+                (normalized,),
+            ).fetchone()
+        return self._node_planning_context_row(row) if row is not None else None
+
+    def get_node_planning_context(self, context_id: str) -> dict[str, Any]:
+        normalized = _identifier(context_id, "context_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM node_planning_context WHERE context_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "NODE_PLANNING_CONTEXT_NOT_FOUND",
+                "Node Planning Context does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        return self._node_planning_context_row(row)
+
+    def _attach_feature_meeting_room(
+        self, feature_id: str, room_id: str
+    ) -> dict[str, Any]:
+        feature = self.get_feature_node(feature_id)
+        current_room = str(feature.get("meeting_room_id") or "")
+        if current_room:
+            if current_room != room_id:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_CONFLICT",
+                    "Feature Node is already attached to another Meeting Room",
+                    HTTPStatus.CONFLICT,
+                )
+            return feature
+        if feature["state"] in {"ADOPTED", "ARCHIVED"}:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_STATE_INVALID",
+                "adopted or archived Feature Node cannot start another planning room",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE feature_node
+                SET meeting_room_id = ?, state = 'EXPLORING', revision = revision + 1,
+                    updated_at = ?
+                WHERE feature_id = ? AND meeting_room_id IS NULL
+                """,
+                (room_id, now, feature["feature_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "FEATURE_MEETING_ROOM_CONFLICT",
+                    "Feature Node meeting attachment changed",
+                    HTTPStatus.CONFLICT,
+                )
+        return self.get_feature_node(feature["feature_id"])
+
+    def explore_feature_node_proposal(
+        self, proposal_id: str, value: Any
+    ) -> tuple[
+        dict[str, Any], dict[str, Any], dict[str, Any], bool, bool, bool
+    ]:
+        request = _exact_object_fields(
+            value,
+            field="feature_node_proposal_exploration",
+            required=frozenset({"expected_proposal_digest"}),
+        )
+        expected_digest = _required_text(
+            request["expected_proposal_digest"], "expected_proposal_digest"
+        ).lower()
+        proposal = self.get_feature_node_proposal(proposal_id)
+        if proposal["proposal_digest"] != expected_digest:
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_DIGEST_CONFLICT",
+                "proposal changed before planning could start",
+                HTTPStatus.CONFLICT,
+            )
+        if proposal["state"] != "EXPLORE":
+            raise UniverseError(
+                "FEATURE_NODE_PROPOSAL_EXPLORATION_REVIEW_REQUIRED",
+                "proposal must have an EXPLORE user review before planning starts",
+                HTTPStatus.CONFLICT,
+            )
+        existing = self.find_node_planning_context_for_proposal(
+            proposal["proposal_id"]
+        )
+        if existing is not None:
+            feature = self.get_feature_node(existing["feature_id"])
+            try:
+                room = self.multi_rooms.get_room(existing["room_id"])
+            except MultiRoomError as error:
+                raise UniverseError(
+                    "NODE_PLANNING_ROOM_MISSING",
+                    "recorded Node Planning Context room is missing",
+                    HTTPStatus.CONFLICT,
+                ) from error
+            return existing, feature, room, False, False, False
+
+        target_feature: dict[str, Any] | None = None
+        if proposal["proposal_kind"] == "LINK_EXISTING":
+            target_ref = _required_text(
+                proposal.get("target_node_ref"), "target_node_ref"
+            )
+            target_feature = self.get_feature_node(target_ref)
+            if target_feature["project_id"] != proposal["project_id"]:
+                raise UniverseError(
+                    "FEATURE_NODE_PROPOSAL_TARGET_INVALID",
+                    "existing Feature target belongs to another project",
+                    HTTPStatus.CONFLICT,
+                )
+
+        room_id = str((target_feature or {}).get("meeting_room_id") or "")
+        room_created = False
+        if room_id:
+            try:
+                room = self.multi_rooms.get_room(room_id)
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        else:
+            try:
+                room_result = self.multi_rooms.create_meeting_room(
+                    {
+                        "idempotency_key": f"feature-proposal:{proposal['proposal_id']}",
+                        "title": f"Feature planning / {proposal['title']}",
+                        "topic": proposal["intent_text"],
+                        "project_id": proposal["project_id"],
+                    }
+                )
+            except MultiRoomError as error:
+                raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+            room = room_result["room"]
+            room_id = str(room["room_id"])
+            room_created = room_result["status"] == "MEETING_ROOM_CREATED"
+
+        evidence_refs = list(proposal.get("evidence_refs") or [])
+        proposal_ref = f"universe://feature-node-proposals/{proposal['proposal_id']}"
+        if proposal_ref not in evidence_refs:
+            evidence_refs.append(proposal_ref)
+        if target_feature is None:
+            feature, feature_created = self.create_feature_node(
+                proposal["project_id"],
+                {
+                    "idempotency_key": f"proposal-{proposal['proposal_id']}",
+                    "title": proposal["title"],
+                    "intent_text": proposal["intent_text"],
+                    "created_by_role": "USER",
+                    "meeting_room_id": room_id,
+                    "evidence_refs": evidence_refs,
+                },
+            )
+        else:
+            feature = self._attach_feature_meeting_room(
+                target_feature["feature_id"], room_id
+            )
+            feature_created = False
+
+        context_material = {
+            "schema": NODE_PLANNING_CONTEXT_SCHEMA,
+            "context_id": "planning_context_" + proposal["proposal_digest"][:24],
+            "project_id": proposal["project_id"],
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal["proposal_digest"],
+            "feature_id": feature["feature_id"],
+            "room_id": room_id,
+            "title": proposal["title"],
+            "intent_text": proposal["intent_text"],
+            "proposal_kind": proposal["proposal_kind"],
+            "evidence_refs": list(proposal.get("evidence_refs") or []),
+            "cluster_refs": list(proposal.get("cluster_refs") or []),
+            "constraints": list(proposal.get("constraints") or []),
+            "neighbor_feature_refs": (
+                [feature["feature_id"]]
+                if proposal["proposal_kind"] == "LINK_EXISTING"
+                else []
+            ),
+            "review": proposal.get("review"),
+            "redaction": "REFERENCES_AND_PROPOSAL_SUMMARY_ONLY",
+            "next_operation": "MEETING_PATH_PROPOSALS",
+            "effects": {
+                "goal_created": False,
+                "todo_created": False,
+                "task_frame_created": False,
+                "authority_created": False,
+                "execution_assignment_created": False,
+                "rag_adopted": False,
+            },
+        }
+        context_digest = _json_sha256(context_material)
+        context_material["context_digest"] = context_digest
         now = utc_now()
         with self._connection() as connection:
             try:
                 connection.execute(
                     """
-                    INSERT INTO project_todo(
-                        todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
-                        priority, state, source_kind, sort_order, revision,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    INSERT INTO node_planning_context(
+                        context_id, proposal_id, proposal_digest, project_id,
+                        feature_id, room_id, context_digest, context_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        todo_id,
-                        todo["scope_kind"],
-                        todo["project_id"],
-                        todo["node_ref"],
-                        todo["goal_id"],
-                        todo["milestone_id"],
-                        todo["title"],
-                        todo["detail"],
-                        todo["priority"],
-                        todo["state"],
-                        todo["source_kind"],
-                        todo["sort_order"],
-                        now,
+                        context_material["context_id"],
+                        proposal["proposal_id"],
+                        proposal["proposal_digest"],
+                        proposal["project_id"],
+                        feature["feature_id"],
+                        room_id,
+                        context_digest,
+                        _canonical_json(context_material),
                         now,
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except sqlite3.IntegrityError:
+                replay = self.find_node_planning_context_for_proposal(
+                    proposal["proposal_id"]
+                )
+                if replay is None:
+                    raise
+                return (
+                    replay,
+                    self.get_feature_node(replay["feature_id"]),
+                    room,
+                    False,
+                    False,
+                    False,
+                )
+        return (
+            self.get_node_planning_context(context_material["context_id"]),
+            feature,
+            room,
+            True,
+            feature_created,
+            room_created,
+        )
+
+    def get_feature_node(self, feature_id: str) -> dict[str, Any]:
+        fid = _identifier(feature_id, "feature_id")
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (fid,)).fetchone()
+            if row is None:
+                raise UniverseError("FEATURE_NODE_NOT_FOUND", "Feature Node does not exist", HTTPStatus.NOT_FOUND)
+            paths = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? ORDER BY created_at, expected_path_id",
+                (fid,),
+            ).fetchall()
+            route_rows = {
+                str(item["expected_path_id"]): item
+                for item in connection.execute(
+                    "SELECT route.* FROM feature_expected_path_route route "
+                    "JOIN feature_expected_path path ON path.expected_path_id = route.expected_path_id "
+                    "WHERE path.feature_id = ?",
+                    (fid,),
+                ).fetchall()
+            }
+            adoption = connection.execute(
+                "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            goal_start_receipt = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE feature_id = ?", (fid,)
+            ).fetchone()
+        result = self._feature_row(row)
+        result["expected_paths"] = [
+            self._expected_path_row(path, route_rows.get(str(path["expected_path_id"])))
+            for path in paths
+        ]
+        result["adoption"] = self._adoption_row(adoption) if adoption is not None else None
+        result["goal_derivation"] = (
+            self._feature_goal_derivation_row(derivation)
+            if derivation is not None
+            else None
+        )
+        result["goal_start_receipt"] = (
+            self._feature_goal_start_receipt_row(goal_start_receipt)
+            if goal_start_receipt is not None
+            else None
+        )
+        if result["goal_derivation"] is not None:
+            result["goal_derivation"]["goal"] = self.get_goal(
+                result["goal_derivation"]["goal_id"]
+            )
+            result["goal_derivation"]["work_plans"] = self.goal_work_plan_surface(
+                result["goal_derivation"]["goal_id"]
+            )
+        return result
+
+    def create_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        feature = self.get_feature_node(feature_id)
+        if feature["state"] == "ADOPTED":
+            raise UniverseError("FEATURE_ALREADY_ADOPTED", "adopted Feature Node cannot accept new paths", HTTPStatus.CONFLICT)
+        request = _exact_object_fields(
+            value,
+            field="expected_path",
+            required=frozenset({"room_id", "artifact_id", "summary"}),
+            optional=frozenset({"title", "evidence_refs", "route"}),
+        )
+        room_id = _identifier(request["room_id"], "room_id")
+        artifact_id = _identifier(request["artifact_id"], "artifact_id")
+        try:
+            room = self.multi_rooms.get_room(room_id)
+            artifact = self.multi_rooms.get_artifact(room_id, artifact_id)
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        if room.get("room_type") != "MEETING" or room.get("project_id") != feature["project_id"]:
+            raise UniverseError("EXPECTED_PATH_ROOM_INVALID", "Expected Path must come from a MEETING room in the Feature project", HTTPStatus.CONFLICT)
+        if feature.get("meeting_room_id") and feature["meeting_room_id"] != room_id:
+            raise UniverseError("EXPECTED_PATH_ROOM_MISMATCH", "Expected Path room does not match the Feature Node room", HTTPStatus.CONFLICT)
+        if artifact.get("artifact_type") != "SPECIFICATION":
+            raise UniverseError("EXPECTED_PATH_SPECIFICATION_REQUIRED", "Expected Path requires a SPECIFICATION artifact", HTTPStatus.CONFLICT)
+        revision = int(artifact["current_revision"])
+        title = _required_text(request.get("title") or artifact.get("title"), "title")
+        summary = _required_text(request["summary"], "summary")
+        route = (
+            normalize_expected_path_route(request["route"])
+            if request.get("route") is not None
+            else None
+        )
+        route_digest = _json_sha256(route) if route is not None else None
+        refs = list(artifact.get("evidence_refs") or [])
+        for ref in self._feature_refs(request.get("evidence_refs"), "evidence_refs"):
+            if ref not in refs:
+                refs.append(ref)
+        if len(refs) > 50:
+            raise UniverseError("FEATURE_EVIDENCE_INVALID", "combined Expected Path evidence exceeds 50 entries")
+        path_id = "expected_path_" + _json_sha256(
+            {"feature_id": feature["feature_id"], "artifact_id": artifact_id, "revision": revision}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? AND artifact_id = ? AND artifact_revision = ?",
+                (feature["feature_id"], artifact_id, revision),
+            ).fetchone()
+            if existing is not None:
+                existing_route = connection.execute(
+                    "SELECT * FROM feature_expected_path_route WHERE expected_path_id = ?",
+                    (path_id,),
+                ).fetchone()
+                material = (title, summary, str(artifact["content_digest"]), refs, route_digest)
+                actual = (
+                    existing["title"], existing["summary"], existing["specification_digest"],
+                    json.loads(existing["evidence_refs_json"]),
+                    str(existing_route["route_digest"]) if existing_route is not None else None,
+                )
+                if actual != material:
+                    raise UniverseError("EXPECTED_PATH_CONFLICT", "artifact revision is already linked with different path material", HTTPStatus.CONFLICT)
+                return self._expected_path_row(existing, existing_route), False
+            connection.execute(
+                """
+                INSERT INTO feature_expected_path(
+                    expected_path_id, feature_id, room_id, artifact_id, artifact_revision,
+                    title, summary, specification_digest, evidence_refs_json, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, ?)
+                """,
+                (
+                    path_id, feature["feature_id"], room_id, artifact_id, revision,
+                    title, summary, str(artifact["content_digest"]), _canonical_json(refs), now, now,
+                ),
+            )
+            if route is not None:
+                connection.execute(
+                    "INSERT INTO feature_expected_path_route(expected_path_id, route_digest, route_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (path_id, route_digest, _canonical_json(route), now, now),
+                )
+            connection.execute(
+                "UPDATE feature_node SET state = 'EXPLORING', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (now, feature["feature_id"]),
+            )
+            row = connection.execute("SELECT * FROM feature_expected_path WHERE expected_path_id = ?", (path_id,)).fetchone()
+            route_row = connection.execute(
+                "SELECT * FROM feature_expected_path_route WHERE expected_path_id = ?",
+                (path_id,),
+            ).fetchone()
+        return self._expected_path_row(row, route_row), True
+
+    def adopt_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_path_adoption",
+            required=frozenset({"expected_path_id", "expected_feature_revision", "rationale", "adopted_by_role"}),
+            optional=frozenset({"evidence_refs"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        path_id = _identifier(request["expected_path_id"], "expected_path_id")
+        role = _identifier(request["adopted_by_role"], "adopted_by_role").upper()
+        if role != "USER":
+            raise UniverseError("EXPECTED_PATH_USER_ADOPTION_REQUIRED", "only USER may adopt an Expected Path", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_feature_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("FEATURE_REVISION_INVALID", "expected_feature_revision must be a positive integer")
+        rationale = _required_text(request["rationale"], "rationale")
+        refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+        now = utc_now()
+        with self._connection() as connection:
+            feature = connection.execute("SELECT * FROM feature_node WHERE feature_id = ?", (fid,)).fetchone()
+            if feature is None:
+                raise UniverseError("FEATURE_NODE_NOT_FOUND", "Feature Node does not exist", HTTPStatus.NOT_FOUND)
+            existing = connection.execute("SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)).fetchone()
+            if existing is not None:
+                if existing["expected_path_id"] != path_id:
+                    raise UniverseError("FEATURE_PATH_ALREADY_ADOPTED", "Feature Node already adopted another Expected Path", HTTPStatus.CONFLICT)
+                if existing["rationale"] != rationale or json.loads(existing["evidence_refs_json"]) != refs:
+                    raise UniverseError("FEATURE_PATH_ADOPTION_CONFLICT", "adopted path replay contains different decision material", HTTPStatus.CONFLICT)
+                return self._adoption_row(existing), False
+            if int(feature["revision"]) != expected_revision:
+                raise UniverseError("FEATURE_REVISION_CONFLICT", "Feature Node revision changed before adoption", HTTPStatus.CONFLICT)
+            candidates = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE feature_id = ? AND state = 'CANDIDATE' ORDER BY expected_path_id",
+                (fid,),
+            ).fetchall()
+            if len(candidates) < 2:
+                raise UniverseError("EXPECTED_PATH_ALTERNATIVES_REQUIRED", "at least two Expected Path candidates are required before adoption", HTTPStatus.CONFLICT)
+            selected = next((candidate for candidate in candidates if candidate["expected_path_id"] == path_id), None)
+            if selected is None:
+                raise UniverseError("EXPECTED_PATH_NOT_CANDIDATE", "selected Expected Path is not a candidate for this Feature Node", HTTPStatus.CONFLICT)
+            adoption_id = "feature_adoption_" + _json_sha256({"feature_id": fid, "expected_path_id": path_id})[:24]
+            connection.execute(
+                "INSERT INTO feature_path_adoption(adoption_id, feature_id, expected_path_id, adopted_by_role, rationale, evidence_refs_json, adopted_at) VALUES (?, ?, ?, 'USER', ?, ?, ?)",
+                (adoption_id, fid, path_id, rationale, _canonical_json(refs), now),
+            )
+            connection.execute(
+                "UPDATE feature_expected_path SET state = CASE WHEN expected_path_id = ? THEN 'ADOPTED' ELSE 'NOT_SELECTED' END, updated_at = ? WHERE feature_id = ? AND state = 'CANDIDATE'",
+                (path_id, now, fid),
+            )
+            connection.execute(
+                "UPDATE feature_node SET state = 'ADOPTED', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (now, fid),
+            )
+            adoption = connection.execute("SELECT * FROM feature_path_adoption WHERE adoption_id = ?", (adoption_id,)).fetchone()
+        return self._adoption_row(adoption), True
+
+    def materialize_feature_goal(
+        self, feature_id: str, value: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_goal_materialization",
+            required=frozenset({"expected_feature_revision", "created_by_role"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        role = _identifier(request["created_by_role"], "created_by_role").upper()
+        if role != "USER":
+            raise UniverseError(
+                "FEATURE_GOAL_USER_ACTION_REQUIRED",
+                "only USER may materialize a Goal from an adopted Expected Path",
+                HTTPStatus.FORBIDDEN,
+            )
+        expected_revision = request["expected_feature_revision"]
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise UniverseError(
+                "FEATURE_REVISION_INVALID",
+                "expected_feature_revision must be a positive integer",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            feature = connection.execute(
+                "SELECT * FROM feature_node WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if feature is None:
                 raise UniverseError(
-                    "TODO_ID_CONFLICT",
-                    "todo_id already exists",
+                    "FEATURE_NODE_NOT_FOUND",
+                    "Feature Node does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if feature["state"] != "ADOPTED":
+                raise UniverseError(
+                    "FEATURE_PATH_ADOPTION_REQUIRED",
+                    "Feature Node requires an explicit USER Expected Path adoption before Goal materialization",
                     HTTPStatus.CONFLICT,
-                ) from error
-        return self.get_todo(todo_id)
+                )
+            if int(feature["revision"]) != expected_revision:
+                raise UniverseError(
+                    "FEATURE_REVISION_CONFLICT",
+                    "Feature Node revision changed before Goal materialization",
+                    HTTPStatus.CONFLICT,
+                )
+            adoption = connection.execute(
+                "SELECT * FROM feature_path_adoption WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if adoption is None:
+                raise UniverseError(
+                    "FEATURE_PATH_ADOPTION_REQUIRED",
+                    "Feature Node has no adopted Expected Path",
+                    HTTPStatus.CONFLICT,
+                )
+            path = connection.execute(
+                "SELECT * FROM feature_expected_path WHERE expected_path_id = ?",
+                (adoption["expected_path_id"],),
+            ).fetchone()
+            if path is None or path["state"] != "ADOPTED":
+                raise UniverseError(
+                    "FEATURE_ADOPTED_PATH_INVALID",
+                    "Feature adoption no longer resolves to an adopted Expected Path",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if existing is not None:
+                goal_row = connection.execute(
+                    "SELECT * FROM project_goal WHERE goal_id = ?", (existing["goal_id"],)
+                ).fetchone()
+                if goal_row is None:
+                    raise UniverseError(
+                        "FEATURE_GOAL_PROVENANCE_INVALID",
+                        "Feature Goal provenance no longer resolves to a Goal",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._feature_goal_derivation_row(existing),
+                    self._goal_row(goal_row),
+                    False,
+                )
+            goal_id = "goal_" + _json_sha256(
+                {
+                    "feature_id": fid,
+                    "adoption_id": adoption["adoption_id"],
+                    "expected_path_id": path["expected_path_id"],
+                    "specification_digest": path["specification_digest"],
+                }
+            )[:24]
+            title = _required_text(feature["title"], "title")[:160]
+            description = "\n".join(
+                (
+                    f"Feature intent: {feature['intent_text']}",
+                    f"Adopted Expected Path: {path['title']}",
+                    f"Path summary: {path['summary']}",
+                    (
+                        "Specification provenance: "
+                        f"revision {path['artifact_revision']} · sha256 {path['specification_digest']}"
+                    ),
+                    f"Source: universe://feature-nodes/{fid}/expected-paths/{path['expected_path_id']}",
+                )
+            )[:4000]
+            next_sort_order = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sort_order), -10) + 10 FROM project_goal WHERE project_id = ?",
+                    (feature["project_id"],),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, 'PROJECT', NULL, NULL, ?, ?, 'UNASSIGNED', 'DESIGNING', ?, 1, ?, ?)",
+                (
+                    goal_id,
+                    feature["project_id"],
+                    title,
+                    description,
+                    next_sort_order,
+                    now,
+                    now,
+                ),
+            )
+            ensure_template_instance(
+                connection,
+                project_id=str(feature["project_id"]),
+                scope_kind="GOAL",
+                scope_ref=goal_id,
+                goal_id=goal_id,
+                node_ref=None,
+                title=title,
+                template=project_seed_template()["work_model"],
+                now=now,
+            )
+            derivation_id = "feature_goal_" + _json_sha256(
+                {"feature_id": fid, "goal_id": goal_id}
+            )[:24]
+            connection.execute(
+                "INSERT INTO feature_goal_derivation(derivation_id, feature_id, adoption_id, expected_path_id, goal_id, artifact_revision, specification_digest, created_by_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'USER', ?)",
+                (
+                    derivation_id,
+                    fid,
+                    adoption["adoption_id"],
+                    path["expected_path_id"],
+                    goal_id,
+                    path["artifact_revision"],
+                    path["specification_digest"],
+                    now,
+                ),
+            )
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE derivation_id = ?",
+                (derivation_id,),
+            ).fetchone()
+            goal_row = connection.execute(
+                "SELECT * FROM project_goal WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+        return (
+            self._feature_goal_derivation_row(derivation),
+            self._goal_row(goal_row),
+            True,
+        )
+
+    def start_feature_goal(
+        self, feature_id: str, value: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="feature_goal_start",
+            required=frozenset(
+                {
+                    "expected_path_id",
+                    "expected_feature_revision",
+                    "expected_path_digest",
+                    "approved_scope",
+                    "constraints",
+                    "validation",
+                    "local_commit_policy",
+                    "push_policy",
+                    "rationale",
+                    "started_by_role",
+                }
+            ),
+            optional=frozenset({"evidence_refs"}),
+        )
+        fid = _identifier(feature_id, "feature_id")
+        role = _identifier(request["started_by_role"], "started_by_role").upper()
+        if role != "USER":
+            raise UniverseError(
+                "GOAL_START_USER_ACTION_REQUIRED",
+                "only USER may create a Goal Start Receipt",
+                HTTPStatus.FORBIDDEN,
+            )
+        path_id = _identifier(request["expected_path_id"], "expected_path_id")
+        expected_revision = request["expected_feature_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("FEATURE_REVISION_INVALID", "expected_feature_revision must be a positive integer")
+        path_digest = _required_text(request["expected_path_digest"], "expected_path_digest").lower()
+        if re.fullmatch(r"[0-9a-f]{64}", path_digest) is None:
+            raise UniverseError("EXPECTED_PATH_DIGEST_INVALID", "expected_path_digest must be a sha256 digest")
+        scope = _exact_object_fields(
+            request["approved_scope"],
+            field="approved_scope",
+            required=frozenset({"project_id"}),
+            optional=frozenset({"node_refs", "write_roots"}),
+        )
+        approved_scope = {
+            "project_id": _identifier(scope["project_id"], "approved_scope.project_id"),
+            "node_refs": _string_array(scope.get("node_refs") or [], "approved_scope.node_refs"),
+            "write_roots": _string_array(scope.get("write_roots") or [], "approved_scope.write_roots"),
+        }
+        constraints = _string_array(request["constraints"], "constraints")
+        validation = _string_array(request["validation"], "validation")
+        if not constraints or not validation or len(constraints) > 30 or len(validation) > 30:
+            raise UniverseError("GOAL_START_BOUNDARY_INVALID", "constraints and validation require 1..30 entries")
+        local_commit_policy = _identifier(request["local_commit_policy"], "local_commit_policy").upper()
+        if local_commit_policy not in {"LOCAL_COMMITS_ALLOWED", "LOCAL_COMMITS_PROHIBITED"}:
+            raise UniverseError("GOAL_START_COMMIT_POLICY_INVALID", "local_commit_policy is invalid")
+        push_policy = _identifier(request["push_policy"], "push_policy").upper()
+        if push_policy != "PUSH_PROHIBITED":
+            raise UniverseError("GOAL_START_PUSH_POLICY_INVALID", "Goal Start must keep push prohibited")
+        rationale = _required_text(request["rationale"], "rationale")
+        evidence_refs = self._feature_refs(request.get("evidence_refs"), "evidence_refs")
+
+        feature = self.get_feature_node(fid)
+        if approved_scope["project_id"] != feature["project_id"]:
+            raise UniverseError("GOAL_START_SCOPE_MISMATCH", "approved scope must match the Feature project", HTTPStatus.CONFLICT)
+        with self._connection() as connection:
+            path = connection.execute(
+                "SELECT path.*, route.route_digest FROM feature_expected_path path "
+                "LEFT JOIN feature_expected_path_route route ON route.expected_path_id = path.expected_path_id "
+                "WHERE path.expected_path_id = ? AND path.feature_id = ?",
+                (path_id, fid),
+            ).fetchone()
+            existing = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE feature_id = ?", (fid,)
+            ).fetchone()
+        if path is None:
+            raise UniverseError("EXPECTED_PATH_NOT_FOUND", "Expected Path does not belong to this Feature", HTTPStatus.NOT_FOUND)
+        if path["route_digest"] is None:
+            raise UniverseError("EXPECTED_PATH_ROUTE_REQUIRED", "Goal Start requires a structured Expected Path route", HTTPStatus.CONFLICT)
+        if str(path["route_digest"]) != path_digest:
+            raise UniverseError("EXPECTED_PATH_DIGEST_CONFLICT", "Expected Path digest changed before Goal Start", HTTPStatus.CONFLICT)
+
+        material = (
+            path_id,
+            expected_revision,
+            path_digest,
+            approved_scope,
+            constraints,
+            validation,
+            local_commit_policy,
+            push_policy,
+            rationale,
+            evidence_refs,
+        )
+        if existing is not None:
+            current = self._feature_goal_start_receipt_row(existing)
+            actual = (
+                current["expected_path_id"],
+                current["expected_feature_revision"],
+                current["expected_path_digest"],
+                current["approved_scope"],
+                current["constraints"],
+                current["validation"],
+                current["local_commit_policy"],
+                current["push_policy"],
+                current["rationale"],
+                current["evidence_refs"],
+            )
+            if actual != material:
+                raise UniverseError("GOAL_START_RECEIPT_CONFLICT", "Goal Start replay contains different authority material", HTTPStatus.CONFLICT)
+            adoption = feature.get("adoption")
+            derivation = feature.get("goal_derivation")
+            if adoption is None or derivation is None:
+                raise UniverseError("GOAL_START_PROVENANCE_INVALID", "Goal Start Receipt lost its adoption or Goal provenance", HTTPStatus.CONFLICT)
+            return current, adoption, derivation, derivation["goal"], False
+
+        if int(feature["revision"]) != expected_revision:
+            raise UniverseError("FEATURE_REVISION_CONFLICT", "Feature Node revision changed before Goal Start", HTTPStatus.CONFLICT)
+        adoption, _ = self.adopt_feature_expected_path(
+            fid,
+            {
+                "expected_path_id": path_id,
+                "expected_feature_revision": expected_revision,
+                "rationale": rationale,
+                "adopted_by_role": "USER",
+                "evidence_refs": evidence_refs,
+            },
+        )
+        adopted_feature = self.get_feature_node(fid)
+        derivation, goal, _ = self.materialize_feature_goal(
+            fid,
+            {
+                "expected_feature_revision": adopted_feature["revision"],
+                "created_by_role": "USER",
+            },
+        )
+        receipt_id = "goal_start_" + _json_sha256(
+            {"feature_id": fid, "expected_path_id": path_id, "expected_path_digest": path_digest}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO feature_goal_start_receipt(receipt_id, feature_id, adoption_id, expected_path_id, goal_id, expected_feature_revision, expected_path_digest, approved_scope_json, constraints_json, validation_json, local_commit_policy, push_policy, rationale, evidence_refs_json, started_by_role, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'USER', ?)",
+                (
+                    receipt_id, fid, adoption["adoption_id"], path_id, goal["goal_id"], expected_revision,
+                    path_digest, _canonical_json(approved_scope), _canonical_json(constraints),
+                    _canonical_json(validation), local_commit_policy, push_policy, rationale,
+                    _canonical_json(evidence_refs), now,
+                ),
+            )
+            receipt_row = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+        return self._feature_goal_start_receipt_row(receipt_row), adoption, derivation, goal, True
+
+    def goal_work_plan_surface(self, goal_id: str) -> dict[str, Any]:
+        goal = self.get_goal(goal_id)
+        with self._connection() as connection:
+            derivation = connection.execute(
+                "SELECT * FROM feature_goal_derivation WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            candidates = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? ORDER BY created_at, work_plan_id",
+                (goal["goal_id"],),
+            ).fetchall()
+            adoption = connection.execute(
+                "SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            application = connection.execute(
+                "SELECT * FROM goal_work_plan_application WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_WORK_PLANS_COLLECTED",
+            "goal": goal,
+            "feature_goal_derivation": self._feature_goal_derivation_row(derivation) if derivation is not None else None,
+            "candidates": [self._goal_work_plan_row(row) for row in candidates],
+            "adoption": self._goal_work_plan_adoption_row(adoption) if adoption is not None else None,
+            "application": self._goal_work_plan_application_row(application) if application is not None else None,
+        }
+
+    def find_goal_start_receipt_for_goal(self, goal_id: str) -> dict[str, Any] | None:
+        gid = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_goal_start_receipt WHERE goal_id = ?", (gid,)
+            ).fetchone()
+        return self._feature_goal_start_receipt_row(row) if row is not None else None
+
+    def materialize_goal_start_work_plan(self, goal_id: str) -> tuple[dict[str, Any], bool]:
+        goal = self.get_goal(goal_id)
+        existing_surface = self.goal_work_plan_surface(goal["goal_id"])
+        if existing_surface["application"] is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "GOAL_START_WORK_PLAN_REPLAYED",
+                "goal_start_receipt": self.find_goal_start_receipt_for_goal(goal["goal_id"]),
+                "work_plan": existing_surface,
+            }, False
+        with self._connection() as connection:
+            source = connection.execute(
+                "SELECT receipt.*, feature.title AS feature_title, path.title AS path_title, "
+                "path.summary AS path_summary, path.room_id, route.route_json "
+                "FROM feature_goal_start_receipt receipt "
+                "JOIN feature_node feature ON feature.feature_id = receipt.feature_id "
+                "JOIN feature_expected_path path ON path.expected_path_id = receipt.expected_path_id "
+                "JOIN feature_expected_path_route route ON route.expected_path_id = path.expected_path_id "
+                "WHERE receipt.goal_id = ?",
+                (goal["goal_id"],),
+            ).fetchone()
+        if source is None:
+            raise UniverseError(
+                "GOAL_START_RECEIPT_REQUIRED",
+                "automatic Work Plan materialization requires an active Goal Start Receipt",
+                HTTPStatus.CONFLICT,
+            )
+        route = normalize_expected_path_route(json.loads(source["route_json"]))
+        dependencies_by_step: dict[str, list[str]] = {}
+        for dependency in route["dependencies"]:
+            dependencies_by_step.setdefault(dependency["to_step_id"], []).append(
+                f"{dependency['kind']} {dependency['from_step_id']}"
+            )
+        acceptance = "; ".join(route["acceptance_conditions"])[:1000]
+        if not acceptance:
+            acceptance = "Complete the pinned Expected Path step and retain validation evidence."
+        steps = list(route["steps"])
+        milestones: list[dict[str, Any]] = []
+        for offset in range(0, len(steps), 4):
+            chunk = steps[offset : offset + 4]
+            phase_names = list(dict.fromkeys(str(step.get("phase") or "Delivery") for step in chunk))
+            title = " / ".join(phase_names)[:160]
+            todos = []
+            for step in chunk:
+                dependency_text = ", ".join(dependencies_by_step.get(step["step_id"], [])) or "None"
+                detail = (
+                    f"Expected Path step: {step['step_id']}\n"
+                    f"Phase: {step.get('phase') or 'Delivery'}\n"
+                    f"Summary: {step['summary']}\n"
+                    f"Dependencies: {dependency_text}\n"
+                    f"Route digest: {source['expected_path_digest']}\n"
+                    f"Goal Start Receipt: {source['receipt_id']}"
+                )[:3000]
+                todos.append(
+                    {
+                        "title": step["title"],
+                        "detail": detail,
+                        "acceptance": acceptance,
+                        "priority": "AUTO",
+                    }
+                )
+            milestones.append(
+                {
+                    "title": title,
+                    "description": (
+                        f"Deterministic projection of Expected Path steps {offset + 1} through "
+                        f"{offset + len(chunk)} under Goal Start Receipt {source['receipt_id']}."
+                    ),
+                    "todos": todos,
+                }
+            )
+        plan = normalize_goal_work_plan(
+            {
+                "title": f"{source['feature_title']} · adopted route",
+                "summary": source["path_summary"],
+                "milestones": milestones,
+            }
+        )
+        plan_digest = _json_sha256(plan)
+        work_plan_id = "work_plan_" + _json_sha256(
+            {"goal_id": goal["goal_id"], "receipt_id": source["receipt_id"], "plan_digest": plan_digest}
+        )[:24]
+        adoption_id = "work_plan_adoption_" + _json_sha256(
+            {"goal_id": goal["goal_id"], "work_plan_id": work_plan_id}
+        )[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            candidate = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ?", (work_plan_id,)
+            ).fetchone()
+            if candidate is None:
+                connection.execute(
+                    "INSERT INTO goal_work_plan_candidate(work_plan_id, goal_id, feature_id, room_id, run_id, source_message_id, author_binding_id, plan_digest, plan_json, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ADOPTED', ?, ?)",
+                    (
+                        work_plan_id, goal["goal_id"], source["feature_id"], source["room_id"],
+                        source["receipt_id"], source["receipt_id"], source["receipt_id"],
+                        plan_digest, _canonical_json(plan), now, now,
+                    ),
+                )
+            elif candidate["plan_digest"] != plan_digest:
+                raise UniverseError(
+                    "GOAL_START_WORK_PLAN_CONFLICT",
+                    "Goal Start Work Plan replay produced different material",
+                    HTTPStatus.CONFLICT,
+                )
+            adoption = connection.execute(
+                "SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (goal["goal_id"],)
+            ).fetchone()
+            if adoption is None:
+                connection.execute(
+                    "INSERT INTO goal_work_plan_adoption(adoption_id, goal_id, work_plan_id, adopted_by_role, rationale, adopted_at) "
+                    "VALUES (?, ?, ?, 'USER', ?, ?)",
+                    (
+                        adoption_id,
+                        goal["goal_id"],
+                        work_plan_id,
+                        f"Authorized by Goal Start Receipt {source['receipt_id']}: {source['rationale']}",
+                        now,
+                    ),
+                )
+            elif adoption["work_plan_id"] != work_plan_id:
+                raise UniverseError(
+                    "GOAL_START_WORK_PLAN_CONFLICT",
+                    "Goal already has a different Work Plan adoption",
+                    HTTPStatus.CONFLICT,
+                )
+        application, applied = self.apply_goal_work_plan(
+            goal["goal_id"],
+            {"expected_goal_revision": goal["revision"], "applied_by_role": "USER"},
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_START_WORK_PLAN_MATERIALIZED" if applied else "GOAL_START_WORK_PLAN_REPLAYED",
+            "goal_start_receipt": self.find_goal_start_receipt_for_goal(goal["goal_id"]),
+            "plan_digest": plan_digest,
+            "application": application,
+            "work_plan": self.goal_work_plan_surface(goal["goal_id"]),
+        }, applied
+
+    def record_goal_work_plan_candidate(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        goal = self.get_goal(goal_id)
+        request = _exact_object_fields(
+            value,
+            field="goal_work_plan_candidate",
+            required=frozenset({"feature_id", "room_id", "run_id", "source_message_id", "author_binding_id", "plan"}),
+        )
+        plan = normalize_goal_work_plan(request["plan"])
+        feature_id = _identifier(request["feature_id"], "feature_id")
+        room_id = _identifier(request["room_id"], "room_id")
+        run_id = _identifier(request["run_id"], "run_id")
+        message_id = _identifier(request["source_message_id"], "source_message_id")
+        binding_id = _identifier(request["author_binding_id"], "author_binding_id")
+        surface = self.goal_work_plan_surface(goal["goal_id"])
+        derivation = surface["feature_goal_derivation"]
+        if derivation is None or derivation["feature_id"] != feature_id:
+            raise UniverseError("GOAL_FEATURE_PROVENANCE_REQUIRED", "Goal is not provenance-bound to this Feature", HTTPStatus.CONFLICT)
+        feature = self.get_feature_node(feature_id)
+        if feature.get("meeting_room_id") != room_id:
+            raise UniverseError("GOAL_WORK_PLAN_ROOM_MISMATCH", "Work Plan must come from the Feature Meeting Room", HTTPStatus.CONFLICT)
+        message = self.multi_rooms.get_message(message_id)
+        if message.get("room_id") != room_id:
+            raise UniverseError("GOAL_WORK_PLAN_MESSAGE_MISMATCH", "Work Plan source message must belong to the Feature Meeting Room", HTTPStatus.CONFLICT)
+        binding = next((item for item in self.multi_rooms.list_bindings(room_id) if item["binding_id"] == binding_id), None)
+        if binding is None:
+            raise UniverseError("GOAL_WORK_PLAN_BINDING_MISMATCH", "Work Plan author binding must belong to the Feature Meeting Room", HTTPStatus.CONFLICT)
+        if message.get("author_role") != "MODEL" or message.get("author_binding_id") != binding_id:
+            raise UniverseError("GOAL_WORK_PLAN_MESSAGE_AUTHOR_MISMATCH", "Work Plan source message must be authored by the recorded MODEL binding", HTTPStatus.CONFLICT)
+        metadata = binding.get("metadata") if isinstance(binding.get("metadata"), Mapping) else {}
+        if not binding.get("provider_session_ref") or not str(metadata.get("provider_chat_key") or "").strip():
+            raise UniverseError("GOAL_WORK_PLAN_BINDING_UNVERIFIED", "Work Plan author binding must retain verified provider session provenance", HTTPStatus.CONFLICT)
+        plan_digest = _json_sha256(plan)
+        work_plan_id = "work_plan_" + _json_sha256({"goal_id": goal["goal_id"], "run_id": run_id, "binding_id": binding_id})[:24]
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? AND run_id = ? AND author_binding_id = ?",
+                (goal["goal_id"], run_id, binding_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["plan_digest"] != plan_digest or existing["source_message_id"] != message_id:
+                    raise UniverseError("GOAL_WORK_PLAN_CANDIDATE_CONFLICT", "candidate replay contains different Work Plan material", HTTPStatus.CONFLICT)
+                return self._goal_work_plan_row(existing), False
+            connection.execute(
+                "INSERT INTO goal_work_plan_candidate(work_plan_id, goal_id, feature_id, room_id, run_id, source_message_id, author_binding_id, plan_digest, plan_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, ?)",
+                (work_plan_id, goal["goal_id"], feature_id, room_id, run_id, message_id, binding_id, plan_digest, _canonical_json(plan), now, now),
+            )
+            row = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ?", (work_plan_id,)).fetchone()
+        return self._goal_work_plan_row(row), True
+
+    def adopt_goal_work_plan(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="goal_work_plan_adoption",
+            required=frozenset({"work_plan_id", "expected_goal_revision", "rationale", "adopted_by_role"}),
+        )
+        gid = _identifier(goal_id, "goal_id")
+        work_plan_id = _identifier(request["work_plan_id"], "work_plan_id")
+        if _identifier(request["adopted_by_role"], "adopted_by_role").upper() != "USER":
+            raise UniverseError("GOAL_WORK_PLAN_USER_ADOPTION_REQUIRED", "only USER may adopt a Goal Work Plan", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_goal_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("GOAL_REVISION_INVALID", "expected_goal_revision must be a positive integer")
+        rationale = _required_text(request["rationale"], "rationale")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute("SELECT * FROM project_goal WHERE goal_id = ?", (gid,)).fetchone()
+            if goal is None: raise UniverseError("GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND)
+            if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan adoption requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+            if int(goal["revision"]) != expected_revision: raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed before Work Plan adoption", HTTPStatus.CONFLICT)
+            existing = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (gid,)).fetchone()
+            if existing is not None:
+                if existing["work_plan_id"] != work_plan_id or existing["rationale"] != rationale:
+                    raise UniverseError("GOAL_WORK_PLAN_ALREADY_ADOPTED", "Goal already adopted different Work Plan material", HTTPStatus.CONFLICT)
+                return self._goal_work_plan_adoption_row(existing), False
+            candidates = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE goal_id = ? AND state = 'CANDIDATE'", (gid,)).fetchall()
+            if len(candidates) < 2: raise UniverseError("GOAL_WORK_PLAN_ALTERNATIVES_REQUIRED", "at least two Work Plan candidates are required", HTTPStatus.CONFLICT)
+            if not any(row["work_plan_id"] == work_plan_id for row in candidates): raise UniverseError("GOAL_WORK_PLAN_NOT_CANDIDATE", "selected Work Plan is not a candidate", HTTPStatus.CONFLICT)
+            adoption_id = "work_plan_adoption_" + _json_sha256({"goal_id": gid, "work_plan_id": work_plan_id})[:24]
+            connection.execute("INSERT INTO goal_work_plan_adoption(adoption_id, goal_id, work_plan_id, adopted_by_role, rationale, adopted_at) VALUES (?, ?, ?, 'USER', ?, ?)", (adoption_id, gid, work_plan_id, rationale, now))
+            connection.execute("UPDATE goal_work_plan_candidate SET state = CASE WHEN work_plan_id = ? THEN 'ADOPTED' ELSE 'NOT_SELECTED' END, updated_at = ? WHERE goal_id = ? AND state = 'CANDIDATE'", (work_plan_id, now, gid))
+            row = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE adoption_id = ?", (adoption_id,)).fetchone()
+        return self._goal_work_plan_adoption_row(row), True
+
+    def apply_goal_work_plan(self, goal_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(value, field="goal_work_plan_application", required=frozenset({"expected_goal_revision", "applied_by_role"}))
+        gid = _identifier(goal_id, "goal_id")
+        if _identifier(request["applied_by_role"], "applied_by_role").upper() != "USER":
+            raise UniverseError("GOAL_WORK_PLAN_USER_APPLY_REQUIRED", "only USER may apply an adopted Goal Work Plan", HTTPStatus.FORBIDDEN)
+        expected_revision = request["expected_goal_revision"]
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise UniverseError("GOAL_REVISION_INVALID", "expected_goal_revision must be a positive integer")
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            goal = connection.execute("SELECT * FROM project_goal WHERE goal_id = ?", (gid,)).fetchone()
+            if goal is None: raise UniverseError("GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND)
+            if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan application requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+            if int(goal["revision"]) != expected_revision: raise UniverseError("GOAL_REVISION_CONFLICT", "Goal revision changed before Work Plan application", HTTPStatus.CONFLICT)
+            existing = connection.execute("SELECT * FROM goal_work_plan_application WHERE goal_id = ?", (gid,)).fetchone()
+            if existing is not None: return self._goal_work_plan_application_row(existing), False
+            adoption = connection.execute("SELECT * FROM goal_work_plan_adoption WHERE goal_id = ?", (gid,)).fetchone()
+            if adoption is None: raise UniverseError("GOAL_WORK_PLAN_ADOPTION_REQUIRED", "adopt a Work Plan before applying it", HTTPStatus.CONFLICT)
+            candidate = connection.execute("SELECT * FROM goal_work_plan_candidate WHERE work_plan_id = ? AND state = 'ADOPTED'", (adoption["work_plan_id"],)).fetchone()
+            if candidate is None: raise UniverseError("GOAL_WORK_PLAN_ADOPTION_INVALID", "adopted Work Plan is unavailable", HTTPStatus.CONFLICT)
+            plan = normalize_goal_work_plan(json.loads(candidate["plan_json"]))
+            milestone_ids=[]; todo_ids=[]
+            for mi, milestone in enumerate(plan["milestones"]):
+                milestone_id="milestone_"+_json_sha256({"work_plan_id":candidate["work_plan_id"],"milestone":mi})[:24]
+                connection.execute("INSERT INTO project_milestone(milestone_id, goal_id, title, description, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, ?, ?, 'PLANNED', ?, 1, ?, ?)", (milestone_id,gid,milestone["title"],milestone["description"],mi*10,now,now))
+                milestone_ids.append(milestone_id)
+                for ti, item in enumerate(milestone["todos"]):
+                    todo_id="todo_"+_json_sha256({"work_plan_id":candidate["work_plan_id"],"milestone":mi,"todo":ti})[:24]
+                    todo={"scope_kind":"PROJECT","project_id":goal["project_id"],"node_ref":None,"universe_goal_id":goal["universe_goal_id"],"goal_id":gid,"milestone_id":milestone_id,"title":item["title"],"detail":f"{item['detail']}\n\nAcceptance: {item['acceptance']}","priority":item["priority"],"state":"BACKLOG","source_kind":"USER","sort_order":ti*10}
+                    if todo["priority"] == "AUTO": todo["priority"] = infer_todo_priority(todo)["priority"]
+                    self._insert_todo(connection,todo_id,todo,now)
+                    todo_ids.append(todo_id)
+            created_items={"milestone_ids":milestone_ids,"todo_ids":todo_ids,"milestone_count":len(milestone_ids),"todo_count":len(todo_ids)}
+            application_id="work_plan_application_"+_json_sha256({"goal_id":gid,"work_plan_id":candidate["work_plan_id"]})[:24]
+            connection.execute("INSERT INTO goal_work_plan_application(application_id, goal_id, adoption_id, work_plan_id, applied_by_role, created_items_json, applied_at) VALUES (?, ?, ?, ?, 'USER', ?, ?)", (application_id,gid,adoption["adoption_id"],candidate["work_plan_id"],_canonical_json(created_items),now))
+            connection.execute("UPDATE goal_work_plan_candidate SET state = 'APPLIED', updated_at = ? WHERE work_plan_id = ?", (now,candidate["work_plan_id"]))
+            row=connection.execute("SELECT * FROM goal_work_plan_application WHERE application_id = ?",(application_id,)).fetchone()
+        return self._goal_work_plan_application_row(row), True
 
     def list_todos(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
+                SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
                        created_at, updated_at
                 FROM project_todo
@@ -7916,7 +12546,7 @@ class UniverseStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT todo_id, scope_kind, project_id, node_ref, goal_id, milestone_id, title, detail,
+                SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
                        created_at, updated_at
                 FROM project_todo
@@ -7935,6 +12565,8 @@ class UniverseStore:
     def update_todo(self, todo_id: str, value: Any) -> dict[str, Any]:
         normalized_id = _identifier(todo_id, "todo_id")
         todo = normalize_todo(value, updating=True)
+        if todo["priority"] == "AUTO":
+            todo["priority"] = infer_todo_priority(todo)["priority"]
         if "todo_id" in todo and todo["todo_id"] != normalized_id:
             raise UniverseError(
                 "TODO_ID_MISMATCH",
@@ -7948,7 +12580,7 @@ class UniverseStore:
             cursor = connection.execute(
                 """
                 UPDATE project_todo
-                SET scope_kind = ?, project_id = ?, node_ref = ?, goal_id = ?, milestone_id = ?, title = ?,
+                SET scope_kind = ?, project_id = ?, node_ref = ?, universe_goal_id = ?, goal_id = ?, milestone_id = ?, title = ?,
                     detail = ?, priority = ?, state = ?, source_kind = ?,
                     sort_order = ?, revision = revision + 1, updated_at = ?
                 WHERE todo_id = ? AND revision = ?
@@ -7957,6 +12589,7 @@ class UniverseStore:
                     todo["scope_kind"],
                     todo["project_id"],
                     todo["node_ref"],
+                    todo["universe_goal_id"],
                     todo["goal_id"],
                     todo["milestone_id"],
                     todo["title"],
@@ -7993,6 +12626,513 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return {"todo_id": normalized, "deleted": True}
+
+    @staticmethod
+    def _intent_routing_error(error: IntentRoutingError) -> UniverseError:
+        status = HTTPStatus.CONFLICT if error.code in {
+            "INTENT_DECISION_STALE",
+            "INTENT_TARGET_AMBIGUOUS",
+            "SKILL_RESOLUTION_AMBIGUOUS",
+            "SKILL_EFFECT_MISMATCH",
+            "FALLBACK_HANDLER_UNAVAILABLE",
+            "CAPABILITY_UNAVAILABLE",
+            "SKILL_CANDIDATE_SUPPORT_INSUFFICIENT",
+        } else HTTPStatus.BAD_REQUEST
+        return UniverseError(error.code, error.detail, status)
+
+    def create_intent_decision(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            decision = normalize_intent_decision(value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT decision_json FROM intent_decision WHERE decision_id = ?",
+                (decision["decision_id"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["decision_json"]), False
+            connection.execute(
+                """
+                INSERT INTO intent_decision(
+                    decision_id, session_id, frame_id, anchor_id, project_id,
+                    node_ref, intent_class, required_capability, effect_class,
+                    decision_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision["decision_id"], decision["session_id"],
+                    decision["frame_id"], decision["anchor_id"],
+                    decision.get("project_id"), decision.get("node_ref"),
+                    decision["intent_class"], decision["required_capability"],
+                    decision["effect_class"], _canonical_json(decision), now,
+                ),
+            )
+        return decision, True
+
+    def register_skill_registry_snapshot(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            snapshot = normalize_registry_snapshot(value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT snapshot_json FROM skill_registry_snapshot WHERE registry_digest = ?",
+                (snapshot["registry_digest"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["snapshot_json"]), False
+            connection.execute(
+                "INSERT INTO skill_registry_snapshot(snapshot_id, registry_digest, snapshot_json, created_at) VALUES (?, ?, ?, ?)",
+                (snapshot["snapshot_id"], snapshot["registry_digest"], _canonical_json(snapshot), now),
+            )
+        return snapshot, True
+
+    def list_skill_registry_snapshots(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT snapshot_json, created_at FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC"
+            ).fetchall()
+        return [{**json.loads(row["snapshot_json"]), "created_at": row["created_at"]} for row in rows]
+
+    @staticmethod
+    def _public_skill_pack_artifact(row: sqlite3.Row) -> dict[str, Any]:
+        artifact = json.loads(row["artifact_json"])
+        return {
+            "schema": "universe.skill-pack-artifact-import.v1",
+            "status": "VERIFIED",
+            "artifact_digest": row["artifact_sha256"],
+            "pack_id": row["pack_id"],
+            "pack_version": row["pack_version"],
+            "byte_length": len(canonical_skill_pack_artifact_bytes(artifact)),
+            "file_count": len(artifact["files"]),
+            "imported_at": row["imported_at"],
+        }
+
+    def _verify_skill_pack_artifact_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        expected_pack_id: str | None = None,
+        expected_version: str | None = None,
+    ) -> dict[str, Any]:
+        digest_value = row["artifact_sha256"]
+        expected_path = (self.skill_pack_artifact_root / f"{digest_value}.skillpack.json").resolve()
+        recorded_path = Path(row["artifact_path"]).resolve()
+        if recorded_path != expected_path or recorded_path.parent != self.skill_pack_artifact_root.resolve():
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact path is outside the canonical digest-addressed location",
+                HTTPStatus.CONFLICT,
+            )
+        if not recorded_path.is_file():
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact is missing or not a regular file",
+                HTTPStatus.CONFLICT,
+            )
+        payload = recorded_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != digest_value:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact digest does not match its identity",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+            artifact = normalize_skill_pack_artifact(parsed)
+            canonical = canonical_skill_pack_artifact_bytes(artifact)
+        except (UnicodeDecodeError, json.JSONDecodeError, IntentRoutingError) as error:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact is not a valid canonical artifact",
+                HTTPStatus.CONFLICT,
+            ) from error
+        if canonical != payload or _canonical_json(artifact) != row["artifact_json"]:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "stored Skill Pack artifact bytes are not canonical",
+                HTTPStatus.CONFLICT,
+            )
+        if expected_pack_id is not None and artifact["pack_id"] != expected_pack_id:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_IDENTITY_MISMATCH",
+                "stored artifact pack_id does not match the release manifest",
+                HTTPStatus.CONFLICT,
+            )
+        if expected_version is not None and artifact["version"] != expected_version:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_IDENTITY_MISMATCH",
+                "stored artifact version does not match the release manifest",
+                HTTPStatus.CONFLICT,
+            )
+        return artifact
+
+    def import_skill_pack_artifact(self, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            artifact = normalize_skill_pack_artifact(value)
+            payload = canonical_skill_pack_artifact_bytes(artifact)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        artifact_digest = hashlib.sha256(payload).hexdigest()
+        artifact_path = (self.skill_pack_artifact_root / f"{artifact_digest}.skillpack.json").resolve()
+        now = utc_now()
+        with self._connection() as connection:
+            version_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE pack_id = ? AND pack_version = ?",
+                (artifact["pack_id"], artifact["version"]),
+            ).fetchone()
+            if version_row is not None:
+                if version_row["artifact_sha256"] != artifact_digest:
+                    raise UniverseError(
+                        "SKILL_PACK_ARTIFACT_VERSION_CONFLICT",
+                        "pack_id and version already refer to a different artifact",
+                        HTTPStatus.CONFLICT,
+                    )
+                self._verify_skill_pack_artifact_row(version_row)
+                return self._public_skill_pack_artifact(version_row), False
+            digest_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (artifact_digest,),
+            ).fetchone()
+            if digest_row is not None:
+                self._verify_skill_pack_artifact_row(digest_row)
+                return self._public_skill_pack_artifact(digest_row), False
+            if artifact_path.exists():
+                if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact_digest:
+                    raise UniverseError(
+                        "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                        "digest-addressed Skill Pack artifact path contains different bytes",
+                        HTTPStatus.CONFLICT,
+                    )
+            else:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{artifact_digest}.", suffix=".tmp", dir=self.skill_pack_artifact_root
+                )
+                temporary_path = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary_path, artifact_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            connection.execute(
+                "INSERT INTO skill_pack_artifact(artifact_sha256, pack_id, pack_version, artifact_path, artifact_json, imported_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    artifact_digest,
+                    artifact["pack_id"],
+                    artifact["version"],
+                    str(artifact_path),
+                    _canonical_json(artifact),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (artifact_digest,),
+            ).fetchone()
+        if row is None:
+            raise UniverseError(
+                "SKILL_PACK_ARTIFACT_STORAGE_INVALID",
+                "Skill Pack artifact import did not produce a durable record",
+                HTTPStatus.CONFLICT,
+            )
+        self._verify_skill_pack_artifact_row(row)
+        return self._public_skill_pack_artifact(row), True
+
+    def list_skill_pack_artifacts(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM skill_pack_artifact ORDER BY imported_at DESC, artifact_sha256 DESC"
+            ).fetchall()
+        artifacts = []
+        for row in rows:
+            self._verify_skill_pack_artifact_row(row)
+            artifacts.append(self._public_skill_pack_artifact(row))
+        return artifacts
+
+    def adopt_skill_release(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value,
+            field="skill_release_adoption",
+            required=frozenset({"manifest", "actor"}),
+        )
+        actor = _exact_object_fields(
+            request["actor"],
+            field="skill_release_adoption.actor",
+            required=frozenset({"kind", "actor_ref", "decision_ref"}),
+        )
+        actor_kind = _identifier(actor["kind"], "actor.kind").upper()
+        if actor_kind != "USER":
+            raise UniverseError(
+                "SKILL_RELEASE_ADOPTION_USER_REQUIRED",
+                "Skill Release adoption requires an explicit USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        try:
+            manifest = normalize_skill_pack_manifest(request["manifest"])
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        actor_ref = _identifier(actor["actor_ref"], "actor.actor_ref")
+        decision_ref = _identifier(actor["decision_ref"], "actor.decision_ref")
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT adoption_json FROM skill_release_adoption WHERE manifest_digest = ?",
+                (manifest["manifest_digest"],),
+            ).fetchone()
+            version_conflict = connection.execute(
+                "SELECT manifest_digest FROM skill_release_adoption WHERE pack_id = ? AND pack_version = ?",
+                (manifest["pack_id"], manifest["version"]),
+            ).fetchone()
+            if version_conflict is not None and version_conflict["manifest_digest"] != manifest["manifest_digest"]:
+                raise UniverseError(
+                    "SKILL_RELEASE_ADOPTION_VERSION_CONFLICT",
+                    "pack_id and version already refer to a different manifest",
+                    HTTPStatus.CONFLICT,
+                )
+            artifact_row = connection.execute(
+                "SELECT * FROM skill_pack_artifact WHERE artifact_sha256 = ?",
+                (manifest["artifact"]["sha256"],),
+            ).fetchone()
+            if artifact_row is None:
+                raise UniverseError(
+                    "SKILL_PACK_ARTIFACT_NOT_IMPORTED",
+                    "Skill Release adoption requires the referenced artifact to be imported first",
+                    HTTPStatus.CONFLICT,
+                )
+            self._verify_skill_pack_artifact_row(
+                artifact_row,
+                expected_pack_id=manifest["pack_id"],
+                expected_version=manifest["version"],
+            )
+            if existing is not None:
+                return json.loads(existing["adoption_json"]), False
+            current = connection.execute(
+                "SELECT snapshot.snapshot_json FROM skill_registry_current AS current "
+                "JOIN skill_registry_snapshot AS snapshot "
+                "ON snapshot.registry_digest = current.registry_digest "
+                "WHERE current.singleton = 1"
+            ).fetchone()
+            if current is None:
+                current = connection.execute(
+                    "SELECT snapshot_json FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"
+                ).fetchone()
+            previous = (
+                json.loads(current["snapshot_json"])
+                if current is not None
+                else normalize_registry_snapshot(
+                    {"skills": [], "source_ref": "universe://skill-registry/empty"}
+                )
+            )
+            snapshot = build_adopted_registry_snapshot(previous, manifest)
+            connection.execute(
+                "INSERT OR IGNORE INTO skill_registry_snapshot(snapshot_id, registry_digest, snapshot_json, created_at) VALUES (?, ?, ?, ?)",
+                (snapshot["snapshot_id"], snapshot["registry_digest"], _canonical_json(snapshot), now),
+            )
+            adoption = {
+                "schema": SKILL_RELEASE_ADOPTION_SCHEMA,
+                "adoption_id": "skill_adoption_" + manifest["manifest_digest"][:24],
+                "status": "ADOPTED",
+                "manifest_digest": manifest["manifest_digest"],
+                "pack_id": manifest["pack_id"],
+                "pack_version": manifest["version"],
+                "artifact_digest": manifest["artifact"]["sha256"],
+                "previous_registry_digest": previous["registry_digest"],
+                "registry_digest": snapshot["registry_digest"],
+                "actor": {
+                    "kind": actor_kind,
+                    "actor_ref": actor_ref,
+                    "decision_ref": decision_ref,
+                },
+                "manifest": manifest,
+                "effects": {
+                    "authority": "NONE",
+                    "execution_assignment": "NONE",
+                    "runtime_mutation_permission": "NONE",
+                },
+            }
+            connection.execute(
+                "INSERT INTO skill_release_adoption(adoption_id, manifest_digest, pack_id, pack_version, artifact_digest, previous_registry_digest, registry_digest, adoption_json, adopted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    adoption["adoption_id"], adoption["manifest_digest"],
+                    adoption["pack_id"], adoption["pack_version"],
+                    adoption["artifact_digest"], adoption["previous_registry_digest"],
+                    adoption["registry_digest"], _canonical_json(adoption), now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO skill_registry_current(singleton, registry_digest, adoption_id, updated_at) VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET registry_digest = excluded.registry_digest, adoption_id = excluded.adoption_id, updated_at = excluded.updated_at",
+                (adoption["registry_digest"], adoption["adoption_id"], now),
+            )
+        return adoption, True
+
+    def list_skill_release_adoptions(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT adoption_json, adopted_at FROM skill_release_adoption ORDER BY adopted_at DESC, adoption_id DESC"
+            ).fetchall()
+        return [
+            {**json.loads(row["adoption_json"]), "adopted_at": row["adopted_at"]}
+            for row in rows
+        ]
+
+    def _skill_registry_snapshot(self, registry_digest: str | None) -> dict[str, Any]:
+        with self._connection() as connection:
+            if registry_digest:
+                row = connection.execute(
+                    "SELECT snapshot_json FROM skill_registry_snapshot WHERE registry_digest = ?",
+                    (registry_digest,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT snapshot.snapshot_json FROM skill_registry_current AS current "
+                    "JOIN skill_registry_snapshot AS snapshot "
+                    "ON snapshot.registry_digest = current.registry_digest "
+                    "WHERE current.singleton = 1"
+                ).fetchone()
+                if row is None:
+                    row = connection.execute(
+                        "SELECT snapshot_json FROM skill_registry_snapshot ORDER BY created_at DESC, snapshot_id DESC LIMIT 1"
+                    ).fetchone()
+        if row is not None:
+            return json.loads(row["snapshot_json"])
+        if registry_digest:
+            raise UniverseError("SKILL_REGISTRY_UNAVAILABLE", "requested Registry snapshot is unavailable", HTTPStatus.NOT_FOUND)
+        snapshot, _ = self.register_skill_registry_snapshot(
+            {"skills": [], "source_ref": "universe://skill-registry/empty"}
+        )
+        return snapshot
+
+    def get_intent_decision(self, decision_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT decision_json FROM intent_decision WHERE decision_id = ?", (_identifier(decision_id, "decision_id"),)).fetchone()
+        if row is None:
+            raise UniverseError("INTENT_DECISION_NOT_FOUND", "Intent Decision does not exist", HTTPStatus.NOT_FOUND)
+        return json.loads(row["decision_json"])
+
+    def create_skill_resolution(self, value: Any) -> tuple[dict[str, Any], bool]:
+        request = _exact_object_fields(
+            value, field="skill_resolution_request",
+            required=frozenset({"intent_decision_id"}),
+            optional=frozenset({"registry_digest", "explicit_skill_id", "project_id", "node_ref", "available_fallback_handlers"}),
+        )
+        decision = self.get_intent_decision(request["intent_decision_id"])
+        snapshot = self._skill_registry_snapshot(request.get("registry_digest"))
+        options = {key: request[key] for key in ("explicit_skill_id", "project_id", "node_ref", "available_fallback_handlers") if key in request}
+        try:
+            resolution = resolve_skill(decision, snapshot, options)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT resolution_json FROM skill_resolution WHERE resolution_id = ?", (resolution["resolution_id"],)).fetchone()
+            if existing is not None:
+                return json.loads(existing["resolution_json"]), False
+            connection.execute(
+                """
+                INSERT INTO skill_resolution(
+                    resolution_id, intent_decision_id, registry_digest, project_id,
+                    node_ref, required_capability, effect_class,
+                    selected_handler_kind, resolution_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (resolution["resolution_id"], resolution["intent_decision_id"], resolution["registry_digest"], request.get("project_id") or decision.get("project_id"), request.get("node_ref") or decision.get("node_ref"), resolution["required_capability"], resolution["effect_class"], resolution["selected_handler_kind"], _canonical_json(resolution), now),
+            )
+        return resolution, True
+
+    def get_skill_resolution(self, resolution_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT resolution_json FROM skill_resolution WHERE resolution_id = ?", (_identifier(resolution_id, "resolution_id"),)).fetchone()
+        if row is None:
+            raise UniverseError("SKILL_RESOLUTION_NOT_FOUND", "Skill Resolution does not exist", HTTPStatus.NOT_FOUND)
+        return json.loads(row["resolution_json"])
+
+    def run_skill_resolution_fallback(self, resolution_id: str, value: Any) -> dict[str, Any]:
+        try:
+            return execute_plan_fallback(self.get_skill_resolution(resolution_id), value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+
+    def create_skill_gap_observation(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            observation = normalize_gap_observation(project["project_id"], value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        resolution = self.get_skill_resolution(observation["resolution_id"])
+        decision = self.get_intent_decision(observation["intent_decision_id"])
+        if not resolution["fallback_used"] or any((observation["capability"] != resolution["required_capability"], observation["effect_class"] != resolution["effect_class"], observation["fallback_handler"] != resolution["fallback_handler"], observation["output_contract"] != resolution["output_contract"], resolution["intent_decision_id"] != decision["decision_id"])):
+            raise UniverseError("SKILL_GAP_OBSERVATION_INVALID", "observation does not match its fallback Resolution", HTTPStatus.CONFLICT)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT observation_digest, observation_json FROM skill_gap_observation WHERE observation_id = ?", (observation["observation_id"],)).fetchone()
+            if existing is not None:
+                if existing["observation_digest"] != observation["observation_digest"]:
+                    raise UniverseError("SKILL_GAP_OBSERVATION_CONFLICT", "observation_id already refers to different redacted content", HTTPStatus.CONFLICT)
+                return json.loads(existing["observation_json"]), False
+            connection.execute(
+                """
+                INSERT INTO skill_gap_observation(
+                    observation_id, observation_digest, project_id, node_ref,
+                    intent_decision_id, resolution_id, capability, effect_class,
+                    outcome, validation_state, context_fingerprint,
+                    observation_json, observed_at, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (observation["observation_id"], observation["observation_digest"], project["project_id"], observation.get("node_ref"), observation["intent_decision_id"], observation["resolution_id"], observation["capability"], observation["effect_class"], observation["outcome"], observation["validation_state"], observation["context_fingerprint"], _canonical_json(observation), observation["observed_at"], now),
+            )
+        return observation, True
+
+    def list_skill_gap_observations(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute("SELECT observation_json FROM skill_gap_observation WHERE project_id = ? ORDER BY observed_at DESC, observation_id DESC", (project["project_id"],)).fetchall()
+        return [json.loads(row["observation_json"]) for row in rows]
+
+    def skill_gap_summary(self, project_id: str) -> dict[str, Any]:
+        observations = self.list_skill_gap_observations(project_id)
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in observations:
+            key = (item["capability"], item["effect_class"], item["output_contract"])
+            group = groups.setdefault(key, {"capability": key[0], "effect_class": key[1], "output_contract": key[2], "observation_count": 0, "validated_success_count": 0, "failed_count": 0, "distinct_context_count": 0, "_contexts": set()})
+            group["observation_count"] += 1
+            group["validated_success_count"] += int(item["outcome"] == "SUCCESS" and item["validation_state"] == "VALIDATED")
+            group["failed_count"] += int(item["outcome"] == "FAILED")
+            group["_contexts"].add(item["context_fingerprint"])
+        summary = []
+        for group in groups.values():
+            group["distinct_context_count"] = len(group.pop("_contexts"))
+            summary.append(group)
+        return {"schema": "universe.skill-gap-summary.v1", "project_id": project_id, "groups": sorted(summary, key=lambda item: (-item["observation_count"], item["capability"])), "observation_count": len(observations)}
+
+    def create_skill_candidate(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        observations = self.list_skill_gap_observations(project["project_id"])
+        try:
+            candidate = build_skill_candidate(project["project_id"], observations, value)
+        except IntentRoutingError as error:
+            raise self._intent_routing_error(error) from error
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute("SELECT candidate_json FROM skill_candidate WHERE candidate_digest = ?", (candidate["candidate_digest"],)).fetchone()
+            if existing is not None:
+                return json.loads(existing["candidate_json"]), False
+            connection.execute("INSERT INTO skill_candidate(candidate_id, candidate_digest, project_id, capability, candidate_state, threshold_policy_version, candidate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (candidate["candidate_id"], candidate["candidate_digest"], project["project_id"], candidate["capability"], candidate["candidate_state"], candidate["threshold_policy"]["version"], _canonical_json(candidate), now))
+            for observation_id in candidate["supporting_observation_ids"]:
+                connection.execute("INSERT INTO skill_candidate_support(candidate_id, observation_id) VALUES (?, ?)", (candidate["candidate_id"], observation_id))
+        return candidate, True
+
+    def list_skill_candidates(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute("SELECT candidate_json, created_at FROM skill_candidate WHERE project_id = ? ORDER BY created_at DESC, candidate_id DESC", (project["project_id"],)).fetchall()
+        return [{**json.loads(row["candidate_json"]), "created_at": row["created_at"]} for row in rows]
 
     def ingest_skill_observations(
         self, project_id: str, value: Any
@@ -8084,6 +13224,31 @@ class UniverseStore:
                         "observed_at": candidate["observed_at"],
                         "recorded_at": now,
                     }
+                )
+            if rows:
+                latest = rows[-1]
+                connection.execute(
+                    """
+                    INSERT INTO semantic_collection_cursor(
+                        project_id, source_kind, last_event_id, last_event_type,
+                        source_digest, observed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                        last_event_id = excluded.last_event_id,
+                        last_event_type = excluded.last_event_type,
+                        source_digest = excluded.source_digest,
+                        observed_at = excluded.observed_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        project["project_id"],
+                        "BENCH_OBSERVATION",
+                        latest["observation_id"],
+                        "SKILL_RUN_OBSERVATION",
+                        request["candidate_digest"],
+                        candidate["observed_at"],
+                        now,
+                    ),
                 )
         created = not existing_candidate
         return {
@@ -8250,6 +13415,338 @@ class UniverseStore:
             limit=bounded_limit,
         )
 
+    def build_project_llm_retrieval_context(
+        self,
+        project_id: str,
+        *,
+        query: str,
+        node_ids: Sequence[str] | None = None,
+        memory_limit: int = 8,
+        skill_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Retrieve trusted Memory and Bench skill evidence for an LLM turn."""
+
+        project = self.get_project(project_id)
+        ingestion = self.sync_project_lineage_memories(project["project_id"])
+        query_tokens = _retrieval_tokens(query)
+        selected_nodes = {
+            str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()
+        }
+        memory_hits: list[dict[str, Any]] = []
+        for memory in self.list_project_memories(
+            project["project_id"], link_state="LINKED", limit=200
+        ):
+            state = rag_retrieval_state(memory)
+            if state == "SUPERSEDED":
+                continue
+            memory_tokens = _retrieval_tokens(
+                " ".join(
+                    [
+                        str(memory.get("title") or ""),
+                        str(memory.get("body") or ""),
+                        str(memory.get("node_ref") or ""),
+                    ]
+                )
+            )
+            shared = sorted(query_tokens & memory_tokens)
+            node_match = bool(
+                selected_nodes and str(memory.get("node_ref") or "") in selected_nodes
+            )
+            if not shared and not node_match:
+                continue
+            freshness = freshness_metadata(memory.get("updated_at"))
+            memory_hits.append(
+                {
+                    "memory_id": memory["memory_id"],
+                    "title": memory.get("title"),
+                    "body": str(memory.get("body") or "")[:2000],
+                    "node_ref": memory.get("node_ref"),
+                    "graph": memory.get("graph"),
+                    "origin_ref": memory.get("origin_ref"),
+                    "source_ref": memory.get("origin_ref"),
+                    "created_at": memory.get("created_at"),
+                    "updated_at": memory.get("updated_at"),
+                    "freshness": freshness,
+                    "retrieval_state": state,
+                    "match": {
+                        "shared_tokens": shared[:20],
+                        "node_match": node_match,
+                        "relevance_score": len(shared),
+                    },
+                }
+            )
+        memory_hits.sort(
+            key=lambda item: (
+                -int(item["match"]["node_match"]),
+                -len(item["match"]["shared_tokens"]),
+                int(item["retrieval_state"] == "CONFLICTED"),
+                -parse_rag_timestamp(item["updated_at"]).timestamp(),
+                str(item["memory_id"]),
+            )
+        )
+
+        grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+        for observation in self.list_skill_observations(
+            project["project_id"], limit=500
+        ):
+            skill = observation["skill"]
+            execution = observation["execution_context"]
+            candidate_tokens = _retrieval_tokens(
+                " ".join(
+                    [
+                        str(skill.get("skill_id") or ""),
+                        str(skill.get("operation_class") or ""),
+                        str(execution.get("task_kind") or ""),
+                        str(execution.get("node_ref") or ""),
+                    ]
+                )
+            )
+            shared = sorted(query_tokens & candidate_tokens)
+            node_match = bool(
+                selected_nodes and str(execution.get("node_ref") or "") in selected_nodes
+            )
+            provider_ref = str(execution.get("provider_ref") or "UNKNOWN")
+            if provider_ref == "UNKNOWN":
+                provider_ref = provider_ref_from_model_ref(observation["model_ref"])
+            key = (
+                str(skill["skill_id"]),
+                str(skill["skill_version"]),
+                str(skill["operation_class"]),
+                str(observation["model_ref"]),
+                provider_ref,
+            )
+            if not shared and not node_match:
+                continue
+            candidate = grouped.setdefault(
+                key,
+                {
+                    "candidate_id": "benchskill_" + _json_sha256(key)[:24],
+                    "skill": dict(skill),
+                    "model_ref": observation["model_ref"],
+                    "provider_ref": provider_ref,
+                    "recommendation_state": "CANDIDATE_ONLY",
+                    "binding_state": "TASK_FRAME_SELECTION_REQUIRED",
+                    "authority": "NONE",
+                    "observation_count": 0,
+                    "successful_count": 0,
+                    "validated_success_count": 0,
+                    "failed_count": 0,
+                    "match": {"shared_tokens": shared[:20], "node_match": node_match},
+                },
+            )
+            candidate["observation_count"] += 1
+            if observation["outcome"] == "SUCCEEDED":
+                candidate["successful_count"] += 1
+                if observation["validation_state"] == "PASS":
+                    candidate["validated_success_count"] += 1
+            elif observation["outcome"] == "FAILED":
+                candidate["failed_count"] += 1
+        skill_candidates = sorted(
+            (
+                item
+                for item in grouped.values()
+                if item["successful_count"] > 0
+            ),
+            key=lambda item: (
+                -int(item["match"]["node_match"]),
+                -len(item["match"]["shared_tokens"]),
+                -item["validated_success_count"],
+                -item["successful_count"],
+                item["failed_count"],
+                -item["observation_count"],
+                item["candidate_id"],
+            ),
+        )[: max(1, min(int(skill_limit), 20))]
+        try:
+            with open_project_index_readonly(
+                project_id=project["project_id"],
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                file_status = index_status(
+                    connection, project_id=project["project_id"]
+                )
+                file_search = (
+                    search_index(
+                        connection,
+                        project_id=project["project_id"],
+                        query=query,
+                        limit=max(1, min(int(memory_limit), 20)),
+                    )
+                    if query.strip()
+                    else {
+                        "schema": "universe.project-file-search.v1",
+                        "project_id": project["project_id"],
+                        "query": query,
+                        "hits": [],
+                        "hit_count": 0,
+                        "scanned": False,
+                    }
+                )
+        except FileIndexError as error:
+            file_status = {
+                "schema": "universe.project-file-index.v1",
+                "project_id": project["project_id"],
+                "availability": "UNAVAILABLE",
+                "error_code": error.error_code,
+                "index_ref": str(project_index_path(Path(project["project_root"]))),
+            }
+            file_search = {
+                "schema": "universe.project-file-search.v1",
+                "project_id": project["project_id"],
+                "query": query,
+                "hits": [],
+                "hit_count": 0,
+                "scanned": False,
+            }
+        material = {
+            "schema": "universe.project-llm-retrieval-context.v1",
+            "project_id": project["project_id"],
+            "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            "file_index": {
+                "policy": "CURRENT_INDEX_PREFERRED",
+                "freshness": file_status,
+                "search": file_search,
+            },
+            "memory": {
+                "policy": "LINKED_ONLY",
+                "relevance_policy": "TOKEN_OR_EXPLICIT_NODE_MATCH_REQUIRED",
+                "ranking": "NODE_THEN_RELEVANCE_THEN_STATE_THEN_UPDATED_AT_DESC",
+                "freshness_policy": {
+                    "stale_after_seconds": STALE_AFTER_SECONDS,
+                    "superseded": "EXCLUDED",
+                    "conflicted": "INCLUDED_PENALIZED",
+                },
+                "ingestion": ingestion,
+                "hits": memory_hits[: max(1, min(int(memory_limit), 20))],
+            },
+            "bench": {
+                "policy": "EVIDENCE_ONLY",
+                "ranking": "MATCH_THEN_VALIDATED_SUCCESS_THEN_SUCCESS_BOUNDED",
+                "recommended_skills": skill_candidates,
+            },
+            "effects": {
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "skill_binding": "NONE",
+                "project_source_write": "NONE",
+            },
+        }
+        material["retrieval_digest"] = _json_sha256(material)
+        return material
+
+    def _require_project_anchor(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, str]:
+        project = self.get_project(project_id)
+        try:
+            mode, anchor_id = coordinate_from_request(payload if isinstance(payload, Mapping) else {})
+            used = require_mode_current_anchor(
+                Path(project["project_root"]), mode=mode, anchor_id=anchor_id
+            )
+        except FileIndexError as error:
+            raise UniverseError(error.error_code, error.detail) from error
+        return {
+            "project_id": project["project_id"],
+            "project_root": project["project_root"],
+            **used,
+        }
+
+    def _sync_project_file_index_bound(self, bound: Mapping[str, str]) -> dict[str, Any]:
+        raise UniverseError(
+            "PROJECT_INDEX_HOOK_REQUIRED",
+            "the project-owned file index is writable only by its file-change hook",
+        )
+
+    def sync_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._sync_project_file_index_bound(
+            self._require_project_anchor(project_id, payload)
+        )
+
+    def sync_project_file_index_current(
+        self, project_id: str, *, preferred_mode: str = "MASTER"
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_INDEX_HOOK_REQUIRED",
+            "project_id": project["project_id"],
+            "preferred_mode": preferred_mode.strip().upper(),
+            "index_ref": str(project_index_path(Path(project["project_root"]))),
+            "universe_access": "READ_ONLY",
+        }
+
+    def search_project_file_index(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._require_project_anchor(project_id, payload)
+        query = str(payload.get("query") or "")
+        try:
+            with open_project_index_readonly(
+                project_id=bound["project_id"],
+                project_root=Path(bound["project_root"]),
+            ) as connection:
+                search = search_index(
+                    connection,
+                    project_id=bound["project_id"],
+                    query=query,
+                    limit=int(payload.get("limit") or 20),
+                )
+        except FileIndexError as error:
+            raise UniverseError(error.error_code, error.detail) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "FILE_SEARCH_COMPLETED",
+            "project_id": bound["project_id"],
+            "mode": bound["mode"],
+            "anchor_id": bound["anchor_id"],
+            "search": search,
+        }
+
+    def project_file_index_status(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            with open_project_index_readonly(
+                project_id=project["project_id"],
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                status = index_status(connection, project_id=project["project_id"])
+        except FileIndexError as error:
+            status = {
+                "schema": "universe.project-file-index.v1",
+                "project_id": project["project_id"],
+                "file_count": 0,
+                "indexed_at": "",
+                "graph_candidates": {
+                    "schema": "universe.project-file-graph-candidates.v1",
+                    "current_count": 0,
+                    "removed_count": 0,
+                    "projection_only": True,
+                },
+                "sync": None,
+                "availability": "UNAVAILABLE",
+                "error_code": error.error_code,
+                "index_ref": str(project_index_path(Path(project["project_root"]))),
+            }
+        return {
+            "schema": API_SCHEMA,
+            "status": "FILE_INDEX_COLLECTED",
+            "project_id": project["project_id"],
+            "index": status,
+            "universe_access": "READ_ONLY",
+        }
+
+    def project_retrieval_context(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        bound = self._require_project_anchor(project_id, payload)
+        retrieval = self.build_project_llm_retrieval_context(
+            bound["project_id"],
+            query=str(payload.get("query") or ""),
+            node_ids=list(payload.get("node_ids") or []),
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "RETRIEVAL_CONTEXT_READY",
+            "project_id": bound["project_id"],
+            "mode": bound["mode"],
+            "anchor_id": bound["anchor_id"],
+            "retrieval": retrieval,
+        }
+
     def create_context_pack(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -8298,6 +13795,11 @@ class UniverseStore:
             if request["bench_limit"]
             else []
         )
+        retrieval = self.build_project_llm_retrieval_context(
+            project["project_id"],
+            query=request["purpose"],
+            node_ids=request["node_ids"],
+        )
         material = {
             "schema": PROJECT_CONTEXT_PACK_SCHEMA,
             "project_id": project["project_id"],
@@ -8319,6 +13821,7 @@ class UniverseStore:
                 "observations": bench_observations,
                 "observation_count": len(bench_observations),
             },
+            "retrieval": retrieval,
             "effects": {
                 "project_source_write": "NONE",
                 "authority": "NONE",
@@ -9478,8 +14981,67 @@ class UniverseStore:
                 "adoption": adoption,
                 "composition": composition,
             }
-        adoption = self._get_skill_plan_adoption(project_id, source["adoption_id"])
-        return {"kind": source["kind"], "adoption": adoption}
+        if source["kind"] == "SKILL_PLAN":
+            adoption = self._get_skill_plan_adoption(project_id, source["adoption_id"])
+            return {"kind": source["kind"], "adoption": adoption}
+        application_id = source["application_id"]
+        with self._connection() as connection:
+            application_row = connection.execute(
+                "SELECT * FROM goal_work_plan_application WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        if application_row is None:
+            raise UniverseError(
+                "MASTER_HANDOFF_SOURCE_NOT_FOUND",
+                "Goal Work Plan application does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        application = self._goal_work_plan_application_row(application_row)
+        surface = self.goal_work_plan_surface(application["goal_id"])
+        goal = surface["goal"]
+        if goal["project_id"] != project_id:
+            raise UniverseError(
+                "MASTER_HANDOFF_PROJECT_MISMATCH",
+                "Goal Work Plan application belongs to another Project",
+                HTTPStatus.CONFLICT,
+            )
+        adoption = surface["adoption"]
+        if (
+            surface["application"] is None
+            or surface["application"]["application_id"] != application_id
+            or adoption is None
+        ):
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_INCOMPLETE",
+                "Goal Work Plan application has incomplete adoption provenance",
+                HTTPStatus.CONFLICT,
+            )
+        work_plan = next(
+            (
+                candidate
+                for candidate in surface["candidates"]
+                if candidate["work_plan_id"] == application["work_plan_id"]
+            ),
+            None,
+        )
+        if work_plan is None or work_plan["state"] != "APPLIED":
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_INCOMPLETE",
+                "applied Work Plan candidate is unavailable",
+                HTTPStatus.CONFLICT,
+            )
+        todos = [
+            self.get_todo(todo_id)
+            for todo_id in application["created_items"]["todo_ids"]
+        ]
+        return {
+            "kind": source["kind"],
+            "goal": goal,
+            "adoption": adoption,
+            "application": application,
+            "work_plan": work_plan,
+            "todos": todos,
+        }
 
     def create_master_handoff(
         self, project_id: str, value: Any
@@ -9487,6 +15049,10 @@ class UniverseStore:
         project = self.get_project(project_id)
         request = normalize_master_handoff_proposal_request(value)
         source = self._master_handoff_source(project["project_id"], request["source"])
+        source_ref = request["source"].get("adoption_id") or request["source"].get(
+            "application_id"
+        )
+        assert isinstance(source_ref, str)
         material: dict[str, Any] = {
             "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
             "project_id": project["project_id"],
@@ -9501,6 +15067,13 @@ class UniverseStore:
             },
             "next_operation": "USER_APPROVAL_REQUIRED_FOR_MASTER_DELIVERY",
         }
+        if request["source"]["kind"] == "GOAL_WORK_PLAN":
+            material["instruction_ref"] = (
+                "universe://projects/"
+                + quote(project["project_id"], safe="")
+                + "/goal-work-plan-applications/"
+                + quote(source_ref, safe="")
+            )
         if "purpose" in request:
             material["purpose"] = request["purpose"]
         material["handoff_digest"] = _json_sha256(material)
@@ -9516,7 +15089,7 @@ class UniverseStore:
                 (
                     project["project_id"],
                     request["source"]["kind"],
-                    request["source"]["adoption_id"],
+                    source_ref,
                 ),
             ).fetchone()
             if existing is not None:
@@ -9541,7 +15114,7 @@ class UniverseStore:
                     material["handoff_id"],
                     project["project_id"],
                     request["source"]["kind"],
-                    request["source"]["adoption_id"],
+                    source_ref,
                     material["handoff_digest"],
                     _canonical_json(material),
                     "PROPOSAL_ONLY",
@@ -9570,6 +15143,740 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return self._master_handoff_row(row)
+
+    def find_goal_work_plan_handoff(
+        self, project_id: str, application_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_application = _identifier(application_id, "application_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT handoff_json, delivery_state, room_message_id,
+                       created_at, delivered_at
+                FROM project_master_handoff
+                WHERE project_id = ? AND source_kind = 'GOAL_WORK_PLAN'
+                  AND source_adoption_id = ?
+                """,
+                (project["project_id"], normalized_application),
+            ).fetchone()
+        return None if row is None else self._master_handoff_row(row)
+
+    def get_master_handoff_task_frame_binding(
+        self, project_id: str, handoff_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_handoff = _identifier(handoff_id, "handoff_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM project_master_handoff_task_frame
+                WHERE project_id = ? AND handoff_id = ?
+                """,
+                (project["project_id"], normalized_handoff),
+            ).fetchone()
+        return None if row is None else self._master_handoff_task_frame_binding_row(row)
+
+    def record_master_handoff_task_frame_binding(
+        self,
+        *,
+        project_id: str,
+        handoff_id: str,
+        instruction_ref: str,
+        proposal_id: str,
+        proposal_digest: str,
+        task_frame_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        material = {
+            "schema": PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA,
+            "project_id": project["project_id"],
+            "handoff_id": _identifier(handoff_id, "handoff_id"),
+            "instruction_ref": _required_text(instruction_ref, "instruction_ref"),
+            "proposal_id": _identifier(proposal_id, "proposal_id"),
+            "proposal_digest": _sha256(proposal_digest, "proposal_digest"),
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+        }
+        binding_digest = _json_sha256(material)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM project_master_handoff_task_frame WHERE handoff_id = ?",
+                (material["handoff_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._master_handoff_task_frame_binding_row(existing)
+                if current["binding_digest"] != binding_digest:
+                    raise UniverseError(
+                        "MASTER_HANDOFF_TASK_FRAME_BINDING_CONFLICT",
+                        "Master handoff is already bound to another proposal or Task Frame",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            bound_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO project_master_handoff_task_frame(
+                    handoff_id, project_id, instruction_ref, proposal_id,
+                    proposal_digest, task_frame_id, binding_digest, bound_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["handoff_id"],
+                    material["project_id"],
+                    material["instruction_ref"],
+                    material["proposal_id"],
+                    material["proposal_digest"],
+                    material["task_frame_id"],
+                    binding_digest,
+                    bound_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM project_master_handoff_task_frame WHERE handoff_id = ?",
+                (material["handoff_id"],),
+            ).fetchone()
+        assert row is not None
+        return self._master_handoff_task_frame_binding_row(row), True
+
+    @staticmethod
+    def _goal_todo_execution_selection_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_TODO_EXECUTION_SELECTION_SCHEMA,
+            "selection_id": str(row["selection_id"]),
+            "goal_id": str(row["goal_id"]),
+            "application_id": str(row["application_id"]),
+            "handoff_id": str(row["handoff_id"]),
+            "task_frame_id": str(row["task_frame_id"]),
+            "todo_ids": json.loads(row["todo_ids_json"]),
+            "provider": str(row["provider"]),
+            "provider_session_ref_hash": str(row["provider_session_ref_hash"]),
+            "session_id": str(row["session_id"]),
+            "session_anchor_ref": str(row["session_anchor_ref"]),
+            "selection_digest": str(row["selection_digest"]),
+            "selected_at": str(row["selected_at"]),
+        }
+
+    def get_goal_todo_execution_selection(
+        self, goal_id: str
+    ) -> dict[str, Any] | None:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        return None if row is None else self._goal_todo_execution_selection_row(row)
+
+    def record_goal_todo_execution_selection(
+        self,
+        *,
+        goal_id: str,
+        application_id: str,
+        handoff_id: str,
+        task_frame_id: str,
+        todo_ids: list[str],
+        provider: str,
+        provider_session_ref: str,
+        session_id: str,
+        session_anchor_ref: str,
+    ) -> tuple[dict[str, Any], bool]:
+        material = {
+            "schema": GOAL_TODO_EXECUTION_SELECTION_SCHEMA,
+            "goal_id": _identifier(goal_id, "goal_id"),
+            "application_id": _identifier(application_id, "application_id"),
+            "handoff_id": _identifier(handoff_id, "handoff_id"),
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+            "todo_ids": list(todo_ids),
+            "provider": _required_text(provider, "provider").upper(),
+            "provider_session_ref_hash": hashlib.sha256(
+                _required_text(
+                    provider_session_ref, "provider_session_ref"
+                ).encode("utf-8")
+            ).hexdigest(),
+            "session_id": _identifier(session_id, "session_id"),
+            "session_anchor_ref": _required_text(
+                session_anchor_ref, "session_anchor_ref"
+            ),
+        }
+        selection_digest = _json_sha256(material)
+        selection_id = "goal_todo_selection_" + selection_digest[:24]
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE goal_id = ?",
+                (material["goal_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._goal_todo_execution_selection_row(existing)
+                if current["selection_digest"] != selection_digest:
+                    raise UniverseError(
+                        "GOAL_TODO_SELECTION_CONFLICT",
+                        "Goal already has a different Task Frame Todo selection",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            selected_at = utc_now()
+            connection.execute(
+                """
+                INSERT INTO goal_todo_execution_selection(
+                    selection_id, goal_id, application_id, handoff_id,
+                    task_frame_id, todo_ids_json, provider,
+                    provider_session_ref_hash, session_id, session_anchor_ref,
+                    selection_digest, selected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    selection_id,
+                    material["goal_id"],
+                    material["application_id"],
+                    material["handoff_id"],
+                    material["task_frame_id"],
+                    _canonical_json(material["todo_ids"]),
+                    material["provider"],
+                    material["provider_session_ref_hash"],
+                    material["session_id"],
+                    material["session_anchor_ref"],
+                    selection_digest,
+                    selected_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_todo_execution_selection WHERE selection_id = ?",
+                (selection_id,),
+            ).fetchone()
+        assert row is not None
+        return self._goal_todo_execution_selection_row(row), True
+
+    def list_goal_todo_action_receipts(
+        self, goal_id: str
+    ) -> list[dict[str, Any]]:
+        prefix = f"goal-automation://{_identifier(goal_id, 'goal_id')}/%"
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM todo_action_mutation_receipt
+                WHERE instruction_ref LIKE ? ESCAPE '\\'
+                ORDER BY prepared_at, receipt_id
+                """,
+                (prefix,),
+            ).fetchall()
+        return [self._todo_action_mutation_receipt_row(row) for row in rows]
+
+    @staticmethod
+    def _goal_automation_scheduler_mutation_receipt_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        return {
+            "schema": "universe.goal-automation-scheduler-mutation-receipt.v1",
+            "receipt_id": row["receipt_id"],
+            "session_id": row["session_id"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "provider": row["provider"],
+            "provider_session_ref_hash": row["provider_session_ref_hash"],
+            "instruction_ref": row["instruction_ref"],
+            "goal_id": row["goal_id"],
+            "payload_sha256": row["payload_sha256"],
+            "status": row["status"],
+            "prepared_at": row["prepared_at"],
+            "expires_at": row["expires_at"],
+            "consumed_at": row["consumed_at"],
+        }
+
+    @staticmethod
+    def _bound_goal_automation_scheduler_mutation(
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str, str]:
+        scheduler = normalize_goal_automation_scheduler_request(
+            request["scheduler"]
+        )
+        payload_sha256 = _json_sha256(
+            {"goal_id": request["goal_id"], "scheduler": scheduler}
+        )
+        provider_ref_hash = hashlib.sha256(
+            str(request["provider_session_ref"]).encode("utf-8")
+        ).hexdigest()
+        return scheduler, payload_sha256, provider_ref_hash
+
+    def prepare_goal_automation_scheduler_mutation_receipt(
+        self, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        scheduler, payload_sha256, provider_ref_hash = (
+            self._bound_goal_automation_scheduler_mutation(request)
+        )
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=int(request["ttl_seconds"]))
+        ).isoformat().replace("+00:00", "Z")
+        receipt_id = "goal_scheduler_receipt_" + _json_sha256(
+            {
+                "session_id": request["session_id"],
+                "instruction_ref": request["instruction_ref"],
+            }
+        )[:24]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE session_id = ? AND instruction_ref = ?
+                """,
+                (request["session_id"], request["instruction_ref"]),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["goal_id"],
+                    payload_sha256,
+                )
+                actual = (
+                    existing["session_anchor_ref"],
+                    existing["provider"],
+                    existing["provider_session_ref_hash"],
+                    existing["goal_id"],
+                    existing["payload_sha256"],
+                )
+                if actual != expected:
+                    raise UniverseError(
+                        "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_CONFLICT",
+                        "instruction_ref is already bound to different scheduler material",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] == "PREPARED" and datetime.fromisoformat(
+                    str(existing["expires_at"]).replace("Z", "+00:00")
+                ) <= now_datetime:
+                    connection.execute(
+                        """
+                        UPDATE goal_automation_scheduler_mutation_receipt
+                        SET prepared_at = ?, expires_at = ? WHERE receipt_id = ?
+                        """,
+                        (now, expires_at, existing["receipt_id"]),
+                    )
+                    existing = connection.execute(
+                        """
+                        SELECT * FROM goal_automation_scheduler_mutation_receipt
+                        WHERE receipt_id = ?
+                        """,
+                        (existing["receipt_id"],),
+                    ).fetchone()
+                return (
+                    self._goal_automation_scheduler_mutation_receipt_row(existing),
+                    False,
+                )
+            goal = connection.execute(
+                "SELECT revision FROM project_goal WHERE goal_id = ?",
+                (request["goal_id"],),
+            ).fetchone()
+            if goal is None:
+                raise UniverseError(
+                    "GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND
+                )
+            if int(goal["revision"]) != scheduler["expected_goal_revision"]:
+                raise UniverseError(
+                    "GOAL_REVISION_CONFLICT",
+                    "Goal revision changed before scheduler receipt preparation",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                INSERT INTO goal_automation_scheduler_mutation_receipt(
+                    receipt_id, session_id, session_anchor_ref, provider,
+                    provider_session_ref_hash, instruction_ref, goal_id,
+                    payload_sha256, status, prepared_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    receipt_id,
+                    request["session_id"],
+                    request["session_anchor_ref"],
+                    request["provider"],
+                    provider_ref_hash,
+                    request["instruction_ref"],
+                    request["goal_id"],
+                    payload_sha256,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+        assert row is not None
+        return self._goal_automation_scheduler_mutation_receipt_row(row), True
+
+    def consume_goal_automation_scheduler_mutation_receipt(
+        self, receipt_id: str, request: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        normalized_receipt_id = _identifier(receipt_id, "receipt_id")
+        scheduler_request, payload_sha256, provider_ref_hash = (
+            self._bound_goal_automation_scheduler_mutation(request)
+        )
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (normalized_receipt_id,),
+            ).fetchone()
+            if receipt is None:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_NOT_FOUND",
+                    "Scheduler mutation receipt does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            expected = (
+                request["session_id"],
+                request["session_anchor_ref"],
+                request["provider"],
+                provider_ref_hash,
+                request["instruction_ref"],
+                request["goal_id"],
+                payload_sha256,
+            )
+            actual = (
+                receipt["session_id"],
+                receipt["session_anchor_ref"],
+                receipt["provider"],
+                receipt["provider_session_ref_hash"],
+                receipt["instruction_ref"],
+                receipt["goal_id"],
+                receipt["payload_sha256"],
+            )
+            if actual != expected:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "receipt is not bound to this session, Anchor, instruction, Goal, and scheduler payload",
+                    HTTPStatus.CONFLICT,
+                )
+            if receipt["status"] == "CONSUMED":
+                row = connection.execute(
+                    "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                    (request["goal_id"],),
+                ).fetchone()
+                if row is None:
+                    raise UniverseError(
+                        "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_CORRUPT",
+                        "consumed receipt has no scheduler state",
+                        HTTPStatus.CONFLICT,
+                    )
+                return (
+                    self._goal_automation_scheduler_mutation_receipt_row(receipt),
+                    self._goal_automation_scheduler_row(row),
+                    True,
+                )
+            if datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            ) <= now_datetime:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_EXPIRED",
+                    "Scheduler mutation receipt expired before consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            scheduler, _created = (
+                self._configure_goal_automation_scheduler_in_connection(
+                    connection,
+                    request["goal_id"],
+                    action=scheduler_request["action"],
+                    expected_goal_revision=scheduler_request[
+                        "expected_goal_revision"
+                    ],
+                    interval_seconds=scheduler_request["interval_seconds"],
+                )
+            )
+            updated = connection.execute(
+                """
+                UPDATE goal_automation_scheduler_mutation_receipt
+                SET status = 'CONSUMED', consumed_at = ?
+                WHERE receipt_id = ? AND status = 'PREPARED'
+                """,
+                (now, normalized_receipt_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REPLAY_CONFLICT",
+                    "Scheduler mutation receipt changed during consumption",
+                    HTTPStatus.CONFLICT,
+                )
+            receipt = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler_mutation_receipt
+                WHERE receipt_id = ?
+                """,
+                (normalized_receipt_id,),
+            ).fetchone()
+        assert receipt is not None
+        return (
+            self._goal_automation_scheduler_mutation_receipt_row(receipt),
+            scheduler,
+            False,
+        )
+
+    @staticmethod
+    def _goal_automation_scheduler_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+            "goal_id": str(row["goal_id"]),
+            "expected_goal_revision": int(row["expected_goal_revision"]),
+            "enabled": bool(row["enabled"]),
+            "status": str(row["status"]),
+            "interval_seconds": int(row["interval_seconds"]),
+            "next_tick_at": row["next_tick_at"],
+            "lease_owner": row["lease_owner"],
+            "lease_expires_at": row["lease_expires_at"],
+            "last_tick_at": row["last_tick_at"],
+            "last_stop_reason": row["last_stop_reason"],
+            "last_error_code": row["last_error_code"],
+            "last_error_detail": row["last_error_detail"],
+            "last_surface": json.loads(str(row["last_surface_json"] or "{}")),
+            "tick_count": int(row["tick_count"]),
+            "revision": int(row["revision"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_goal_automation_scheduler(
+        self, goal_id: str
+    ) -> dict[str, Any] | None:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        return None if row is None else self._goal_automation_scheduler_row(row)
+
+    def configure_goal_automation_scheduler(
+        self,
+        goal_id: str,
+        *,
+        action: str,
+        expected_goal_revision: int,
+        interval_seconds: int,
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._configure_goal_automation_scheduler_in_connection(
+                connection,
+                normalized_goal,
+                action=action,
+                expected_goal_revision=expected_goal_revision,
+                interval_seconds=interval_seconds,
+            )
+
+    def _configure_goal_automation_scheduler_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        goal_id: str,
+        *,
+        action: str,
+        expected_goal_revision: int,
+        interval_seconds: int,
+    ) -> tuple[dict[str, Any], bool]:
+        goal = connection.execute(
+            "SELECT revision FROM project_goal WHERE goal_id = ?", (goal_id,)
+        ).fetchone()
+        if goal is None:
+            raise UniverseError(
+                "GOAL_NOT_FOUND", "Goal does not exist", HTTPStatus.NOT_FOUND
+            )
+        if int(goal["revision"]) != expected_goal_revision:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before scheduler configuration",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        existing = connection.execute(
+            "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO goal_automation_scheduler(
+                    goal_id, expected_goal_revision, enabled, status,
+                    interval_seconds, next_tick_at, lease_owner,
+                    lease_expires_at, last_tick_at, last_stop_reason,
+                    last_error_code, last_error_detail, last_surface_json,
+                    tick_count, revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL,
+                          '{}', 0, 1, ?, ?)
+                """,
+                (
+                    goal_id,
+                    expected_goal_revision,
+                    1 if action == "START" else 0,
+                    "READY" if action == "START" else "PAUSED",
+                    interval_seconds,
+                    now if action == "START" else None,
+                    None if action == "START" else "USER_PAUSED",
+                    now,
+                    now,
+                ),
+            )
+            created = True
+        else:
+            connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET expected_goal_revision = ?, enabled = ?, status = ?,
+                    interval_seconds = ?, next_tick_at = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, last_stop_reason = ?,
+                    last_error_code = NULL, last_error_detail = NULL,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (
+                    expected_goal_revision,
+                    1 if action == "START" else 0,
+                    "READY" if action == "START" else "PAUSED",
+                    interval_seconds,
+                    now if action == "START" else None,
+                    None if action == "START" else "USER_PAUSED",
+                    now,
+                    goal_id,
+                ),
+            )
+            created = False
+        row = connection.execute(
+            "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+            (goal_id,),
+        ).fetchone()
+        assert row is not None
+        return self._goal_automation_scheduler_row(row), created
+
+    def claim_due_goal_automation_scheduler(
+        self, lease_owner: str, *, lease_seconds: int = 15
+    ) -> dict[str, Any] | None:
+        owner = _required_text(lease_owner, "lease_owner")
+        now_datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        now = now_datetime.isoformat().replace("+00:00", "Z")
+        expires_at = (
+            now_datetime + timedelta(seconds=max(1, min(int(lease_seconds), 300)))
+        ).isoformat().replace("+00:00", "Z")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM goal_automation_scheduler
+                WHERE enabled = 1 AND status IN ('READY', 'RUNNING')
+                  AND next_tick_at IS NOT NULL AND next_tick_at <= ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                ORDER BY next_tick_at, goal_id
+                LIMIT 1
+                """,
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            updated = connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET status = 'RUNNING', lease_owner = ?, lease_expires_at = ?,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ? AND revision = ?
+                """,
+                (owner, expires_at, now, row["goal_id"], row["revision"]),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (row["goal_id"],),
+            ).fetchone()
+        assert claimed is not None
+        return self._goal_automation_scheduler_row(claimed)
+
+    def finish_goal_automation_scheduler_tick(
+        self,
+        goal_id: str,
+        *,
+        lease_owner: str,
+        status: str,
+        stop_reason: str,
+        surface: Mapping[str, Any] | None,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        owner = _required_text(lease_owner, "lease_owner")
+        normalized_status = _required_text(status, "status").upper()
+        if normalized_status not in {"WAITING", "BLOCKED", "COMPLETED"}:
+            raise UniverseError(
+                "GOAL_AUTOMATION_SCHEDULER_STATUS_INVALID",
+                "scheduler tick status must be WAITING, BLOCKED, or COMPLETED",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_NOT_FOUND",
+                    "Goal automation scheduler does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["lease_owner"] != owner or row["status"] != "RUNNING":
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_LEASE_MISMATCH",
+                    "scheduler tick no longer owns the durable lease",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE goal_automation_scheduler
+                SET enabled = 0, status = ?, next_tick_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    last_tick_at = ?, last_stop_reason = ?,
+                    last_error_code = ?, last_error_detail = ?,
+                    last_surface_json = ?, tick_count = tick_count + 1,
+                    revision = revision + 1, updated_at = ?
+                WHERE goal_id = ?
+                """,
+                (
+                    normalized_status,
+                    now,
+                    _required_text(stop_reason, "stop_reason"),
+                    error_code,
+                    error_detail,
+                    _canonical_json(dict(surface or {})),
+                    now,
+                    normalized_goal,
+                ),
+            )
+            finished = connection.execute(
+                "SELECT * FROM goal_automation_scheduler WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        assert finished is not None
+        return self._goal_automation_scheduler_row(finished)
+
+    @staticmethod
+    def _master_handoff_task_frame_binding_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA,
+            "project_id": str(row["project_id"]),
+            "handoff_id": str(row["handoff_id"]),
+            "instruction_ref": str(row["instruction_ref"]),
+            "proposal_id": str(row["proposal_id"]),
+            "proposal_digest": str(row["proposal_digest"]),
+            "task_frame_id": str(row["task_frame_id"]),
+            "binding_digest": str(row["binding_digest"]),
+            "bound_at": str(row["bound_at"]),
+        }
 
     def list_master_handoffs(
         self, project_id: str, *, limit: int = 100
@@ -10345,6 +16652,182 @@ class UniverseStore:
             item["updated_at"] = row["updated_at"]
             items.append(item)
         return items
+
+    def ingest_project_lineage_memory(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            event = normalize_lineage_memory_event(value)
+        except ProjectRagError as error:
+            raise UniverseError(error.code, error.detail) from error
+        if event["project_id"] != project["project_id"]:
+            raise UniverseError(
+                "LINEAGE_MEMORY_PROJECT_MISMATCH",
+                "producer-derived project_id does not match the target project",
+                HTTPStatus.CONFLICT,
+            )
+        source_digest = _json_sha256(event)
+        now = utc_now()
+        node_ref = event["node_ref"] or project["project_id"]
+        material = {
+            "schema": MEMORY_SCHEMA,
+            "project_id": project["project_id"],
+            "title": event["title"],
+            "body": event["summary"],
+            "state": "OBSERVED",
+            "link_state": "LINKED",
+            "node_ref": node_ref,
+            "graph": "functional",
+            "origin_ref": event["source_ref"],
+            "retrieval_state": event["retrieval_state"],
+            "lineage": {
+                "source_kind": event["source_kind"],
+                "event_id": event["event_id"],
+                "event_type": event["event_type"],
+                "source_digest": source_digest,
+                "observed_at": event["observed_at"],
+            },
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "queue_publication": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+            "next_operation": "RETRIEVAL_READY",
+        }
+        material["memory_digest"] = _json_sha256(material)
+        material["memory_id"] = "memory_" + material["memory_digest"][:24]
+        material["created_at"] = event["observed_at"]
+        material["updated_at"] = event["observed_at"]
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT project_id, memory_json, created_at, updated_at FROM project_memory "
+                "WHERE origin_ref = ? ORDER BY memory_id LIMIT 1",
+                (event["source_ref"],),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["project_id"]) != project["project_id"]:
+                    raise UniverseError(
+                        "LINEAGE_MEMORY_ATTRIBUTION_CONFLICT",
+                        "canonical source_ref is already attributed to another project",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored = json.loads(existing["memory_json"])
+                lineage = stored.get("lineage") if isinstance(stored.get("lineage"), Mapping) else {}
+                if lineage.get("source_digest") != source_digest:
+                    raise UniverseError(
+                        "LINEAGE_MEMORY_SOURCE_CONFLICT",
+                        "source_ref is already bound to different result material",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored["created_at"] = existing["created_at"]
+                stored["updated_at"] = existing["updated_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_memory(
+                    memory_id, project_id, title, body, state, link_state,
+                    node_ref, graph, origin_ref, memory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'LINKED', ?, 'functional', ?, ?, ?, ?)
+                """,
+                (
+                    material["memory_id"], project["project_id"], material["title"],
+                    material["body"], material["state"], material["node_ref"],
+                    material["origin_ref"], _canonical_json(material),
+                    material["created_at"], material["updated_at"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO semantic_collection_cursor(
+                    project_id, source_kind, last_event_id, last_event_type,
+                    source_digest, observed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, source_kind) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_event_type = excluded.last_event_type,
+                    source_digest = excluded.source_digest,
+                    observed_at = excluded.observed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project["project_id"], event["source_kind"], event["event_id"],
+                    event["event_type"], source_digest, event["observed_at"], now,
+                ),
+            )
+        return material, True
+
+    def sync_project_lineage_memories(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        events: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            room_rows = connection.execute(
+                "SELECT message_id, message_json, created_at FROM project_room_message "
+                "WHERE project_id = ? ORDER BY created_at, message_id",
+                (project["project_id"],),
+            ).fetchall()
+            delegation_rows = connection.execute(
+                "SELECT delegation_id, state, result_json, completed_at FROM conductor_delegation "
+                "WHERE project_id = ? AND state IN ('COMPLETED', 'FAILED') "
+                "ORDER BY completed_at, delegation_id",
+                (project["project_id"],),
+            ).fetchall()
+        for row in room_rows:
+            message = json.loads(row["message_json"])
+            if str(message.get("kind") or "").upper() != "RESULT":
+                continue
+            events.append({
+                "project_id": project["project_id"],
+                "producer_kind": "UNIVERSE_STORE",
+                "source_kind": "ROOM_RESULT",
+                "event_id": str(row["message_id"]),
+                "event_type": "RESULT_ATTACHED",
+                "title": f"Project Room result · {row['message_id']}",
+                "summary": str(message.get("body") or "")[:2000],
+                "source_ref": canonical_source_ref("ROOM_RESULT", str(row["message_id"])),
+                "observed_at": str(row["created_at"]),
+            })
+        for row in delegation_rows:
+            result = json.loads(row["result_json"])
+            summary = str(result.get("summary") or result.get("reason") or "").strip()
+            if not summary:
+                continue
+            events.append({
+                "project_id": project["project_id"],
+                "producer_kind": "UNIVERSE_STORE",
+                "source_kind": "CONDUCTOR_RESULT",
+                "event_id": str(row["delegation_id"]),
+                "event_type": str(row["state"]),
+                "title": f"Conductor result · {row['delegation_id']}",
+                "summary": summary[:2000],
+                "source_ref": canonical_source_ref("CONDUCTOR_RESULT", str(row["delegation_id"])),
+                "observed_at": str(row["completed_at"]),
+            })
+        created = replayed = failed = 0
+        diagnostics: list[dict[str, str]] = []
+        for event in events:
+            try:
+                _, was_created = self.ingest_project_lineage_memory(project["project_id"], event)
+                created += int(was_created)
+                replayed += int(not was_created)
+            except UniverseError as error:
+                failed += 1
+                diagnostics.append({"event_id": str(event["event_id"]), "error_code": error.code})
+        return {
+            "schema": "universe.project-lineage-memory-sync.v1",
+            "status": "COMPLETE" if failed == 0 else "PARTIAL",
+            "project_id": project["project_id"],
+            "last_event_id": str(events[-1]["event_id"]) if events else None,
+            "observed_count": len(events),
+            "created_count": created,
+            "replayed_count": replayed,
+            "failed_count": failed,
+            "diagnostics": diagnostics[:20],
+            "source_policy": "AUTHORITATIVE_TERMINAL_RESULTS_ONLY",
+            "notification_text": "EXCLUDED",
+        }
 
     def get_project_memory(self, project_id: str, memory_id: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -11579,10 +18062,11 @@ class UniverseStore:
             "step",
             "sequence",
             "project_room_message_id",
+            "target_session_anchor_ref",
         }:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
-                "progress accepts summary, step, sequence, and a bounded room reference only",
+                "progress accepts summary, step, sequence, bounded room and target-session references only",
             )
         summary = _required_text(value.get("summary"), "progress.summary")
         if len(summary) > 1000:
@@ -11606,6 +18090,21 @@ class UniverseStore:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
                 "progress.project_room_message_id is invalid",
+            )
+        target_session_anchor_ref = str(
+            value.get("target_session_anchor_ref") or ""
+        ).strip()
+        if target_session_anchor_ref and (
+            len(target_session_anchor_ref) > 256
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}",
+                target_session_anchor_ref,
+            )
+            is None
+        ):
+            raise UniverseError(
+                "CONDUCTOR_DELEGATION_PROGRESS_INVALID",
+                "progress.target_session_anchor_ref is invalid",
             )
         now = utc_now()
         normalized = _required_text(delegation_id, "delegation_id")
@@ -11641,6 +18140,7 @@ class UniverseStore:
                     "accepted_at",
                     "recovered_at",
                     "project_room_message_id",
+                    "target_session_anchor_ref",
                 )
                 if previous.get(key) is not None
             }
@@ -11652,6 +18152,8 @@ class UniverseStore:
             })
             if project_room_message_id:
                 progress["project_room_message_id"] = project_room_message_id
+            if target_session_anchor_ref:
+                progress["target_session_anchor_ref"] = target_session_anchor_ref
             update = connection.execute(
                 """
                 UPDATE conductor_delegation
@@ -12235,7 +18737,113 @@ class UniverseStore:
         )
         return queued, True
 
+    def apply_todo_action(self, todo_id: str, value: Any) -> dict[str, Any]:
+        event_payload = normalize_todo_action_payload(todo_id, value)
+        normalized_todo_id = event_payload["todo_id"]
+        action_id = event_payload["action_id"]
+        outcome = event_payload["outcome"]
+        desired_state = event_payload["state"]
+        event_id = "todo-action-" + _json_sha256(event_payload)[:32]
+        payload_json = json.dumps(
+            event_payload, sort_keys=True, separators=(",", ":")
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            todo_row = connection.execute(
+                """
+                SELECT project_id, state, revision FROM project_todo
+                WHERE todo_id = ?
+                """,
+                (normalized_todo_id,),
+            ).fetchone()
+            if todo_row is None:
+                raise UniverseError(
+                    "TODO_NOT_FOUND", "todo does not exist", HTTPStatus.NOT_FOUND
+                )
+            project_id = todo_row["project_id"]
+            if not isinstance(project_id, str) or not project_id:
+                raise UniverseError(
+                    "TODO_ACTION_PROJECT_REQUIRED",
+                    "hook actions require a project-bound Todo",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                """
+                SELECT project_id, event_type, payload_json
+                FROM project_event WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["project_id"] != project_id
+                    or existing["event_type"] != "TODO_ACTION_APPLIED"
+                ):
+                    raise UniverseError(
+                        "TODO_ACTION_ID_CONFLICT",
+                        "action_id already refers to different Todo action content",
+                        HTTPStatus.CONFLICT,
+                    )
+                return {
+                    "status": "TODO_ACTION_ALREADY_APPLIED",
+                    "action_id": action_id,
+                    "event_id": event_id,
+                    "todo": self.get_todo(normalized_todo_id),
+                }
+
+            current_state = str(todo_row["state"])
+            if current_state == "DONE" and outcome != "REOPENED":
+                next_state = "DONE"
+            else:
+                next_state = desired_state
+            if next_state != current_state:
+                cursor = connection.execute(
+                    """
+                    UPDATE project_todo
+                    SET state = ?, revision = revision + 1, updated_at = ?
+                    WHERE todo_id = ? AND revision = ?
+                    """,
+                    (
+                        next_state,
+                        now,
+                        normalized_todo_id,
+                        todo_row["revision"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise UniverseError(
+                        "TODO_REVISION_CONFLICT",
+                        "todo changed before the hook action could be applied",
+                        HTTPStatus.CONFLICT,
+                    )
+            event_payload["state"] = next_state
+            payload_json = json.dumps(
+                event_payload, sort_keys=True, separators=(",", ":")
+            )
+            connection.execute(
+                """
+                INSERT INTO project_event(
+                    event_id, project_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, 'TODO_ACTION_APPLIED', ?, ?)
+                """,
+                (event_id, project_id, payload_json, now),
+            )
+
+        todo = self.get_todo(normalized_todo_id)
+        result = {
+            "status": "TODO_ACTION_APPLIED",
+            "action_id": action_id,
+            "event_id": event_id,
+            "todo": todo,
+        }
+        if outcome in {"COMPLETED", "FAILED"}:
+            result["result_fanout"] = self.record_todo_result_fanout(
+                project_id, normalized_todo_id, outcome, todo["state"]
+            )
+        return result
+
     def apply_master_message_todo_transition(
+
         self,
         project_id: str,
         message_id: str,
@@ -12333,6 +18941,12 @@ class UniverseStore:
                 },
             },
         )
+        fanout = self.record_todo_result_fanout(
+            normalized_project,
+            todo_id,
+            normalized_outcome,
+            desired_state,
+        )
         return {
             "status": "TODO_TRANSITION_APPLIED",
             "project_id": normalized_project,
@@ -12341,6 +18955,2100 @@ class UniverseStore:
             "state": desired_state,
             "outcome": normalized_outcome,
             "event_id": event["event_id"],
+            "result_fanout": fanout,
+        }
+
+    def record_todo_result_fanout(
+        self,
+        project_id: str,
+        todo_id: str,
+        outcome: str,
+        state: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        material = build_result_fanout(
+            project_id=project["project_id"],
+            source_kind="TODO",
+            source_id=todo_id,
+            outcome=outcome,
+            state=state,
+        )
+        sink_kinds = (
+            "GOAL_PLAN",
+            "EXPERIENCE",
+            "MEMORY",
+            "BENCH",
+            "DOCUMENT_AUTOMATION",
+        )
+        material["review_candidate_count"] = len(sink_kinds)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT fanout_json, created_at
+                FROM work_loop_result_fanout
+                WHERE project_id = ? AND source_kind = 'TODO'
+                  AND source_id = ? AND outcome = ?
+                """,
+                (project["project_id"], todo_id, outcome),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["fanout_json"])
+                stored["created_at"] = existing["created_at"]
+                stored["status"] = "WORK_LOOP_RESULT_FANOUT_ALREADY_RECORDED"
+                return stored
+            connection.execute(
+                """
+                INSERT INTO work_loop_result_fanout(
+                    fanout_id, project_id, source_kind, source_id, outcome,
+                    fanout_digest, fanout_json, created_at
+                ) VALUES (?, ?, 'TODO', ?, ?, ?, ?, ?)
+                """,
+                (
+                    material["fanout_id"],
+                    project["project_id"],
+                    todo_id,
+                    outcome,
+                    material["fanout_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+            for sink_kind in sink_kinds:
+                candidate_id = "work-review-" + _json_sha256(
+                    {"fanout_id": material["fanout_id"], "sink_kind": sink_kind}
+                )[:24]
+                candidate = {
+                    "schema": "universe.work-loop-review-candidate.v1",
+                    "candidate_id": candidate_id,
+                    "project_id": project["project_id"],
+                    "fanout_id": material["fanout_id"],
+                    "source": {
+                        "kind": "TODO_RESULT",
+                        "todo_id": todo_id,
+                        "outcome": outcome,
+                        "state": state,
+                    },
+                    "sink_kind": sink_kind,
+                    "review_state": "PENDING_REVIEW",
+                    "auto_adopt": False,
+                    "effects": {
+                        "goal_plan": "NONE",
+                        "experience": "NONE",
+                        "memory": "NONE",
+                        "bench": "NONE",
+                        "document": "NONE",
+                        "authority": "NONE",
+                        "execution_assignment": "NONE",
+                    },
+                }
+                connection.execute(
+                    """
+                    INSERT INTO work_loop_review_candidate(
+                        candidate_id, project_id, fanout_id, sink_kind,
+                        review_state, candidate_json, created_at
+                    ) VALUES (?, ?, ?, ?, 'PENDING_REVIEW', ?, ?)
+                    ON CONFLICT(fanout_id, sink_kind) DO NOTHING
+                    """,
+                    (
+                        candidate_id,
+                        project["project_id"],
+                        material["fanout_id"],
+                        sink_kind,
+                        _canonical_json(candidate),
+                        now,
+                    ),
+                )
+        material["created_at"] = now
+        material["status"] = "WORK_LOOP_RESULT_FANOUT_RECORDED"
+        return material
+
+    def list_work_loop_result_fanouts(
+        self, project_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT fanout_json, created_at
+                FROM work_loop_result_fanout
+                WHERE project_id = ?
+                ORDER BY created_at DESC, fanout_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["fanout_json"])
+            item["created_at"] = row["created_at"]
+            items.append(item)
+        return items
+
+    def list_work_loop_review_candidates(
+        self, project_id: str, *, limit: int = 250
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT candidate_json, review_state, created_at, reviewed_at
+                FROM work_loop_review_candidate
+                WHERE project_id = ?
+                ORDER BY created_at DESC, candidate_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 1000))),
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = json.loads(row["candidate_json"])
+            item["review_state"] = row["review_state"]
+            item["created_at"] = row["created_at"]
+            item["reviewed_at"] = row["reviewed_at"]
+            items.append(item)
+        return items
+
+    def review_work_loop_candidate(
+        self,
+        project_id: str,
+        candidate_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        normalized_id = _required_text(candidate_id, "candidate_id")
+        normalized_decision = str(decision or "").strip().upper()
+        next_state = {"KEEP": "KEPT", "REJECT": "REJECTED"}.get(
+            normalized_decision
+        )
+        if next_state is None:
+            raise UniverseError(
+                "WORK_LOOP_REVIEW_DECISION_INVALID",
+                "decision must be KEEP or REJECT",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM work_loop_review_candidate
+                WHERE project_id = ? AND candidate_id = ?
+                """,
+                (project["project_id"], normalized_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "WORK_LOOP_REVIEW_CANDIDATE_NOT_FOUND",
+                    "review candidate does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["review_state"] == next_state:
+                reviewed = json.loads(row["candidate_json"])
+                reviewed["review_state"] = next_state
+                reviewed["created_at"] = row["created_at"]
+                reviewed["reviewed_at"] = row["reviewed_at"]
+                reviewed["status"] = "WORK_LOOP_REVIEW_ALREADY_RECORDED"
+                return reviewed
+            if row["review_state"] != "PENDING_REVIEW":
+                raise UniverseError(
+                    "WORK_LOOP_REVIEW_CONFLICT",
+                    "candidate already has another review decision",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE work_loop_review_candidate
+                SET review_state = ?, reviewed_at = ?
+                WHERE candidate_id = ? AND review_state = 'PENDING_REVIEW'
+                """,
+                (next_state, now, normalized_id),
+            )
+            reviewed = json.loads(row["candidate_json"])
+        reviewed["review_state"] = next_state
+        reviewed["created_at"] = row["created_at"]
+        reviewed["reviewed_at"] = now
+        reviewed["status"] = "WORK_LOOP_REVIEW_RECORDED"
+        reviewed["auto_adopt"] = False
+        return reviewed
+
+    def recover_interrupted_work_loop_todos(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        recovered: list[dict[str, Any]] = []
+        with self._connection() as connection:
+            todos = connection.execute(
+                """
+                SELECT todo_id, state, revision
+                FROM project_todo
+                WHERE project_id = ? AND state = 'IN_PROGRESS'
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            messages = connection.execute(
+                """
+                SELECT message_id, message_json, delivery_state
+                FROM project_room_message
+                WHERE project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchall()
+            linked: dict[str, list[sqlite3.Row]] = {}
+            for message in messages:
+                payload = json.loads(message["message_json"])
+                todo_id = payload.get("todo_id")
+                if isinstance(todo_id, str) and todo_id:
+                    linked.setdefault(todo_id, []).append(message)
+            now = utc_now()
+            for todo in todos:
+                rows = linked.get(todo["todo_id"], [])
+                failed = any(
+                    str(row["delivery_state"] or "").upper() == "FAILED" for row in rows
+                )
+                if not failed:
+                    continue
+                cursor = connection.execute(
+                    """
+                    UPDATE project_todo
+                    SET state = 'READY', revision = revision + 1, updated_at = ?
+                    WHERE todo_id = ? AND revision = ? AND state = 'IN_PROGRESS'
+                    """,
+                    (now, todo["todo_id"], todo["revision"]),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                recovered.append(
+                    {
+                        "todo_id": todo["todo_id"],
+                        "previous_state": "IN_PROGRESS",
+                        "state": "READY",
+                        "reason": "LINKED_MESSAGE_FAILED",
+                    }
+                )
+        if recovered:
+            self.append_event(
+                project["project_id"],
+                {
+                    "event_id": "todo-recover-"
+                    + _json_sha256(
+                        {
+                            "project_id": project["project_id"],
+                            "todo_ids": [item["todo_id"] for item in recovered],
+                        }
+                    )[:24],
+                    "event_type": "TODO_RESTART_RECOVERED",
+                    "payload": {"recovered": recovered},
+                },
+            )
+        return {
+            "status": "WORK_LOOP_TODOS_RECOVERED",
+            "project_id": project["project_id"],
+            "recovered": recovered,
+            "task_frame_created": False,
+            "execution_assignment_created": False,
+        }
+
+    def propose_work_loop_predictions(self, project_id: str) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        try:
+            seed = self.get_project_seed(project["project_id"])
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            seed = None
+        bundle = {
+            "project_id": project["project_id"],
+            "seed": seed,
+            "experience_cases": self.list_experience_cases(project["project_id"], limit=200),
+            "bench_observations": self.list_skill_observations(
+                project["project_id"], limit=200
+            ),
+            "todos": [
+                todo
+                for todo in self.list_todos()
+                if todo.get("project_id") == project["project_id"]
+            ],
+            "memories": self.list_project_memories(
+                project["project_id"], link_state="LINKED", limit=200
+            ),
+        }
+        material = build_work_loop_predictions(bundle)
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ? AND proposal_digest = ?
+                """,
+                (project["project_id"], material["proposal_digest"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["proposal_json"])
+                stored["review_state"] = existing["review_state"]
+                stored["created_at"] = existing["created_at"]
+                stored["reviewed_at"] = existing["reviewed_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO work_loop_prediction(
+                    proposal_id, project_id, proposal_digest, proposal_json,
+                    review_state, created_at, reviewed_at
+                ) VALUES (?, ?, ?, ?, 'PROPOSAL_ONLY', ?, NULL)
+                """,
+                (
+                    material["proposal_id"],
+                    project["project_id"],
+                    material["proposal_digest"],
+                    _canonical_json(material),
+                    now,
+                ),
+            )
+        material["review_state"] = "PROPOSAL_ONLY"
+        material["created_at"] = now
+        material["reviewed_at"] = None
+        return material, True
+
+    def list_work_loop_predictions(
+        self, project_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 200))),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = json.loads(row["proposal_json"])
+            item["review_state"] = row["review_state"]
+            item["created_at"] = row["created_at"]
+            item["reviewed_at"] = row["reviewed_at"]
+            item["feedback"] = {
+                "state": (
+                    "HIT"
+                    if row["review_state"] == "KEPT"
+                    else "MISS"
+                    if row["review_state"] == "REJECTED"
+                    else "PENDING"
+                ),
+                "basis": "USER_REVIEW",
+                "recorded_at": row["reviewed_at"],
+                "effects": {"goal_created": False, "todo_created": False},
+            }
+            items.append(item)
+        return items
+
+    def review_work_loop_prediction(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        project = self.get_project(project_id)
+        request = _exact_object_fields(
+            value,
+            field="work_loop_prediction_review",
+            required=frozenset({"proposal_id", "decision"}),
+        )
+        proposal_id = _identifier(request["proposal_id"], "proposal_id")
+        decision = _identifier(request["decision"], "decision").upper()
+        if decision not in {"KEEP", "REJECT"}:
+            raise UniverseError(
+                "WORK_LOOP_PREDICTION_DECISION_INVALID",
+                "decision must be KEEP or REJECT",
+                HTTPStatus.CONFLICT,
+            )
+        next_state = "KEPT" if decision == "KEEP" else "REJECTED"
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT proposal_json, review_state, created_at, reviewed_at
+                FROM work_loop_prediction
+                WHERE project_id = ? AND proposal_id = ?
+                """,
+                (project["project_id"], proposal_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "WORK_LOOP_PREDICTION_NOT_FOUND",
+                    "work-loop prediction does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if row["review_state"] == next_state:
+                stored = json.loads(row["proposal_json"])
+                stored["review_state"] = row["review_state"]
+                stored["created_at"] = row["created_at"]
+                stored["reviewed_at"] = row["reviewed_at"]
+                stored["goal_created"] = False
+                stored["todo_created"] = False
+                stored["feedback"] = {
+                    "state": "HIT" if row["review_state"] == "KEPT" else "MISS",
+                    "basis": "USER_REVIEW",
+                    "recorded_at": row["reviewed_at"],
+                    "effects": {"goal_created": False, "todo_created": False},
+                }
+                return stored, False
+            if row["review_state"] != "PROPOSAL_ONLY":
+                raise UniverseError(
+                    "WORK_LOOP_PREDICTION_REVIEW_CONFLICT",
+                    "prediction already has another review decision",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                UPDATE work_loop_prediction
+                SET review_state = ?, reviewed_at = ?
+                WHERE project_id = ? AND proposal_id = ? AND review_state = 'PROPOSAL_ONLY'
+                """,
+                (next_state, now, project["project_id"], proposal_id),
+            )
+        stored = json.loads(row["proposal_json"])
+        stored["review_state"] = next_state
+        stored["created_at"] = row["created_at"]
+        stored["reviewed_at"] = now
+        stored["goal_created"] = False
+        stored["todo_created"] = False
+        stored["feedback"] = {
+            "state": "HIT" if next_state == "KEPT" else "MISS",
+            "basis": "USER_REVIEW",
+            "recorded_at": now,
+            "effects": {"goal_created": False, "todo_created": False},
+        }
+        stored["schema"] = WORK_LOOP_PREDICTION_SCHEMA
+        return stored, True
+
+    def work_loop_snapshot(self, project_id: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        predictions = self.list_work_loop_predictions(project["project_id"])
+        with self._connection() as connection:
+            document_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM document_incorporation_proposal
+                WHERE project_id = ?
+                """,
+                (project["project_id"],),
+            ).fetchone()["count"]
+            document_review_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM work_loop_review_candidate
+                WHERE project_id = ? AND sink_kind = 'DOCUMENT_AUTOMATION'
+                  AND review_state = 'PENDING_REVIEW'
+                """,
+                (project["project_id"],),
+            ).fetchone()["count"]
+        return {
+            "schema": "universe.work-loop-snapshot.v1",
+            "status": "WORK_LOOP_COLLECTED",
+            "project_id": project["project_id"],
+            "predictions": predictions,
+            "result_fanouts": self.list_work_loop_result_fanouts(project["project_id"]),
+            "review_candidates": self.list_work_loop_review_candidates(
+                project["project_id"]
+            ),
+            "memory_schedules": self.list_memory_batch_schedule_states(
+                project["project_id"]
+            ),
+            "document_automation": {
+                "proposal_count": int(document_count),
+                "pending_result_reviews": int(document_review_count),
+                "auto_applied": False,
+            },
+            "adoption_policy": {
+                "auto_adopt": False,
+                "creates_goal": False,
+                "creates_todo": False,
+            },
+            "task_frame_created": False,
+            "execution_assignment_created": False,
+        }
+
+    def semantic_project_graph(self, project_id: str) -> dict[str, Any]:
+        """Project existing durable records as typed, non-authoritative graph facts."""
+        project = self.get_project(project_id)
+        project_id = project["project_id"]
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        node_ids: set[str] = set()
+        edge_ids: set[str] = set()
+
+        def add_node(
+            entity_type: str,
+            source_id: str,
+            label: str,
+            lifecycle_state: str,
+            source_kind: str,
+            source_ref: str,
+            data: Mapping[str, Any],
+        ) -> str:
+            node_id = f"{entity_type.lower()}:{source_id}"
+            if node_id in node_ids:
+                return node_id
+            node_ids.add(node_id)
+            nodes.append(
+                {
+                    "id": node_id,
+                    "entity_type": entity_type,
+                    "label": label or source_id,
+                    "lifecycle_state": lifecycle_state or "UNKNOWN",
+                    "provenance": {
+                        "source_kind": source_kind,
+                        "source_ref": source_ref,
+                    },
+                    "projection_only": True,
+                    "authority_state": "NONE",
+                    "data": dict(data),
+                }
+            )
+            return node_id
+
+        def add_edge(edge_type: str, source: str, target: str, source_ref: str) -> None:
+            edge_id = f"{edge_type}:{source}->{target}"
+            if edge_id in edge_ids:
+                return
+            edge_ids.add(edge_id)
+            edges.append(
+                {
+                    "id": edge_id,
+                    "edge_type": edge_type,
+                    "from": source,
+                    "to": target,
+                    "provenance": {"source_ref": source_ref},
+                    "projection_only": True,
+                }
+            )
+
+        project_node = add_node(
+            "PROJECT",
+            project_id,
+            str(project.get("display_name") or project_id),
+            str(project.get("state") or "REGISTERED"),
+            "PROJECT_CONNECTION",
+            f"universe://projects/{project_id}",
+            project,
+        )
+        universe_node = add_node(
+            "UNIVERSE",
+            "universe",
+            "Universe",
+            "CURRENT",
+            "UNIVERSE_RUNTIME",
+            "universe://",
+            {"scope_kind": "UNIVERSE"},
+        )
+        try:
+            with open_project_index_readonly(
+                project_id=project_id,
+                project_root=Path(project["project_root"]),
+            ) as connection:
+                file_candidates = list_graph_candidates(
+                    connection, project_id=project_id, include_removed=True
+                )
+        except FileIndexError:
+            file_candidates = []
+        for candidate in file_candidates:
+            relative_path = str(candidate["relative_path"])
+            source_ref = (
+                f"universe://projects/{quote(project_id, safe='')}/file-index/candidates/"
+                f"{quote(relative_path, safe='')}"
+            )
+            candidate_node = add_node(
+                "IMPLEMENTATION_MODULE_CANDIDATE",
+                f"{project_id}:{relative_path}",
+                relative_path,
+                str(candidate["lifecycle_state"]),
+                "FILE_INDEX_GRAPH_RECONCILE",
+                source_ref,
+                candidate,
+            )
+            add_edge(
+                "PROJECT_HAS_IMPLEMENTATION_CANDIDATE",
+                project_node,
+                candidate_node,
+                source_ref,
+            )
+        for cursor in self.list_semantic_collection_cursors(project_id, limit=100):
+            source_kind = str(cursor.get("source_kind") or "UNKNOWN")
+            cursor_node = add_node(
+                "COLLECTION_CURSOR",
+                f"{project_id}:{source_kind}",
+                f"Collection cursor · {source_kind}",
+                "CURRENT",
+                "SEMANTIC_COLLECTION_CURSOR",
+                f"universe://semantic-collection-cursors/{project_id}/{source_kind}",
+                cursor,
+            )
+            add_edge(
+                "PROJECT_HAS_COLLECTION_CURSOR",
+                project_node,
+                cursor_node,
+                f"universe://semantic-collection-cursors/{project_id}/{source_kind}",
+            )
+        session_nodes_by_provider_digest: dict[str, str] = {}
+        project_session_anchor_refs: set[str] = set()
+        session_nodes_by_anchor_ref: dict[str, str] = {}
+        for session in self.session_supervisor.list_sessions(
+            node=project_id, include_hidden=True
+        ):
+            session_id = str(session.get("session_id") or "")
+            if not session_id:
+                continue
+            source_ref = f"universe://supervisor/sessions/{session_id}"
+            session_node = add_node(
+                "SESSION", session_id,
+                str(session.get("display_name") or session_id),
+                str(session.get("state") or "UNKNOWN"),
+                "SESSION_SUPERVISOR", source_ref,
+                {
+                    key: session.get(key)
+                    for key in (
+                        "session_id", "node", "mode", "provider", "state",
+                        "currentness", "activity_state", "is_default", "updated_at",
+                    )
+                    if session.get(key) is not None
+                }
+                | {
+                    "provider_session_digest": _json_sha256(
+                        session.get("provider_session_ref") or ""
+                    )
+                },
+            )
+            add_edge("PROJECT_HAS_SESSION", project_node, session_node, source_ref)
+            if (
+                str(session.get("currentness") or "").upper() == "STALE"
+                and str(session.get("state") or "").upper() in {"LIVE", "STARTING"}
+            ):
+                drift_node = add_node(
+                    "DRIFT_CANDIDATE",
+                    session_id,
+                    f"Session drift candidate · {session.get('mode') or 'UNKNOWN'}",
+                    "AUTO_OBSERVED",
+                    "SESSION_CURRENTNESS_DRIFT",
+                    source_ref,
+                    {
+                        "session_id": session_id,
+                        "session_anchor_ref": session.get("session_anchor_ref"),
+                        "observed_state": session.get("state"),
+                        "observed_currentness": session.get("currentness"),
+                        "updated_at": session.get("updated_at"),
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "SESSION_DERIVES_DRIFT_CANDIDATE",
+                    session_node,
+                    drift_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_DRIFT_CANDIDATE",
+                    project_node,
+                    drift_node,
+                    source_ref,
+                )
+            provider_session_ref = str(session.get("provider_session_ref") or "")
+            if provider_session_ref:
+                session_nodes_by_provider_digest[_json_sha256(provider_session_ref)] = session_node
+            anchor_ref = str(session.get("session_anchor_ref") or "")
+            if anchor_ref:
+                project_session_anchor_refs.add(anchor_ref)
+                anchor_node = add_node(
+                    "SESSION_ANCHOR", anchor_ref, f"Session Anchor · {anchor_ref}",
+                    str(session.get("currentness") or "OBSERVED"),
+                    "SESSION_SUPERVISOR", source_ref,
+                    {"session_anchor_ref": anchor_ref, "session_id": session_id},
+                )
+                session_nodes_by_anchor_ref[anchor_ref] = anchor_node
+                add_edge("SESSION_OWNS_ANCHOR", session_node, anchor_node, source_ref)
+        for mode_anchor in self.session_supervisor.list_project_mode_anchors(
+            project_id=project_id
+        ):
+            mode = str(mode_anchor.get("mode") or "UNKNOWN")
+            anchor_ref = str(mode_anchor.get("anchor_ref") or "")
+            if not anchor_ref:
+                continue
+            source_ref = f"universe://project-mode-anchors/{project_id}/{mode}"
+            mode_node = add_node(
+                "MODE_ANCHOR", anchor_ref, f"{mode} Mode Anchor",
+                "CURRENT", "PROJECT_MODE_ANCHOR", source_ref,
+                {
+                    "project_id": project_id,
+                    "mode": mode,
+                    "anchor_ref": anchor_ref,
+                    "revision": mode_anchor.get("revision"),
+                    "updated_at": mode_anchor.get("updated_at"),
+                },
+            )
+            add_edge("PROJECT_HAS_MODE_ANCHOR", project_node, mode_node, source_ref)
+            for attachment in mode_anchor.get("session_anchor_refs") or []:
+                if not isinstance(attachment, Mapping):
+                    continue
+                session_anchor_ref = str(attachment.get("session_anchor_ref") or "")
+                if not session_anchor_ref:
+                    continue
+                session_anchor_node = add_node(
+                    "SESSION_ANCHOR", session_anchor_ref,
+                    f"Session Anchor · {session_anchor_ref}", "OBSERVED",
+                    "PROJECT_MODE_ANCHOR", source_ref,
+                    {
+                        "session_anchor_ref": session_anchor_ref,
+                        "session_id": attachment.get("session_id"),
+                        "revision": attachment.get("revision"),
+                        "attached_at": attachment.get("attached_at"),
+                    },
+                )
+                add_edge(
+                    "MODE_ANCHOR_REFS_SESSION_ANCHOR", mode_node, session_anchor_node,
+                    source_ref,
+                )
+
+        # Task Frame lineage is durable Anchor Graph input, not a separate
+        # ephemeral execution view.  Only result digests/times are projected:
+        # a Result Packet can contain provider or source details that do not
+        # belong in the shared semantic graph.
+        project_task_frames = [
+            frame
+            for frame in self.task_frame_lineage.list_task_frames()
+            if str(frame.get("origin_session_anchor_ref") or "")
+            in project_session_anchor_refs
+        ]
+        task_frame_nodes: dict[str, str] = {}
+        for frame in project_task_frames:
+            frame_ref = str(frame.get("frame_ref") or "")
+            origin_anchor_ref = str(frame.get("origin_session_anchor_ref") or "")
+            if not frame_ref or not origin_anchor_ref:
+                continue
+            source_ref = f"universe://task-frame-lineage/{frame_ref}"
+            frame_node = add_node(
+                "TASK_FRAME", frame_ref, f"Task Frame · {frame_ref}",
+                "OBSERVED", "TASK_FRAME_LINEAGE", source_ref,
+                {
+                    key: frame.get(key)
+                    for key in (
+                        "frame_ref", "origin_session_anchor_ref",
+                        "target_session_anchor_ref", "parent_task_frame_ref",
+                        "frame_digest", "revision", "created_at",
+                    )
+                    if frame.get(key) is not None
+                }
+                | {"result_count": len(frame.get("results") or [])},
+            )
+            task_frame_nodes[frame_ref] = frame_node
+            add_edge("PROJECT_HAS_TASK_FRAME", project_node, frame_node, source_ref)
+            origin_node = session_nodes_by_anchor_ref.get(origin_anchor_ref)
+            if origin_node is not None:
+                add_edge("SESSION_ANCHOR_HAS_TASK_FRAME", origin_node, frame_node, source_ref)
+            target_anchor_ref = str(frame.get("target_session_anchor_ref") or "")
+            target_node = session_nodes_by_anchor_ref.get(target_anchor_ref)
+            if target_node is not None:
+                add_edge("TASK_FRAME_TARGETS_SESSION_ANCHOR", frame_node, target_node, source_ref)
+            for result in frame.get("results") or []:
+                if not isinstance(result, Mapping):
+                    continue
+                result_ref = str(result.get("result_ref") or "")
+                if not result_ref:
+                    continue
+                result_node = add_node(
+                    "TASK_FRAME_RESULT", result_ref, f"Result · {result_ref}",
+                    "ATTACHED", "TASK_FRAME_LINEAGE", f"{source_ref}/results/{result_ref}",
+                    {
+                        key: result.get(key)
+                        for key in (
+                            "result_ref", "frame_ref", "origin_session_anchor_ref",
+                            "result_digest", "attached_at",
+                        )
+                        if result.get(key) is not None
+                    },
+                )
+                add_edge("TASK_FRAME_HAS_RESULT", frame_node, result_node, source_ref)
+        for frame in project_task_frames:
+            frame_ref = str(frame.get("frame_ref") or "")
+            parent_ref = str(frame.get("parent_task_frame_ref") or "")
+            frame_node = task_frame_nodes.get(frame_ref)
+            parent_node = task_frame_nodes.get(parent_ref)
+            if frame_node is not None and parent_node is not None:
+                add_edge("TASK_FRAME_CONTINUES", parent_node, frame_node,
+                         f"universe://task-frame-lineage/{frame_ref}")
+
+        # Automation dispatch stays out of the user chat queue.  Its durable
+        # record is projected as a work allocation that explicitly connects
+        # origin and target Session Anchors, even if one is currently offline.
+        # The bounded request summary is intentionally not copied into graph
+        # data: its source record remains the retrieval surface.
+        for allocation in self.list_conductor_delegations(
+            project_id=project_id, limit=200
+        ):
+            allocation_id = str(allocation.get("delegation_id") or "")
+            request = allocation.get("request")
+            if not allocation_id or not isinstance(request, Mapping):
+                continue
+            origin_ref = str(request.get("origin_session_anchor_ref") or "")
+            target_ref = str(request.get("target_session_anchor_ref") or "")
+            if not origin_ref or not target_ref:
+                continue
+            source_ref = f"universe://conductor/delegations/{allocation_id}"
+            allocation_node = add_node(
+                "WORK_ALLOCATION",
+                allocation_id,
+                f"Work allocation · {allocation.get('state') or 'QUEUED'}",
+                str(allocation.get("state") or "QUEUED"),
+                "CONDUCTOR_AUTOMATION",
+                source_ref,
+                {
+                    key: allocation.get(key)
+                    for key in (
+                        "delegation_id", "project_id", "state", "created_at",
+                        "updated_at", "started_at", "completed_at",
+                    )
+                    if allocation.get(key) is not None
+                }
+                | {
+                    "worker_role": request.get("worker_role"),
+                    "task_frame_ref": request.get("task_frame_ref"),
+                    "queue_scope": request.get("queue_scope"),
+                },
+            )
+            origin_node = session_nodes_by_anchor_ref.get(origin_ref)
+            if origin_node is None:
+                origin_node = add_node(
+                    "SESSION_ANCHOR", origin_ref,
+                    f"Session Anchor · {origin_ref}", "OBSERVED",
+                    "CONDUCTOR_ALLOCATION", source_ref,
+                    {"session_anchor_ref": origin_ref},
+                )
+                session_nodes_by_anchor_ref[origin_ref] = origin_node
+            target_node = session_nodes_by_anchor_ref.get(target_ref)
+            if target_node is None:
+                target_node = add_node(
+                    "SESSION_ANCHOR", target_ref,
+                    f"Session Anchor · {target_ref}", "OBSERVED",
+                    "CONDUCTOR_ALLOCATION", source_ref,
+                    {"session_anchor_ref": target_ref},
+                )
+                session_nodes_by_anchor_ref[target_ref] = target_node
+            add_edge(
+                "SESSION_ANCHOR_ALLOCATES_WORK",
+                origin_node,
+                allocation_node,
+                source_ref,
+            )
+            add_edge(
+                "WORK_ALLOCATION_TARGETS_SESSION_ANCHOR",
+                allocation_node,
+                target_node,
+                source_ref,
+            )
+
+        universe_goals = {
+            str(goal["universe_goal_id"]): goal
+            for goal in self.list_universe_goals()
+        }
+        universe_goal_nodes: dict[str, str] = {}
+        goals = self.list_project_goals(project_id)
+        goal_nodes_by_node_ref: dict[str, list[str]] = {}
+        goal_nodes_by_id: dict[str, str] = {}
+        assigned_todos: set[str] = set()
+        for goal in goals:
+            goal_id = str(goal["goal_id"])
+            goal_node = add_node(
+                "GOAL", goal_id, str(goal.get("title") or goal_id),
+                str(goal.get("state") or "UNKNOWN"), "PROJECT_GOAL",
+                f"universe://goals/{goal_id}", goal,
+            )
+            goal_nodes_by_id[goal_id] = goal_node
+            add_edge("PROJECT_HAS_GOAL", project_node, goal_node, f"universe://goals/{goal_id}")
+            if goal.get("scope_kind") == "NODE" and goal.get("node_ref"):
+                goal_nodes_by_node_ref.setdefault(str(goal["node_ref"]), []).append(goal_node)
+            universe_goal_id = goal.get("universe_goal_id")
+            universe_goal = universe_goals.get(str(universe_goal_id)) if universe_goal_id else None
+            if universe_goal is not None:
+                global_node = universe_goal_nodes.setdefault(
+                    str(universe_goal_id),
+                    add_node(
+                        "UNIVERSE_GOAL",
+                        str(universe_goal_id),
+                        str(universe_goal.get("title") or universe_goal_id),
+                        str(universe_goal.get("state") or "UNKNOWN"),
+                        "UNIVERSE_GOAL",
+                        f"universe://universe-goals/{universe_goal_id}",
+                        universe_goal,
+                    ),
+                )
+                add_edge(
+                    "UNIVERSE_HAS_GOAL", universe_node, global_node,
+                    f"universe://universe-goals/{universe_goal_id}",
+                )
+                add_edge(
+                    "UNIVERSE_GOAL_HAS_PROJECT_GOAL", global_node, goal_node,
+                    f"universe://universe-goals/{universe_goal_id}",
+                )
+                # Universe-scoped work belongs to the root Goal directly.  It
+                # is still visible while navigating any child project, without
+                # pretending that the work is owned by that project.
+                for global_todo in universe_goal.get("todos", []):
+                    global_todo_id = str(global_todo.get("todo_id") or "")
+                    if not global_todo_id:
+                        continue
+                    global_todo_node = add_node(
+                        "TODO",
+                        global_todo_id,
+                        str(global_todo.get("title") or global_todo_id),
+                        str(global_todo.get("state") or "UNKNOWN"),
+                        "UNIVERSE_TODO",
+                        f"universe://todos/{global_todo_id}",
+                        global_todo,
+                    )
+                    add_edge(
+                        "UNIVERSE_GOAL_HAS_TODO",
+                        global_node,
+                        global_todo_node,
+                        f"universe://todos/{global_todo_id}",
+                    )
+            for milestone in goal.get("milestones", []):
+                milestone_id = str(milestone["milestone_id"])
+                milestone_node = add_node(
+                    "MILESTONE", milestone_id, str(milestone.get("title") or milestone_id),
+                    str(milestone.get("state") or "UNKNOWN"), "PROJECT_MILESTONE",
+                    f"universe://milestones/{milestone_id}", milestone,
+                )
+                add_edge("GOAL_HAS_MILESTONE", goal_node, milestone_node, f"universe://milestones/{milestone_id}")
+                for todo in milestone.get("todos", []):
+                    todo_id = str(todo["todo_id"])
+                    assigned_todos.add(todo_id)
+                    todo_node = add_node(
+                        "TODO", todo_id, str(todo.get("title") or todo_id),
+                        str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                        f"universe://todos/{todo_id}", todo,
+                    )
+                    add_edge("MILESTONE_HAS_TODO", milestone_node, todo_node, f"universe://todos/{todo_id}")
+            for todo in goal.get("todos", []):
+                todo_id = str(todo["todo_id"])
+                assigned_todos.add(todo_id)
+                todo_node = add_node(
+                    "TODO", todo_id, str(todo.get("title") or todo_id),
+                    str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                    f"universe://todos/{todo_id}", todo,
+                )
+                add_edge("GOAL_HAS_TODO", goal_node, todo_node, f"universe://todos/{todo_id}")
+
+        for todo in self.list_todos():
+            if todo.get("project_id") != project_id or str(todo["todo_id"]) in assigned_todos:
+                continue
+            todo_id = str(todo["todo_id"])
+            todo_node = add_node(
+                "TODO", todo_id, str(todo.get("title") or todo_id),
+                str(todo.get("state") or "UNKNOWN"), "PROJECT_TODO",
+                f"universe://todos/{todo_id}", todo,
+            )
+            add_edge("PROJECT_HAS_TODO", project_node, todo_node, f"universe://todos/{todo_id}")
+
+        # A current Project Seed is the authoritative source for functional
+        # decomposition.  Its nodes are projected automatically; this does
+        # not create, promote, or mutate the Seed when one is absent.
+        try:
+            project_seed = self.get_project_seed(project_id)
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            project_seed = None
+        if project_seed is not None:
+            functional_nodes: dict[str, str] = {}
+            seed_id = str(project_seed.get("seed_id") or "UNKNOWN")
+            seed_ref = f"universe://project-seeds/{project_id}/{seed_id}"
+            for functional in project_seed.get("nodes") or []:
+                if not isinstance(functional, Mapping):
+                    continue
+                functional_id = str(functional.get("node_id") or "")
+                if not functional_id:
+                    continue
+                functional_node = add_node(
+                    "FUNCTIONAL_NODE", f"{project_id}:{functional_id}",
+                    str(functional.get("title") or functional_id),
+                    str(functional.get("state") or "CURRENT"),
+                    "PROJECT_SEED", seed_ref,
+                    {
+                        key: functional.get(key)
+                        for key in ("node_id", "kind", "title", "purpose", "acceptance_condition")
+                        if functional.get(key) is not None
+                    },
+                )
+                functional_nodes[functional_id] = functional_node
+                add_edge("PROJECT_HAS_FUNCTIONAL_NODE", project_node, functional_node, seed_ref)
+                for scoped_goal_node in goal_nodes_by_node_ref.get(functional_id, []):
+                    add_edge(
+                        "FUNCTIONAL_NODE_HAS_GOAL",
+                        functional_node,
+                        scoped_goal_node,
+                        seed_ref,
+                    )
+            for functional_edge in project_seed.get("edges") or []:
+                if not isinstance(functional_edge, Mapping):
+                    continue
+                source = functional_nodes.get(str(functional_edge.get("from_node") or ""))
+                target = functional_nodes.get(str(functional_edge.get("to_node") or ""))
+                if source is None or target is None:
+                    continue
+                relation = str(functional_edge.get("kind") or "RELATED_TO")
+                add_edge(f"FUNCTIONAL_{relation}", source, target, seed_ref)
+
+        for prediction in self.list_work_loop_predictions(project_id):
+            proposal_id = str(prediction.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            suggestions = prediction.get("suggestions") if isinstance(prediction.get("suggestions"), list) else []
+            prediction_node = add_node(
+                "PREDICTION", proposal_id,
+                str(prediction.get("title") or f"Prediction · {len(suggestions)} suggestion(s)"),
+                str(prediction.get("review_state") or "PROPOSAL_ONLY"),
+                "WORK_LOOP_PREDICTION", f"universe://work-loop/predictions/{proposal_id}", prediction,
+            )
+            add_edge("PROJECT_HAS_PREDICTION", project_node, prediction_node, f"universe://work-loop/predictions/{proposal_id}")
+
+        # Document automation remains review-only, but it must be visible as a
+        # graph input alongside the other automatic work-loop outputs. Do not
+        # project source/target paths: they can disclose repository layout and
+        # are not needed for navigation or adoption decisions.
+        for proposal in self.list_document_incorporation_proposals(project_id):
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            operations = proposal.get("operations")
+            normalized_operations = (
+                [item for item in operations if isinstance(item, Mapping)]
+                if isinstance(operations, list)
+                else []
+            )
+            operations_by_kind: dict[str, int] = {}
+            roles: set[str] = set()
+            for operation in normalized_operations:
+                operation_kind = str(operation.get("operation") or "UNKNOWN")
+                operations_by_kind[operation_kind] = (
+                    operations_by_kind.get(operation_kind, 0) + 1
+                )
+                role = str(operation.get("role") or "")
+                if role:
+                    roles.add(role)
+            source_ref = f"universe://document-incorporation-proposals/{proposal_id}"
+            document_node = add_node(
+                "DOCUMENT_AUTOMATION",
+                proposal_id,
+                f"Document automation · {len(normalized_operations)} operation(s)",
+                str(proposal.get("status") or "INCORPORATION_PROPOSAL_READY"),
+                "DOCUMENT_INCORPORATION_PROPOSAL",
+                source_ref,
+                {
+                    key: proposal.get(key)
+                    for key in (
+                        "proposal_id", "projection_id", "projection_digest",
+                        "proposal_digest", "approval", "execution_owner",
+                        "next_operation", "created_at",
+                    )
+                    if proposal.get(key) is not None
+                }
+                | {
+                    "operation_count": len(normalized_operations),
+                    "operations_by_kind": operations_by_kind,
+                    "roles": sorted(roles),
+                },
+            )
+            add_edge(
+                "PROJECT_HAS_DOCUMENT_AUTOMATION",
+                project_node,
+                document_node,
+                source_ref,
+            )
+
+        for memory in self.list_project_memories(project_id, limit=200):
+            memory_id = str(memory.get("memory_id") or "")
+            if not memory_id:
+                continue
+            source_ref = str(memory.get("origin_ref") or f"universe://memories/{memory_id}")
+            # Project Memory may retain a reviewable body in its source store.
+            # The semantic graph is a redacted navigation projection, so only
+            # stable identity/link metadata belongs here.
+            memory_data = {
+                key: memory.get(key)
+                for key in (
+                    "memory_id", "title", "state", "link_state", "origin_ref",
+                    "node_ref", "graph", "created_at", "updated_at",
+                )
+                if memory.get(key) is not None
+            }
+            memory_node = add_node(
+                "MEMORY", memory_id, str(memory.get("title") or memory_id),
+                str(memory.get("link_state") or memory.get("state") or "LINKED_ONLY"),
+                "PROJECT_MEMORY", source_ref, memory_data,
+            )
+            add_edge("PROJECT_HAS_MEMORY", project_node, memory_node, f"universe://memories/{memory_id}")
+            if str(memory.get("link_state") or "").upper() == "LINKED":
+                rag_node = add_node(
+                    "RAG_SOURCE",
+                    memory_id,
+                    f"RAG source · {memory.get('title') or memory_id}",
+                    "LINKED_ONLY",
+                    "PROJECT_MEMORY_RAG",
+                    source_ref,
+                    {
+                        key: memory.get(key)
+                        for key in ("memory_id", "node_ref", "graph", "link_state")
+                        if memory.get(key) is not None
+                    }
+                    | {
+                        "retrieval_policy": "LINKED_ONLY",
+                        "body_in_graph": False,
+                    },
+                )
+                add_edge("PROJECT_HAS_RAG_SOURCE", project_node, rag_node, source_ref)
+                add_edge("RAG_SOURCE_USES_MEMORY", rag_node, memory_node, source_ref)
+
+        for candidate in self.list_work_loop_review_candidates(project_id):
+            if str(candidate.get("sink_kind") or "").upper() != "BENCH":
+                continue
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            bench_node = add_node(
+                "BENCH", candidate_id,
+                str(candidate.get("title") or candidate.get("summary") or "Bench recommendation"),
+                str(candidate.get("review_state") or "PENDING_REVIEW"),
+                "WORK_LOOP_BENCH_CANDIDATE", f"universe://work-loop/review-candidates/{candidate_id}", candidate,
+            )
+            add_edge("PROJECT_HAS_BENCH_CANDIDATE", project_node, bench_node, f"universe://work-loop/review-candidates/{candidate_id}")
+
+        memory_candidates = self.list_memory_candidates(project_id, limit=200)
+        memory_candidate_nodes: dict[str, str] = {}
+        for candidate in memory_candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if not candidate_id:
+                continue
+            candidate_node = add_node(
+                "MEMORY_CANDIDATE", candidate_id,
+                str(candidate.get("title") or candidate.get("summary") or candidate_id),
+                str(candidate.get("state") or "REVIEW_REQUIRED"),
+                "MEMORY_CANDIDATE",
+                f"universe://memory-candidates/{candidate_id}", candidate,
+            )
+            memory_candidate_nodes[candidate_id] = candidate_node
+            add_edge(
+                "PROJECT_HAS_MEMORY_CANDIDATE", project_node, candidate_node,
+                f"universe://memory-candidates/{candidate_id}",
+            )
+        for candidate in memory_candidates:
+            candidate_id = str(candidate.get("candidate_id") or "")
+            source_node = memory_candidate_nodes.get(candidate_id)
+            if source_node is None:
+                continue
+            for relation in candidate.get("relations") or []:
+                if not isinstance(relation, Mapping):
+                    continue
+                target_node = memory_candidate_nodes.get(
+                    str(relation.get("candidate_id") or "")
+                )
+                relation_type = str(relation.get("relation") or "RELATED_TO")
+                if target_node is not None:
+                    add_edge(
+                        f"MEMORY_CANDIDATE_{relation_type}", source_node, target_node,
+                        f"universe://memory-candidates/{candidate_id}",
+                    )
+
+        proposal_nodes_by_id: dict[str, str] = {}
+        for proposal in self.list_feature_node_proposals(project_id, limit=200):
+            proposal_id = str(proposal.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            proposal_ref = f"universe://feature-node-proposals/{proposal_id}"
+            proposal_node = add_node(
+                "FEATURE_NODE_PROPOSAL",
+                proposal_id,
+                str(proposal.get("title") or proposal_id),
+                str(proposal.get("state") or "PROPOSAL_ONLY"),
+                "FEATURE_NODE_PROPOSAL",
+                proposal_ref,
+                {
+                    "proposal_id": proposal_id,
+                    "project_id": proposal.get("project_id"),
+                    "proposal_kind": proposal.get("proposal_kind"),
+                    "target_node_ref": proposal.get("target_node_ref"),
+                    "cluster_refs": proposal.get("cluster_refs") or [],
+                    "evidence_refs": proposal.get("evidence_refs") or [],
+                    "evidence_count": len(proposal.get("evidence_refs") or []),
+                    "confidence": proposal.get("confidence"),
+                    "proposal_digest": proposal.get("proposal_digest"),
+                    "review": proposal.get("review"),
+                    "effects": proposal.get("effects"),
+                    "body_in_graph": False,
+                },
+            )
+            proposal_nodes_by_id[proposal_id] = proposal_node
+            add_edge(
+                "PROJECT_HAS_FEATURE_NODE_PROPOSAL",
+                project_node,
+                proposal_node,
+                proposal_ref,
+            )
+
+        room_nodes_by_id: dict[str, str] = {}
+        artifact_nodes_by_id: dict[str, str] = {}
+
+        # Rooms are a separate conversation plane from the legacy Project Room
+        # message feed below.  Project the durable room/binding records here so
+        # graph consumers can navigate the exact session-anchor relationship
+        # without treating a provider transcript or queue item as a session.
+        for room in self.multi_rooms.list_rooms(project_id=project_id):
+            room_id = str(room.get("room_id") or "")
+            if not room_id:
+                continue
+            source_ref = f"universe://chat-rooms/{room_id}"
+            room_node = add_node(
+                "CHAT_ROOM", room_id,
+                str(room.get("title") or room_id),
+                str(room.get("state") or "OPEN"),
+                "MULTI_ROOM", source_ref,
+                {
+                    key: room.get(key)
+                    for key in (
+                        "room_id", "room_type", "project_id", "task_frame_id",
+                        "host_role", "participant_count", "created_at", "updated_at",
+                    )
+                    if room.get(key) is not None
+                },
+            )
+            room_nodes_by_id[room_id] = room_node
+            add_edge("PROJECT_HAS_CHAT_ROOM", project_node, room_node, source_ref)
+            for binding in self.multi_rooms.list_bindings(room_id):
+                binding_id = str(binding.get("binding_id") or "")
+                if not binding_id:
+                    continue
+                binding_data = {
+                    key: binding.get(key)
+                    for key in (
+                        "binding_id", "slot_role", "provider", "supervisor_session_id",
+                        "session_anchor_ref", "participant_state", "created_at", "updated_at",
+                    )
+                    if binding.get(key) is not None
+                }
+                if binding.get("provider") == "TASK_FRAME_RUN":
+                    binding_data["task_frame_run_ref"] = binding.get(
+                        "provider_session_ref"
+                    )
+                binding_node = add_node(
+                    "ROOM_BINDING", binding_id,
+                    str(binding.get("display_name") or binding.get("slot_role") or binding_id),
+                    str(binding.get("state") or "UNKNOWN"),
+                    "MULTI_ROOM_BINDING", f"{source_ref}/bindings/{binding_id}",
+                    binding_data,
+                )
+                add_edge("CHAT_ROOM_HAS_BINDING", room_node, binding_node, source_ref)
+                anchor_ref = str(binding.get("session_anchor_ref") or "")
+                if anchor_ref:
+                    anchor_node = add_node(
+                        "SESSION_ANCHOR", anchor_ref, f"Session Anchor · {anchor_ref}",
+                        "OBSERVED", "ROOM_SESSION_ANCHOR", source_ref,
+                        {"session_anchor_ref": anchor_ref},
+                    )
+                    add_edge(
+                        "ROOM_BINDING_REFS_SESSION_ANCHOR", binding_node, anchor_node,
+                        source_ref,
+                    )
+
+            # Multi-room messages are a separate durable conversation plane.
+            # Keep their text out of the graph while retaining the exact room,
+            # author binding, sequence, and content provenance needed by the
+            # automatic collector.  No message text is interpreted as a Todo,
+            # decision, or authority claim here; promotion stays user-driven.
+            multi_message_nodes: dict[str, str] = {}
+            for message in self.multi_rooms.list_messages(room_id, limit=200):
+                message_id = str(message.get("message_id") or "")
+                if not message_id:
+                    continue
+                message_ref = f"{source_ref}/messages/{message_id}"
+                content_digest = _json_sha256(
+                    {"body_text": str(message.get("body_text") or "")}
+                )
+                graph_message = {
+                    key: message.get(key)
+                    for key in (
+                        "message_id", "room_id", "room_event_id", "room_sequence",
+                        "kind", "author_role", "author_binding_id", "created_at",
+                    )
+                    if message.get(key) is not None
+                }
+                graph_message.update(
+                    {
+                        "content_digest": content_digest,
+                        "body_in_graph": False,
+                        "extraction_state": "AUTO_OBSERVED",
+                    }
+                )
+                if message.get("provider_event_id"):
+                    graph_message["provider_event_digest"] = _json_sha256(
+                        {"provider_event_id": message.get("provider_event_id")}
+                    )
+                if message.get("correlation_id"):
+                    graph_message["correlation_digest"] = _json_sha256(
+                        {"correlation_id": message.get("correlation_id")}
+                    )
+                message_node = add_node(
+                    "CHAT_ROOM_MESSAGE",
+                    f"{room_id}:{message_id}",
+                    f"{message.get('author_role') or 'UNKNOWN'} · room message",
+                    "RECORDED",
+                    "MULTI_ROOM_MESSAGE",
+                    message_ref,
+                    graph_message,
+                )
+                multi_message_nodes[message_id] = message_node
+                add_edge("CHAT_ROOM_HAS_MESSAGE", room_node, message_node, message_ref)
+                binding_id = str(message.get("author_binding_id") or "")
+                if binding_id:
+                    add_edge(
+                        "ROOM_MESSAGE_AUTHORED_BY_BINDING",
+                        message_node,
+                        f"room_binding:{binding_id}",
+                        message_ref,
+                    )
+                message_kind = str(message.get("kind") or "MESSAGE").upper()
+                if message_kind == "DECISION":
+                    decision_node = add_node(
+                        "ROOM_DECISION",
+                        f"{room_id}:{message_id}",
+                        f"Room decision · {message.get('author_role') or 'UNKNOWN'}",
+                        "AUTO_OBSERVED",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge("ROOM_MESSAGE_DERIVES_DECISION", message_node, decision_node, message_ref)
+                    add_edge("PROJECT_HAS_ROOM_DECISION", project_node, decision_node, message_ref)
+                elif message_kind in {"TASK_DRAFT", "DOCUMENT_DRAFT", "FAILURE"}:
+                    candidate_type = {
+                        "TASK_DRAFT": "TODO_CANDIDATE",
+                        "DOCUMENT_DRAFT": "DOCUMENT_CANDIDATE",
+                        "FAILURE": "FAILURE_CANDIDATE",
+                    }[message_kind]
+                    candidate_node = add_node(
+                        candidate_type,
+                        f"{room_id}:{message_id}",
+                        f"{candidate_type.replace('_', ' ').title()} · room",
+                        "PROPOSAL_ONLY",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "promotion_state": "USER_SELECTION_REQUIRED",
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge(
+                        f"ROOM_MESSAGE_DERIVES_{candidate_type}",
+                        message_node,
+                        candidate_node,
+                        message_ref,
+                    )
+                    add_edge(
+                        f"PROJECT_HAS_{candidate_type}",
+                        project_node,
+                        candidate_node,
+                        message_ref,
+                    )
+                elif message_kind == "BENCH_OBSERVATION":
+                    bench_node = add_node(
+                        "BENCH_OBSERVATION",
+                        f"{room_id}:{message_id}",
+                        "Bench observation · room",
+                        "AUTO_OBSERVED",
+                        "MULTI_ROOM_EXTRACTION",
+                        message_ref,
+                        {
+                            "room_id": room_id,
+                            "message_id": message_id,
+                            "content_digest": content_digest,
+                            "created_at": message.get("created_at"),
+                            "body_in_graph": False,
+                        },
+                    )
+                    add_edge("ROOM_MESSAGE_DERIVES_BENCH_OBSERVATION", message_node, bench_node, message_ref)
+                    add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, message_ref)
+
+            # Structured findings expose research, cross-feature boundaries,
+            # and escalation requests without interpreting chat or creating authority.
+            for finding in self.multi_rooms.list_findings(room_id, limit=200):
+                finding_id = str(finding.get("finding_id") or "")
+                if not finding_id:
+                    continue
+                finding_ref = f"{source_ref}/findings/{finding_id}"
+                entity_type = {
+                    "RAG_FINDING": "ROOM_RAG_FINDING",
+                    "CROSS_FEATURE_DEPENDENCY": "ROOM_CROSS_FEATURE_DEPENDENCY",
+                    "ESCALATION_REQUEST": "ROOM_ESCALATION_REQUEST",
+                }.get(str(finding.get("finding_type") or ""), "ROOM_FINDING")
+                finding_node = add_node(
+                    entity_type,
+                    finding_id,
+                    str(finding.get("summary") or finding_id),
+                    str(finding.get("state") or "OPEN"),
+                    "MULTI_ROOM_FINDING",
+                    finding_ref,
+                    {
+                        key: finding.get(key)
+                        for key in (
+                            "finding_id", "room_id", "finding_type", "summary",
+                            "reporter_role", "reporter_binding_id", "evidence_refs",
+                            "feature_refs", "requested_owner_role", "source_message_id",
+                            "content_digest", "state", "resolution_state", "authority",
+                            "created_at", "updated_at",
+                        )
+                        if finding.get(key) is not None
+                    }
+                    | {"detail_in_graph": False},
+                )
+                add_edge("CHAT_ROOM_HAS_FINDING", room_node, finding_node, finding_ref)
+                add_edge("PROJECT_HAS_ROOM_FINDING", project_node, finding_node, finding_ref)
+                source_message_id = str(finding.get("source_message_id") or "")
+                if source_message_id and source_message_id in multi_message_nodes:
+                    add_edge(
+                        "ROOM_FINDING_REFS_MESSAGE",
+                        finding_node,
+                        multi_message_nodes[source_message_id],
+                        finding_ref,
+                    )
+                for feature_ref in finding.get("feature_refs") or []:
+                    feature_ref_text = str(feature_ref)
+                    feature_node = add_node(
+                        "FEATURE_REFERENCE",
+                        feature_ref_text,
+                        feature_ref_text,
+                        "REFERENCED",
+                        "MULTI_ROOM_FINDING",
+                        finding_ref,
+                        {"feature_ref": feature_ref_text},
+                    )
+                    add_edge(
+                        "ROOM_FINDING_REFS_FEATURE",
+                        finding_node,
+                        feature_node,
+                        finding_ref,
+                    )
+
+            # Room-native artifacts are explicit, revisioned candidates. Keep the
+            # body outside the semantic graph while preserving evidence links and
+            # revision lineage. Nothing here adopts a Feature Node or Expected Path.
+            for artifact in self.multi_rooms.list_artifacts(room_id, limit=200):
+                artifact_id = str(artifact.get("artifact_id") or "")
+                if not artifact_id:
+                    continue
+                artifact_ref = f"{source_ref}/artifacts/{artifact_id}"
+                artifact_node = add_node(
+                    "ROOM_ARTIFACT",
+                    artifact_id,
+                    str(artifact.get("title") or artifact_id),
+                    str(artifact.get("state") or "DRAFT"),
+                    "MULTI_ROOM_ARTIFACT",
+                    artifact_ref,
+                    {
+                        key: artifact.get(key)
+                        for key in (
+                            "artifact_id", "room_id", "artifact_type", "state",
+                            "current_revision", "content_digest", "evidence_refs",
+                            "source_message_id", "created_at", "updated_at",
+                            "promotion_state", "authority",
+                        )
+                        if artifact.get(key) is not None
+                    }
+                    | {"body_in_graph": False},
+                )
+                artifact_nodes_by_id[artifact_id] = artifact_node
+                add_edge("CHAT_ROOM_HAS_ARTIFACT", room_node, artifact_node, artifact_ref)
+                detailed = self.multi_rooms.get_artifact(room_id, artifact_id)
+                for revision in detailed.get("revisions") or []:
+                    revision_number = int(revision.get("revision") or 0)
+                    revision_ref = f"{artifact_ref}/revisions/{revision_number}"
+                    revision_node = add_node(
+                        "ROOM_ARTIFACT_REVISION",
+                        f"{artifact_id}:{revision_number}",
+                        f"{artifact.get('artifact_type')} revision {revision_number}",
+                        str(revision.get("state") or "DRAFT"),
+                        "MULTI_ROOM_ARTIFACT_REVISION",
+                        revision_ref,
+                        {
+                            key: revision.get(key)
+                            for key in (
+                                "artifact_id", "revision", "state", "author_role",
+                                "author_binding_id", "evidence_refs", "source_message_id",
+                                "content_digest", "created_at",
+                            )
+                            if revision.get(key) is not None
+                        }
+                        | {"body_in_graph": False},
+                    )
+                    add_edge(
+                        "ROOM_ARTIFACT_HAS_REVISION",
+                        artifact_node,
+                        revision_node,
+                        revision_ref,
+                    )
+                    source_message_id = str(revision.get("source_message_id") or "")
+                    if source_message_id and source_message_id in multi_message_nodes:
+                        add_edge(
+                            "ROOM_ARTIFACT_REVISION_REFS_MESSAGE",
+                            revision_node,
+                            multi_message_nodes[source_message_id],
+                            revision_ref,
+                        )
+
+            # BOSS-room Worker reports are results, not transcript messages.
+            # Project their structured, non-secret envelope independently so a
+            # graph consumer can distinguish a result from discussion text.
+            for event in self.multi_rooms.list_control_events(room_id, limit=200):
+                event_id = str(event.get("event_id") or "")
+                event_type = str(event.get("event_type") or "ROOM_CONTROL")
+                if not event_id:
+                    continue
+                event_ref = f"{source_ref}/control-events/{event_id}"
+                payload = event.get("payload")
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                if event_type == "WORKER_REPORT":
+                    message_id = str(event.get("message_id") or "")
+                    result_node = add_node(
+                        "ROOM_RESULT",
+                        event_id,
+                        "Worker report",
+                        str(payload.get("severity") or event.get("severity") or "INFO"),
+                        "MULTI_ROOM_RESULT",
+                        event_ref,
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "room_id": room_id,
+                            "message_id": message_id or None,
+                            "severity": payload.get("severity") or event.get("severity"),
+                            "created_at": event.get("created_at"),
+                            "body_in_graph": False,
+                            "extraction_state": "AUTO_OBSERVED",
+                        },
+                    )
+                    add_edge("CHAT_ROOM_HAS_RESULT", room_node, result_node, event_ref)
+                    message_node = multi_message_nodes.get(message_id)
+                    if message_node is not None:
+                        add_edge("ROOM_RESULT_REFS_MESSAGE", result_node, message_node, event_ref)
+                else:
+                    control_node = add_node(
+                        "ROOM_CONTROL_EVENT",
+                        event_id,
+                        f"Room control · {event_type}",
+                        "RECORDED",
+                        "MULTI_ROOM_CONTROL_EVENT",
+                        event_ref,
+                        {
+                            "event_id": event_id,
+                            "event_type": event_type,
+                            "room_id": room_id,
+                            "created_at": event.get("created_at"),
+                            "payload_in_graph": False,
+                        },
+                    )
+                    add_edge("CHAT_ROOM_HAS_CONTROL_EVENT", room_node, control_node, event_ref)
+
+
+        # Feature Nodes precede work planning. Expected Paths are revision-pinned
+        # Meeting Room specifications, and adoption is an explicit USER decision.
+        feature_nodes_by_id: dict[str, str] = {}
+        for feature in self.list_feature_nodes(project_id):
+            feature_id = str(feature["feature_id"])
+            feature_ref = f"universe://feature-nodes/{feature_id}"
+            feature_node = add_node(
+                "FEATURE_NODE", feature_id, str(feature["title"]), str(feature["state"]),
+                "FEATURE_NODE", feature_ref,
+                {key: feature.get(key) for key in (
+                    "feature_id", "project_id", "intent_text", "state", "meeting_room_id",
+                    "created_by_role", "evidence_refs", "revision", "created_at", "updated_at",
+                )},
+            )
+            feature_nodes_by_id[feature_id] = feature_node
+            add_edge("PROJECT_HAS_FEATURE_NODE", project_node, feature_node, feature_ref)
+            meeting_room_id = str(feature.get("meeting_room_id") or "")
+            if meeting_room_id in room_nodes_by_id:
+                add_edge("FEATURE_NODE_EXPLORED_IN_MEETING_ROOM", feature_node, room_nodes_by_id[meeting_room_id], feature_ref)
+            detailed_feature = self.get_feature_node(feature_id)
+            path_nodes: dict[str, str] = {}
+            for path in detailed_feature["expected_paths"]:
+                path_id = str(path["expected_path_id"])
+                path_ref = f"{feature_ref}/expected-paths/{path_id}"
+                path_node = add_node(
+                    "EXPECTED_PATH", path_id, str(path["title"]), str(path["state"]),
+                    "FEATURE_EXPECTED_PATH", path_ref,
+                    {key: path.get(key) for key in (
+                        "expected_path_id", "feature_id", "room_id", "artifact_id",
+                        "artifact_revision", "summary", "specification_digest", "evidence_refs",
+                        "state", "route_digest", "created_at", "updated_at",
+                    )},
+                )
+                path_nodes[path_id] = path_node
+                add_edge("FEATURE_NODE_HAS_EXPECTED_PATH", feature_node, path_node, path_ref)
+                if str(path["room_id"]) in room_nodes_by_id:
+                    add_edge("EXPECTED_PATH_FROM_MEETING_ROOM", path_node, room_nodes_by_id[str(path["room_id"])], path_ref)
+                if str(path["artifact_id"]) in artifact_nodes_by_id:
+                    add_edge("EXPECTED_PATH_PINS_SPECIFICATION", path_node, artifact_nodes_by_id[str(path["artifact_id"])], path_ref)
+                route = path.get("route") if isinstance(path.get("route"), Mapping) else None
+                route_step_nodes: dict[str, str] = {}
+                if route is not None:
+                    for ordinal, step in enumerate(route.get("steps") or [], start=1):
+                        step_id = str(step.get("step_id") or "")
+                        if not step_id:
+                            continue
+                        step_ref = f"{path_ref}/route/steps/{step_id}"
+                        step_node = add_node(
+                            "EXPECTED_PATH_STEP",
+                            f"{path_id}:{step_id}",
+                            str(step.get("title") or step_id),
+                            "PREDICTED",
+                            "EXPECTED_PATH_ROUTE_STEP",
+                            step_ref,
+                            {
+                                "expected_path_id": path_id,
+                                "step_id": step_id,
+                                "ordinal": ordinal,
+                                "summary": step.get("summary"),
+                                "phase": step.get("phase"),
+                                "route_digest": path.get("route_digest"),
+                                "predicted": True,
+                            },
+                        )
+                        route_step_nodes[step_id] = step_node
+                        add_edge("EXPECTED_PATH_HAS_STEP", path_node, step_node, step_ref)
+                    for dependency in route.get("dependencies") or []:
+                        source = route_step_nodes.get(str(dependency.get("from_step_id") or ""))
+                        target = route_step_nodes.get(str(dependency.get("to_step_id") or ""))
+                        if source is not None and target is not None:
+                            add_edge(
+                                "EXPECTED_PATH_STEP_" + str(dependency.get("kind") or "PRECEDES"),
+                                source,
+                                target,
+                                path_ref + "/route/dependencies",
+                            )
+                    for branch_index, branch in enumerate(route.get("branches") or []):
+                        source = route_step_nodes.get(str(branch.get("from_step_id") or ""))
+                        for target_id in branch.get("to_step_ids") or []:
+                            target = route_step_nodes.get(str(target_id))
+                            if source is not None and target is not None:
+                                add_edge(
+                                    "EXPECTED_PATH_BRANCH",
+                                    source,
+                                    target,
+                                    f"{path_ref}/route/branches/{branch_index}",
+                                )
+            adoption = detailed_feature.get("adoption")
+            if adoption and str(adoption["expected_path_id"]) in path_nodes:
+                add_edge(
+                    "FEATURE_NODE_ADOPTS_EXPECTED_PATH", feature_node,
+                    path_nodes[str(adoption["expected_path_id"])],
+                    f"{feature_ref}/adoption",
+                )
+            derivation = detailed_feature.get("goal_derivation")
+            if derivation:
+                goal_node = goal_nodes_by_id.get(str(derivation["goal_id"]))
+                path_node = path_nodes.get(str(derivation["expected_path_id"]))
+                derivation_ref = f"{feature_ref}/goal-derivation"
+                if goal_node is not None:
+                    add_edge(
+                        "FEATURE_NODE_DERIVES_GOAL",
+                        feature_node,
+                        goal_node,
+                        derivation_ref,
+                    )
+                    if path_node is not None:
+                        add_edge(
+                            "EXPECTED_PATH_DERIVES_GOAL",
+                            path_node,
+                            goal_node,
+                            derivation_ref,
+                        )
+
+            if derivation:
+                goal_id = str(derivation["goal_id"])
+                goal_node = goal_nodes_by_id.get(goal_id)
+                work_plan_surface = detailed_feature.get("goal_derivation", {}).get("work_plans") or {}
+                adopted_work_plan_id = str((work_plan_surface.get("adoption") or {}).get("work_plan_id") or "")
+                for work_plan in work_plan_surface.get("candidates") or []:
+                    work_plan_id = str(work_plan["work_plan_id"])
+                    plan = work_plan.get("plan") or {}
+                    milestone_count = len(plan.get("milestones") or [])
+                    todo_count = sum(len(item.get("todos") or []) for item in plan.get("milestones") or [])
+                    work_plan_ref = f"universe://goals/{goal_id}/work-plans/{work_plan_id}"
+                    work_plan_node = add_node(
+                        "GOAL_WORK_PLAN", work_plan_id, str(plan.get("title") or "Work Plan"),
+                        str(work_plan["state"]), "GOAL_WORK_PLAN", work_plan_ref,
+                        {
+                            "work_plan_id": work_plan_id,
+                            "goal_id": goal_id,
+                            "feature_id": work_plan.get("feature_id"),
+                            "room_id": work_plan.get("room_id"),
+                            "run_id": work_plan.get("run_id"),
+                            "source_message_id": work_plan.get("source_message_id"),
+                            "author_binding_id": work_plan.get("author_binding_id"),
+                            "plan_digest": work_plan.get("plan_digest"),
+                            "title": plan.get("title"),
+                            "summary": plan.get("summary"),
+                            "milestone_count": milestone_count,
+                            "todo_count": todo_count,
+                            "state": work_plan.get("state"),
+                            "created_at": work_plan.get("created_at"),
+                            "updated_at": work_plan.get("updated_at"),
+                            "plan_in_graph": False,
+                        },
+                    )
+                    if goal_node is not None:
+                        add_edge("GOAL_HAS_WORK_PLAN", goal_node, work_plan_node, work_plan_ref)
+                        if work_plan_id == adopted_work_plan_id:
+                            add_edge("GOAL_ADOPTS_WORK_PLAN", goal_node, work_plan_node, f"universe://goals/{goal_id}/work-plan-adoption")
+
+        for proposal in self.list_feature_node_proposals(project_id, limit=200):
+            context = proposal.get("planning_context")
+            if not isinstance(context, Mapping):
+                continue
+            context_id = str(context.get("context_id") or "")
+            if not context_id:
+                continue
+            context_ref = f"universe://node-planning-contexts/{context_id}"
+            context_node = add_node(
+                "NODE_PLANNING_CONTEXT",
+                context_id,
+                str(context.get("title") or context_id),
+                "READY_FOR_MEETING",
+                "NODE_PLANNING_CONTEXT",
+                context_ref,
+                {
+                    "context_id": context_id,
+                    "project_id": context.get("project_id"),
+                    "proposal_id": context.get("proposal_id"),
+                    "proposal_digest": context.get("proposal_digest"),
+                    "feature_id": context.get("feature_id"),
+                    "room_id": context.get("room_id"),
+                    "context_digest": context.get("context_digest"),
+                    "proposal_kind": context.get("proposal_kind"),
+                    "evidence_count": len(context.get("evidence_refs") or []),
+                    "neighbor_feature_refs": context.get("neighbor_feature_refs") or [],
+                    "redaction": context.get("redaction"),
+                    "next_operation": context.get("next_operation"),
+                    "effects": context.get("effects"),
+                    "body_in_graph": False,
+                },
+            )
+            add_edge(
+                "PROJECT_HAS_NODE_PLANNING_CONTEXT",
+                project_node,
+                context_node,
+                context_ref,
+            )
+            proposal_node = proposal_nodes_by_id.get(str(context.get("proposal_id") or ""))
+            if proposal_node is not None:
+                add_edge(
+                    "FEATURE_NODE_PROPOSAL_STARTS_PLANNING",
+                    proposal_node,
+                    context_node,
+                    context_ref,
+                )
+            feature_node = feature_nodes_by_id.get(str(context.get("feature_id") or ""))
+            if feature_node is not None:
+                add_edge(
+                    "NODE_PLANNING_CONTEXT_FOR_FEATURE",
+                    context_node,
+                    feature_node,
+                    context_ref,
+                )
+            room_node = room_nodes_by_id.get(str(context.get("room_id") or ""))
+            if room_node is not None:
+                add_edge(
+                    "NODE_PLANNING_CONTEXT_OPENS_MEETING_ROOM",
+                    context_node,
+                    room_node,
+                    context_ref,
+                )
+
+        room_message_nodes: dict[str, str] = {}
+        room_message_parents: list[tuple[str, str]] = []
+        for message in self.list_room_messages(project_id, limit=200):
+            message_id = str(message.get("message_id") or "")
+            if not message_id:
+                continue
+            source_ref = f"universe://project-room/{project_id}/messages/{message_id}"
+            graph_message = {
+                key: message.get(key)
+                for key in (
+                    "message_id", "kind", "sender", "todo_id", "in_reply_to",
+                    "delivery_state", "created_at", "updated_at", "content_digest",
+                )
+                if message.get(key) is not None
+            }
+            graph_message["delivery_digest"] = _json_sha256(message.get("delivery") or {})
+            message_node = add_node(
+                "ROOM_MESSAGE", message_id,
+                f"{message.get('kind') or 'MESSAGE'} · {message.get('sender') or 'UNKNOWN'}",
+                str(message.get("delivery_state") or "RECORDED"),
+                "PROJECT_ROOM_MESSAGE", source_ref, graph_message,
+            )
+            room_message_nodes[message_id] = message_node
+            add_edge("PROJECT_HAS_ROOM_MESSAGE", project_node, message_node, source_ref)
+            message_kind = str(message.get("kind") or "").upper()
+            if message_kind == "DECISION":
+                decision_node = add_node(
+                    "ROOM_DECISION",
+                    message_id,
+                    f"Decision · {message.get('sender') or 'UNKNOWN'}",
+                    str(message.get("delivery_state") or "RECORDED"),
+                    "PROJECT_ROOM_EXTRACTION",
+                    source_ref,
+                    {
+                        "message_id": message_id,
+                        "content_digest": message.get("content_digest"),
+                        "sender": message.get("sender"),
+                        "created_at": message.get("created_at"),
+                        "extraction_state": "AUTO_OBSERVED",
+                    },
+                )
+                add_edge(
+                    "ROOM_MESSAGE_DERIVES_DECISION",
+                    message_node,
+                    decision_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_ROOM_DECISION",
+                    project_node,
+                    decision_node,
+                    source_ref,
+                )
+            elif message_kind == "TASK_DRAFT":
+                candidate_node = add_node(
+                    "TODO_CANDIDATE",
+                    message_id,
+                    f"Todo candidate · {message.get('sender') or 'UNKNOWN'}",
+                    "PROPOSAL_ONLY",
+                    "PROJECT_ROOM_EXTRACTION",
+                    source_ref,
+                    {
+                        "message_id": message_id,
+                        "content_digest": message.get("content_digest"),
+                        "sender": message.get("sender"),
+                        "created_at": message.get("created_at"),
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "ROOM_MESSAGE_DERIVES_TODO_CANDIDATE",
+                    message_node,
+                    candidate_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_TODO_CANDIDATE",
+                    project_node,
+                    candidate_node,
+                    source_ref,
+                )
+            todo_id = str(message.get("todo_id") or "")
+            if todo_id and f"todo:{todo_id}" in node_ids:
+                add_edge("ROOM_MESSAGE_REFERENCES_TODO", message_node, f"todo:{todo_id}", source_ref)
+            parent_id = str(message.get("in_reply_to") or "")
+            if parent_id:
+                room_message_parents.append((message_id, parent_id))
+        for message_id, parent_id in room_message_parents:
+            parent_node = room_message_nodes.get(parent_id)
+            child_node = room_message_nodes.get(message_id)
+            if parent_node is not None and child_node is not None:
+                add_edge(
+                    "ROOM_MESSAGE_REPLIES_TO", child_node, parent_node,
+                    f"universe://project-room/{project_id}/messages/{message_id}",
+                )
+
+        for event in self.list_events(project_id, limit=200):
+            event_id = str(event.get("event_id") or "")
+            if not event_id:
+                continue
+            source_ref = f"universe://events/{event_id}"
+            payload = event.get("payload")
+            event_type = str(event.get("event_type") or "EVENT")
+            event_data = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "created_at": event.get("created_at"),
+                "payload_digest": _json_sha256(payload),
+            }
+            entity_type = "EVENT"
+            label = event_type
+            if event_type == "GIT_WORK_STATUS" and isinstance(payload, Mapping):
+                entity_type = "GIT_MILESTONE"
+                operation = str(payload.get("operation") or "GIT")
+                state = str(payload.get("state") or "OBSERVED")
+                label = f"{operation} · {state}"
+                event_data.update(
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "source", "operation", "state", "exit_code", "commit_sha",
+                            "short_sha", "branch", "remote", "redaction_state",
+                        )
+                        if payload.get(key) is not None
+                    }
+                )
+            elif event_type == "HOOK_SESSION_BOUND" and isinstance(payload, Mapping):
+                entity_type = "HOOK_OBSERVATION"
+                trigger = str(payload.get("trigger") or "SESSION_START")
+                label = f"Hook · {trigger}"
+                event_data.update(
+                    {
+                        key: payload.get(key)
+                        for key in (
+                            "source", "trigger", "observed_at", "session_anchor_ref",
+                            "supervisor_session_id", "provider",
+                            "provider_session_digest", "redaction_state",
+                        )
+                        if payload.get(key) is not None
+                    }
+                )
+            elif event_type == "TEST_WORK_STATUS" and isinstance(payload, Mapping):
+                entity_type = "TEST_RUN"
+                state = "PASSED" if payload.get("successful") is True else "FAILED"
+                label = f"Tests · {payload.get('tier') or 'UNKNOWN'} · {state}"
+                event_data.update({key: payload.get(key) for key in (
+                    "source", "tier", "successful", "tests_run", "elapsed_seconds",
+                    "target_seconds", "redaction_state",
+                ) if payload.get(key) is not None})
+            event_node = add_node(
+                entity_type, event_id, label,
+                "OBSERVED", "PROJECT_EVENT", source_ref,
+                event_data,
+            )
+            add_edge("PROJECT_HAS_EVENT", project_node, event_node, source_ref)
+            if (
+                event_type == "TEST_WORK_STATUS"
+                and isinstance(payload, Mapping)
+                and payload.get("successful") is False
+            ):
+                failure_node = add_node(
+                    "FAILURE_CANDIDATE",
+                    event_id,
+                    f"Failure candidate · {payload.get('tier') or 'UNKNOWN'} tests",
+                    "PROPOSAL_ONLY",
+                    "TEST_FAILURE_EXTRACTION",
+                    source_ref,
+                    {
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "payload_digest": event_data["payload_digest"],
+                        "tier": payload.get("tier"),
+                        "created_at": event.get("created_at"),
+                        "extraction_state": "AUTO_OBSERVED",
+                        "promotion_state": "USER_SELECTION_REQUIRED",
+                    },
+                )
+                add_edge(
+                    "TEST_RUN_DERIVES_FAILURE_CANDIDATE",
+                    event_node,
+                    failure_node,
+                    source_ref,
+                )
+                add_edge(
+                    "PROJECT_HAS_FAILURE_CANDIDATE",
+                    project_node,
+                    failure_node,
+                    source_ref,
+                )
+            if event_type == "GIT_WORK_STATUS" and isinstance(payload, Mapping):
+                session_node = session_nodes_by_provider_digest.get(
+                    str(payload.get("provider_session_digest") or "")
+                )
+                if session_node is not None:
+                    add_edge(
+                        "GIT_MILESTONE_FROM_SESSION", event_node, session_node, source_ref
+                    )
+            elif event_type == "HOOK_SESSION_BOUND" and isinstance(payload, Mapping):
+                session_node = session_nodes_by_anchor_ref.get(
+                    str(payload.get("session_anchor_ref") or "")
+                )
+                if session_node is not None:
+                    add_edge(
+                        "HOOK_OBSERVATION_FOR_SESSION", event_node, session_node, source_ref
+                    )
+
+        for observation in self.list_skill_observations(project_id, limit=200):
+            observation_id = str(observation.get("observation_id") or "")
+            if not observation_id:
+                continue
+            source_ref = str(observation.get("source_ref") or f"universe://skill-observations/{observation_id}")
+            execution_context = observation.get("execution_context")
+            if not isinstance(execution_context, Mapping):
+                execution_context = {}
+            observation_node = add_node(
+                "SKILL_OBSERVATION", observation_id,
+                f"{(observation.get('skill') or {}).get('skill_id') or 'skill'} · {observation.get('outcome') or 'UNKNOWN'}",
+                str(observation.get("validation_state") or "UNKNOWN"),
+                "SKILL_OBSERVATION", source_ref,
+                {
+                    "observation_id": observation_id,
+                    "candidate_id": observation.get("candidate_id"),
+                    "outcome": observation.get("outcome"),
+                    "validation_state": observation.get("validation_state"),
+                    "skill": observation.get("skill"),
+                    "execution_context": dict(execution_context),
+                    "observed_at": observation.get("observed_at"),
+                    "recorded_at": observation.get("recorded_at"),
+                },
+            )
+            add_edge("PROJECT_HAS_SKILL_OBSERVATION", project_node, observation_node, source_ref)
+            task_frame_ref = str(observation.get("task_frame_ref") or "")
+            if task_frame_ref:
+                frame_node = add_node(
+                    "TASK_FRAME", task_frame_ref, f"Task Frame · {task_frame_ref}",
+                    "OBSERVED", "TASK_FRAME_REFERENCE", task_frame_ref,
+                    {"task_frame_ref": task_frame_ref},
+                )
+                add_edge("SKILL_OBSERVATION_FROM_TASK_FRAME", observation_node, frame_node, source_ref)
+            failure_kind = str(execution_context.get("failure_kind") or "NONE")
+            if failure_kind not in {"", "NONE", "UNKNOWN"}:
+                failure_node = add_node(
+                    "FAILURE", f"{observation_id}:{failure_kind}", failure_kind,
+                    str(observation.get("outcome") or "OBSERVED"),
+                    "SKILL_OBSERVATION_FAILURE", source_ref,
+                    {"failure_kind": failure_kind, "observation_id": observation_id},
+                )
+                add_edge("SKILL_OBSERVATION_REPORTED_FAILURE", observation_node, failure_node, source_ref)
+            bench_node = add_node(
+                "BENCH", observation_id,
+                f"Bench · {observation.get('outcome') or 'UNKNOWN'}",
+                str(observation.get("validation_state") or "UNKNOWN"),
+                "SKILL_OBSERVATION_BENCH", source_ref,
+                {"observation_id": observation_id, "metrics": observation.get("metrics") or {}},
+            )
+            add_edge("PROJECT_HAS_BENCH_OBSERVATION", project_node, bench_node, source_ref)
+            add_edge("BENCH_DERIVED_FROM_SKILL_OBSERVATION", bench_node, observation_node, source_ref)
+
+        return {
+            "schema": "universe.semantic-project-graph.v1",
+            "status": "SEMANTIC_PROJECT_GRAPH_COLLECTED",
+            "project_id": project_id,
+            "nodes": nodes,
+            "edges": edges,
+            "invariants": {
+                "projection_only": True,
+                "auto_promote": False,
+                "creates_authority": False,
+                "creates_task_frame": False,
+                "source_stores_remain_authoritative": True,
+            },
         }
 
     def append_master_bridge_reply(
@@ -12663,6 +21371,92 @@ class UniverseStore:
             "resolved_at": row["resolved_at"],
         }
 
+    def record_provider_session_action(
+        self,
+        chat_key: str,
+        action: Mapping[str, Any],
+        *,
+        retain: int,
+    ) -> dict[str, Any]:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        payload = dict(action)
+        action_id = _identifier(payload.get("action_id"), "action_id")
+        created_at = _required_text(payload.get("created_at"), "action.created_at")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO provider_session_action(
+                    action_id, chat_key, action_json, created_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(action_id) DO UPDATE SET
+                    action_json = excluded.action_json
+                WHERE provider_session_action.chat_key = excluded.chat_key
+                """,
+                (
+                    action_id,
+                    normalized_chat_key,
+                    _canonical_json(payload),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM provider_session_action
+                WHERE chat_key = ? AND action_id NOT IN (
+                    SELECT action_id FROM provider_session_action
+                    WHERE chat_key = ?
+                    ORDER BY created_at DESC, action_id DESC
+                    LIMIT ?
+                )
+                """,
+                (normalized_chat_key, normalized_chat_key, max(1, int(retain))),
+            )
+        return payload
+
+    def list_provider_session_actions(
+        self, chat_key: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT action_json FROM (
+                    SELECT action_json, created_at, action_id
+                    FROM provider_session_action
+                    WHERE chat_key = ?
+                    ORDER BY created_at DESC, action_id DESC
+                    LIMIT ?
+                )
+                ORDER BY created_at ASC, action_id ASC
+                """,
+                (normalized_chat_key, max(1, int(limit))),
+            ).fetchall()
+        return [json.loads(str(row["action_json"])) for row in rows]
+
+    def delete_provider_session_action(
+        self, chat_key: str, action_id: str
+    ) -> dict[str, Any] | None:
+        normalized_chat_key = _required_text(chat_key, "chat_key")
+        normalized_action_id = _identifier(action_id, "action_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT action_json FROM provider_session_action
+                WHERE chat_key = ? AND action_id = ?
+                """,
+                (normalized_chat_key, normalized_action_id),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                DELETE FROM provider_session_action
+                WHERE chat_key = ? AND action_id = ?
+                """,
+                (normalized_chat_key, normalized_action_id),
+            )
+        return json.loads(str(row["action_json"]))
+
     def record_governance_proposal_decision(
         self,
         project_id: str,
@@ -12759,7 +21553,20 @@ class UniverseStore:
                         "idempotency_key",
                     )
                 }
-                if comparable != material:
+                failed_cancel_retry = (
+                    current["state"] == "FAILED"
+                    and current["decision"] == "CANCEL"
+                    and all(
+                        current[key] == material[key]
+                        for key in (
+                            "project_id",
+                            "proposal_id",
+                            "proposal_digest",
+                            "decision",
+                        )
+                    )
+                )
+                if comparable != material and not failed_cancel_retry:
                     raise UniverseError(
                         "GOVERNANCE_PROPOSAL_DECISION_CONFLICT",
                         "Proposal or idempotency key is already bound to another decision",
@@ -13292,6 +22099,31 @@ class UniverseStore:
             )
         proposal["created_at"] = now
         return proposal, True
+
+    def list_document_incorporation_proposals(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return durable document-automation proposals without source content."""
+
+        project = self.get_project(project_id)
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_json, created_at
+                FROM document_incorporation_proposal
+                WHERE project_id = ?
+                ORDER BY created_at DESC, proposal_id DESC
+                LIMIT ?
+                """,
+                (project["project_id"], bounded_limit),
+            ).fetchall()
+        proposals: list[dict[str, Any]] = []
+        for row in rows:
+            proposal = json.loads(row["proposal_json"])
+            proposal["created_at"] = row["created_at"]
+            proposals.append(proposal)
+        return proposals
 
     def import_release(self, value: Any) -> tuple[dict[str, Any], bool]:
         request = _exact_object_fields(
@@ -14673,11 +23505,29 @@ class UniverseStore:
         }
 
     @staticmethod
+    def _universe_goal_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": UNIVERSE_GOAL_SCHEMA,
+            "universe_goal_id": row["universe_goal_id"],
+            "title": row["title"],
+            "description": row["description"],
+            "owner": row["owner"],
+            "state": row["state"],
+            "sort_order": row["sort_order"],
+            "revision": row["revision"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
     def _goal_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": GOAL_SCHEMA,
             "goal_id": row["goal_id"],
             "project_id": row["project_id"],
+            "scope_kind": row["scope_kind"],
+            "node_ref": row["node_ref"],
+            "universe_goal_id": row["universe_goal_id"],
             "title": row["title"],
             "description": row["description"],
             "owner": row["owner"],
@@ -14711,11 +23561,13 @@ class UniverseStore:
             "scope_kind": row["scope_kind"],
             "project_id": row["project_id"],
             "node_ref": row["node_ref"],
+            "universe_goal_id": row["universe_goal_id"],
             "goal_id": row["goal_id"],
             "milestone_id": row["milestone_id"],
             "title": row["title"],
             "detail": row["detail"],
             "priority": row["priority"],
+            "priority_recommendation": infer_todo_priority(dict(row)),
             "state": row["state"],
             "source_kind": row["source_kind"],
             "sort_order": row["sort_order"],
@@ -15027,6 +23879,169 @@ class RoomParticipantPermissionRegistry:
                     record["resolved_at"] = utc_now()
 
 
+def select_directory_with_native_dialog() -> str | None:
+    """Open the Host's native directory chooser without changing project state."""
+
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            selected = filedialog.askdirectory(
+                parent=root,
+                mustexist=True,
+                title="Select project root",
+            )
+        finally:
+            root.destroy()
+    except Exception as error:
+        raise UniverseError(
+            "HOST_DIRECTORY_PICKER_UNAVAILABLE",
+            f"native directory picker is unavailable: {error}",
+        ) from error
+    return str(selected).strip() or None
+
+
+def select_file_with_native_dialog(kind: str) -> str | None:
+    """Open a constrained Host file chooser without importing the selection."""
+
+    choices = {
+        "RELEASE_DATABASE": (
+            "Select Release DB",
+            [("SQLite database", "*.sqlite3"), ("All files", "*.*")],
+        ),
+        "RELEASE_MANIFEST": (
+            "Select Release manifest",
+            [("JSON manifest", "*.json"), ("All files", "*.*")],
+        ),
+    }
+    if kind not in choices:
+        raise UniverseError("HOST_FILE_SELECTION_KIND_INVALID", "file selection kind is invalid")
+    title, filetypes = choices[kind]
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            selected = filedialog.askopenfilename(
+                parent=root,
+                title=title,
+                filetypes=filetypes,
+            )
+        finally:
+            root.destroy()
+    except Exception as error:
+        raise UniverseError(
+            "HOST_FILE_PICKER_UNAVAILABLE",
+            f"native file picker is unavailable: {error}",
+        ) from error
+    return str(selected).strip() or None
+
+
+class _ProjectedTerminalSession:
+    """Expose a projected public coordinate while retaining Host operations."""
+
+    def __init__(self, source: Any, payload: Mapping[str, Any]) -> None:
+        self._source = source
+        self._payload = dict(payload)
+
+    def public(self) -> dict[str, Any]:
+        return dict(self._payload)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._source, name)
+
+
+class _SessionAnchorTerminalHost:
+    """Project PTY location from its Supervisor session's current Anchor."""
+
+    def __init__(
+        self,
+        host: Any,
+        resolver: Callable[[Mapping[str, Any]], dict[str, Any]],
+    ) -> None:
+        self._host = host
+        self._resolver = resolver
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        rows = self._host.list_sessions()
+        if not isinstance(rows, (list, tuple)):
+            return []
+        return [self._resolver(item) for item in rows if isinstance(item, Mapping)]
+
+    def get(self, terminal_id: str) -> Any:
+        source = self._host.get(terminal_id)
+        public = source.public() if hasattr(source, "public") else source
+        if not isinstance(public, Mapping):
+            return source
+        projected = self._resolver(public)
+        if isinstance(source, Mapping):
+            return projected
+        return _ProjectedTerminalSession(source, projected)
+
+    def find_live(
+        self,
+        *,
+        project_id: str,
+        mode: str,
+        provider: str = "",
+        supervisor_session_id: str = "",
+    ) -> dict[str, Any] | None:
+        wanted_mode = str(mode or "").upper()
+        wanted_provider = str(provider or "").upper()
+        wanted_session = str(supervisor_session_id or "")
+
+        def matches(item: Mapping[str, Any]) -> bool:
+            return (
+                str(item.get("state") or "").upper() == "LIVE"
+                and str(item.get("project_id") or "") == str(project_id or "")
+                and str(item.get("mode") or "").upper() == wanted_mode
+                and (
+                    not wanted_provider
+                    or wanted_provider == "AUTO"
+                    or str(item.get("provider") or "").upper() == wanted_provider
+                )
+                and (
+                    not wanted_session
+                    or str(item.get("supervisor_session_id") or "")
+                    == wanted_session
+                )
+            )
+
+        candidate = self._host.find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
+        )
+        if isinstance(candidate, Mapping):
+            projected_candidate = self._resolver(candidate)
+            if matches(projected_candidate):
+                return projected_candidate
+
+        rows = self._host.list_sessions()
+        if not isinstance(rows, (list, tuple)):
+            return None
+        matched = [
+            item
+            for item in (self._resolver(row) for row in rows if isinstance(row, Mapping))
+            if matches(item)
+        ]
+        if not matched:
+            return None
+        matched.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return matched[0]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._host, name)
+
+
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -15044,18 +24059,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         conductor_delegation_executor: Any = None,
         auto_start_project_masters: bool = True,
         project_master_provider_factory: Any = None,
-        room_participant_provider_factory: Any = None,
+        room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
         provider_session_host_factory: Any = None,
+        session_broker_client: Any = None,
         host_profile: HostProfileStore | None = None,
         provider_model_catalog: ProviderModelCatalogStore | None = None,
         service_state_path: Path | None = None,
         remote_gateway_state_path: Path | None = None,
         remote_connector_state_path: Path | None = None,
         remote_connector_config_path: Path | None = None,
+        directory_selector: Callable[[], str | None] | None = None,
+        file_selector: Callable[[str], str | None] | None = None,
+        memory_scheduler_clock: Any = None,
+        memory_scheduler_poll_seconds: float = 30.0,
+        auto_start_memory_scheduler: bool = True,
+        auto_start_goal_scheduler: bool = True,
+        use_pty_supervisor: bool = False,
     ):
         self.store = store
         self.project_task_proposals = ProjectTaskProposalAdapter()
-        self.session_supervisor = SessionSupervisorStore(store.database_path)
+        self.session_supervisor = store.session_supervisor
         self.token = token
         self.service_state_path = (service_state_path or default_state_path()).resolve()
         self.remote_gateway_state_path = (
@@ -15067,7 +24090,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.remote_connector_config_path = (
             remote_connector_config_path or default_connector_config_path()
         ).resolve()
+        self.directory_selector = (
+            directory_selector or select_directory_with_native_dialog
+        )
+        self.file_selector = file_selector or select_file_with_native_dialog
         self.host_profile = host_profile or HostProfileStore()
+        if use_pty_supervisor:
+            self.terminal_host = SupervisedTerminalHost()
+        else:
+            self.terminal_host = TerminalHost(database_path=store.database_path)
+        self.session_bus = SessionBus(
+            database_path=store.database_path,
+            result_observer=self._observe_session_bus_result,
+        )
         try:
             self.host_profile.ensure_initialized()
         except HostProfileError as error:
@@ -15086,6 +24121,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.provider_model_catalog,
             api_schema=API_SCHEMA,
         )
+        self._memory_scheduler_stop = threading.Event()
+        self._memory_scheduler_wake = threading.Event()
+        self._memory_scheduler_poll_seconds = max(
+            0.05, min(float(memory_scheduler_poll_seconds), 300.0)
+        )
+        self._memory_scheduler_last_tick: dict[str, Any] | None = None
+        self.memory_batch_scheduler = MemoryBatchScheduler(
+            self.store,
+            self._run_scheduled_memory_batch,
+            clock=memory_scheduler_clock,
+        )
+        self._auto_start_memory_scheduler = bool(auto_start_memory_scheduler)
+        self._goal_scheduler_stop = threading.Event()
+        self._goal_scheduler_wake = threading.Event()
+        self._goal_scheduler_owner = "goal_scheduler_" + uuid.uuid4().hex
+        self._goal_scheduler_last_tick: dict[str, Any] | None = None
+        self._auto_start_goal_scheduler = bool(auto_start_goal_scheduler)
         python_tool = self.host_profile.resolve("python")
         self.continuity_coordinator = (
             ProjectContinuityCoordinator(
@@ -15126,16 +24178,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.project_room_events = ProjectRoomEventHub()
         self._project_master_stream_lock = threading.RLock()
         self._active_project_master_streams: dict[str, dict[str, Any]] = {}
-        self.multi_rooms = MultiRoomStore(str(store.database_path))
+        self.multi_rooms = store.multi_rooms
         self.multi_room_native_controls = MultiRoomNativeControlRegistry(
             self.multi_rooms
         )
         self.room_participant_permissions = RoomParticipantPermissionRegistry()
         self._room_permission_resolution_lock = threading.RLock()
-        self.room_participant_hosts = ResidentRoomParticipantHostManager(
-            room_event_observer=self._observe_native_room_event,
-            permission_observer=self._observe_room_participant_permission,
-            provider_factory=room_participant_provider_factory,
+        self.room_participant_permission_resolver = (
+            room_participant_permission_resolver
         )
         self.provider_sessions = ProviderSessionService(
             resolver=lambda chat_key: self.resolve_provider_chat_session(chat_key),
@@ -15143,8 +24193,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 provider_session_host_factory
                 or self._create_provider_session_host
             ),
+            action_store=self.store,
+            action_observer=self._observe_provider_session_action,
         )
-        self.task_frame_lineage = TaskFrameLineageStore(store.database_path)
+        self.session_broker = session_broker_client or SessionBrokerClient(
+            self.store.database_path.parent / "session-broker-state-v2.json",
+            self.store.database_path.parent / "session-broker.sqlite3",
+            timeout=620.0,
+        )
+        self.task_frame_lineage = store.task_frame_lineage
         self.session_anchor_transport = SessionAnchorTransport(
             database_path=store.database_path,
             session_supervisor=self.session_supervisor,
@@ -15157,6 +24214,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.multi_room_delivery = MultiRoomDeliveryCoordinator(
             self.multi_rooms,
             self.multi_room_native_controls.send_input,
+        )
+        self._meeting_provider_timeout_seconds = 600.0
+        self.multi_room_meetings = MultiRoomMeetingCoordinator(
+            self.multi_rooms,
+            self._invoke_multi_room_meeting_provider,
         )
         self.conductor_permissions = ConductorPermissionBridge()
         # Register all local manifest-defined Node trees without product names.
@@ -15221,11 +24283,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 bridge_registrar=self.store.register_master_bridge,
                 session_supervisor=self.session_supervisor,
                 continuity_coordinator=self.continuity_coordinator,
+                terminal_host=self.terminal_host,
                 provider_factory=project_master_provider_factory,
                 provider_resolver=self._resolve_project_master_provider,
                 model_resolver=self._resolve_project_master_model,
                 effort_resolver=self._resolve_project_master_effort,
                 governance_context_resolver=self._project_master_governance_context,
+                retrieval_context_resolver=(
+                    lambda project_id, message: self.store.build_project_llm_retrieval_context(
+                        project_id,
+                        query=str(message.get("body") or ""),
+                    )
+                ),
                 release_source_binding_resolver=(
                     lambda project_id: self.store.selected_project_release_binding(
                         project_id
@@ -15258,6 +24327,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._maintain_worker.start()
+        self._memory_scheduler_worker = threading.Thread(
+            target=self._memory_batch_scheduler_loop,
+            name="universe-memory-batch-scheduler",
+            daemon=True,
+        )
+        if self._auto_start_memory_scheduler:
+            self._memory_scheduler_worker.start()
         self._supervisor_maintenance_stop = threading.Event()
         self._supervisor_maintenance_last_run: dict[str, Any] | None = None
         self._supervisor_maintenance_worker = threading.Thread(
@@ -15266,6 +24342,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._supervisor_maintenance_worker.start()
+        self._goal_scheduler_worker = threading.Thread(
+            target=self._goal_automation_scheduler_loop,
+            name="universe-goal-automation-scheduler",
+            daemon=True,
+        )
+        if self._auto_start_goal_scheduler:
+            self._goal_scheduler_worker.start()
         self.rendezvous_service: UniverseRendezvousService | None = None
         self._rendezvous_start_error: dict[str, str] | None = None
         self._remote_access_resume: dict[str, Any] | None = None
@@ -15282,6 +24365,130 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
+
+    def _is_current_live_pty_session(self, session: Mapping[str, Any]) -> bool:
+        """Verify currentness through the Mode Anchor and exact live PTY join."""
+
+        provider = str(session.get("provider") or "").upper()
+        provider_ref = str(session.get("provider_session_ref") or "").strip()
+        provider_identity = _vendor_identity_from_observer(provider_ref)
+        if (
+            provider_identity is None
+            and provider in {"CODEX", "CLAUDE", "GROK"}
+            and provider_ref
+        ):
+            provider_identity = (provider, provider_ref)
+        project_id = str(
+            session.get("current_project_id") or session.get("node") or ""
+        ).strip()
+        mode = str(session.get("mode") or "").upper()
+        session_id = str(session.get("session_id") or "").strip()
+        if provider_identity is None or not project_id or not mode or not session_id:
+            return False
+        try:
+            anchor_sessions = self.list_project_anchor_sessions(project_id).get(
+                "sessions", []
+            )
+        except UniverseError:
+            return False
+        for anchor_session in anchor_sessions:
+            if (
+                str(anchor_session.get("mode") or "").upper() != mode
+                or str(anchor_session.get("currentness") or "").upper()
+                != "CURRENT"
+                or _vendor_identity_from_observer(
+                    str(anchor_session.get("observer_session_ref") or "")
+                )
+                != provider_identity
+            ):
+                continue
+            binding = anchor_session.get("pty_binding")
+            if not isinstance(binding, Mapping) or binding.get("status") != "BOUND":
+                continue
+            terminal_id = str(binding.get("terminal_id") or "").strip()
+            if not terminal_id:
+                continue
+            try:
+                source = self._session_anchor_terminal_host().get(terminal_id)
+            except TerminalHostError:
+                continue
+            terminal = source.public() if hasattr(source, "public") else source
+            if not isinstance(terminal, Mapping):
+                continue
+            if (
+                str(terminal.get("state") or "").upper() == "LIVE"
+                and str(terminal.get("supervisor_session_id") or "")
+                == session_id
+            ):
+                return True
+        return False
+
+    def resolve_todo_mutation_session(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._resolve_current_provider_mutation_session(
+            request,
+            error_prefix="TODO_MUTATION",
+            subject="Todo mutation",
+        )
+
+    def resolve_goal_automation_scheduler_mutation_session(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._resolve_current_provider_mutation_session(
+            request,
+            error_prefix="GOAL_AUTOMATION_SCHEDULER_MUTATION",
+            subject="Scheduler mutation",
+        )
+
+    def _resolve_current_provider_mutation_session(
+        self,
+        request: Mapping[str, Any],
+        *,
+        error_prefix: str,
+        subject: str,
+    ) -> dict[str, Any]:
+        matching = [
+            session
+            for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("provider") or "").upper() == request["provider"]
+            and str(session.get("provider_session_ref") or "")
+            == request["provider_session_ref"]
+        ]
+        current = [
+            session
+            for session in matching
+            if session.get("currentness") == "CURRENT"
+            or self._is_current_live_pty_session(session)
+        ]
+        if not current:
+            raise UniverseError(
+                f"{error_prefix}_SESSION_NOT_CURRENT",
+                "provider session is not current in the Session Supervisor",
+                HTTPStatus.CONFLICT,
+            )
+        if len(current) != 1:
+            raise UniverseError(
+                f"{error_prefix}_SESSION_AMBIGUOUS",
+                "provider session resolves to more than one current supervised session",
+                HTTPStatus.CONFLICT,
+            )
+        session = current[0]
+        if session["session_id"] != request["session_id"]:
+            raise UniverseError(
+                f"{error_prefix}_SESSION_MISMATCH",
+                f"{subject} session_id does not match the current provider session",
+                HTTPStatus.CONFLICT,
+            )
+        if session["session_anchor_ref"] != request["session_anchor_ref"]:
+            raise UniverseError(
+                f"{error_prefix}_ANCHOR_MISMATCH",
+                f"{subject} Session Anchor is not current for the provider session",
+                HTTPStatus.CONFLICT,
+            )
+        return session
 
     def _resume_remote_access_background(self) -> None:
         try:
@@ -16099,6 +25306,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching Task Frame receipt",
                 HTTPStatus.CONFLICT,
             )
+        try:
+            self.task_frame_lineage.create_task_frame(
+                frame_ref=host_result.get("task_frame_id"),
+                origin_session_anchor_ref=host_result.get("origin_session_anchor_ref"),
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.CONFLICT,
+            ) from error
+        task_frame_room = self._ensure_task_frame_room(
+            project["project_id"], host_result
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -16107,6 +25328,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "primary_proposal_id": primary_id,
             "primary_proposal_digest": primary_digest,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
         }
 
     def create_instruction_authorized_task_frame(
@@ -16196,6 +25418,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching instruction Task Frame receipt",
                 HTTPStatus.CONFLICT,
             )
+        try:
+            self.task_frame_lineage.create_task_frame(
+                frame_ref=host_result.get("task_frame_id"),
+                origin_session_anchor_ref=host_result.get("origin_session_anchor_ref"),
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.CONFLICT,
+            ) from error
+        task_frame_room = self._ensure_task_frame_room(
+            project["project_id"], host_result
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -16205,6 +25441,1063 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_digest": primary_digest,
             "parent_instruction_ref": instruction_ref,
             "task_frame": dict(host_result),
+            "task_frame_room": task_frame_room,
+        }
+
+    def create_goal_handoff_instruction_task_frame(
+        self, project_id: str, handoff_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Bind one delivered Goal handoff to its exact Master proposal and frame."""
+
+        request = normalize_master_handoff_task_frame_request(value)
+        project = self.store.get_project(project_id)
+        handoff = self.store.get_master_handoff(project["project_id"], handoff_id)
+        if handoff.get("source", {}).get("kind") != "GOAL_WORK_PLAN":
+            raise UniverseError(
+                "MASTER_HANDOFF_GOAL_WORK_PLAN_REQUIRED",
+                "only a GOAL_WORK_PLAN handoff may use this transition",
+                HTTPStatus.CONFLICT,
+            )
+        if handoff["handoff_digest"] != request["handoff_digest"]:
+            raise UniverseError(
+                "MASTER_HANDOFF_DIGEST_MISMATCH",
+                "handoff digest does not match the durable receipt",
+                HTTPStatus.CONFLICT,
+            )
+        instruction_ref = handoff.get("instruction_ref")
+        if not isinstance(instruction_ref, str) or not instruction_ref.strip():
+            raise UniverseError(
+                "MASTER_HANDOFF_INSTRUCTION_REF_UNAVAILABLE",
+                "Goal handoff has no exact parent instruction reference",
+                HTTPStatus.CONFLICT,
+            )
+        if handoff["delivery_state"] == "PROPOSAL_ONLY" or not handoff.get(
+            "room_message_id"
+        ):
+            raise UniverseError(
+                "MASTER_HANDOFF_DELIVERY_REQUIRED",
+                "deliver the Goal handoff to Project Master before binding a proposal",
+                HTTPStatus.CONFLICT,
+            )
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == request["proposal_id"]
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "Project Master governance Proposal does not exist",
+                HTTPStatus.NOT_FOUND,
+            )
+        if proposal.get("proposal_digest") != request["proposal_digest"]:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_DIGEST_MISMATCH",
+                "proposal digest does not match the Master proposal",
+                HTTPStatus.CONFLICT,
+            )
+        if proposal.get("request_ref") != instruction_ref:
+            raise UniverseError(
+                "MASTER_HANDOFF_PROPOSAL_LINEAGE_MISMATCH",
+                "Master proposal does not cite the exact Goal handoff instruction_ref",
+                HTTPStatus.CONFLICT,
+            )
+        frame_id = _identifier(
+            request["task_frame"].get("frame_id"), "task_frame.frame_id"
+        )
+        existing = self.store.get_master_handoff_task_frame_binding(
+            project["project_id"], handoff["handoff_id"]
+        )
+        if existing is not None:
+            if (
+                existing["instruction_ref"] != instruction_ref
+                or existing["proposal_id"] != proposal["proposal_id"]
+                or existing["proposal_digest"] != proposal["proposal_digest"]
+                or existing["task_frame_id"] != frame_id
+            ):
+                raise UniverseError(
+                    "MASTER_HANDOFF_TASK_FRAME_BINDING_CONFLICT",
+                    "Master handoff is already bound to another proposal or Task Frame",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "GOAL_HANDOFF_TASK_FRAME_ALREADY_BOUND",
+                "project_id": project["project_id"],
+                "handoff": handoff,
+                "proposal": proposal,
+                "binding": existing,
+                "task_frame": None,
+            }, False
+        created_frame = self.create_instruction_authorized_task_frame(
+            project["project_id"],
+            proposal["proposal_id"],
+            {
+                "proposal_digest": proposal["proposal_digest"],
+                "task_frame": request["task_frame"],
+            },
+        )
+        host_frame = created_frame.get("task_frame")
+        if not isinstance(host_frame, Mapping) or host_frame.get(
+            "task_frame_id"
+        ) != frame_id:
+            raise UniverseError(
+                "MASTER_HANDOFF_TASK_FRAME_RECEIPT_INVALID",
+                "Project Master returned a different Task Frame coordinate",
+                HTTPStatus.CONFLICT,
+            )
+        binding, bound = self.store.record_master_handoff_task_frame_binding(
+            project_id=project["project_id"],
+            handoff_id=handoff["handoff_id"],
+            instruction_ref=instruction_ref,
+            proposal_id=proposal["proposal_id"],
+            proposal_digest=proposal["proposal_digest"],
+            task_frame_id=frame_id,
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_HANDOFF_TASK_FRAME_BOUND",
+            "project_id": project["project_id"],
+            "handoff": handoff,
+            "proposal": proposal,
+            "binding": binding,
+            "task_frame": created_frame,
+        }, bound
+
+    def goal_automation_surface(self, goal_id: str) -> dict[str, Any]:
+        work_plans = self.store.goal_work_plan_surface(goal_id)
+        goal = work_plans["goal"]
+        goal_start_receipt = self.store.find_goal_start_receipt_for_goal(goal["goal_id"])
+        scheduler = self.store.get_goal_automation_scheduler(goal["goal_id"])
+        if scheduler is not None:
+            scheduler = {
+                key: value
+                for key, value in scheduler.items()
+                if key != "last_surface"
+            }
+        application = work_plans["application"]
+        handoff = None
+        matching_proposals: list[dict[str, Any]] = []
+        binding = None
+        todo_execution = {
+            "eligible_todo_ids": [],
+            "selection": None,
+            "action_receipts": [],
+            "task_frame_results": [],
+        }
+        if application is None and goal_start_receipt is not None:
+            state = "READY_FOR_GOAL_START_PLAN"
+            next_operation = "MATERIALIZE_GOAL_START_PLAN"
+        elif application is None:
+            state = "WAITING_USER_WORK_PLAN_APPLICATION"
+            next_operation = "APPLY_ADOPTED_WORK_PLAN"
+        else:
+            todo_execution["eligible_todo_ids"] = list(
+                application.get("created_items", {}).get("todo_ids", [])
+            )
+            handoff = self.store.find_goal_work_plan_handoff(
+                goal["project_id"], application["application_id"]
+            )
+            if handoff is None:
+                state = "READY_FOR_MASTER_HANDOFF"
+                next_operation = "CREATE_AND_DELIVER_MASTER_HANDOFF"
+            elif handoff["delivery_state"] == "PROPOSAL_ONLY":
+                state = "MASTER_HANDOFF_READY"
+                next_operation = "DELIVER_MASTER_HANDOFF"
+            else:
+                instruction_ref = handoff.get("instruction_ref")
+                matching_proposals = [
+                    proposal
+                    for proposal in self.list_project_governance_proposals(
+                        goal["project_id"]
+                    )
+                    if proposal.get("request_ref") == instruction_ref
+                ]
+                if not matching_proposals:
+                    state = "WAITING_MASTER_PROPOSAL"
+                    next_operation = "WAIT"
+                elif len(matching_proposals) > 1:
+                    state = "AMBIGUOUS_MASTER_PROPOSALS"
+                    next_operation = "USER_RESOLUTION_REQUIRED"
+                else:
+                    binding = self.store.get_master_handoff_task_frame_binding(
+                        goal["project_id"], handoff["handoff_id"]
+                    )
+                    if binding is None:
+                        state = "MASTER_PROPOSAL_READY"
+                        next_operation = "BIND_INSTRUCTION_TASK_FRAME"
+                    else:
+                        state = "TASK_FRAME_READY"
+                        selection = self.store.get_goal_todo_execution_selection(
+                            goal["goal_id"]
+                        )
+                        todo_execution["selection"] = selection
+                        todo_execution["action_receipts"] = (
+                            self.store.list_goal_todo_action_receipts(goal["goal_id"])
+                        )
+                        try:
+                            lineage = self.task_frame_lineage.get_task_frame(
+                                binding["task_frame_id"]
+                            )
+                        except TaskFrameLineageError:
+                            lineage = None
+                        if isinstance(lineage, Mapping):
+                            todo_execution["task_frame_results"] = [
+                                {
+                                    "result_ref": result["result_ref"],
+                                    "result_digest": result["result_digest"],
+                                    "attached_at": result["attached_at"],
+                                }
+                                for result in lineage.get("results", [])
+                            ]
+                        if selection is None:
+                            next_operation = "SELECT_TODOS_FOR_EXECUTION"
+                        elif todo_execution["task_frame_results"]:
+                            next_operation = "APPLY_TASK_FRAME_RESULT"
+                        else:
+                            next_operation = "RUN_TASK_FRAME"
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_AUTOMATION_STATE_PROJECTED",
+            "goal": goal,
+            "application": application,
+            "goal_start_receipt": goal_start_receipt,
+            "handoff": handoff,
+            "matching_proposals": matching_proposals,
+            "binding": binding,
+            "todo_execution": todo_execution,
+            "scheduler": scheduler,
+            "automation_state": state,
+            "next_operation": next_operation,
+            "effects": {
+                "task_frame_run": "NONE",
+                "todo_state_change": "NONE",
+                "authority_created": False,
+                "execution_assignment_created": False,
+            },
+        }
+
+    @staticmethod
+    def _goal_todo_action_request(
+        actor: Mapping[str, Any],
+        *,
+        instruction_ref: str,
+        todo_id: str,
+        action: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "provider": actor["provider"],
+            "provider_session_ref": actor["provider_session_ref"],
+            "session_id": actor["session_id"],
+            "session_anchor_ref": actor["session_anchor_ref"],
+            "instruction_ref": instruction_ref,
+            "todo_id": todo_id,
+            "action": dict(action),
+            "ttl_seconds": actor["ttl_seconds"],
+        }
+
+    def _apply_goal_todo_action(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        receipt, _created = self.store.prepare_todo_action_mutation_receipt(request)
+        consumed, action, replayed = self.store.consume_todo_action_mutation_receipt(
+            receipt["receipt_id"], request
+        )
+        return {
+            "receipt": consumed,
+            "action": action,
+            "todo": action["todo"],
+            "replayed": replayed,
+        }
+
+    def select_goal_todos_for_execution(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_todo_execution_selection_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before Todo execution selection",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["automation_state"] != "TASK_FRAME_READY":
+            raise UniverseError(
+                "GOAL_TASK_FRAME_BINDING_REQUIRED",
+                "bind the Goal handoff to a Task Frame before selecting Todos",
+                HTTPStatus.CONFLICT,
+            )
+        self.resolve_todo_mutation_session(request)
+        application = surface["application"]
+        handoff = surface["handoff"]
+        binding = surface["binding"]
+        assert isinstance(application, Mapping)
+        assert isinstance(handoff, Mapping)
+        assert isinstance(binding, Mapping)
+        eligible = set(
+            application.get("created_items", {}).get("todo_ids", [])
+        )
+        requested_ids = request["todo_ids"]
+        if any(todo_id not in eligible for todo_id in requested_ids):
+            raise UniverseError(
+                "GOAL_TODO_SELECTION_SCOPE_MISMATCH",
+                "selection contains a Todo not created by the applied Work Plan",
+                HTTPStatus.CONFLICT,
+            )
+        for todo_id in requested_ids:
+            todo = self.store.get_todo(todo_id)
+            if todo.get("goal_id") != goal["goal_id"]:
+                raise UniverseError(
+                    "GOAL_TODO_SELECTION_SCOPE_MISMATCH",
+                    "selection Todo is not bound to this Goal",
+                    HTTPStatus.CONFLICT,
+                )
+            if todo.get("state") == "DONE":
+                raise UniverseError(
+                    "GOAL_TODO_SELECTION_STATE_INVALID",
+                    "completed Todos cannot be selected for a new execution",
+                    HTTPStatus.CONFLICT,
+                )
+        selection, created = self.store.record_goal_todo_execution_selection(
+            goal_id=goal["goal_id"],
+            application_id=application["application_id"],
+            handoff_id=handoff["handoff_id"],
+            task_frame_id=binding["task_frame_id"],
+            todo_ids=requested_ids,
+            provider=request["provider"],
+            provider_session_ref=request["provider_session_ref"],
+            session_id=request["session_id"],
+            session_anchor_ref=request["session_anchor_ref"],
+        )
+        actions = []
+        for todo_id in selection["todo_ids"]:
+            action = {
+                "action_id": "goal-execution-start-"
+                + _json_sha256(
+                    {"selection_id": selection["selection_id"], "todo_id": todo_id}
+                )[:24],
+                "outcome": "STARTED",
+                "source": "GOAL_AUTOMATION",
+                "evidence_ref": (
+                    f"universe://goal-execution-selections/{selection['selection_id']}"
+                    f"/todos/{todo_id}"
+                ),
+            }
+            action_request = self._goal_todo_action_request(
+                request,
+                instruction_ref=(
+                    f"goal-automation://{goal['goal_id']}/selections/"
+                    f"{selection['selection_id']}/todos/{todo_id}/started"
+                ),
+                todo_id=todo_id,
+                action=action,
+            )
+            actions.append(self._apply_goal_todo_action(action_request))
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "GOAL_TODOS_SELECTED_FOR_EXECUTION"
+                if created
+                else "GOAL_TODO_EXECUTION_SELECTION_REPLAYED"
+            ),
+            "goal_id": goal["goal_id"],
+            "binding": binding,
+            "selection": selection,
+            "actions": actions,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+        }
+
+    def apply_goal_task_frame_todo_result(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_todo_result_projection_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before Task Frame result projection",
+                HTTPStatus.CONFLICT,
+            )
+        binding = surface.get("binding")
+        selection = surface.get("todo_execution", {}).get("selection")
+        if not isinstance(binding, Mapping) or not isinstance(selection, Mapping):
+            raise UniverseError(
+                "GOAL_TODO_EXECUTION_SELECTION_REQUIRED",
+                "select exact Work Plan Todos before applying a Task Frame result",
+                HTTPStatus.CONFLICT,
+            )
+        self.resolve_todo_mutation_session(request)
+        try:
+            lineage = self.task_frame_lineage.get_task_frame(
+                binding["task_frame_id"]
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+        result = next(
+            (
+                item
+                for item in lineage.get("results", [])
+                if item.get("result_ref") == request["result_ref"]
+            ),
+            None,
+        )
+        if not isinstance(result, Mapping):
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_NOT_FOUND",
+                "result_ref is not attached to the bound Goal Task Frame",
+                HTTPStatus.NOT_FOUND,
+            )
+        result_payload = result.get("result")
+        if not isinstance(result_payload, Mapping):
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_INVALID",
+                "Task Frame result payload must be an object",
+                HTTPStatus.CONFLICT,
+            )
+        raw_actions = _array(
+            result_payload.get("todo_actions"), "task_frame_result.todo_actions"
+        )
+        if not raw_actions or len(raw_actions) > 100:
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_ACTIONS_INVALID",
+                "Task Frame result must contain 1..100 Todo actions",
+                HTTPStatus.CONFLICT,
+            )
+        selected_ids = set(selection["todo_ids"])
+        normalized_actions: list[tuple[str, dict[str, Any]]] = []
+        observed_ids: set[str] = set()
+        for raw_action in raw_actions:
+            entry = _exact_object_fields(
+                raw_action,
+                field="task_frame_result.todo_actions[]",
+                required=frozenset({"todo_id", "outcome", "evidence_ref"}),
+                optional=frozenset({"validation"}),
+            )
+            todo_id = _identifier(entry["todo_id"], "todo_id")
+            if todo_id not in selected_ids:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_TODO_MISMATCH",
+                    "Task Frame result contains a Todo outside its execution selection",
+                    HTTPStatus.CONFLICT,
+                )
+            if todo_id in observed_ids:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_TODO_DUPLICATE",
+                    "Task Frame result contains more than one action for a Todo",
+                    HTTPStatus.CONFLICT,
+                )
+            observed_ids.add(todo_id)
+            outcome = _required_text(entry["outcome"], "outcome").upper()
+            if outcome not in {"COMPLETED", "FAILED"}:
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_OUTCOME_INVALID",
+                    "Task Frame result outcome must be COMPLETED or FAILED",
+                    HTTPStatus.CONFLICT,
+                )
+            action_material = {
+                "action_id": "goal-task-frame-result-"
+                + _json_sha256(
+                    {
+                        "result_digest": result["result_digest"],
+                        "todo_id": todo_id,
+                        "outcome": outcome,
+                    }
+                )[:24],
+                "outcome": outcome,
+                "source": "GOAL_AUTOMATION_TASK_FRAME",
+                "evidence_ref": entry["evidence_ref"],
+            }
+            if "validation" in entry:
+                action_material["validation"] = entry["validation"]
+            normalized_actions.append(
+                (todo_id, normalize_todo_action_payload(todo_id, action_material))
+            )
+        actions = []
+        for todo_id, action in normalized_actions:
+            action.pop("todo_id", None)
+            action.pop("state", None)
+            instruction_ref = (
+                f"goal-automation://{goal['goal_id']}/results/"
+                f"{result['result_digest']}/todos/{todo_id}/{action['outcome'].lower()}"
+            )
+            action_request = self._goal_todo_action_request(
+                request,
+                instruction_ref=instruction_ref,
+                todo_id=todo_id,
+                action=action,
+            )
+            actions.append(self._apply_goal_todo_action(action_request))
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_TASK_FRAME_TODO_RESULT_APPLIED",
+            "goal_id": goal["goal_id"],
+            "binding": binding,
+            "selection": selection,
+            "result": {
+                "result_ref": result["result_ref"],
+                "result_digest": result["result_digest"],
+                "attached_at": result["attached_at"],
+            },
+            "actions": actions,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+        }
+
+    def advance_goal_automation(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_automation_advance_request(value)
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before automation advance",
+                HTTPStatus.CONFLICT,
+            )
+        operations: list[str] = []
+        if surface["next_operation"] == "MATERIALIZE_GOAL_START_PLAN":
+            _materialized, created = self.store.materialize_goal_start_work_plan(goal["goal_id"])
+            operations.append(
+                "GOAL_START_PLAN_APPLIED" if created else "GOAL_START_PLAN_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        if surface["application"] is None:
+            raise UniverseError(
+                "GOAL_WORK_PLAN_APPLICATION_REQUIRED",
+                "apply the USER-adopted Work Plan before automation",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["handoff"] is None:
+            handoff, created = self.store.create_master_handoff(
+                goal["project_id"],
+                {
+                    "source": {
+                        "kind": "GOAL_WORK_PLAN",
+                        "application_id": surface["application"]["application_id"],
+                    },
+                    "purpose": "Execute the USER-adopted Goal Work Plan.",
+                },
+            )
+            operations.append(
+                "MASTER_HANDOFF_CREATED" if created else "MASTER_HANDOFF_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        if surface["automation_state"] == "MASTER_HANDOFF_READY":
+            handoff = surface["handoff"]
+            assert isinstance(handoff, Mapping)
+            _delivered, delivered, _application = self.deliver_master_handoff(
+                goal["project_id"], handoff["handoff_id"], {"approval": "DELIVER"}
+            )
+            operations.append(
+                "MASTER_HANDOFF_DELIVERED"
+                if delivered
+                else "MASTER_HANDOFF_DELIVERY_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        if surface["automation_state"] == "AMBIGUOUS_MASTER_PROPOSALS":
+            raise UniverseError(
+                "GOAL_AUTOMATION_MASTER_PROPOSAL_AMBIGUOUS",
+                "multiple Master proposals cite the same Goal instruction_ref",
+                HTTPStatus.CONFLICT,
+            )
+        if surface["automation_state"] == "MASTER_PROPOSAL_READY":
+            task_frame = request.get("task_frame")
+            if task_frame is None:
+                return {
+                    "schema": API_SCHEMA,
+                    "status": "GOAL_AUTOMATION_TASK_FRAME_INPUT_REQUIRED",
+                    "operations": operations,
+                    "surface": surface,
+                }
+            proposal = surface["matching_proposals"][0]
+            handoff = surface["handoff"]
+            result, created = self.create_goal_handoff_instruction_task_frame(
+                goal["project_id"],
+                handoff["handoff_id"],
+                {
+                    "handoff_digest": handoff["handoff_digest"],
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "task_frame": task_frame,
+                },
+            )
+            operations.append(
+                "TASK_FRAME_BOUND" if created else "TASK_FRAME_BINDING_REUSED"
+            )
+            surface = self.goal_automation_surface(goal["goal_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "GOAL_AUTOMATION_ADVANCED",
+            "operations": operations,
+            "surface": surface,
+        }
+
+    def configure_goal_automation_scheduler(
+        self, goal_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = normalize_goal_automation_scheduler_request(value)
+        goal = self.store.get_goal(goal_id)
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before scheduler configuration",
+                HTTPStatus.CONFLICT,
+            )
+        scheduler, created = self.store.configure_goal_automation_scheduler(
+            goal["goal_id"],
+            action=request["action"],
+            expected_goal_revision=request["expected_goal_revision"],
+            interval_seconds=request["interval_seconds"],
+        )
+        if request["action"] == "START":
+            self._goal_scheduler_wake.set()
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "GOAL_AUTOMATION_SCHEDULER_STARTED"
+                if request["action"] == "START"
+                else "GOAL_AUTOMATION_SCHEDULER_PAUSED"
+            ),
+            "created": created,
+            "scheduler": scheduler,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+            "effects": {
+                "task_frame_run": "NONE",
+                "todo_state_change": "NONE",
+                "authority_created": False,
+                "execution_assignment_created": False,
+            },
+        }
+
+    @staticmethod
+    def _goal_scheduler_stop_reason(surface: Mapping[str, Any]) -> str:
+        operation = str(surface.get("next_operation") or "UNKNOWN").upper()
+        state = str(surface.get("automation_state") or "UNKNOWN").upper()
+        return {
+            "APPLY_ADOPTED_WORK_PLAN": "USER_WORK_PLAN_APPLICATION_REQUIRED",
+            "WAIT": state,
+            "USER_RESOLUTION_REQUIRED": state,
+            "BIND_INSTRUCTION_TASK_FRAME": "TASK_FRAME_INPUT_REQUIRED",
+            "SELECT_TODOS_FOR_EXECUTION": "TODO_EXECUTION_SELECTION_REQUIRED",
+            "RUN_TASK_FRAME": "TASK_FRAME_RUN_REQUIRED",
+            "APPLY_TASK_FRAME_RESULT": "TASK_FRAME_RESULT_APPLICATION_REQUIRED",
+        }.get(operation, f"STOP_AT_{operation}")
+
+    def run_goal_automation_scheduler_once(self) -> dict[str, Any]:
+        job = self.store.claim_due_goal_automation_scheduler(
+            self._goal_scheduler_owner
+        )
+        if job is None:
+            result = {
+                "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                "status": "NO_DUE_GOAL_AUTOMATION",
+            }
+            self._goal_scheduler_last_tick = result
+            return result
+        goal_id = job["goal_id"]
+        surface: dict[str, Any] | None = None
+        operations: list[str] = []
+        try:
+            for _ in range(4):
+                surface = self.goal_automation_surface(goal_id)
+                goal = surface["goal"]
+                if goal["revision"] != job["expected_goal_revision"]:
+                    raise UniverseError(
+                        "GOAL_REVISION_CONFLICT",
+                        "Goal revision changed before the scheduled tick",
+                        HTTPStatus.CONFLICT,
+                    )
+                operation = str(surface.get("next_operation") or "UNKNOWN")
+                if operation not in {
+                    "MATERIALIZE_GOAL_START_PLAN",
+                    "CREATE_AND_DELIVER_MASTER_HANDOFF",
+                    "DELIVER_MASTER_HANDOFF",
+                }:
+                    scheduler = self.store.finish_goal_automation_scheduler_tick(
+                        goal_id,
+                        lease_owner=self._goal_scheduler_owner,
+                        status="WAITING",
+                        stop_reason=self._goal_scheduler_stop_reason(surface),
+                        surface=surface,
+                    )
+                    result = {
+                        "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_STOPPED",
+                        "operations": operations,
+                        "scheduler": scheduler,
+                        "surface": surface,
+                    }
+                    self._goal_scheduler_last_tick = result
+                    return result
+                advanced = self.advance_goal_automation(
+                    goal_id,
+                    {
+                        "approval": "ADVANCE",
+                        "expected_goal_revision": job["expected_goal_revision"],
+                    },
+                )
+                operations.extend(advanced.get("operations", []))
+                surface = advanced["surface"]
+            raise UniverseError(
+                "GOAL_AUTOMATION_SCHEDULER_LOOP_LIMIT",
+                "scheduled advance exceeded the bounded four-step loop",
+                HTTPStatus.CONFLICT,
+            )
+        except UniverseError as error:
+            scheduler = self.store.finish_goal_automation_scheduler_tick(
+                goal_id,
+                lease_owner=self._goal_scheduler_owner,
+                status="BLOCKED",
+                stop_reason=error.code,
+                surface=surface,
+                error_code=error.code,
+                error_detail=error.detail,
+            )
+            result = {
+                "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                "status": "GOAL_AUTOMATION_SCHEDULER_BLOCKED",
+                "operations": operations,
+                "scheduler": scheduler,
+                "surface": surface,
+                "error_code": error.code,
+                "detail": error.detail,
+            }
+            self._goal_scheduler_last_tick = result
+            return result
+
+    def _goal_automation_scheduler_loop(self) -> None:
+        while not self._goal_scheduler_stop.is_set():
+            self._goal_scheduler_wake.wait(0.5)
+            self._goal_scheduler_wake.clear()
+            if self._goal_scheduler_stop.is_set():
+                return
+            try:
+                while True:
+                    result = self.run_goal_automation_scheduler_once()
+                    if result.get("status") == "NO_DUE_GOAL_AUTOMATION":
+                        break
+            except Exception as error:  # noqa: BLE001 - background loop remains observable
+                self._goal_scheduler_last_tick = {
+                    "schema": GOAL_AUTOMATION_SCHEDULER_SCHEMA,
+                    "status": "GOAL_AUTOMATION_SCHEDULER_LOOP_FAILED",
+                    "error_code": type(error).__name__,
+                    "detail": str(error),
+                }
+
+    def _ensure_task_frame_room(
+        self,
+        project_id: str,
+        task_frame: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Ensure the ephemeral Task Frame Room is bound to its origin anchor."""
+
+        frame_id = _required_text(task_frame.get("task_frame_id"), "task_frame_id")
+        origin_anchor = _required_text(
+            task_frame.get("origin_session_anchor_ref"),
+            "origin_session_anchor_ref",
+        )
+        try:
+            room = self.multi_rooms.create_boss_room(
+                project_id=project_id,
+                task_frame_id=frame_id,
+                title=f"Task Frame / {frame_id}",
+            )
+            matching_session = next(
+                (
+                    item
+                    for item in self.session_supervisor.list_sessions(
+                        node=project_id, include_hidden=True
+                    )
+                    if item.get("session_anchor_ref") == origin_anchor
+                ),
+                None,
+            )
+            bindings = self.multi_rooms.list_bindings(room["room_id"])
+            master = next(
+                (
+                    item
+                    for item in bindings
+                    if item.get("state") == "ACTIVE"
+                    and item.get("slot_role") == "MASTER"
+                    and item.get("session_anchor_ref") == origin_anchor
+                ),
+                None,
+            )
+            if master is None:
+                self.multi_rooms.attach_session(
+                    room["room_id"],
+                    {
+                        "slot_role": "MASTER",
+                        "display_name": "Project Master",
+                        "provider": (
+                            matching_session.get("provider")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "provider_session_ref": (
+                            matching_session.get("provider_session_ref")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "supervisor_session_id": (
+                            matching_session.get("session_id")
+                            if isinstance(matching_session, Mapping)
+                            else None
+                        ),
+                        "session_anchor_ref": origin_anchor,
+                        "participant_state": "ATTACHED",
+                    },
+                )
+            # Task Frame turns are run references, not extra vendor sessions.
+            # Keep their identity visible in the one Room Engine without
+            # creating the duplicate session cards that previously confused
+            # MASTER/CONDUCTOR routing.
+            role_to_slot = {
+                "BOSS": "BOSS",
+                "IMPLEMENTER": "WORKER",
+                "SECURITY_REVIEWER": "REVIEWER",
+                "QA_REVIEWER": "REVIEWER",
+                "SUB_REVIEWER": "REVIEWER",
+            }
+            existing_run_refs = {
+                str(binding.get("provider_session_ref") or "")
+                for binding in self.multi_rooms.list_bindings(room["room_id"])
+                if binding.get("state") == "ACTIVE"
+                and binding.get("provider") == "TASK_FRAME_RUN"
+            }
+            turns = task_frame.get("turns")
+            if isinstance(turns, list):
+                for turn in turns:
+                    if not isinstance(turn, Mapping):
+                        continue
+                    turn_id = str(turn.get("turn_id") or "").strip()
+                    slot_role = role_to_slot.get(
+                        str(turn.get("role") or "").strip().upper()
+                    )
+                    if not turn_id or slot_role is None:
+                        continue
+                    run_ref = f"task-frame-run:{frame_id}:{turn_id}"
+                    if run_ref in existing_run_refs:
+                        continue
+                    self.multi_rooms.attach_session(
+                        room["room_id"],
+                        {
+                            "slot_role": slot_role,
+                            "display_name": (
+                                f"{slot_role.title()} run · {turn_id}"
+                            ),
+                            "provider": "TASK_FRAME_RUN",
+                            "provider_session_ref": run_ref,
+                            "participant_state": "OBSERVED",
+                        },
+                    )
+            return self.multi_rooms.room_snapshot(room["room_id"])
+        except MultiRoomError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    @staticmethod
+    def _safe_task_frame_child_results(
+        host_result: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Keep only bounded, user-visible Task Frame result fields."""
+
+        raw_children = host_result.get("child_results")
+        if not isinstance(raw_children, list):
+            return []
+        safe_children: list[dict[str, Any]] = []
+        for item in raw_children[:32]:
+            if not isinstance(item, Mapping):
+                continue
+            child = {
+                key: str(item.get(key))[:256]
+                for key in ("turn_id", "role", "status")
+                if item.get(key) is not None
+            }
+            raw_result = item.get("result")
+            if isinstance(raw_result, Mapping):
+                result: dict[str, Any] = {}
+                for key, limit in (("outcome", 64), ("summary", 4000)):
+                    value = raw_result.get(key)
+                    if isinstance(value, str) and value.strip():
+                        result[key] = value.strip()[:limit]
+                evidence_refs = raw_result.get("evidence_refs")
+                if isinstance(evidence_refs, list):
+                    result["evidence_refs"] = [
+                        str(value)[:512]
+                        for value in evidence_refs[:32]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                validation = raw_result.get("validation")
+                if isinstance(validation, list):
+                    result["validation"] = [
+                        {
+                            key: entry.get(key)
+                            for key in ("plane", "state", "evidence_refs")
+                            if entry.get(key) is not None
+                        }
+                        for entry in validation[:32]
+                        if isinstance(entry, Mapping)
+                    ]
+                child["result"] = result
+            safe_children.append(child)
+        return safe_children
+
+    def _complete_task_frame_room(
+        self,
+        project_id: str,
+        task_frame_id: str,
+        host_result: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Project the terminal result, then close the ephemeral Task Frame Room."""
+
+        try:
+            rooms = self.multi_rooms.list_rooms(
+                project_id=project_id, room_type="BOSS", state="OPEN"
+            )
+            room = next(
+                (item for item in rooms if item.get("task_frame_id") == task_frame_id),
+                None,
+            )
+            if room is None:
+                return None
+            visible_result = {
+                "schema": "universe.task-frame-room-result.v1",
+                "task_frame_id": task_frame_id,
+                "status": host_result.get("status"),
+                "boss_turn_id": host_result.get("boss_turn_id"),
+                "child_results": self._safe_task_frame_child_results(host_result),
+                "redaction_state": "STRUCTURED_SUMMARY_ONLY",
+            }
+            message = self.multi_rooms.post_message(
+                room["room_id"],
+                {
+                    "author_role": "BOSS",
+                    "kind": "MESSAGE",
+                    "body_text": json.dumps(
+                        visible_result, ensure_ascii=False, indent=2
+                    ),
+                    "provider_event_id": f"task-frame-result:{task_frame_id}",
+                    "correlation_id": task_frame_id,
+                    "idempotency_key": f"task-frame-result:{task_frame_id}",
+                },
+            )
+            self._observe_multi_room_collection(message)
+            closed = self.multi_rooms.close_room(room["room_id"])
+            return self.multi_rooms.room_snapshot(closed["room_id"])
+        except MultiRoomError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def _record_task_frame_terminal_result(
+        self, task_frame_id: str, host_result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Append a redacted terminal result to the exact Task Frame lineage."""
+
+        try:
+            frame = self.task_frame_lineage.get_task_frame(task_frame_id)
+            result_ref = "task-frame-terminal:" + _json_sha256(
+                {
+                    "task_frame_id": task_frame_id,
+                    "status": host_result.get("status"),
+                    "boss_turn_id": host_result.get("boss_turn_id"),
+                }
+            )[:24]
+            safe_children = self._safe_task_frame_child_results(host_result)
+            result, created = self.task_frame_lineage.attach_result(
+                result_ref=result_ref,
+                frame_ref=task_frame_id,
+                origin_session_anchor_ref=frame["origin_session_anchor_ref"],
+                result={
+                    "status": host_result.get("status"),
+                    "boss_turn_id": host_result.get("boss_turn_id"),
+                    "child_results": safe_children,
+                    "redaction_state": "SUMMARY_ONLY",
+                },
+            )
+            return {"result": result, "created": created}
+        except TaskFrameLineageError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def run_instruction_authorized_task_frame(
+        self,
+        project_id: str,
+        proposal_id: str,
+        task_frame_id: str,
+    ) -> dict[str, Any]:
+        """Run a direct-instruction v2 Task Frame without approval evidence."""
+
+        project = self.store.get_project(project_id)
+        primary_id = _required_text(proposal_id, "primary_proposal_id")
+        frame_id = _required_text(task_frame_id, "task_frame_id")
+        proposal = next(
+            (
+                item
+                for item in self.list_project_governance_proposals(
+                    project["project_id"]
+                )
+                if item.get("proposal_id") == primary_id
+            ),
+            None,
+        )
+        if proposal is None:
+            raise UniverseError(
+                "GOVERNANCE_PROPOSAL_NOT_FOUND",
+                "governance Proposal does not exist for this Project",
+                HTTPStatus.NOT_FOUND,
+            )
+        primary_digest = _sha256(
+            proposal.get("proposal_digest"), "primary_proposal.proposal_digest"
+        )
+        try:
+            self.ensure_project_master(project["project_id"])
+            bridge = self.store.get_master_bridge(project["project_id"])
+            receipt = HttpProjectMasterBridge(
+                endpoint=bridge["endpoint"],
+                credential_env=bridge["credential_env"],
+            ).run_instruction_authorized_task_frame(
+                bridge=bridge,
+                task_frame_id=frame_id,
+                primary_proposal_id=primary_id,
+                primary_proposal_digest=primary_digest,
+            )
+        except (DispatchError, OSError, ProjectMasterHostError) as error:
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_RUN_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        host_result = receipt.get("host_response")
+        if (
+            not isinstance(host_result, Mapping)
+            or host_result.get("status") != "INSTRUCTION_TASK_FRAME_COMPLETED"
+            or host_result.get("project_id") != project["project_id"]
+            or host_result.get("primary_proposal_id") != primary_id
+            or host_result.get("task_frame_id") != frame_id
+        ):
+            raise UniverseError(
+                "INSTRUCTION_TASK_FRAME_RUN_RECEIPT_INVALID",
+                "Project Master did not return a matching instruction Task Frame completion receipt",
+                HTTPStatus.CONFLICT,
+            )
+        task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
+        task_frame_room = self._complete_task_frame_room(
+            project["project_id"], frame_id, host_result
+        )
+        self.publish_project_room_changed(project["project_id"])
+        return {
+            "schema": API_SCHEMA,
+            "status": "INSTRUCTION_TASK_FRAME_COMPLETED",
+            "project_id": project["project_id"],
+            "primary_proposal_id": primary_id,
+            "task_frame": dict(host_result),
+            "task_frame_result": task_frame_result,
+            "task_frame_room": task_frame_room,
         }
 
     def run_approved_descendant_task_frame(
@@ -16302,6 +26595,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Project Master did not return a matching Task Frame completion receipt",
                 HTTPStatus.CONFLICT,
             )
+        task_frame_result = self._record_task_frame_terminal_result(frame_id, host_result)
+        task_frame_room = self._complete_task_frame_room(
+            project["project_id"], frame_id, host_result
+        )
         self.publish_project_room_changed(project["project_id"])
         return {
             "schema": API_SCHEMA,
@@ -16309,6 +26606,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project["project_id"],
             "primary_proposal_id": primary_id,
             "task_frame": dict(host_result),
+            "task_frame_result": task_frame_result,
+            "task_frame_room": task_frame_room,
         }
 
     def _project_master_governance_context(self, project_id: str) -> dict[str, Any]:
@@ -16537,6 +26836,134 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         with self.project_release_application_lock:
             return self._apply_project_release(project_id, request)
 
+    def prepare_project_connection(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="project_connection_prepare",
+            required=frozenset({"project_id", "project_root"}),
+            optional=frozenset({"release_id"}),
+        )
+        project_id = _project_id(request["project_id"])
+        root = _canonical_project_root(request["project_root"])
+        runtime_manifest = root / INSTALLATION_MANIFEST_PATH
+        if runtime_manifest.is_file() and not runtime_manifest.is_symlink():
+            material = {
+                "project_id": project_id,
+                "project_root": str(root),
+                "action": "ATTACH_RUNTIME_PROJECT",
+            }
+            digest = _json_sha256(material)
+            return {
+                "schema": API_SCHEMA,
+                "status": "PROJECT_CONNECTION_PLAN_READY",
+                **material,
+                "plan_digest": digest,
+                "action_label": "Attach to Universe",
+                "detail": "Installed Runtime detected. Universe will attach without reinstalling it.",
+            }
+        releases = self.store.list_releases()
+        release_id = request.get("release_id")
+        if not release_id and len(releases) == 1:
+            release_id = releases[0]["release_id"]
+        if not release_id:
+            raise UniverseError(
+                "PROJECT_RELEASE_SELECTION_REQUIRED",
+                "Import exactly one Release DB or select a release before Runtime installation",
+                HTTPStatus.CONFLICT,
+            )
+        artifact = self.store.get_release_artifact_binding(str(release_id))
+        with ReleaseRuntime(
+            database_path=Path(artifact["database_path"]),
+            manifest_path=Path(artifact["manifest_path"]),
+        ) as runtime:
+            plan = plan_project_release_lifecycle(
+                project_root=root,
+                project_id=project_id,
+                release_id=runtime.release_id,
+                source_commit=runtime.metadata["source_commit"],
+            )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_CONNECTION_PLAN_READY",
+            "project_id": project_id,
+            "project_root": str(root),
+            "action": "INSTALL_RUNTIME_AND_ADD",
+            "release_id": str(release_id),
+            "release_database_sha256": artifact["database_sha256"],
+            "plan": plan,
+            "plan_digest": plan["plan_digest"],
+            "action_label": "Install Runtime & Add",
+            "detail": "Runtime is not installed. Existing source and Git content will be preserved.",
+        }
+
+    def apply_project_connection(self, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="project_connection_apply",
+            required=frozenset(
+                {"project_id", "project_root", "plan_digest", "command"}
+            ),
+            optional=frozenset({"release_id"}),
+        )
+        if request["command"] != "CONNECT_PROJECT":
+            raise UniverseError(
+                "PROJECT_CONNECTION_COMMAND_INVALID",
+                "command must be CONNECT_PROJECT",
+            )
+        prepared = self.prepare_project_connection(
+            {
+                "project_id": request["project_id"],
+                "project_root": request["project_root"],
+                **(
+                    {"release_id": request["release_id"]}
+                    if request.get("release_id")
+                    else {}
+                ),
+            }
+        )
+        if request["plan_digest"] != prepared["plan_digest"]:
+            raise UniverseError("PROJECT_CONNECTION_PLAN_STALE", "project connection plan changed")
+        receipt = None
+        if prepared["action"] == "INSTALL_RUNTIME_AND_ADD":
+            artifact = self.store.get_release_artifact_binding(prepared["release_id"])
+            try:
+                receipt = apply_project_release_plan(
+                    project_root=Path(prepared["project_root"]),
+                    project_id=prepared["project_id"],
+                    plan=prepared["plan"],
+                    release_database_sha256=prepared["release_database_sha256"],
+                    instruction_ref=(
+                        "universe://direct-command/project-connections/"
+                        + prepared["plan_digest"]
+                    ),
+                    database_path=Path(artifact["database_path"]),
+                    manifest_path=Path(artifact["manifest_path"]),
+                )
+            except ProjectReleaseApplyError as error:
+                raise UniverseError(
+                    error.code,
+                    str(error),
+                    HTTPStatus.CONFLICT,
+                ) from error
+        project, created = self.store.register_project(
+            {
+                "project_id": prepared["project_id"],
+                "project_root": prepared["project_root"],
+                "install_mode": (
+                    "UNIVERSE_ATTACHED"
+                    if prepared["action"] == "INSTALL_RUNTIME_AND_ADD"
+                    else "PROJECT_STANDALONE"
+                ),
+            }
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROJECT_CONNECTED",
+            "project": project,
+            "created": created,
+            "runtime_receipt": receipt,
+        }
+
     def _apply_project_release(
         self,
         project_id: str,
@@ -16592,9 +27019,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         project = self.store.get_project(project_id)
         artifact = self.store.get_release_artifact_binding(proposal["release_id"])
-        resident_stopped = False
-        if self.project_master_hosts is not None:
-            resident_stopped = self.project_master_hosts.stop(project_id)
         try:
             receipt = apply_project_release_proposal(
                 project_root=Path(project["project_root"]),
@@ -16605,18 +27029,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 manifest_path=Path(artifact["manifest_path"]),
             )
         except ProjectReleaseApplyError as error:
-            master_host = {"status": "NOT_RESTARTED"}
-            if resident_stopped:
-                try:
-                    master_host = self.ensure_project_master(project_id)
-                except (OSError, ProjectMasterHostError, UniverseError) as restart:
-                    master_host = {
-                        "status": "PROJECT_MASTER_RESTART_FAILED",
-                        "detail": str(restart),
-                    }
             raise UniverseError(
                 error.code,
-                f"{error}; master_host={master_host['status']}",
+                str(error),
                 HTTPStatus.CONFLICT,
             ) from error
 
@@ -16626,13 +27041,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             approval_digest=approval_digest,
             receipt=receipt,
         )
-        try:
-            master_host = self.ensure_project_master(project_id)
-        except (OSError, ProjectMasterHostError, UniverseError) as error:
-            master_host = {
-                "status": "PROJECT_MASTER_START_FAILED",
-                "detail": str(error),
-            }
         return {
             "schema": API_SCHEMA,
             "status": (
@@ -16644,7 +27052,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_id": proposal["proposal_id"],
             "approval": approval,
             "receipt": stored_receipt,
-            "master_host": master_host,
         }
 
     def provider_settings(self) -> dict[str, Any]:
@@ -16799,6 +27206,89 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.BAD_REQUEST,
             )
 
+    def _validate_new_session_coordinates(
+        self,
+        request: Mapping[str, Any],
+        *,
+        project_id: str,
+        project_root: Path,
+        expected_mode: str,
+        mode_registry_path: Path,
+    ) -> dict[str, str]:
+        supplied_project_id = str(request.get("project_id") or "").strip()
+        if not supplied_project_id:
+            raise UniverseError(
+                "SESSION_PROJECT_ID_REQUIRED",
+                "New session creation requires project_id",
+                HTTPStatus.BAD_REQUEST,
+            )
+        normalized_project_id = _project_id(supplied_project_id)
+        normalized_expected_project_id = _project_id(project_id)
+        if normalized_project_id.casefold() != normalized_expected_project_id.casefold():
+            raise UniverseError(
+                "SESSION_PROJECT_ID_MISMATCH",
+                "New session project_id does not match the selected project",
+                HTTPStatus.BAD_REQUEST,
+            )
+
+        supplied_cwd_value = str(request.get("cwd") or "").strip()
+        if not supplied_cwd_value:
+            raise UniverseError(
+                "SESSION_CWD_REQUIRED",
+                "New session creation requires cwd",
+                HTTPStatus.BAD_REQUEST,
+            )
+        try:
+            supplied_cwd = Path(supplied_cwd_value).expanduser().resolve(strict=True)
+            expected_root = project_root.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise UniverseError(
+                "SESSION_CWD_UNAVAILABLE",
+                str(error),
+                HTTPStatus.BAD_REQUEST,
+            ) from error
+        if not supplied_cwd.is_dir() or supplied_cwd != expected_root:
+            raise UniverseError(
+                "SESSION_CWD_MISMATCH",
+                "New session cwd must equal the selected project root",
+                HTTPStatus.BAD_REQUEST,
+            )
+
+        requested_mode = str(request.get("requested_mode") or "").strip().upper()
+        if not requested_mode:
+            raise UniverseError(
+                "SESSION_MODE_REQUIRED",
+                "New session creation requires requested_mode",
+                HTTPStatus.BAD_REQUEST,
+            )
+        try:
+            registry = json.loads(mode_registry_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise UniverseError(
+                "SESSION_MODE_REGISTRY_UNAVAILABLE",
+                str(error),
+                HTTPStatus.CONFLICT,
+            ) from error
+        modes = registry.get("modes") if isinstance(registry, Mapping) else None
+        if not isinstance(modes, Mapping) or requested_mode not in modes:
+            raise UniverseError(
+                "SESSION_MODE_NOT_REGISTERED",
+                f"Mode {requested_mode} is not registered for project {project_id}",
+                HTTPStatus.CONFLICT,
+            )
+        normalized_expected_mode = str(expected_mode).strip().upper()
+        if requested_mode != normalized_expected_mode:
+            raise UniverseError(
+                "SESSION_MODE_MISMATCH",
+                "New session requested_mode does not match the selected Mode card",
+                HTTPStatus.BAD_REQUEST,
+            )
+        return {
+            "project_id": normalized_expected_project_id,
+            "cwd": str(expected_root),
+            "requested_mode": normalized_expected_mode,
+        }
+
     def _ensure_conductor_session_host(self) -> ResidentModeSessionHost:
         with self._conductor_session_host_lock:
             if self.conductor_session_host is None:
@@ -16856,37 +27346,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             session_action = normalize_session_action(
                 request.get("session_action", "RESUME")
             )
-            if any(key in request for key in ("provider", "model_ref", "effort")):
-                current = self.store.provider_setting(
-                    "UNIVERSE_CONDUCTOR", "CONDUCTOR"
-                )
-                self.set_universe_provider_setting(
-                    {
-                        "provider": request.get("provider") or current["provider"],
-                        "model_ref": request.get(
-                            "model_ref", current.get("model_ref", "")
-                        ),
-                        "effort": request.get(
-                            "effort", current.get("effort", "AUTO")
-                        ),
-                    },
+            session_coordinates = None
+            if session_action == "NEW":
+                universe_root = Path(__file__).resolve().parents[1]
+                session_coordinates = self._validate_new_session_coordinates(
+                    request,
+                    project_id="universe",
+                    project_root=universe_root,
+                    expected_mode="CONDUCTOR",
+                    mode_registry_path=DEFAULT_MODE_REGISTRY_PATH,
                 )
             setting = self.store.provider_setting(
                 "UNIVERSE_CONDUCTOR", "CONDUCTOR"
             )
-            provider = self._resolve_conductor_provider({"requested_provider": "AUTO"})
-            self._validate_provider_model_pair(
-                provider,
-                str(setting.get("model_ref") or "").strip(),
+            effective_model = str(
+                request.get("model_ref", setting.get("model_ref", "")) or ""
+            ).strip()
+            effective_effort = str(
+                request.get("effort", setting.get("effort", "AUTO")) or "AUTO"
+            ).strip().upper()
+            provider = self._resolve_conductor_provider(
+                {"requested_provider": request.get("provider") or "AUTO"}
             )
+            self._validate_provider_model_pair(provider, effective_model)
             host = self._ensure_conductor_session_host()
             prepare_options = {
-                "model": str(setting.get("model_ref") or "").strip(),
-                "effort": str(setting.get("effort") or "AUTO").strip().upper(),
+                "model": effective_model,
+                "effort": effective_effort,
             }
             if session_action == "NEW":
                 prepare_options["session_action"] = session_action
-            status = host.prepare(provider, **prepare_options)
+            status = dict(host.prepare(provider, **prepare_options))
+            if session_coordinates is not None:
+                status["session_coordinates"] = session_coordinates
             self._conductor_session_error = None
             return status
         except (
@@ -16996,6 +27488,247 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "suggestions": suggestions,
         }
 
+    def session_graph_projection(self, project_id: str | None = None) -> dict[str, Any]:
+        """Project the durable Mode/Session Anchor and Task Frame lineage.
+
+        This is a read-only projection over canonical stores. It never changes
+        currentness, chat selection, authority, or Task Frame state.
+        """
+
+        project_filter = str(project_id or "").strip() or None
+        if project_filter is not None:
+            self.store.get_project(project_filter)
+        anchors = self.session_supervisor.list_project_mode_anchors(
+            project_id=project_filter
+        )
+        sessions = self.session_supervisor.list_public_sessions(
+            include_hidden=True,
+        )
+        sessions_by_anchor = {
+            str(item.get("session_anchor_ref") or ""): item
+            for item in sessions
+            if str(item.get("session_anchor_ref") or "")
+        }
+        nodes: dict[str, dict[str, Any]] = {}
+        edges: dict[str, dict[str, Any]] = {}
+
+        def add_node(node_id: str, entity_type: str, label: str, **fields: Any) -> None:
+            nodes.setdefault(
+                node_id,
+                {
+                    "id": node_id,
+                    "entity_type": entity_type,
+                    "label": label,
+                    **fields,
+                },
+            )
+
+        def add_edge(edge_type: str, source: str, target: str, **fields: Any) -> None:
+            edge_id = f"{edge_type}:{source}:{target}"
+            edges.setdefault(
+                edge_id,
+                {
+                    "id": edge_id,
+                    "edge_type": edge_type,
+                    "from": source,
+                    "to": target,
+                    **fields,
+                },
+            )
+
+        included_session_refs: set[str] = set()
+        for anchor in anchors:
+            project_ref = str(anchor.get("project_id") or "UNKNOWN")
+            mode = str(anchor.get("mode") or "UNKNOWN").upper()
+            anchor_ref = str(anchor.get("anchor_ref") or "UNKNOWN")
+            project_node = f"project:{project_ref}"
+            mode_node = f"mode:{project_ref}:{mode}"
+            mode_anchor_node = f"mode_anchor:{anchor_ref}"
+            add_node(
+                project_node,
+                "PROJECT",
+                project_ref,
+                project_id=project_ref,
+                source_ref=f"universe://projects/{project_ref}",
+            )
+            add_node(
+                mode_node,
+                "MODE",
+                mode,
+                project_id=project_ref,
+                mode=mode,
+                source_ref="universe://runtime/mode-registry",
+            )
+            add_node(
+                mode_anchor_node,
+                "MODE_ANCHOR",
+                f"{mode} anchor",
+                ref=anchor_ref,
+                project_id=project_ref,
+                mode=mode,
+                revision=anchor.get("revision"),
+                created_at=anchor.get("created_at"),
+                updated_at=anchor.get("updated_at"),
+                source_ref=f"universe://supervisor/project-mode-anchors/{project_ref}/{mode}",
+            )
+            add_edge("PROJECT_HAS_MODE", project_node, mode_node)
+            add_edge("MODE_HAS_MODE_ANCHOR", mode_node, mode_anchor_node)
+            for lineage in anchor.get("session_anchor_refs") or []:
+                session_anchor_ref = str(
+                    lineage.get("session_anchor_ref") or ""
+                ).strip()
+                if not session_anchor_ref:
+                    continue
+                included_session_refs.add(session_anchor_ref)
+                session = sessions_by_anchor.get(session_anchor_ref) or {}
+                session_node = f"session_anchor:{session_anchor_ref}"
+                add_node(
+                    session_node,
+                    "SESSION_ANCHOR",
+                    str(session.get("alias") or session_anchor_ref),
+                    ref=session_anchor_ref,
+                    project_id=project_ref,
+                    mode=mode,
+                    session_id=(
+                        session.get("universe_session_id")
+                        or lineage.get("session_id")
+                    ),
+                    provider=(
+                        session.get("current_provider")
+                        or session.get("provider")
+                        or "UNKNOWN"
+                    ),
+                    state=session.get("state") or "UNKNOWN",
+                    currentness=session.get("currentness") or "UNKNOWN",
+                    is_default=bool(session.get("is_default")),
+                    attached_at=lineage.get("attached_at"),
+                    lineage_revision=lineage.get("revision"),
+                    source_ref=f"universe://sessions/{session_anchor_ref}",
+                )
+                add_edge(
+                    "MODE_ANCHOR_HAS_SESSION_ANCHOR",
+                    mode_anchor_node,
+                    session_node,
+                    revision=lineage.get("revision"),
+                    attached_at=lineage.get("attached_at"),
+                )
+
+        for frame in self.task_frame_lineage.list_task_frames():
+            origin_ref = str(frame.get("origin_session_anchor_ref") or "")
+            target_ref = str(frame.get("target_session_anchor_ref") or "")
+            if project_filter is not None and origin_ref not in included_session_refs:
+                continue
+            if origin_ref not in included_session_refs:
+                continue
+            frame_ref = str(frame.get("frame_ref") or "")
+            if not frame_ref:
+                continue
+            frame_node = f"task_frame:{frame_ref}"
+            origin_node = f"session_anchor:{origin_ref}"
+            origin = nodes.get(origin_node) or {}
+            add_node(
+                frame_node,
+                "TASK_FRAME",
+                frame_ref,
+                ref=frame_ref,
+                project_id=origin.get("project_id"),
+                mode=origin.get("mode"),
+                revision=frame.get("revision"),
+                result_count=len(frame.get("results") or []),
+                created_at=frame.get("created_at"),
+                source_ref=f"universe://task-frame-lineage/{frame_ref}",
+            )
+            add_edge("SESSION_ANCHOR_HAS_TASK_FRAME", origin_node, frame_node)
+            parent_ref = str(frame.get("parent_task_frame_ref") or "")
+            if parent_ref:
+                add_edge(
+                    "TASK_FRAME_CONTINUES",
+                    f"task_frame:{parent_ref}",
+                    frame_node,
+                )
+            if target_ref and target_ref in included_session_refs:
+                add_edge(
+                    "TASK_FRAME_TARGETS_SESSION",
+                    frame_node,
+                    f"session_anchor:{target_ref}",
+                )
+            for result in frame.get("results") or []:
+                result_ref = str(result.get("result_ref") or "")
+                if not result_ref:
+                    continue
+                result_node = f"task_frame_result:{result_ref}"
+                add_node(
+                    result_node,
+                    "TASK_FRAME_RESULT",
+                    f"Result · {result_ref}",
+                    ref=result_ref,
+                    frame_ref=frame_ref,
+                    origin_session_anchor_ref=result.get(
+                        "origin_session_anchor_ref"
+                    ),
+                    result_digest=result.get("result_digest"),
+                    attached_at=result.get("attached_at"),
+                    result_in_graph=False,
+                    source_ref=(
+                        f"universe://task-frame-lineage/{frame_ref}/results/{result_ref}"
+                    ),
+                )
+                add_edge("TASK_FRAME_HAS_RESULT", frame_node, result_node)
+                result_origin = str(result.get("origin_session_anchor_ref") or "")
+                if result_origin in included_session_refs:
+                    add_edge(
+                        "TASK_FRAME_RESULT_ORIGINATES_FROM_SESSION",
+                        result_node,
+                        f"session_anchor:{result_origin}",
+                    )
+
+        return {
+            "schema": "universe.session-graph-projection.v1",
+            "status": "SESSION_GRAPH_PROJECTED",
+            "project_id": project_filter,
+            "observed_at": utc_now(),
+            "projection_policy": {
+                "read_only": True,
+                "selection_scope": "UI_NAVIGATION_ONLY",
+                "authority_created": False,
+                "source_write": False,
+            },
+            "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
+            "edges": sorted(edges.values(), key=lambda item: item["id"]),
+        }
+
+    def _live_pty_session_anchors(self) -> dict[str, str]:
+        """Return only exact live PTY-to-Session-Anchor bindings.
+
+        PTY liveness may restore Supervisor host state, but it never selects a
+        default session or changes currentness, Authority, or Assignment.
+        """
+
+        try:
+            terminals = self._session_anchor_terminal_host().list_sessions()
+        except TerminalHostError:
+            return {}
+        bindings: dict[str, str] = {}
+        for terminal in terminals:
+            if str(terminal.get("state") or "").upper() != "LIVE":
+                continue
+            session_id = str(
+                terminal.get("supervisor_session_id") or ""
+            ).strip()
+            anchor_ref = str(
+                terminal.get("session_anchor_ref")
+                or terminal.get("active_session_anchor_ref")
+                or ""
+            ).strip()
+            if session_id and anchor_ref:
+                bindings[session_id] = anchor_ref
+        return bindings
+
+    def _sweep_stale_live_sessions(self) -> dict[str, Any]:
+        return self.session_supervisor.sweep_stale_live_sessions(
+            live_session_anchors=self._live_pty_session_anchors()
+        )
+
     def runtime_audit(self) -> dict[str, Any]:
         continuity: list[dict[str, Any]] = []
         if self.continuity_coordinator is not None:
@@ -17012,7 +27745,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
         # Drop zombie LIVE rows (dead PID / no owned lease) before Observatory reads.
         try:
-            live_sweep = self.session_supervisor.sweep_stale_live_sessions()
+            live_sweep = self._sweep_stale_live_sessions()
         except SessionSupervisorError as error:
             live_sweep = {
                 "status": "LIVE_SESSION_SWEEP_FAILED",
@@ -17344,40 +28077,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _project_anchor_observations(
         self, discovered: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        provider_identities: dict[tuple[str, str], dict[str, Any]] = {}
-        exact_identities: dict[str, list[tuple[str, str]]] = {}
-        for source in discovered:
-            provider = str(source.get("provider") or "").upper()
-            provider_session_id = str(
-                source.get("provider_session_id") or ""
-            ).strip()
-            if (
-                source.get("identity_state") != "VERIFIED"
-                or str(source.get("session_kind") or "CHAT").upper() == "WORKER"
-                or not provider_session_id
-            ):
-                continue
-            identity = (provider, provider_session_id)
-            provider_identities.setdefault(identity, source)
-            exact_identities.setdefault(provider_session_id, []).append(identity)
+        provider_identities, exact_identities = _verified_provider_identity_index(
+            discovered
+        )
 
         def resolve_observer(observer_ref: Any) -> tuple[str, str] | None:
-            raw = str(observer_ref or "").strip()
-            if not raw or raw.upper() in {"UNKNOWN", "UNASSIGNED", "NONE"}:
-                return None
-            prefixed = (
-                ("claude-code:", "CLAUDE"),
-                ("grok-acp:", "GROK"),
-                ("codex-app-server:", "CODEX"),
-                ("codex:", "CODEX"),
+            return _resolve_verified_provider_identity(
+                observer_ref, provider_identities, exact_identities
             )
-            lowered = raw.lower()
-            for prefix, provider in prefixed:
-                if lowered.startswith(prefix):
-                    identity = (provider, raw[len(prefix) :])
-                    return identity if identity in provider_identities else None
-            exact = exact_identities.get(raw) or []
-            return exact[0] if len(exact) == 1 else None
 
         candidates: list[dict[str, Any]] = []
         current_anchors: dict[tuple[str, str], dict[str, Any]] = {}
@@ -17576,6 +28283,951 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "unchanged": len(observations),
         }
 
+    def list_project_anchor_sessions(self, project_id: str) -> dict[str, Any]:
+        """List Current and durable recent sessions from the project store."""
+
+        project = self.store.get_project(project_id)
+        project_root = Path(str(project.get("project_root") or "")).resolve(
+            strict=False
+        )
+        runtime_store = (
+            project_root / ".ai" / "runtime" / "state" / "project_runtime.sqlite3"
+        )
+        session_dir = project_root / ".ai" / "runtime" / "session_store"
+        current_by_mode, beyond_by_anchor = _read_project_runtime_anchors(
+            runtime_store
+        )
+        store_rows = _read_session_store_rows(session_dir)
+        sessions: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def remember(mode: str, session_id: str) -> bool:
+            key = (mode, session_id)
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+        def matching_store_row(
+            *,
+            mode: str,
+            anchor_id: str,
+            session_id: str,
+            observer_ref: str,
+        ) -> dict[str, Any] | None:
+            candidates = []
+            if session_id:
+                candidates.append(_session_store_digest(session_id))
+            if observer_ref:
+                candidates.append(_session_store_digest(observer_ref))
+            for row in store_rows:
+                if row.get("digest") in candidates:
+                    return row
+                if anchor_id and row.get("anchor_id") == anchor_id:
+                    return row
+                if session_id and row.get("session_id") == session_id:
+                    return row
+                if observer_ref and row.get("observer_session_ref") == observer_ref:
+                    return row
+            return None
+
+        for mode, current in current_by_mode.items():
+            observer = str(current.get("observer_session_ref") or "").strip()
+            session_id = (
+                str(current.get("session_id") or "").strip()
+                or observer
+                or str(current.get("anchor_id") or "")
+            )
+            if not session_id or not remember(mode, session_id):
+                continue
+            store_row = matching_store_row(
+                mode=mode,
+                anchor_id=str(current.get("anchor_id") or ""),
+                session_id=session_id,
+                observer_ref=observer,
+            )
+            provider, chat_key = _chat_key_for_observer(observer)
+            sessions.append(
+                _public_anchor_session(
+                    project_id=project_id,
+                    mode=mode,
+                    session_id=session_id,
+                    provider=provider,
+                    session_anchor_ref=str(current.get("anchor_id") or ""),
+                    current_anchor_ref=str(current.get("anchor_id") or ""),
+                    origin_anchor_ref=str(current.get("anchor_id") or ""),
+                    temporality="CURRENT",
+                    currentness="CURRENT",
+                    currentness_source="MODE_CURRENT_ANCHOR",
+                    state=str(
+                        (store_row or {}).get("state") or current.get("state") or "CURRENT"
+                    ),
+                    last_seen_at=str(
+                        (store_row or {}).get("observed_at")
+                        or current.get("observed_at")
+                        or ""
+                    ),
+                    chat_key=chat_key,
+                    store_present=store_row is not None,
+                    observer_session_ref=observer,
+                )
+            )
+
+        for row in store_rows:
+            anchor_id = str(row.get("anchor_id") or "").strip()
+            if not anchor_id:
+                continue
+            beyond = beyond_by_anchor.get(anchor_id) or {}
+            mode = str(row.get("mode") or beyond.get("mode") or "").upper()
+            session_id = (
+                str(row.get("session_id") or "").strip()
+                or str(row.get("observer_session_ref") or "").strip()
+                or f"session-{row.get('digest')}"
+            )
+            current = current_by_mode.get(mode) or {}
+            if session_id in {
+                str(current.get("session_id") or ""),
+                str(current.get("observer_session_ref") or ""),
+            } or anchor_id == str(current.get("anchor_id") or ""):
+                continue
+            if not mode or not remember(mode, session_id):
+                continue
+            observer = str(
+                row.get("observer_session_ref")
+                or beyond.get("observer_session_ref")
+                or ""
+            )
+            provider, chat_key = _chat_key_for_observer(observer)
+            sessions.append(
+                _public_anchor_session(
+                    project_id=project_id,
+                    mode=mode,
+                    session_id=session_id,
+                    provider=provider,
+                    session_anchor_ref=anchor_id,
+                    current_anchor_ref=str(current.get("anchor_id") or anchor_id),
+                    origin_anchor_ref=anchor_id,
+                    temporality="BEYOND" if beyond else "SESSION",
+                    currentness="PAST",
+                    currentness_source="SESSION_STORE",
+                    state=str(row.get("state") or beyond.get("state") or "UNKNOWN"),
+                    last_seen_at=str(
+                        row.get("observed_at") or beyond.get("observed_at") or ""
+                    ),
+                    chat_key=chat_key,
+                    observer_session_ref=observer,
+                    store_present=True,
+                )
+            )
+
+        sessions = self._join_live_pty_bindings(project_id, sessions)
+        sessions.sort(
+            key=lambda item: str(item.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        sessions.sort(
+            key=lambda item: (
+                0 if item.get("currentness") == "CURRENT" else 1,
+                str(item.get("mode") or ""),
+            )
+        )
+        return {
+            "schema": "universe.project-anchor-sessions.v1",
+            "status": "PROJECT_ANCHOR_SESSIONS_COLLECTED",
+            "project_id": project_id,
+            "sessions": sessions,
+        }
+
+    def _pty_binding_material(
+        self, terminal: Mapping[str, Any], status: str
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "terminal_id": terminal.get("terminal_id"),
+            "pty_state": terminal.get("state"),
+            "pid": terminal.get("pid"),
+            "provider": terminal.get("provider"),
+            "backend_owner": terminal.get("backend_owner"),
+            "reconnection_host_id": terminal.get("reconnection_host_id"),
+        }
+
+    def _pty_anchor_session(
+        self,
+        project_id: str,
+        terminal: Mapping[str, Any],
+        anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Project one live PTY the Anchor and session store do not cover.
+
+        The record reports the terminal that is observably alive and the
+        Supervisor session it is bound to.  It never borrows Mode Current
+        Anchor currentness, Authority, or Execution Assignment from that
+        liveness.
+        """
+
+        supervisor_id = str(terminal.get("supervisor_session_id") or "").strip()
+        session: Mapping[str, Any] = {}
+        if supervisor_id:
+            try:
+                session = self.session_supervisor.get_session(supervisor_id)
+            except SessionSupervisorError:
+                session = {}
+        provider = str(
+            terminal.get("provider") or session.get("provider") or "UNKNOWN"
+        ).upper()
+        observer = str(session.get("provider_session_ref") or "")
+        _observer_provider, chat_key = _chat_key_for_observer(observer)
+        anchor_pending = not anchor_ref
+        return _public_anchor_session(
+            project_id=project_id,
+            mode=str(terminal.get("mode") or session.get("mode") or "").upper(),
+            session_id=supervisor_id or str(terminal.get("terminal_id") or ""),
+            provider=provider,
+            session_anchor_ref=anchor_ref,
+            current_anchor_ref=anchor_ref,
+            origin_anchor_ref=anchor_ref,
+            temporality="SESSION",
+            currentness="UNKNOWN" if anchor_pending else "NOT_CURRENT",
+            currentness_source="PTY_LIVENESS",
+            state="LIVE",
+            last_seen_at=str(
+                session.get("last_seen_at") or terminal.get("created_at") or ""
+            ),
+            chat_key=chat_key,
+            store_present=False,
+            observer_session_ref=observer,
+            pty_binding=self._pty_binding_material(
+                terminal,
+                "ANCHOR_PENDING" if anchor_pending else "BOUND",
+            ),
+        )
+
+    def _join_live_pty_bindings(
+        self, project_id: str, sessions: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Collapse a verified PTY binding and its session into one record.
+
+        A live PTY whose active Session Anchor matches an Anchor record renders
+        as that single record in a LIVE state instead of a separate live PTY
+        card beside an offline Anchor card.  A live PTY without a verified
+        Session Anchor renders ANCHOR_PENDING and must not imply a binding.
+        """
+
+        terminals = [
+            terminal
+            for terminal in self._session_anchor_terminal_host().list_sessions()
+            if str(terminal.get("state") or "").upper() == "LIVE"
+            and str(terminal.get("project_id") or "") == str(project_id or "")
+        ]
+        if not terminals:
+            return sessions
+        bound: dict[str, Mapping[str, Any]] = {}
+        bound_by_provider_session: dict[tuple[str, str], Mapping[str, Any]] = {}
+        anchor_pending: list[Mapping[str, Any]] = []
+        for terminal in terminals:
+            anchor_ref = str(terminal.get("active_session_anchor_ref") or "").strip()
+            if anchor_ref:
+                bound.setdefault(anchor_ref, terminal)
+            else:
+                anchor_pending.append(terminal)
+            supervisor_id = str(
+                terminal.get("supervisor_session_id") or ""
+            ).strip()
+            if not supervisor_id:
+                continue
+            try:
+                supervised = self.session_supervisor.get_session(supervisor_id)
+            except SessionSupervisorError:
+                continue
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            identity = _vendor_identity_from_observer(provider_ref)
+            if identity is None and provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                identity = (provider, provider_ref)
+            if identity is not None:
+                bound_by_provider_session.setdefault(identity, terminal)
+
+        joined: list[dict[str, Any]] = []
+        matched_terminal_ids: set[str] = set()
+        for session in sessions:
+            anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+            terminal = bound.get(anchor_ref) if anchor_ref else None
+            if terminal is None and str(session.get("currentness") or "").upper() == "CURRENT":
+                observer_identity = _vendor_identity_from_observer(
+                    str(session.get("observer_session_ref") or "")
+                )
+                if observer_identity is not None:
+                    terminal = bound_by_provider_session.pop(observer_identity, None)
+            if terminal is None:
+                joined.append(session)
+                continue
+            matched_terminal_ids.add(str(terminal.get("terminal_id") or ""))
+            record = dict(session)
+            record["pty_binding"] = _public_pty_binding(
+                self._pty_binding_material(terminal, "BOUND")
+            )
+            record["state"] = "LIVE"
+            record["active_ing"] = True
+            joined.append(record)
+
+        for anchor_ref, terminal in bound.items():
+            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
+                continue
+            joined.append(self._pty_anchor_session(project_id, terminal, anchor_ref))
+        for terminal in anchor_pending:
+            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
+                continue
+            joined.append(self._pty_anchor_session(project_id, terminal, ""))
+        return joined
+
+    def list_all_project_anchor_sessions(self) -> list[dict[str, Any]]:
+        sessions: list[dict[str, Any]] = []
+        for project in self.store.list_projects()[:100]:
+            project_id = str(project.get("project_id") or "").strip()
+            if not project_id:
+                continue
+            try:
+                listed = self.list_project_anchor_sessions(project_id)
+            except UniverseError:
+                continue
+            sessions.extend(listed.get("sessions") or [])
+        return sessions
+
+    def list_cli_terminals(self) -> dict[str, Any]:
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_TERMINALS_COLLECTED",
+            "terminals": self._session_anchor_terminal_host().list_sessions(),
+        }
+
+    def list_cli_terminal_audit_events(
+        self, query: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        raw = query if isinstance(query, Mapping) else {}
+        try:
+            limit = int(raw.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        return {
+            "schema": API_SCHEMA,
+            "status": "TERMINAL_AUDIT_EVENTS_COLLECTED",
+            "events": self.terminal_host.audit_events(
+                terminal_id=str(raw.get("terminal_id") or ""),
+                limit=limit,
+            ),
+        }
+
+    def _session_anchor_terminal_host(self) -> _SessionAnchorTerminalHost:
+        return _SessionAnchorTerminalHost(
+            self.terminal_host,
+            self._project_terminal_session_location,
+        )
+
+    def _project_terminal_session_location(
+        self, terminal: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Keep PTY birth coordinates as history and project its active location."""
+
+        projected = dict(terminal)
+        created_project_id = str(terminal.get("project_id") or "").strip()
+        created_mode = str(terminal.get("mode") or "").strip().upper()
+        projected["created_project_id"] = created_project_id
+        projected["created_mode"] = created_mode
+        projected["creation_coordinate"] = {
+            "project_id": created_project_id,
+            "mode": created_mode,
+        }
+        session_id = str(terminal.get("supervisor_session_id") or "").strip()
+        if not session_id:
+            projected["location_source"] = "PTY_CREATION"
+            return projected
+        try:
+            session = self.session_supervisor.get_session(session_id)
+        except SessionSupervisorError:
+            projected["location_source"] = "PTY_CREATION"
+            return projected
+        current_location = next(
+            (
+                item
+                for item in reversed(list(session.get("location_history") or []))
+                if item.get("is_current")
+            ),
+            {},
+        )
+        current_project_id = str(
+            current_location.get("project_id")
+            or session.get("current_project_id")
+            or session.get("node")
+            or created_project_id
+        ).strip()
+        current_mode = str(
+            current_location.get("mode") or session.get("mode") or created_mode
+        ).strip().upper()
+        projected["project_id"] = current_project_id
+        projected["mode"] = current_mode
+        projected["active_session_anchor_ref"] = str(
+            session.get("session_anchor_ref") or ""
+        )
+        projected["location_source"] = "SESSION_ANCHOR"
+        projected["location_rebound"] = (
+            current_project_id != created_project_id or current_mode != created_mode
+        )
+        return projected
+
+    def _resolve_project_anchor_pty_binding(
+        self, *, project_id: str, mode: str, session_anchor_ref: str
+    ) -> dict[str, str]:
+        anchor_ref = str(session_anchor_ref or "").strip()
+        if not anchor_ref:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_ANCHOR_REQUIRED",
+                "PTY Binding requires a Session Anchor",
+                HTTPStatus.BAD_REQUEST,
+            )
+        listed = self.list_project_anchor_sessions(project_id)
+        selected = next(
+            (
+                session
+                for session in listed.get("sessions") or []
+                if str(session.get("session_anchor_ref") or "") == anchor_ref
+                and str(session.get("mode") or "").upper() == mode
+            ),
+            None,
+        )
+        if selected is None:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_ANCHOR_NOT_FOUND",
+                "Session Anchor is not available at the requested terminal coordinate",
+                HTTPStatus.NOT_FOUND,
+            )
+
+        supervisor_sessions = self.session_supervisor.list_sessions(include_hidden=True)
+        selected_session_ids = {
+            str(selected.get("session_id") or "").strip(),
+            str(selected.get("universe_session_id") or "").strip(),
+        } - {""}
+        for supervised in supervisor_sessions:
+            supervised_project = str(
+                supervised.get("current_project_id")
+                or supervised.get("node")
+                or ""
+            ).strip()
+            supervised_mode = str(supervised.get("mode") or "").upper()
+            supervised_id = str(
+                supervised.get("universe_session_id")
+                or supervised.get("session_id")
+                or ""
+            ).strip()
+            if (
+                supervised_project.casefold() != project_id.casefold()
+                or supervised_mode != mode
+                or supervised_id not in selected_session_ids
+            ):
+                continue
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                vendor_identity = _vendor_identity_from_observer(provider_ref)
+                if vendor_identity is not None:
+                    provider, provider_ref = vendor_identity
+                return {
+                    "provider": provider,
+                    "provider_session_id": provider_ref,
+                    "supervisor_session_id": supervised_id,
+                }
+
+        sources: list[dict[str, Any]] = []
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            sources.extend(self.store.discover_provider_session_sources(provider))
+        for supervised in supervisor_sessions:
+            provider = str(supervised.get("provider") or "").upper()
+            provider_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if provider in {"CODEX", "CLAUDE", "GROK"} and provider_ref:
+                vendor_identity = _vendor_identity_from_observer(provider_ref)
+                if vendor_identity is not None:
+                    provider, provider_ref = vendor_identity
+                sources.append(
+                    {
+                        "provider": provider,
+                        "provider_session_id": provider_ref,
+                        "session_kind": supervised.get("session_kind") or "CHAT",
+                        "identity_state": "VERIFIED",
+                    }
+                )
+        provider_identities, exact_identities = _verified_provider_identity_index(
+            sources
+        )
+        identity = _resolve_verified_provider_identity(
+            selected.get("observer_session_ref"),
+            provider_identities,
+            exact_identities,
+        )
+        if identity is None:
+            raise UniverseError(
+                "TERMINAL_PTY_BINDING_PROVIDER_SESSION_UNAVAILABLE",
+                "Session Anchor has no verified provider-owned session id for PTY Binding",
+                HTTPStatus.CONFLICT,
+            )
+        return {
+            "provider": identity[0],
+            "provider_session_id": identity[1],
+            "supervisor_session_id": "",
+        }
+
+    def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        project_id = str(payload.get("project_id") or "").strip()
+        mode = str(payload.get("mode") or "MASTER").strip().upper()
+        cwd = str(payload.get("cwd") or "").strip()
+        provider = str(payload.get("provider") or "AUTO").strip().upper()
+        model_ref = str(payload.get("model_ref") or "").strip()
+        effort = str(payload.get("effort") or "AUTO").strip().upper() or "AUTO"
+        resume_ref = str(payload.get("resume_session_ref") or "").strip()
+        pty_binding_anchor_ref = str(
+            payload.get("pty_binding_anchor_ref") or ""
+        ).strip()
+        supervisor_session_id = str(
+            payload.get("supervisor_session_id") or ""
+        ).strip()
+        if supervisor_session_id:
+            try:
+                supervised = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+            supervised_project = str(
+                supervised.get("current_project_id")
+                or supervised.get("node")
+                or ""
+            ).strip()
+            supervised_mode = str(supervised.get("mode") or "").upper()
+            supervised_provider = str(
+                supervised.get("provider") or ""
+            ).upper()
+            if (
+                supervised_project.casefold() != project_id.casefold()
+                or supervised_mode != mode
+                or (provider not in {"", "AUTO"} and provider != supervised_provider)
+            ):
+                raise UniverseError(
+                    "TERMINAL_SESSION_COORDINATE_MISMATCH",
+                    "Supervisor session does not match the requested terminal coordinate",
+                    HTTPStatus.CONFLICT,
+                )
+            provider = supervised_provider
+            stored_ref = str(
+                supervised.get("provider_session_ref") or ""
+            ).strip()
+            if not stored_ref:
+                raise UniverseError(
+                    "TERMINAL_PROVIDER_SESSION_UNAVAILABLE",
+                    "Supervisor session has no provider-owned session id",
+                    HTTPStatus.CONFLICT,
+                )
+            vendor_identity = _vendor_identity_from_observer(stored_ref)
+            if vendor_identity is not None:
+                stored_provider, stored_ref = vendor_identity
+                if stored_provider != provider:
+                    raise UniverseError(
+                        "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                        "Stored provider session does not match the terminal provider",
+                        HTTPStatus.CONFLICT,
+                    )
+            resume_ref = stored_ref
+        elif pty_binding_anchor_ref:
+            binding = self._resolve_project_anchor_pty_binding(
+                project_id=project_id,
+                mode=mode,
+                session_anchor_ref=pty_binding_anchor_ref,
+            )
+            binding_provider = binding["provider"]
+            if provider not in {"", "AUTO"} and provider != binding_provider:
+                raise UniverseError(
+                    "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                    "Session Anchor provider does not match the terminal provider",
+                    HTTPStatus.CONFLICT,
+                )
+            provider = binding_provider
+            resume_ref = binding["provider_session_id"]
+            supervisor_session_id = binding["supervisor_session_id"]
+        if not supervisor_session_id:
+            supervisor_session_id = "session_" + secrets.token_hex(12)
+        # Anchor-before-spawn: the Supervisor resolves (or creates) the Session
+        # Anchor first, so the PTY attaches to an existing opaque Anchor rather
+        # than inventing a coordinate once it is already running.
+        spawn_anchor_ref = str(pty_binding_anchor_ref or "").strip()
+        if not spawn_anchor_ref:
+            try:
+                supervised = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError:
+                supervised, _created = self.session_supervisor.register_session(
+                    {
+                        "session_id": supervisor_session_id,
+                        "node": project_id,
+                        "mode": mode,
+                        "provider": provider if provider not in {"", "AUTO"} else "UNKNOWN",
+                        "provider_session_ref": None,
+                        "alias": f"{project_id} {mode}",
+                        "state": "STARTING",
+                        "currentness": "UNKNOWN",
+                        "bounded_summary": "Supervisor Anchor resolved before PTY spawn",
+                    }
+                )
+            spawn_anchor_ref = str(
+                (supervised or {}).get("session_anchor_ref") or ""
+            ).strip()
+        if not spawn_anchor_ref:
+            raise UniverseError(
+                "TERMINAL_ANCHOR_REQUIRED",
+                "Supervisor could not resolve a Session Anchor before spawn",
+                HTTPStatus.CONFLICT,
+            )
+        existing = self._session_anchor_terminal_host().find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
+        )
+        if existing is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "CLI_TERMINAL_ATTACHED",
+                "terminal": existing,
+            }
+        try:
+            terminal = self.terminal_host.create(
+                project_id=project_id,
+                mode=mode,
+                cwd=cwd,
+                provider=provider,
+                model_ref=model_ref,
+                effort=effort,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=spawn_anchor_ref,
+                resume_session_ref=resume_ref,
+                cols=int(payload.get("cols") or 120),
+                rows=int(payload.get("rows") or 32),
+            )
+        except TerminalHostError as error:
+            status = (
+                HTTPStatus.NOT_FOUND
+                if error.code == "TERMINAL_NOT_FOUND"
+                else HTTPStatus.CONFLICT
+            )
+            raise UniverseError(error.code, error.detail, status) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "CLI_TERMINAL_CREATED",
+            "terminal": terminal,
+        }
+
+    def close_cli_terminal(self, terminal_id: str) -> dict[str, Any]:
+        try:
+            result = self.terminal_host.close(terminal_id)
+        except TerminalHostError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.NOT_FOUND,
+            ) from error
+        return {"schema": API_SCHEMA, **result}
+
+    def terminate_cli_terminal(self, terminal_id: str) -> dict[str, Any]:
+        try:
+            supervised = self.terminal_host.get(terminal_id)
+            terminal = (
+                supervised.public()
+                if hasattr(supervised, "public")
+                else dict(supervised)
+            )
+            result = self.terminal_host.terminate(terminal_id)
+        except TerminalHostError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.NOT_FOUND,
+            ) from error
+        session_id = str(terminal.get("supervisor_session_id") or "").strip()
+        session_anchor_ref = str(
+            terminal.get("session_anchor_ref") or ""
+        ).strip()
+        supervisor_session = None
+        if session_id and session_anchor_ref:
+            supervisor_session = self.session_supervisor.record_host_termination(
+                session_id, session_anchor_ref=session_anchor_ref
+            )
+        return {
+            "schema": API_SCHEMA,
+            **result,
+            "supervisor_session": supervisor_session,
+        }
+
+    def session_bus_directory(self) -> dict[str, Any]:
+        try:
+            payload = dict(
+                self.session_bus.directory(self._session_anchor_terminal_host())
+            )
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+        rooms = []
+        for room in self.multi_rooms.list_rooms(room_type="MEETING", state="OPEN"):
+            rooms.append(
+                {
+                    "room_id": room.get("room_id"),
+                    "room_type": room.get("room_type"),
+                    "title": room.get("title"),
+                    "project_id": room.get("project_id"),
+                    "state": room.get("state"),
+                    "slots": [
+                        {
+                            "binding_id": binding.get("binding_id"),
+                            "slot_role": binding.get("slot_role"),
+                            "provider": binding.get("provider"),
+                            "display_name": binding.get("display_name"),
+                        }
+                        for binding in self.multi_rooms.list_bindings(room["room_id"])
+                    ],
+                }
+            )
+        payload["rooms"] = rooms
+        return payload
+
+    def session_bus_unread(self) -> dict[str, Any]:
+        directory = self.session_bus.directory(self._session_anchor_terminal_host())
+        return {
+            "schema": "universe.session-bus.v1",
+            "status": "OK",
+            "counts": {
+                str(item.get("terminal_id") or ""): int(item.get("unread") or 0)
+                for item in directory.get("terminals") or []
+                if str(item.get("terminal_id") or "")
+            },
+        }
+
+    def session_bus_inbox(self, query: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        raw = query if isinstance(query, Mapping) else {}
+        try:
+            return self.session_bus.inbox(
+                self._session_anchor_terminal_host(),
+                terminal_id=str(raw.get("terminal_id") or ""),
+                project_id=str(raw.get("project_id") or ""),
+                mode=str(raw.get("mode") or ""),
+                provider=str(raw.get("provider") or ""),
+                room_id=str(raw.get("room_id") or ""),
+                session_anchor_ref=str(raw.get("session_anchor_ref") or ""),
+                thread_id=str(raw.get("thread_id") or ""),
+                projection=str(raw.get("projection") or "INBOX"),
+                event_kind=str(raw.get("event_kind") or raw.get("kind") or ""),
+                lifecycle_state=str(raw.get("lifecycle_state") or ""),
+                task_frame_ref=str(raw.get("task_frame_ref") or ""),
+                node_ref=str(raw.get("node_ref") or ""),
+                headers_only=str(raw.get("headers") or "") == "1",
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def post_session_bus_message(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
+        payload = dict(value or {})
+        destination = payload.get("to") if isinstance(payload.get("to"), Mapping) else {}
+        try:
+            if destination.get("room_id") or payload.get("room_id"):
+                return fanout_meeting_bus(
+                    rooms=self.multi_rooms,
+                    host=self._session_anchor_terminal_host(),
+                    bus=self.session_bus,
+                    value=payload,
+                )
+            posted = self.session_bus.post(
+                self._session_anchor_terminal_host(), payload
+            )
+            # A SessionStart hook owns boot-time delivery.  Once a terminal is
+            # already live, however, waiting for a hypothetical next boot
+            # leaves a direct UI instruction stranded in PENDING.  Bind the
+            # same atomic claim to the live Session Anchor and use the common
+            # Runtime's TURN_IDLE delivery contract instead.
+            self._dispatch_live_posted_session_instructions(posted)
+            return posted
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def _dispatch_live_posted_session_instructions(
+        self, posted: Mapping[str, Any]
+    ) -> None:
+        """Deliver newly posted instructions to an already verified live session.
+
+        This is deliberately best-effort.  A terminal without a current
+        Session Anchor keeps its message PENDING for the normal SessionStart
+        hook; posting must not manufacture an Anchor or a provider session.
+        """
+
+        messages = posted.get("messages")
+        if not isinstance(messages, list):
+            return
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            if (
+                str(message.get("kind") or "").upper() != "INSTRUCTION"
+                or str(message.get("delivery_state") or "").upper() != "PENDING"
+            ):
+                continue
+            target = message.get("to")
+            terminal_id = (
+                str(target.get("terminal_id") or "").strip()
+                if isinstance(target, Mapping)
+                else ""
+            )
+            if not terminal_id:
+                continue
+            try:
+                terminal_value = self._session_anchor_terminal_host().get(
+                    terminal_id
+                )
+                terminal = (
+                    terminal_value.public()
+                    if hasattr(terminal_value, "public")
+                    and callable(terminal_value.public)
+                    else terminal_value
+                )
+                if not isinstance(terminal, Mapping):
+                    continue
+                if str(terminal.get("state") or "").upper() != "LIVE":
+                    continue
+                session_id = str(terminal.get("supervisor_session_id") or "").strip()
+                if not session_id:
+                    continue
+                session_value = self.session_supervisor.get_session(session_id)
+                session = (
+                    session_value.public()
+                    if hasattr(session_value, "public")
+                    and callable(session_value.public)
+                    else session_value
+                )
+                if not isinstance(session, Mapping):
+                    continue
+                project_id = str(terminal.get("project_id") or "").strip()
+                if not project_id:
+                    continue
+                posted_message_id = str(message.get("message_id") or "").strip()
+                dispatch = self._dispatch_pending_session_instruction(
+                    project_id=project_id,
+                    session=session,
+                    trigger="TURN_IDLE",
+                    message_id=posted_message_id,
+                )
+                if isinstance(message, dict):
+                    message["delivery_state"] = (
+                        "DISPATCHED"
+                        if dispatch.get("status") == "DISPATCHED"
+                        and str(dispatch.get("message_id") or "") == posted_message_id
+                        else str(message.get("delivery_state") or "PENDING")
+                    )
+                    message["dispatch_status"] = dispatch.get("status")
+            except (SessionSupervisorError, TerminalHostError, UniverseError):
+                continue
+
+    def _observe_session_bus_result(self, packet: Mapping[str, Any]) -> None:
+        original = packet.get("message")
+        result = packet.get("result")
+        if not isinstance(original, Mapping) or not isinstance(result, Mapping):
+            return
+        room_id = str(original.get("room_id") or "").strip()
+        if not room_id:
+            return
+        target = original.get("to")
+        target = target if isinstance(target, Mapping) else {}
+        provider = str(target.get("provider") or "").strip().upper()
+        session_anchor_ref = str(
+            original.get("recipient_anchor_ref")
+            or target.get("session_anchor_ref")
+            or ""
+        ).strip()
+        matches = [
+            binding
+            for binding in self.multi_rooms.list_bindings(room_id, active_only=True)
+            if str(binding.get("provider") or "").upper() == provider
+            and str(binding.get("session_anchor_ref") or "") == session_anchor_ref
+        ]
+        if len(matches) != 1:
+            raise SessionBusError(
+                "BUS_ROOM_RESULT_BINDING_UNRESOLVED",
+                "Session Bus result does not resolve to one exact Room participant",
+                409,
+            )
+        binding = matches[0]
+        message = self.multi_rooms.post_message(
+            room_id,
+            {
+                "author_role": binding.get("slot_role") or "MODEL",
+                "author_binding_id": binding["binding_id"],
+                "body_text": result.get("body_text"),
+                "provider_event_id": result.get("message_id"),
+                "correlation_id": original.get("thread_id"),
+                "idempotency_key": "session-bus-result:"
+                + str(result.get("message_id") or ""),
+            },
+        )
+        self._observe_multi_room_collection(message)
+
+    def ack_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.ack(
+                message_id, str(payload.get("terminal_id") or "")
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+
+    def transition_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.transition(
+                message_id,
+                state=str(payload.get("state") or ""),
+                terminal_id=str(payload.get("terminal_id") or ""),
+                session_anchor_ref=str(payload.get("session_anchor_ref") or ""),
+                provider_message_id=str(payload.get("provider_message_id") or ""),
+                result_ref=str(payload.get("result_ref") or ""),
+                error_code=str(payload.get("error_code") or ""),
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def reply_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            return self.session_bus.reply(
+                message_id,
+                terminal_id=str(payload.get("terminal_id") or ""),
+                session_anchor_ref=str(payload.get("session_anchor_ref") or ""),
+                body_text=str(payload.get("body_text") or payload.get("text") or ""),
+                result_ref=str(payload.get("result_ref") or ""),
+                outcome=str(payload.get("outcome") or "COMPLETED"),
+            )
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
 
@@ -17670,30 +29322,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             bound = matches[0] if matches else None
             binding: dict[str, Any] = {"state": "UNBOUND"}
-            # A persistent Supervisor session already owns its exact vendor
-            # chat key.  Historical Project Anchor observations may enrich an
-            # unbound source, but must not replace that session identity.
-            binding_observation = None if bound is not None else anchor_observation
-            if binding_observation is None and bound is not None:
-                bound_node = str(bound.get("node") or "UNKNOWN")
-                bound_project_id = str(
-                    bound.get("current_project_id")
-                    or (bound_node if bound_node != "UNKNOWN" else "")
-                ).strip()
-                bound_anchor_ref = str(bound.get("anchor_ref") or "UNKNOWN")
-                binding_observation = {
-                    "project_id": bound_project_id or None,
-                    "node": bound_node,
-                    "mode": str(bound.get("mode") or "UNKNOWN"),
-                    "anchor_ref": bound_anchor_ref,
-                    "observed_anchor_ref": bound_anchor_ref,
-                    "temporality": "SUPERVISOR_CURRENT",
-                    "observed_at": (
-                        bound.get("last_seen_at")
-                        or bound.get("updated_at")
-                        or "UNKNOWN"
-                    ),
-                }
+            # Vendor chats stay independent. Mode Current Anchor is observational
+            # currentness, not Session Supervisor ownership.
+            binding_observation = anchor_observation
             if binding_observation is not None:
                 node = str(binding_observation.get("node") or "UNKNOWN")
                 mode = str(binding_observation.get("mode") or "UNKNOWN")
@@ -17722,19 +29353,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     binding_observation.get("anchor_currentness_source") or ""
                 ).upper()
                 if not observer_currentness:
-                    if anchor_observation is not None:
-                        observer_currentness = (
-                            "CURRENT"
-                            if str(binding_observation.get("temporality") or "").upper()
-                            == "CURRENT"
-                            else "PAST"
-                        )
-                        currentness_source = "PROJECT_ANCHOR_DB"
-                    else:
-                        observer_currentness = "UNKNOWN"
-                        currentness_source = "UNKNOWN"
+                    observer_currentness = (
+                        "CURRENT"
+                        if str(binding_observation.get("temporality") or "").upper()
+                        == "CURRENT"
+                        else "PAST"
+                    )
+                    currentness_source = "MODE_CURRENT_ANCHOR"
                 binding = {
-                    "state": "BOUND" if bound is not None else "ANCHOR_OBSERVED",
+                    "state": "ANCHOR_OBSERVED",
                     "current_project_id": anchor_identity["project_id"],
                     "node": node,
                     "mode": mode,
@@ -17781,6 +29408,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         bound is not None and bound.get("is_default")
                     ),
                 }
+            else:
+                workspace_name = str(source.get("workspace_name") or "").strip()
+                workspace_path = str(source.get("workspace") or "").strip()
+                project_match = None
+                for item in self.store.list_projects():
+                    project_id = str(item.get("project_id") or "").strip()
+                    project_root = str(item.get("project_root") or "").strip()
+                    root_name = Path(project_root).name if project_root else ""
+                    if project_id and project_id.lower() == workspace_name.lower():
+                        project_match = item
+                        break
+                    if root_name and root_name.lower() == workspace_name.lower():
+                        project_match = item
+                        break
+                    if (
+                        workspace_path
+                        and project_root.replace("\\", "/").lower()
+                        == workspace_path.replace("\\", "/").lower()
+                    ):
+                        project_match = item
+                        break
+                if project_match is not None:
+                    project_id = str(project_match.get("project_id") or "")
+                    binding = {
+                        "state": "INDEPENDENT",
+                        "current_project_id": project_id,
+                        "node": project_id,
+                        "mode": "MASTER",
+                        "alias": f"{project_id} observed",
+                        "observer_currentness": "UNKNOWN",
+                        "currentness_source": "WORKSPACE_OBSERVED",
+                        "selection_scope": "UI_NAVIGATION_ONLY",
+                        "is_default": False,
+                    }
 
             registered = registered_by_identity.get(
                 (provider, provider_session_id, source_path)
@@ -18000,9 +29661,54 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "PROVIDER_CHAT_CATALOG_COLLECTED",
             "observed_at": utc_now(),
             "rooms": rooms,
+            "anchor_sessions": self.list_all_project_anchor_sessions(),
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
+
+    def _observe_provider_session_action(
+        self, chat_key: str, action: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        operation = str(action.get("operation") or "").upper()
+        state = str(action.get("state") or "").upper()
+        if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+            return {"status": "SKIPPED"}
+        descriptor = self.resolve_provider_chat_session(chat_key)
+        anchor_ref = str(descriptor.get("current_anchor_ref") or "").strip()
+        if not anchor_ref or anchor_ref == "UNKNOWN":
+            raise ProviderSessionError(
+                "PROVIDER_SESSION_ANCHOR_UNKNOWN",
+                "Provider action cannot be projected without a current Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+        details = action.get("details") if isinstance(action.get("details"), Mapping) else {}
+        commit_sha = str(details.get("commit_sha") or "").strip().lower()
+        action_id = str(action.get("action_id") or "provider-action").strip()
+        result_ref = f"git://commit/{commit_sha}" if commit_sha else f"provider-action://{action_id}"
+        project_id = str(descriptor.get("project_id") or "").strip()
+        mode = str(descriptor.get("mode") or "").upper()
+        provider = str(descriptor.get("provider") or "").upper()
+        node_ref = str(descriptor.get("node") or project_id).strip()
+        task_frame_ref = str(details.get("task_frame_ref") or "").strip()
+        summary = str(action.get("summary") or action.get("title") or operation).strip()
+        posted = self.session_bus.post(
+            self._session_anchor_terminal_host(),
+            {
+                "to": {"session_anchor_ref": anchor_ref, "project_id": project_id, "mode": mode, "provider": provider, "node_ref": node_ref},
+                "from": {"project_id": project_id, "mode": mode, "provider": provider, "node_ref": node_ref, "task_frame_ref": task_frame_ref},
+                "kind": "RESULT",
+                "body_text": f"{operation} {state}\n{summary}",
+                "thread_id": str(action.get("message_id") or action_id)[:80],
+            },
+        )
+        message_id = str(posted["message_id"])
+        self.session_bus.transition(message_id, state="ACCEPTED", session_anchor_ref=anchor_ref)
+        if state == "COMPLETED":
+            self.session_bus.transition(message_id, state="STARTED", session_anchor_ref=anchor_ref)
+        projected = self.session_bus.transition(
+            message_id, state=state, session_anchor_ref=anchor_ref, result_ref=result_ref
+        )
+        return {"status": "EVENT_PROJECTED", "message_id": message_id, "thread_id": projected["thread_id"], "result_ref": result_ref}
 
     def resolve_provider_chat_session(self, chat_key: str) -> dict[str, Any]:
         """Resolve one opaque browser key to an adapter-private provider target."""
@@ -18027,11 +29733,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         binding = room.get("binding") or {}
         if binding.get("state") not in {"BOUND", "ANCHOR_OBSERVED"}:
-            raise ProviderSessionError(
-                "PROVIDER_SESSION_NOT_ATTACHED",
-                "Attach the Provider Session to a Project Anchor before opening it",
-                HTTPStatus.CONFLICT,
-            )
+            provider = str(room.get("provider") or "UNKNOWN").upper()
+            source_refs: list[str] = []
+            for source in self.store.discover_provider_session_sources(provider):
+                if str(source.get("session_kind") or "CHAT").upper() == "WORKER":
+                    continue
+                identity = {
+                    "provider": provider,
+                    "provider_session_id": str(source.get("provider_session_id") or ""),
+                    "source_path": (
+                        ""
+                        if source.get("identity_state") == "VERIFIED"
+                        else _canonical_provider_source_path(source.get("source_path"))
+                    ),
+                }
+                candidate_key = "provider_chat_" + _provider_source_key(identity).removeprefix(
+                    "provider_source_"
+                )
+                if candidate_key == key and identity["provider_session_id"]:
+                    source_refs.append(identity["provider_session_id"])
+            exact_sessions = [
+                item
+                for item in self.session_supervisor.list_sessions(include_hidden=True)
+                if str(item.get("provider") or "").upper() == provider
+                and str(item.get("provider_session_ref") or "") in source_refs
+                and str(item.get("session_anchor_ref") or "").strip()
+                and str(item.get("session_kind") or "CHAT").upper() != "WORKER"
+            ]
+            if len(exact_sessions) != 1:
+                raise ProviderSessionError(
+                    "PROVIDER_SESSION_NOT_ATTACHED",
+                    "Attach the Provider Session to a Project Anchor before opening it",
+                    HTTPStatus.CONFLICT,
+                )
+            observed = exact_sessions[0]
+            binding = {
+                **binding,
+                "state": "ANCHOR_OBSERVED",
+                "current_project_id": observed.get("current_project_id")
+                or observed.get("node"),
+                "node": observed.get("node"),
+                "mode": observed.get("mode"),
+                "universe_session_id": observed.get("session_id"),
+                "session_anchor_ref": observed.get("session_anchor_ref"),
+                "current_anchor_ref": observed.get("anchor_ref"),
+                "alias": observed.get("alias"),
+            }
         project_id = str(
             binding.get("current_project_id") or binding.get("node") or ""
         ).strip()
@@ -18082,6 +29829,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "chat_key": key,
                     "provider": provider,
                     "provider_session_ref": supervisor_ref,
+                    "supervisor_session_id": supervisor_session_id,
                     "project_id": project_id,
                     "node": str(binding.get("node") or project_id),
                     "mode": str(binding.get("mode") or "MASTER").upper(),
@@ -18098,7 +29846,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "alias": binding.get("alias") or room.get("display_name"),
                     "model_ref": setting.get("model_ref") or "UNKNOWN",
                     "session_kind": room.get("session_kind") or "CHAT",
-                    "identity_state": room.get("identity_state") or "UNKNOWN",
+                    # The public catalog deliberately keeps this row as
+                    # ``SUPERVISOR_OBSERVED`` because it has no provider
+                    # transcript source file.  At this private resolution
+                    # boundary, however, the exact provider/session pair was
+                    # checked against the attached Session Supervisor record
+                    # above.  ProviderSessionService needs that attestation to
+                    # open the persistent target; do not make it rediscover a
+                    # source file that is not required for supervisor-owned
+                    # sessions.
+                    "identity_state": "VERIFIED",
+                    "identity_source": "SESSION_SUPERVISOR",
                 }
         candidates: list[dict[str, Any]] = []
         for source in self.store.discover_provider_session_sources(provider):
@@ -18141,6 +29899,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "chat_key": key,
             "provider": provider,
             "provider_session_ref": str(source.get("provider_session_id") or ""),
+            "supervisor_session_id": str(
+                binding.get("universe_session_id") or ""
+            ).strip(),
             "project_id": project_id,
             "node": str(binding.get("node") or project_id),
             "mode": str(binding.get("mode") or "MASTER").upper(),
@@ -18241,6 +30002,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"{source_id}/activity/{latest.get('activity_id')}"
                 ),
             )
+        # A Session Hook has already verified these anchors.  The provider
+        # catalog can still lag that hook by one or more scans, so retry only
+        # allocations that were explicitly parked for catalog visibility.
+        # Never use this path to bypass the initial Hook requirement.
+        for session in sessions_by_identity.values():
+            project_id = str(session.get("project_id") or "").strip()
+            session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+            if project_id and session_anchor_ref:
+                self._resume_hook_verified_conductor_allocations(
+                    project_id,
+                    session_anchor_ref,
+                    retry_catalog_visibility=True,
+                )
         return scans
 
     def tail_live_provider_sessions(self) -> dict[str, Any]:
@@ -18264,7 +30038,198 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if delta["deltas"] or delta["delivery"] == "ACTIVITY_ONLY":
                 deltas.append(delta)
+        self._publish_live_provider_excerpts(deltas)
         return {"scans": scans, "deltas": deltas}
+
+    def _provider_chat_key_for_source_id(self, source_id: str) -> str | None:
+        wanted = str(source_id or "").strip()
+        if not wanted:
+            return None
+        for source in self.store.list_provider_session_sources():
+            if str(source.get("source_id") or "") != wanted:
+                continue
+            identity = {
+                "provider": source.get("provider"),
+                "provider_session_id": source.get("provider_session_id"),
+                "source_path": "",
+            }
+            return "provider_chat_" + _provider_source_key(identity).removeprefix(
+                "provider_source_"
+            )
+        return None
+
+    def _source_id_for_provider_chat_key(self, chat_key: str) -> str | None:
+        wanted = str(chat_key or "").strip()
+        if not wanted:
+            return None
+        for source in self.store.list_provider_session_sources():
+            identity = {
+                "provider": source.get("provider"),
+                "provider_session_id": source.get("provider_session_id"),
+                "source_path": "",
+            }
+            key = "provider_chat_" + _provider_source_key(identity).removeprefix(
+                "provider_source_"
+            )
+            if key == wanted:
+                return str(source.get("source_id") or "") or None
+        return None
+
+    def hydrate_provider_session_transcript(self, chat_key: str) -> None:
+        source_id = self._source_id_for_provider_chat_key(chat_key)
+        if not source_id:
+            return
+        try:
+            excerpts = (
+                self.store.provider_session_observer.build_transient_visible_transcript(
+                    source_id
+                )
+            )
+        except ProviderSessionObserverError:
+            return
+        try:
+            self.provider_sessions.observe_excerpts(
+                chat_key, excerpts, replace_observer=True
+            )
+        except ProviderSessionError:
+            return
+
+    def _publish_live_provider_excerpts(self, deltas: list[dict[str, Any]]) -> None:
+        for delta in deltas:
+            if not isinstance(delta, Mapping):
+                continue
+            excerpts = delta.get("deltas")
+            source = delta.get("source")
+            if not excerpts or not isinstance(source, Mapping):
+                continue
+            chat_key = self._provider_chat_key_for_source_id(
+                str(source.get("source_id") or "")
+            )
+            if not chat_key:
+                continue
+            try:
+                self.provider_sessions.observe_excerpts(
+                    chat_key, excerpts, publish=True
+                )
+            except ProviderSessionError:
+                continue
+
+    def resolve_provider_chat_identity(self, chat_key: str) -> dict[str, Any]:
+        wanted = str(chat_key or "").strip()
+        if not wanted:
+            raise UniverseError("PROVIDER_CHAT_KEY_REQUIRED", "chat_key is required")
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            for source in self.store.discover_provider_session_sources(provider):
+                provider_name = str(source.get("provider") or "UNKNOWN").upper()
+                provider_session_id = str(source.get("provider_session_id") or "")
+                source_path = _canonical_provider_source_path(source.get("source_path"))
+                if not source_path:
+                    continue
+                identity_verified = source.get("identity_state") == "VERIFIED"
+                session_kind = str(source.get("session_kind") or "CHAT").upper()
+                chat_identity = {
+                    "provider": provider_name,
+                    "provider_session_id": provider_session_id,
+                    "source_path": (
+                        ""
+                        if identity_verified and session_kind != "WORKER"
+                        else source_path
+                    ),
+                }
+                key = "provider_chat_" + _provider_source_key(chat_identity).removeprefix(
+                    "provider_source_"
+                )
+                if key != wanted:
+                    continue
+                if not identity_verified or session_kind == "WORKER":
+                    raise UniverseError(
+                        "PROVIDER_SESSION_IDENTITY_UNKNOWN",
+                        "this vendor session cannot be attached",
+                        HTTPStatus.CONFLICT,
+                    )
+                return {
+                    **source,
+                    "chat_key": key,
+                    "provider": provider_name,
+                    "provider_session_id": provider_session_id,
+                }
+        raise UniverseError(
+            "PROVIDER_CHAT_ROOM_NOT_FOUND",
+            "vendor session is no longer observable",
+            HTTPStatus.NOT_FOUND,
+        )
+
+    def attach_provider_chat_room(
+        self, chat_key: str, request: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        payload = request if isinstance(request, Mapping) else {}
+        identity = self.resolve_provider_chat_identity(chat_key)
+        project_id = str(payload.get("project_id") or payload.get("node") or "").strip()
+        if not project_id:
+            workspace = str(identity.get("workspace") or "").strip()
+            workspace_name = str(identity.get("workspace_name") or "").strip()
+            projects = self.store.list_projects()
+            match = next(
+                (
+                    item
+                    for item in projects
+                    if str(item.get("project_id") or "").lower()
+                    in {workspace_name.lower(), Path(workspace).name.lower()}
+                    or (
+                        workspace
+                        and str(item.get("project_root") or "").replace("\\", "/").lower()
+                        == workspace.replace("\\", "/").lower()
+                    )
+                ),
+                None,
+            )
+            if match is None:
+                raise UniverseError(
+                    "INJECT_TARGET_REQUIRED",
+                    "attach requires a matching registered project",
+                    HTTPStatus.CONFLICT,
+                )
+            project_id = str(match.get("project_id") or "")
+        self.store.register_provider_session_source(
+            {
+                "provider": identity["provider"],
+                "provider_session_id": identity["provider_session_id"],
+                "source_path": identity["source_path"],
+                "source_kind": identity["source_kind"],
+                "source_version": identity.get("source_version") or "v1",
+            }
+        )
+        mode = str(payload.get("mode") or "MASTER").strip().upper() or "MASTER"
+        injected = perform_session_ref_inject(
+            session_supervisor=self.session_supervisor,
+            multi_rooms=self.multi_rooms,
+            terminal_host=self.terminal_host,
+            body={
+                "project_id": project_id,
+                "node": project_id,
+                "mode": mode,
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": identity["provider"],
+                "provider_session_ref": identity["provider_session_id"],
+                "alias": (
+                    payload.get("alias")
+                    or identity.get("display_name")
+                    or f"{project_id} {mode}"
+                ),
+                "make_default": payload.get("make_default") is True,
+                "bounded_summary": "Provider catalog session attached from the UI",
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "PROVIDER_CHAT_ROOM_ATTACHED",
+            "chat_key": str(identity["chat_key"]),
+            "project_id": project_id,
+            "supervisor_session": injected.get("supervisor_session"),
+            "room_binding": injected.get("binding"),
+            "catalog": self.provider_chat_catalog(),
+        }
 
     def discover_host_tools(self) -> dict[str, Any]:
         try:
@@ -18316,6 +30281,57 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "catalog": catalog,
         }
 
+    def setup_provider_hooks(self, value: Any) -> dict[str, Any]:
+        from universe_session_inject_hook import setup_provider_hooks as _setup
+        body = value if isinstance(value, dict) else {}
+        global_ = bool(body.get("global", False))
+        raw_providers = body.get("providers")
+        providers = (
+            [str(p).upper() for p in raw_providers if str(p).upper() in {"CLAUDE", "CODEX", "GROK"}]
+            if isinstance(raw_providers, list)
+            else ["CODEX", "GROK", "CLAUDE"]
+        )
+        repo_root = Path(__file__).resolve().parents[1]
+        result = _setup(
+            repo_root,
+            global_=global_,
+            providers=providers,
+        )
+        injects: list[dict[str, Any]] = []
+        for item in result.get("repairs") or []:
+            if item.get("status") != "REPAIRED":
+                continue
+            try:
+                injected = perform_session_ref_inject(
+                    session_supervisor=self.session_supervisor,
+                    multi_rooms=self.multi_rooms,
+                    body={
+                        "project_id": repo_root.name,
+                        "mode": item.get("mode") or "MASTER",
+                        "provider": "GROK",
+                        "provider_session_ref": item.get("session_ref") or "",
+                        "make_default": True,
+                        "bounded_summary": "Setup CLI Hooks repaired Grok compat stamp",
+                    },
+                )
+                injects.append(
+                    {
+                        "status": injected.get("status"),
+                        "mode": item.get("mode"),
+                        "session_ref": item.get("session_ref"),
+                    }
+                )
+            except Exception as error:  # noqa: BLE001 - setup stays best-effort
+                injects.append(
+                    {
+                        "status": "INJECT_FAILED",
+                        "mode": item.get("mode"),
+                        "detail": f"{type(error).__name__}:{error}",
+                    }
+                )
+        result["injects"] = injects
+        return {"schema": API_SCHEMA, **result}
+
     def memory_batch_catalog_settings(self) -> dict[str, Any]:
         return self.memory_batch_config_service.catalog_settings()
 
@@ -18329,12 +30345,99 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return self.memory_batch_config_service.resolve(project_id, value)
 
     def memory_batch_configs(self, project_id: str) -> dict[str, Any]:
-        return self.memory_batch_config_service.list_configs(project_id)
+        result = self.memory_batch_config_service.list_configs(project_id)
+        result["schedules"] = self.store.list_memory_batch_schedule_states(project_id)
+        result["scheduler"] = {
+            "status": (
+                "RUNNING"
+                if self._auto_start_memory_scheduler
+                and self._memory_scheduler_worker.is_alive()
+                else "STOPPED"
+            ),
+            "last_tick": self._memory_scheduler_last_tick,
+        }
+        return result
 
     def set_memory_batch_config(
         self, project_id: str, value: Any
     ) -> dict[str, Any]:
-        return self.memory_batch_config_service.save_config(project_id, value)
+        result = self.memory_batch_config_service.save_config(project_id, value)
+        self._memory_scheduler_wake.set()
+        result["schedule"] = next(
+            (
+                item
+                for item in self.store.list_memory_batch_schedule_states(project_id)
+                if item["stage"] == result["config"]["stage"]
+            ),
+            None,
+        )
+        return result
+
+    def _run_scheduled_memory_batch(
+        self, project_id: str, stage: str
+    ) -> Mapping[str, Any]:
+        request: dict[str, Any] = {"stage": stage, "trigger": "SCHEDULED"}
+        if stage == "FAST_EXTRACT":
+            request["source_ids"] = [
+                item["source_id"]
+                for item in self.store.list_provider_session_sources()
+            ]
+        return self.run_memory_batch(project_id, request)
+
+    def _propose_prediction_after_collection(self, project_id: str) -> dict[str, Any]:
+        """Create an idempotent review-only prediction after collection.
+
+        A collection result may produce a candidate, but it must never create
+        a Goal, Todo, Task Frame, or assignment.  Those remain explicit user
+        promotion decisions.
+        """
+
+        document_automation = self._propose_document_after_collection(project_id)
+        try:
+            proposal, created = self.store.propose_work_loop_predictions(project_id)
+        except UniverseError as error:
+            return {
+                "status": "PREDICTION_NOT_AVAILABLE",
+                "reason": error.code,
+                "proposal_created": False,
+                "document_automation": document_automation,
+            }
+        return {
+            "status": "PREDICTION_PROPOSAL_READY",
+            "proposal_id": proposal.get("proposal_id"),
+            "review_state": proposal.get("review_state", "PROPOSAL_ONLY"),
+            "proposal_created": created,
+            "goal_created": False,
+            "todo_created": False,
+            "task_frame_created": False,
+            "execution_assignment_created": False,
+            "document_automation": document_automation,
+        }
+
+    def _propose_document_after_collection(self, project_id: str) -> dict[str, Any]:
+        """Create the projection-derived Docs candidate without changing source.
+
+        Collection may create a durable, idempotent incorporation proposal. It
+        does not write a document, alter a project plan, or require an approval;
+        those effects remain a later user promotion.
+        """
+        try:
+            proposal, created = self.store.create_document_incorporation_proposal(
+                project_id, {}
+            )
+        except UniverseError as error:
+            return {
+                "status": "DOCUMENT_AUTOMATION_NOT_AVAILABLE",
+                "reason": error.code,
+                "proposal_created": False,
+                "document_written": False,
+            }
+        return {
+            "status": "DOCUMENT_AUTOMATION_PROPOSAL_READY",
+            "proposal_id": proposal.get("proposal_id"),
+            "proposal_created": created,
+            "document_written": False,
+        }
 
     def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
@@ -18361,10 +30464,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
         budget = resolved.get("quota_or_budget")
-        if isinstance(budget, Mapping) and set(budget) - {"max_runs"}:
+        if isinstance(budget, Mapping) and set(budget) - {"max_runs", "window_hours"}:
             raise UniverseError(
                 "MEMORY_BATCH_BUDGET_ENFORCEMENT_UNAVAILABLE",
-                "this slice enforces max_runs only; token, cost, and window budgets require Provider usage telemetry",
+                "this slice enforces max_runs and UTC run windows only; token and cost budgets require Provider usage telemetry",
                 HTTPStatus.CONFLICT,
             )
         request = {
@@ -18393,6 +30496,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     },
                 ),
                 "run": result,
+                "prediction": self._propose_prediction_after_collection(project_id),
             }
 
         if (
@@ -18479,6 +30583,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         },
                         "execution": existing["result"].get("execution", {}),
                         "run": existing["result"],
+                        "prediction": self._propose_prediction_after_collection(
+                            project_id
+                        ),
                     }
 
             binding_digest = str(
@@ -18644,6 +30751,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "candidate_digest": normalized_skill["candidate_digest"],
                         "observation_count": len(skill_result["observations"]),
                     },
+                    "prediction": self._propose_prediction_after_collection(project_id),
                 }
             except (FastExtractError, RuntimeHostError, UniverseError) as error:
                 error_code = getattr(error, "code", "FAST_EXTRACT_FAILED")
@@ -18794,19 +30902,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         session_action = normalize_session_action(
             request.get("session_action", "RESUME")
         )
-        if any(key in request for key in ("provider", "model_ref", "effort")):
-            current = self.store.provider_setting("PROJECT_MASTER", project_id)
-            self.set_project_provider_setting(
-                project_id,
-                {
-                    "provider": request.get("provider") or current["provider"],
-                    "model_ref": request.get(
-                        "model_ref", current.get("model_ref", "")
-                    ),
-                    "effort": request.get(
-                        "effort", current.get("effort", "AUTO")
-                    ),
-                },
+        project = self.store.get_project(project_id)
+        session_coordinates = None
+        if session_action == "NEW":
+            # Apply any explicit provider / model / effort from the request so
+            # the new session actually starts with the user's chosen provider.
+            new_provider = str(request.get("provider") or "").strip().upper()
+            if new_provider and new_provider not in {"", "AUTO"}:
+                provider_update: dict[str, str] = {"provider": new_provider}
+                new_model = str(request.get("model_ref") or "").strip()
+                new_effort = str(request.get("effort") or "").strip().upper()
+                if new_model:
+                    provider_update["model_ref"] = new_model
+                if new_effort and new_effort != "AUTO":
+                    provider_update["effort"] = new_effort
+                self.set_project_provider_setting(project_id, provider_update)
+            project_root = Path(project["project_root"])
+            session_coordinates = self._validate_new_session_coordinates(
+                request,
+                project_id=project["project_id"],
+                project_root=project_root,
+                expected_mode="MASTER",
+                mode_registry_path=project_root / project["refs"]["mode_registry"],
             )
         try:
             if session_action == "NEW":
@@ -18866,6 +30983,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "provider_session_ref": connection.get("session_ref")
                         or connection.get("last_session_ref")
                         or connection.get("provider_session_ref"),
+                        "session_anchor_ref": connection.get("session_anchor_ref"),
                         "display_name": "Project Master",
                         # A re-prepared Project Master is an explicit recovery
                         # action, so it may retry only a prior failed delivery.
@@ -18910,6 +31028,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": API_SCHEMA,
             "status": "PROJECT_MASTER_SESSION_PREPARED",
             "project_id": project_id,
+            "session_coordinates": session_coordinates,
             "master_host": host,
             "session_connection": (
                 self.project_master_hosts.connection_status(project_id)
@@ -18918,6 +31037,195 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             "multi_room": multi_room,
             "bridge_line": bridge_line,
+        }
+
+    def _resolve_room_participant_live_pty(
+        self,
+        *,
+        room: Mapping[str, Any],
+        binding: Mapping[str, Any],
+    ) -> dict[str, str]:
+        provider = str(binding.get("provider") or "").strip().upper()
+        provider_session_ref = str(
+            binding.get("provider_session_ref") or ""
+        ).strip()
+        supervisor_session_id = str(
+            binding.get("supervisor_session_id") or ""
+        ).strip()
+        session_anchor_ref = str(
+            binding.get("session_anchor_ref") or ""
+        ).strip()
+        if not all(
+            (
+                provider,
+                provider_session_ref,
+                supervisor_session_id,
+                session_anchor_ref,
+            )
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_REQUIRED",
+                (
+                    "provider, provider_session_ref, supervisor_session_id, and "
+                    "session_anchor_ref are required for exact PTY control"
+                ),
+                409,
+            )
+        try:
+            supervised = self.session_supervisor.get_session(supervisor_session_id)
+        except SessionSupervisorError as error:
+            raise MultiRoomError(error.code, str(error), error.status) from error
+        supervised_provider = str(supervised.get("provider") or "").upper()
+        supervised_ref = str(
+            supervised.get("provider_session_ref") or ""
+        ).strip()
+        supervised_anchor = str(
+            supervised.get("session_anchor_ref")
+            or supervised.get("anchor_ref")
+            or ""
+        ).strip()
+        if (
+            supervised_provider != provider
+            or supervised_ref != provider_session_ref
+            or supervised_anchor != session_anchor_ref
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "room binding does not match the exact supervised Session Anchor",
+                409,
+            )
+        project_id = str(
+            supervised.get("current_project_id")
+            or supervised.get("project_id")
+            or supervised.get("node")
+            or room.get("project_id")
+            or ""
+        ).strip()
+        mode = str(supervised.get("mode") or "").strip().upper()
+        terminal = self._session_anchor_terminal_host().find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=supervisor_session_id,
+        )
+        if not isinstance(terminal, Mapping):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                "no live PTY exists for the exact room participant Session Anchor",
+                409,
+            )
+        terminal_anchor = str(
+            terminal.get("active_session_anchor_ref")
+            or terminal.get("session_anchor_ref")
+            or ""
+        ).strip()
+        if terminal_anchor != session_anchor_ref:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "live PTY no longer belongs to the bound Session Anchor",
+                409,
+            )
+        return {
+            "terminal_id": str(terminal.get("terminal_id") or "").strip(),
+            "project_id": project_id,
+            "mode": mode,
+            "provider": provider,
+            "provider_session_ref": provider_session_ref,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
+
+    def _queue_room_event_for_exact_session(
+        self,
+        coordinate: Mapping[str, str],
+        binding: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        terminal_id = str(coordinate.get("terminal_id") or "")
+        try:
+            source = self._session_anchor_terminal_host().get(terminal_id)
+            terminal = source.public() if hasattr(source, "public") else source
+        except (TerminalHostError, SessionSupervisorError) as error:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                str(error),
+                409,
+            ) from error
+        if not isinstance(terminal, Mapping) or any(
+            str(terminal.get(key) or "").strip().upper()
+            != str(coordinate.get(key) or "").strip().upper()
+            for key in (
+                "terminal_id",
+                "project_id",
+                "mode",
+                "provider",
+                "supervisor_session_id",
+            )
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_COORDINATE_MISMATCH",
+                "live PTY coordinate changed after room connection",
+                409,
+            )
+        active_anchor = str(
+            terminal.get("active_session_anchor_ref")
+            or terminal.get("session_anchor_ref")
+            or ""
+        ).strip()
+        if (
+            str(terminal.get("state") or "").upper() != "LIVE"
+            or active_anchor != coordinate.get("session_anchor_ref")
+            or str(binding.get("provider_session_ref") or "")
+            != coordinate.get("provider_session_ref")
+        ):
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_PTY_UNAVAILABLE",
+                "exact room participant PTY is no longer live",
+                409,
+            )
+        message = event.get("message")
+        body = str(message.get("body_text") or "") if isinstance(message, Mapping) else ""
+        if not body:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_EVENT_BODY_REQUIRED",
+                "room event has no message body for PTY delivery",
+                409,
+            )
+        try:
+            posted = self.session_bus.post(
+                self._session_anchor_terminal_host(),
+                {
+                    "to": {
+                        "terminal_id": terminal_id,
+                        "project_id": coordinate.get("project_id"),
+                        "mode": coordinate.get("mode"),
+                        "provider": coordinate.get("provider"),
+                        "session_anchor_ref": coordinate.get("session_anchor_ref"),
+                    },
+                    "from": {
+                        "project_id": coordinate.get("project_id"),
+                        "mode": "MEETING",
+                        "provider": "UNIVERSE",
+                    },
+                    "kind": "INSTRUCTION",
+                    "notify": "HEADER",
+                    "body_text": body,
+                    "room_id": binding.get("room_id"),
+                    "thread_id": message.get("message_id")
+                    or event.get("room_event_id"),
+                },
+            )
+            dispatches = self._dispatch_live_posted_session_instructions(posted)
+        except (SessionBusError, TerminalHostError) as error:
+            raise MultiRoomError(
+                "ROOM_PARTICIPANT_SESSION_BUS_UNAVAILABLE",
+                str(error),
+                409,
+            ) from error
+        return {
+            "status": "DEFERRED",
+            "session_bus_message_id": posted.get("message_id"),
+            "dispatches": dispatches,
         }
 
     def set_room_participant_control(
@@ -18955,18 +31263,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 409,
             )
         if action == "DISCONNECT":
-            self.multi_room_native_controls.unregister(binding_id)
-            stopped = self.room_participant_hosts.stop(binding_id)
+            detached = self.multi_room_native_controls.unregister(binding_id)
             self.room_participant_permissions.cancel_binding(binding_id)
-            cursor = self.multi_rooms.set_participant_state(
-                binding_id,
-                "DISCONNECTED",
-            )
+            cursor = self.multi_rooms.set_participant_state(binding_id, "DISCONNECTED")
             return {
                 "schema": API_SCHEMA,
                 "status": "ROOM_PARTICIPANT_CONTROL_DISCONNECTED",
                 "binding_id": binding_id,
-                "resident_host_stopped": stopped,
+                "pty_control_detached": detached,
+                "resident_host_stopped": False,
                 "cursor": cursor,
             }
         if action != "CONNECT":
@@ -18974,71 +31279,1015 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "ROOM_PARTICIPANT_CONTROL_ACTION_INVALID",
                 "action must be CONNECT or DISCONNECT",
             )
-        provider = str(binding.get("provider") or "").strip().upper()
-        provider_session_ref = str(
-            binding.get("provider_session_ref") or ""
-        ).strip()
-        if not provider or not provider_session_ref:
-            raise MultiRoomError(
-                "ROOM_PARTICIPANT_SESSION_COORDINATE_REQUIRED",
-                "provider and provider_session_ref are required",
-                409,
-            )
-
-        project_id = room.get("project_id")
-        repository_root = Path(__file__).resolve().parents[1]
-        node = str(project_id or _node_tag_from_project_root(repository_root))
-        mode = "CONDUCTOR" if binding.get("slot_role") == "CONDUCTOR" else "MASTER"
-        supervisor_session_id = binding.get("supervisor_session_id")
-        if isinstance(project_id, str) and project_id:
-            repository_root = Path(self.store.get_project(project_id)["project_root"])
-        if isinstance(supervisor_session_id, str) and supervisor_session_id:
-            try:
-                supervised = self.session_supervisor.get_session(supervisor_session_id)
-            except SessionSupervisorError as error:
-                raise MultiRoomError(error.code, str(error), error.status) from error
-            node = str(supervised.get("node") or node)
-            mode = str(supervised.get("mode") or mode).upper()
-
-        try:
-            resident = self.room_participant_hosts.ensure(
-                binding=binding,
-                repository_root=repository_root,
-                node=node,
-                mode=mode,
-            )
-            try:
-                control = self.multi_room_native_controls.register(
-                    binding_id,
-                    provider=provider,
-                    provider_session_ref=provider_session_ref,
-                    send_input=self.room_participant_hosts.submit,
+        coordinate = self._resolve_room_participant_live_pty(
+            room=room,
+            binding=binding,
+        )
+        control = self.multi_room_native_controls.register(
+            binding_id,
+            provider=coordinate["provider"],
+            provider_session_ref=coordinate["provider_session_ref"],
+            send_input=(
+                lambda native_binding, event, exact=dict(coordinate): (
+                    self._queue_room_event_for_exact_session(
+                        exact,
+                        native_binding,
+                        event,
+                    )
                 )
-            except Exception:
-                self.room_participant_hosts.stop(binding_id)
-                raise
-        except MultiRoomError:
-            raise
-        except (OSError, ProjectMasterHostError) as error:
-            raise MultiRoomError(
-                "ROOM_PARTICIPANT_CONTROL_START_FAILED",
-                str(error),
-                409,
-            ) from error
+            ),
+        )
+        delivery = self.multi_room_delivery.deliver_binding(binding_id)
         return {
             "schema": API_SCHEMA,
             "status": "ROOM_PARTICIPANT_CONTROL_CONNECTED",
             "binding_id": binding_id,
-            "resident_host": resident,
+            "live_pty": coordinate,
             "native_control": control,
+            "pending_delivery": delivery,
         }
+
+    def _task_frame_room_timeline(
+        self, task_frame_id: str, project_id: str = ""
+    ) -> dict[str, Any]:
+        """Project one Task Frame journal as a bounded operator conversation."""
+
+        frame_id = str(task_frame_id or "").strip()
+        unavailable = {
+            "schema": "universe.task-frame-room-timeline.v1",
+            "status": "TASK_FRAME_TIMELINE_UNAVAILABLE",
+            "task_frame_id": frame_id,
+            "task_state": "UNKNOWN",
+            "entries": [],
+        }
+        if not frame_id:
+            return unavailable
+        repository_roots = [self.runtime_host.repository_root]
+        if project_id:
+            try:
+                project = self.store.get_project(project_id)
+                project_root = Path(str(project.get("project_root") or "")).resolve()
+                if project_root not in repository_roots:
+                    repository_roots.append(project_root)
+            except (OSError, UniverseError):
+                pass
+        paths: list[Path] = []
+        try:
+            for repository_root in repository_roots:
+                frames_root = repository_root / ".ai" / "runtime" / "task_frames"
+                if frames_root.is_dir():
+                    paths.extend(frames_root.glob("*.sqlite3"))
+            paths.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        except OSError:
+            return unavailable
+        for database_path in paths:
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=0.25,
+                )
+                connection.row_factory = sqlite3.Row
+                try:
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    if "task_frame_context" not in tables:
+                        continue
+                    context = connection.execute(
+                        "SELECT frame_id, task_state FROM task_frame_context WHERE singleton = 1"
+                    ).fetchone()
+                    if context is None or str(context["frame_id"]) != frame_id:
+                        continue
+                    entries: list[dict[str, Any]] = []
+                    if "task_journal" in tables:
+                        for row in connection.execute(
+                            "SELECT event_ordinal, event_type, turn_id, details_json, observed_at "
+                            "FROM task_journal ORDER BY event_ordinal"
+                        ):
+                            try:
+                                details = json.loads(str(row["details_json"] or "{}"))
+                            except (TypeError, json.JSONDecodeError):
+                                details = {}
+                            safe_detail: list[str] = []
+                            if isinstance(details, Mapping):
+                                for key in (
+                                    "status",
+                                    "reason",
+                                    "failure_code",
+                                    "failure_reason",
+                                    "review_decision",
+                                ):
+                                    value = details.get(key)
+                                    if value not in (None, "", []):
+                                        safe_detail.append(f"{key}: {str(value)[:2000]}")
+                                turn_ids = details.get("turn_ids")
+                                if isinstance(turn_ids, list):
+                                    safe_detail.append(
+                                        "turns: " + ", ".join(str(value) for value in turn_ids[:32])
+                                    )
+                            event_type = str(row["event_type"])
+                            entries.append(
+                                {
+                                    "entry_id": f"journal:{row['event_ordinal']}",
+                                    "entry_kind": "LIFECYCLE",
+                                    "author_role": "SYSTEM",
+                                    "turn_id": str(row["turn_id"] or ""),
+                                    "title": event_type.replace("_", " ").title(),
+                                    "body_text": "\n".join(safe_detail),
+                                    "state": event_type,
+                                    "observed_at": str(row["observed_at"]),
+                                    "sort_ordinal": int(row["event_ordinal"]) * 10,
+                                }
+                            )
+                    if "boss_allocations" in tables:
+                        for row in connection.execute(
+                            "SELECT allocation_ordinal, turn_id, task_text, recorded_at "
+                            "FROM boss_allocations ORDER BY allocation_ordinal"
+                        ):
+                            entries.append(
+                                {
+                                    "entry_id": f"allocation:{row['allocation_ordinal']}",
+                                    "entry_kind": "ALLOCATION",
+                                    "author_role": "BOSS",
+                                    "turn_id": str(row["turn_id"]),
+                                    "title": f"Assigned {row['turn_id']}",
+                                    "body_text": str(row["task_text"] or "")[:12000],
+                                    "state": "ALLOCATED",
+                                    "observed_at": str(row["recorded_at"]),
+                                    "sort_ordinal": int(row["allocation_ordinal"]) * 10 + 5,
+                                }
+                            )
+                    if "task_turns" in tables:
+                        for row in connection.execute(
+                            "SELECT turn_ordinal, turn_id, role, state, result_json, "
+                            "review_decision, claimed_at, completed_at, created_at "
+                            "FROM task_turns ORDER BY turn_ordinal"
+                        ):
+                            try:
+                                result = json.loads(str(row["result_json"] or "{}"))
+                            except (TypeError, json.JSONDecodeError):
+                                result = {}
+                            summary = result.get("summary") if isinstance(result, Mapping) else None
+                            outcome = result.get("outcome") if isinstance(result, Mapping) else None
+                            if not isinstance(summary, str) or not summary.strip():
+                                continue
+                            role = str(row["role"] or "WORKER")
+                            entries.append(
+                                {
+                                    "entry_id": f"result:{row['turn_ordinal']}",
+                                    "entry_kind": "RESULT",
+                                    "author_role": role,
+                                    "turn_id": str(row["turn_id"]),
+                                    "title": f"{role.replace('_', ' ').title()} result",
+                                    "body_text": summary.strip()[:24000],
+                                    "state": str(row["state"]),
+                                    "outcome": str(outcome or row["review_decision"] or ""),
+                                    "observed_at": str(
+                                        row["completed_at"] or row["claimed_at"] or row["created_at"]
+                                    ),
+                                    "sort_ordinal": int(row["turn_ordinal"]) * 10 + 9,
+                                }
+                            )
+                    entries.sort(
+                        key=lambda item: (
+                            str(item.get("observed_at") or ""),
+                            int(item.get("sort_ordinal") or 0),
+                            str(item.get("entry_id") or ""),
+                        )
+                    )
+                    for item in entries:
+                        item.pop("sort_ordinal", None)
+                    return {
+                        "schema": "universe.task-frame-room-timeline.v1",
+                        "status": "TASK_FRAME_TIMELINE_AVAILABLE",
+                        "task_frame_id": frame_id,
+                        "task_state": str(context["task_state"] or "UNKNOWN"),
+                        "entries": entries[-400:],
+                    }
+                finally:
+                    connection.close()
+            except (OSError, sqlite3.Error):
+                continue
+        return unavailable
 
     def multi_room_snapshot(self, room_id: str) -> dict[str, Any]:
         snapshot = self.multi_rooms.room_snapshot(room_id)
         snapshot["permissions"] = self.room_participant_permissions.list_requests(
             room_id
         )
+        room = snapshot.get("room")
+        if isinstance(room, Mapping) and room.get("room_type") == "BOSS":
+            snapshot["task_frame_timeline"] = self._task_frame_room_timeline(
+                str(room.get("task_frame_id") or ""),
+                str(room.get("project_id") or ""),
+            )
         return snapshot
+
+
+    def attach_meeting_provider_session(
+        self, room_id: str, value: Any
+    ) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        chat_key = _required_text(request.get("chat_key"), "chat_key")
+        room = self.multi_rooms.get_room(room_id)
+        if room.get("room_type") != "MEETING":
+            raise UniverseError(
+                "MEETING_ROOM_TYPE_INVALID",
+                "provider sessions may be attached here only to a MEETING room",
+                HTTPStatus.CONFLICT,
+            )
+        descriptor = self.resolve_provider_chat_session(chat_key)
+        if descriptor.get("project_id") != room.get("project_id"):
+            raise UniverseError(
+                "MEETING_PROVIDER_PROJECT_MISMATCH",
+                "provider session must belong to the Meeting Room project",
+                HTTPStatus.CONFLICT,
+            )
+        catalog_room = next(
+            (
+                item
+                for item in self.provider_chat_catalog().get("rooms", [])
+                if item.get("chat_key") == chat_key
+            ),
+            None,
+        )
+        catalog_binding = (
+            catalog_room.get("binding")
+            if isinstance(catalog_room, Mapping)
+            and isinstance(catalog_room.get("binding"), Mapping)
+            else {}
+        )
+        existing = next(
+            (
+                item
+                for item in self.multi_rooms.list_bindings(room["room_id"])
+                if item.get("slot_role") == "MODEL"
+                and item.get("provider") == descriptor.get("provider")
+                and item.get("provider_session_ref")
+                == descriptor.get("provider_session_ref")
+            ),
+            None,
+        )
+        if existing is not None:
+            return {
+                "schema": API_SCHEMA,
+                "status": "MEETING_PROVIDER_SESSION_ALREADY_ATTACHED",
+                "binding": existing,
+            }
+        attached = self.multi_rooms.attach_session(
+            room["room_id"],
+            {
+                "slot_role": "MODEL",
+                "provider": descriptor.get("provider"),
+                "provider_session_ref": descriptor.get("provider_session_ref"),
+                "supervisor_session_id": catalog_binding.get("universe_session_id"),
+                "session_anchor_ref": descriptor.get("origin_session_anchor_ref"),
+                "provider_chat_key": chat_key,
+                "display_name": (
+                    catalog_room.get("display_name")
+                    if isinstance(catalog_room, Mapping)
+                    else descriptor.get("alias")
+                )
+                or descriptor.get("alias")
+                or descriptor.get("provider"),
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEETING_PROVIDER_SESSION_ATTACHED",
+            "binding": attached["binding"],
+        }
+
+    def create_fresh_meeting_sessions(self, room_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        room = self.multi_rooms.get_room(room_id)
+        if room.get("room_type") != "MEETING" or room.get("state") != "OPEN":
+            raise UniverseError(
+                "MEETING_ROOM_NOT_OPEN",
+                "fresh participants require an open Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        project_id = _required_text(room.get("project_id"), "room.project_id")
+        project = self.store.get_project(project_id)
+        raw_providers = request.get("providers") or ["CODEX", "CLAUDE", "GROK"]
+        if not isinstance(raw_providers, list):
+            raise UniverseError(
+                "MEETING_PROVIDERS_INVALID", "providers must be a list", HTTPStatus.BAD_REQUEST
+            )
+        providers = list(dict.fromkeys(str(item or "").upper() for item in raw_providers))
+        if not providers or any(item not in {"CODEX", "CLAUDE", "GROK"} for item in providers):
+            raise UniverseError(
+                "MEETING_PROVIDERS_INVALID",
+                "providers must contain CODEX, CLAUDE, or GROK",
+                HTTPStatus.BAD_REQUEST,
+            )
+        created: list[dict[str, Any]] = []
+        for provider in providers:
+            chat_key = "meeting_chat_" + secrets.token_hex(12)
+            setting = self.store.provider_setting("PROJECT_MASTER", project_id)
+            descriptor = {
+                "chat_key": chat_key,
+                "provider": provider,
+                "project_id": project_id,
+                "node": project_id,
+                "mode": "MASTER",
+                "repository_root": str(project["project_root"]),
+                "current_anchor_ref": "UNKNOWN",
+                "alias": f"{provider} independent meeting reviewer",
+                "model_ref": setting.get("model_ref") or "UNKNOWN",
+            }
+            try:
+                resident = self.session_broker.create_session(descriptor)
+            except SessionBrokerError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus(error.status)) from error
+            provider_ref = _required_text(
+                resident.get("provider_session_ref"), "provider_session_ref"
+            )
+            attached = self.multi_rooms.attach_session(
+                room_id,
+                {
+                    "slot_role": "MODEL",
+                    "provider": provider,
+                    "provider_session_ref": provider_ref,
+                    "session_anchor_ref": f"meeting-session://{chat_key}",
+                    "provider_chat_key": chat_key,
+                    "display_name": f"{provider} fresh reviewer",
+                    "metadata": {
+                        "meeting_session": True,
+                        "session_origin": "FRESH",
+                        "lifecycle_owner": "MEETING",
+                        "archive_on_close": True,
+                        "project_id": project_id,
+                        "node": project_id,
+                        "mode": "MASTER",
+                        "repository_root": str(project["project_root"]),
+                        "model_ref": setting.get("model_ref") or "UNKNOWN",
+                    },
+                },
+            )
+            created.append({"resident": resident, "binding": attached["binding"]})
+        return {
+            "schema": API_SCHEMA,
+            "status": "MEETING_FRESH_SESSIONS_CREATED",
+            "room_id": room_id,
+            "sessions": created,
+        }
+
+    def close_multi_room(self, room_id: str) -> dict[str, Any]:
+        room = self.multi_rooms.get_room(room_id)
+        archived: list[dict[str, Any]] = []
+        if room.get("room_type") == "MEETING":
+            for binding in self.multi_rooms.list_bindings(room_id):
+                metadata = binding.get("metadata")
+                if not isinstance(metadata, Mapping):
+                    continue
+                if metadata.get("lifecycle_owner") != "MEETING" or not metadata.get(
+                    "archive_on_close"
+                ):
+                    continue
+                chat_key = str(metadata.get("provider_chat_key") or "").strip()
+                if not chat_key:
+                    continue
+                try:
+                    archived.append(self.session_broker.archive_session(chat_key))
+                except SessionBrokerError as error:
+                    archived.append(
+                        {"chat_key": chat_key, "status": "ARCHIVE_FAILED", "reason": error.code}
+                    )
+        closed = self.multi_rooms.close_room(room_id)
+        return {
+            "schema": API_SCHEMA,
+            "status": "ROOM_CLOSED",
+            "room": closed,
+            "archived_sessions": archived,
+        }
+
+    def _invoke_multi_room_meeting_provider(
+        self,
+        binding: Mapping[str, Any],
+        turn: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata = binding.get("metadata")
+        chat_key = str(
+            metadata.get("provider_chat_key")
+            if isinstance(metadata, Mapping)
+            else ""
+        ).strip()
+        if not chat_key:
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_CHAT_REQUIRED",
+                "Meeting model binding has no verified provider chat key",
+                HTTPStatus.CONFLICT,
+            )
+        meeting_owned = (
+            isinstance(metadata, Mapping)
+            and metadata.get("meeting_session") is True
+            and metadata.get("lifecycle_owner") == "MEETING"
+        )
+        if meeting_owned:
+            descriptor = {
+                "chat_key": chat_key,
+                "provider": binding.get("provider"),
+                "provider_session_ref": binding.get("provider_session_ref"),
+                "project_id": metadata.get("project_id"),
+                "node": metadata.get("node") or metadata.get("project_id"),
+                "mode": metadata.get("mode") or "MASTER",
+                "repository_root": metadata.get("repository_root"),
+                "current_anchor_ref": "UNKNOWN",
+                "model_ref": metadata.get("model_ref") or "UNKNOWN",
+            }
+        else:
+            descriptor = self.resolve_provider_chat_session(chat_key)
+        if (
+            str(descriptor.get("provider") or "").upper()
+            != str(binding.get("provider") or "").upper()
+            or descriptor.get("provider_session_ref")
+            != binding.get("provider_session_ref")
+        ):
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_IDENTITY_MISMATCH",
+                "Meeting model binding no longer matches the provider session",
+                HTTPStatus.CONFLICT,
+            )
+        delta = turn.get("delta")
+        delta_body = str(
+            delta.get("body_text") if isinstance(delta, Mapping) else ""
+        ).strip()
+        if not delta_body:
+            raise ProviderSessionError(
+                "MEETING_PROVIDER_DELTA_REQUIRED",
+                "Meeting turn has no incremental delta",
+            )
+        prompt = (
+            "You are participating in a bounded Universe Feature Meeting. "
+            "Use only the incoming delta below and do not assume execution authority. "
+            "Do not call tools, read files, run commands, or write files; all required "
+            "information is already present. Return only the requested artifact with "
+            "no preface or explanation. When JSON is requested, return one raw JSON "
+            "object without Markdown fences. "
+            "Return one self-contained candidate in the exact format requested by "
+            "that delta so another reviewer can compare it with alternatives. "
+            "The complete response must stay under 18000 characters.\n\n"
+            f"Incoming delta:\n{delta_body}"
+        )[:24000]
+        provider_event_id = (
+            f"feature-meeting:{turn.get('run_id')}:"
+            f"{turn.get('turn_number')}:{binding.get('binding_id')}"
+        )
+        try:
+            completed = self.session_broker.turn(
+                descriptor, prompt, provider_event_id
+            )
+        except SessionBrokerError as error:
+            return {
+                "status": "FAILED",
+                "reason": error.code,
+                "provider_event_id": provider_event_id,
+            }
+        body_text = str(completed.get("body") or "")
+
+        def candidate_error(value: str) -> str | None:
+            if len(value) > 20000:
+                return "OUTPUT_TOO_LARGE"
+            candidate_text = value.strip()
+            if candidate_text.startswith("```"):
+                lines = candidate_text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                candidate_text = "\n".join(lines).strip()
+            try:
+                parsed = json.loads(candidate_text)
+            except json.JSONDecodeError:
+                return "JSON_INVALID"
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("route"), dict):
+                return "JSON_SHAPE_INVALID"
+            try:
+                self._parse_expected_path_candidate_output(
+                    candidate_text,
+                    fallback_title="Feature Meeting candidate",
+                )
+            except UniverseError as error:
+                return error.code
+            return None
+
+        validation_error = candidate_error(body_text)
+        if validation_error is not None:
+            provider_event_id += ":repair"
+            repair_prompt = (
+                f"Your previous Feature Meeting response failed {validation_error}. "
+                "Return the same candidate again as one complete valid raw JSON object. "
+                "Keep title under 160 characters, summary under 400, specification under "
+                "6000, the complete JSON under 18000, and use 2-8 concise route steps. "
+                "Preserve every required top-level and route field. Do not call tools and "
+                "do not add Markdown fences."
+            )
+            try:
+                completed = self.session_broker.turn(
+                    descriptor, repair_prompt, provider_event_id
+                )
+            except SessionBrokerError as error:
+                return {
+                    "status": "FAILED",
+                    "reason": error.code,
+                    "provider_event_id": provider_event_id,
+                }
+            body_text = str(completed.get("body") or "")
+            validation_error = candidate_error(body_text)
+        if validation_error is not None:
+            return {
+                "status": "COMPLETED",
+                "body_text": body_text,
+                "output_warning": f"MEETING_PROVIDER_OUTPUT_INVALID:{validation_error}",
+                "provider_event_id": provider_event_id,
+            }
+        return {
+            "status": "COMPLETED",
+            "body_text": body_text,
+            "provider_event_id": provider_event_id,
+        }
+
+    def run_feature_meeting(self, feature_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        feature = self.store.get_feature_node(feature_id)
+        if feature.get("state") == "ADOPTED":
+            raise UniverseError(
+                "FEATURE_ALREADY_ADOPTED",
+                "adopted Feature Node cannot run new specification meetings",
+                HTTPStatus.CONFLICT,
+            )
+        room_id = str(feature.get("meeting_room_id") or "").strip()
+        if not room_id:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        bindings = [
+            item
+            for item in self.multi_rooms.list_bindings(room_id)
+            if item.get("slot_role") == "MODEL"
+            and item.get("provider")
+            and item.get("provider_session_ref")
+            and isinstance(item.get("metadata"), Mapping)
+            and str(item["metadata"].get("provider_chat_key") or "").strip()
+        ]
+        raw_binding_ids = request.get("binding_ids")
+        if raw_binding_ids is not None:
+            if not isinstance(raw_binding_ids, list) or not raw_binding_ids:
+                raise UniverseError(
+                    "FEATURE_MEETING_BINDINGS_INVALID",
+                    "binding_ids must be a non-empty list of active MODEL binding IDs",
+                )
+            requested_binding_ids = list(
+                dict.fromkeys(_identifier(item, "binding_id") for item in raw_binding_ids)
+            )
+            binding_by_id = {str(item["binding_id"]): item for item in bindings}
+            if any(binding_id not in binding_by_id for binding_id in requested_binding_ids):
+                raise UniverseError(
+                    "FEATURE_MEETING_BINDINGS_INVALID",
+                    "every requested binding must be an active verified MODEL binding in this room",
+                    HTTPStatus.CONFLICT,
+                )
+            bindings = [binding_by_id[binding_id] for binding_id in requested_binding_ids]
+        if len(bindings) < 2:
+            raise UniverseError(
+                "FEATURE_MEETING_MODELS_REQUIRED",
+                "Feature specification meeting requires at least two attached provider sessions",
+                HTTPStatus.CONFLICT,
+            )
+        raw_turns = request.get("max_turns", len(bindings) * 2)
+        if isinstance(raw_turns, bool):
+            raise UniverseError("MEETING_TURN_LIMIT_INVALID", "max_turns must be an integer")
+        try:
+            max_turns = int(raw_turns)
+        except (TypeError, ValueError) as error:
+            raise UniverseError(
+                "MEETING_TURN_LIMIT_INVALID", "max_turns must be an integer"
+            ) from error
+        run_id = _required_text(
+            request.get("run_id") or "feature_meeting_" + secrets.token_hex(12),
+            "run_id",
+        )
+        user_prompt = str(request.get("prompt") or "").strip()
+        raw_roles = request.get("participant_roles")
+        role_specs: list[Mapping[str, Any]]
+        if raw_roles is None:
+            role_specs = [
+                FEATURE_MEETING_ROLE_TEMPLATES[index % len(FEATURE_MEETING_ROLE_TEMPLATES)]
+                for index in range(len(bindings))
+            ]
+        else:
+            if not isinstance(raw_roles, list) or len(raw_roles) != len(bindings):
+                raise UniverseError(
+                    "FEATURE_MEETING_ROLES_INVALID",
+                    "participant_roles must contain exactly one role object per selected MODEL binding",
+                )
+            role_specs = []
+            for index, raw_role in enumerate(raw_roles):
+                role = _exact_object_fields(
+                    raw_role,
+                    field=f"participant_roles[{index}]",
+                    required=frozenset({"role", "mandate"}),
+                    optional=frozenset({"assistants"}),
+                )
+                role_specs.append(role)
+        participant_briefs: dict[str, dict[str, Any]] = {}
+        for binding, role_spec in zip(bindings, role_specs, strict=True):
+            assistants = role_spec.get("assistants") or []
+            if not isinstance(assistants, list):
+                raise UniverseError(
+                    "FEATURE_MEETING_ROLES_INVALID",
+                    "participant role assistants must be a list",
+                )
+            participant_briefs[str(binding["binding_id"])] = {
+                "role": _required_text(role_spec.get("role"), "participant_role.role"),
+                "mandate": _required_text(
+                    role_spec.get("mandate"), "participant_role.mandate"
+                ),
+                "assistants": [
+                    _required_text(item, "participant_role.assistant") for item in assistants
+                ],
+            }
+        prompt = (
+            f"Feature: {feature['title']}\n"
+            f"Intent: {feature['intent_text']}\n\n"
+            "Produce one alternative detailed implementation route. Return ONLY one JSON object "
+            "with this shape: "
+            '{"title":"...","summary":"...","specification":"...","route":{'
+            '"steps":[{"step_id":"step-1","title":"...","summary":"...","phase":"..."}],'
+            '"dependencies":[{"from_step_id":"step-1","to_step_id":"step-2","kind":"PRECEDES"}],'
+            '"branches":[{"from_step_id":"step-1","condition":"...","to_step_ids":["step-2"]}],'
+            '"architecture_decisions":["..."],'
+            '"implementation_phases":[{"title":"...","step_ids":["step-1"]}],'
+            '"risks":[{"risk":"...","mitigation":"..."}],'
+            '"acceptance_conditions":["..."],'
+            '"estimates":{"effort":"...","cost":"...","quota":"..."},'
+            '"evidence_refs":[]}}. '
+            "Use 2-12 concise steps with stable IDs, valid dependency/branch references, and 1-6 phases. "
+            "Keep title at most 160 characters, summary at most 400 characters, "
+            "specification at most 6000 characters, and the complete JSON under 18000 characters. "
+            "Every turn must remain a self-contained candidate and must not create Goals, Todos, "
+            "Task Frames, authority, or execution assignments."
+        )
+        if user_prompt:
+            prompt += f"\n\nUser direction:\n{user_prompt}"
+        try:
+            summary = self.multi_room_meetings.run(
+                room_id,
+                prompt=prompt,
+                max_turns=max_turns,
+                run_id=run_id,
+                binding_ids=[str(item["binding_id"]) for item in bindings],
+                protocol="INDEPENDENT_PROPOSAL_REVIEW",
+                participant_briefs=participant_briefs,
+            )
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        candidates: list[dict[str, Any]] = []
+        candidate_failures: list[dict[str, str]] = []
+        duplicate_candidates: list[dict[str, str]] = []
+        semantic_candidates: dict[str, str] = {}
+        if summary.get("status") == "COMPLETED":
+            messages = {
+                str(item.get("room_event_id") or ""): item
+                for item in self.multi_rooms.list_messages(room_id, limit=500)
+            }
+            latest_by_binding: dict[str, Mapping[str, Any]] = {}
+            for turn in summary.get("turns", []):
+                if turn.get("status") == "COMPLETED" and turn.get("output_event_id"):
+                    latest_by_binding[str(turn["binding_id"])] = turn
+            binding_by_id = {str(item["binding_id"]): item for item in bindings}
+            for binding_id in summary.get("participant_order", []):
+                turn = latest_by_binding.get(str(binding_id))
+                message = messages.get(str((turn or {}).get("output_event_id") or ""))
+                binding = binding_by_id.get(str(binding_id))
+                if message is None or binding is None:
+                    continue
+                output_warning = str((turn or {}).get("output_warning") or "").strip()
+                if output_warning:
+                    candidate_failures.append(
+                        {
+                            "binding_id": str(binding_id),
+                            "error_code": output_warning.split(":", 1)[0],
+                            "detail": output_warning,
+                        }
+                    )
+                    continue
+                source_artifact = None
+                source_artifact_id = str((turn or {}).get("artifact_id") or "").strip()
+                if source_artifact_id:
+                    try:
+                        source_artifact = self.multi_rooms.get_artifact(
+                            room_id, source_artifact_id
+                        )
+                    except MultiRoomError:
+                        source_artifact = None
+                provider_body = str(
+                    (source_artifact or {}).get("body_text")
+                    or message.get("body_text")
+                    or ""
+                ).strip()
+                if not provider_body:
+                    continue
+                fallback_title = (
+                    f"{feature['title']} · "
+                    f"{binding.get('display_name') or binding.get('provider')} path"
+                )
+                evidence_refs = [
+                    f"universe://chat-rooms/{room_id}/messages/{message['message_id']}",
+                    f"universe://feature-nodes/{feature['feature_id']}/meeting-runs/{run_id}",
+                ]
+                try:
+                    candidate = self._parse_expected_path_candidate_output(
+                        provider_body, fallback_title=fallback_title
+                    )
+                except UniverseError as error:
+                    candidate_failures.append(
+                        {
+                            "binding_id": str(binding_id),
+                            "error_code": error.code,
+                            "detail": str(error),
+                        }
+                    )
+                    continue
+                semantic_route = dict(candidate["route"])
+                semantic_route["evidence_refs"] = []
+                semantic_digest = _json_sha256(
+                    {
+                        "title": candidate["title"],
+                        "summary": candidate["summary"],
+                        "specification": candidate["specification"],
+                        "route": normalize_expected_path_route(semantic_route),
+                    }
+                )
+                duplicate_of = semantic_candidates.get(semantic_digest)
+                if duplicate_of is not None:
+                    duplicate_candidates.append(
+                        {
+                            "binding_id": binding_id,
+                            "duplicate_of_binding_id": duplicate_of,
+                            "semantic_digest": semantic_digest,
+                        }
+                    )
+                    continue
+                semantic_candidates[semantic_digest] = binding_id
+                route = dict(candidate["route"])
+                route["evidence_refs"] = list(
+                    dict.fromkeys([*(route.get("evidence_refs") or []), *evidence_refs])
+                )
+                route = normalize_expected_path_route(route)
+                title = candidate["title"]
+                body_text = candidate["specification"]
+                try:
+                    if (
+                        source_artifact is not None
+                        and source_artifact.get("artifact_type") == "SPECIFICATION"
+                    ):
+                        artifact = source_artifact
+                    else:
+                        artifact = self.multi_rooms.create_artifact(
+                            room_id,
+                            {
+                                "artifact_type": "SPECIFICATION",
+                                "title": title,
+                                "body_text": body_text,
+                                "state": "CANDIDATE",
+                                "author_role": "MODEL",
+                                "author_binding_id": binding_id,
+                                "source_message_id": message["message_id"],
+                                "evidence_refs": evidence_refs,
+                            },
+                        )
+                    expected_path, _ = self.store.create_feature_expected_path(
+                        feature["feature_id"],
+                        {
+                            "room_id": room_id,
+                            "artifact_id": artifact["artifact_id"],
+                            "title": title,
+                            "summary": candidate["summary"],
+                            "evidence_refs": evidence_refs,
+                            "route": route,
+                        },
+                    )
+                except MultiRoomError as error:
+                    raise UniverseError(
+                        error.code, str(error), HTTPStatus(error.status)
+                    ) from error
+                candidates.append(
+                    {"artifact": artifact, "expected_path": expected_path}
+                )
+        self.multi_rooms.record_control_event(
+            room_id,
+            "FEATURE_MEETING_RESULT",
+            {
+                "run_id": run_id,
+                "feature_id": feature["feature_id"],
+                "meeting_status": summary.get("status"),
+                "candidate_count": len(candidates),
+                "candidate_failure_count": len(candidate_failures),
+                "duplicate_candidate_count": len(duplicate_candidates),
+                "expected_path_ids": [
+                    item["expected_path"]["expected_path_id"] for item in candidates
+                ],
+                "authority": "UNASSIGNED",
+                "execution_assignment": "UNASSIGNED",
+            },
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "FEATURE_MEETING_COMPLETED"
+                if summary.get("status") == "COMPLETED"
+                else "FEATURE_MEETING_STOPPED"
+            ),
+            "feature": self.store.get_feature_node(feature["feature_id"]),
+            "meeting": summary,
+            "candidates": candidates,
+            "candidate_failures": candidate_failures,
+            "duplicate_candidates": duplicate_candidates,
+            "participant_briefs": participant_briefs,
+            "goal_created": False,
+            "todo_created": False,
+            "task_frame_created": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+        }
+
+    @staticmethod
+    def _parse_expected_path_candidate_output(
+        body_text: str, *, fallback_title: str
+    ) -> dict[str, Any]:
+        text = str(body_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("route"), dict):
+            candidate = _exact_object_fields(
+                parsed,
+                field="expected_path_candidate",
+                required=frozenset({"title", "summary", "specification", "route"}),
+            )
+            title = _required_text(candidate["title"], "expected_path_candidate.title")
+            summary = _required_text(candidate["summary"], "expected_path_candidate.summary")
+            specification = _required_text(
+                candidate["specification"], "expected_path_candidate.specification"
+            )
+            if len(title) > 200 or len(summary) > 500 or len(specification) > 24000:
+                raise UniverseError(
+                    "EXPECTED_PATH_CANDIDATE_TEXT_INVALID",
+                    "Expected Path candidate text exceeds its limit",
+                )
+            return {
+                "title": title,
+                "summary": summary,
+                "specification": specification,
+                "route": normalize_expected_path_route(candidate["route"]),
+            }
+        specification = _required_text(text, "expected_path_candidate.specification")
+        summary = " ".join(specification.split())[:500]
+        return {
+            "title": fallback_title,
+            "summary": summary,
+            "specification": specification,
+            "route": normalize_expected_path_route(
+                {
+                    "steps": [
+                        {
+                            "step_id": "specification",
+                            "title": "Implement the specification",
+                            "summary": summary,
+                            "phase": "Implementation",
+                        }
+                    ],
+                    "dependencies": [],
+                    "branches": [],
+                    "architecture_decisions": [],
+                    "implementation_phases": [
+                        {"title": "Implementation", "step_ids": ["specification"]}
+                    ],
+                    "risks": [],
+                    "acceptance_conditions": ["The pinned specification is implemented and validated"],
+                    "estimates": {"effort": "UNKNOWN", "cost": "UNKNOWN", "quota": "UNKNOWN"},
+                    "evidence_refs": [],
+                }
+            ),
+        }
+
+    @staticmethod
+    def _parse_goal_work_plan_output(body_text: str) -> dict[str, Any]:
+        text = str(body_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"): lines = lines[1:]
+            if lines and lines[-1].strip() == "```": lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise UniverseError("GOAL_WORK_PLAN_JSON_INVALID", "provider Work Plan output must be one JSON object") from error
+        return normalize_goal_work_plan(parsed)
+
+    def run_goal_work_plan_meeting(self, goal_id: str, value: Any) -> dict[str, Any]:
+        request = value if isinstance(value, Mapping) else {}
+        surface = self.store.goal_work_plan_surface(goal_id)
+        goal = surface["goal"]
+        if goal["state"] != "DESIGNING": raise UniverseError("GOAL_WORK_PLAN_GOAL_STATE_INVALID", "Work Plan generation requires a DESIGNING Goal", HTTPStatus.CONFLICT)
+        derivation = surface["feature_goal_derivation"]
+        if derivation is None: raise UniverseError("GOAL_FEATURE_PROVENANCE_REQUIRED", "Goal must come from an adopted Feature path", HTTPStatus.CONFLICT)
+        if surface["adoption"] is not None: raise UniverseError("GOAL_WORK_PLAN_ALREADY_ADOPTED", "Goal already adopted a Work Plan", HTTPStatus.CONFLICT)
+        feature = self.store.get_feature_node(derivation["feature_id"])
+        room_id = str(feature.get("meeting_room_id") or "")
+        path = next((item for item in feature["expected_paths"] if item["expected_path_id"] == derivation["expected_path_id"]), None)
+        if path is None: raise UniverseError("FEATURE_ADOPTED_PATH_INVALID", "Goal provenance Expected Path is unavailable", HTTPStatus.CONFLICT)
+        artifact = self.multi_rooms.get_artifact(room_id, path["artifact_id"])
+        bindings=[item for item in self.multi_rooms.list_bindings(room_id) if item.get("slot_role")=="MODEL" and item.get("provider") and item.get("provider_session_ref") and isinstance(item.get("metadata"),Mapping) and str(item["metadata"].get("provider_chat_key") or "").strip()]
+        if len(bindings)<2: raise UniverseError("GOAL_WORK_PLAN_MODELS_REQUIRED", "Work Plan generation requires at least two verified provider sessions", HTTPStatus.CONFLICT)
+        run_id=_required_text(request.get("run_id") or "goal_work_plan_"+secrets.token_hex(12),"run_id")
+        raw_turns=request.get("max_turns",len(bindings)*2)
+        if isinstance(raw_turns,bool): raise UniverseError("MEETING_TURN_LIMIT_INVALID","max_turns must be an integer")
+        try: max_turns=int(raw_turns)
+        except (TypeError,ValueError) as error: raise UniverseError("MEETING_TURN_LIMIT_INVALID","max_turns must be an integer") from error
+        prompt=(
+            "Create an alternative implementation Work Plan for the Goal below. Return ONLY one JSON object with exactly this shape: "
+            '{"title":"...","summary":"...","milestones":[{"title":"...","description":"...","todos":[{"title":"...","detail":"...","acceptance":"...","priority":"AUTO|P0|P1|P2|P3"}]}]}. '
+            "Keep the entire JSON under 12000 characters. Use 1-4 milestones, 1-4 Todos per milestone, "
+            "and no more than 16 concise Todos. "
+            "Keep title and milestone titles at most 160 characters, summary at most 1000, "
+            "milestone descriptions at most 4000, Todo detail at most 3000, and Todo acceptance "
+            "at most 1000. Do not call tools, use Markdown fences, create authority, or claim execution.\n\n"
+            f"Goal: {goal['title']}\n{goal['description']}\n\nAdopted specification:\n{artifact.get('body_text') or ''}"
+        )[:20000]
+        try:
+            summary=self.multi_room_meetings.run(room_id,prompt=prompt,max_turns=max_turns,run_id=run_id,binding_ids=[str(item["binding_id"]) for item in bindings])
+        except MultiRoomError as error: raise UniverseError(error.code,str(error),HTTPStatus(error.status)) from error
+        messages={str(item.get("room_event_id") or ""):item for item in self.multi_rooms.list_messages(room_id,limit=500)}
+        latest={}
+        for turn in summary.get("turns",[]):
+            if turn.get("status")=="COMPLETED" and turn.get("output_event_id"): latest[str(turn["binding_id"])]=turn
+        candidates=[]; failures=[]
+        for binding in bindings:
+            turn=latest.get(str(binding["binding_id"])); message=messages.get(str((turn or {}).get("output_event_id") or ""))
+            if message is None: continue
+            try:
+                plan=self._parse_goal_work_plan_output(str(message.get("body_text") or ""))
+            except UniverseError as error:
+                failures.append({"binding_id":binding["binding_id"],"error_code":error.code})
+                continue
+            candidate,_=self.store.record_goal_work_plan_candidate(goal["goal_id"],{"feature_id":feature["feature_id"],"room_id":room_id,"run_id":run_id,"source_message_id":message["message_id"],"author_binding_id":binding["binding_id"],"plan":plan})
+            candidates.append(candidate)
+        return {"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_CANDIDATES_READY" if len(candidates)>=2 else "GOAL_WORK_PLAN_CANDIDATES_INCOMPLETE","goal":goal,"meeting":summary,"candidates":candidates,"candidate_failures":failures,"milestone_created":False,"todo_created":False,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False}
+
+    def cancel_feature_meeting(
+        self, feature_id: str, run_id: str, value: Any
+    ) -> dict[str, Any]:
+        feature = self.store.get_feature_node(feature_id)
+        if not feature.get("meeting_room_id"):
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        request = value if isinstance(value, Mapping) else {}
+        result = self.multi_room_meetings.cancel(
+            run_id, reason=str(request.get("reason") or "user stop")
+        )
+        return {"schema": API_SCHEMA, **result, "feature_id": feature["feature_id"]}
+
+    def feature_meeting_summary(
+        self, feature_id: str, run_id: str
+    ) -> dict[str, Any]:
+        feature = self.store.get_feature_node(feature_id)
+        room_id = str(feature.get("meeting_room_id") or "").strip()
+        if not room_id:
+            raise UniverseError(
+                "FEATURE_MEETING_ROOM_REQUIRED",
+                "Feature Node must be linked to a Meeting Room",
+                HTTPStatus.CONFLICT,
+            )
+        try:
+            summary = self.multi_room_meetings.summary(room_id, run_id)
+        except MultiRoomError as error:
+            raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
+        return {
+            "schema": API_SCHEMA,
+            "status": "FEATURE_MEETING_SUMMARY_COLLECTED",
+            "feature_id": feature["feature_id"],
+            "meeting": summary,
+        }
 
     def send_project_room_message(
         self,
@@ -19053,159 +32302,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.publish_project_room_changed(project_id)
         return message, created
 
-    def prepare_release_db_resident_boot(
-        self,
-        project_id: str,
-        value: Any,
-    ) -> dict[str, Any]:
-        """Prepare the Release DB-bound Conductor and resident Project Master."""
-
-        selection = self.store.selected_project_release_binding(project_id)
-        if selection.get("status") != "SELECTED":
-            raise UniverseError(
-                "RBOOT_RELEASE_SELECTION_REQUIRED",
-                f"Project {project_id} has no selected immutable Release DB",
-                HTTPStatus.CONFLICT,
-            )
-        release_id = _required_text(selection.get("release_id"), "release_id")
-        source_commit = _source_commit(selection.get("source_commit"))
-        database_sha256 = _sha256(
-            selection.get("database_sha256"), "database_sha256"
-        )
-        source_repository = _required_text(
-            selection.get("source_repository"), "source_repository"
-        )
-        source_ref = f"universe-release-db://{release_id}@{database_sha256}"
-
-        context = self._project_master_governance_context(project_id)
-        if not isinstance(context, Mapping) or context.get("status") != "SELECTED":
-            raise UniverseError(
-                "RBOOT_GOVERNANCE_CONTEXT_UNAVAILABLE",
-                "The selected Release DB did not return a governance context",
-                HTTPStatus.CONFLICT,
-            )
-        context_release_id = _required_text(
-            context.get("release_id"), "governance_context.release_id"
-        )
-        context_source_commit = _source_commit(context.get("source_commit"))
-        catalog_digest = _sha256(
-            context.get("catalog_digest"), "governance_context.catalog_digest"
-        )
-        selector_digest = _sha256(
-            context.get("selector_digest"), "governance_context.selector_digest"
-        )
-        if (
-            context_release_id != release_id
-            or context_source_commit != source_commit
-        ):
-            raise UniverseError(
-                "RBOOT_RELEASE_CONTEXT_MISMATCH",
-                (
-                    "Release selection and governance context do not share one "
-                    "immutable source"
-                ),
-                HTTPStatus.CONFLICT,
-            )
-
-        planning = self._ensure_conductor_planning_runtime()
-        if not isinstance(planning, Mapping):
-            status = self.planning_binding_status()
-            raise UniverseError(
-                "RBOOT_CONDUCTOR_PREPARATION_FAILED",
-                str(
-                    status.get("reason")
-                    or status.get("error_code")
-                    or status["status"]
-                ),
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-        if (
-            planning.get("runtime_currentness_observation") != "CURRENT"
-            or planning.get("source_ref") != source_ref
-            or planning.get("source_commit") != source_commit
-            or planning.get("source_repository") != source_repository
-            or any(
-                str(planning.get(field) or "UNKNOWN").upper() == "UNKNOWN"
-                for field in (
-                    "session_id",
-                    "origin_anchor_ref",
-                    "origin_frame_id",
-                    "binding_evidence_ref",
-                )
-            )
-        ):
-            raise UniverseError(
-                "RBOOT_CONDUCTOR_EVIDENCE_NOT_CURRENT",
-                "Conductor Session Boot evidence is missing, stale, or bound to another source",
-                HTTPStatus.CONFLICT,
-            )
-
-        resident = self.prepare_project_master_session(project_id)
-        connection = resident.get("session_connection")
-        resident_context = (
-            connection.get("governance_context")
-            if isinstance(connection, Mapping)
-            else None
-        )
-        runtime_observation = (
-            connection.get("runtime_observation")
-            if isinstance(connection, Mapping)
-            else None
-        )
-        if (
-            resident.get("status") != "PROJECT_MASTER_SESSION_PREPARED"
-            or not isinstance(connection, Mapping)
-            or connection.get("resident") is not True
-            or connection.get("requested_mode") != "MASTER"
-            or str(connection.get("session_ref") or "UNKNOWN").upper() == "UNKNOWN"
-            or not isinstance(runtime_observation, Mapping)
-            or str(runtime_observation.get("state") or "UNKNOWN").upper()
-            == "UNKNOWN"
-            or not isinstance(resident_context, Mapping)
-            or resident_context.get("status") != "SELECTED"
-            or resident_context.get("release_id") != release_id
-            or resident_context.get("source_commit") != source_commit
-            or resident_context.get("catalog_digest") != catalog_digest
-            or resident_context.get("selector_digest") != selector_digest
-        ):
-            raise UniverseError(
-                "RBOOT_RESIDENT_MASTER_EVIDENCE_INVALID",
-                "Resident Project Master evidence is missing or does not match the Release DB context",
-                HTTPStatus.CONFLICT,
-            )
-
-        delivery = {
-            "status": "RELEASE_DB_RESIDENT_BOOT_PREPARED",
-            "governance_state": "GOVERNANCE_ONLY",
-            "executor_state": "INACTIVE",
-            "mode": "CONDUCTOR",
-            "authority": "UNASSIGNED",
-            "execution_assignment": "UNASSIGNED",
-            "release_id": release_id,
-            "database_sha256": database_sha256,
-            "source_commit": source_commit,
-            "catalog_digest": catalog_digest,
-            "selector_digest": selector_digest,
-            "session_id": planning["session_id"],
-            "origin_anchor_ref": planning["origin_anchor_ref"],
-            "origin_frame_id": planning["origin_frame_id"],
-            "binding_evidence_ref": planning["binding_evidence_ref"],
-            "resident_master_session_ref": connection["session_ref"],
-        }
-        message, created = self.store.create_room_message(
-            project_id,
-            value,
-            delivery_state="ROUTED_TO_RELEASE_DB_RESIDENT_BOOT",
-            delivery=delivery,
-        )
-        self.publish_project_room_changed(project_id)
-        return {
-            "status": "PROJECT_RELEASE_DB_RESIDENT_BOOT_PREPARED",
-            "created": created,
-            "message": message,
-            "boot": delivery,
-        }
-
     def handle_project_room_input(
         self,
         project_id: str,
@@ -19218,8 +32314,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         trusted_commander = bool(
             commander_context and commander_context.get("authenticated") is True
         )
-        if trusted_commander and RBOOT_ROOM_COMMAND_PATTERN.fullmatch(body):
-            return self.prepare_release_db_resident_boot(project_id, value)
         is_commander_approval = (
             trusted_commander
             and is_governance_approval_command(body)
@@ -19552,6 +32646,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "ACCEPTED_BY_MASTER",
         }:
             return
+        if stream_event == "FAILED":
+            failed = self.store._update_room_delivery(
+                message,
+                delivery_state="FAILED",
+                delivery={
+                    **dict(message.get("delivery") or {}),
+                    "status": "FAILED",
+                    "failed_at": utc_now(),
+                    "detail": str(event.get("detail") or "PROJECT_MASTER_FAILED"),
+                },
+            )
+            try:
+                self.store.apply_master_message_todo_transition(
+                    project_id,
+                    failed["message_id"],
+                    outcome="FAILED",
+                )
+            except UniverseError:
+                pass
+            self.publish_project_room_changed(project_id)
         with self._project_master_stream_lock:
             if stream_event == "STARTED":
                 self._active_project_master_streams[project_id] = {
@@ -19655,8 +32769,739 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # A missing/old room message must not turn a completed provider turn
             # into an error or invent a Todo linkage.
             pass
+        self._record_project_master_work_statuses(event)
         self._resolve_project_master_delegation(event)
         self.publish_project_room_changed(project_id)
+
+    def _git_work_attribution(self, provider_session_ref: str) -> tuple[str, str]:
+        """Resolve the exact Session Anchor and terminal for a Git milestone.
+
+        Attribution is only emitted when the provider coordinate resolves to
+        exactly one supervised session.  An ambiguous or absent coordinate
+        stays unattributed rather than guessing an Anchor or a terminal.
+        """
+
+        reference = str(provider_session_ref or "").strip()
+        if not reference:
+            return "", ""
+        matches = [
+            session
+            for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("provider_session_ref") or "") == reference
+        ]
+        if len(matches) != 1:
+            return "", ""
+        anchor_ref = str(matches[0].get("session_anchor_ref") or "").strip()
+        supervisor_id = str(matches[0].get("session_id") or "").strip()
+        terminal_id = ""
+        if supervisor_id:
+            for terminal in self._session_anchor_terminal_host().list_sessions():
+                if str(terminal.get("supervisor_session_id") or "") == supervisor_id:
+                    terminal_id = str(terminal.get("terminal_id") or "").strip()
+                    break
+        return anchor_ref, terminal_id
+
+    def list_git_work_history(
+        self,
+        project_id: str,
+        *,
+        session_anchor_ref: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List authoritative COMMIT/PUSH milestones for one project.
+
+        Entries come from recorded `GIT_WORK_STATUS` observations only.  An
+        entry without exact Anchor attribution is reported as UNATTRIBUTED
+        instead of being joined to the requested Anchor by proximity.
+        """
+
+        wanted = str(session_anchor_ref or "").strip()
+        entries: list[dict[str, Any]] = []
+        for event in self.store.list_events(project_id, limit=500):
+            if str(event.get("event_type") or "") != "GIT_WORK_STATUS":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            operation = str(payload.get("operation") or "").upper()
+            if operation not in {"COMMIT", "PUSH"}:
+                continue
+            anchor_ref = str(payload.get("session_anchor_ref") or "").strip()
+            if wanted and anchor_ref != wanted:
+                continue
+            entries.append(
+                {
+                    "schema": "universe.git-work-history-entry.v1",
+                    "event_id": str(event.get("event_id") or ""),
+                    "created_at": event.get("created_at"),
+                    "operation": operation,
+                    "state": str(payload.get("state") or "OBSERVED").upper(),
+                    "exit_code": payload.get("exit_code"),
+                    "commit_sha": payload.get("commit_sha"),
+                    "short_sha": payload.get("short_sha"),
+                    "branch": payload.get("branch"),
+                    "remote": payload.get("remote"),
+                    "session_anchor_ref": anchor_ref or None,
+                    "terminal_id": str(payload.get("terminal_id") or "") or None,
+                    "attribution": "EXACT" if anchor_ref else "UNATTRIBUTED",
+                }
+            )
+            if len(entries) >= max(1, int(limit)):
+                break
+        return {
+            "schema": "universe.git-work-history.v1",
+            "status": "GIT_WORK_HISTORY_COLLECTED",
+            "project_id": project_id,
+            "session_anchor_ref": wanted or None,
+            "entries": entries,
+        }
+
+    def _record_project_master_work_statuses(self, event: Mapping[str, Any]) -> None:
+        """Persist redacted provider Git milestones as idempotent graph inputs."""
+
+        project_id = str(event.get("project_id") or "").strip()
+        message_id = str(event.get("message_id") or "").strip()
+        provider_session_ref = str(event.get("provider_session_ref") or "").strip()
+        raw_statuses = event.get("work_statuses")
+        if not project_id or not message_id or not isinstance(raw_statuses, list):
+            return
+        session_digest = _json_sha256(provider_session_ref) if provider_session_ref else "UNKNOWN"
+        anchor_ref, terminal_id = self._git_work_attribution(provider_session_ref)
+        for raw in raw_statuses:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("schema") or "") != "universe.git-trace2-work-status.v1":
+                continue
+            operation = str(raw.get("operation") or "").upper()
+            state = str(raw.get("state") or "").upper()
+            exit_code = raw.get("exit_code")
+            if operation not in {"COMMIT", "PUSH"} or state not in {"COMPLETED", "FAILED"}:
+                continue
+            if not isinstance(exit_code, int):
+                continue
+            payload: dict[str, Any] = {
+                "schema": "universe.git-work-observation.v1",
+                "source": "GIT_TRACE2",
+                "message_id": message_id,
+                "provider_session_digest": session_digest,
+                "operation": operation,
+                "state": state,
+                "exit_code": exit_code,
+                "redaction_state": "REDACTED",
+            }
+            for key in ("commit_sha", "short_sha", "branch", "remote"):
+                value = raw.get(key)
+                if isinstance(value, str) and value.strip():
+                    payload[key] = value.strip()
+            if anchor_ref:
+                payload["session_anchor_ref"] = anchor_ref
+            if terminal_id:
+                payload["terminal_id"] = terminal_id
+            event_id = "git_work_" + _json_sha256(
+                {"project_id": project_id, **payload}
+            )[:24]
+            try:
+                self.store.append_event(
+                    project_id,
+                    {
+                        "event_id": event_id,
+                        "event_type": "GIT_WORK_STATUS",
+                        "payload": payload,
+                    },
+                )
+            except UniverseError:
+                # A stale project connection must not perturb the provider turn.
+                continue
+
+    def record_session_hook_observation(
+        self,
+        request: Mapping[str, Any],
+        injected: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Record one redacted SessionStart/ModeChange binding observation.
+
+        The hook itself remains best-effort.  This method only observes a
+        successful inject, and keeps the provider coordinate as a digest so
+        graph consumers can join it to a supervised session without exposing
+        a vendor session identifier.
+        """
+
+        raw_hook = request.get("hook_observation")
+        if not isinstance(raw_hook, Mapping):
+            return None
+        project_id = str(request.get("project_id") or "").strip()
+        session = injected.get("supervisor_session")
+        if not project_id or not isinstance(session, Mapping):
+            return None
+        try:
+            self.store.get_project(project_id)
+        except UniverseError:
+            return None
+        trigger = str(raw_hook.get("trigger") or "SESSION_START").strip().upper()
+        if trigger not in {"SESSION_START", "MODE_CHANGE", "MANUAL"}:
+            trigger = "OTHER"
+        provider_session_ref = str(session.get("provider_session_ref") or "")
+        provider_digest = (
+            _json_sha256(provider_session_ref) if provider_session_ref else "UNKNOWN"
+        )
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        if not session_anchor_ref:
+            return None
+        observed_at = str(raw_hook.get("observed_at") or "").strip()
+        payload = {
+            "schema": "universe.hook-session-observation.v1",
+            "source": "SESSION_INJECT_HOOK",
+            "trigger": trigger,
+            "observed_at": observed_at or utc_now(),
+            "session_anchor_ref": session_anchor_ref,
+            "supervisor_session_id": str(session.get("session_id") or ""),
+            "provider": str(session.get("provider") or "UNKNOWN"),
+            "provider_session_digest": provider_digest,
+            "redaction_state": "REDACTED",
+        }
+        event_id = "hook_session_" + _json_sha256(
+            {
+                "project_id": project_id,
+                "session_anchor_ref": session_anchor_ref,
+                "provider_session_digest": provider_digest,
+                "trigger": trigger,
+            }
+        )[:24]
+        try:
+            event, created = self.store.append_event(
+                project_id,
+                {
+                    "event_id": event_id,
+                    "event_type": "HOOK_SESSION_BOUND",
+                    "payload": payload,
+                },
+            )
+        except UniverseError:
+            return None
+        instruction_dispatch = self._dispatch_pending_session_instruction(
+            project_id=project_id,
+            session=session,
+            trigger=trigger,
+        )
+        self._resume_hook_verified_conductor_allocations(
+            project_id, session_anchor_ref
+        )
+        return {
+            "event_id": event.get("event_id"),
+            "created": created,
+            "redaction_state": "REDACTED",
+            "pending_instruction_dispatch": instruction_dispatch,
+        }
+
+    def _dispatch_pending_session_instruction(
+        self,
+        *,
+        project_id: str,
+        session: Mapping[str, Any],
+        trigger: str,
+        message_id: str = "",
+    ) -> dict[str, Any]:
+        """Claim and deliver one anchor-bound bus instruction at a safe point.
+
+        The common Runtime validates the claimed payload and selects provider
+        hook output.  A bound Provider Session receives the raw body through
+        its native user-turn adapter or, for Claude PTY sessions, the
+        authenticated Claude Code Channel. PTY is retained only as the
+        explicit fallback for non-Claude live manual terminals with no native
+        transport; Claude bus instructions fail closed until Channel is ready.
+        """
+
+        if trigger not in {"SESSION_START", "TURN_IDLE"}:
+            return {"status": "NOT_APPLICABLE", "trigger": trigger}
+        session_id = str(session.get("session_id") or "").strip()
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        provider = str(session.get("provider") or "").strip().upper()
+        provider_session_ref = str(
+            session.get("provider_session_ref") or ""
+        ).strip()
+        mode = str(session.get("mode") or "").strip().upper()
+        if not session_id or not session_anchor_ref or not provider or not mode:
+            return {"status": "COORDINATE_UNAVAILABLE"}
+        terminal = self._session_anchor_terminal_host().find_live(
+            project_id=project_id,
+            mode=mode,
+            provider=provider,
+            supervisor_session_id=session_id,
+        )
+        if not isinstance(terminal, Mapping):
+            return {"status": "TERMINAL_UNAVAILABLE"}
+        terminal_id = str(terminal.get("terminal_id") or "").strip()
+        if not terminal_id:
+            return {"status": "TERMINAL_UNAVAILABLE"}
+        try:
+            claim = self.session_bus.claim_instruction(
+                self._session_anchor_terminal_host(),
+                terminal_id=terminal_id,
+                session_anchor_ref=session_anchor_ref,
+                message_id=message_id,
+            )
+        except (SessionBusError, TerminalHostError) as error:
+            return {"status": "CLAIM_UNAVAILABLE", "detail": str(error)}
+        if claim is None:
+            return {"status": "NO_PENDING_INSTRUCTION"}
+        try:
+            runtime_root = Path(__file__).resolve().parents[1] / ".ai" / "runtime"
+            if str(runtime_root) not in sys.path:
+                sys.path.insert(0, str(runtime_root))
+            from reference_runtime.session_instruction_hook_runtime import (
+                REQUEST_SCHEMA,
+                evaluate_session_instruction_hook,
+            )
+
+            outcome = evaluate_session_instruction_hook(
+                {
+                    "schema": REQUEST_SCHEMA,
+                    "provider": provider,
+                    "trigger": "SESSION_START",
+                    "session_anchor_ref": session_anchor_ref,
+                    "pending_instruction": {
+                        "message_id": claim["message_id"],
+                        "instruction_ref": "session-bus:" + claim["message_id"],
+                        "body_text": claim["body_text"],
+                        "provenance": claim.get("provenance"),
+                    },
+                }
+            )
+        except Exception as error:  # Common Runtime must never break provider boot.
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "COMMON_HOOK_UNAVAILABLE", "detail": str(error)}
+        delivery = outcome.get("provider_adapter_delivery")
+        if not isinstance(delivery, Mapping):
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "DELIVERY_UNAVAILABLE"}
+
+        provenance = claim.get("provenance")
+        sender_id = (
+            "UNIVERSE_UI"
+            if isinstance(provenance, Mapping)
+            and bool(provenance.get("user_authorized"))
+            else "UNIVERSE_SESSION_BUS"
+        )
+        message_id = str(claim.get("message_id") or "")
+        channel_payload = {
+            "schema": HOST_MESSAGE_CHANNEL_SCHEMA,
+            "message_id": message_id,
+            "session_anchor_ref": session_anchor_ref,
+            "content": str(delivery["body_text"]),
+            "meta": {
+                "message_id": message_id,
+                "session_anchor_ref": session_anchor_ref,
+                "sender_id": sender_id,
+                "kind": "INSTRUCTION",
+                "project_id": str(project_id),
+                "mode": mode,
+                "provider": provider,
+            },
+        }
+
+        # Claude's interactive CLI stays in the existing PTY/xterm, but a
+        # session-bus instruction must not be typed into that PTY.  The
+        # terminal host provisions an authenticated Claude Code Channel MCP
+        # child for each Claude terminal.  Prefer that channel even when a
+        # provider-native catalog entry happens to be visible: the channel is
+        # bound to this exact live supervisor terminal and Session Anchor.
+        if provider == "CLAUDE":
+            try:
+                channel_state = self.terminal_host.channel_state(terminal_id)
+            except (AttributeError, TerminalHostError):
+                channel_state = "UNAVAILABLE"
+            if channel_state == "PENDING":
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {
+                    "status": "CLAUDE_CHANNEL_PENDING",
+                    "delivery_mode": "CLAUDE_CODE_CHANNEL_PENDING",
+                    "provider": provider,
+                    "session_anchor_ref": session_anchor_ref,
+                    "hook_stdout": outcome.get("hook_stdout"),
+                }
+            if channel_state == "READY":
+                channel_dispatch_ready = threading.Event()
+                channel_dispatch_started = {"value": False}
+
+                def observe_channel_result(result: Mapping[str, Any]) -> None:
+                    channel_dispatch_ready.wait(5.0)
+                    if not channel_dispatch_started["value"]:
+                        raise SessionBusError(
+                            "BUS_CHANNEL_DISPATCH_NOT_STARTED",
+                            "Claude Channel result arrived before dispatch completed",
+                            409,
+                        )
+                    self.session_bus.reply(
+                        message_id,
+                        terminal_id=terminal_id,
+                        session_anchor_ref=session_anchor_ref,
+                        body_text=str(result.get("body_text") or ""),
+                        result_ref=str(result.get("result_ref") or "")
+                        or f"claude-channel://{terminal_id}/{message_id}",
+                        outcome=str(result.get("outcome") or "COMPLETED"),
+                    )
+                try:
+                    channel_result = self.terminal_host.push_channel(
+                        terminal_id,
+                        channel_payload,
+                        on_result=observe_channel_result,
+                    )
+                    completed = self.session_bus.complete_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    channel_dispatch_started["value"] = True
+                    channel_dispatch_ready.set()
+                except (SessionBusError, TerminalHostError, UnicodeError) as error:
+                    channel_dispatch_ready.set()
+                    self.session_bus.release_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    return {
+                        "status": "CLAUDE_CHANNEL_DELIVERY_FAILED",
+                        "delivery_mode": "CLAUDE_CODE_CHANNEL",
+                        "provider": provider,
+                        "detail": str(error),
+                        "session_anchor_ref": session_anchor_ref,
+                        "hook_stdout": outcome.get("hook_stdout"),
+                    }
+                return {
+                    "status": "DISPATCHED",
+                    "delivery_mode": "CLAUDE_CODE_CHANNEL",
+                    "provider": provider,
+                    "message_id": completed["message_id"],
+                    "channel_result": channel_result,
+                    "session_anchor_ref": session_anchor_ref,
+                    "hook_stdout": outcome.get("hook_stdout"),
+                }
+
+        native_chat_key = self._provider_chat_key_for_session_instruction(
+            session=session,
+        )
+        if native_chat_key:
+            accepted_holder: dict[str, str] = {}
+            native_terminal_holder: dict[str, Mapping[str, Any]] = {}
+            native_dispatch_lock = threading.Lock()
+            native_dispatch_started = {"value": False}
+
+            def observe_native_accept(reply: Mapping[str, Any]) -> None:
+                provider_message_id = str(reply.get("message_id") or "").strip()
+                if not provider_message_id:
+                    raise ProviderSessionError(
+                        "PROVIDER_SESSION_REPLY_ID_MISSING",
+                        "native Provider Session did not return an accepted reply id",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                accepted_holder["provider_message_id"] = provider_message_id
+
+            def project_native_terminal(reply: Mapping[str, Any]) -> None:
+                provider_state = str(reply.get("state") or "FAILED").upper()
+                outcome = "COMPLETED" if provider_state == "COMPLETED" else "FAILED"
+                body = str(reply.get("body") or "").strip()
+                if not body:
+                    body = str(
+                        reply.get("error_code")
+                        or "Provider turn completed without a result body."
+                    )
+                provider_message_id = str(reply.get("message_id") or "").strip()
+                result_ref = (
+                    f"provider-session://{native_chat_key}/{provider_message_id}"
+                    if provider_message_id
+                    else f"provider-session://{native_chat_key}"
+                )
+                try:
+                    self.session_bus.reply(
+                        str(claim["message_id"]),
+                        terminal_id=terminal_id,
+                        session_anchor_ref=session_anchor_ref,
+                        body_text=body,
+                        result_ref=result_ref,
+                        outcome=outcome,
+                    )
+                except SessionBusError as error:
+                    # Result delivery failures must remain observable on the
+                    # original event; never silently lose a provider turn.
+                    try:
+                        self.session_bus.transition(
+                            str(claim["message_id"]),
+                            state="FAILED",
+                            terminal_id=terminal_id,
+                            session_anchor_ref=session_anchor_ref,
+                            error_code=error.code,
+                        )
+                    except SessionBusError:
+                        pass
+
+            def observe_native_terminal(reply: Mapping[str, Any]) -> None:
+                with native_dispatch_lock:
+                    if not native_dispatch_started["value"]:
+                        native_terminal_holder["reply"] = dict(reply)
+                        return
+                project_native_terminal(reply)
+
+            try:
+                native_result = self.provider_sessions.submit_channel(
+                    native_chat_key,
+                    channel_payload,
+                    on_accepted=observe_native_accept,
+                    on_terminal=observe_native_terminal,
+                )
+                # ``submit`` only returns after the native turn worker is
+                # started. A prior idempotent submission skips the callback,
+                # but this fresh bus claim still completes here.
+                completed = self.session_bus.complete_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim["message_id"]),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                self.session_bus.transition(
+                    str(claim["message_id"]),
+                    state="STARTED",
+                    terminal_id=terminal_id,
+                    session_anchor_ref=session_anchor_ref,
+                    provider_message_id=accepted_holder.get("provider_message_id", ""),
+                )
+                with native_dispatch_lock:
+                    native_dispatch_started["value"] = True
+                    buffered_terminal = native_terminal_holder.pop("reply", None)
+                if buffered_terminal is not None:
+                    project_native_terminal(buffered_terminal)
+            except (
+                ProviderSessionError,
+                SessionBusError,
+                TerminalHostError,
+                UnicodeError,
+            ) as error:
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {"status": "DELIVERY_FAILED", "detail": str(error)}
+            return {
+                "status": "DISPATCHED",
+                "delivery_mode": "PROVIDER_NATIVE",
+                "provider": provider,
+                "chat_key": native_chat_key,
+                "message_id": completed["message_id"],
+                "provider_message_id": accepted_holder.get("provider_message_id"),
+                "provider_result": native_result,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        if provider_session_ref:
+            # A supervised provider session must never receive a bus payload by
+            # PTY injection. Keep the claim pending until its exact opaque
+            # native chat is visible in the catalog (or the next hook retries).
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {
+                "status": "NATIVE_PROVIDER_UNAVAILABLE",
+                "delivery_mode": "PROVIDER_NATIVE_PENDING",
+                "provider": provider,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        if provider == "CLAUDE":
+            # A Claude terminal without a registered Channel is not allowed to
+            # fall back to typing the bus body into PTY stdin.  The operator can
+            # still use xterm manually; automated delivery remains pending
+            # until the authenticated channel is available.
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {
+                "status": "CLAUDE_CHANNEL_UNAVAILABLE",
+                "delivery_mode": "CLAUDE_CODE_CHANNEL_REQUIRED",
+                "provider": provider,
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
+
+        try:
+            # Manual-terminal fallback. This is intentionally not the Session
+            # Bus HEADER path: the SessionStart hook verified this exact live
+            # PTY and the message was atomically claimed for its Session Anchor.
+            self.terminal_host.write(
+                terminal_id,
+                (str(delivery["body_text"]) + "\r").encode("utf-8"),
+            )
+            completed = self.session_bus.complete_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(delivery["message_id"]),
+                session_anchor_ref=session_anchor_ref,
+            )
+        except (SessionBusError, TerminalHostError, UnicodeError) as error:
+            self.session_bus.release_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=str(claim.get("message_id") or ""),
+                session_anchor_ref=session_anchor_ref,
+            )
+            return {"status": "DELIVERY_FAILED", "detail": str(error)}
+        return {
+            "status": "DISPATCHED",
+            "delivery_mode": "PTY_FALLBACK",
+            "message_id": completed["message_id"],
+            "session_anchor_ref": session_anchor_ref,
+            "hook_stdout": outcome.get("hook_stdout"),
+        }
+
+    def _provider_chat_key_for_session_instruction(
+        self,
+        *,
+        session: Mapping[str, Any],
+    ) -> str | None:
+        """Resolve an exact native chat for one supervised Session Anchor.
+
+        The opaque chat key is accepted only when the catalog binds the same
+        Universe supervisor session and Session Anchor.  A provider/session
+        coordinate alone is insufficient; unresolved or ambiguous sessions
+        return no key so the caller can keep supervised delivery pending.
+        """
+
+        session_id = str(session.get("session_id") or "").strip()
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        provider = str(session.get("provider") or "").strip().upper()
+        provider_ref = str(session.get("provider_session_ref") or "").strip()
+        if not session_id or not session_anchor_ref or not provider or not provider_ref:
+            return None
+        try:
+            expected_key = _vendor_chat_key(provider, provider_ref)
+            catalog = self.provider_chat_catalog()
+        except Exception:
+            return None
+        matches = [
+            room
+            for room in catalog.get("rooms", [])
+            if isinstance(room, Mapping)
+            and str(room.get("chat_key") or "") == expected_key
+            and str(room.get("provider") or "").upper() == provider
+        ]
+        if len(matches) != 1:
+            return None
+        room = matches[0]
+        binding = room.get("binding")
+        binding_exact = (
+            isinstance(binding, Mapping)
+            and str(binding.get("universe_session_id") or "") == session_id
+            and str(binding.get("session_anchor_ref") or "") == session_anchor_ref
+            and str(binding.get("state") or "").upper()
+            in {"BOUND", "ANCHOR_OBSERVED"}
+        )
+        try:
+            descriptor = self.resolve_provider_chat_session(expected_key)
+        except Exception:
+            return None
+        if (
+            str(descriptor.get("provider") or "").upper() != provider
+            or str(descriptor.get("provider_session_ref") or "") != provider_ref
+        ):
+            return None
+        if binding_exact:
+            return expected_key
+        # A freshly-created provider transcript can be discovered before the
+        # public catalog projects its Anchor binding.  The private resolver
+        # already performs the exact, unique Supervisor join; accept that
+        # bounded lag only when it returns the same Session and Anchor.
+        if (
+            str(descriptor.get("supervisor_session_id") or "") != session_id
+            or str(descriptor.get("origin_session_anchor_ref") or "")
+            != session_anchor_ref
+        ):
+            return None
+        return expected_key
+
+    def _resume_hook_verified_conductor_allocations(
+        self,
+        project_id: str,
+        session_anchor_ref: str,
+        *,
+        retry_catalog_visibility: bool = False,
+    ) -> None:
+        """Deliver only allocations whose Session Hook verified this target.
+
+        The initial call runs from the Hook and may only advance
+        ``WAITING_FOR_VENDOR_HOOK``.  A later provider catalog scan may retry
+        the narrower ``WAITING_FOR_VENDOR_CHAT`` state, which exists only
+        after that Hook already succeeded.
+        """
+
+        waiting_step = (
+            "WAITING_FOR_VENDOR_CHAT"
+            if retry_catalog_visibility
+            else "WAITING_FOR_VENDOR_HOOK"
+        )
+
+        waiting = [
+            item
+            for item in self.store.list_conductor_delegations(
+                project_id=project_id, state="RUNNING", limit=500
+            )
+            if item.get("progress", {}).get("step") == waiting_step
+            and item.get("progress", {}).get("target_session_anchor_ref")
+            == session_anchor_ref
+        ]
+        for delegation in waiting:
+            try:
+                outcome = self._dispatch_project_master_delegation(delegation)
+            except UniverseError as error:
+                # A successful inject is necessary but catalog visibility can
+                # lag one observation cycle.  Preserve the allocation rather
+                # than turning a not-yet-visible verified chat into failure.
+                if error.code in {
+                    "TARGET_SESSION_TRANSPORT_UNAVAILABLE",
+                    "TARGET_SESSION_ANCHOR_STALE",
+                }:
+                    updated = self.store.update_conductor_delegation_progress(
+                        delegation["delegation_id"],
+                        {
+                            "summary": (
+                                "Session Hook verified the target; awaiting the "
+                                "exact vendor chat catalog entry for delivery."
+                            ),
+                            "step": "WAITING_FOR_VENDOR_CHAT",
+                            "target_session_anchor_ref": session_anchor_ref,
+                        },
+                    )
+                    self._publish_conductor_delegation(updated)
+                    continue
+                failed = self.store.fail_conductor_delegation(
+                    delegation["delegation_id"],
+                    code=error.code,
+                    reason=error.detail,
+                )
+                self._publish_conductor_delegation(failed)
+                continue
+            if not isinstance(outcome, Mapping):
+                continue
+            progress = outcome.get("progress")
+            if isinstance(progress, Mapping):
+                updated = self.store.update_conductor_delegation_progress(
+                    delegation["delegation_id"], progress
+                )
+                self._publish_conductor_delegation(updated)
 
     def _resolve_project_master_delegation(
         self, event: Mapping[str, Any]
@@ -19751,7 +33596,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     request_id,
                     option_id,
                 )
-            if not self.room_participant_hosts.resolve_permission(
+            resolver = self.room_participant_permission_resolver
+            if resolver is None or not resolver(
                 binding_id,
                 request_id,
                 option_id,
@@ -19776,6 +33622,60 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return permission, changed
 
+    def _observe_multi_room_collection(
+        self,
+        message: Mapping[str, Any],
+        *,
+        result_event: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record redacted MultiRoom collection currentness for one write."""
+
+        room_id = str(message.get("room_id") or "")
+        message_id = str(message.get("message_id") or "")
+        if not room_id or not message_id:
+            return
+        try:
+            room = self.multi_rooms.get_room(room_id)
+            project_id = str(room.get("project_id") or "")
+            if not project_id:
+                return
+            self.store.record_semantic_collection_observation(
+                project_id=project_id,
+                source_kind="MULTI_ROOM_MESSAGE",
+                event_id=message_id,
+                event_type="MESSAGE",
+                source_material={
+                    "room_id": room_id,
+                    "message_id": message_id,
+                    "room_sequence": message.get("room_sequence"),
+                    "author_role": message.get("author_role"),
+                    "body_digest": _json_sha256(
+                        {"body_text": str(message.get("body_text") or "")}
+                    ),
+                },
+                observed_at=str(message.get("created_at") or "") or None,
+            )
+            if result_event is not None:
+                event_id = str(result_event.get("event_id") or "")
+                if event_id:
+                    self.store.record_semantic_collection_observation(
+                        project_id=project_id,
+                        source_kind="MULTI_ROOM_RESULT",
+                        event_id=event_id,
+                        event_type=str(result_event.get("event_type") or "RESULT"),
+                        source_material={
+                            "room_id": room_id,
+                            "event_id": event_id,
+                            "event_type": result_event.get("event_type"),
+                            "message_id": message_id,
+                            "severity": result_event.get("severity"),
+                        },
+                        observed_at=str(result_event.get("created_at") or "") or None,
+                    )
+        except (MultiRoomError, UniverseError):
+            # Collection observation never changes room delivery semantics.
+            return
+
     def _observe_native_room_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("event")
         room_id = event.get("room_id")
@@ -19795,6 +33695,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     provider_result={
                         "provider_session_ref": event.get("provider_session_ref"),
                         "observation": "NATIVE_PROVIDER_ACCEPTED",
+                    },
+                )
+                return
+            if event_type == "RESET":
+                self.multi_rooms.hub.publish(
+                    room_id,
+                    {
+                        "type": "PARTICIPANT_RESET",
+                        "binding_id": binding_id,
+                        "room_event_id": room_event_id,
                     },
                 )
                 return
@@ -19854,6 +33764,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "idempotency_key": provider_event_id,
                 },
             )
+            self._observe_multi_room_collection(message)
             self.multi_rooms.record_provider_observation(
                 binding_id,
                 provider_event_id,
@@ -19903,6 +33814,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def list_governance_proposal_inbox(self) -> list[dict[str, Any]]:
         proposals: list[dict[str, Any]] = []
         for project in self.store.list_projects():
+            # A stale registration must not make the global UI unavailable.
+            # Project-specific governance still reports its own missing root,
+            # while the aggregate inbox keeps serving every reachable project.
+            if not Path(project["project_root"]).expanduser().is_dir():
+                continue
             proposals.extend(
                 self.list_project_governance_proposals(project["project_id"])
             )
@@ -19915,6 +33831,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             reverse=True,
         )
+
+    def list_pending_governance_proposal_inbox(self) -> list[dict[str, Any]]:
+        pending: list[dict[str, Any]] = []
+        for proposal in self.list_governance_proposal_inbox():
+            if proposal.get("state") != "PROPOSED":
+                continue
+            decision = self.store.find_governance_proposal_decision(
+                proposal["project_id"], proposal["proposal_id"]
+            )
+            if (
+                decision is not None
+                and decision["decision"] == "CANCEL"
+                and decision["state"] == "APPLIED"
+            ):
+                continue
+            pending.append(proposal)
+        return pending
 
     def decide_project_governance_proposal(
         self,
@@ -19999,12 +33932,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     evidence_ref=decision["evidence_ref"],
                 )
             else:
-                decision_result = self.project_task_proposals.cancel(
-                    Path(project["project_root"]),
-                    proposal_id=proposal["proposal_id"],
-                    proposal_digest=proposal["proposal_digest"],
-                    evidence_ref=decision["evidence_ref"],
-                )
+                decision_result = {
+                    "schema": "universe.governance-proposal-dismissal.v1",
+                    "status": "TASK_PROPOSAL_DISMISSED",
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "evidence_ref": decision["evidence_ref"],
+                    "dismissed_at": utc_now(),
+                    "reference_proposal_state": proposal["state"],
+                    "reference_proposal_preserved": True,
+                }
         except ProjectMasterHostError as error:
             failed = self.store.fail_governance_proposal_decision(
                 decision["decision_id"],
@@ -20105,12 +34042,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "permission request already has another decision",
                 HTTPStatus.CONFLICT,
             )
-        if self.project_master_hosts is None or not (
-            self.project_master_hosts.resolve_permission(
-                project_id,
-                request_id,
-                decision["option_id"],
+        delivered = False
+        if self.project_master_hosts is not None:
+            delivered = bool(
+                self.project_master_hosts.resolve_permission(
+                    project_id,
+                    request_id,
+                    decision["option_id"],
+                )
             )
+        if not delivered and not permission_option_is_reject(
+            current, decision["option_id"]
         ):
             raise UniverseError(
                 "AGENT_PERMISSION_SESSION_UNAVAILABLE",
@@ -20321,10 +34263,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         target_session_anchor_ref = str(
             request.get("target_session_anchor_ref") or ""
         ).strip()
-        if not origin_session_anchor_ref or not target_session_anchor_ref:
+        target_session_action = str(
+            request.get("target_session_action") or "EXISTING"
+        ).upper()
+        progress = record.get("progress")
+        if not target_session_anchor_ref and isinstance(progress, Mapping):
+            target_session_anchor_ref = str(
+                progress.get("target_session_anchor_ref") or ""
+            ).strip()
+        if not origin_session_anchor_ref:
             raise UniverseError(
                 "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
-                "cross-session delegation requires both origin and target Session Anchors",
+                "cross-session delegation requires an origin Session Anchor",
                 HTTPStatus.CONFLICT,
             )
         project_id = _project_id(record.get("project_id"))
@@ -20337,8 +34287,58 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "delegation provider does not match the resident Project Master",
                     HTTPStatus.CONFLICT,
                 )
+        if not target_session_anchor_ref:
+            if target_session_action not in {"NEW", "RESUME"}:
+                raise UniverseError(
+                    "CONDUCTOR_DELEGATION_SESSION_LINEAGE_INVALID",
+                    "existing allocation requires a target Session Anchor",
+                    HTTPStatus.CONFLICT,
+                )
+            prepared = self.prepare_project_master_session(
+                project_id,
+                {"session_action": target_session_action},
+            )
+            connection = prepared.get("session_connection")
+            if not isinstance(connection, Mapping):
+                return {
+                    "progress": {
+                        "summary": (
+                            "Session allocation requested; awaiting a Session Anchor "
+                            "from the Session Card preparation path."
+                        ),
+                        "step": "WAITING_FOR_SESSION_ANCHOR",
+                    }
+                }
+            target_session_anchor_ref = str(
+                connection.get("session_anchor_ref") or ""
+            ).strip()
+            if not target_session_anchor_ref:
+                return {
+                    "progress": {
+                        "summary": (
+                            "Session allocation prepared; awaiting Session Anchor "
+                            "registration before delivery."
+                        ),
+                        "step": "WAITING_FOR_SESSION_ANCHOR",
+                    }
+                }
+            return {
+                "progress": {
+                    "summary": (
+                        "Session allocation prepared; awaiting the Session Hook to "
+                        "verify the exact vendor Session ID before delivery."
+                    ),
+                    "step": "WAITING_FOR_VENDOR_HOOK",
+                    "target_session_anchor_ref": target_session_anchor_ref,
+                }
+            }
         try:
-            return self.session_anchor_transport.deliver(record)
+            delivery_request = dict(request)
+            delivery_request["target_session_anchor_ref"] = target_session_anchor_ref
+            delivery_request["target_session_action"] = "EXISTING"
+            return self.session_anchor_transport.deliver(
+                {**dict(record), "request": delivery_request}
+            )
         except SessionAnchorTransportError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
@@ -20859,6 +34859,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "last_run": self._maintain_last_run,
         }
 
+    def _memory_batch_scheduler_loop(self) -> None:
+        while not self._memory_scheduler_stop.is_set():
+            try:
+                self._memory_scheduler_last_tick = self.memory_batch_scheduler.tick()
+            except Exception as error:  # noqa: BLE001 - scheduler remains observable
+                self._memory_scheduler_last_tick = {
+                    "schema": "universe.memory-batch-scheduler.v1",
+                    "status": "MEMORY_BATCH_SCHEDULER_TICK_FAILED",
+                    "observed_at": utc_now(),
+                    "error_code": str(
+                        getattr(error, "code", "") or type(error).__name__
+                    ),
+                }
+            self._memory_scheduler_wake.wait(
+                timeout=self._memory_scheduler_poll_seconds
+            )
+            self._memory_scheduler_wake.clear()
+
     def _memory_maintain_worker_loop(self) -> None:
         """In-process maintain batch. interval_hours 0 => idle recheck only."""
 
@@ -20942,7 +34960,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     break
 
     def adopt_runtime_executor(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Adopt one official Session Boot executor into the resident Supervisor."""
+        """Adopt one official persistent project runtime host into the resident Supervisor."""
 
         if not isinstance(body, Mapping):
             raise SessionSupervisorError(
@@ -21126,11 +35144,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "remote_access_resume_worker",
                 lambda: self._remote_access_resume_worker.join(timeout=5),
             )
+        self._goal_scheduler_stop.set()
+        self._goal_scheduler_wake.set()
+        if self._goal_scheduler_worker.is_alive():
+            close_step(
+                "goal_automation_scheduler",
+                lambda: self._goal_scheduler_worker.join(timeout=5),
+            )
         self._supervisor_maintenance_stop.set()
         if self._supervisor_maintenance_worker.is_alive():
             close_step(
                 "supervisor_maintenance_worker",
                 lambda: self._supervisor_maintenance_worker.join(timeout=5),
+            )
+        self.memory_batch_scheduler.stop_accepting()
+        self._memory_scheduler_stop.set()
+        self._memory_scheduler_wake.set()
+        if self._memory_scheduler_worker.is_alive():
+            close_step(
+                "memory_batch_scheduler",
+                lambda: self._memory_scheduler_worker.join(timeout=5),
             )
         self._maintain_stop.set()
         self._maintain_wake.set()
@@ -21171,10 +35204,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "provider_sessions",
             self.provider_sessions.close,
         )
-        close_step(
-            "room_participant_hosts",
-            self.room_participant_hosts.close,
-        )
         if self.project_master_hosts is not None:
             close_step("project_master_hosts", self.project_master_hosts.close)
             self.project_master_hosts = None
@@ -21195,6 +35224,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
             )
         close_step("http_server", super().server_close)
+        close_step(
+            "remote_connector",
+            lambda: stop_connector(self.remote_connector_state_path),
+        )
+        close_step(
+            "remote_gateway",
+            lambda: stop_gateway(self.remote_gateway_state_path),
+        )
         print(
             json.dumps(
                 {
@@ -21214,8 +35251,80 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path in {"/", "/app.js", "/styles.css"}:
+        if path in {"/", "/app.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js"}:
             self._send_static(path)
+            return
+        terminal_history = re.fullmatch(r"/v1/terminals/([^/]+)/history", path)
+        if terminal_history is not None:
+            if not self._authorize():
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                before_raw = str((query.get("before_cursor") or [""])[0]).strip()
+                before_cursor = int(before_raw) if before_raw else None
+                limit = int((query.get("limit") or ["100"])[0])
+                payload = self.server.terminal_host.history(
+                    unquote(terminal_history.group(1)),
+                    before_cursor=before_cursor,
+                    limit=limit,
+                )
+            except ValueError:
+                self._send_error(
+                    UniverseError(
+                        "TERMINAL_HISTORY_CURSOR_INVALID",
+                        "before_cursor and limit must be integers",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                )
+                return
+            except TerminalHostError as error:
+                self._send_error(
+                    UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND)
+                )
+                return
+            self._send(HTTPStatus.OK, payload)
+            return
+        if path.startswith("/v1/terminals/") and path.endswith("/stream"):
+            if not self._authorize():
+                return
+            self._upgrade_terminal_stream(unquote(path[len("/v1/terminals/") : -len("/stream")]))
+            return
+        if path == "/v1/terminals":
+            if not self._authorize():
+                return
+            self._send(HTTPStatus.OK, self.server.list_cli_terminals())
+            return
+        if path == "/v1/terminal-audit-events":
+            if not self._authorize():
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            self._send(
+                HTTPStatus.OK,
+                self.server.list_cli_terminal_audit_events(
+                    {key: values[0] for key, values in query.items() if values}
+                ),
+            )
+            return
+        if path in {
+            "/v1/session-bus/directory",
+            "/v1/session-bus/unread",
+            "/v1/session-bus/inbox",
+        }:
+            if not self._authorize():
+                return
+            try:
+                if path.endswith("/directory"):
+                    self._send(HTTPStatus.OK, self.server.session_bus_directory())
+                elif path.endswith("/unread"):
+                    self._send(HTTPStatus.OK, self.server.session_bus_unread())
+                else:
+                    query = {
+                        key: (values[0] if values else "")
+                        for key, values in parse_qs(urlsplit(self.path).query).items()
+                    }
+                    self._send(HTTPStatus.OK, self.server.session_bus_inbox(query))
+            except UniverseError as error:
+                self._send_error(error)
             return
         if path == "/health":
             self._send(
@@ -21306,11 +35415,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 {
                     "schema": API_SCHEMA,
                     "status": "GOVERNANCE_PROPOSAL_INBOX_COLLECTED",
-                    "proposals": [
-                        proposal
-                        for proposal in self.server.list_governance_proposal_inbox()
-                        if proposal.get("state") == "PROPOSED"
-                    ],
+                    "proposals": self.server.list_pending_governance_proposal_inbox(),
                 },
             )
             return
@@ -21355,7 +35460,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if path == "/v1/supervisor/sessions":
             query = parse_qs(urlsplit(self.path).query)
             try:
-                sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+                sweep = self.server._sweep_stale_live_sessions()
             except SessionSupervisorError as error:
                 sweep = {
                     "status": "LIVE_SESSION_SWEEP_FAILED",
@@ -21503,6 +35608,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        if path == "/v1/session-graph":
+            query = parse_qs(urlsplit(self.path).query)
+            graph = self.server.session_graph_projection(
+                project_id=query.get("project_id", [None])[0]
+            )
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": graph["status"],
+                    "graph": graph,
+                },
+            )
+            return
         if path == "/v1/runtime/audit":
             try:
                 self._send(HTTPStatus.OK, self.server.runtime_audit())
@@ -21556,9 +35675,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 query_map = parse_qs(urlsplit(self.path).query)
                 project_id = (query_map.get("project_id") or [None])[0]
                 room_type = (query_map.get("room_type") or [None])[0]
+                requested_state = str(
+                    (query_map.get("state") or ["OPEN"])[0] or "OPEN"
+                ).upper()
+                room_state = None if requested_state == "ALL" else requested_state
                 rooms = self.server.multi_rooms.list_rooms(
                     project_id=project_id or None,
                     room_type=room_type or None,
+                    state=room_state,
                 )
                 self._send(
                     HTTPStatus.OK,
@@ -21597,6 +35721,53 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "room_id": room_id,
                         "messages": self.server.multi_rooms.list_messages(room_id),
                     },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_findings = re.fullmatch(r"/v1/rooms/([^/]+)/findings$", path)
+        if room_findings is not None:
+            try:
+                room_id = unquote(room_findings.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_FINDINGS_COLLECTED",
+                        "room_id": room_id,
+                        "findings": self.server.multi_rooms.list_findings(room_id),
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_artifacts = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
+        if room_artifacts is not None:
+            try:
+                room_id = unquote(room_artifacts.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ROOM_ARTIFACTS_COLLECTED",
+                        "room_id": room_id,
+                        "artifacts": self.server.multi_rooms.list_artifacts(room_id),
+                    },
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        room_artifact = re.fullmatch(
+            r"/v1/rooms/([^/]+)/artifacts/([^/]+)$", path
+        )
+        if room_artifact is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.multi_rooms.get_artifact(
+                        unquote(room_artifact.group(1)),
+                        unquote(room_artifact.group(2)),
+                    ),
                 )
             except MultiRoomError as error:
                 self._send_multi_room_error(error)
@@ -21730,6 +35901,171 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/universe-goals":
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "UNIVERSE_GOAL_PLAN_COLLECTED",
+                        "goals": self.server.store.list_universe_goals(),
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        feature_meeting_summary = re.fullmatch(
+            r"/v1/feature-nodes/([^/]+)/meeting-runs/([^/]+)", path
+        )
+        if feature_meeting_summary is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.feature_meeting_summary(
+                        unquote(feature_meeting_summary.group(1)),
+                        unquote(feature_meeting_summary.group(2)),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        goal_work_plans = re.fullmatch(r"/v1/goals/([^/]+)/work-plans", path)
+        if goal_work_plans is not None:
+            try:
+                self._send(HTTPStatus.OK, self.server.store.goal_work_plan_surface(unquote(goal_work_plans.group(1))))
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        goal_automation = re.fullmatch(r"/v1/goals/([^/]+)/automation", path)
+        if goal_automation is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.goal_automation_surface(
+                        unquote(goal_automation.group(1))
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        proposal_planning_context = re.fullmatch(
+            r"/v1/feature-node-proposals/([^/]+)/planning-context", path
+        )
+        if proposal_planning_context is not None:
+            try:
+                proposal_id = unquote(proposal_planning_context.group(1))
+                context = self.server.store.find_node_planning_context_for_proposal(
+                    proposal_id
+                )
+                if context is None:
+                    raise UniverseError(
+                        "NODE_PLANNING_CONTEXT_NOT_FOUND",
+                        "Node Planning Context does not exist",
+                        HTTPStatus.NOT_FOUND,
+                    )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "NODE_PLANNING_CONTEXT_COLLECTED",
+                        "planning_context": context,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        feature_proposal_detail = re.fullmatch(
+            r"/v1/feature-node-proposals/([^/]+)", path
+        )
+        if feature_proposal_detail is not None:
+            try:
+                proposal = self.server.store.get_feature_node_proposal(
+                    unquote(feature_proposal_detail.group(1))
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_PROPOSAL_COLLECTED",
+                        "proposal": proposal,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_feature_proposals = re.fullmatch(
+            r"/v1/projects/([^/]+)/feature-node-proposals", path
+        )
+        if project_feature_proposals is not None:
+            try:
+                project_id = unquote(project_feature_proposals.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_PROPOSALS_COLLECTED",
+                        "project_id": project_id,
+                        "proposals": self.server.store.list_feature_node_proposals(
+                            project_id
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
+        if feature_detail is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_COLLECTED",
+                        "feature": self.server.store.get_feature_node(unquote(feature_detail.group(1))),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_features = re.fullmatch(r"/v1/projects/([^/]+)/feature-nodes", path)
+        if project_features is not None:
+            try:
+                project_id = unquote(project_features.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODES_COLLECTED",
+                        "project_id": project_id,
+                        "features": self.server.store.list_feature_nodes(project_id),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_work_surface = re.fullmatch(r"/v1/projects/([^/]+)/work-surface", path)
+        if project_work_surface is not None:
+            try:
+                query = parse_qs(urlsplit(self.path).query)
+                node_ref = str(query.get("node_ref", [""])[0]).strip() or None
+                surface = self.server.store.project_work_surface(
+                    unquote(project_work_surface.group(1)), node_ref=node_ref
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_WORK_SURFACE_COLLECTED",
+                        "work_surface": surface,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         project_goals = re.fullmatch(r"/v1/projects/([^/]+)/goals", path)
         if project_goals is not None:
             try:
@@ -21780,6 +36116,52 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/skill-registry-snapshots":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_REGISTRY_SNAPSHOTS_COLLECTED",
+                    "snapshots": self.server.store.list_skill_registry_snapshots(),
+                },
+            )
+            return
+        if path == "/v1/skill-pack-artifacts":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_PACK_ARTIFACTS_COLLECTED",
+                    "artifacts": self.server.store.list_skill_pack_artifacts(),
+                },
+            )
+            return
+        if path == "/v1/skill-release-adoptions":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "SKILL_RELEASE_ADOPTIONS_COLLECTED",
+                    "adoptions": self.server.store.list_skill_release_adoptions(),
+                },
+            )
+            return
+        skill_resolution_get = re.fullmatch(r"/v1/skill-resolutions/([^/]+)", path)
+        if skill_resolution_get is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RESOLUTION_COLLECTED",
+                        "resolution": self.server.store.get_skill_resolution(
+                            unquote(skill_resolution_get.group(1))
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path == "/v1/session-observer/sources":
             sources = [
                 _public_provider_source(source)
@@ -21803,6 +36185,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 if provider_session_get.group(2):
                     self._stream_provider_session(chat_key)
                 else:
+                    self.server.hydrate_provider_session_transcript(chat_key)
                     self._send(
                         HTTPStatus.OK,
                         self.server.provider_sessions.snapshot(chat_key),
@@ -22045,6 +36428,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if suffix == "":
                 self._send(HTTPStatus.OK, self.server.store.get_project(project_id))
                 return
+            if suffix == "/file-index":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.project_file_index_status(project_id),
+                )
+                return
             if suffix == "/integration-template-proposal":
                 self.server.store.get_project(project_id)
                 self._send(
@@ -22119,6 +36508,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "observations": self.server.store.list_skill_observations(
                             project_id
                         ),
+                    },
+                )
+                return
+            if suffix == "/skill-gap-summary":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_GAP_SUMMARY_COLLECTED",
+                        "summary": self.server.store.skill_gap_summary(project_id),
+                    },
+                )
+                return
+            if suffix == "/skill-candidates":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_SKILL_CANDIDATES_COLLECTED",
+                        "project_id": project_id,
+                        "candidates": self.server.store.list_skill_candidates(project_id),
                     },
                 )
                 return
@@ -22229,6 +36639,49 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "status": "PROJECT_EXPERIENCE_CASES_COLLECTED",
                         "project_id": project_id,
                         "cases": self.server.store.list_experience_cases(project_id),
+                    },
+                )
+                return
+            if suffix == "/semantic-graph":
+                self._send(HTTPStatus.OK, self.server.store.semantic_project_graph(project_id))
+                return
+            if suffix == "/anchor-sessions":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.list_project_anchor_sessions(project_id),
+                )
+                return
+            if suffix == "/git-work-history":
+                query_map = parse_qs(urlsplit(self.path).query)
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.list_git_work_history(
+                        project_id,
+                        session_anchor_ref=(
+                            query_map.get("session_anchor_ref") or [""]
+                        )[0],
+                    ),
+                )
+                return
+            if suffix == "/work-loop":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.work_loop_snapshot(project_id),
+                    },
+                )
+                return
+            if suffix == "/work-loop/predictions":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "WORK_LOOP_PREDICTIONS_COLLECTED",
+                        "project_id": project_id,
+                        "predictions": self.server.store.list_work_loop_predictions(
+                            project_id
+                        ),
                     },
                 )
                 return
@@ -22417,6 +36870,81 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/terminals":
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.create_cli_terminal(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        terminal_terminate = re.fullmatch(r"/v1/terminals/([^/]+)/terminate", path)
+        if terminal_terminate is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.terminate_cli_terminal(
+                        unquote(terminal_terminate.group(1))
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path == "/v1/session-bus/messages":
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.post_session_bus_message(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_ack = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/ack", path
+        )
+        if session_bus_ack is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.ack_session_bus_message(
+                        unquote(session_bus_ack.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_state = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/state", path
+        )
+        if session_bus_state is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.transition_session_bus_message(
+                        unquote(session_bus_state.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_reply = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/reply", path
+        )
+        if session_bus_reply is not None:
+            try:
+                self._send(
+                    HTTPStatus.CREATED,
+                    self.server.reply_session_bus_message(
+                        unquote(session_bus_reply.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path.startswith("/v1/settings/remote-access/") and not (
             self._authorize_local_operator()
         ):
@@ -22826,7 +37354,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     keep_states = frozenset({"LIVE", "STARTING"})
                 # Always sweep zombie LIVE first so dead PIDs can be purged.
                 try:
-                    sweep = self.server.session_supervisor.sweep_stale_live_sessions()
+                    sweep = self.server._sweep_stale_live_sessions()
                 except SessionSupervisorError as error:
                     sweep = {
                         "status": "LIVE_SESSION_SWEEP_FAILED",
@@ -22980,13 +37508,104 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return
+            meeting_provider_attach = re.fullmatch(
+                r"/v1/rooms/([^/]+)/provider-sessions$", path
+            )
+            if meeting_provider_attach is not None:
+                try:
+                    self._send(
+                        HTTPStatus.CREATED,
+                        self.server.attach_meeting_provider_session(
+                            unquote(meeting_provider_attach.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except (MultiRoomError, ProviderSessionError) as error:
+                    if isinstance(error, MultiRoomError):
+                        self._send_multi_room_error(error)
+                    else:
+                        self._send_provider_session_error(error)
+                return
+            meeting_fresh_sessions = re.fullmatch(
+                r"/v1/rooms/([^/]+)/fresh-provider-sessions$", path
+            )
+            if meeting_fresh_sessions is not None:
+                try:
+                    self._send(
+                        HTTPStatus.CREATED,
+                        self.server.create_fresh_meeting_sessions(
+                            unquote(meeting_fresh_sessions.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            feature_meeting_cancel = re.fullmatch(
+                r"/v1/feature-nodes/([^/]+)/meeting-runs/([^/]+)/cancel$", path
+            )
+            if feature_meeting_cancel is not None:
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.cancel_feature_meeting(
+                            unquote(feature_meeting_cancel.group(1)),
+                            unquote(feature_meeting_cancel.group(2)),
+                            body or {},
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            feature_meeting_run = re.fullmatch(
+                r"/v1/feature-nodes/([^/]+)/meeting-runs$", path
+            )
+            if feature_meeting_run is not None:
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.run_feature_meeting(
+                            unquote(feature_meeting_run.group(1)), body or {}
+                        ),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
+            provider_chat_attach = re.fullmatch(
+                r"/v1/session-observer/chat-rooms/([^/]+)/attach$", path
+            )
+            if provider_chat_attach is not None:
+                try:
+                    result = self.server.attach_provider_chat_room(
+                        unquote(provider_chat_attach.group(1)),
+                        body or {},
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except UniverseError as error:
+                    self._send_error(error)
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                except SessionSupervisorError as error:
+                    self._send_supervisor_error(error)
+                return
             if path == "/v1/sessions/inject":
                 try:
                     result = perform_session_ref_inject(
                         session_supervisor=self.server.session_supervisor,
                         multi_rooms=self.server.multi_rooms,
                         body=body or {},
+                        terminal_host=self.server.terminal_host,
                     )
+                    hook_observation = self.server.record_session_hook_observation(
+                        body or {}, result
+                    )
+                    if hook_observation is not None:
+                        result["hook_observation"] = hook_observation
+                        result["pending_instruction_dispatch"] = (
+                            hook_observation.get("pending_instruction_dispatch")
+                        )
                     self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
@@ -23005,12 +37624,97 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
                 return
+            room_finding_post = re.fullmatch(r"/v1/rooms/([^/]+)/findings$", path)
+            if room_finding_post is not None:
+                try:
+                    finding_body = dict(body or {})
+                    finding_body["author_role"] = "USER"
+                    finding = self.server.multi_rooms.record_finding(
+                        unquote(room_finding_post.group(1)), finding_body
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_FINDING_RECORDED",
+                            "finding": finding,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_finding_state_post = re.fullmatch(
+                r"/v1/rooms/([^/]+)/findings/([^/]+)/state$", path
+            )
+            if room_finding_state_post is not None:
+                try:
+                    finding_body = dict(body or {})
+                    finding_body["author_role"] = "USER"
+                    finding = self.server.multi_rooms.update_finding_state(
+                        unquote(room_finding_state_post.group(1)),
+                        unquote(room_finding_state_post.group(2)),
+                        finding_body,
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_FINDING_STATE_CHANGED",
+                            "finding": finding,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_artifact_revision_post = re.fullmatch(
+                r"/v1/rooms/([^/]+)/artifacts/([^/]+)/revisions$", path
+            )
+            if room_artifact_revision_post is not None:
+                try:
+                    revision_body = dict(body or {})
+                    revision_body["author_role"] = "USER"
+                    artifact = self.server.multi_rooms.revise_artifact(
+                        unquote(room_artifact_revision_post.group(1)),
+                        unquote(room_artifact_revision_post.group(2)),
+                        revision_body,
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_ARTIFACT_REVISED",
+                            "artifact": artifact,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
+            room_artifact_post = re.fullmatch(r"/v1/rooms/([^/]+)/artifacts$", path)
+            if room_artifact_post is not None:
+                try:
+                    artifact_body = dict(body or {})
+                    artifact_body["author_role"] = "USER"
+                    artifact = self.server.multi_rooms.create_artifact(
+                        unquote(room_artifact_post.group(1)), artifact_body
+                    )
+                    self._send(
+                        HTTPStatus.CREATED,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ROOM_ARTIFACT_RECORDED",
+                            "artifact": artifact,
+                        },
+                    )
+                except MultiRoomError as error:
+                    self._send_multi_room_error(error)
+                return
             room_message_post = re.fullmatch(r"/v1/rooms/([^/]+)/messages$", path)
             if room_message_post is not None:
                 try:
                     message = self.server.multi_rooms.post_message(
                         unquote(room_message_post.group(1)), body or {}
                     )
+                    self.server._observe_multi_room_collection(message)
                     delivery = self.server.multi_room_delivery.deliver_room(
                         message["room_id"]
                     )
@@ -23180,6 +37884,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     result = self.server.multi_rooms.worker_report(
                         unquote(room_worker_report.group(1)), body or {}
                     )
+                    self.server._observe_multi_room_collection(
+                        result["message"], result_event=result["event"]
+                    )
                     self._send(HTTPStatus.CREATED, {"schema": API_SCHEMA, **result})
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
@@ -23187,16 +37894,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             room_close = re.fullmatch(r"/v1/rooms/([^/]+)/close$", path)
             if room_close is not None:
                 try:
-                    room = self.server.multi_rooms.close_room(
-                        unquote(room_close.group(1))
-                    )
                     self._send(
                         HTTPStatus.OK,
-                        {
-                            "schema": API_SCHEMA,
-                            "status": "ROOM_CLOSED",
-                            "room": room,
-                        },
+                        self.server.close_multi_room(unquote(room_close.group(1))),
                     )
                 except MultiRoomError as error:
                     self._send_multi_room_error(error)
@@ -23304,6 +38004,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 except UniverseError as error:
                     self._send_error(error)
                 return
+            if path == "/v1/settings/setup-provider-hooks":
+                try:
+                    self._send(
+                        HTTPStatus.OK,
+                        self.server.setup_provider_hooks(body),
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                return
             host_tool_match = re.fullmatch(
                 r"/v1/settings/host-tools/([^/]+)/(select|verify|model)",
                 path,
@@ -23342,6 +38051,97 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/v1/host/select-directory":
+                try:
+                    selected = self.server.directory_selector()
+                    directory = None
+                    if selected:
+                        selected_path = (
+                            Path(selected).expanduser().resolve(strict=True)
+                        )
+                        if not selected_path.is_dir():
+                            raise UniverseError(
+                                "HOST_DIRECTORY_SELECTION_INVALID",
+                                "selected path must be an existing directory",
+                            )
+                        directory = str(selected_path)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "DIRECTORY_SELECTED"
+                                if directory is not None
+                                else "DIRECTORY_SELECTION_CANCELLED"
+                            ),
+                            "directory": directory,
+                        },
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except Exception as error:
+                    self._send_error(
+                        UniverseError(
+                            "HOST_DIRECTORY_PICKER_UNAVAILABLE",
+                            f"native directory picker is unavailable: {error}",
+                        )
+                    )
+                return
+            if path == "/v1/host/select-file":
+                try:
+                    kind = _required_text(body.get("kind"), "kind")
+                    selected = self.server.file_selector(kind)
+                    file_path = None
+                    if selected:
+                        selected_path = Path(selected).expanduser().resolve(strict=True)
+                        if not selected_path.is_file():
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_INVALID",
+                                "selected path must be an existing file",
+                            )
+                        allowed_suffix = {
+                            "RELEASE_DATABASE": ".sqlite3",
+                            "RELEASE_MANIFEST": ".json",
+                        }.get(kind)
+                        if allowed_suffix is None:
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_KIND_INVALID",
+                                "file selection kind is invalid",
+                            )
+                        if selected_path.suffix.lower() != allowed_suffix:
+                            raise UniverseError(
+                                "HOST_FILE_SELECTION_INVALID",
+                                f"selected file must use the {allowed_suffix} extension",
+                            )
+                        file_path = str(selected_path)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": (
+                                "FILE_SELECTED"
+                                if file_path is not None
+                                else "FILE_SELECTION_CANCELLED"
+                            ),
+                            "file": file_path,
+                        },
+                    )
+                except UniverseError as error:
+                    self._send_error(error)
+                except Exception as error:
+                    self._send_error(
+                        UniverseError(
+                            "HOST_FILE_PICKER_UNAVAILABLE",
+                            f"native file picker is unavailable: {error}",
+                        )
+                    )
+                return
+            if path == "/v1/project-connections/prepare":
+                self._send(HTTPStatus.OK, self.server.prepare_project_connection(body))
+                return
+            if path == "/v1/project-connections/apply":
+                self._send(HTTPStatus.OK, self.server.apply_project_connection(body))
+                return
             if path == "/v1/projects/register":
                 project, created = self.server.store.register_project(body)
                 self._send(
@@ -23352,6 +38152,278 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         if created
                         else "PROJECT_REFRESHED",
                         "project": project,
+                    },
+                )
+                return
+            project_feature_proposal_generation = re.fullmatch(
+                r"/v1/projects/([^/]+)/feature-node-proposals/generate", path
+            )
+            if project_feature_proposal_generation is not None:
+                if body != {}:
+                    raise UniverseError(
+                        "FEATURE_NODE_PROPOSAL_GENERATION_INVALID",
+                        "proposal generation body must be an empty object",
+                    )
+                result = self.server.store.generate_feature_node_proposals(
+                    unquote(project_feature_proposal_generation.group(1))
+                )
+                self._send(
+                    HTTPStatus.CREATED
+                    if result["created_count"]
+                    else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_PROPOSALS_RECORDED"
+                            if result["created_count"]
+                            else "FEATURE_NODE_PROPOSALS_REPLAYED"
+                        ),
+                        **result,
+                    },
+                )
+                return
+            feature_proposal_explorations = re.fullmatch(
+                r"/v1/feature-node-proposals/([^/]+)/explorations", path
+            )
+            if feature_proposal_explorations is not None:
+                (
+                    context,
+                    feature,
+                    room,
+                    created,
+                    feature_created,
+                    room_created,
+                ) = (
+                    self.server.store.explore_feature_node_proposal(
+                        unquote(feature_proposal_explorations.group(1)), body
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_EXPLORATION_STARTED"
+                            if created
+                            else "FEATURE_NODE_EXPLORATION_REPLAYED"
+                        ),
+                        "planning_context": context,
+                        "feature": feature,
+                        "room": room,
+                        "feature_node_created": feature_created,
+                        "meeting_room_created": room_created,
+                        "planning_context_created": created,
+                        "goal_created": False,
+                        "todo_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                        "rag_adopted": False,
+                    },
+                )
+                return
+            feature_proposal_reviews = re.fullmatch(
+                r"/v1/feature-node-proposals/([^/]+)/reviews", path
+            )
+            if feature_proposal_reviews is not None:
+                proposal, changed = self.server.store.review_feature_node_proposal(
+                    unquote(feature_proposal_reviews.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "FEATURE_NODE_PROPOSAL_REVIEW_RECORDED"
+                            if changed
+                            else "FEATURE_NODE_PROPOSAL_REVIEW_REPLAYED"
+                        ),
+                        "proposal": proposal,
+                        "feature_node_created": False,
+                        "goal_created": False,
+                        "todo_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                        "rag_adopted": False,
+                    },
+                )
+                return
+            project_features = re.fullmatch(r"/v1/projects/([^/]+)/feature-nodes", path)
+            if project_features is not None:
+                feature, created = self.server.store.create_feature_node(
+                    unquote(project_features.group(1)), {**body, "created_by_role": "USER"}
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "FEATURE_NODE_RECORDED" if created else "FEATURE_NODE_REPLAYED", "feature": feature},
+                )
+                return
+            expected_paths = re.fullmatch(r"/v1/feature-nodes/([^/]+)/expected-paths", path)
+            if expected_paths is not None:
+                expected_path, created = self.server.store.create_feature_expected_path(
+                    unquote(expected_paths.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "EXPECTED_PATH_RECORDED" if created else "EXPECTED_PATH_REPLAYED", "expected_path": expected_path},
+                )
+                return
+            feature_adoptions = re.fullmatch(r"/v1/feature-nodes/([^/]+)/adoptions", path)
+            if feature_adoptions is not None:
+                adoption, created = self.server.store.adopt_feature_expected_path(
+                    unquote(feature_adoptions.group(1)), {**body, "adopted_by_role": "USER"}
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_adoptions.group(1)))
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "EXPECTED_PATH_ADOPTED" if created else "EXPECTED_PATH_ADOPTION_REPLAYED", "adoption": adoption, "feature": feature},
+                )
+                return
+            feature_goals = re.fullmatch(r"/v1/feature-nodes/([^/]+)/goals", path)
+            if feature_goals is not None:
+                derivation, goal, created = self.server.store.materialize_feature_goal(
+                    unquote(feature_goals.group(1)),
+                    {**body, "created_by_role": "USER"},
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_goals.group(1)))
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_GOAL_MATERIALIZED" if created else "FEATURE_GOAL_REPLAYED",
+                        "feature": feature,
+                        "derivation": derivation,
+                        "goal": goal,
+                        "goal_created": created,
+                        "todo_created": False,
+                        "milestone_created": False,
+                        "task_frame_created": False,
+                        "authority_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            feature_goal_starts = re.fullmatch(r"/v1/feature-nodes/([^/]+)/goal-start-receipts", path)
+            if feature_goal_starts is not None:
+                receipt, adoption, derivation, goal, created = self.server.store.start_feature_goal(
+                    unquote(feature_goal_starts.group(1)),
+                    {**body, "started_by_role": "USER"},
+                )
+                feature = self.server.store.get_feature_node(unquote(feature_goal_starts.group(1)))
+                plan_materialization, _plan_created = self.server.store.materialize_goal_start_work_plan(
+                    goal["goal_id"]
+                )
+                try:
+                    automation = self.server.advance_goal_automation(
+                        goal["goal_id"],
+                        {"approval": "ADVANCE", "expected_goal_revision": goal["revision"]},
+                    )
+                except UniverseError as error:
+                    automation = {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_BLOCKED",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                        "surface": self.server.goal_automation_surface(goal["goal_id"]),
+                    }
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_GOAL_STARTED" if created else "FEATURE_GOAL_START_REPLAYED",
+                        "feature": feature,
+                        "goal_start_receipt": receipt,
+                        "adoption": adoption,
+                        "derivation": derivation,
+                        "goal": goal,
+                        "plan_materialization": plan_materialization,
+                        "automation": automation,
+                        "goal_created": created,
+                        "authority_created": created,
+                        "execution_assignment_created": False,
+                        "task_frame_created": False,
+                        "rag_adopted": False,
+                        "repository_pushed": False,
+                        "next_operation": automation["surface"]["next_operation"],
+                    },
+                )
+                return
+            goal_work_plan_runs = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-runs", path)
+            if goal_work_plan_runs is not None:
+                self._send(HTTPStatus.OK, self.server.run_goal_work_plan_meeting(unquote(goal_work_plan_runs.group(1)), body))
+                return
+            goal_work_plan_adoptions = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-adoptions", path)
+            if goal_work_plan_adoptions is not None:
+                adoption, created = self.server.store.adopt_goal_work_plan(unquote(goal_work_plan_adoptions.group(1)), {**body, "adopted_by_role":"USER"})
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK,{"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_ADOPTED" if created else "GOAL_WORK_PLAN_ADOPTION_REPLAYED","adoption":adoption,"surface":self.server.store.goal_work_plan_surface(unquote(goal_work_plan_adoptions.group(1))),"milestone_created":False,"todo_created":False,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False})
+                return
+            goal_work_plan_applications = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-applications", path)
+            if goal_work_plan_applications is not None:
+                application, created = self.server.store.apply_goal_work_plan(unquote(goal_work_plan_applications.group(1)), {**body, "applied_by_role":"USER"})
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK,{"schema":API_SCHEMA,"status":"GOAL_WORK_PLAN_APPLIED" if created else "GOAL_WORK_PLAN_APPLICATION_REPLAYED","application":application,"surface":self.server.store.goal_work_plan_surface(unquote(goal_work_plan_applications.group(1))),"milestone_created":created,"todo_created":created,"task_frame_created":False,"authority_created":False,"execution_assignment_created":False})
+                return
+            goal_automation_advance = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/advance", path
+            )
+            if goal_automation_advance is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.advance_goal_automation(
+                        unquote(goal_automation_advance.group(1)), body
+                    ),
+                )
+                return
+            goal_automation_scheduler = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/scheduler", path
+            )
+            if goal_automation_scheduler is not None:
+                raise UniverseError(
+                    "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_REQUIRED",
+                    "Scheduler START/PAUSE requires the current Session Anchor prepare/consume route",
+                    HTTPStatus.CONFLICT,
+                )
+            goal_todo_selection = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/todo-selection", path
+            )
+            if goal_todo_selection is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.select_goal_todos_for_execution(
+                        unquote(goal_todo_selection.group(1)), body
+                    ),
+                )
+                return
+            goal_todo_result = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/todo-results", path
+            )
+            if goal_todo_result is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.apply_goal_task_frame_todo_result(
+                        unquote(goal_todo_result.group(1)), body
+                    ),
+                )
+                return
+            todo_action_match = re.fullmatch(
+                r"/v1/todos/([^/]+)/actions", path
+            )
+            if todo_action_match is not None:
+                raise UniverseError(
+                    "TODO_ACTION_MUTATION_RECEIPT_REQUIRED",
+                    "Todo actions require the current Session Anchor prepare/consume route",
+                    HTTPStatus.CONFLICT,
+                )
+            if path == "/v1/universe-goals":
+                goal = self.server.store.create_universe_goal(body)
+                self._send(
+                    HTTPStatus.CREATED,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "UNIVERSE_GOAL_RECORDED",
+                        "goal": goal,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
                     },
                 )
                 return
@@ -23395,6 +38467,213 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "schema": API_SCHEMA,
                         "status": "TODO_RECORDED",
                         "todo": todo,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            if path == "/v1/intent-decisions":
+                decision, created = self.server.store.create_intent_decision(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "INTENT_DECISION_RECORDED" if created else "INTENT_DECISION_ALREADY_RECORDED",
+                        "decision": decision,
+                    },
+                )
+                return
+            if path == "/v1/skill-registry-snapshots":
+                snapshot, created = self.server.store.register_skill_registry_snapshot(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_REGISTRY_SNAPSHOT_RECORDED" if created else "SKILL_REGISTRY_SNAPSHOT_ALREADY_RECORDED",
+                        "snapshot": snapshot,
+                    },
+                )
+                return
+            if path == "/v1/skill-pack-artifacts":
+                artifact, created = self.server.store.import_skill_pack_artifact(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_PACK_ARTIFACT_IMPORTED" if created else "SKILL_PACK_ARTIFACT_ALREADY_IMPORTED",
+                        "artifact": artifact,
+                    },
+                )
+                return
+            if path == "/v1/skill-release-adoptions":
+                adoption, created = self.server.store.adopt_skill_release(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RELEASE_ADOPTED" if created else "SKILL_RELEASE_ALREADY_ADOPTED",
+                        "adoption": adoption,
+                    },
+                )
+                return
+            if path == "/v1/skill-resolutions":
+                resolution, created = self.server.store.create_skill_resolution(body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_RESOLUTION_RECORDED" if created else "SKILL_RESOLUTION_ALREADY_RECORDED",
+                        "resolution": resolution,
+                    },
+                )
+                return
+            skill_fallback = re.fullmatch(r"/v1/skill-resolutions/([^/]+)/fallback", path)
+            if skill_fallback is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_FALLBACK_COMPLETED",
+                        "result": self.server.store.run_skill_resolution_fallback(
+                            unquote(skill_fallback.group(1)), body
+                        ),
+                    },
+                )
+                return
+
+            if path == "/v1/goal-automation-scheduler-mutation-receipts":
+                request = normalize_goal_automation_scheduler_mutation_request(
+                    body
+                )
+                self.server.resolve_goal_automation_scheduler_mutation_session(
+                    request
+                )
+                receipt, created = (
+                    self.server.store.prepare_goal_automation_scheduler_mutation_receipt(
+                        request
+                    )
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            goal_scheduler_mutation_consume = re.fullmatch(
+                r"/v1/goal-automation-scheduler-mutation-receipts/([^/]+)/consume",
+                path,
+            )
+            if goal_scheduler_mutation_consume is not None:
+                request = normalize_goal_automation_scheduler_mutation_request(
+                    body
+                )
+                self.server.resolve_goal_automation_scheduler_mutation_session(
+                    request
+                )
+                receipt, scheduler, replayed = (
+                    self.server.store.consume_goal_automation_scheduler_mutation_receipt(
+                        unquote(goal_scheduler_mutation_consume.group(1)),
+                        request,
+                    )
+                )
+                if request["scheduler"]["action"] == "START":
+                    self.server._goal_scheduler_wake.set()
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "GOAL_AUTOMATION_SCHEDULER_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "scheduler": scheduler,
+                        "surface": self.server.goal_automation_surface(
+                            request["goal_id"]
+                        ),
+                        "replayed": replayed,
+                        "effects": {
+                            "task_frame_run": "NONE",
+                            "todo_state_change": "NONE",
+                            "authority_created": False,
+                            "execution_assignment_created": False,
+                        },
+                    },
+                )
+                return
+
+            if path == "/v1/todo-action-mutation-receipts":
+                request = normalize_todo_action_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, created = self.server.store.prepare_todo_action_mutation_receipt(
+                    request
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_ACTION_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            todo_action_mutation_consume = re.fullmatch(
+                r"/v1/todo-action-mutation-receipts/([^/]+)/consume", path
+            )
+            if todo_action_mutation_consume is not None:
+                request = normalize_todo_action_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, result, replayed = (
+                    self.server.store.consume_todo_action_mutation_receipt(
+                        unquote(todo_action_mutation_consume.group(1)), request
+                    )
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_ACTION_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "action": result,
+                        "todo": result["todo"],
+                        "replayed": replayed,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            if path == "/v1/todo-mutation-receipts":
+                request = normalize_todo_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, created = self.server.store.prepare_todo_mutation_receipt(
+                    request
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_MUTATION_RECEIPT_PREPARED",
+                        "receipt": receipt,
+                    },
+                )
+                return
+            todo_mutation_consume = re.fullmatch(
+                r"/v1/todo-mutation-receipts/([^/]+)/consume", path
+            )
+            if todo_mutation_consume is not None:
+                request = normalize_todo_mutation_request(body)
+                self.server.resolve_todo_mutation_session(request)
+                receipt, todo, replayed = self.server.store.consume_todo_mutation_receipt(
+                    unquote(todo_mutation_consume.group(1)), request
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_MUTATION_APPLIED",
+                        "receipt": receipt,
+                        "todo": todo,
+                        "replayed": replayed,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
                     },
@@ -23812,6 +39091,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     result,
                 )
                 return
+            handoff_frame_parts = self._goal_handoff_task_frame_path(path)
+            if handoff_frame_parts is not None:
+                result, created = self.server.create_goal_handoff_instruction_task_frame(
+                    handoff_frame_parts[0], handoff_frame_parts[1], body
+                )
+                self._send(HTTPStatus.CREATED if created else HTTPStatus.OK, result)
+                return
             conductor_permission_id = self._conductor_permission_path(path)
             if conductor_permission_id is not None:
                 permission, changed = self.server.resolve_conductor_permission(
@@ -23897,7 +39183,20 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             instruction_task_frame_parts = self._instruction_authorized_task_frame_path(
                 path
             )
+            instruction_task_frame_run_parts = (
+                self._instruction_authorized_task_frame_run_path(path)
+            )
             approved_task_frame_run_parts = self._approved_descendant_task_frame_run_path(path)
+            if instruction_task_frame_run_parts is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.run_instruction_authorized_task_frame(
+                        instruction_task_frame_run_parts[0],
+                        instruction_task_frame_run_parts[1],
+                        instruction_task_frame_run_parts[2],
+                    ),
+                )
+                return
             if approved_task_frame_run_parts is not None:
                 self._send(
                     HTTPStatus.OK,
@@ -24155,6 +39454,32 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/skill-gap-observations":
+                observation, created = self.server.store.create_skill_gap_observation(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_GAP_OBSERVATION_RECORDED" if created else "SKILL_GAP_OBSERVATION_ALREADY_RECORDED",
+                        "observation": observation,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/skill-candidates":
+                candidate, created = self.server.store.create_skill_candidate(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "SKILL_CANDIDATE_RECORDED" if created else "SKILL_CANDIDATE_ALREADY_RECORDED",
+                        "candidate": candidate,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/skill-observation-queue":
                 item, created = self.server.store.enqueue_skill_observations(
                     parts[0], body
@@ -24170,6 +39495,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         ),
                         "item": item,
                     },
+                )
+                return
+            if parts is not None and parts[1] == "/file-index/sync":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.sync_project_file_index(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/file-index/search":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.search_project_file_index(parts[0], body),
+                )
+                return
+            if parts is not None and parts[1] == "/retrieval-context":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.store.project_retrieval_context(parts[0], body),
                 )
                 return
             if parts is not None and parts[1] == "/context-packs":
@@ -24248,6 +39591,70 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "EXPERIENCE_CASE_ALREADY_RECORDED"
                         ),
                         "case": case,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/predictions":
+                proposal, created = self.server.store.propose_work_loop_predictions(
+                    parts[0]
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "WORK_LOOP_PREDICTION_RECORDED"
+                            if created
+                            else "WORK_LOOP_PREDICTION_ALREADY_RECORDED"
+                        ),
+                        "prediction": proposal,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/predictions/review":
+                prediction, changed = self.server.store.review_work_loop_prediction(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "WORK_LOOP_PREDICTION_REVIEW_RECORDED"
+                            if changed
+                            else "WORK_LOOP_PREDICTION_REVIEW_ALREADY_RECORDED"
+                        ),
+                        "prediction": prediction,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/review-candidates/review":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "WORK_LOOP_REVIEW_INVALID", "review body must be an object"
+                    )
+                candidate = self.server.store.review_work_loop_candidate(
+                    parts[0],
+                    str(body.get("candidate_id") or ""),
+                    str(body.get("decision") or ""),
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": candidate.pop("status"),
+                        "candidate": candidate,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/work-loop/recover":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        **self.server.store.recover_interrupted_work_loop_todos(
+                            parts[0]
+                        ),
                     },
                 )
                 return
@@ -24581,6 +39988,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         try:
             body = self._read_json()
+            universe_goal_match = re.fullmatch(r"/v1/universe-goals/([^/]+)", path)
+            if universe_goal_match is not None:
+                goal = self.server.store.update_universe_goal(
+                    unquote(universe_goal_match.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "UNIVERSE_GOAL_UPDATED",
+                        "goal": goal,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
             goal_match = re.fullmatch(r"/v1/goals/([^/]+)", path)
             if goal_match is not None:
                 goal = self.server.store.update_goal(unquote(goal_match.group(1)), body)
@@ -24643,6 +40066,41 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        room_delete = re.fullmatch(r"/v1/rooms/([^/]+)$", path)
+        if room_delete is not None:
+            try:
+                room_id = unquote(room_delete.group(1))
+                room = self.server.multi_rooms.close_room(room_id)
+                self._send(
+                    HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "ROOM_CLOSED", "room": room},
+                )
+            except MultiRoomError as error:
+                self._send_multi_room_error(error)
+            return
+        terminal_id = re.fullmatch(r"/v1/terminals/([^/]+)$", path)
+        if terminal_id is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.close_cli_terminal(unquote(terminal_id.group(1))),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        provider_session_action = re.fullmatch(
+            r"/v1/provider-sessions/([^/]+)/actions/([^/]+)", path
+        )
+        if provider_session_action is not None:
+            try:
+                result = self.server.provider_sessions.delete_action(
+                    unquote(provider_session_action.group(1)),
+                    unquote(provider_session_action.group(2)),
+                )
+                self._send(HTTPStatus.OK, result)
+            except ProviderSessionError as error:
+                self._send_provider_session_error(error)
+            return
         todo_id = self._todo_path(path)
         if todo_id is not None:
             try:
@@ -24806,6 +40264,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-handoffs",
             "/experience-cases/from-observations",
             "/experience-cases",
+            "/work-loop/predictions/review",
+            "/work-loop/review-candidates/review",
+            "/work-loop/predictions",
+            "/work-loop/recover",
+            "/work-loop",
+            "/semantic-graph",
+            "/anchor-sessions",
+            "/git-work-history",
             "/experience-matches",
             "/experience-patterns/auto",
             "/experience-pattern-proposals",
@@ -24819,6 +40285,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memories/link",
             "/memories",
             "/career-promotion-queue",
+            "/file-index/sync",
+            "/file-index/search",
+            "/file-index",
+            "/retrieval-context",
             "/context-packs",
             "/release-proposals/apply",
             "/release-proposals",
@@ -24830,6 +40300,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/projection",
             "/events",
             "/skill-observations",
+            "/skill-gap-observations",
+            "/skill-gap-summary",
+            "/skill-candidates",
             "/skill-observation-queue",
             "/seed-asset-proposal/apply",
             "/seed-asset-proposal",
@@ -24930,6 +40403,36 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         return unquote(project_id), unquote(proposal_id)
 
     @staticmethod
+    def _instruction_authorized_task_frame_run_path(
+        path: str,
+    ) -> tuple[str, str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/governance-proposals/"
+        separator = "/instruction-task-frames/"
+        suffix = "/run"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or separator not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        remainder = path[len(prefix) :]
+        project_id, proposal_path = remainder.split(marker, 1)
+        proposal_id, frame_path = proposal_path.split(separator, 1)
+        frame_id = frame_path[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not proposal_id
+            or "/" in proposal_id
+            or not frame_id
+            or "/" in frame_id
+        ):
+            return None
+        return unquote(project_id), unquote(proposal_id), unquote(frame_id)
+
+    @staticmethod
     def _approved_descendant_task_frame_run_path(
         path: str,
     ) -> tuple[str, str, str] | None:
@@ -25021,6 +40524,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return None
         return unquote(project_id), "/deliver", unquote(handoff_id)
 
+    @staticmethod
+    def _goal_handoff_task_frame_path(path: str) -> tuple[str, str] | None:
+        prefix = "/v1/projects/"
+        marker = "/master-handoffs/"
+        suffix = "/instruction-task-frame"
+        if (
+            not path.startswith(prefix)
+            or marker not in path
+            or not path.endswith(suffix)
+        ):
+            return None
+        project_id, remainder = path[len(prefix) :].split(marker, 1)
+        handoff_id = remainder[: -len(suffix)]
+        if (
+            not project_id
+            or "/" in project_id
+            or not handoff_id
+            or "/" in handoff_id
+        ):
+            return None
+        return unquote(project_id), unquote(handoff_id)
+
     def _not_found(self) -> None:
         self._send(
             HTTPStatus.NOT_FOUND,
@@ -25084,10 +40609,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 "room": snapshot["room"],
                 "bindings": snapshot["bindings"],
                 "messages": snapshot["messages"],
+                "artifacts": snapshot["artifacts"],
+                "findings": snapshot["findings"],
                 "events": snapshot["events"],
                 "participant_cursors": snapshot["participant_cursors"],
                 "bridge_line": snapshot["bridge_line"],
                 "permissions": snapshot["permissions"],
+                "task_frame_timeline": snapshot.get("task_frame_timeline"),
             },
         )
         cursor = self.server.multi_rooms.hub.cursor()
@@ -25099,7 +40627,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     timeout_seconds=15.0,
                 )
                 if not events:
-                    write_event("ping", {"type": "PING", "at": utc_now()})
+                    room = snapshot.get("room")
+                    if isinstance(room, Mapping) and room.get("room_type") == "BOSS":
+                        write_event(
+                            "task-frame",
+                            self.server._task_frame_room_timeline(
+                                str(room.get("task_frame_id") or ""),
+                                str(room.get("project_id") or ""),
+                            ),
+                        )
+                    else:
+                        write_event("ping", {"type": "PING", "at": utc_now()})
                     continue
                 for event in events:
                     cursor = max(cursor, int(event["event_id"]))
@@ -25109,6 +40647,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def _stream_provider_session(self, chat_key: str) -> None:
         cursor = self.server.provider_sessions.events.cursor()
+        self.server.hydrate_provider_session_transcript(chat_key)
         snapshot = self.server.provider_sessions.snapshot(chat_key)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -25286,11 +40825,46 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _upgrade_terminal_stream(self, terminal_id: str) -> None:
+        self.log_message("TERM-WS: upgrade request for terminal_id=%r surface=%r", terminal_id, self.headers.get("X-Universe-Access-Surface"))
+        try:
+            self.server.terminal_host.get(terminal_id)
+        except TerminalHostError as error:
+            self.log_message("TERM-WS: terminal not found: %r", error.code)
+            self._send_error(
+                UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND)
+            )
+            return
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if str(self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
+            self.log_message("TERM-WS: missing upgrade headers, key=%r", key)
+            self._send_error(
+                UniverseError(
+                    "TERMINAL_STREAM_UPGRADE_REQUIRED",
+                    "terminal stream requires a WebSocket upgrade",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            )
+            return
+        self.log_message("TERM-WS: sending 101 for terminal_id=%r", terminal_id)
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        self.end_headers()
+        self.wfile.flush()
+        pump_terminal_socket(self, terminal_id, self.server.terminal_host)
+        self.log_message("TERM-WS: pump done for terminal_id=%r", terminal_id)
+
     def _send_static(self, path: str) -> None:
         filename = {
             "/": "index.html",
             "/app.js": "app.js",
             "/styles.css": "styles.css",
+            "/terminals.js": "terminals.js",
+            "/xterm.min.js": "xterm.min.js",
+            "/xterm.min.css": "xterm.min.css",
+            "/xterm-addon-fit.min.js": "xterm-addon-fit.min.js",
         }[path]
         target = UI_ROOT / filename
         if not target.is_file() or target.is_symlink():
@@ -25308,8 +40882,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; "
             "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
         )
         self.end_headers()
@@ -25333,14 +40907,19 @@ def create_server(
     conductor_delegation_executor: Any = None,
     auto_start_project_masters: bool = True,
     project_master_provider_factory: Any = None,
-    room_participant_provider_factory: Any = None,
+    room_participant_permission_resolver: Callable[[str, str, str], bool] | None = None,
     provider_session_host_factory: Any = None,
+    session_broker_client: Any = None,
     host_profile: HostProfileStore | None = None,
     provider_model_catalog: ProviderModelCatalogStore | None = None,
     service_state_path: Path | None = None,
     remote_gateway_state_path: Path | None = None,
     remote_connector_state_path: Path | None = None,
     remote_connector_config_path: Path | None = None,
+    directory_selector: Callable[[], str | None] | None = None,
+    file_selector: Callable[[str], str | None] | None = None,
+    auto_start_goal_scheduler: bool = True,
+    use_pty_supervisor: bool = False,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -25365,14 +40944,19 @@ def create_server(
         conductor_delegation_executor=conductor_delegation_executor,
         auto_start_project_masters=auto_start_project_masters,
         project_master_provider_factory=project_master_provider_factory,
-        room_participant_provider_factory=room_participant_provider_factory,
+        room_participant_permission_resolver=room_participant_permission_resolver,
         provider_session_host_factory=provider_session_host_factory,
+        session_broker_client=session_broker_client,
         host_profile=host_profile,
         provider_model_catalog=provider_model_catalog,
         service_state_path=service_state_path,
         remote_gateway_state_path=remote_gateway_state_path,
         remote_connector_state_path=remote_connector_state_path,
         remote_connector_config_path=remote_connector_config_path,
+        directory_selector=directory_selector,
+        file_selector=file_selector,
+        auto_start_goal_scheduler=auto_start_goal_scheduler,
+        use_pty_supervisor=use_pty_supervisor,
     )
 
 
@@ -25556,9 +41140,9 @@ def resolve_project_work_preflight(
             "universe": health.get("universe"),
         },
         "runtime_installation": (
-            "INSTALLED_CAREER_RUNTIME"
+            "INSTALLED_PROJECT_RUNTIME"
             if runtime_manifest.is_file() and not runtime_manifest.is_symlink()
-            else "MISSING_CAREER_RUNTIME"
+            else "MISSING_PROJECT_RUNTIME"
         ),
         "install_binding": {
             "status": "PRESENT" if install_binding is not None else "MISSING",
@@ -25594,11 +41178,11 @@ def resolve_project_work_preflight(
         "asset_count": len(proposal.get("assets") or []),
         "apply_contract": proposal.get("apply_contract"),
     }
-    if response["runtime_installation"] == "MISSING_CAREER_RUNTIME":
+    if response["runtime_installation"] == "MISSING_PROJECT_RUNTIME":
         response.update(
             {
-                "status": "CAREER_OS_INSTALL_REQUIRED",
-                "next_operation": "INSTALL_CAREER_RUNTIME_THROUGH_RELEASE_LIFECYCLE",
+                "status": "PROJECT_RUNTIME_INSTALL_REQUIRED",
+                "next_operation": "INSTALL_PROJECT_RUNTIME_FROM_RELEASE_ARTIFACT",
             }
         )
     elif install_binding is None:
@@ -25643,12 +41227,70 @@ def supervisor_session_id_for(
     return "session_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
+def _record_managed_shell_attachment(
+    *,
+    terminal_host: Any,
+    body: Mapping[str, Any],
+    session: Mapping[str, Any],
+    effective_session_id: str,
+) -> dict[str, Any] | None:
+    """Bind one SessionStart attach receipt to its exact managed terminal.
+
+    The receipt is only accepted when the terminal it names is owned by this
+    supervised session and carries the same Session Anchor.  A receipt that
+    points anywhere else is recorded as a mismatch, never applied.
+    """
+
+    attach = body.get("managed_shell_attach")
+    if terminal_host is None or not isinstance(attach, Mapping):
+        return None
+    terminal_id = str(attach.get("terminal_id") or "").strip()
+    if not terminal_id:
+        return {"status": "ATTACH_TERMINAL_REQUIRED"}
+    try:
+        terminal = terminal_host.get(terminal_id)
+    except Exception:  # noqa: BLE001 - an unknown terminal is a mismatch
+        return {"status": "ATTACH_TERMINAL_UNKNOWN", "terminal_id": terminal_id}
+    public = terminal.public() if hasattr(terminal, "public") else terminal
+    if str(public.get("supervisor_session_id") or "") != effective_session_id:
+        return {
+            "status": "ATTACH_SESSION_MISMATCH",
+            "terminal_id": terminal_id,
+        }
+    claimed_anchor = str(attach.get("session_anchor_ref") or "").strip()
+    terminal_anchor = str(public.get("session_anchor_ref") or "").strip()
+    # Anchor-first: require the receipt to state its Anchor.  The previous
+    # truthy guard let an omitted Anchor pass, which is exactly the case a
+    # forged or misrouted receipt produces.
+    if not claimed_anchor:
+        return {"status": "ATTACH_ANCHOR_REQUIRED", "terminal_id": terminal_id}
+    if not terminal_anchor or claimed_anchor != terminal_anchor:
+        return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+    session_anchor = str(session.get("session_anchor_ref") or "").strip()
+    if session_anchor and terminal_anchor != session_anchor:
+        return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+    sealed_attach = dict(attach)
+    sealed_attach["provider"] = str(session.get("provider") or "").strip().upper()
+    sealed_attach["provider_session_ref"] = str(
+        session.get("provider_session_ref") or ""
+    ).strip()
+    try:
+        return terminal_host.record_managed_attach(terminal_id, sealed_attach)
+    except Exception as error:  # noqa: BLE001 - report, never fail the inject
+        return {
+            "status": "ATTACH_REJECTED",
+            "terminal_id": terminal_id,
+            "detail": f"{type(error).__name__}: {error}",
+        }
+
+
 def perform_session_ref_inject(
     *,
     session_supervisor: SessionSupervisorStore,
     multi_rooms: MultiRoomStore,
     body: Mapping[str, Any],
     environment: Mapping[str, str] | None = None,
+    terminal_host: Any = None,
 ) -> dict[str, Any]:
     """Harness boot inject: Supervisor register (+ optional default) then room attach.
 
@@ -25669,6 +41311,9 @@ def perform_session_ref_inject(
     normalized_ref = str(
         body.get("provider_session_ref") or body.get("session_ref") or ""
     ).strip()
+    explicit_session_id = str(
+        body.get("supervisor_session_id") or body.get("session_id") or ""
+    ).strip()
     ref_source = "EXPLICIT"
     if not normalized_ref:
         env = os.environ if environment is None else environment
@@ -25677,10 +41322,10 @@ def perform_session_ref_inject(
             normalized_ref = str(env.get(environment_key) or "").strip()
             if normalized_ref:
                 ref_source = environment_key
-    if not normalized_ref:
+    if not normalized_ref and not explicit_session_id:
         raise UniverseError(
             "PROVIDER_SESSION_REF_REQUIRED",
-            "provider session ref is required; Codex Desktop may supply CODEX_THREAD_ID",
+            "provider session ref is required unless a live PTY supervisor session is supplied",
         )
 
     room_id = body.get("room_id")
@@ -25705,20 +41350,85 @@ def perform_session_ref_inject(
             room_type = str(room.get("room_type") or room_type).upper()
         except MultiRoomError:
             room = None
-    normalized_node = str(body.get("node") or project_id or "CONDUCTOR").strip()
+    # Server-owned coordinates win when an explicit supervisor session is named
+    # and the caller did not state node/mode.  A SessionStart hook must not be
+    # able to relabel a live CONDUCTOR session as MASTER by omission.
+    stored_session: Mapping[str, Any] = {}
+    resolved_existing_session_id = ""
+    if explicit_session_id:
+        try:
+            stored_session = session_supervisor.get_session(explicit_session_id) or {}
+        except SessionSupervisorError:
+            stored_session = {}
+    elif normalized_ref:
+        # Desktop SessionStart does not always receive the Supervisor session
+        # id.  The provider identity is still durable, so resolve its single
+        # existing current owner before applying PROJECT/MASTER defaults.  This
+        # keeps a current CONDUCTOR session in CONDUCTOR when the generic hook
+        # fires again after a turn or reconnect.
+        identity_matches = [
+            item
+            for item in session_supervisor.list_sessions(include_hidden=True)
+            if str(item.get("provider") or "").upper() == normalized_provider
+            and str(item.get("provider_session_ref") or "") == normalized_ref
+        ]
+        current_identity_matches = [
+            item
+            for item in identity_matches
+            if str(item.get("currentness") or "").upper() == "CURRENT"
+            or str(item.get("state") or "").upper() in {"LIVE", "STARTING"}
+        ]
+        selected_identity = (
+            current_identity_matches[0]
+            if len(current_identity_matches) == 1
+            else identity_matches[0]
+            if len(identity_matches) == 1
+            else None
+        )
+        if selected_identity is not None:
+            stored_session = selected_identity
+            resolved_existing_session_id = str(
+                selected_identity.get("session_id") or ""
+            ).strip()
+    normalized_node = str(
+        body.get("node") or stored_session.get("node") or project_id or "CONDUCTOR"
+    ).strip()
     if not normalized_node:
         normalized_node = "CONDUCTOR"
-    normalized_mode = str(body.get("mode") or "MASTER").strip().upper() or "MASTER"
-
-    explicit_session_id = str(
-        body.get("supervisor_session_id") or body.get("session_id") or ""
-    ).strip()
-    session_id = explicit_session_id or supervisor_session_id_for(
-        node=normalized_node,
-        mode=normalized_mode,
-        provider=normalized_provider,
-        provider_session_ref=normalized_ref,
+    normalized_mode = (
+        str(body.get("mode") or stored_session.get("mode") or "MASTER")
+        .strip()
+        .upper()
+        or "MASTER"
     )
+
+    session_id = (
+        explicit_session_id
+        or resolved_existing_session_id
+        or supervisor_session_id_for(
+            node=normalized_node,
+            mode=normalized_mode,
+            provider=normalized_provider,
+            provider_session_ref=normalized_ref,
+        )
+    )
+    # A provider may not expose its own conversation id until after the first
+    # interactive turn.  A SessionStart hook still identifies the durable
+    # Supervisor session, so retain its current provider ref instead of
+    # accidentally rebinding that Session Anchor to ``None``.
+    if not normalized_ref and explicit_session_id:
+        try:
+            current_session = session_supervisor.get_session(explicit_session_id)
+        except SessionSupervisorError:
+            current_session = None
+        if (
+            isinstance(current_session, Mapping)
+            and str(current_session.get("provider") or "").upper()
+            == normalized_provider
+        ):
+            normalized_ref = str(
+                current_session.get("provider_session_ref") or ""
+            ).strip()
     if str(body.get("alias") or "").strip():
         normalized_alias = str(body.get("alias")).strip()
     elif normalized_node == normalized_mode:
@@ -25737,7 +41447,7 @@ def perform_session_ref_inject(
             "node": normalized_node,
             "mode": normalized_mode,
             "provider": normalized_provider,
-            "provider_session_ref": normalized_ref,
+            "provider_session_ref": normalized_ref or None,
             "alias": normalized_alias,
             "state": str(body.get("state") or "DISCONNECTED").strip().upper()
             or "DISCONNECTED",
@@ -25747,12 +41457,71 @@ def perform_session_ref_inject(
             ).strip(),
         }
     )
+    # register_session may resolve a different session_id via identity_owner lookup
+    # (when another session already owns this provider_session_ref). Use the
+    # effective session_id from the returned session dict for all subsequent ops.
+    effective_session_id = str(session.get("session_id") or session_id)
+    # An explicit supervisor coordinate names the session to bind.  If the
+    # provider identity is already owned by a different session, that is a
+    # collision, not a redirect: relocating the owner would move a session the
+    # caller never named.  Require an explicit handoff instead.
+    if (
+        explicit_session_id
+        and effective_session_id != explicit_session_id
+        and not bool(body.get("allow_identity_handoff"))
+    ):
+        raise UniverseError(
+            "SESSION_IDENTITY_OWNER_CONFLICT",
+            "provider identity is owned by a different supervised session; "
+            "explicit handoff is required",
+            HTTPStatus.CONFLICT,
+        )
+    explicit_location = "node" in body or "mode" in body
+    if explicit_location and (
+        str(session.get("node") or "") != normalized_node
+        or str(session.get("mode") or "").upper() != normalized_mode
+    ):
+        session = session_supervisor.bind_current_location(
+            effective_session_id,
+            project_id=str(project_id or normalized_node),
+            node=normalized_node,
+            mode=normalized_mode,
+            anchor_ref=body.get("anchor_ref") or body.get("session_anchor_ref"),
+            evidence_ref="universe://session-ref-inject/explicit-location",
+            expected_version=session.get("row_version"),
+        )
     default_selection: Mapping[str, Any] | None = None
     if make_default and not bool(session.get("is_default")):
-        default_selection = session_supervisor.set_default(
-            session_id,
-            expected_pointer_version=session.get("default_pointer_version"),
-        )
+        # Don't steal the default pointer from a session that is currently LIVE.
+        # A live default means a running PTY/harness session is active; the new
+        # inject should register alongside it rather than replacing it.
+        try:
+            live_default_exists = any(
+                s.get("is_default")
+                and str(s.get("state") or "").upper() in {"LIVE", "STARTING"}
+                for s in session_supervisor.list_sessions()
+                if str(s.get("node") or "") == normalized_node
+                and str(s.get("mode") or "") == normalized_mode
+            )
+        except Exception:
+            live_default_exists = False
+        if live_default_exists:
+            make_default = False
+    if make_default and not bool(session.get("is_default")):
+        try:
+            default_selection = session_supervisor.set_default(
+                effective_session_id,
+                expected_pointer_version=session.get("default_pointer_version"),
+            )
+        except SessionSupervisorError as _err:
+            if _err.code != "DEFAULT_SESSION_VERSION_CONFLICT":
+                raise
+            # Stale version — retry unconditionally (no live default guard already passed).
+            default_selection = session_supervisor.set_default(
+                effective_session_id,
+                expected_pointer_version=session.get("default_pointer_version"),
+                force=True,
+            )
         session = dict(session)
         session["is_default"] = True
         session["default_pointer_version"] = (
@@ -25776,8 +41545,9 @@ def perform_session_ref_inject(
             "room_type": room_type,
             "slot_role": slot_role,
             "provider": normalized_provider,
-            "provider_session_ref": normalized_ref,
-            "supervisor_session_id": session_id,
+            "provider_session_ref": normalized_ref or None,
+            "supervisor_session_id": effective_session_id,
+            "session_anchor_ref": session.get("session_anchor_ref"),
             "display_name": display_name,
         }
     )
@@ -25803,8 +41573,12 @@ def perform_session_ref_inject(
                 session_supervisor=session_supervisor,
                 requested_mode=normalized_mode or "MASTER",
             )
-            observation = master_store.observe_provider_session(
-                normalized_provider, normalized_ref
+            observation = (
+                master_store.observe_provider_session(
+                    normalized_provider, normalized_ref
+                )
+                if normalized_ref
+                else "SUPERVISOR_OBSERVED"
             )
             project_master = {
                 "project_id": str(project_id),
@@ -25833,13 +41607,33 @@ def perform_session_ref_inject(
                 "observation": "FAILED",
                 "detail": f"{type(error).__name__}:{error}",
             }
+    managed_shell_attachment = _record_managed_shell_attachment(
+        terminal_host=terminal_host,
+        body=body,
+        session=session,
+        effective_session_id=effective_session_id,
+    )
+    if (
+        isinstance(managed_shell_attachment, Mapping)
+        and managed_shell_attachment.get("status") == "MANAGED_SHELL_ATTACHED"
+    ):
+        session_supervisor.sweep_stale_live_sessions(
+            live_session_anchors={
+                effective_session_id: str(session.get("session_anchor_ref") or "")
+            }
+        )
+        session = session_supervisor.get_session(effective_session_id)
     return {
         **room_result,
         "schema": API_SCHEMA,
         "status": "SESSION_REF_INJECTED",
+        "managed_shell_attachment": managed_shell_attachment,
         "supervisor_session": session,
         "supervisor_session_created": created,
         "provider_session_ref_source": ref_source,
+        "provider_identity_state": (
+            "VERIFIED" if normalized_ref else "SUPERVISOR_OBSERVED"
+        ),
         "make_default": make_default,
         "default_selection": (
             dict(default_selection) if default_selection is not None else None
@@ -26322,6 +42116,14 @@ def parser() -> argparse.ArgumentParser:
     )
     restart_command.set_defaults(open_ui=False)
 
+    pty_restart_command = commands.add_parser(
+        "pty-restart",
+        help="Restart the PTY Supervisor and reconcile Host-owned sessions",
+    )
+    pty_restart_command.add_argument(
+        "--state-file", type=Path, default=default_pty_supervisor_state_path()
+    )
+
     tray_command = commands.add_parser(
         "tray",
         help="Start the Windows system-tray host (packaging/windows/Universe-Tray.ps1)",
@@ -26480,6 +42282,11 @@ def _windows_tray_creationflags() -> int:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "pty-restart":
+            result = restart_supervisor(state_path=args.state_file)
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
         if args.command in {"status", "start", "stop", "restart", "tray"}:
             from universe_service_control import (
                 restart_service,
@@ -26588,6 +42395,20 @@ def main() -> int:
             return 0
 
         if args.command == "serve":
+            # Strip AI-session markers from this process so PTY children
+            # don't inherit them and show "transcript saving is off" warnings.
+            for _env_key in (
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_SESSION_ID",
+                "CLAUDE_CONVERSATION_ID",
+                "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
+                "GROK_SESSION_ID",
+                "XAI_SESSION_ID",
+                "GROK_CONVERSATION_ID",
+            ):
+                os.environ.pop(_env_key, None)
             mode_registry = load_universe_mode_registry(args.mode_registry)
             mode_contract = universe_mode_contract(mode_registry)
             token = (
@@ -26603,6 +42424,7 @@ def main() -> int:
                 mode_contract=mode_contract,
                 auto_start_conductor_runtime=False,
                 service_state_path=args.state_file,
+                use_pty_supervisor=True,
             )
             host, port = server.server_address[:2]
             host_text = host.decode("ascii") if isinstance(host, bytes) else host

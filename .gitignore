@@ -11,3 +11,20 @@ projects/*/.universe/
 
 dist/portable/
 
+# Playwright MCP debug logs
+.playwright-mcp/
+
+# Local agent client state
+.claude/
+.codex/
+.grok/
+
+# Generated browser test artifacts
+.artifacts/ui/
+
+# Generated release artifacts
+dist/releases/
+
+# Malformed Claude temp scratchpad paths materialized at repository root
+/*AppDataLocalTempclaudeC--workspace-universe*scratchpad*.txt
+

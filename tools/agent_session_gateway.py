@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import queue
+import re
+import shutil
 import subprocess  # nosec B404
 import tempfile
 import threading
@@ -54,6 +58,128 @@ CLAUDE_FORBIDDEN_PERMISSION_MODES = frozenset(
     {"acceptEdits", "auto", "bypassPermissions", "dontAsk"}
 )
 PLATFORM_APPROVAL_EVIDENCE_SCHEMA = "ai-career.platform-approval-evidence.v1"
+PROVIDER_QUOTA_SNAPSHOT_SCHEMA = "universe.provider-quota-snapshot.v1"
+
+
+def _unknown_quota_snapshot(provider: str, source: str) -> dict[str, Any]:
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": provider,
+        "source": source,
+        "state": "UNKNOWN",
+        "windows": [],
+    }
+
+
+def _quota_state(windows: list[dict[str, Any]], reached: Any = None) -> str:
+    if reached not in {None, "", False}:
+        return "EXHAUSTED"
+    percents = [
+        value
+        for window in windows
+        if isinstance((value := window.get("used_percent")), (int, float))
+        and not isinstance(value, bool)
+    ]
+    if not percents:
+        return "UNKNOWN"
+    if any(value >= 100 for value in percents):
+        return "EXHAUSTED"
+    if any(value >= 80 for value in percents):
+        return "WARNING"
+    return "AVAILABLE"
+
+
+def _codex_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _unknown_quota_snapshot("CODEX", source)
+    snapshot = value.get("rateLimits")
+    if not isinstance(snapshot, Mapping):
+        snapshot = value
+    windows: list[dict[str, Any]] = []
+    for name in ("primary", "secondary"):
+        item = snapshot.get(name)
+        if not isinstance(item, Mapping):
+            continue
+        used = item.get("usedPercent")
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        window = {"name": name.upper(), "used_percent": used}
+        for source_key, target_key in (
+            ("windowDurationMins", "window_minutes"),
+            ("resetsAt", "resets_at"),
+        ):
+            field_value = item.get(source_key)
+            if isinstance(field_value, (int, float)) and not isinstance(field_value, bool):
+                window[target_key] = field_value
+        windows.append(window)
+    reached = snapshot.get("rateLimitReachedType")
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": "CODEX",
+        "source": source,
+        "state": _quota_state(windows, reached),
+        "windows": windows,
+        "rate_limit_reached_type": reached,
+    }
+
+
+def _grok_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _unknown_quota_snapshot("GROK", source)
+    snapshot = value.get("config")
+    if not isinstance(snapshot, Mapping):
+        snapshot = value
+    usage = snapshot.get("usage")
+    limit = snapshot.get("monthlyLimit") or snapshot.get("monthly_limit")
+    total = usage.get("totalUsed") if isinstance(usage, Mapping) else None
+    if total is None:
+        total = snapshot.get("used")
+
+    def amount(item: Any) -> float | None:
+        if isinstance(item, Mapping):
+            item = item.get("val")
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            return float(item)
+        return None
+
+    limit_value = amount(limit)
+    total_value = amount(total)
+    used_percent = snapshot.get("creditUsagePercent")
+    if used_percent is None:
+        used_percent = snapshot.get("credit_usage_percent")
+    if not isinstance(used_percent, (int, float)) or isinstance(used_percent, bool):
+        used_percent = (
+            total_value / limit_value * 100
+            if limit_value is not None and limit_value > 0 and total_value is not None
+            else None
+        )
+    windows: list[dict[str, Any]] = []
+    if used_percent is not None:
+        window: dict[str, Any] = {
+            "name": "CREDITS",
+            "used_percent": float(used_percent),
+        }
+        period = snapshot.get("currentPeriod") or snapshot.get("current_period")
+        reset: Any = None
+        if isinstance(period, Mapping):
+            period_type = period.get("type")
+            if isinstance(period_type, str) and period_type:
+                window["name"] = period_type.upper()
+            reset = period.get("end")
+        if reset is None:
+            reset = snapshot.get("billingPeriodEnd") or snapshot.get(
+                "billing_period_end"
+            )
+        if isinstance(reset, str) and reset:
+            window["resets_at"] = reset
+        windows.append(window)
+    return {
+        "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+        "provider": "GROK",
+        "source": source,
+        "state": _quota_state(windows),
+        "windows": windows,
+    }
 
 
 class AgentSessionError(RuntimeError):
@@ -155,6 +281,8 @@ class AgentSession(Protocol):
 
     def set_permission_requester(self, requester: PermissionRequester) -> None: ...
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]: ...
+
     def close(self) -> None: ...
 
 
@@ -175,6 +303,315 @@ class BoundedSession(Protocol):
     def prompt(self, text: str, on_delta: Callable[[str], None]) -> str: ...
 
     def close(self) -> None: ...
+
+
+class GitTrace2Observer:
+    """Collect terminal commit/push milestones from one provider process tree.
+
+    Git writes JSONL to a session-scoped runtime file. Only the command name and
+    exit code leave this observer; argv and repository paths stay out of UI
+    events and the trace file is removed when the provider session closes.
+    """
+
+    schema = "universe.git-trace2-work-status.v1"
+    _operations = {"commit": "COMMIT", "push": "PUSH"}
+
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        metadata_reader: Callable[[str], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.cwd = cwd.resolve()
+        runtime_root = self.cwd / ".ai" / "runtime" / "tmp" / "git-trace2"
+        try:
+            runtime_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            runtime_root = Path(tempfile.gettempdir()) / "universe-git-trace2"
+            runtime_root.mkdir(parents=True, exist_ok=True)
+        self.path = runtime_root / f"provider-{uuid4().hex}.jsonl"
+        self._offset = 0
+        self._remainder = b""
+        self._commands: dict[str, str] = {}
+        self._emitted: set[str] = set()
+        self._lock = threading.Lock()
+        self._metadata_reader = metadata_reader or self._read_git_metadata
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        environment = dict(base)
+        environment["GIT_TRACE2_EVENT"] = str(self.path)
+        environment["GIT_TRACE2_EVENT_NESTING"] = "20"
+        environment["GIT_TRACE_REDACT"] = "1"
+        return environment
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        with self._lock:
+            records = self._read_records()
+            milestones: list[dict[str, Any]] = []
+            for record in records:
+                sid = str(record.get("sid") or "").strip()
+                if not sid:
+                    continue
+                event = str(record.get("event") or "").casefold()
+                if event == "cmd_name":
+                    operation = self._operations.get(
+                        str(record.get("name") or "").casefold()
+                    )
+                    if operation is not None:
+                        self._commands[sid] = operation
+                    continue
+                if event not in {"exit", "atexit"} or sid in self._emitted:
+                    continue
+                operation = self._commands.get(sid)
+                code = record.get("code")
+                if operation is None or not isinstance(code, int):
+                    continue
+                self._emitted.add(sid)
+                milestone = {
+                    "schema": self.schema,
+                    "operation": operation,
+                    "state": "COMPLETED" if code == 0 else "FAILED",
+                    "exit_code": code,
+                    "source": "GIT_TRACE2",
+                }
+                if code == 0:
+                    try:
+                        metadata = self._metadata_reader(operation)
+                    except Exception:
+                        metadata = {}
+                    if isinstance(metadata, Mapping):
+                        milestone.update(
+                            {
+                                key: metadata[key]
+                                for key in (
+                                    "commit_sha",
+                                    "short_sha",
+                                    "commit_message",
+                                    "branch",
+                                    "remote",
+                                    "changed_files",
+                                )
+                                if key in metadata
+                            }
+                        )
+                milestones.append(milestone)
+            return milestones
+
+    def _read_git_metadata(self, operation: str) -> dict[str, Any]:
+        executable = shutil.which("git.exe") or shutil.which("git")
+        if not executable:
+            return {}
+        environment = {
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_EVENT_NESTING": "0",
+            "GIT_TRACE_REDACT": "1",
+        }
+
+        def read(*arguments: str, maximum: int = 4096) -> str:
+            result = run_native_cli(
+                NativeCliRequest(
+                    executable=Path(executable),
+                    arguments=tuple(arguments),
+                    cwd=self.cwd,
+                    timeout_seconds=5,
+                    output_encoding="utf-8",
+                    max_output_chars=maximum,
+                    environment=environment,
+                )
+            )
+            if result.status != "COMPLETED" or result.return_code != 0:
+                return ""
+            return result.stdout
+
+        identity = read("show", "-s", "--format=%H%x00%s", "HEAD")
+        commit_sha, separator, message = identity.strip().partition("\x00")
+        if not separator or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
+            return {}
+        metadata: dict[str, Any] = {
+            "commit_sha": commit_sha.lower(),
+            "short_sha": commit_sha[:7].lower(),
+            "commit_message": self._safe_git_label(message, 240) or "Commit",
+        }
+        changed = read(
+            "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD",
+            maximum=200_000,
+        )
+        metadata["changed_files"] = len(
+            [line for line in changed.splitlines() if line.strip()]
+        )
+        branch = self._safe_git_label(read("branch", "--show-current"), 160)
+        metadata["branch"] = branch or "DETACHED"
+        if operation == "PUSH" and branch:
+            remote = self._safe_git_label(
+                read("config", "--get", f"branch.{branch}.remote"), 80
+            )
+            if remote and not any(marker in remote for marker in ("/", chr(92), "://")):
+                metadata["remote"] = remote
+        return metadata
+
+    @staticmethod
+    def _safe_git_label(value: Any, maximum: int) -> str:
+        text = " ".join(str(value or "").split())
+        return "".join(character for character in text if character.isprintable())[:maximum]
+
+    def close(self) -> None:
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+
+    def _read_records(self) -> list[dict[str, Any]]:
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size < self._offset:
+            self._offset = 0
+            self._remainder = b""
+        with self.path.open("rb") as stream:
+            stream.seek(self._offset)
+            chunk = stream.read()
+        self._offset += len(chunk)
+        if not chunk:
+            return []
+        lines = (self._remainder + chunk).split(b"\n")
+        self._remainder = lines.pop()
+        records: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(record, Mapping):
+                records.append(dict(record))
+        return records
+
+
+class GitTrace2RepositoryObserver(GitTrace2Observer):
+    """Collect Git milestones from every Git process for one repository.
+
+    Git ignores Trace2 values from repository-local config. Registration uses a
+    global ``includeIf gitdir`` entry whose included file targets only this
+    repository. The collector deletes completed raw traces after extracting the
+    bounded commit/push milestone so argv never enters Universe events.
+    """
+
+    def __init__(
+        self,
+        cwd: Path,
+        *,
+        metadata_reader: Callable[[str], Mapping[str, Any]] | None = None,
+        native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
+        register: bool = True,
+    ) -> None:
+        super().__init__(cwd, metadata_reader=metadata_reader)
+        self.path.unlink(missing_ok=True)
+        self.runtime_root = self.path.parent
+        self.event_root = self.runtime_root / "repository-events"
+        self.event_root.mkdir(parents=True, exist_ok=True)
+        self.config_path = self.runtime_root / "repository-trace2.config"
+        self._native_runner = native_runner
+        self.registration_state = "NOT_REQUESTED"
+        if register:
+            self.registration_state = self._register_repository_target()
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        environment = dict(base)
+        environment["GIT_TRACE2_EVENT"] = str(self.event_root)
+        environment["GIT_TRACE2_EVENT_NESTING"] = "20"
+        environment["GIT_TRACE_REDACT"] = "1"
+        return environment
+
+    def close(self) -> None:
+        return None
+
+    def _register_repository_target(self) -> str:
+        executable = shutil.which("git.exe") or shutil.which("git")
+        if not executable:
+            return "GIT_UNAVAILABLE"
+        disabled_trace = {
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_EVENT_NESTING": "0",
+            "GIT_TRACE_REDACT": "1",
+        }
+
+        def run(*arguments: str) -> NativeCliResult:
+            return self._native_runner(
+                NativeCliRequest(
+                    executable=Path(executable),
+                    arguments=tuple(arguments),
+                    cwd=self.cwd,
+                    timeout_seconds=10,
+                    output_encoding="utf-8",
+                    max_output_chars=20_000,
+                    environment=disabled_trace,
+                )
+            )
+
+        git_dir_result = run("rev-parse", "--absolute-git-dir")
+        if git_dir_result.status != "COMPLETED" or git_dir_result.return_code != 0:
+            return "REPOSITORY_UNAVAILABLE"
+        git_dir = str(git_dir_result.stdout or "").strip().replace(chr(92), "/")
+        if not git_dir:
+            return "REPOSITORY_UNAVAILABLE"
+        target = str(self.event_root.resolve()).replace(chr(92), "/")
+        config = "\n".join(
+            (
+                "[trace2]",
+                f"\teventTarget = {target}",
+                "\teventNesting = 20",
+                "\teventBrief = true",
+                "",
+            )
+        )
+        try:
+            self.config_path.write_text(config, encoding="utf-8", newline="\n")
+        except OSError:
+            return "CONFIG_WRITE_FAILED"
+        key = f"includeIf.gitdir/i:{git_dir}.path"
+        current = run("config", "--global", "--get-all", key)
+        configured = {
+            line.strip().casefold()
+            for line in str(current.stdout or "").splitlines()
+            if line.strip()
+        }
+        wanted = str(self.config_path.resolve()).casefold()
+        if wanted in configured:
+            return "REGISTERED"
+        added = run("config", "--global", "--add", key, str(self.config_path.resolve()))
+        if added.status != "COMPLETED" or added.return_code != 0:
+            return "REGISTRATION_FAILED"
+        return "REGISTERED"
+
+    def _read_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        try:
+            paths = sorted(path for path in self.event_root.iterdir() if path.is_file())
+        except OSError:
+            return records
+        for path in paths:
+            try:
+                lines = path.read_bytes().splitlines()
+            except OSError:
+                continue
+            terminal = False
+            for line in lines:
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                item = dict(record)
+                records.append(item)
+                if str(item.get("event") or "").casefold() in {"exit", "atexit"}:
+                    terminal = True
+            if terminal:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if len(self._emitted) > 10_000:
+            self._emitted.clear()
+        return records
 
 
 def worker_session_contract(session: Any) -> dict[str, Any]:
@@ -274,6 +711,96 @@ def build_platform_approval_evidence(
     }
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_SUPERVISED_SOFT_WRAP = re.compile(r"\r?\n\x1b\[\d+;\d+H")
+_SUPERVISED_DUPLICATED_SOFT_WRAP = re.compile(
+    r"(.)\r?\n\x1b\[\d+;\d+H\1", re.DOTALL
+)
+_SUPERVISED_CURSOR_PREFIX = re.compile(r"\x1b\[\d*(?:;\d*)?")
+
+
+def _join_supervised_soft_wraps(text: str) -> str:
+    collapsed = _SUPERVISED_DUPLICATED_SOFT_WRAP.sub(r"\1", text)
+    return _SUPERVISED_SOFT_WRAP.sub("", collapsed)
+
+
+def _supervised_json_lines(waiter: queue.Queue) -> Any:
+    buffer = ""
+    closed = False
+    while not closed:
+        force_boundary = False
+        try:
+            chunk = (
+                waiter.get(timeout=0.25)
+                if "\n" in buffer
+                else waiter.get()
+            )
+        except queue.Empty:
+            # A resident process does not close stdout after each turn. Once no
+            # cursor-position continuation arrives within one attach poll, the
+            # trailing newline is a real JSONL boundary.
+            chunk = b""
+            force_boundary = True
+        if chunk is None:
+            closed = True
+            force_boundary = True
+        else:
+            buffer += bytes(chunk).decode("utf-8", errors="replace")
+        buffer = _join_supervised_soft_wraps(buffer)
+        while "\n" in buffer:
+            line_end = buffer.find("\n")
+            suffix = buffer[line_end + 1 :]
+            if not force_boundary and (
+                not suffix or _SUPERVISED_CURSOR_PREFIX.fullmatch(suffix)
+            ):
+                # A ConPTY soft wrap may be split across subscription chunks.
+                # Wait until the following cursor-position sequence is complete
+                # before deciding whether this is a real JSONL boundary.
+                break
+            line, buffer = buffer.split("\n", 1)
+            cleaned = _ANSI_ESCAPE.sub("", line).strip("\r ")
+            opening = cleaned.find("{")
+            if opening >= 0:
+                yield cleaned[opening:]
+    cleaned = _ANSI_ESCAPE.sub("", _join_supervised_soft_wraps(buffer)).strip("\r ")
+    opening = cleaned.find("{")
+    if opening >= 0:
+        yield cleaned[opening:]
+
+
+def _supervised_process_identity(
+    terminal_host: Any,
+    terminal_id: str,
+    *,
+    endpoint: str,
+    handshake_token: str,
+) -> dict[str, Any]:
+    terminal = terminal_host.get(terminal_id)
+    payload = getattr(terminal, "payload", terminal)
+    if not isinstance(payload, Mapping) or str(payload.get("state") or "") != "LIVE":
+        raise AgentSessionError("AGENT_PROCESS_NOT_ALIVE")
+    shell = payload.get("shell_process")
+    if not isinstance(shell, Mapping):
+        raise AgentSessionError("AGENT_SUPERVISED_SHELL_IDENTITY_UNAVAILABLE")
+    pid = int(shell.get("pid") or 0)
+    started_at = float(shell.get("started_at") or 0.0)
+    if pid <= 0 or started_at <= 0:
+        raise AgentSessionError("AGENT_SUPERVISED_SHELL_IDENTITY_INVALID")
+    cmd = os.environ.get("ComSpec") or "cmd.exe"
+    return {
+        "pid": pid,
+        "process_created_at": datetime.fromtimestamp(
+            started_at, timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "executable": cmd,
+        "command": [cmd, f"supervised-terminal:{terminal_id}"],
+        "endpoint": str(endpoint),
+        "handshake_fingerprint": hashlib.sha256(
+            handshake_token.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 class JsonRpcStdioProcess:
     def __init__(
         self,
@@ -284,24 +811,56 @@ class JsonRpcStdioProcess:
         environment: Mapping[str, str],
         request_handler: Callable[[str, Mapping[str, Any]], Any],
         notification_handler: Callable[[str, Mapping[str, Any]], None],
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        provider: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self._executable = executable.expanduser().resolve()
         self._arguments = tuple(arguments)
-        self._process = open_native_cli(
-            NativeCliRequest(
-                executable=self._executable,
-                arguments=self._arguments,
-                cwd=cwd,
-                timeout_seconds=300,
-                output_encoding="utf-8",
-                environment={
+        self._terminal_host = terminal_host
+        self._terminal_id = ""
+        self._terminal_waiter: queue.Queue | None = None
+        self._process = None
+        if terminal_host is None:
+            self._process = open_native_cli(
+                NativeCliRequest(
+                    executable=self._executable,
+                    arguments=self._arguments,
+                    cwd=cwd,
+                    timeout_seconds=300,
+                    output_encoding="utf-8",
+                    environment={
+                        str(key): str(value) for key, value in environment.items()
+                    },
+                )
+            )
+        else:
+            terminal = terminal_host.create(
+                project_id=project_id,
+                mode=mode,
+                cwd=str(cwd),
+                provider=provider,
+                supervisor_session_id=supervisor_session_id,
+                session_anchor_ref=session_anchor_ref,
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=list(self._arguments),
+                provider_environment={
                     str(key): str(value) for key, value in environment.items()
                 },
+                cols=240,
+                rows=40,
             )
-        )
+            self._terminal_id = str(terminal.get("terminal_id") or "")
+            if not self._terminal_id:
+                raise AgentSessionError("AGENT_SUPERVISED_TERMINAL_ID_MISSING")
+            self._terminal_waiter = terminal_host.subscribe(self._terminal_id)
         self._request_handler = request_handler
         self._notification_handler = notification_handler
         self._write_lock = threading.Lock()
+        self._sent_lines: deque[str] = deque(maxlen=256)
         self._pending_lock = threading.Lock()
         self._pending: dict[int, _PendingResponse] = {}
         self._next_id = 1
@@ -318,7 +877,8 @@ class JsonRpcStdioProcess:
             daemon=True,
         )
         self._reader.start()
-        self._stderr_reader.start()
+        if self._process is not None:
+            self._stderr_reader.start()
 
     def request(
         self,
@@ -363,7 +923,15 @@ class JsonRpcStdioProcess:
         if self._closed.is_set():
             return
         self._closed.set()
-        if self._process.poll() is None:
+        if self._terminal_host is not None and self._terminal_id:
+            waiter = self._terminal_waiter
+            if waiter is not None:
+                self._terminal_host.unsubscribe(self._terminal_id, waiter)
+            try:
+                self._terminal_host.close(self._terminal_id)
+            except Exception:
+                pass
+        elif self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
                 self._process.wait(timeout=3)
@@ -377,12 +945,20 @@ class JsonRpcStdioProcess:
             item.error = {"message": "agent process closed"}
             item.event.set()
         self._reader.join(timeout=1)
-        self._stderr_reader.join(timeout=1)
+        if self._process is not None:
+            self._stderr_reader.join(timeout=1)
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
     ) -> dict[str, Any]:
-        if self._process.poll() is not None:
+        if self._terminal_host is not None:
+            return _supervised_process_identity(
+                self._terminal_host,
+                self._terminal_id,
+                endpoint=endpoint,
+                handshake_token=handshake_token,
+            )
+        if self._process is None or self._process.poll() is not None:
             raise AgentSessionError("AGENT_PROCESS_NOT_ALIVE")
         return launched_process_identity(
             self._process,
@@ -393,27 +969,53 @@ class JsonRpcStdioProcess:
         )
 
     def _send(self, message: Mapping[str, Any]) -> None:
-        if self._closed.is_set() or self._process.poll() is not None:
+        if self._closed.is_set():
             raise AgentSessionError("AGENT_PROCESS_UNAVAILABLE" + self._stderr_detail())
-        stdin = self._process.stdin
-        if stdin is None:
-            raise AgentSessionError("AGENT_PROCESS_STDIN_UNAVAILABLE")
         encoded = json.dumps(
             message,
             ensure_ascii=False,
             separators=(",", ":"),
         )
         with self._write_lock:
+            if self._terminal_host is not None:
+                self._sent_lines.append(encoded)
+                # ConPTY input is terminal input, not a pipe: carriage return
+                # is the Enter key that submits one JSON line to the hosted CLI.
+                self._terminal_host.write(
+                    self._terminal_id, (encoded + "\r").encode("utf-8")
+                )
+                return
+            if self._process is None or self._process.poll() is not None:
+                raise AgentSessionError(
+                    "AGENT_PROCESS_UNAVAILABLE" + self._stderr_detail()
+                )
+            stdin = self._process.stdin
+            if stdin is None:
+                raise AgentSessionError("AGENT_PROCESS_STDIN_UNAVAILABLE")
             stdin.write(encoded + "\n")
             stdin.flush()
 
     def _read_stdout(self) -> None:
-        stdout = self._process.stdout
-        if stdout is None:
-            self._closed.set()
-            return
+        if self._terminal_host is not None:
+            waiter = self._terminal_waiter
+            if waiter is None:
+                self._closed.set()
+                return
+            stdout = _supervised_json_lines(waiter)
+        else:
+            if self._process is None or self._process.stdout is None:
+                self._closed.set()
+                return
+            stdout = self._process.stdout
         try:
             for line in stdout:
+                if self._terminal_host is not None:
+                    try:
+                        self._sent_lines.remove(line)
+                    except ValueError:
+                        pass
+                    else:
+                        continue
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
@@ -455,6 +1057,8 @@ class JsonRpcStdioProcess:
                 item.event.set()
 
     def _read_stderr(self) -> None:
+        if self._process is None:
+            return
         stderr = self._process.stderr
         if stderr is None:
             return
@@ -515,6 +1119,12 @@ class UniverseAcpGateway:
     def set_permission_requester(self, requester: PermissionRequester) -> None:
         self.session.set_permission_requester(requester)
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        reader = getattr(self.session, "drain_work_statuses", None)
+        if not callable(reader):
+            return []
+        return [dict(item) for item in reader() if isinstance(item, Mapping)]
+
     def runtime_observation(self) -> dict[str, Any]:
         observer = getattr(self.session, "runtime_observation", None)
         if callable(observer):
@@ -567,9 +1177,22 @@ class GrokAcpSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         response_timeout_seconds: float = 300,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": mode,
+            "provider": "GROK",
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         # An ephemeral session is bounded: it never resumes a stored session
         # and never reports its id back, so nothing can be resumed later.
         self.ephemeral = bool(ephemeral)
@@ -584,8 +1207,12 @@ class GrokAcpSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
+        self._quota_snapshot = _unknown_quota_snapshot("GROK", "_x.ai/billing")
         self._active_delta: Callable[[str], None] | None = None
+        self._active_message_reset: Callable[[], None] | None = None
         self._bootstrap_pending = True
+        self._git_trace2 = GitTrace2Observer(cwd)
+        environment = self._git_trace2.environment(environment)
         transport_arguments = [
             "--no-auto-update",
             "--permission-mode",
@@ -601,6 +1228,7 @@ class GrokAcpSession:
             environment=environment,
             request_handler=self._handle_request,
             notification_handler=self._handle_notification,
+            **self._supervisor_transport,
         )
         try:
             self._initialize()
@@ -628,7 +1256,14 @@ class GrokAcpSession:
             parts.append(delta)
             on_delta(delta)
 
+        def reset_message() -> None:
+            parts.clear()
+            reset_callback = getattr(on_delta, "reset", None)
+            if callable(reset_callback):
+                reset_callback()
+
         self._active_delta = receive
+        self._active_message_reset = reset_message
         prompt_text = text
         if self._bootstrap_pending:
             prompt_text = f"{self.system_prompt}\n\n{text}"
@@ -649,6 +1284,7 @@ class GrokAcpSession:
             )
         finally:
             self._active_delta = None
+            self._active_message_reset = None
         if not isinstance(result, Mapping):
             raise AgentSessionError("GROK_ACP_PROMPT_RESULT_INVALID")
         output = "".join(parts).strip()
@@ -656,8 +1292,86 @@ class GrokAcpSession:
             raise AgentSessionError("GROK_ACP_RESPONSE_MISSING")
         return output
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
+    def runtime_observation(self) -> dict[str, Any]:
+        quota = dict(self._quota_snapshot)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "GROK",
+            "session_ref": self.session_ref,
+            "state": "READY",
+            "quota_state": quota.get("state", "UNKNOWN"),
+            "usage": {},
+            "quota": quota,
+        }
+
+    def _refresh_quota(self) -> None:
+        source = "_x.ai/billing"
+        try:
+            value = self._transport.request(
+                "_x.ai/billing", {}, timeout_seconds=12
+            )
+        except AgentSessionError:
+            value = self._read_local_billing_log()
+            source = "grok-cli-local-billing-log"
+        if not isinstance(value, Mapping):
+            fallback = self._read_local_billing_log()
+            if isinstance(fallback, Mapping):
+                value = fallback
+                source = "grok-cli-local-billing-log"
+        self._quota_snapshot = _grok_quota_snapshot(value, source=source)
+
+    @staticmethod
+    def _read_local_billing_log() -> Mapping[str, Any] | None:
+        profile = os.environ.get("USERPROFILE")
+        if not profile:
+            return None
+        path = Path(profile) / ".grok" / "logs" / "unified.jsonl"
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 262_144), os.SEEK_SET)
+                data = handle.read()
+        except OSError:
+            return None
+        for raw_line in reversed(data.splitlines()):
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            candidates = [
+                record,
+                record.get("ctx"),
+                record.get("billing"),
+                record.get("data"),
+                record.get("payload"),
+            ]
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                payload = candidate.get("config")
+                if not isinstance(payload, Mapping):
+                    payload = candidate
+                if any(
+                    key in payload
+                    for key in (
+                        "monthlyLimit",
+                        "monthly_limit",
+                        "creditUsagePercent",
+                        "credit_usage_percent",
+                    )
+                ):
+                    return candidate
+        return None
+
     def close(self) -> None:
         self._transport.close()
+        self._git_trace2.close()
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
@@ -707,6 +1421,7 @@ class GrokAcpSession:
             {"methodId": "cached_token", "_meta": {"headless": True}},
             timeout_seconds=30,
         )
+        self._refresh_quota()
         capabilities = result.get("agentCapabilities")
         can_load = isinstance(capabilities, Mapping) and bool(
             capabilities.get("loadSession")
@@ -749,7 +1464,12 @@ class GrokAcpSession:
         update = params.get("update")
         if not isinstance(update, Mapping):
             return
-        if update.get("sessionUpdate") != "agent_message_chunk":
+        update_type = update.get("sessionUpdate")
+        if update_type == "tool_call":
+            if self._active_message_reset is not None:
+                self._active_message_reset()
+            return
+        if update_type != "agent_message_chunk":
             return
         content = update.get("content")
         if isinstance(content, Mapping):
@@ -800,10 +1520,23 @@ class CodexAppServerSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         response_timeout_seconds: float = 300,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "",
+        supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> None:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
+        self._supervisor_transport = {
+            "terminal_host": terminal_host,
+            "project_id": project_id,
+            "mode": mode,
+            "provider": "CODEX",
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
         self.model = _text(model, "model")
         self.effort = _text(effort, "effort").upper()
         if self.effort not in PROVIDER_EFFORTS:
@@ -811,6 +1544,9 @@ class CodexAppServerSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.last_platform_approval_evidence: dict[str, Any] | None = None
+        self._quota_snapshot = _unknown_quota_snapshot(
+            "CODEX", "account/rateLimits/read"
+        )
         self.ephemeral = bool(ephemeral)
         self.response_timeout_seconds = _positive_timeout_seconds(
             response_timeout_seconds, "CODEX_RESPONSE_TIMEOUT_INVALID"
@@ -821,12 +1557,16 @@ class CodexAppServerSession:
         self._completed_turns: set[str] = set()
         self._turn_statuses: dict[str, str] = {}
         self._bootstrap_pending = False
+        self._git_trace2 = GitTrace2Observer(cwd)
+        environment = self._git_trace2.environment(environment)
         transport_arguments = ["app-server"]
         if self.model.casefold() not in {"auto", "default"}:
-            transport_arguments.extend(("-c", f"model={json.dumps(self.model)}"))
+            # Config values are already one argv item. Literal quotes are not
+            # needed by Codex and cannot safely cross the managed cmd /s path.
+            transport_arguments.extend(("-c", f"model={self.model}"))
         if self.effort != "AUTO":
             transport_arguments.extend(
-                ("-c", f"model_reasoning_effort={json.dumps(self.effort.lower())}")
+                ("-c", f"model_reasoning_effort={self.effort.lower()}")
             )
         transport_arguments.extend(("--listen", "stdio://"))
         self._transport = JsonRpcStdioProcess(
@@ -836,6 +1576,7 @@ class CodexAppServerSession:
             environment=environment,
             request_handler=self._handle_request,
             notification_handler=self._handle_notification,
+            **self._supervisor_transport,
         )
         try:
             self._initialize()
@@ -912,8 +1653,35 @@ class CodexAppServerSession:
             raise AgentSessionError("CODEX_RESPONSE_MISSING")
         return output
 
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
+    def runtime_observation(self) -> dict[str, Any]:
+        quota = dict(self._quota_snapshot)
+        return {
+            "schema": "universe.provider-runtime-observation.v1",
+            "provider": "CODEX",
+            "session_ref": self.session_ref,
+            "state": "READY",
+            "quota_state": quota.get("state", "UNKNOWN"),
+            "usage": {},
+            "quota": quota,
+        }
+
+    def _refresh_quota(self) -> None:
+        try:
+            value = self._transport.request(
+                "account/rateLimits/read", {}, timeout_seconds=12
+            )
+        except AgentSessionError:
+            return
+        self._quota_snapshot = _codex_quota_snapshot(
+            value, source="account/rateLimits/read"
+        )
+
     def close(self) -> None:
         self._transport.close()
+        self._git_trace2.close()
 
     def supervisor_process_identity(
         self, endpoint: str, handshake_token: str
@@ -965,6 +1733,7 @@ class CodexAppServerSession:
         if not isinstance(result, Mapping):
             raise AgentSessionError("CODEX_APP_INITIALIZE_INVALID")
         self._transport.notify("initialized")
+        self._refresh_quota()
         if self.session_id and not self.ephemeral:
             try:
                 session_result = self._transport.request(
@@ -1006,6 +1775,11 @@ class CodexAppServerSession:
         self.session_observer(session_id)
 
     def _handle_notification(self, method: str, params: Mapping[str, Any]) -> None:
+        if method == "account/rateLimits/updated":
+            self._quota_snapshot = _codex_quota_snapshot(
+                params, source="account/rateLimits/updated"
+            )
+            return
         if method == "item/agentMessage/delta" and self._active_delta is not None:
             delta = params.get("delta")
             if isinstance(delta, str) and delta:
@@ -1173,6 +1947,7 @@ class ClaudeCodeSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
+        allow_read_only_tools: bool = False,
         max_turns: int = 8,
         response_timeout_seconds: float = 300,
         json_schema: Mapping[str, Any] | None = None,
@@ -1180,7 +1955,8 @@ class ClaudeCodeSession:
     ) -> None:
         self.executable = executable
         self.cwd = cwd
-        self.environment = dict(environment)
+        self._git_trace2 = GitTrace2Observer(cwd)
+        self.environment = self._git_trace2.environment(environment)
         self.system_prompt = system_prompt
         self.model = _text(model, "model")
         self._resume_session = bool(session_id) and not ephemeral
@@ -1192,6 +1968,7 @@ class ClaudeCodeSession:
         self.permission_requester = permission_requester
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
+        self.allow_read_only_tools = bool(allow_read_only_tools)
         self.max_turns = max(1, int(max_turns))
         self.response_timeout_seconds = _positive_timeout_seconds(
             response_timeout_seconds, "CLAUDE_RESPONSE_TIMEOUT_INVALID"
@@ -1200,6 +1977,7 @@ class ClaudeCodeSession:
             _json_object(json_schema) if json_schema is not None else None
         )
         self.native_runner = native_runner
+        self.last_result_observation: dict[str, Any] = {}
 
     @property
     def session_ref(self) -> str:
@@ -1215,6 +1993,8 @@ class ClaudeCodeSession:
             "-p",
             "--output-format",
             "json",
+            "--system-prompt",
+            self.system_prompt,
             "--permission-mode",
             CLAUDE_PERMISSION_MODE,
             "--model",
@@ -1223,7 +2003,11 @@ class ClaudeCodeSession:
             str(self.max_turns),
             "--strict-mcp-config",
             "--tools",
-            "" if self.ephemeral else ",".join(CLAUDE_READ_ONLY_TOOLS),
+            (
+                ",".join(CLAUDE_READ_ONLY_TOOLS)
+                if self.allow_read_only_tools or not self.ephemeral
+                else ""
+            ),
         ]
         if self.ephemeral:
             arguments.append("--no-session-persistence")
@@ -1259,27 +2043,66 @@ class ClaudeCodeSession:
             )
         finally:
             prompt_path.unlink(missing_ok=True)
-        if result.status != "COMPLETED" or result.return_code != 0:
-            detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
-            raise AgentSessionError(f"CLAUDE_CODE_FAILED:{detail or result.status}")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
+            self.last_result_observation = self._result_observation(result, None)
+            if result.status != "COMPLETED" or result.return_code != 0:
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ) from error
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID") from error
-        if not isinstance(payload, Mapping) or payload.get("is_error") is True:
+        if not isinstance(payload, Mapping):
+            self.last_result_observation = self._result_observation(result, None)
             raise AgentSessionError("CLAUDE_CODE_RESPONSE_INVALID")
+        self.last_result_observation = self._result_observation(result, payload)
         if self.json_schema is not None:
             structured_output = payload.get("structured_output")
-            if not isinstance(structured_output, Mapping):
+            if isinstance(structured_output, Mapping):
+                output = json.dumps(
+                    _json_object(structured_output),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            elif (
+                result.status != "COMPLETED"
+                or result.return_code != 0
+                or payload.get("is_error") is True
+            ):
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
                 raise AgentSessionError("CLAUDE_CODE_STRUCTURED_OUTPUT_MISSING")
-            output = json.dumps(
-                _json_object(structured_output),
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
         else:
+            if (
+                result.status != "COMPLETED"
+                or result.return_code != 0
+                or payload.get("is_error") is True
+            ):
+                raise AgentSessionError(
+                    "CLAUDE_CODE_RESULT_FAILED:"
+                    + json.dumps(
+                        self.last_result_observation,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             output = payload.get("result")
             if not isinstance(output, str) or not output.strip():
                 raise AgentSessionError("CLAUDE_CODE_RESPONSE_MISSING")
@@ -1291,8 +2114,41 @@ class ClaudeCodeSession:
         on_delta(output)
         return output.strip()
 
+    @staticmethod
+    def _result_observation(
+        result: NativeCliResult, payload: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        observation: dict[str, Any] = {
+            "native_status": result.status,
+            "return_code": result.return_code,
+            "stdout_sha256": hashlib.sha256(
+                result.stdout.encode("utf-8")
+            ).hexdigest(),
+            "stdout_truncated": result.stdout_truncated,
+            "stderr_sha256": hashlib.sha256(
+                result.stderr.encode("utf-8")
+            ).hexdigest(),
+            "stderr_truncated": result.stderr_truncated,
+            "payload_parsed": payload is not None,
+            "structured_output_present": bool(
+                payload is not None
+                and isinstance(payload.get("structured_output"), Mapping)
+            ),
+        }
+        if payload is not None:
+            for key in ("is_error", "stop_reason", "session_id", "num_turns"):
+                value = payload.get(key)
+                if isinstance(value, (str, int, bool)) and not isinstance(
+                    value, float
+                ):
+                    observation[key] = value
+        return observation
+
+    def drain_work_statuses(self) -> list[dict[str, Any]]:
+        return self._git_trace2.drain_work_statuses()
+
     def close(self) -> None:
-        return None
+        self._git_trace2.close()
 
     @staticmethod
     def _argument_value(arguments: list[str], flag: str, error_code: str) -> str:
@@ -1315,6 +2171,9 @@ class ClaudeCodeSession:
 
         if CLAUDE_FORBIDDEN_ARGUMENTS.intersection(arguments):
             raise AgentSessionError("CLAUDE_PERMISSION_BYPASS_FORBIDDEN")
+        ClaudeCodeSession._argument_value(
+            arguments, "--system-prompt", "CLAUDE_SYSTEM_PROMPT_REQUIRED"
+        )
         mode = ClaudeCodeSession._argument_value(
             arguments, "--permission-mode", "CLAUDE_PERMISSION_MODE_REQUIRED"
         )
@@ -1338,7 +2197,7 @@ class ClaudeCodeSession:
         )
         path = Path(temporary)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(f"{self.system_prompt}\n\n{text}\n")
+            stream.write(f"{text}\n")
         return path
 
 

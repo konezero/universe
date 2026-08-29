@@ -19,12 +19,16 @@ class FakeMemoryStore:
     def __init__(self) -> None:
         self.candidates: list[dict[str, Any]] = []
         self.run_count = 0
+        self.count_since: str | None = None
         self.persisted: list[dict[str, Any]] = []
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         return {"project_id": project_id}
 
-    def count_memory_batch_runs(self, project_id: str, stage: str) -> int:
+    def count_memory_batch_runs(
+        self, project_id: str, stage: str, *, since: str | None = None
+    ) -> int:
+        self.count_since = since
         return self.run_count
 
     def list_provider_session_sources(self) -> list[dict[str, Any]]:
@@ -155,6 +159,22 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
         self.assertEqual("MEMORY_BATCH_QUOTA_EXCEEDED", error.exception.code)
         self.assertEqual([], self.store.persisted)
         self.assertEqual([], self.store.candidates)
+
+    def test_quota_window_counts_only_current_utc_window(self) -> None:
+        service = MemoryBatchExecutionService(
+            self.store,
+            now=lambda: "2026-08-16T12:14:00Z",
+        )
+        service.execute(
+            "TEST",
+            {
+                "stage": "FAST_EXTRACT",
+                "dry_run": True,
+                "quota_or_budget": {"max_runs": 2, "window_hours": 6},
+            },
+            {"activity_batches": [self.activity_batch]},
+        )
+        self.assertEqual("2026-08-16T12:00:00Z", self.store.count_since)
 
 
 if __name__ == "__main__":

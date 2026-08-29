@@ -109,6 +109,11 @@ class ProjectMasterBridgeHost:
             "INSTRUCTION_TASK_FRAME_GATEWAY_UNAVAILABLE"
         )
 
+    def run_instruction_authorized_task_frame(self, _request: Any) -> dict[str, Any]:
+        raise ProjectMasterBridgeError(
+            "INSTRUCTION_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
+        )
+
     def run_approved_descendant_task_frame(self, _request: Any) -> dict[str, Any]:
         raise ProjectMasterBridgeError(
             "APPROVED_DESCENDANT_TASK_FRAME_RUN_GATEWAY_UNAVAILABLE"
@@ -172,6 +177,9 @@ class ProjectMasterBridgeRequestHandler(BaseHTTPRequestHandler):
             (
                 "/v1/project-master/task-frames/instruction"
             ): self.server.bridge_host.create_instruction_authorized_task_frame,
+            (
+                "/v1/project-master/task-frames/instruction/run"
+            ): self.server.bridge_host.run_instruction_authorized_task_frame,
             (
                 "/v1/project-master/task-frames/run"
             ): self.server.bridge_host.run_approved_descendant_task_frame,

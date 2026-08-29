@@ -477,6 +477,22 @@ class HttpProjectMasterBridge:
             "delivered_at": utc_now(),
         }
 
+    def run_instruction_authorized_task_frame(
+        self,
+        *,
+        bridge: dict[str, Any],
+        task_frame_id: str,
+        primary_proposal_id: str,
+        primary_proposal_digest: str,
+    ) -> dict[str, Any]:
+        return self.run_approved_descendant_task_frame(
+            bridge=bridge,
+            task_frame_id=task_frame_id,
+            primary_proposal_id=primary_proposal_id,
+            primary_proposal_digest=primary_proposal_digest,
+            approval_evidence_ref=None,
+        )
+
     def run_approved_descendant_task_frame(
         self,
         *,
@@ -484,7 +500,7 @@ class HttpProjectMasterBridge:
         task_frame_id: str,
         primary_proposal_id: str,
         primary_proposal_digest: str,
-        approval_evidence_ref: str,
+        approval_evidence_ref: str | None,
     ) -> dict[str, Any]:
         endpoint = self.validate()
         credential_env = _environment_name(self.credential_env)
@@ -493,24 +509,29 @@ class HttpProjectMasterBridge:
             raise DispatchError("MASTER_BRIDGE_CREDENTIAL_UNAVAILABLE")
         project_id = _project_id(bridge.get("project_id"))
         frame_id = _text(task_frame_id, "task_frame_id")
+        run_request = {
+            "task_frame_id": frame_id,
+            "primary_proposal_id": _text(
+                primary_proposal_id, "primary_proposal_id"
+            ),
+            "primary_proposal_digest": _text(
+                primary_proposal_digest, "primary_proposal_digest"
+            ),
+        }
+        if approval_evidence_ref is not None:
+            run_request["approval_evidence_ref"] = _text(
+                approval_evidence_ref, "approval_evidence_ref"
+            )
         body = json.dumps(
-            {
-                "task_frame_id": frame_id,
-                "primary_proposal_id": _text(
-                    primary_proposal_id, "primary_proposal_id"
-                ),
-                "primary_proposal_digest": _text(
-                    primary_proposal_digest, "primary_proposal_digest"
-                ),
-                "approval_evidence_ref": _text(
-                    approval_evidence_ref, "approval_evidence_ref"
-                ),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
+            run_request, separators=(",", ":"), sort_keys=True
         ).encode("utf-8")
         request = Request(
-            endpoint + "/v1/project-master/task-frames/run",
+            endpoint
+            + (
+                "/v1/project-master/task-frames/run"
+                if approval_evidence_ref is not None
+                else "/v1/project-master/task-frames/instruction/run"
+            ),
             data=body,
             method="POST",
             headers={

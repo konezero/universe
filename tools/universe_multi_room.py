@@ -28,9 +28,33 @@ ROOM_DURABLE_EVENT_SCHEMA = "universe.chat-room-durable-event.v1"
 ROOM_CURSOR_SCHEMA = "universe.chat-room-cursor.v1"
 MEETING_COORDINATOR_SCHEMA = "universe.meeting-coordinator.v1"
 MEETING_SUMMARY_SCHEMA = "universe.meeting-summary.v1"
+MEETING_PROTOCOLS = frozenset(
+    {"INCREMENTAL_DELTA_ONLY", "INDEPENDENT_PROPOSAL_REVIEW"}
+)
+ROOM_ARTIFACT_SCHEMA = "universe.chat-room-artifact.v1"
+ROOM_ARTIFACT_REVISION_SCHEMA = "universe.chat-room-artifact-revision.v1"
+ROOM_FINDING_SCHEMA = "universe.chat-room-finding.v1"
 
 ROOM_TYPES = frozenset({"PROJECT", "BOSS", "MEETING"})
 ROOM_STATES = frozenset({"OPEN", "CLOSED"})
+ROOM_ARTIFACT_TYPES = frozenset(
+    {"PROPOSAL", "SPECIFICATION", "COMPARISON", "DECISION_CANDIDATE"}
+)
+ROOM_ARTIFACT_STATES = frozenset({"DRAFT", "REVIEW", "CANDIDATE", "ARCHIVED"})
+ROOM_FINDING_TYPES = frozenset(
+    {"RAG_FINDING", "CROSS_FEATURE_DEPENDENCY", "ESCALATION_REQUEST"}
+)
+ROOM_FINDING_STATES = frozenset({"OPEN", "ACKNOWLEDGED", "RESOLVED"})
+MESSAGE_KINDS = frozenset(
+    {
+        "MESSAGE",
+        "DECISION",
+        "TASK_DRAFT",
+        "DOCUMENT_DRAFT",
+        "FAILURE",
+        "BENCH_OBSERVATION",
+    }
+)
 ATTACH_STATES = frozenset({"ACTIVE", "DETACHED", "STALE"})
 PARTICIPANT_STATES = frozenset(
     {"OBSERVED", "ATTACHED", "CONTROLLED", "LIVE", "DISCONNECTED"}
@@ -55,6 +79,7 @@ MEMBER_ROLES = frozenset(
         "MASTER",
         "BOSS",
         "WORKER",
+        "REVIEWER",
         "MODEL",
         "OBSERVER",
     }
@@ -62,7 +87,7 @@ MEMBER_ROLES = frozenset(
 # Who may POST chat messages in each room type (product write matrix).
 WRITE_ROLES: dict[str, frozenset[str]] = {
     "PROJECT": frozenset({"USER", "CONDUCTOR", "MASTER"}),
-    "BOSS": frozenset({"BOSS", "WORKER", "MASTER"}),  # user observe-only
+    "BOSS": frozenset({"BOSS", "WORKER", "REVIEWER", "MASTER"}),  # user observe-only
     "MEETING": frozenset({"USER", "CONDUCTOR", "MODEL", "MASTER"}),
 }
 
@@ -236,6 +261,71 @@ class MultiRoomStore:
 
                 CREATE INDEX IF NOT EXISTS chat_room_message_room_time
                 ON chat_room_message(room_id, created_at, message_id);
+
+                CREATE TABLE IF NOT EXISTS chat_room_artifact (
+                    artifact_id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    artifact_type TEXT NOT NULL
+                        CHECK(artifact_type IN (
+                            'PROPOSAL', 'SPECIFICATION', 'COMPARISON',
+                            'DECISION_CANDIDATE'
+                        )),
+                    title TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('DRAFT', 'REVIEW', 'CANDIDATE', 'ARCHIVED')),
+                    current_revision INTEGER NOT NULL,
+                    created_by_role TEXT NOT NULL,
+                    created_by_binding_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_room_artifact_room_time
+                ON chat_room_artifact(room_id, updated_at, artifact_id);
+
+                CREATE TABLE IF NOT EXISTS chat_room_artifact_revision (
+                    artifact_id TEXT NOT NULL
+                        REFERENCES chat_room_artifact(artifact_id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    body_text TEXT NOT NULL,
+                    author_role TEXT NOT NULL,
+                    author_binding_id TEXT,
+                    evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                    source_message_id TEXT,
+                    content_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(artifact_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_room_finding (
+                    finding_id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL
+                        REFERENCES chat_room(room_id) ON DELETE CASCADE,
+                    finding_type TEXT NOT NULL
+                        CHECK(finding_type IN (
+                            'RAG_FINDING', 'CROSS_FEATURE_DEPENDENCY',
+                            'ESCALATION_REQUEST'
+                        )),
+                    summary TEXT NOT NULL,
+                    detail_text TEXT NOT NULL,
+                    reporter_role TEXT NOT NULL,
+                    reporter_binding_id TEXT,
+                    evidence_refs_json TEXT NOT NULL,
+                    feature_refs_json TEXT NOT NULL,
+                    requested_owner_role TEXT,
+                    source_message_id TEXT,
+                    content_digest TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('OPEN', 'ACKNOWLEDGED', 'RESOLVED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_room_finding_room_time
+                ON chat_room_finding(room_id, created_at, finding_id);
 
                 CREATE TABLE IF NOT EXISTS chat_room_control_event (
                     event_id TEXT PRIMARY KEY,
@@ -491,24 +581,40 @@ class MultiRoomStore:
         *,
         project_id: str | None = None,
         room_type: str | None = None,
-        state: str = "OPEN",
+        state: str | None = "OPEN",
     ) -> list[dict[str, Any]]:
-        clauses = ["state = ?"]
-        params: list[Any] = [state if state in ROOM_STATES else "OPEN"]
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state if state in ROOM_STATES else "OPEN")
         if project_id:
             clauses.append("project_id = ?")
             params.append(project_id)
         if room_type:
             clauses.append("room_type = ?")
             params.append(room_type.upper())
+        where_sql = (
+            " WHERE " + " AND ".join(f"r.{clause}" for clause in clauses)
+            if clauses
+            else ""
+        )
         sql = (
-            "SELECT * FROM chat_room WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY created_at DESC, room_id DESC"
+            "SELECT r.*, COUNT(b.binding_id) AS participant_count"
+            " FROM chat_room r"
+            " LEFT JOIN chat_room_session b ON b.room_id = r.room_id AND b.state = 'ACTIVE'"
+            + where_sql
+            + " GROUP BY r.room_id"
+            + " ORDER BY r.created_at DESC, r.room_id DESC"
         )
         with self._connect() as connection:
             rows = connection.execute(sql, params).fetchall()
-            return [self._room_row(row) for row in rows]
+            result = []
+            for row in rows:
+                item = self._room_row(row)
+                item["participant_count"] = row["participant_count"]
+                result.append(item)
+            return result
 
     def close_room(self, room_id: str) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)
@@ -516,6 +622,11 @@ class MultiRoomStore:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE chat_room SET state = 'CLOSED', updated_at = ? WHERE room_id = ?",
+                (now, rid),
+            )
+            connection.execute(
+                "UPDATE chat_room_session SET state = 'DETACHED', updated_at = ? "
+                "WHERE room_id = ? AND state = 'ACTIVE'",
                 (now, rid),
             )
             connection.commit()
@@ -547,6 +658,22 @@ class MultiRoomStore:
             limit=128,
         )
         display_name = _optional_text(value.get("display_name"), "display_name", limit=120)
+        session_anchor_ref = _optional_text(
+            value.get("session_anchor_ref") or value.get("anchor_ref"),
+            "session_anchor_ref",
+            limit=256,
+        )
+        raw_metadata = value.get("metadata")
+        binding_metadata: dict[str, Any] = (
+            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        )
+        if session_anchor_ref is not None:
+            binding_metadata["session_anchor_ref"] = session_anchor_ref
+        provider_chat_key = _optional_text(
+            value.get("provider_chat_key"), "provider_chat_key", limit=160
+        )
+        if provider_chat_key is not None:
+            binding_metadata["provider_chat_key"] = provider_chat_key
         resume_pending_delivery = value.get("resume_pending_delivery") is True
         participant_state = str(value.get("participant_state") or "OBSERVED").upper()
         if participant_state not in PARTICIPANT_STATES:
@@ -620,7 +747,7 @@ class MultiRoomStore:
                     binding_id, room_id, slot_role, provider, provider_session_ref,
                     supervisor_session_id, display_name, state, metadata_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', '{}', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
                 """,
                 (
                     binding_id,
@@ -630,6 +757,7 @@ class MultiRoomStore:
                     provider_session_ref,
                     supervisor_session_id,
                     display_name,
+                    json.dumps(binding_metadata, ensure_ascii=False, separators=(",", ":")),
                     now,
                     now,
                 ),
@@ -696,6 +824,8 @@ class MultiRoomStore:
                 or value.get("session_ref"),
                 "supervisor_session_id": value.get("supervisor_session_id")
                 or value.get("session_id"),
+                "session_anchor_ref": value.get("session_anchor_ref")
+                or value.get("anchor_ref"),
                 "display_name": value.get("display_name"),
             },
         )
@@ -789,6 +919,15 @@ class MultiRoomStore:
                 403,
             )
         body_text = _text(value.get("body_text") or value.get("text") or value.get("body"), "body_text", limit=20000)
+        message_kind = _text(
+            value.get("kind") or value.get("message_kind") or "MESSAGE",
+            "message_kind",
+            limit=64,
+        ).upper()
+        if message_kind not in MESSAGE_KINDS:
+            raise MultiRoomError(
+                "MESSAGE_KIND_INVALID", f"unsupported message_kind: {message_kind}"
+            )
         idem = _optional_text(value.get("idempotency_key"), "idempotency_key", limit=120)
         if not idem:
             idem = "idem_" + secrets.token_hex(16)
@@ -801,6 +940,24 @@ class MultiRoomStore:
         correlation_id = _optional_text(
             value.get("correlation_id"), "correlation_id", limit=256
         )
+        target_binding_ids_raw = value.get("target_binding_ids")
+        target_binding_ids: list[str] | None = None
+        if target_binding_ids_raw is not None:
+            if not isinstance(target_binding_ids_raw, list):
+                raise MultiRoomError(
+                    "TARGET_BINDINGS_INVALID",
+                    "target_binding_ids must be an array",
+                )
+            target_binding_ids = []
+            for item in target_binding_ids_raw:
+                binding_id = _text(item, "target_binding_id", limit=80)
+                if binding_id not in target_binding_ids:
+                    target_binding_ids.append(binding_id)
+            if not target_binding_ids:
+                raise MultiRoomError(
+                    "TARGET_BINDINGS_REQUIRED",
+                    "target_binding_ids must contain at least one binding",
+                )
         message_id = "msg_" + secrets.token_hex(12)
         room_event_id = "room_evt_" + secrets.token_hex(12)
         now = utc_now()
@@ -826,6 +983,20 @@ class MultiRoomStore:
                     raise MultiRoomError(
                         "AUTHOR_BINDING_INVALID",
                         "author binding does not belong to the room",
+                        409,
+                    )
+            for target_binding_id in target_binding_ids or []:
+                target_binding = connection.execute(
+                    """
+                    SELECT binding_id FROM chat_room_session
+                    WHERE binding_id = ? AND room_id = ? AND state = 'ACTIVE'
+                    """,
+                    (target_binding_id, room["room_id"]),
+                ).fetchone()
+                if target_binding is None:
+                    raise MultiRoomError(
+                        "TARGET_BINDING_INVALID",
+                        "target binding is not an active participant in the room",
                         409,
                     )
             if provider_event_id is not None:
@@ -856,10 +1027,12 @@ class MultiRoomStore:
                 "room_id": room["room_id"],
                 "room_event_id": room_event_id,
                 "room_sequence": room_sequence,
+                "kind": message_kind,
                 "author_role": author_role,
                 "author_binding_id": author_binding_id,
                 "provider_event_id": provider_event_id,
                 "correlation_id": correlation_id,
+                "target_binding_ids": target_binding_ids,
                 "body_text": body_text,
                 "created_at": now,
             }
@@ -927,6 +1100,492 @@ class MultiRoomStore:
             },
         )
         return message
+
+    def _artifact_write_context(
+        self,
+        room: Mapping[str, Any],
+        value: Mapping[str, Any],
+        connection: sqlite3.Connection,
+    ) -> tuple[str, str | None]:
+        if room["state"] != "OPEN":
+            raise MultiRoomError("ROOM_CLOSED", "cannot write artifacts in a closed room", 409)
+        if room["room_type"] != "MEETING":
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_UNSUPPORTED",
+                "Room-native specification artifacts are currently limited to MEETING rooms",
+                409,
+            )
+        author_role = _text(
+            value.get("author_role") or value.get("role") or "USER",
+            "author_role",
+        ).upper()
+        if author_role not in WRITE_ROLES["MEETING"]:
+            raise MultiRoomError(
+                "ROOM_WRITE_FORBIDDEN",
+                f"role {author_role} cannot write artifacts in MEETING rooms",
+                403,
+            )
+        author_binding_id = _optional_text(
+            value.get("author_binding_id"), "author_binding_id", limit=80
+        )
+        if author_binding_id is not None:
+            binding = connection.execute(
+                "SELECT binding_id FROM chat_room_session WHERE binding_id = ? AND room_id = ?",
+                (author_binding_id, room["room_id"]),
+            ).fetchone()
+            if binding is None:
+                raise MultiRoomError(
+                    "AUTHOR_BINDING_INVALID",
+                    "author binding does not belong to the room",
+                    409,
+                )
+        return author_role, author_binding_id
+
+    def _artifact_evidence_refs(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_EVIDENCE_INVALID",
+                "evidence_refs must be an array",
+            )
+        if len(value) > 50:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_EVIDENCE_INVALID",
+                "evidence_refs exceeds 50 entries",
+            )
+        refs: list[str] = []
+        for item in value:
+            ref = _text(item, "evidence_ref", limit=512)
+            if ref not in refs:
+                refs.append(ref)
+        return refs
+
+    def _artifact_source_message(
+        self,
+        connection: sqlite3.Connection,
+        room_id: str,
+        value: Any,
+    ) -> str | None:
+        source_message_id = _optional_text(value, "source_message_id", limit=80)
+        if source_message_id is None:
+            return None
+        message = connection.execute(
+            "SELECT message_id FROM chat_room_message WHERE message_id = ? AND room_id = ?",
+            (source_message_id, room_id),
+        ).fetchone()
+        if message is None:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_SOURCE_INVALID",
+                "source message does not belong to the room",
+                409,
+            )
+        return source_message_id
+
+    def create_artifact(
+        self, room_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        artifact_type = _text(value.get("artifact_type"), "artifact_type", limit=64).upper()
+        if artifact_type not in ROOM_ARTIFACT_TYPES:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_TYPE_INVALID",
+                f"unsupported artifact_type: {artifact_type}",
+            )
+        title = _text(value.get("title"), "title", limit=300)
+        body_text = _text(value.get("body_text") or value.get("body"), "body_text", limit=100000)
+        state = _text(value.get("state") or "DRAFT", "state", limit=32).upper()
+        if state not in ROOM_ARTIFACT_STATES:
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_STATE_INVALID", f"unsupported artifact state: {state}"
+            )
+        evidence_refs = self._artifact_evidence_refs(value.get("evidence_refs"))
+        artifact_id = "room_art_" + secrets.token_hex(12)
+        now = utc_now()
+        with self._connect() as connection:
+            author_role, author_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            content_digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact(
+                    artifact_id, room_id, artifact_type, title, state,
+                    current_revision, created_by_role, created_by_binding_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id, room["room_id"], artifact_type, title, state,
+                    author_role, author_binding_id, now, now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact_revision(
+                    artifact_id, revision, title, state, body_text, author_role,
+                    author_binding_id, evidence_refs_json, source_message_id,
+                    content_digest, created_at
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id, title, state, body_text, author_role,
+                    author_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    source_message_id, content_digest, now,
+                ),
+            )
+            connection.commit()
+        artifact = self.get_artifact(room["room_id"], artifact_id)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_ARTIFACT_CREATED", "artifact": artifact}
+        )
+        return artifact
+
+    def revise_artifact(
+        self,
+        room_id: str,
+        artifact_id: str,
+        value: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        aid = _text(artifact_id, "artifact_id", limit=80)
+        if isinstance(value.get("expected_revision"), bool):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_REVISION_REQUIRED", "expected_revision must be an integer"
+            )
+        try:
+            expected_revision = int(value.get("expected_revision"))
+        except (TypeError, ValueError):
+            raise MultiRoomError(
+                "ROOM_ARTIFACT_REVISION_REQUIRED", "expected_revision must be an integer"
+            ) from None
+        body_text = _text(value.get("body_text") or value.get("body"), "body_text", limit=100000)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT artifact.*, revision.evidence_refs_json
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.artifact_id = ? AND artifact.room_id = ?
+                """,
+                (aid, room["room_id"]),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError("ROOM_ARTIFACT_NOT_FOUND", "artifact not found", 404)
+            if int(current["current_revision"]) != expected_revision:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_REVISION_CONFLICT",
+                    "expected_revision does not match the current artifact revision",
+                    409,
+                )
+            author_role, author_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            title = _text(value.get("title") or current["title"], "title", limit=300)
+            state = _text(value.get("state") or current["state"], "state", limit=32).upper()
+            if state not in ROOM_ARTIFACT_STATES:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_STATE_INVALID",
+                    f"unsupported artifact state: {state}",
+                )
+            if "evidence_refs" in value:
+                evidence_refs = self._artifact_evidence_refs(value.get("evidence_refs"))
+            else:
+                evidence_refs = json.loads(current["evidence_refs_json"] or "[]")
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            revision = expected_revision + 1
+            now = utc_now()
+            content_digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+            updated = connection.execute(
+                """
+                UPDATE chat_room_artifact
+                SET title = ?, state = ?, current_revision = ?, updated_at = ?
+                WHERE artifact_id = ? AND room_id = ? AND current_revision = ?
+                """,
+                (title, state, revision, now, aid, room["room_id"], expected_revision),
+            )
+            if updated.rowcount != 1:
+                raise MultiRoomError(
+                    "ROOM_ARTIFACT_REVISION_CONFLICT",
+                    "artifact revision changed while the update was being applied",
+                    409,
+                )
+            connection.execute(
+                """
+                INSERT INTO chat_room_artifact_revision(
+                    artifact_id, revision, title, state, body_text, author_role,
+                    author_binding_id, evidence_refs_json, source_message_id,
+                    content_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    aid, revision, title, state, body_text, author_role,
+                    author_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    source_message_id, content_digest, now,
+                ),
+            )
+            connection.commit()
+        artifact = self.get_artifact(room["room_id"], aid)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_ARTIFACT_REVISED", "artifact": artifact}
+        )
+        return artifact
+
+    def get_artifact(self, room_id: str, artifact_id: str) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        aid = _text(artifact_id, "artifact_id", limit=80)
+        with self._connect() as connection:
+            current = connection.execute(
+                """
+                SELECT artifact.*, revision.body_text, revision.author_role,
+                       revision.author_binding_id AS revision_author_binding_id,
+                       revision.evidence_refs_json, revision.source_message_id,
+                       revision.content_digest,
+                       revision.created_at AS revision_created_at
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.artifact_id = ? AND artifact.room_id = ?
+                """,
+                (aid, rid),
+            ).fetchone()
+            if current is None:
+                raise MultiRoomError("ROOM_ARTIFACT_NOT_FOUND", "artifact not found", 404)
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_room_artifact_revision
+                WHERE artifact_id = ? ORDER BY revision ASC
+                """,
+                (aid,),
+            ).fetchall()
+        artifact = self._artifact_row(current)
+        artifact["revisions"] = [self._artifact_revision_row(row) for row in rows]
+        return artifact
+
+    def list_artifacts(
+        self, room_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT artifact.*, revision.body_text, revision.author_role,
+                       revision.author_binding_id AS revision_author_binding_id,
+                       revision.evidence_refs_json, revision.source_message_id,
+                       revision.content_digest,
+                       revision.created_at AS revision_created_at
+                FROM chat_room_artifact artifact
+                JOIN chat_room_artifact_revision revision
+                  ON revision.artifact_id = artifact.artifact_id
+                 AND revision.revision = artifact.current_revision
+                WHERE artifact.room_id = ?
+                ORDER BY artifact.updated_at ASC, artifact.artifact_id ASC
+                LIMIT ?
+                """,
+                (rid, cap),
+            ).fetchall()
+        return [self._artifact_row(row) for row in rows]
+
+    def _finding_refs(
+        self,
+        value: Any,
+        *,
+        field: str,
+        error_code: str,
+        limit: int,
+    ) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise MultiRoomError(error_code, f"{field} must be an array")
+        if len(value) > limit:
+            raise MultiRoomError(error_code, f"{field} exceeds {limit} entries")
+        refs: list[str] = []
+        for item in value:
+            ref = _text(item, field[:-1] if field.endswith("s") else field, limit=512)
+            if ref not in refs:
+                refs.append(ref)
+        return refs
+
+    def record_finding(
+        self, room_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        finding_type = _text(
+            value.get("finding_type") or value.get("kind"),
+            "finding_type",
+            limit=64,
+        ).upper()
+        if finding_type not in ROOM_FINDING_TYPES:
+            raise MultiRoomError(
+                "ROOM_FINDING_TYPE_INVALID",
+                f"unsupported finding_type: {finding_type}",
+            )
+        summary = _text(value.get("summary"), "summary", limit=500)
+        detail_text = _optional_text(
+            value.get("detail_text") or value.get("detail"),
+            "detail_text",
+            limit=20000,
+        ) or ""
+        evidence_refs = self._finding_refs(
+            value.get("evidence_refs"),
+            field="evidence_refs",
+            error_code="ROOM_FINDING_EVIDENCE_INVALID",
+            limit=50,
+        )
+        if not evidence_refs:
+            raise MultiRoomError(
+                "ROOM_FINDING_EVIDENCE_REQUIRED",
+                "structured room findings require at least one evidence reference",
+            )
+        feature_refs = self._finding_refs(
+            value.get("feature_refs"),
+            field="feature_refs",
+            error_code="ROOM_FINDING_FEATURE_REFS_INVALID",
+            limit=20,
+        )
+        if finding_type == "CROSS_FEATURE_DEPENDENCY" and len(feature_refs) < 2:
+            raise MultiRoomError(
+                "ROOM_FINDING_FEATURE_REFS_REQUIRED",
+                "cross-feature dependencies require at least two feature_refs",
+            )
+        requested_owner_role = _optional_text(
+            value.get("requested_owner_role"), "requested_owner_role", limit=64
+        )
+        if requested_owner_role is not None:
+            requested_owner_role = requested_owner_role.upper()
+            if requested_owner_role not in MEMBER_ROLES:
+                raise MultiRoomError(
+                    "ROOM_FINDING_OWNER_INVALID",
+                    f"unsupported requested_owner_role: {requested_owner_role}",
+                )
+        if finding_type == "ESCALATION_REQUEST" and requested_owner_role is None:
+            raise MultiRoomError(
+                "ROOM_FINDING_OWNER_REQUIRED",
+                "escalation requests require requested_owner_role",
+            )
+        state = _text(value.get("state") or "OPEN", "state", limit=32).upper()
+        if state not in ROOM_FINDING_STATES:
+            raise MultiRoomError(
+                "ROOM_FINDING_STATE_INVALID", f"unsupported finding state: {state}"
+            )
+        finding_id = "room_find_" + secrets.token_hex(12)
+        now = utc_now()
+        with self._connect() as connection:
+            reporter_role, reporter_binding_id = self._artifact_write_context(
+                room, value, connection
+            )
+            source_message_id = self._artifact_source_message(
+                connection, room["room_id"], value.get("source_message_id")
+            )
+            content_digest = hashlib.sha256(detail_text.encode("utf-8")).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO chat_room_finding(
+                    finding_id, room_id, finding_type, summary, detail_text,
+                    reporter_role, reporter_binding_id, evidence_refs_json,
+                    feature_refs_json, requested_owner_role, source_message_id,
+                    content_digest, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finding_id, room["room_id"], finding_type, summary, detail_text,
+                    reporter_role, reporter_binding_id,
+                    json.dumps(evidence_refs, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(feature_refs, ensure_ascii=False, separators=(",", ":")),
+                    requested_owner_role, source_message_id, content_digest,
+                    state, now, now,
+                ),
+            )
+            connection.commit()
+        finding = self.get_finding(room["room_id"], finding_id)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_FINDING_RECORDED", "finding": finding}
+        )
+        return finding
+
+    def get_finding(self, room_id: str, finding_id: str) -> dict[str, Any]:
+        rid = _text(room_id, "room_id", limit=80)
+        fid = _text(finding_id, "finding_id", limit=80)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_room_finding WHERE room_id = ? AND finding_id = ?",
+                (rid, fid),
+            ).fetchone()
+        if row is None:
+            raise MultiRoomError("ROOM_FINDING_NOT_FOUND", "finding not found", 404)
+        return self._finding_row(row)
+
+    def list_findings(
+        self, room_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        rid = _text(room_id, "room_id", limit=80)
+        cap = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM chat_room_finding
+                WHERE room_id = ?
+                ORDER BY created_at ASC, finding_id ASC
+                LIMIT ?
+                """,
+                (rid, cap),
+            ).fetchall()
+        return [self._finding_row(row) for row in rows]
+
+    def update_finding_state(
+        self, room_id: str, finding_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        room = self.get_room(room_id)
+        fid = _text(finding_id, "finding_id", limit=80)
+        requested_state = _text(value.get("state"), "state", limit=32).upper()
+        if requested_state not in ROOM_FINDING_STATES:
+            raise MultiRoomError(
+                "ROOM_FINDING_STATE_INVALID",
+                f"unsupported finding state: {requested_state}",
+            )
+        allowed = {
+            "OPEN": {"OPEN", "ACKNOWLEDGED", "RESOLVED"},
+            "ACKNOWLEDGED": {"ACKNOWLEDGED", "RESOLVED"},
+            "RESOLVED": {"RESOLVED"},
+        }
+        with self._connect() as connection:
+            self._artifact_write_context(room, value, connection)
+            row = connection.execute(
+                "SELECT state FROM chat_room_finding WHERE room_id = ? AND finding_id = ?",
+                (room["room_id"], fid),
+            ).fetchone()
+            if row is None:
+                raise MultiRoomError("ROOM_FINDING_NOT_FOUND", "finding not found", 404)
+            current_state = str(row["state"])
+            if requested_state not in allowed[current_state]:
+                raise MultiRoomError(
+                    "ROOM_FINDING_STATE_TRANSITION_INVALID",
+                    f"cannot transition finding from {current_state} to {requested_state}",
+                    409,
+                )
+            if requested_state != current_state:
+                connection.execute(
+                    "UPDATE chat_room_finding SET state = ?, updated_at = ? WHERE room_id = ? AND finding_id = ?",
+                    (requested_state, utc_now(), room["room_id"], fid),
+                )
+                connection.commit()
+        finding = self.get_finding(room["room_id"], fid)
+        self.hub.publish(
+            room["room_id"], {"type": "ROOM_FINDING_STATE_CHANGED", "finding": finding}
+        )
+        return finding
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1047,6 +1706,18 @@ class MultiRoomStore:
         with self._connect() as connection:
             for event in events:
                 if event.get("origin_binding_id") == cursor["binding_id"]:
+                    continue
+                message = event.get("message")
+                target_binding_ids = (
+                    message.get("target_binding_ids")
+                    if isinstance(message, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(target_binding_ids, list)
+                    and target_binding_ids
+                    and cursor["binding_id"] not in target_binding_ids
+                ):
                     continue
                 prior = connection.execute(
                     """
@@ -1483,18 +2154,84 @@ class MultiRoomStore:
         title = _text(value.get("title") or "Meeting", "title", limit=200)
         project_id = _optional_text(value.get("project_id"), "project_id", limit=120)
         topic = _optional_text(value.get("topic"), "topic", limit=2000)
+        idempotency_key = _optional_text(
+            value.get("idempotency_key"), "idempotency_key", limit=200
+        )
         models = value.get("models") or value.get("model_slots") or []
         if not isinstance(models, list):
             raise MultiRoomError("MEETING_MODELS_INVALID", "models must be a list")
+        room_id = None
+        if idempotency_key is not None:
+            room_id = "room_" + hashlib.sha256(
+                f"MEETING\0{project_id or ''}\0{idempotency_key}".encode("utf-8")
+            ).hexdigest()[:24]
+            try:
+                existing = self.get_room(room_id)
+            except MultiRoomError as error:
+                if error.code != "ROOM_NOT_FOUND":
+                    raise
+            else:
+                if existing.get("state") != "OPEN":
+                    raise MultiRoomError(
+                        "MEETING_IDEMPOTENCY_CLOSED",
+                        "idempotent Meeting Room is closed",
+                        409,
+                    )
+                expected = (
+                    "MEETING",
+                    project_id,
+                    title,
+                    topic,
+                    idempotency_key,
+                )
+                actual = (
+                    existing.get("room_type"),
+                    existing.get("project_id"),
+                    existing.get("title"),
+                    (existing.get("metadata") or {}).get("topic"),
+                    (existing.get("metadata") or {}).get("idempotency_key"),
+                )
+                if actual != expected:
+                    raise MultiRoomError(
+                        "MEETING_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to different Meeting material",
+                        409,
+                    )
+                bindings = self.list_bindings(room_id)
+                if not any(
+                    item.get("slot_role") == "CONDUCTOR"
+                    and item.get("state") == "ACTIVE"
+                    for item in bindings
+                ):
+                    self.attach_session(
+                        room_id,
+                        {
+                            "slot_role": "CONDUCTOR",
+                            "display_name": value.get("conductor_name") or "Conductor",
+                            "provider": value.get("conductor_provider"),
+                            "provider_session_ref": value.get("conductor_session_ref"),
+                        },
+                    )
+                    bindings = self.list_bindings(room_id)
+                return {
+                    "schema": ROOM_SCHEMA,
+                    "status": "MEETING_ROOM_REPLAYED",
+                    "room": self.get_room(room_id),
+                    "bindings": bindings,
+                    "authority": "UNASSIGNED",
+                    "execution_assignment": "UNASSIGNED",
+                }
         room = self.create_room(
             room_type="MEETING",
             title=title,
             host_role="CONDUCTOR",
             project_id=project_id,
+            room_id=room_id,
             metadata={
                 "topic": topic,
                 "source": "meeting-room.create",
                 "created_by": "skill_or_api",
+                "idempotency_key": idempotency_key,
             },
         )
         self.attach_session(
@@ -1725,6 +2462,8 @@ class MultiRoomStore:
         room = self.get_room(room_id)
         bindings = self.list_bindings(room_id)
         messages = self.list_messages(room_id, limit=200)
+        artifacts = self.list_artifacts(room_id, limit=200)
+        findings = self.list_findings(room_id, limit=200)
         events = self.list_room_events(room_id, limit=200)
         participant_cursors = [
             self.participant_cursor(binding["binding_id"]) for binding in bindings
@@ -1740,6 +2479,8 @@ class MultiRoomStore:
             "room": room,
             "bindings": bindings,
             "messages": messages,
+            "artifacts": artifacts,
+            "findings": findings,
             "events": events,
             "participant_cursors": participant_cursors,
             "bridge_line": bridge,
@@ -1786,7 +2527,96 @@ class MultiRoomStore:
             "updated_at": row["updated_at"],
         }
 
+    def _finding_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        try:
+            feature_refs = json.loads(row["feature_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            feature_refs = []
+        finding_type = str(row["finding_type"])
+        return {
+            "schema": ROOM_FINDING_SCHEMA,
+            "finding_id": row["finding_id"],
+            "room_id": row["room_id"],
+            "finding_type": finding_type,
+            "summary": row["summary"],
+            "detail_text": row["detail_text"],
+            "reporter_role": row["reporter_role"],
+            "reporter_binding_id": row["reporter_binding_id"],
+            "evidence_refs": evidence_refs,
+            "feature_refs": feature_refs,
+            "requested_owner_role": row["requested_owner_role"],
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "state": row["state"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "resolution_state": (
+                "RESOLVED"
+                if row["state"] == "RESOLVED"
+                else "ACKNOWLEDGED"
+                if row["state"] == "ACKNOWLEDGED"
+                else "OWNER_ACTION_REQUIRED"
+                if finding_type == "ESCALATION_REQUEST"
+                else "REVIEW_REQUIRED"
+            ),
+            "authority": "UNASSIGNED",
+        }
+
+    def _artifact_revision_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        return {
+            "schema": ROOM_ARTIFACT_REVISION_SCHEMA,
+            "artifact_id": row["artifact_id"],
+            "revision": int(row["revision"]),
+            "title": row["title"],
+            "state": row["state"],
+            "body_text": row["body_text"],
+            "author_role": row["author_role"],
+            "author_binding_id": row["author_binding_id"],
+            "evidence_refs": evidence_refs,
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "created_at": row["created_at"],
+        }
+
+    def _artifact_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            evidence_refs = json.loads(row["evidence_refs_json"] or "[]")
+        except json.JSONDecodeError:
+            evidence_refs = []
+        return {
+            "schema": ROOM_ARTIFACT_SCHEMA,
+            "artifact_id": row["artifact_id"],
+            "room_id": row["room_id"],
+            "artifact_type": row["artifact_type"],
+            "title": row["title"],
+            "state": row["state"],
+            "current_revision": int(row["current_revision"]),
+            "body_text": row["body_text"],
+            "author_role": row["author_role"],
+            "author_binding_id": row["revision_author_binding_id"],
+            "evidence_refs": evidence_refs,
+            "source_message_id": row["source_message_id"],
+            "content_digest": row["content_digest"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "revision_created_at": row["revision_created_at"],
+            "promotion_state": "USER_SELECTION_REQUIRED",
+            "authority": "UNASSIGNED",
+        }
+
     def _binding_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
         return {
             "schema": ROOM_ATTACH_SCHEMA,
             "binding_id": row["binding_id"],
@@ -1796,6 +2626,8 @@ class MultiRoomStore:
             "provider_session_ref": row["provider_session_ref"],
             "supervisor_session_id": row["supervisor_session_id"],
             "display_name": row["display_name"],
+            "session_anchor_ref": metadata.get("session_anchor_ref"),
+            "metadata": metadata,
             "state": row["state"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -2003,11 +2835,16 @@ class MultiRoomNativeControlRegistry:
                 "native provider control rejected the incremental event",
                 409,
             )
+        transport = dict(accepted) if isinstance(accepted, Mapping) else {}
+        status = str(transport.get("status") or "QUEUED").upper()
+        if status not in DELIVERY_STATES:
+            status = "QUEUED"
         return {
-            "status": "QUEUED",
+            "status": status,
             "binding_id": bid,
             "room_event_id": event.get("room_event_id"),
             "control_ref": control["control_ref"],
+            "transport": transport,
         }
 
     def close(self) -> None:
@@ -2022,11 +2859,13 @@ class MultiRoomNativeControlRegistry:
 
 
 class MultiRoomMeetingCoordinator:
-    """Run a bounded, deterministic round-robin meeting over model bindings.
+    """Run a bounded, deterministic meeting over model bindings.
 
-    Provider adapters receive only the immediately preceding room delta. The
-    durable room remains the source of the observable transcript; the
-    coordinator never constructs or forwards a full transcript to a provider.
+    The legacy protocol forwards only the immediately preceding room delta.
+    Role-aware meetings first fan out the same prompt independently, then send
+    bounded excerpts of those proposals for one structured review phase. The
+    durable room remains the source of the observable transcript; neither
+    protocol forwards the unbounded room transcript.
     """
 
     def __init__(
@@ -2077,6 +2916,9 @@ class MultiRoomMeetingCoordinator:
         max_turns: int = 6,
         run_id: str | None = None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None = None,
+        binding_ids: list[str] | tuple[str, ...] | None = None,
+        protocol: str = "INCREMENTAL_DELTA_ONLY",
+        participant_briefs: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)
         with self._run_lock:
@@ -2094,6 +2936,9 @@ class MultiRoomMeetingCoordinator:
                 max_turns=max_turns,
                 run_id=run_id,
                 cancel_check=cancel_check,
+                binding_ids=binding_ids,
+                protocol=protocol,
+                participant_briefs=participant_briefs,
             )
         finally:
             with self._run_lock:
@@ -2107,6 +2952,9 @@ class MultiRoomMeetingCoordinator:
         max_turns: int,
         run_id: str | None,
         cancel_check: Callable[[Mapping[str, Any]], bool] | None,
+        binding_ids: list[str] | tuple[str, ...] | None,
+        protocol: str,
+        participant_briefs: Mapping[str, Mapping[str, Any]] | None,
     ) -> dict[str, Any]:
         room = self.store.get_room(room_id)
         if room["room_type"] != "MEETING":
@@ -2136,11 +2984,26 @@ class MultiRoomMeetingCoordinator:
                 "MEETING_CANCEL_CHECK_INVALID",
                 "cancel_check must be callable",
             )
+        meeting_protocol = str(protocol or "INCREMENTAL_DELTA_ONLY").upper()
+        if meeting_protocol not in MEETING_PROTOCOLS:
+            raise MultiRoomError(
+                "MEETING_PROTOCOL_INVALID",
+                f"unsupported meeting protocol: {meeting_protocol}",
+            )
+        selected_binding_ids = (
+            None
+            if binding_ids is None
+            else {_text(item, "binding_id", limit=80) for item in binding_ids}
+        )
         models = sorted(
             (
                 binding
                 for binding in self.store.list_bindings(room["room_id"])
                 if binding["slot_role"] == "MODEL"
+                and (
+                    selected_binding_ids is None
+                    or binding["binding_id"] in selected_binding_ids
+                )
             ),
             key=lambda item: (item.get("created_at") or "", item["binding_id"]),
         )
@@ -2150,6 +3013,52 @@ class MultiRoomMeetingCoordinator:
                 "meeting requires at least one active MODEL binding",
                 409,
             )
+        briefs: dict[str, dict[str, Any]] = {}
+        if participant_briefs is not None:
+            if not isinstance(participant_briefs, Mapping):
+                raise MultiRoomError(
+                    "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                    "participant_briefs must be an object keyed by binding_id",
+                )
+            model_ids = {str(item["binding_id"]) for item in models}
+            for binding_id, raw_brief in participant_briefs.items():
+                bid = _text(binding_id, "participant_briefs.binding_id", limit=80)
+                if bid not in model_ids or not isinstance(raw_brief, Mapping):
+                    raise MultiRoomError(
+                        "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                        "participant brief must target a selected MODEL binding",
+                    )
+                role = _text(raw_brief.get("role"), "participant_brief.role", limit=120)
+                mandate = _text(
+                    raw_brief.get("mandate"), "participant_brief.mandate", limit=2000
+                )
+                raw_assistants = raw_brief.get("assistants") or []
+                if not isinstance(raw_assistants, list) or len(raw_assistants) > 8:
+                    raise MultiRoomError(
+                        "MEETING_PARTICIPANT_BRIEFS_INVALID",
+                        "participant assistants must be a list of at most 8 names",
+                    )
+                assistants = [
+                    _text(item, "participant_brief.assistant", limit=120)
+                    for item in raw_assistants
+                ]
+                briefs[bid] = {
+                    "role": role,
+                    "mandate": mandate,
+                    "assistants": assistants,
+                }
+        if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+            missing = [item["binding_id"] for item in models if item["binding_id"] not in briefs]
+            if missing:
+                raise MultiRoomError(
+                    "MEETING_PARTICIPANT_BRIEFS_REQUIRED",
+                    "independent proposal review requires one brief per MODEL binding",
+                )
+            if bounded_turns < len(models) * 2:
+                raise MultiRoomError(
+                    "MEETING_TURN_LIMIT_INVALID",
+                    "independent proposal review requires at least two turns per participant",
+                )
         meeting_run_id = _text(
             run_id or "meeting_" + secrets.token_hex(12),
             "run_id",
@@ -2172,6 +3081,7 @@ class MultiRoomMeetingCoordinator:
         started_at = utc_now()
         turns: list[dict[str, Any]] = []
         current_delta: dict[str, Any] | None = None
+        proposal_outputs: dict[str, dict[str, Any]] = {}
         status = "COMPLETED"
         reason = "BOUNDED_TURNS_REACHED"
         prompt_message = self.store.post_message(
@@ -2192,7 +3102,7 @@ class MultiRoomMeetingCoordinator:
                 "run_id": meeting_run_id,
                 "max_turns": bounded_turns,
                 "participant_order": [item["binding_id"] for item in models],
-                "delivery_mode": "INCREMENTAL_DELTA_ONLY",
+                "delivery_mode": meeting_protocol,
                 "transcript_forwarded": False,
                 "cancel_policy": "TURN_BOUNDARY_FAIL_CLOSED",
             },
@@ -2226,6 +3136,40 @@ class MultiRoomMeetingCoordinator:
                     status = "FAILED"
                     reason = "INCREMENTAL_DELTA_MISSING"
                     break
+                phase = "DISCUSSION"
+                turn_delta = current_delta
+                brief = briefs.get(str(binding["binding_id"]))
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+                    phase = "PROPOSAL" if turn_number < len(models) else "REVIEW"
+                    assistant_text = ", ".join((brief or {}).get("assistants") or []) or "none"
+                    role_text = (
+                        f"Assigned role: {(brief or {}).get('role')}\n"
+                        f"Role mandate: {(brief or {}).get('mandate')}\n"
+                        f"Research assistants available by function: {assistant_text}\n"
+                    )
+                    if phase == "PROPOSAL":
+                        delta_body = (
+                            f"{prompt}\n\n{role_text}\n"
+                            "Independent proposal phase: produce a genuinely distinct candidate from your "
+                            "assigned role. You cannot see other participants' proposals."
+                        )
+                    else:
+                        excerpt_budget = max(1000, min(5000, 14000 // len(models)))
+                        proposal_text = "\n\n".join(
+                            f"Candidate {index + 1} ({item.get('display_name') or item.get('provider')}):\n"
+                            f"{proposal_outputs[str(item['binding_id'])]['body_text'][:excerpt_budget]}"
+                            for index, item in enumerate(models)
+                        )
+                        delta_body = (
+                            f"{prompt[:6000]}\n\n{role_text}\n"
+                            "Review phase: compare every independent candidate below. Preserve real "
+                            "disagreements, correct weaknesses from your assigned role, and return one "
+                            "complete revised candidate in the original requested format. Do not merely "
+                            "repeat another candidate.\n\n"
+                            f"Independent candidates:\n{proposal_text}"
+                        )
+                    turn_delta = dict(prompt_message)
+                    turn_delta["body_text"] = delta_body
                 turn = {
                     "schema": MEETING_COORDINATOR_SCHEMA,
                     "run_id": meeting_run_id,
@@ -2234,9 +3178,12 @@ class MultiRoomMeetingCoordinator:
                     "binding_id": binding["binding_id"],
                     "provider": binding.get("provider"),
                     "provider_session_ref": binding.get("provider_session_ref"),
-                    "input_mode": "INCREMENTAL_DELTA_ONLY",
+                    "input_mode": meeting_protocol,
+                    "phase": phase,
+                    "meeting_role": (brief or {}).get("role"),
+                    "assistant_roles": list((brief or {}).get("assistants") or []),
                     "transcript_forwarded": False,
-                    "delta": dict(current_delta),
+                    "delta": dict(turn_delta),
                 }
                 self.store.record_control_event(
                     room["room_id"], "MEETING_TURN_STARTED", turn
@@ -2250,7 +3197,9 @@ class MultiRoomMeetingCoordinator:
                         )
                 except Exception as error:  # provider failure is observable and terminal
                     status = "FAILED"
-                    reason = f"PROVIDER_ERROR:{type(error).__name__}"
+                    error_code = str(getattr(error, "code", "") or type(error).__name__)
+                    error_detail = " ".join(str(error).split())[:240]
+                    reason = f"PROVIDER_ERROR:{error_code}:{error_detail}"
                     turns.append(
                         {
                             "turn_number": turn_number,
@@ -2306,13 +3255,47 @@ class MultiRoomMeetingCoordinator:
                         }
                     )
                     break
+                output_artifact = None
+                room_body = body
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+                    output_artifact = self.store.create_artifact(
+                        room["room_id"],
+                        {
+                            "artifact_type": (
+                                "PROPOSAL" if phase == "PROPOSAL" else "SPECIFICATION"
+                            ),
+                            "title": (
+                                f"{(brief or {}).get('role') or binding.get('display_name') or 'Reviewer'} "
+                                f"{phase.title()} turn {turn_number + 1}"
+                            ),
+                            "body_text": body,
+                            "state": "CANDIDATE",
+                            "author_role": "MODEL",
+                            "author_binding_id": binding["binding_id"],
+                            "evidence_refs": [],
+                        },
+                    )
+                    artifact_ref = (
+                        f"universe://chat-rooms/{room['room_id']}/artifacts/"
+                        f"{output_artifact['artifact_id']}"
+                    )
+                    room_body = json.dumps(
+                        {
+                            "phase": phase,
+                            "role": (brief or {}).get("role"),
+                            "artifact_ref": artifact_ref,
+                            "summary": " ".join(body.split())[:600],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                 try:
                     output_message = self.store.post_message(
                         room["room_id"],
                         {
                             "author_role": "MODEL",
                             "author_binding_id": binding["binding_id"],
-                            "body_text": body,
+                            "body_text": room_body,
                             "idempotency_key": f"meeting:{meeting_run_id}:turn:{turn_number}",
                             "provider_event_id": provider_result.get("provider_event_id"),
                             "correlation_id": meeting_run_id,
@@ -2320,7 +3303,9 @@ class MultiRoomMeetingCoordinator:
                     )
                 except Exception as error:
                     status = "FAILED"
-                    reason = f"ROOM_OUTPUT_ERROR:{type(error).__name__}"
+                    error_code = str(getattr(error, "code", "") or type(error).__name__)
+                    error_detail = " ".join(str(error).split())[:240]
+                    reason = f"ROOM_OUTPUT_ERROR:{error_code}:{error_detail}"
                     turns.append(
                         {
                             "turn_number": turn_number,
@@ -2333,10 +3318,20 @@ class MultiRoomMeetingCoordinator:
                     )
                     break
                 current_delta = output_message
+                if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW" and phase == "PROPOSAL":
+                    proposal_outputs[str(binding["binding_id"])] = {
+                        **output_message,
+                        "body_text": body,
+                        "artifact_id": (output_artifact or {}).get("artifact_id"),
+                    }
                 turns.append(
                     {
                         "turn_number": turn_number,
                         "binding_id": binding["binding_id"],
+                        "phase": phase,
+                        "meeting_role": (brief or {}).get("role"),
+                        "artifact_id": (output_artifact or {}).get("artifact_id"),
+                        "output_warning": provider_result.get("output_warning"),
                         "status": "COMPLETED",
                         "reason": "NONE",
                         "input_event_id": turn["delta"].get("room_event_id"),
@@ -2355,6 +3350,8 @@ class MultiRoomMeetingCoordinator:
             "started_at": started_at,
             "completed_at": finished_at,
             "max_turns": bounded_turns,
+            "protocol": meeting_protocol,
+            "participant_briefs": briefs,
             "turn_count": len(turns),
             "round_count": (len(turns) + len(models) - 1) // len(models),
             "participant_order": [item["binding_id"] for item in models],

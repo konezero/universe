@@ -525,7 +525,10 @@ class ReleaseRuntime:
                 action = "CREATE"
             elif actual["sha256"] == item.sha256:
                 action = "NOOP"
-            elif isinstance(prior_digest, str) and actual["sha256"] == prior_digest:
+            elif isinstance(prior_digest, str) and (
+                actual["sha256"] == prior_digest
+                or previous.get("legacy_managed_update", False)
+            ):
                 action = "UPDATE"
             else:
                 action = "COLLISION"
@@ -548,6 +551,11 @@ class ReleaseRuntime:
 
         for path, prior_digest in sorted(previous_inventory.items()):
             if path in desired:
+                continue
+            # The first Release DB migration must not delete paths that were
+            # only tracked by the legacy Core installer.  They may be
+            # project-local runtime surfaces absent from this release bundle.
+            if previous.get("legacy_managed_update", False):
                 continue
             target = _target_path(root, path)
             actual = _file_state(target)
@@ -722,17 +730,55 @@ def _file_state(path: Path) -> dict[str, str]:
     }
 
 
+_LEGACY_DIST_MANIFEST_PATH = (
+    ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
+)
+_LEGACY_DIST_MANIFEST_SCHEMA = "ai-career.project-runtime-installation.v1"
+
+
 def _load_install_state(root: Path) -> dict[str, Any] | None:
     path = _target_path(root, INSTALL_STATE_PATH)
-    if not path.exists():
+    if path.exists():
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ReleaseRuntimeError("project release state is invalid") from error
+        if not isinstance(state, dict) or state.get("schema") != INSTALL_STATE_SCHEMA:
+            raise ReleaseRuntimeError("project release state schema is unsupported")
+        return state
+    # Fall back to legacy DISTRIBUTION_MANIFEST.json produced by older installs.
+    # Build a synthetic inventory from managed_paths so existing managed files are
+    # treated as UPDATE candidates instead of COLLISION during a runtime update.
+    legacy_path = _target_path(root, _LEGACY_DIST_MANIFEST_PATH)
+    if not legacy_path.exists():
         return None
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ReleaseRuntimeError("project release state is invalid") from error
-    if not isinstance(state, dict) or state.get("schema") != INSTALL_STATE_SCHEMA:
-        raise ReleaseRuntimeError("project release state schema is unsupported")
-    return state
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(legacy, dict) or legacy.get("schema") != _LEGACY_DIST_MANIFEST_SCHEMA:
+        return None
+    managed_paths = legacy.get("managed_paths")
+    if not isinstance(managed_paths, list):
+        return None
+    inventory: dict[str, str] = {}
+    for entry in managed_paths:
+        if isinstance(entry, dict):
+            target = entry.get("target_path")
+            sha = entry.get("local_sha256")
+            if isinstance(target, str) and target and isinstance(sha, str) and sha:
+                inventory[target] = sha
+    return {
+        "schema": INSTALL_STATE_SCHEMA,
+        "release_id": str(legacy.get("release_id") or "LEGACY"),
+        "inventory": inventory,
+        # A legacy Core installation owns these paths, but its file digests can
+        # legitimately differ after a Runtime package revision.  The first
+        # Release DB update must migrate those owned paths instead of treating
+        # the whole Core as project-owned collisions.  Subsequent updates use
+        # the Release DB state and retain strict digest collision checks.
+        "legacy_managed_update": True,
+    }
 
 
 def _replace_file(path: Path, content: bytes) -> None:

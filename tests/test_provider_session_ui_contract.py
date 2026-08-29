@@ -10,6 +10,31 @@ CSS = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8"
 
 
 class ProviderSessionUiContractTests(unittest.TestCase):
+    def test_goal_scheduler_uses_live_rust_host_receipt_route(self) -> None:
+        start = APP.index("function liveConductorHostSession()")
+        end = APP.index("function renderMeetingFeaturePanel", start)
+        scheduler = APP[start:end]
+        self.assertIn('session.mode || "").toUpperCase() === "CONDUCTOR"', scheduler)
+        self.assertIn('binding.backend_owner || "").toUpperCase() === "RUST_RECONNECTION_HOST"', scheduler)
+        self.assertIn("binding.reconnection_host_id", scheduler)
+        self.assertNotIn("nodeModeSessionIsCurrent(session)", scheduler)
+        self.assertIn("/v1/goal-automation-scheduler-mutation-receipts", scheduler)
+        self.assertIn("prepared.receipt.receipt_id", scheduler)
+        self.assertIn("session_anchor_ref: session.session_anchor_ref", scheduler)
+        self.assertNotIn("/automation/scheduler`", scheduler)
+
+    def test_applied_goal_work_plan_uses_conductor_advance_route(self) -> None:
+        self.assertIn("async function advanceGoalAutomation()", APP)
+        start = APP.index("async function advanceGoalAutomation()")
+        end = APP.index("function renderMeetingFeaturePanel", start)
+        delivery = APP[start:end]
+        self.assertIn("/automation/advance`,", delivery)
+        self.assertIn('approval: "ADVANCE"', delivery)
+        self.assertIn("expected_goal_revision: goal.revision", delivery)
+        self.assertNotIn("/master-handoffs", delivery)
+        self.assertNotIn("task-frame", delivery.lower())
+        self.assertIn('"Advance Conductor"', APP)
+
     def test_selected_session_uses_native_provider_endpoint_not_room_queue(self) -> None:
         self.assertIn('kind: "PROVIDER_SESSION"', APP)
         self.assertIn("async function openProviderChatSession(room, options = {})", APP)
@@ -37,8 +62,17 @@ class ProviderSessionUiContractTests(unittest.TestCase):
                 "function renderNodeModeSessionCards"
             )
         ]
+        resume_slice = APP[
+            APP.index("async function bindNodeModeSessionPty") : APP.index(
+                "async function startNewNodeModeSession"
+            )
+        ]
         self.assertIn("[coordinate.key]: anchorSessionKey(session)", selection_slice)
-        self.assertIn("await openProviderChatSession(room, { session });", selection_slice)
+        self.assertIn("openNodeModeSessionActions(coordinate, session)", selection_slice)
+        self.assertNotIn("await resumeNodeModeSession(coordinate, session)", selection_slice)
+        self.assertIn("createTerminalTab(coordinate, session)", resume_slice)
+        self.assertIn("focusTerminalForSession(coordinate, session)", resume_slice)
+        self.assertNotIn("attachProviderChatRoom", resume_slice)
         open_slice = APP[
             APP.index("async function openProviderChatSession") : APP.index(
                 "function closeProjectRoomStream"
@@ -90,6 +124,21 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("function openProviderSessionStream(chatKey)", APP)
         self.assertIn("PROVIDER_SESSION_DELTA", APP)
         self.assertIn("PROVIDER_SESSION_PERMISSION", APP)
+        self.assertIn("PROVIDER_SESSION_WORK_STATUS", APP)
+        self.assertIn("PROVIDER_SESSION_ACTION", APP)
+        self.assertIn("PROVIDER_SESSION_ACTION_DELETED", APP)
+        self.assertIn("function workStatusNotificationText(workStatus)", APP)
+        action_slice = APP[
+            APP.index("function pendingActionItems") : APP.index(
+                "function finishRoomMessageRender"
+            )
+        ]
+        self.assertNotIn("governanceProposal", action_slice)
+        self.assertNotIn("renderGovernanceProposalCard", APP)
+        render_slice = action_slice[action_slice.index("function renderActionInbox") :]
+        self.assertNotIn("renderGitActionCard", render_slice)
+        self.assertNotIn("Recent activity", render_slice)
+        self.assertIn("state.providerSessionPermissions", APP)
         self.assertIn("function closeProviderSessionStream(chatKey)", APP)
         stream_slice = APP[
             APP.index("function openProviderSessionStream") : APP.index(
@@ -131,11 +180,23 @@ class ProviderSessionUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn('sessionKind !== "WORKER"', eligibility)
-        self.assertIn('"BOUND", "ANCHOR_OBSERVED"', eligibility)
+        self.assertIn("function providerSessionObservedProjectId(room)", APP)
+        self.assertIn('["BOUND", "ANCHOR_OBSERVED"].includes(bindingState)', eligibility)
         self.assertIn('currentness === "CURRENT"', eligibility)
-        self.assertIn("providerSessionRoomIsEligible(room)", APP)
-        self.assertIn("delete state.providerSessionRoomCaches[key]", APP)
-        self.assertIn("closeProviderSessionStream(chatKey)", APP)
+        self.assertNotIn("providerSessionRoomIsSelected(chatKey)", eligibility)
+
+        subscriptions = APP[
+            APP.index("function syncProviderSessionSubscriptions") : APP.index(
+                "function reconcileProviderSessionStreams"
+            )
+        ]
+        self.assertIn(
+            "eligible.has(key) || providerSessionRoomIsSelected(key)",
+            subscriptions,
+        )
+        self.assertIn("closeProviderSessionStream(key)", subscriptions)
+        self.assertIn("delete state.providerSessionRoomCaches[key]", subscriptions)
+        self.assertIn("delete state.providerSessionStreamStates[key]", subscriptions)
     def test_provider_session_cancel_uses_direct_endpoint_without_room_queue(self) -> None:
         self.assertIn("async function cancelProviderSessionTurn()", APP)
         cancel_slice = APP[

@@ -43,6 +43,7 @@ from project_master_host import (  # noqa: E402
     ResidentRoomParticipantHostManager,
     _default_state_db,
     _project_master_system_prompt,
+    _task_frame_child_max_turns,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
@@ -382,6 +383,16 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.replies: list[dict[str, Any]] = []
         self.streams: list[dict[str, Any]] = []
 
+    def test_claude_runtime_normalizes_canonical_resume_coordinate(self) -> None:
+        self.state.observe_provider_session(
+            "CLAUDE", "claude-code:stable-session"
+        )
+
+        runtime = ClaudeProjectMasterRuntime(self.root, "GCS", self.state)
+
+        self.assertEqual("stable-session", runtime.session_id)
+        self.assertEqual("claude-code:stable-session", runtime.session_ref)
+
     def tearDown(self) -> None:
         self.temp.cleanup()
 
@@ -471,6 +482,120 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("PROVIDER_SESSION_ATTACHED", event_types)
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
+
+    def test_provider_binding_retries_after_host_activity_advances_row(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "provider-bind-race.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "provider-bind-race-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        reserved = state.ensure_supervisor_session(
+            "CLAUDE",
+            new_session=True,
+            owner_key="PROJECT_MASTER",
+        )
+        self.assertIsNotNone(reserved)
+        original_bind = supervisor.bind_provider_session
+        bind_calls = 0
+
+        def race_once(*args, **kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            if bind_calls == 1:
+                supervisor.observe_session_activity(
+                    str(reserved["session_id"]),
+                    event_type="HOST_STARTED",
+                    activity_state="STARTING",
+                    evidence_ref="test://host-start",
+                )
+            return original_bind(*args, **kwargs)
+
+        with patch.object(
+            supervisor,
+            "bind_provider_session",
+            side_effect=race_once,
+        ):
+            self.assertEqual(
+                "NEW",
+                state.observe_provider_session("CLAUDE", "claude-code:fresh"),
+            )
+
+        self.assertEqual(2, bind_calls)
+        current = supervisor.get_session(str(reserved["session_id"]))
+        self.assertEqual("claude-code:fresh", current["provider_session_ref"])
+
+    def test_current_anchor_binding_retries_after_host_activity_advances_row(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "anchor-bind-race.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "anchor-bind-race-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        reserved = state.ensure_supervisor_session(
+            "CLAUDE",
+            new_session=True,
+            owner_key="PROJECT_MASTER",
+        )
+        self.assertIsNotNone(reserved)
+        original_bind = supervisor.bind_current_anchor
+        bind_calls = 0
+
+        def race_once(*args, **kwargs):
+            nonlocal bind_calls
+            bind_calls += 1
+            if bind_calls == 1:
+                supervisor.observe_session_activity(
+                    str(reserved["session_id"]),
+                    event_type="HOST_READY",
+                    activity_state="READY",
+                    evidence_ref="test://host-ready",
+                )
+            return original_bind(*args, **kwargs)
+
+        with patch.object(
+            supervisor,
+            "bind_current_anchor",
+            side_effect=race_once,
+        ):
+            observed = state.observe_current_anchor("MASTER-CURRENT-FRESH")
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(2, bind_calls)
+        current = supervisor.get_session(str(reserved["session_id"]))
+        self.assertEqual("MASTER-CURRENT-FRESH", current["anchor_ref"])
+
+    def test_new_session_creates_fresh_supervisor_anchor_lineage(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "new-session-lineage.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "new-session-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.observe_provider_session("GROK", "grok-old")
+        previous = next(
+            item
+            for item in supervisor.list_sessions(node="universe", mode="MASTER")
+            if item["is_default"]
+        )
+
+        fresh = state.ensure_supervisor_session("CODEX", new_session=True)
+        self.assertIsNotNone(fresh)
+        state.observe_provider_session("CODEX", "codex-new")
+
+        sessions = supervisor.list_sessions(node="universe", mode="MASTER")
+        self.assertEqual(2, len(sessions))
+        current = next(item for item in sessions if item["is_default"])
+        old = next(item for item in sessions if item["session_id"] == previous["session_id"])
+        self.assertNotEqual(old["session_anchor_ref"], current["session_anchor_ref"])
+        self.assertEqual("grok-old", old["provider_session_ref"])
+        self.assertEqual("codex-new", current["provider_session_ref"])
+        anchors = supervisor.list_project_mode_anchors(project_id="universe")
+        master = next(item for item in anchors if item["mode"] == "MASTER")
+        self.assertEqual(2, len(master["session_anchor_refs"]))
 
     def test_provider_rebind_uses_identity_owner_after_stale_default_pointer(self) -> None:
         supervisor = SessionSupervisorStore(self.root / "stale-pointer.sqlite3")
@@ -671,9 +796,11 @@ class ProjectMasterHostTests(unittest.TestCase):
 
     def test_project_master_greets_only_new_provider_session(self) -> None:
         prompts: list[str] = []
+        session_options: list[dict[str, object]] = []
 
         class FakeSession:
-            def __init__(self, *, session_id, session_observer, **_kwargs) -> None:
+            def __init__(self, *, session_id, session_observer, **kwargs) -> None:
+                session_options.append(dict(kwargs))
                 self.session_id = session_id or "grok-session-new"
                 self.session_ref = f"grok-acp:{self.session_id}"
                 session_observer(self.session_id)
@@ -719,6 +846,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             resumed.reply(message)
             resumed.close()
 
+        self.assertEqual([900.0, 900.0], [item["response_timeout_seconds"] for item in session_options])
         self.assertIn("Enter MASTER Mode", prompts[0])
         self.assertIn("Project Room message is the current work request", prompts[0])
         self.assertIn("status?", prompts[0])
@@ -812,6 +940,33 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(["CONDUCTOR", "CONDUCTOR"], [item[1] for item in created])
         self.assertTrue(created[0][3].closed)
         self.assertTrue(created[1][3].closed)
+
+    def test_resident_mode_session_projects_new_provider_id_before_first_turn(self) -> None:
+        class StartedProvider(PreparedFakeProvider):
+            def prepare_session(self) -> None:
+                super().prepare_session()
+                self.session_id = "codex-thread-started"
+
+        host = ResidentModeSessionHost(
+            self.root,
+            "CONDUCTOR",
+            "CONDUCTOR",
+            self.root / "conductor-anchor-projection.sqlite",
+            actor_label="Universe Conductor",
+            provider_factory=lambda *_args: StartedProvider(),
+        )
+        try:
+            with patch("project_master_host.patch_mode_current_anchor") as project:
+                host.prepare("CODEX", session_action="NEW")
+        finally:
+            host.close()
+
+        project.assert_called_once_with(
+            self.root,
+            provider="CODEX",
+            session_ref="codex-thread-started",
+            mode="CONDUCTOR",
+        )
 
     def test_resident_mode_session_replaces_changed_provider_profile(self) -> None:
         created: list[PreparedFakeProvider] = []
@@ -1824,6 +1979,92 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual("Project Master answer", self.replies[0]["body"])
 
+    def test_project_master_message_receives_read_only_retrieval_context(self) -> None:
+        retrieval = {
+            "schema": "universe.project-llm-retrieval-context.v1",
+            "memory": {"policy": "LINKED_ONLY", "hits": [{"memory_id": "memory_1"}]},
+            "bench": {
+                "policy": "EVIDENCE_ONLY",
+                "recommended_skills": [
+                    {
+                        "candidate_id": "benchskill_1",
+                        "recommendation_state": "CANDIDATE_ONLY",
+                        "binding_state": "TASK_FRAME_SELECTION_REQUIRED",
+                        "authority": "NONE",
+                    }
+                ],
+            },
+            "effects": {"authority": "NONE", "skill_binding": "NONE"},
+        }
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            retrieval_context_resolver=lambda project_id, message: (
+                retrieval
+                if project_id == "GCS" and message["body"]
+                else {}
+            ),
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(retrieval, self.provider.messages[0]["retrieval_context"])
+
+    def test_project_master_completion_redacts_git_trace_statuses(self) -> None:
+        completions: list[dict[str, Any]] = []
+        self.provider.drain_work_statuses = lambda: [
+            {
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": "COMMIT",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "commit_sha": "a" * 40,
+                "commit_message": "do not persist this",
+                "changed_files": ["secret-path.txt"],
+            }
+        ]
+        worker = ProjectMasterConversationWorker(
+            provider=self.provider,
+            store=self.state,
+            universe_endpoint="http://127.0.0.1:52973",
+            project_id="GCS",
+            bridge_token="bridge-token",
+            surface_observer=self.surface_observer,
+            reply_poster=lambda **values: self.replies.append(values) or {},
+            stream_poster=lambda **values: self.streams.append(values) or {},
+            completion_observer=lambda event: completions.append(dict(event)),
+        )
+        worker.start()
+        try:
+            worker.submit(self._envelope())
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(completions))
+        self.assertEqual(
+            [{
+                "schema": "universe.git-trace2-work-status.v1",
+                "source": "GIT_TRACE2",
+                "operation": "COMMIT",
+                "state": "COMPLETED",
+                "exit_code": 0,
+                "commit_sha": "a" * 40,
+            }],
+            completions[0]["work_statuses"],
+        )
+
     def test_native_room_event_sends_only_incremental_input_and_observes_output(
         self,
     ) -> None:
@@ -1839,6 +2080,12 @@ class ProjectMasterHostTests(unittest.TestCase):
             reply_poster=lambda **values: self.replies.append(values) or {},
             stream_poster=lambda **values: self.streams.append(values) or {},
             room_event_observer=lambda event: observed.append(dict(event)),
+            retrieval_context_resolver=lambda project_id, message: {
+                "schema": "universe.project-llm-retrieval-context.v1",
+                "project_id": project_id,
+                "query": message["body"],
+                "effects": {"authority": "NONE", "skill_binding": "NONE"},
+            },
         )
         room_event = {
             "room_id": "room_native",
@@ -1873,6 +2120,13 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("history", provider_message)
         self.assertNotIn("messages", provider_message)
         self.assertNotIn("skill_plan_context", provider_message)
+        self.assertEqual(
+            "Review only this new line",
+            provider_message["retrieval_context"]["query"],
+        )
+        self.assertEqual(
+            "NONE", provider_message["retrieval_context"]["effects"]["skill_binding"]
+        )
         self.assertEqual([room_event], self.surface_observer.room_events)
         self.assertEqual(
             [
@@ -2186,6 +2440,15 @@ class ProjectMasterHostTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        supervisor = SessionSupervisorStore(self.root / "anchor-graph.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("GROK")
+        state.observe_provider_session("GROK", "grok-cli:session-001")
         requests: list[dict[str, Any]] = []
 
         def runner(request):
@@ -2230,6 +2493,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "GCS",
             "grok-cli:session-001",
             native_runner=runner,
+            session_supervisor=supervisor,
             source_binding_resolver=lambda _root: {
                 "status": "SELECTED",
                 "release_id": "core-test",
@@ -2242,45 +2506,107 @@ class ProjectMasterHostTests(unittest.TestCase):
             "project_master_host._required_host_executable",
             return_value=Path(sys.executable),
         ):
-            coordinator.prepare()
-            coordinator.observe(self._envelope()["message"])
+            preparation = coordinator.prepare()
+            observation = coordinator.observe(self._envelope()["message"])
 
-        self.assertEqual("MASTER", requests[0]["mode"])
+        self.assertEqual([], requests)
+        self.assertEqual("ANCHOR_GRAPH", preparation["preparation_path"])
+        self.assertEqual("MASTER", preparation["mode"])
+        self.assertEqual("COMMANDER_INPUT_OBSERVED", observation["status"])
         self.assertEqual(
-            f"universe-release-db://core-test@{'c' * 64}",
-            requests[0]["source_ref"],
-        )
-        self.assertEqual("b" * 40, requests[0]["source_commit"])
-        self.assertEqual(
-            "fixture/universe-private", requests[0]["source_repository"]
-        )
-        self.assertEqual("grok-cli:session-001", requests[0]["host_session_ref"])
-        self.assertEqual("UNIVERSE_UI", requests[1]["commander_surface"])
-        self.assertEqual(
-            f"universe://project-room/messages/{self._message_id()}",
-            requests[1]["evidence_ref"],
+            preparation["session_anchor_ref"], observation["snapshot"]["anchor_id"]
         )
 
-    def test_project_mode_coordinator_resolves_role_from_selected_mode(self) -> None:
+    def test_project_mode_coordinator_uses_observed_session_anchor_for_chat(self) -> None:
+        runtime_cli = self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        supervisor = SessionSupervisorStore(self.root / "anchor-graph.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "project-state.sqlite",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("CODEX")
+        state.observe_provider_session("CODEX", "codex-anchor-001")
+
+        def unexpected_runner(_request):
+            raise AssertionError("resident chat must not invoke Runtime Boot")
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex-anchor-001",
+            native_runner=unexpected_runner,
+            session_supervisor=supervisor,
+        )
+
+        preparation = coordinator.prepare()
+        observation = coordinator.observe(self._envelope()["message"])
+
+        session = next(
+            item
+            for item in supervisor.list_sessions(node="GCS", mode="MASTER")
+            if item["provider_session_ref"] == "codex-anchor-001"
+        )
+        self.assertEqual("ANCHOR_GRAPH", preparation["preparation_path"])
+        self.assertEqual(session["session_anchor_ref"], preparation["session_anchor_ref"])
+        self.assertEqual("COMMANDER_INPUT_OBSERVED", observation["status"])
+        self.assertEqual(
+            session["session_anchor_ref"], observation["snapshot"]["anchor_id"]
+        )
+
+    def test_project_mode_coordinator_matches_canonical_claude_session_ref(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
-        registry = self.root / ".ai/runtime/project_instance/mode_registry.json"
-        registry.parent.mkdir(parents=True, exist_ok=True)
-        registry.write_text(
-            json.dumps(
-                {
-                    "modes": {
-                        "DESIGN": {
-                            "role": "DESIGNER",
-                            "scope": "product/ux",
-                            "mode_profile": "GOVERNANCE_ONLY",
-                        }
-                    }
-                }
-            ),
-            encoding="utf-8",
+        supervisor = SessionSupervisorStore(self.root / "claude-anchor.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "claude-project-state.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
         )
+        state.ensure_supervisor_session("CLAUDE")
+        state.observe_provider_session("CLAUDE", "fresh-claude-id")
+        supervisor.register_session(
+            {
+                "session_id": "session-unrelated-runtime",
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "RUNTIME",
+                "provider_session_ref": "runtime-host-1",
+                "state": "REGISTERED",
+                "currentness": "STALE",
+            }
+        )
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "universe",
+            "claude-code:fresh-claude-id",
+            session_supervisor=supervisor,
+        )
+
+        preparation = coordinator.prepare()
+
+        self.assertEqual("SESSION_PREPARED", preparation["status"])
+        self.assertEqual(
+            next(
+                item["session_anchor_ref"]
+                for item in supervisor.list_sessions(
+                    node="universe", mode="MASTER"
+                )
+                if item["provider_session_ref"] == "fresh-claude-id"
+            ),
+            preparation["session_anchor_ref"],
+        )
+
+    def test_project_mode_coordinator_anchor_prepare_does_not_resolve_mode_role(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
         requests: list[dict[str, Any]] = []
 
         def runner(request):
@@ -2288,31 +2614,22 @@ class ProjectMasterHostTests(unittest.TestCase):
                 request.arguments[request.arguments.index("--request") + 1]
             )
             requests.append(json.loads(request_path.read_text(encoding="utf-8")))
-            payload = {
-                "status": "SESSION_PREPARED",
-                "mode_current_anchor": {
-                    "status": "MODE_CURRENT_ANCHOR_OBSERVED",
-                    "snapshot": {"snapshot": {"anchor_id": "DESIGN-CURRENT-001"}},
-                },
-                "mode_boot_binding": {
-                    "status": "PREPARED",
-                    "binding_id": "mode-boot-design-001",
-                    "mode": "DESIGN",
-                    "role": "DESIGNER",
-                    "frame_id": "current",
-                    "anchor_id": "DESIGN-CURRENT-001",
-                },
+            raise AssertionError("Anchor Graph preparation must not invoke Runtime Boot")
+
+        supervisor = SessionSupervisorStore(self.root / "design-anchor.sqlite3")
+        supervisor.register_session(
+            {
+                "session_id": "session-design-001",
+                "node": "universe",
+                "project_id": "GCS",
+                "mode": "DESIGN",
+                "provider": "CODEX",
+                "provider_session_ref": "codex:session-design-001",
+                "anchor_ref": "DESIGN-CURRENT-001",
+                "state": "REGISTERED",
+                "currentness": "CURRENT",
             }
-            return NativeCliResult(
-                contract="universe.windows-native-cli.v1",
-                status="COMPLETED",
-                return_code=0,
-                duration_ms=1,
-                stdout=json.dumps(payload),
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-            )
+        )
 
         coordinator = ProjectModeCoordinator(
             self.root,
@@ -2321,18 +2638,19 @@ class ProjectMasterHostTests(unittest.TestCase):
             session_node="universe",
             requested_mode="DESIGN",
             native_runner=runner,
+            session_supervisor=supervisor,
             source_binding_resolver=lambda _root: self._selected_release(),
         )
 
-        coordinator.prepare()
+        preparation = coordinator.prepare()
 
         self.assertEqual("universe", coordinator.session_node)
         self.assertEqual("DESIGN", coordinator.requested_mode)
-        self.assertEqual("DESIGNER", coordinator._mode_role)
-        self.assertEqual("DESIGN", requests[0]["mode"])
-        self.assertEqual("DESIGNER", requests[0]["role"])
+        self.assertIsNone(coordinator._mode_role)
+        self.assertEqual("DESIGN", preparation["mode"])
+        self.assertEqual([], requests)
 
-    def test_project_mode_coordinator_requires_mode_boot_binding(self) -> None:
+    def test_project_mode_coordinator_requires_exact_session_anchor(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
@@ -2382,11 +2700,11 @@ class ProjectMasterHostTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ProjectMasterHostError,
-            "PROJECT_MASTER_MODE_BOOT_BINDING_UNAVAILABLE",
+            "PROJECT_MASTER_SESSION_ANCHOR_UNAVAILABLE",
         ):
             coordinator.prepare()
 
-    def test_project_mode_runtime_uses_prepared_binding_and_anchor_frame(self) -> None:
+    def test_project_mode_runtime_attaches_directly_to_supervised_anchor(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
         runtime_cli.write_text("# test runtime\n", encoding="utf-8")
@@ -2396,23 +2714,16 @@ class ProjectMasterHostTests(unittest.TestCase):
             "codex:session-001",
             source_binding_resolver=lambda _root: self._selected_release(),
         )
-        coordinator._prepared = {
-            "status": "SESSION_PREPARED",
-            "mode_current_anchor": {
-                "status": "MODE_CURRENT_ANCHOR_CREATED",
-                "snapshot": {
-                    "snapshot": {"anchor_id": "MASTER-CURRENT-001"}
-                },
-            },
-            "mode_boot_binding": {
-                "status": "PREPARED",
-                "binding_id": "mode-boot-master-001",
-                "mode": "MASTER",
-                "role": "MASTER",
-                "frame_id": "current",
-                "anchor_id": "MASTER-CURRENT-001",
-            },
-        }
+        supervisor = SessionSupervisorStore(self.root / "runtime-anchor.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "runtime-state.sqlite3",
+            "GCS",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        state.ensure_supervisor_session("CODEX")
+        state.observe_provider_session("CODEX", "codex:session-001")
+        coordinator.session_supervisor = supervisor
         process_holder: list[Any] = []
 
         class FakeRuntimeProcess:
@@ -2445,22 +2756,19 @@ class ProjectMasterHostTests(unittest.TestCase):
             session_id = command[command.index("--session-id") + 1]
             process = FakeRuntimeProcess(
                 {
-                    "status": "SESSION_BOOT_IMAGE_CREATED",
+                    "status": "PERSISTENT_SESSION_ATTACHED",
                     "host_adapter": {
                         "endpoint": "http://127.0.0.1:41992",
                         "token": token,
                     },
                     "runtime_state": {
-                        "anchor_id": "MASTER-CURRENT-001",
+                        "anchor_id": coordinator._anchor_graph_session()["session_anchor_ref"],
                         "mode": "MASTER",
-                        "role": "MASTER",
+                        "role": "UNASSIGNED",
                         "session_id": session_id,
                         "executable_runtime_currentness": "CURRENT",
                     },
-                    "mode_boot_binding": {
-                        "status": "ACTIVE",
-                        "binding_id": "mode-boot-master-001",
-                    },
+                    "attachment_path": "ANCHOR_GRAPH",
                 }
             )
             process.command = list(command)
@@ -2476,20 +2784,27 @@ class ProjectMasterHostTests(unittest.TestCase):
         ), patch(
             "project_master_host._WindowsKillOnCloseJob",
             return_value=FakeJob(),
+        ), patch(
+            "project_master_host.launched_process_identity",
+            return_value={
+                "pid": 5151,
+                "process_created_at": "2026-08-21T12:00:00.000000Z",
+                "executable": str(Path(sys.executable)),
+                "command": [str(Path(sys.executable)), "project-runtime", "serve"],
+                "endpoint": "http://127.0.0.1:41992",
+                "handshake_fingerprint": "a" * 64,
+            },
         ):
             binding = coordinator._ensure_runtime()
 
         command = process_holder[0].command
+        self.assertIn("project-runtime", command)
+        self.assertNotIn("session-boot", command)
         self.assertEqual("current", binding["frame_id"])
-        self.assertEqual(
-            "mode-boot-master-001", binding["mode_boot_binding_id"]
-        )
-        self.assertEqual(
-            "mode-boot-master-001",
-            command[command.index("--boot-binding-id") + 1],
-        )
+        self.assertEqual("ANCHOR_GRAPH", binding["attachment_path"])
+        self.assertNotIn("--boot-binding-id", command)
+        self.assertEqual("MASTER", command[command.index("--mode") + 1])
         self.assertEqual("current", command[command.index("--frame-id") + 1])
-        coordinator.close()
 
     def test_task_frame_runtime_lease_does_not_replace_master_lease(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
@@ -2547,7 +2862,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }
@@ -2557,7 +2872,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         ):
             coordinator._register_process_lease(
                 process=object(),
-                command=["C:\\fake\\python.exe", "session-boot", "serve"],
+                command=["C:\\fake\\python.exe", "project-runtime", "serve"],
                 endpoint=runtime_identity["endpoint"],
                 token="runtime-stop-capability",
                 runtime_session_id="project-master-gcs-master",
@@ -2622,7 +2937,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }
@@ -2704,7 +3019,7 @@ class ProjectMasterHostTests(unittest.TestCase):
             "pid": 4202,
             "process_created_at": "2026-08-14T00:01:00.000000Z",
             "executable": "C:\\fake\\python.exe",
-            "command": ["C:\\fake\\python.exe", "session-boot", "serve"],
+            "command": ["C:\\fake\\python.exe", "project-runtime", "serve"],
             "endpoint": "http://127.0.0.1:54202",
             "handshake_fingerprint": "b" * 64,
         }
@@ -3292,6 +3607,175 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertIsNone(frame["task_frame_execution_approval"])
 
+    def test_instruction_authorized_read_only_worker_inherits_master_frame(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(self.root, "GCS", "codex:session-001")
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        posts: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            posts.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        with patch.object(coordinator, "_ensure_runtime", return_value=binding), patch.object(
+            coordinator, "_post_runtime", side_effect=post
+        ), patch.object(
+            coordinator,
+            "_invoke",
+            return_value={
+                "execution_proposal": {
+                    "proposal_id": "task_frame_proposal_read_only_001",
+                    "plan_digest": "b" * 64,
+                }
+            },
+        ):
+            result = coordinator.create_instruction_authorized_task_frame(
+                proposal_reference={
+                    "proposal_id": "task_proposal_reference_only",
+                    "proposal_digest": "a" * 64,
+                    "request_ref": "universe://project-room/messages/review-001",
+                },
+                task_frame={
+                    "frame_id": "instruction-review-frame-001",
+                    "parent_actor_ref": "project-master:GCS",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "turns": [
+                        {
+                            "turn_id": "review",
+                            "role": "BOSS",
+                            "worker_slot_ref": "review-worker",
+                            "provider": "CLAUDE",
+                            "model": "opus",
+                            "reasoning_effort": "high",
+                        }
+                    ],
+                    "instruction_id": "review-001",
+                    "instruction_text": "Review the Master Task Frame read-only.",
+                    "constraints": ["NO_MUTATION"],
+                    "expected_output": {"result": "findings"},
+                },
+            )
+
+        self.assertEqual("INSTRUCTION_TASK_FRAME_READY", result["status"])
+        frame = posts[0]["payload"]["frame"]
+        self.assertEqual("NONE", frame["parent_instruction"]["repository_write_scope"])
+        self.assertEqual({"operations": [], "targets": []}, frame["parent_instruction"]["mutation_scope"])
+        self.assertNotIn("work_receipt", frame)
+
+    def test_instruction_authorized_source_review_preserves_policy_ref(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        coordinator = ProjectModeCoordinator(self.root, "GCS", "codex:session-001")
+        binding = {
+            "endpoint": "http://127.0.0.1:41992",
+            "token": "test-token",
+            "session_id": "project-master-session-001",
+            "frame_id": "current",
+            "anchor_id": "MASTER-CURRENT-001",
+        }
+        posts: list[dict[str, Any]] = []
+        invocations: list[dict[str, Any]] = []
+
+        def post(_endpoint, _token, path, payload):
+            posts.append({"path": path, "payload": payload})
+            if path == "/v1/task-frame/create":
+                return {"status": "TASK_FRAME_HOST_ACTIVE"}
+            return {
+                "status": "TASK_FRAME_OPERATION_APPLIED",
+                "output": {"status": "TASK_TURNS_DECLARED"},
+            }
+
+        def invoke(_args, payload):
+            invocations.append(dict(payload))
+            return {
+                "execution_proposal": {
+                    "proposal_id": "task_frame_proposal_reviewed_001",
+                    "plan_digest": "b" * 64,
+                }
+            }
+
+        policy_commit = "1" * 40
+        candidate_commit = "2" * 40
+        policy_ref = f"installed-runtime://policy@{policy_commit}"
+        candidate_ref = f"git:{self.root.as_posix()}@{candidate_commit}"
+        source_review_result = {
+            "schema": "ai-career.source-review-result.v1",
+            "status": "SOURCE_REVIEW_PERMITTED",
+            "policy_source": {
+                "ref": policy_ref,
+                "commit": policy_commit,
+                "kind": "INSTALLED_DISTRIBUTION",
+                "evidence_ref": "installed-runtime://manifest/verified",
+                "use": "REVIEWER_POLICY",
+            },
+            "candidate_source": {
+                "ref": candidate_ref,
+                "commit": candidate_commit,
+                "policy_activation": "FORBIDDEN",
+                "classification": "DATA_ONLY",
+            },
+            "review_mode": "STATIC_REVIEW",
+            "repository_write": False,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "candidate_execution": "FORBIDDEN",
+            "execution_environment": "NOT_APPLICABLE",
+            "test_status": "NOT_RUN_UNTRUSTED",
+            "reasons": [],
+        }
+
+        with patch.object(coordinator, "_ensure_runtime", return_value=binding), patch.object(
+            coordinator, "_post_runtime", side_effect=post
+        ), patch.object(coordinator, "_invoke", side_effect=invoke):
+            result = coordinator.create_instruction_authorized_task_frame(
+                proposal_reference={
+                    "proposal_id": "task_proposal_reference_only",
+                    "proposal_digest": "a" * 64,
+                    "request_ref": "universe://project-room/messages/reviewed-001",
+                },
+                task_frame={
+                    "frame_id": "instruction-reviewed-frame-001",
+                    "candidate_source_ref": candidate_ref,
+                    "source_review_result": source_review_result,
+                    "parent_actor_ref": "project-master:GCS",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "turns": [{
+                        "turn_id": "review",
+                        "role": "BOSS",
+                        "worker_slot_ref": "review-worker",
+                        "provider": "CLAUDE",
+                        "model": "opus",
+                        "reasoning_effort": "high",
+                    }],
+                    "instruction_id": "reviewed-001",
+                    "instruction_text": "Review the candidate read-only.",
+                    "constraints": ["NO_MUTATION"],
+                    "expected_output": {"result": "findings"},
+                },
+            )
+
+        self.assertEqual("INSTRUCTION_TASK_FRAME_READY", result["status"])
+        plan = invocations[0]["execution_plan"]
+        frame = posts[0]["payload"]["frame"]
+        self.assertEqual(policy_ref, plan["source_ref"])
+        self.assertEqual(policy_ref, frame["source_ref"])
+        self.assertEqual(candidate_ref, plan["candidate_source_ref"])
+        self.assertEqual(source_review_result, plan["source_review_result"])
+
     def test_approved_descendant_runs_boss_then_declared_child_turns(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
         runtime_cli.parent.mkdir(parents=True, exist_ok=True)
@@ -3452,6 +3936,15 @@ class ProjectMasterHostTests(unittest.TestCase):
             dispatches[1]["output_contract"]["schema"],
         )
         self.assertEqual("submit_boss_allocations", operations[1]["operation"])
+        self.assertEqual("IMPLEMENTER", result["child_results"][0]["role"])
+        self.assertEqual(
+            "Implemented and verified.",
+            result["child_results"][0]["result"]["summary"],
+        )
+        self.assertEqual(
+            ["result://implementation"],
+            result["child_results"][0]["result"]["evidence_refs"],
+        )
 
     def test_boss_allocations_fail_closed_on_missing_or_reviewer_mutation(self) -> None:
         target = str(self.root / "tools" / "app.py")
@@ -3493,6 +3986,39 @@ class ProjectMasterHostTests(unittest.TestCase):
             str(reviewer.exception),
         )
 
+    def test_read_only_reviewer_inherits_master_frame_without_work_receipt(self) -> None:
+        turns = [
+            {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
+            {
+                "turn_id": "review",
+                "role": "SUB_REVIEWER",
+                "worker_slot_ref": "independent-reviewer",
+            },
+        ]
+        allocation = {
+            "turn_id": "review",
+            "worker_slot_ref": "independent-reviewer",
+            "worker_path": "/root/boss/review",
+            "task": "Review without mutation.",
+            "expected_output": {"result": "review"},
+            "mutation_scope": {"operations": [], "targets": []},
+            "skill_bindings": [],
+        }
+
+        canonical = ProjectModeCoordinator._canonical_boss_allocations(
+            [allocation],
+            turns=turns,
+            parent_mutation_scope={"operations": [], "targets": []},
+        )
+
+        self.assertEqual([allocation], canonical)
+        self.assertNotIn("work_receipt", canonical[0])
+        self.assertEqual([], canonical[0]["mutation_scope"]["operations"])
+
+    def test_read_only_worker_gets_review_budget_without_write_authority(self) -> None:
+        self.assertEqual(16, _task_frame_child_max_turns(write_enabled=False))
+        self.assertEqual(1, _task_frame_child_max_turns(write_enabled=True))
+
     def test_boss_allocation_contract_binds_exact_declared_identities(self) -> None:
         turns = [
             {"turn_id": "boss", "role": "BOSS", "worker_slot_ref": "boss-worker"},
@@ -3513,7 +4039,9 @@ class ProjectMasterHostTests(unittest.TestCase):
             },
         ]
 
-        contract = ProjectModeCoordinator._boss_allocation_output_contract(turns)
+        contract = ProjectModeCoordinator._boss_allocation_output_contract(
+            turns, parent_mutation_scope={"operations": [], "targets": []}
+        )
         allocations = contract["json_schema"]["properties"]["worker_allocations"]
 
         self.assertEqual(3, allocations["minItems"])
@@ -3591,6 +4119,24 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(
             [[], ["boss"], ["implement"], ["security"]],
             [turn["input_turn_ids"] for turn in declared],
+        )
+        execution_turns = ProjectModeCoordinator._runtime_execution_turns(
+            [
+                {"turn_id": "boss", "role": "BOSS", "provider": "CLAUDE"},
+                {
+                    "turn_id": "security",
+                    "role": "SECURITY_REVIEWER",
+                    "provider": "CLAUDE",
+                },
+            ]
+        )
+        self.assertEqual(
+            ["BOSS", "SUB_REVIEWER"],
+            [turn["role"] for turn in execution_turns],
+        )
+        self.assertEqual(
+            ["CLAUDE", "CLAUDE"],
+            [turn["provider"] for turn in execution_turns],
         )
     def test_approved_descendant_rejects_target_outside_primary_roots(self) -> None:
         runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
@@ -3829,6 +4375,10 @@ class ProjectMasterHostTests(unittest.TestCase):
                 self.assertEqual("STARTED", result["status"])
                 self.assertEqual("LIVE", live["state"])
                 self.assertEqual("OWNED", live["process_lease"]["lease_state"])
+                self.assertEqual(
+                    live["session_anchor_ref"],
+                    result["session_connection"]["session_anchor_ref"],
+                )
                 self.assertEqual(4321, live["process_lease"]["process_identity"]["pid"])
                 handle = manager._handles["GCS"]
                 owned_before_reuse = supervisor.get_session(
@@ -4203,6 +4753,39 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(
             "fake-provider:actual-session", selected["provider_session_ref"]
         )
+
+    def test_resident_manager_new_session_reserves_fresh_supervisor_slot(
+        self,
+    ) -> None:
+        def register(project_id, value):
+            return {"project_id": project_id, **dict(value)}, True
+
+        with (
+            patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False),
+            patch.object(
+                ProjectMasterSessionStore,
+                "ensure_supervisor_session",
+                return_value=None,
+            ) as ensure_session,
+        ):
+            manager = ResidentProjectMasterHostManager(
+                universe_endpoint="http://127.0.0.1:52973",
+                bridge_registrar=register,
+                provider_factory=lambda _root, _project_id, _store: FakeProvider(),
+                provider_resolver=lambda _project_id: "CODEX",
+                coordinator_factory=lambda _root, _project_id, _session: (
+                    self.surface_observer
+                ),
+            )
+            try:
+                manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)},
+                    session_action="NEW",
+                )
+            finally:
+                manager.close()
+
+        ensure_session.assert_called_once_with("CODEX", new_session=True)
 
     def test_resident_manager_restarts_when_provider_selection_changes(self) -> None:
         registrations: list[dict[str, Any]] = []
