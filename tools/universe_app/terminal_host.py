@@ -73,6 +73,7 @@ from claude_channel_broker import (
     ClaudeChannelBroker,
     MCP_SERVER_NAME,
     ensure_local_channel_server_registered,
+    session_lookup_path,
 )
 
 TERMINAL_SCHEMA = "universe.cli-terminal.v1"
@@ -87,6 +88,10 @@ TERMINAL_HISTORY_MAX_BYTES = 4 * 1024 * 1024
 TERMINAL_HISTORY_CHUNK_BYTES = 32 * 1024
 TERMINAL_HISTORY_PAGE_LIMIT = 100
 TERMINAL_HISTORY_PAGE_MAX_BYTES = 256 * 1024
+SESSION_BOOTSTRAP_PROMPT = (
+    "Initialize this Universe session without calling tools. "
+    "Reply exactly SESSION_READY and wait for user instructions."
+)
 
 # Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
 # sequences so terminal output can be checked as plain text.
@@ -96,6 +101,16 @@ _ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07
 # space, so after stripping escapes the words land back to back with no
 # separator at all - hence no `\s*` between "local" and "development" below.
 _DEV_CHANNEL_PROMPT_RE = re.compile(rb"localdevelopment", re.IGNORECASE)
+
+
+def provider_cli_ready_for_bootstrap(provider: str, output: bytes) -> bool:
+    plain = _ANSI_ESCAPE_RE.sub(b"", bytes(output or b""))
+    name = str(provider or "").strip().upper()
+    if name == "GROK":
+        return b"always-approve" in plain
+    if name == "CODEX":
+        return b"OpenAI Codex" in plain
+    return False
 
 
 class TerminalScreenProjection:
@@ -450,11 +465,14 @@ class TerminalSession:
     pump_thread: Any = None
     exit_detail: str | None = None
     channel_broker: ClaudeChannelBroker | None = None
+    channel_enabled: bool = False
     session_anchor_ref: str = ""
     managed_shell: Any = None
     managed_shell_identity_file: str = ""
     backend_owner: str = "PYTHON_CONPTY"
     reconnection_host_id: str = ""
+    bootstrap_input: bytes = b""
+    bootstrap_delivered: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -490,12 +508,26 @@ class TerminalSession:
             "pid": self.live_pid(),
             "exit_detail": self.exit_detail,
             "automation_transport": (
-                "CLAUDE_CODE_CHANNEL" if self.channel_broker is not None else "PTY"
+                "CLAUDE_CODE_CHANNEL" if self.channel_enabled else "PTY"
             ),
-            "channel_registered": (
-                self.channel_broker.registered if self.channel_broker is not None else False
+            "channel_owner": (
+                "RUST_SESSION_HOST"
+                if self.channel_enabled and isinstance(self.backend, ReconnectionPty)
+                else "SUPERVISOR_LEGACY" if self.channel_enabled
+                else "NOT_APPLICABLE"
             ),
+            "channel_registered": self.channel_is_registered(),
         }
+
+    def channel_is_registered(self) -> bool:
+        if self.channel_broker is not None:
+            return self.channel_broker.registered
+        if self.channel_enabled and isinstance(self.backend, ReconnectionPty):
+            try:
+                return self.backend.channel_state() == "READY"
+            except Exception:  # noqa: BLE001 - public projection stays available
+                return False
+        return False
 
     def live_pid(self) -> int | None:
         backend = self.backend
@@ -717,33 +749,43 @@ class TerminalHost:
             ):
                 created[terminal_id] = event
         results: list[dict[str, Any]] = []
-        terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
+        terminal_states = {
+            "TERMINAL_CLOSED",
+            "TERMINAL_TERMINATED",
+            "TERMINAL_ORPHAN_RECLAIMED",
+        }
         for terminal_id, event in created.items():
             if terminal_id in active_terminal_ids or latest.get(terminal_id) in terminal_states:
                 continue
             details = event.get("details")
             details = details if isinstance(details, Mapping) else {}
-            if (
-                details.get("backend_owner") == "RUST_RECONNECTION_HOST"
-                and self._reconnection_registry is not None
-            ):
+            if details.get("backend_owner") == "RUST_RECONNECTION_HOST":
+                # A Rust Host owns the ConPTY handles and its cmd child. This
+                # legacy identity-file reclaimer must never terminate that cmd,
+                # even when Host discovery is disabled or temporarily fails.
+                # Reconciliation and registry cleanup own the Host lifecycle.
+                host: Mapping[str, Any] = {}
                 anchor_ref = str(details.get("session_anchor_ref") or "").strip()
-                if anchor_ref:
+                if self._reconnection_registry is not None and anchor_ref:
                     try:
                         client = self._reconnection_registry.discover(anchor_ref)
                         host = client.status()
                     except ReconnectionHostError:
-                        pass
-                    else:
-                        results.append(
-                            {
-                                "terminal_id": terminal_id,
-                                "status": "HOST_OWNED_ORPHAN_PRESERVED",
-                                "pid": host.get("child_pid"),
-                                "host_id": host.get("host_id"),
-                            }
-                        )
-                        continue
+                        host = {}
+                results.append(
+                    {
+                        "terminal_id": terminal_id,
+                        "status": (
+                            "HOST_OWNED_ORPHAN_PRESERVED"
+                            if host
+                            else "HOST_OWNED_ORPHAN_DEFERRED"
+                        ),
+                        "pid": host.get("child_pid") or event.get("pid"),
+                        "host_id": host.get("host_id")
+                        or details.get("reconnection_host_id"),
+                    }
+                )
+                continue
             path_text = str(
                 details.get("managed_shell_identity_file")
             ).strip()
@@ -843,7 +885,11 @@ class TerminalHost:
             else None
         )
         unmatched_live_anchors = set(live_clients or {})
-        terminal_states = {"TERMINAL_CLOSED", "TERMINAL_ORPHAN_RECLAIMED"}
+        terminal_states = {
+            "TERMINAL_CLOSED",
+            "TERMINAL_TERMINATED",
+            "TERMINAL_ORPHAN_RECLAIMED",
+        }
         results: list[dict[str, Any]] = []
         for terminal_id, event in created.items():
             if terminal_id in active_terminal_ids:
@@ -896,19 +942,12 @@ class TerminalHost:
                 details.get("launch_profile") or "INTERACTIVE"
             ).strip().upper()
             channel_broker: ClaudeChannelBroker | None = None
-            channel_state = "NOT_APPLICABLE"
-            if provider == "CLAUDE" and launch_profile == "INTERACTIVE":
-                try:
-                    channel_broker = ClaudeChannelBroker(
-                        terminal_id=terminal_id,
-                        project_id=project_id,
-                        mode=mode,
-                        provider=provider,
-                        supervisor_session_id=supervisor_session_id,
-                    ).start()
-                    channel_state = "REBOUND"
-                except Exception:  # noqa: BLE001 - PTY recovery remains usable
-                    channel_state = "UNAVAILABLE"
+            channel_enabled = bool(status.get("channel_enabled"))
+            channel_state = (
+                "READY" if bool(status.get("channel_registered"))
+                else "PENDING" if channel_enabled
+                else "NOT_APPLICABLE"
+            )
             session = TerminalSession(
                 terminal_id=terminal_id,
                 project_id=project_id,
@@ -926,6 +965,7 @@ class TerminalHost:
                 rows=max(24, int(details.get("rows") or 32)),
                 backend=backend,
                 channel_broker=channel_broker,
+                channel_enabled=channel_enabled,
                 session_anchor_ref=anchor_ref,
                 managed_shell_identity_file=str(
                     details.get("managed_shell_identity_file") or ""
@@ -1098,26 +1138,37 @@ class TerminalHost:
                 "launch_profile must be INTERACTIVE or SUPERVISED_STDIO",
             )
         channel_broker: ClaudeChannelBroker | None = None
-        if resolved_provider == "CLAUDE" and profile == "INTERACTIVE":
-            # The --channels allowlist Claude Code checks at startup only
-            # recognizes MCP servers that are persistently registered
-            # (enterprise/user/project/local scope) - a one-off --mcp-config
-            # file is invisible to it. Register the (stable, secret-free)
-            # server entry once per project instead; each session's actual
-            # broker connection is discovered by the spawned MCP child via
-            # UNIVERSE_TERMINAL_ID, not via this registration.
+        channel_enabled = resolved_provider == "CLAUDE" and profile == "INTERACTIVE"
+        channel_bootstrap_token = ""
+        channel_session_token = ""
+        if channel_enabled:
+            # The provider adapter is static, but the authenticated queue lives
+            # with the Rust Host so Supervisor restart cannot sever delivery.
             ensure_local_channel_server_registered(str(root.resolve()))
-            channel_broker = ClaudeChannelBroker(
-                terminal_id=terminal_id,
-                project_id=project,
-                mode=requested_mode,
-                provider=resolved_provider,
-                supervisor_session_id=supervisor,
-            ).start()
+            if self._reconnection_registry is None:
+                channel_broker = ClaudeChannelBroker(
+                    terminal_id=terminal_id,
+                    project_id=project,
+                    mode=requested_mode,
+                    provider=resolved_provider,
+                    supervisor_session_id=supervisor,
+                ).start()
+            else:
+                channel_bootstrap_token = secrets.token_urlsafe(32)
+                channel_session_token = secrets.token_urlsafe(32)
         fresh_claude_session_id = (
             str(uuid.uuid4())
             if (
                 resolved_provider == "CLAUDE"
+                and profile == "INTERACTIVE"
+                and not str(resume_session_ref or "").strip()
+            )
+            else ""
+        )
+        fresh_grok_session_id = (
+            str(uuid.uuid4())
+            if (
+                resolved_provider == "GROK"
                 and profile == "INTERACTIVE"
                 and not str(resume_session_ref or "").strip()
             )
@@ -1137,7 +1188,8 @@ class TerminalHost:
                 model_ref=selected_model,
                 effort=selected_effort,
                 claude_session_id=fresh_claude_session_id,
-                claude_channel_enabled=channel_broker is not None,
+                grok_session_id=fresh_grok_session_id,
+                claude_channel_enabled=channel_enabled,
             )
         session = TerminalSession(
             terminal_id=terminal_id,
@@ -1154,6 +1206,7 @@ class TerminalHost:
             cols=max(80, int(cols or 120)),
             rows=max(24, int(rows or 32)),
             channel_broker=channel_broker,
+            channel_enabled=channel_enabled,
             session_anchor_ref=anchor_ref,
         )
         session.managed_shell = ManagedShell(
@@ -1174,6 +1227,13 @@ class TerminalHost:
             "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(shell_identity_path),
             "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
+        if resolved_provider == "GROK":
+            # Grok scans Claude-compatible hooks by default. Universe already
+            # installs one provider-native Grok SessionStart hook, so importing
+            # the Claude copies would dispatch the same session injection three
+            # times and contend on the same runtime state. Isolate this Host to
+            # its native hook path; other Claude compatibility surfaces remain.
+            child_environment["GROK_CLAUDE_HOOKS_ENABLED"] = "0"
         reserved_environment = frozenset(child_environment)
         for key, value in dict(provider_environment or {}).items():
             normalized_key = str(key)
@@ -1198,6 +1258,12 @@ class TerminalHost:
             [executable, *argv],
             pipe_console_input=pipe_console_input,
         )
+        provider_bootstrap_input = (
+            startup_input(resolved_provider, resume_session_ref)
+            if profile == "INTERACTIVE"
+            else b""
+        )
+        session.bootstrap_input = provider_bootstrap_input
         shell_argv = managed_shell_cmdline(
             [executable, *argv],
             pipe_console_input=pipe_console_input,
@@ -1214,6 +1280,13 @@ class TerminalHost:
                     shell=shell_executable,
                     cwd=Path(session.cwd),
                     shell_args=("/d", "/q", "/k"),
+                    host_kind="SESSION",
+                    owner_ref=anchor_ref,
+                    channel_lookup_file=(
+                        session_lookup_path(terminal_id) if channel_enabled else None
+                    ),
+                    channel_bootstrap_token=channel_bootstrap_token,
+                    channel_session_token=channel_session_token,
                     environment=host_environment,
                     cols=session.cols,
                     rows=session.rows,
@@ -1224,11 +1297,6 @@ class TerminalHost:
                 )
                 session.backend_owner = "RUST_RECONNECTION_HOST"
                 session.reconnection_host_id = session.backend.host_id
-                # A newly created Windows pseudo-console asks its terminal for
-                # the cursor position before rendering the first prompt.  The
-                # Host must answer even when no browser/xterm is attached yet.
-                session.backend.write(b"\x1b[1;1R")
-                session.backend.write(provider_command.encode("utf-8") + b"\r\n")
             else:
                 session.backend = self._spawn(
                     shell_executable,
@@ -1263,6 +1331,25 @@ class TerminalHost:
         session.state = "LIVE"
         with self._lock:
             self._sessions[terminal_id] = session
+        if isinstance(session.backend, ReconnectionPty):
+            try:
+                session.backend.execute(
+                    b"\x1b[1;1R"
+                    + provider_command.encode("utf-8")
+                    + b"\r\n"
+                )
+            except Exception as error:  # noqa: BLE001 - surface Host dispatch failure
+                session.managed_shell.record_failure_evidence(
+                    "CLI_START_FAILED", {"detail": str(error)}
+                )
+                try:
+                    self.terminate(terminal_id, audit_context=audit_context)
+                except Exception:
+                    pass
+                raise TerminalHostError(
+                    "TERMINAL_SPAWN_FAILED",
+                    str(error) or "failed to dispatch CLI through Session Host",
+                ) from error
         created = session.public()
         self.record_audit_event(
             "TERMINAL_CREATED",
@@ -1366,10 +1453,14 @@ class TerminalHost:
                 else None
             ),
             provider=session.provider,
+            provider_session_ref=str(evidence.get("provider_session_ref") or ""),
             session_anchor_ref=str(evidence.get("session_anchor_ref") or ""),
+            observed_at=str(evidence.get("observed_at") or ""),
         )
         shell.record_attach_evidence(attach)
-        identity_path = str(session.managed_shell_identity_file or "").strip()
+        identity_path = str(
+            getattr(session, "managed_shell_identity_file", "") or ""
+        ).strip()
         if identity_path:
             write_managed_shell_identity(Path(identity_path), session)
         return {
@@ -1676,12 +1767,17 @@ class TerminalHost:
         return performed
 
     def close(
-        self, terminal_id: str, *, audit_context: Mapping[str, Any] | None = None
+        self,
+        terminal_id: str,
+        *,
+        audit_context: Mapping[str, Any] | None = None,
+        terminate_host: bool = False,
     ) -> dict[str, Any]:
         session = self.get(terminal_id)
         terminal = session.public()
+        request_event = "TERMINATE_REQUESTED" if terminate_host else "DETACH_REQUESTED"
         self.record_audit_event(
-            "CLOSE_REQUESTED", terminal=terminal, context=audit_context
+            request_event, terminal=terminal, context=audit_context
         )
         session.pump_stop.set()
         backend = session.backend
@@ -1706,9 +1802,12 @@ class TerminalHost:
         with self._lock:
             self._sessions.pop(session.terminal_id, None)
         self.bus.drop_terminal(session.terminal_id)
-        closer = getattr(backend, "close", None)
-        if callable(closer):
-            closer()
+        if terminate_host and isinstance(backend, ReconnectionPty):
+            backend.client.shutdown()
+        else:
+            closer = getattr(backend, "close", None)
+            if callable(closer):
+                closer()
         if session.channel_broker is not None:
             session.channel_broker.close()
         try:
@@ -1723,10 +1822,16 @@ class TerminalHost:
                 ).unlink(missing_ok=True)
         except OSError:
             pass
-        self.record_audit_event(
-            "TERMINAL_CLOSED", terminal=terminal, context=audit_context
+        event_type = "TERMINAL_TERMINATED" if terminate_host else "TERMINAL_DETACHED"
+        self.record_audit_event(event_type, terminal=terminal, context=audit_context)
+        return {"status": event_type, "terminal_id": session.terminal_id}
+
+    def terminate(
+        self, terminal_id: str, *, audit_context: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.close(
+            terminal_id, audit_context=audit_context, terminate_host=True
         )
-        return {"status": "TERMINAL_CLOSED", "terminal_id": session.terminal_id}
 
     def write(
         self,
@@ -1869,22 +1974,37 @@ class TerminalHost:
     ) -> dict[str, Any]:
         session = self.get(terminal_id)
         broker = session.channel_broker
-        if broker is None:
-            raise TerminalHostError(
-                "TERMINAL_CHANNEL_UNAVAILABLE",
-                "terminal has no Claude Code channel bridge",
-            )
         try:
-            return broker.push(payload, on_result=on_result)
+            if broker is not None:
+                return broker.push(payload, on_result=on_result)
+            if session.channel_enabled and isinstance(session.backend, ReconnectionPty):
+                return session.backend.channel_push(payload)
         except Exception as error:  # noqa: BLE001 - preserve terminal error contract
             raise TerminalHostError("TERMINAL_CHANNEL_UNAVAILABLE", str(error)) from error
+        raise TerminalHostError(
+            "TERMINAL_CHANNEL_UNAVAILABLE",
+            "terminal has no Host-owned message channel",
+        )
 
     def channel_state(self, terminal_id: str) -> str:
         session = self.get(terminal_id)
-        broker = session.channel_broker
-        if broker is None:
-            return "UNAVAILABLE"
-        return "READY" if broker.registered else "PENDING"
+        if session.channel_broker is not None:
+            return "READY" if session.channel_broker.registered else "PENDING"
+        if session.channel_enabled and isinstance(session.backend, ReconnectionPty):
+            try:
+                return session.backend.channel_state()
+            except Exception as error:  # noqa: BLE001 - preserve terminal error contract
+                raise TerminalHostError("TERMINAL_CHANNEL_UNAVAILABLE", str(error)) from error
+        return "UNAVAILABLE"
+
+    def channel_result(self, terminal_id: str, message_id: str) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        if session.channel_enabled and isinstance(session.backend, ReconnectionPty):
+            try:
+                return session.backend.channel_result(message_id)
+            except Exception as error:  # noqa: BLE001 - preserve terminal error contract
+                raise TerminalHostError("TERMINAL_CHANNEL_UNAVAILABLE", str(error)) from error
+        return {"status": "EMPTY", "message_id": str(message_id)}
 
     def resize(self, terminal_id: str, cols: int, rows: int) -> None:
         session = self.get(terminal_id)
@@ -2074,6 +2194,10 @@ class TerminalHost:
         # (rather than guessing a delay) and confirm it the moment it renders.
         awaiting_channel_confirm = session.channel_broker is not None
         channel_confirm_tail = b""
+        awaiting_bootstrap = bool(
+            session.bootstrap_input and not session.bootstrap_delivered
+        )
+        bootstrap_tail = b""
         next_managed_sample = time.time() + self._managed_sample_interval
         while not session.pump_stop.is_set() and session.state == "LIVE":
             backend = session.backend
@@ -2112,6 +2236,32 @@ class TerminalHost:
                     self._mark_backend_exit(session)
                     break
                 continue
+            if awaiting_bootstrap:
+                bootstrap_tail += chunk
+                if provider_cli_ready_for_bootstrap(
+                    session.provider, bootstrap_tail
+                ):
+                    try:
+                        backend.write(session.bootstrap_input)
+                    except Exception:  # noqa: BLE001 - lifecycle retry remains active
+                        pass
+                    else:
+                        session.bootstrap_delivered = True
+                        awaiting_bootstrap = False
+                        self.record_audit_event(
+                            "SESSION_BOOTSTRAP_INPUT_WRITTEN",
+                            terminal=session.public(),
+                            context={
+                                "source": "SUPERVISOR_SESSION_BOOTSTRAP",
+                                "access_surface": "SUPERVISOR",
+                            },
+                            details={
+                                "byte_count": len(session.bootstrap_input),
+                                "content_persisted": False,
+                            },
+                        )
+                elif len(bootstrap_tail) > 16384:
+                    bootstrap_tail = bootstrap_tail[-8192:]
             if awaiting_channel_confirm:
                 # Search the full accumulated buffer *before* capping it - the
                 # confirmation screen is one large write (box borders, ANSI
@@ -2223,6 +2373,7 @@ def startup_argv(
     model_ref: str = "",
     effort: str = "AUTO",
     claude_session_id: str = "",
+    grok_session_id: str = "",
     claude_channel_enabled: bool = False,
 ) -> list[str]:
     """Build one interactive CLI command without changing its supervisor anchor.
@@ -2244,7 +2395,12 @@ def startup_argv(
             argv.extend(("--effort", selected_effort.lower()))
         elif name == "CODEX":
             argv.extend(("--config", f"model_reasoning_effort={selected_effort.lower()}"))
-    argv.extend(resume_argv(name, resume_session_ref))
+    resume_arguments = resume_argv(name, resume_session_ref)
+    argv.extend(resume_arguments)
+    if name == "GROK" and not resume_arguments:
+        session_id = str(grok_session_id or "").strip()
+        if session_id:
+            argv.extend(("--session-id", session_id))
     if name == "CLAUDE":
         session_id = str(claude_session_id or "").strip()
         if session_id:
@@ -2259,6 +2415,15 @@ def startup_argv(
             # confirmed in _pump_session once it renders).
             argv.extend(("--dangerously-load-development-channels", f"server:{MCP_SERVER_NAME}"))
     return argv
+
+
+def startup_input(provider: str, resume_session_ref: str) -> bytes:
+    """Return the first provider input required to materialize a new session."""
+
+    name = str(provider or "").strip().upper()
+    if resume_argv(name, resume_session_ref) or name not in {"GROK", "CODEX"}:
+        return b""
+    return SESSION_BOOTSTRAP_PROMPT.encode("utf-8") + b"\r"
 
 
 def infer_provider(executable: str) -> str:

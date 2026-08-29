@@ -38,6 +38,8 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
                 {
                     "schema": STATE_SCHEMA,
                     "anchor_ref": anchor_ref,
+                    "host_kind": "SESSION",
+                    "owner_ref": anchor_ref,
                     "host_id": f"host-{pid}",
                     "endpoint": "tcp://127.0.0.1:50000",
                     "pid": pid,

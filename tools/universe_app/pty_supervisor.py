@@ -210,7 +210,7 @@ def _terminate_supervisor_process(pid: int) -> bool:
 
 
 def restart_supervisor(*, state_path: Path | None = None, timeout: float = 8.0) -> dict[str, Any]:
-    """Restart only the standalone PTY Supervisor and end its active terminals."""
+    """Restart the Supervisor while Host-owned sessions remain reconnectable."""
     path = state_path or default_state_path()
     previous = load_state(path) or {}
     pid = int(previous.get("pid") or 0)
@@ -237,7 +237,8 @@ def restart_supervisor(*, state_path: Path | None = None, timeout: float = 8.0) 
         "previous_pid": pid or None,
         "pid": int(current.get("pid") or 0) or None,
         "endpoint": str(current.get("endpoint") or ""),
-        "active_terminals_ended": bool(pid),
+        "previous_supervisor_ended": bool(pid),
+        "terminal_continuity": "HOST_OWNED_RECONCILED_LEGACY_ENDED",
     }
 
 
@@ -370,6 +371,57 @@ class SupervisedTerminalHost:
             f"/v1/terminals/{quote(terminal_id, safe='')}",
             audit_source="UNIVERSE_TERMINAL_DELETE",
         )
+
+    def terminate(self, terminal_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/terminate",
+            audit_source="UNIVERSE_TERMINAL_TERMINATE",
+        )
+
+    def channel_state(self, terminal_id: str) -> str:
+        payload = self._request(
+            "GET", f"/v1/terminals/{quote(terminal_id, safe='')}/channel"
+        )
+        return str(payload.get("channel_state") or "UNAVAILABLE")
+
+    def push_channel(
+        self,
+        terminal_id: str,
+        payload: Mapping[str, Any],
+        *,
+        on_result: Any = None,
+    ) -> dict[str, Any]:
+        result = self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/channel",
+            payload=dict(payload),
+            audit_source="UNIVERSE_TERMINAL_CHANNEL",
+        ).get("channel_result")
+        result = dict(result) if isinstance(result, Mapping) else {}
+        message_id = str(result.get("message_id") or payload.get("message_id") or "")
+        if on_result is not None and message_id:
+            def poll_result() -> None:
+                deadline = time.monotonic() + 24 * 60 * 60
+                while time.monotonic() < deadline:
+                    try:
+                        observed = self._request(
+                            "GET",
+                            f"/v1/terminals/{quote(terminal_id, safe='')}/channel/results/{quote(message_id, safe='')}",
+                        ).get("channel_result")
+                    except TerminalHostError:
+                        time.sleep(0.25)
+                        continue
+                    if isinstance(observed, Mapping) and observed.get("status") in {"ACCEPTED", "DUPLICATE"}:
+                        on_result(dict(observed))
+                        return
+                    time.sleep(0.2)
+            threading.Thread(
+                target=poll_result,
+                name=f"universe-channel-result-{terminal_id}",
+                daemon=True,
+            ).start()
+        return result
 
     def record_managed_attach(
         self, terminal_id: str, evidence: Mapping[str, Any]

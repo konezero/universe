@@ -1,7 +1,8 @@
 use base64::Engine;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,8 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATE_SCHEMA: &str = "universe.reconnection-host-state.v1";
 const RESPONSE_SCHEMA: &str = "universe.reconnection-host-response.v1";
-const MAX_REQUEST_BYTES: u64 = 16 * 1024;
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const OUTPUT_CAPACITY_BYTES: usize = 256 * 1024;
+const CHANNEL_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 struct Config {
@@ -26,6 +28,11 @@ struct Config {
     shell: String,
     cwd: Option<PathBuf>,
     shell_args: Vec<String>,
+    host_kind: String,
+    owner_ref: String,
+    channel_lookup_file: Option<PathBuf>,
+    channel_bootstrap_token: Option<String>,
+    channel_session_token: Option<String>,
     environment: Vec<(String, String)>,
     cols: u16,
     rows: u16,
@@ -36,6 +43,8 @@ struct HostSnapshot {
     schema: &'static str,
     host_id: String,
     anchor_ref: String,
+    host_kind: String,
+    owner_ref: String,
     endpoint: String,
     pid: u32,
     started_at_unix_ms: u128,
@@ -47,6 +56,8 @@ struct HostSnapshot {
     child_pid: Option<u32>,
     child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
+    channel_enabled: bool,
+    channel_registered: bool,
     auth_token: String,
 }
 
@@ -60,6 +71,7 @@ struct HostRequest {
     after_cursor: Option<u64>,
     cols: Option<u16>,
     rows: Option<u16>,
+    channel: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +86,8 @@ struct HostResponse {
     host: Option<PublicSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputChunk>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +95,8 @@ struct PublicSnapshot {
     schema: &'static str,
     host_id: String,
     anchor_ref: String,
+    host_kind: String,
+    owner_ref: String,
     endpoint: String,
     pid: u32,
     started_at_unix_ms: u128,
@@ -92,6 +108,8 @@ struct PublicSnapshot {
     child_pid: Option<u32>,
     child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
+    channel_enabled: bool,
+    channel_registered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +118,169 @@ struct OutputChunk {
     start_cursor: u64,
     next_cursor: u64,
     truncated: bool,
+}
+
+#[derive(Debug)]
+struct MessageChannel {
+    bootstrap_token: String,
+    session_token: String,
+    registered: bool,
+    queue: VecDeque<Value>,
+    seen: HashSet<String>,
+    anchors: HashMap<String, String>,
+    results: HashMap<String, Value>,
+}
+
+impl MessageChannel {
+    fn new(bootstrap_token: String, session_token: String) -> Self {
+        Self {
+            bootstrap_token,
+            session_token,
+            registered: false,
+            queue: VecDeque::new(),
+            seen: HashSet::new(),
+            anchors: HashMap::new(),
+            results: HashMap::new(),
+        }
+    }
+
+    fn exchange(&mut self, token: &str) -> Result<Value, (&'static str, String)> {
+        if self.registered {
+            return Err((
+                "CHANNEL_BOOTSTRAP_ALREADY_USED",
+                "channel bootstrap was already exchanged".to_owned(),
+            ));
+        }
+        if token != self.bootstrap_token {
+            return Err((
+                "CHANNEL_BOOTSTRAP_INVALID",
+                "channel bootstrap token is invalid".to_owned(),
+            ));
+        }
+        self.registered = true;
+        self.bootstrap_token.clear();
+        Ok(json!({"status": "REGISTERED", "session_token": self.session_token}))
+    }
+
+    fn require_session(&self, token: &str) -> Result<(), (&'static str, String)> {
+        if !self.registered || token != self.session_token {
+            return Err((
+                "CHANNEL_SESSION_UNAUTHORIZED",
+                "channel session token is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, payload: &Value) -> Result<Value, (&'static str, String)> {
+        if !self.registered {
+            return Err((
+                "CHANNEL_NOT_REGISTERED",
+                "message channel is not registered".to_owned(),
+            ));
+        }
+        let message_id = payload
+            .get("message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
+        let anchor = payload
+            .get("session_anchor_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if message_id.is_empty() || content.trim().is_empty() || anchor.is_empty() {
+            return Err((
+                "CHANNEL_PAYLOAD_INVALID",
+                "message_id, content, and session_anchor_ref are required".to_owned(),
+            ));
+        }
+        if self.seen.contains(message_id) {
+            return Ok(json!({"status": "DUPLICATE", "message_id": message_id}));
+        }
+        if self.queue.len() >= CHANNEL_QUEUE_CAPACITY {
+            return Err((
+                "CHANNEL_QUEUE_FULL",
+                "message channel queue is full".to_owned(),
+            ));
+        }
+        let meta = payload.get("meta").cloned().unwrap_or_else(|| json!({}));
+        self.seen.insert(message_id.to_owned());
+        self.anchors
+            .insert(message_id.to_owned(), anchor.to_owned());
+        self.queue.push_back(json!({
+            "schema": "universe.host-message-channel.v1",
+            "message_id": message_id,
+            "content": content,
+            "meta": meta,
+        }));
+        Ok(json!({"status": "QUEUED", "message_id": message_id}))
+    }
+
+    fn poll(&mut self, token: &str) -> Result<Value, (&'static str, String)> {
+        self.require_session(token)?;
+        match self.queue.pop_front() {
+            Some(event) => Ok(json!({"status": "EVENT", "event": event})),
+            None => Ok(json!({"status": "EMPTY"})),
+        }
+    }
+
+    fn submit_result(
+        &mut self,
+        token: &str,
+        payload: &Value,
+    ) -> Result<Value, (&'static str, String)> {
+        self.require_session(token)?;
+        let message_id = payload
+            .get("message_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let body = payload
+            .get("body_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let Some(anchor) = self.anchors.get(message_id).cloned() else {
+            return Err((
+                "CHANNEL_RESULT_MESSAGE_UNKNOWN",
+                "channel result message is unknown".to_owned(),
+            ));
+        };
+        if body.is_empty() {
+            return Err((
+                "CHANNEL_RESULT_INVALID",
+                "channel result body_text is required".to_owned(),
+            ));
+        }
+        let result = json!({
+            "status": "ACCEPTED",
+            "message_id": message_id,
+            "body_text": body,
+            "outcome": payload.get("outcome").and_then(Value::as_str).unwrap_or("COMPLETED"),
+            "result_ref": payload.get("result_ref").and_then(Value::as_str).unwrap_or(""),
+            "session_anchor_ref": anchor,
+        });
+        if let Some(existing) = self.results.get(message_id) {
+            if existing == &result {
+                return Ok(json!({"status": "DUPLICATE", "message_id": message_id}));
+            }
+            return Err((
+                "CHANNEL_RESULT_CONFLICT",
+                "channel result conflicts with the stored result".to_owned(),
+            ));
+        }
+        self.results.insert(message_id.to_owned(), result.clone());
+        Ok(result)
+    }
+
+    fn result(&self, message_id: &str) -> Value {
+        self.results
+            .get(message_id)
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "EMPTY", "message_id": message_id}))
+    }
 }
 
 #[derive(Debug)]
@@ -209,6 +390,14 @@ impl TerminalRuntime {
         ))
     }
 
+    fn terminate(&self) -> Result<(), String> {
+        self.child
+            .lock()
+            .map_err(|_| "terminal child lock is unavailable".to_owned())?
+            .kill()
+            .map_err(|error| error.to_string())
+    }
+
     fn write(&self, input: &[u8]) -> Result<(), String> {
         let mut writer = self
             .writer
@@ -259,6 +448,8 @@ impl From<&HostSnapshot> for PublicSnapshot {
             schema: value.schema,
             host_id: value.host_id.clone(),
             anchor_ref: value.anchor_ref.clone(),
+            host_kind: value.host_kind.clone(),
+            owner_ref: value.owner_ref.clone(),
             endpoint: value.endpoint.clone(),
             pid: value.pid,
             started_at_unix_ms: value.started_at_unix_ms,
@@ -270,6 +461,8 @@ impl From<&HostSnapshot> for PublicSnapshot {
             child_pid: value.child_pid,
             child_exit_code: value.child_exit_code,
             handle_kinds: value.handle_kinds,
+            channel_enabled: value.channel_enabled,
+            channel_registered: value.channel_registered,
         }
     }
 }
@@ -344,7 +537,7 @@ fn parse_config() -> Result<Config, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("serve") {
         return Err(
-            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --token TOKEN [--shell PATH] [--cwd PATH] [--shell-arg VALUE] [--env NAME=VALUE] [--cols N] [--rows N]"
+            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --host-kind SESSION --owner-ref REF --token TOKEN [--shell PATH] [--cwd PATH] [--shell-arg VALUE] [--env NAME=VALUE] [--cols N] [--rows N]"
                 .to_owned(),
         );
     }
@@ -354,6 +547,24 @@ fn parse_config() -> Result<Config, String> {
     {
         return Err("--cwd must name an existing directory".to_owned());
     }
+    let host_kind = required_arg(&args, "--host-kind")?.to_ascii_uppercase();
+    if host_kind != "SESSION" {
+        return Err("--host-kind currently supports SESSION only".to_owned());
+    }
+    let channel_lookup_file = optional_arg(&args, "--channel-lookup-file").map(PathBuf::from);
+    let channel_bootstrap_token = optional_arg(&args, "--channel-bootstrap-token");
+    let channel_session_token = optional_arg(&args, "--channel-session-token");
+    let channel_parts = [
+        channel_lookup_file.is_some(),
+        channel_bootstrap_token.is_some(),
+        channel_session_token.is_some(),
+    ];
+    if channel_parts.iter().any(|value| *value) && !channel_parts.iter().all(|value| *value) {
+        return Err(
+            "channel lookup, bootstrap token, and session token must be supplied together"
+                .to_owned(),
+        );
+    }
     Ok(Config {
         state_file: PathBuf::from(required_arg(&args, "--state-file")?),
         anchor_ref: required_arg(&args, "--anchor-ref")?,
@@ -361,6 +572,11 @@ fn parse_config() -> Result<Config, String> {
         shell: optional_arg(&args, "--shell").unwrap_or_else(|| "cmd.exe".to_owned()),
         cwd,
         shell_args: repeated_args(&args, "--shell-arg")?,
+        host_kind,
+        owner_ref: required_arg(&args, "--owner-ref")?,
+        channel_lookup_file,
+        channel_bootstrap_token,
+        channel_session_token,
         environment: environment_overlays(&args)?,
         cols: terminal_dimension(&args, "--cols", 120)?,
         rows: terminal_dimension(&args, "--rows", 30)?,
@@ -397,6 +613,7 @@ fn success(state: &HostSnapshot) -> HostResponse {
         detail: None,
         host: Some(PublicSnapshot::from(state)),
         output: None,
+        channel: None,
     }
 }
 
@@ -408,6 +625,7 @@ fn failure(code: &'static str, detail: impl Into<String>) -> HostResponse {
         detail: Some(detail.into()),
         host: None,
         output: None,
+        channel: None,
     }
 }
 
@@ -419,6 +637,19 @@ fn terminal_success(state: &HostSnapshot, output: OutputChunk) -> HostResponse {
         detail: None,
         host: Some(PublicSnapshot::from(state)),
         output: Some(output),
+        channel: None,
+    }
+}
+
+fn channel_success(state: &HostSnapshot, channel: Value) -> HostResponse {
+    HostResponse {
+        schema: RESPONSE_SCHEMA,
+        status: "OK",
+        error_code: None,
+        detail: None,
+        host: Some(PublicSnapshot::from(state)),
+        output: None,
+        channel: Some(channel),
     }
 }
 
@@ -461,7 +692,53 @@ fn apply_request(
     request: HostRequest,
     shutdown: &AtomicBool,
     terminal: Option<&TerminalRuntime>,
+    channel: Option<&Mutex<MessageChannel>>,
 ) -> HostResponse {
+    if request.action == "channel_exchange" {
+        let Some(channel) = channel else {
+            return failure("CHANNEL_UNAVAILABLE", "message channel is unavailable");
+        };
+        let mut channel = match channel.lock() {
+            Ok(value) => value,
+            Err(_) => {
+                return failure(
+                    "CHANNEL_STATE_POISONED",
+                    "message channel lock is unavailable",
+                );
+            }
+        };
+        return match channel.exchange(&request.token) {
+            Ok(value) => {
+                state.channel_registered = channel.registered;
+                channel_success(state, value)
+            }
+            Err((code, detail)) => failure(code, detail),
+        };
+    }
+    if matches!(request.action.as_str(), "channel_poll" | "channel_result") {
+        let Some(channel) = channel else {
+            return failure("CHANNEL_UNAVAILABLE", "message channel is unavailable");
+        };
+        let mut channel = match channel.lock() {
+            Ok(value) => value,
+            Err(_) => {
+                return failure(
+                    "CHANNEL_STATE_POISONED",
+                    "message channel lock is unavailable",
+                );
+            }
+        };
+        let payload = request.channel.as_ref().unwrap_or(&Value::Null);
+        let result = if request.action == "channel_poll" {
+            channel.poll(&request.token)
+        } else {
+            channel.submit_result(&request.token, payload)
+        };
+        return match result {
+            Ok(value) => channel_success(state, value),
+            Err((code, detail)) => failure(code, detail),
+        };
+    }
     if request.token != state.auth_token {
         return failure("HOST_UNAUTHORIZED", "invalid host token");
     }
@@ -493,13 +770,22 @@ fn apply_request(
             success(state)
         }
         "shutdown" => {
+            if state.runtime_state == "LIVE"
+                && let Some(terminal) = terminal
+                && let Err(error) = terminal.terminate()
+            {
+                return failure("HOST_CHILD_TERMINATE_FAILED", error);
+            }
+            state.runtime_state = "TERMINATED".to_owned();
+            state.attached_supervisor_id = None;
             shutdown.store(true, Ordering::SeqCst);
             success(state)
         }
-        "write" => {
+        "write" | "execute" => {
             if let Err(response) = require_attached_supervisor(state, &request) {
                 return *response;
             }
+            let action = request.action.clone();
             let input = match (request.input_base64.as_deref(), request.input.as_deref()) {
                 (Some(value), _) => match base64::engine::general_purpose::STANDARD.decode(value) {
                     Ok(value) => value,
@@ -509,7 +795,7 @@ fn apply_request(
                 (None, None) => {
                     return failure(
                         "HOST_INPUT_REQUIRED",
-                        "write requires input_base64 or input",
+                        format!("{action} requires input_base64 or input"),
                     );
                 }
             };
@@ -548,6 +834,41 @@ fn apply_request(
                 Err(error) => failure("HOST_RESIZE_FAILED", error),
             }
         }
+        "channel_state" | "channel_push" | "channel_result_get" => {
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let Some(channel) = channel else {
+                return failure("CHANNEL_UNAVAILABLE", "message channel is unavailable");
+            };
+            let mut channel = match channel.lock() {
+                Ok(value) => value,
+                Err(_) => {
+                    return failure(
+                        "CHANNEL_STATE_POISONED",
+                        "message channel lock is unavailable",
+                    );
+                }
+            };
+            let payload = request.channel.as_ref().unwrap_or(&Value::Null);
+            let result = match request.action.as_str() {
+                "channel_state" => {
+                    Ok(json!({"status": if channel.registered { "READY" } else { "PENDING" }}))
+                }
+                "channel_push" => channel.push(payload),
+                _ => {
+                    let message_id = payload
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    Ok(channel.result(message_id))
+                }
+            };
+            match result {
+                Ok(value) => channel_success(state, value),
+                Err((code, detail)) => failure(code, detail),
+            }
+        }
         _ => failure("HOST_ACTION_UNSUPPORTED", "unsupported host action"),
     }
 }
@@ -582,6 +903,7 @@ fn handle_connection(
     terminal: Arc<TerminalRuntime>,
     state_file: PathBuf,
     shutdown: Arc<AtomicBool>,
+    channel: Option<Arc<Mutex<MessageChannel>>>,
 ) {
     let request = match read_request(&stream) {
         Ok(request) => request,
@@ -604,16 +926,24 @@ fn handle_connection(
     let before_supervisor = state.attached_supervisor_id.clone();
     let before_runtime_state = state.runtime_state.clone();
     let before_exit_code = state.child_exit_code;
+    let before_channel_registered = state.channel_registered;
     if let Err(error) = refresh_runtime_state(&mut state, &terminal) {
         write_response(stream, &failure("HOST_CHILD_STATUS_FAILED", error));
         return;
     }
-    let response = apply_request(&mut state, request, &shutdown, Some(&terminal));
+    let response = apply_request(
+        &mut state,
+        request,
+        &shutdown,
+        Some(&terminal),
+        channel.as_deref(),
+    );
     if response.status == "OK"
         && (before_generation != state.attachment_generation
             || before_supervisor != state.attached_supervisor_id
             || before_runtime_state != state.runtime_state
-            || before_exit_code != state.child_exit_code)
+            || before_exit_code != state.child_exit_code
+            || before_channel_registered != state.channel_registered)
         && let Err(error) = atomic_write_state(&state_file, &state)
     {
         write_response(stream, &failure("HOST_STATE_WRITE_FAILED", error));
@@ -634,10 +964,22 @@ fn serve(config: Config) -> Result<(), String> {
         .cwd
         .as_deref()
         .map(|path| path.to_string_lossy().into_owned());
+    let channel_enabled = config.channel_lookup_file.is_some();
+    let channel = match (
+        config.channel_bootstrap_token.clone(),
+        config.channel_session_token.clone(),
+    ) {
+        (Some(bootstrap), Some(session)) => Some(Arc::new(Mutex::new(MessageChannel::new(
+            bootstrap, session,
+        )))),
+        _ => None,
+    };
     let state = HostSnapshot {
         schema: STATE_SCHEMA,
         host_id: format!("host-{}-{started_at:x}", process::id()),
         anchor_ref: config.anchor_ref,
+        host_kind: config.host_kind,
+        owner_ref: config.owner_ref,
         endpoint: format!("tcp://{address}"),
         pid: process::id(),
         started_at_unix_ms: started_at,
@@ -649,9 +991,31 @@ fn serve(config: Config) -> Result<(), String> {
         child_pid,
         child_exit_code: None,
         handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
+        channel_enabled,
+        channel_registered: false,
         auth_token: config.token,
     };
     atomic_write_state(&config.state_file, &state)?;
+    if let (Some(path), Some(bootstrap)) = (
+        config.channel_lookup_file.as_deref(),
+        config.channel_bootstrap_token.as_deref(),
+    ) {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "channel lookup requires a parent directory".to_owned())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let temporary = path.with_extension(format!("tmp-{}", process::id()));
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&json!({"endpoint": state.endpoint, "bootstrap_token": bootstrap}))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    }
     let shared = Arc::new(Mutex::new(state));
     let terminal = Arc::new(terminal);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -662,8 +1026,9 @@ fn serve(config: Config) -> Result<(), String> {
                 let terminal = Arc::clone(&terminal);
                 let state_file = config.state_file.clone();
                 let shutdown_flag = Arc::clone(&shutdown);
+                let channel = channel.as_ref().map(Arc::clone);
                 thread::spawn(move || {
-                    handle_connection(stream, state, terminal, state_file, shutdown_flag)
+                    handle_connection(stream, state, terminal, state_file, shutdown_flag, channel)
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -671,6 +1036,9 @@ fn serve(config: Config) -> Result<(), String> {
             }
             Err(error) => return Err(error.to_string()),
         }
+    }
+    if let Some(path) = config.channel_lookup_file.as_deref() {
+        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -692,6 +1060,8 @@ mod tests {
             schema: STATE_SCHEMA,
             host_id: "host-test".to_owned(),
             anchor_ref: "anchor-test".to_owned(),
+            host_kind: "SESSION".to_owned(),
+            owner_ref: "anchor-test".to_owned(),
             endpoint: "tcp://127.0.0.1:1".to_owned(),
             pid: 1,
             started_at_unix_ms: 1,
@@ -703,6 +1073,8 @@ mod tests {
             child_pid: Some(2),
             child_exit_code: None,
             handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
+            channel_enabled: false,
+            channel_registered: false,
             auth_token: "token".to_owned(),
         }
     }
@@ -722,8 +1094,10 @@ mod tests {
                 after_cursor: None,
                 cols: None,
                 rows: None,
+                channel: None,
             },
             &shutdown,
+            None,
             None,
         );
         assert_eq!(first.status, "OK");
@@ -739,8 +1113,10 @@ mod tests {
                 after_cursor: None,
                 cols: None,
                 rows: None,
+                channel: None,
             },
             &shutdown,
+            None,
             None,
         );
         assert_eq!(second.status, "OK");
@@ -767,8 +1143,10 @@ mod tests {
                 after_cursor: None,
                 cols: None,
                 rows: None,
+                channel: None,
             },
             &shutdown,
+            None,
             None,
         );
         assert_eq!(response.error_code, Some("HOST_UNAUTHORIZED"));

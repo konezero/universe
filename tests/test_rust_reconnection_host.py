@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.reconnection_host import (  # noqa: E402
     ReconnectionHostRegistry,
+    ReconnectionPty,
 )
 from universe_app.windows_process import process_is_alive  # noqa: E402
 from universe_app.terminal_host import TerminalHost  # noqa: E402
@@ -188,6 +190,120 @@ class RustReconnectionHostTests(unittest.TestCase):
                     while process_is_alive(host_pid) and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertFalse(process_is_alive(host_pid))
+
+    def test_shutdown_terminates_host_owned_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            client = registry.launch(
+                "anchor-shutdown-owned-shell",
+                cwd=root,
+                shell_args=("/Q",),
+                host_kind="SESSION",
+                owner_ref="anchor-shutdown-owned-shell",
+            )
+            status = client.status()
+            self.assertEqual("SESSION", status["host_kind"])
+            self.assertEqual("anchor-shutdown-owned-shell", status["owner_ref"])
+            host_pid = int(status["pid"])
+            child_pid = int(status["child_pid"])
+
+            client.shutdown()
+            registry.reap_launched_process("anchor-shutdown-owned-shell")
+            deadline = time.monotonic() + 5
+            while (
+                process_is_alive(host_pid) or process_is_alive(child_pid)
+            ) and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+            self.assertFalse(process_is_alive(host_pid))
+            self.assertFalse(process_is_alive(child_pid))
+
+    def test_message_channel_survives_supervisor_reattach(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            lookup_path = root / "channel.json"
+            anchor_ref = "anchor-channel-reattach"
+            bootstrap_token = "bootstrap-test-token"
+            session_token = "session-test-token"
+            client = registry.launch(
+                anchor_ref,
+                cwd=root,
+                shell_args=("/Q",),
+                host_kind="SESSION",
+                owner_ref=anchor_ref,
+                channel_lookup_file=lookup_path,
+                channel_bootstrap_token=bootstrap_token,
+                channel_session_token=session_token,
+            )
+
+            def channel_request(token: str, action: str, channel: dict[str, object]) -> dict[str, object]:
+                endpoint = json.loads(lookup_path.read_text(encoding="utf-8"))["endpoint"]
+                host, port_text = str(endpoint).removeprefix("tcp://").rsplit(":", 1)
+                request = json.dumps(
+                    {"token": token, "action": action, "channel": channel},
+                    separators=(",", ":"),
+                ).encode("utf-8") + b"\n"
+                with socket.create_connection((host, int(port_text)), timeout=5) as connection:
+                    connection.sendall(request)
+                    response = bytearray()
+                    while b"\n" not in response:
+                        response.extend(connection.recv(8192))
+                return json.loads(response.split(b"\n", 1)[0])["channel"]
+
+            first = ReconnectionPty(client, supervisor_id="supervisor-channel-a")
+            second: ReconnectionPty | None = None
+            try:
+                lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
+                self.assertEqual(bootstrap_token, lookup["bootstrap_token"])
+                exchanged = channel_request(bootstrap_token, "channel_exchange", {})
+                self.assertEqual("REGISTERED", exchanged["status"])
+                self.assertEqual(session_token, exchanged["session_token"])
+                self.assertEqual("READY", first.channel_state())
+
+                queued = first.channel_push(
+                    {
+                        "message_id": "message-before-reattach",
+                        "content": "continue after supervisor replacement",
+                        "session_anchor_ref": anchor_ref,
+                        "meta": {"provider": "CLAUDE"},
+                    }
+                )
+                self.assertEqual("QUEUED", queued["status"])
+                first.close()
+
+                second = ReconnectionPty(
+                    registry.discover(anchor_ref),
+                    supervisor_id="supervisor-channel-b",
+                )
+                self.assertEqual("READY", second.channel_state())
+                delivered = channel_request(session_token, "channel_poll", {})
+                self.assertEqual("EVENT", delivered["status"])
+                self.assertEqual(
+                    "message-before-reattach",
+                    delivered["event"]["message_id"],
+                )
+                accepted = channel_request(
+                    session_token,
+                    "channel_result",
+                    {
+                        "message_id": "message-before-reattach",
+                        "body_text": "reattached result",
+                        "outcome": "COMPLETED",
+                    },
+                )
+                self.assertEqual("ACCEPTED", accepted["status"])
+                self.assertEqual(
+                    "reattached result",
+                    second.channel_result("message-before-reattach")["body_text"],
+                )
+            finally:
+                if second is not None:
+                    second.close()
+                client.shutdown()
+                registry.reap_launched_process(anchor_ref)
+            self.assertFalse(lookup_path.exists())
 
     def test_production_terminal_host_reconstructs_same_rust_host(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

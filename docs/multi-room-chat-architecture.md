@@ -118,6 +118,10 @@ implementation paths, not automatically selected plans. Todos belong to the
 adopted path and must not be used as a substitute for the Feature Node or the
 pre-adoption candidate set.
 
+Topic classification, role assignment, evidence and output budgets, role limits,
+and the promotion boundary for a future Meeting Skill are defined in
+`docs/meeting-topic-role-guide.md`.
+
 ### 2.4 Work progress dashboard (observation UI)
 
 Not a chat room. Aggregates:

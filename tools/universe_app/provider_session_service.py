@@ -27,6 +27,7 @@ from agent_session_gateway import (
 
 PROVIDER_SESSION_STREAM_SCHEMA = "universe.provider-session-stream.v1"
 PROVIDER_SESSION_MESSAGE_SCHEMA = "universe.provider-session-message.v1"
+HOST_MESSAGE_CHANNEL_SCHEMA = "universe.host-message-channel.v1"
 PROVIDER_SESSION_SNAPSHOT_SCHEMA = "universe.provider-session-snapshot.v1"
 WORK_STATUS_SCHEMA = "universe.work-status-notification.v1"
 PROVIDER_ACTION_SCHEMA = "universe.provider-session-action.v1"
@@ -370,6 +371,58 @@ class ProviderSessionService:
                     key, {"type": "PROVIDER_SESSION_MESSAGE", "message": message}
                 )
         return created
+
+    def submit_channel(
+        self,
+        chat_key: str,
+        value: Mapping[str, Any],
+        *,
+        on_accepted: Callable[[Mapping[str, Any]], None] | None = None,
+        on_terminal: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Translate one common Host message envelope into a provider-native turn."""
+
+        if not isinstance(value, Mapping):
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_REQUEST_INVALID",
+                "channel payload must be an object",
+                400,
+            )
+        schema = _text(value.get("schema"), "schema")
+        if schema != HOST_MESSAGE_CHANNEL_SCHEMA:
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_SCHEMA_UNSUPPORTED",
+                "channel payload schema is unsupported",
+                400,
+            )
+        message_id = _text(value.get("message_id"), "message_id")
+        session_anchor_ref = _text(
+            value.get("session_anchor_ref"), "session_anchor_ref"
+        )
+        content = _text(value.get("content"), "content")
+        meta = value.get("meta")
+        if not isinstance(meta, Mapping):
+            raise ProviderSessionError(
+                "PROVIDER_CHANNEL_META_INVALID",
+                "channel payload meta must be an object",
+                400,
+            )
+        result = self.submit(
+            chat_key,
+            {
+                "body": content,
+                "idempotency_key": f"host-channel:{message_id}",
+            },
+            on_accepted=on_accepted,
+            on_terminal=on_terminal,
+        )
+        result["message_channel"] = {
+            "schema": HOST_MESSAGE_CHANNEL_SCHEMA,
+            "message_id": message_id,
+            "session_anchor_ref": session_anchor_ref,
+            "adapter": "PROVIDER_NATIVE",
+        }
+        return result
 
     def submit(
         self,

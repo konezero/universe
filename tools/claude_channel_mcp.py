@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -54,7 +55,12 @@ def _session_lookup() -> tuple[str, str] | None:
         return None
     endpoint = str(data.get("endpoint") or "").strip().rstrip("/")
     bootstrap = str(data.get("bootstrap_token") or "").strip()
-    if not endpoint.startswith(("http://127.0.0.1:", "http://localhost:")) or not bootstrap:
+    if not endpoint.startswith((
+        "http://127.0.0.1:",
+        "http://localhost:",
+        "tcp://127.0.0.1:",
+        "tcp://localhost:",
+    )) or not bootstrap:
         return None
     return endpoint, bootstrap
 
@@ -63,6 +69,39 @@ def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] |
     endpoint = _ENDPOINT
     if endpoint is None or not token:
         return None
+    if endpoint.startswith("tcp://"):
+        actions = {
+            CHANNEL_EXCHANGE_PATH: "channel_exchange",
+            CHANNEL_POLL_PATH: "channel_poll",
+            CHANNEL_RESULT_PATH: "channel_result",
+        }
+        action = actions.get(path)
+        if action is None:
+            return None
+        address = endpoint.removeprefix("tcp://")
+        try:
+            host, port_text = address.rsplit(":", 1)
+            request = {
+                "token": token,
+                "action": action,
+                "channel": dict(payload),
+            }
+            encoded = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
+            with socket.create_connection((host, int(port_text)), timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                client.sendall(encoded)
+                response = bytearray()
+                while b"\n" not in response:
+                    chunk = client.recv(8192)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                    if len(response) > 128 * 1024:
+                        return None
+            decoded = json.loads(response.split(b"\n", 1)[0])
+        except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+            return None
+        channel = decoded.get("channel") if isinstance(decoded, Mapping) else None
+        return dict(channel) if isinstance(channel, Mapping) else None
     body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint}{path}",

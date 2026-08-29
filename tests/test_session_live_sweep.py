@@ -4,12 +4,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from session_supervisor import SessionSupervisorStore  # noqa: E402
+from universe_multi_room import MultiRoomStore  # noqa: E402
+from universe_server import perform_session_ref_inject  # noqa: E402
 
 
 class LiveSessionSweepTests(unittest.TestCase):
@@ -68,6 +71,95 @@ class LiveSessionSweepTests(unittest.TestCase):
         again = self.store.get_session(registered["session_id"])
         self.assertEqual("LIVE", again["state"])
         self.assertEqual("CURRENT", again["currentness"])
+
+    def test_exact_live_pty_binding_promotes_starting_session(self) -> None:
+        registered, _ = self.store.register_session(
+            {
+                "session_id": "session_test_starting_pty",
+                "node": "demo",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "STARTING",
+                "currentness": "UNKNOWN",
+            }
+        )
+
+        sweep = self.store.sweep_stale_live_sessions(
+            live_session_anchors={
+                registered["session_id"]: registered["session_anchor_ref"]
+            }
+        )
+
+        self.assertEqual(1, sweep["restored_live_count"])
+        promoted = self.store.get_session(registered["session_id"])
+        self.assertEqual("LIVE", promoted["state"])
+        self.assertEqual("ATTACHED", promoted["current_activity_state"])
+
+    def test_managed_attach_returns_live_supervisor_projection(self) -> None:
+        registered, _ = self.store.register_session(
+            {
+                "session_id": "session_test_attach_projection",
+                "node": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CLAUDE",
+                "state": "STARTING",
+                "currentness": "UNKNOWN",
+            }
+        )
+        anchor = registered["session_anchor_ref"]
+
+        class Host:
+            def get(self, terminal_id: str):
+                return SimpleNamespace(
+                    public=lambda: {
+                        "terminal_id": terminal_id,
+                        "supervisor_session_id": registered["session_id"],
+                        "session_anchor_ref": anchor,
+                    }
+                )
+
+            def record_managed_attach(self, terminal_id: str, _evidence):
+                return {"status": "MANAGED_SHELL_ATTACHED", "terminal_id": terminal_id}
+
+        result = perform_session_ref_inject(
+            session_supervisor=self.store,
+            multi_rooms=MultiRoomStore(str(Path(self.temp.name) / "rooms.sqlite3")),
+            terminal_host=Host(),
+            environment={},
+            body={
+                "provider": "CLAUDE",
+                "project_id": "universe",
+                "supervisor_session_id": registered["session_id"],
+                "managed_shell_attach": {
+                    "terminal_id": "term_attach_projection",
+                    "session_anchor_ref": anchor,
+                },
+            },
+        )
+
+        self.assertEqual("MANAGED_SHELL_ATTACHED", result["managed_shell_attachment"]["status"])
+        self.assertEqual("LIVE", result["supervisor_session"]["state"])
+
+    def test_exact_host_termination_stops_only_matching_session(self) -> None:
+        registered, _ = self.store.register_session(
+            {
+                "session_id": "session_test_host_terminated",
+                "node": "demo",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        stopped = self.store.record_host_termination(
+            registered["session_id"],
+            session_anchor_ref=registered["session_anchor_ref"],
+        )
+
+        self.assertEqual("STOPPED", stopped["state"])
+        self.assertEqual("TERMINATED", stopped["current_activity_state"])
+        self.assertEqual("CURRENT", stopped["currentness"])
 
     def test_exact_live_pty_binding_restores_only_matching_anchor(self) -> None:
         registered, _ = self.store.register_session(

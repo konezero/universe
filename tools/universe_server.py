@@ -266,6 +266,7 @@ from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting
 from universe_app.terminal_host import TerminalHost, TerminalHostError
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
+    HOST_MESSAGE_CHANNEL_SCHEMA,
     PROVIDER_SESSION_STREAM_SCHEMA,
     ProviderSessionError,
     ProviderSessionService,
@@ -27715,7 +27716,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 terminal.get("supervisor_session_id") or ""
             ).strip()
             anchor_ref = str(
-                terminal.get("active_session_anchor_ref") or ""
+                terminal.get("session_anchor_ref")
+                or terminal.get("active_session_anchor_ref")
+                or ""
             ).strip()
             if session_id and anchor_ref:
                 bindings[session_id] = anchor_ref
@@ -28938,6 +28941,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ) from error
         return {"schema": API_SCHEMA, **result}
 
+    def terminate_cli_terminal(self, terminal_id: str) -> dict[str, Any]:
+        try:
+            supervised = self.terminal_host.get(terminal_id)
+            terminal = (
+                supervised.public()
+                if hasattr(supervised, "public")
+                else dict(supervised)
+            )
+            result = self.terminal_host.terminate(terminal_id)
+        except TerminalHostError as error:
+            raise UniverseError(
+                error.code,
+                error.detail,
+                HTTPStatus.NOT_FOUND,
+            ) from error
+        session_id = str(terminal.get("supervisor_session_id") or "").strip()
+        session_anchor_ref = str(
+            terminal.get("session_anchor_ref") or ""
+        ).strip()
+        supervisor_session = None
+        if session_id and session_anchor_ref:
+            supervisor_session = self.session_supervisor.record_host_termination(
+                session_id, session_anchor_ref=session_anchor_ref
+            )
+        return {
+            "schema": API_SCHEMA,
+            **result,
+            "supervisor_session": supervisor_session,
+        }
+
     def session_bus_directory(self) -> dict[str, Any]:
         try:
             payload = dict(
@@ -29088,15 +29121,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project_id = str(terminal.get("project_id") or "").strip()
                 if not project_id:
                     continue
+                posted_message_id = str(message.get("message_id") or "").strip()
                 dispatch = self._dispatch_pending_session_instruction(
                     project_id=project_id,
                     session=session,
                     trigger="TURN_IDLE",
+                    message_id=posted_message_id,
                 )
                 if isinstance(message, dict):
                     message["delivery_state"] = (
                         "DISPATCHED"
                         if dispatch.get("status") == "DISPATCHED"
+                        and str(dispatch.get("message_id") or "") == posted_message_id
                         else str(message.get("delivery_state") or "PENDING")
                     )
                     message["dispatch_status"] = dispatch.get("status")
@@ -29793,6 +29829,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "chat_key": key,
                     "provider": provider,
                     "provider_session_ref": supervisor_ref,
+                    "supervisor_session_id": supervisor_session_id,
                     "project_id": project_id,
                     "node": str(binding.get("node") or project_id),
                     "mode": str(binding.get("mode") or "MASTER").upper(),
@@ -29862,6 +29899,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "chat_key": key,
             "provider": provider,
             "provider_session_ref": str(source.get("provider_session_id") or ""),
+            "supervisor_session_id": str(
+                binding.get("universe_session_id") or ""
+            ).strip(),
             "project_id": project_id,
             "node": str(binding.get("node") or project_id),
             "mode": str(binding.get("mode") or "MASTER").upper(),
@@ -32959,6 +32999,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id: str,
         session: Mapping[str, Any],
         trigger: str,
+        message_id: str = "",
     ) -> dict[str, Any]:
         """Claim and deliver one anchor-bound bus instruction at a safe point.
 
@@ -32997,6 +33038,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self._session_anchor_terminal_host(),
                 terminal_id=terminal_id,
                 session_anchor_ref=session_anchor_ref,
+                message_id=message_id,
             )
         except (SessionBusError, TerminalHostError) as error:
             return {"status": "CLAIM_UNAVAILABLE", "detail": str(error)}
@@ -33041,6 +33083,30 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             return {"status": "DELIVERY_UNAVAILABLE"}
 
+        provenance = claim.get("provenance")
+        sender_id = (
+            "UNIVERSE_UI"
+            if isinstance(provenance, Mapping)
+            and bool(provenance.get("user_authorized"))
+            else "UNIVERSE_SESSION_BUS"
+        )
+        message_id = str(claim.get("message_id") or "")
+        channel_payload = {
+            "schema": HOST_MESSAGE_CHANNEL_SCHEMA,
+            "message_id": message_id,
+            "session_anchor_ref": session_anchor_ref,
+            "content": str(delivery["body_text"]),
+            "meta": {
+                "message_id": message_id,
+                "session_anchor_ref": session_anchor_ref,
+                "sender_id": sender_id,
+                "kind": "INSTRUCTION",
+                "project_id": str(project_id),
+                "mode": mode,
+                "provider": provider,
+            },
+        }
+
         # Claude's interactive CLI stays in the existing PTY/xterm, but a
         # session-bus instruction must not be typed into that PTY.  The
         # terminal host provisions an authenticated Claude Code Channel MCP
@@ -33066,27 +33132,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "hook_stdout": outcome.get("hook_stdout"),
                 }
             if channel_state == "READY":
-                provenance = claim.get("provenance")
-                sender_id = (
-                    "UNIVERSE_UI"
-                    if isinstance(provenance, Mapping)
-                    and bool(provenance.get("user_authorized"))
-                    else "UNIVERSE_SESSION_BUS"
-                )
-                message_id = str(claim.get("message_id") or "")
-                channel_payload = {
-                    "message_id": message_id,
-                    "session_anchor_ref": session_anchor_ref,
-                    "content": str(delivery["body_text"]),
-                    "meta": {
-                        "message_id": message_id,
-                        "session_anchor_ref": session_anchor_ref,
-                        "sender_id": sender_id,
-                        "kind": "INSTRUCTION",
-                        "project_id": str(project_id),
-                        "mode": mode,
-                    },
-                }
                 channel_dispatch_ready = threading.Event()
                 channel_dispatch_started = {"value": False}
 
@@ -33150,7 +33195,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if native_chat_key:
             accepted_holder: dict[str, str] = {}
-            native_dispatch_ready = threading.Event()
+            native_terminal_holder: dict[str, Mapping[str, Any]] = {}
+            native_dispatch_lock = threading.Lock()
             native_dispatch_started = {"value": False}
 
             def observe_native_accept(reply: Mapping[str, Any]) -> None:
@@ -33163,10 +33209,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 accepted_holder["provider_message_id"] = provider_message_id
 
-            def observe_native_terminal(reply: Mapping[str, Any]) -> None:
-                native_dispatch_ready.wait(5.0)
-                if not native_dispatch_started["value"]:
-                    return
+            def project_native_terminal(reply: Mapping[str, Any]) -> None:
                 provider_state = str(reply.get("state") or "FAILED").upper()
                 outcome = "COMPLETED" if provider_state == "COMPLETED" else "FAILED"
                 body = str(reply.get("body") or "").strip()
@@ -33204,16 +33247,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     except SessionBusError:
                         pass
 
+            def observe_native_terminal(reply: Mapping[str, Any]) -> None:
+                with native_dispatch_lock:
+                    if not native_dispatch_started["value"]:
+                        native_terminal_holder["reply"] = dict(reply)
+                        return
+                project_native_terminal(reply)
+
             try:
-                native_result = self.provider_sessions.submit(
+                native_result = self.provider_sessions.submit_channel(
                     native_chat_key,
-                    {
-                        # The adapter turns this into the provider's official
-                        # user turn.  Do not add a prose "verified" marker:
-                        # provenance is enforced by Universe before dispatch.
-                        "body": str(delivery["body_text"]),
-                        "idempotency_key": "session-bus:" + str(claim["message_id"]),
-                    },
+                    channel_payload,
                     on_accepted=observe_native_accept,
                     on_terminal=observe_native_terminal,
                 )
@@ -33225,7 +33269,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message_id=str(claim["message_id"]),
                     session_anchor_ref=session_anchor_ref,
                 )
-                native_dispatch_started["value"] = True
                 self.session_bus.transition(
                     str(claim["message_id"]),
                     state="STARTED",
@@ -33233,14 +33276,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     session_anchor_ref=session_anchor_ref,
                     provider_message_id=accepted_holder.get("provider_message_id", ""),
                 )
-                native_dispatch_ready.set()
+                with native_dispatch_lock:
+                    native_dispatch_started["value"] = True
+                    buffered_terminal = native_terminal_holder.pop("reply", None)
+                if buffered_terminal is not None:
+                    project_native_terminal(buffered_terminal)
             except (
                 ProviderSessionError,
                 SessionBusError,
                 TerminalHostError,
                 UnicodeError,
             ) as error:
-                native_dispatch_ready.set()
                 self.session_bus.release_instruction_claim(
                     terminal_id=terminal_id,
                     message_id=str(claim.get("message_id") or ""),
@@ -33346,29 +33392,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             catalog = self.provider_chat_catalog()
         except Exception:
             return None
-        matches: list[Mapping[str, Any]] = []
-        for room in catalog.get("rooms", []):
-            if not isinstance(room, Mapping):
-                continue
-            if str(room.get("chat_key") or "") != expected_key:
-                continue
-            if str(room.get("provider") or "").upper() != provider:
-                continue
-            binding = room.get("binding")
-            if not isinstance(binding, Mapping):
-                continue
-            if str(binding.get("universe_session_id") or "") != session_id:
-                continue
-            if str(binding.get("session_anchor_ref") or "") != session_anchor_ref:
-                continue
-            if str(binding.get("state") or "").upper() not in {
-                "BOUND",
-                "ANCHOR_OBSERVED",
-            }:
-                continue
-            matches.append(room)
+        matches = [
+            room
+            for room in catalog.get("rooms", [])
+            if isinstance(room, Mapping)
+            and str(room.get("chat_key") or "") == expected_key
+            and str(room.get("provider") or "").upper() == provider
+        ]
         if len(matches) != 1:
             return None
+        room = matches[0]
+        binding = room.get("binding")
+        binding_exact = (
+            isinstance(binding, Mapping)
+            and str(binding.get("universe_session_id") or "") == session_id
+            and str(binding.get("session_anchor_ref") or "") == session_anchor_ref
+            and str(binding.get("state") or "").upper()
+            in {"BOUND", "ANCHOR_OBSERVED"}
+        )
         try:
             descriptor = self.resolve_provider_chat_session(expected_key)
         except Exception:
@@ -33376,6 +33417,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if (
             str(descriptor.get("provider") or "").upper() != provider
             or str(descriptor.get("provider_session_ref") or "") != provider_ref
+        ):
+            return None
+        if binding_exact:
+            return expected_key
+        # A freshly-created provider transcript can be discovered before the
+        # public catalog projects its Anchor binding.  The private resolver
+        # already performs the exact, unique Supervisor join; accept that
+        # bounded lag only when it returns the same Session and Anchor.
+        if (
+            str(descriptor.get("supervisor_session_id") or "") != session_id
+            or str(descriptor.get("origin_session_anchor_ref") or "")
+            != session_anchor_ref
         ):
             return None
         return expected_key
@@ -36822,6 +36875,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.CREATED,
                     self.server.create_cli_terminal(self._read_json()),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        terminal_terminate = re.fullmatch(r"/v1/terminals/([^/]+)/terminate", path)
+        if terminal_terminate is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.terminate_cli_terminal(
+                        unquote(terminal_terminate.group(1))
+                    ),
                 )
             except UniverseError as error:
                 self._send_error(error)
@@ -41204,8 +41269,13 @@ def _record_managed_shell_attachment(
     session_anchor = str(session.get("session_anchor_ref") or "").strip()
     if session_anchor and terminal_anchor != session_anchor:
         return {"status": "ATTACH_ANCHOR_MISMATCH", "terminal_id": terminal_id}
+    sealed_attach = dict(attach)
+    sealed_attach["provider"] = str(session.get("provider") or "").strip().upper()
+    sealed_attach["provider_session_ref"] = str(
+        session.get("provider_session_ref") or ""
+    ).strip()
     try:
-        return terminal_host.record_managed_attach(terminal_id, attach)
+        return terminal_host.record_managed_attach(terminal_id, sealed_attach)
     except Exception as error:  # noqa: BLE001 - report, never fail the inject
         return {
             "status": "ATTACH_REJECTED",
@@ -41543,6 +41613,16 @@ def perform_session_ref_inject(
         session=session,
         effective_session_id=effective_session_id,
     )
+    if (
+        isinstance(managed_shell_attachment, Mapping)
+        and managed_shell_attachment.get("status") == "MANAGED_SHELL_ATTACHED"
+    ):
+        session_supervisor.sweep_stale_live_sessions(
+            live_session_anchors={
+                effective_session_id: str(session.get("session_anchor_ref") or "")
+            }
+        )
+        session = session_supervisor.get_session(effective_session_id)
     return {
         **room_result,
         "schema": API_SCHEMA,
@@ -42038,7 +42118,7 @@ def parser() -> argparse.ArgumentParser:
 
     pty_restart_command = commands.add_parser(
         "pty-restart",
-        help="Restart the standalone PTY Supervisor and end its active terminals",
+        help="Restart the PTY Supervisor and reconcile Host-owned sessions",
     )
     pty_restart_command.add_argument(
         "--state-file", type=Path, default=default_pty_supervisor_state_path()

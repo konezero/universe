@@ -23,6 +23,7 @@ from universe_app.terminal_host import (  # noqa: E402
     resolve_cli_executable,
     resume_argv,
     startup_argv,
+    startup_input,
 )
 
 
@@ -51,6 +52,8 @@ class FakeReconnectionClient:
     def __init__(self, anchor_ref: str) -> None:
         self.state = SimpleNamespace(
             anchor_ref=anchor_ref,
+            host_kind="SESSION",
+            owner_ref=anchor_ref,
             host_id="host-test",
             pid=5252,
             started_at_unix_ms=1000,
@@ -58,12 +61,16 @@ class FakeReconnectionClient:
         )
         self.attached_supervisor_id: str | None = None
         self.generation = 0
+        self.executions: list[bytes] = []
         self.writes: list[bytes] = []
+        self.shutdown_called = False
 
     def _host(self) -> dict[str, object]:
         return {
             "host_id": self.state.host_id,
             "anchor_ref": self.state.anchor_ref,
+            "host_kind": self.state.host_kind,
+            "owner_ref": self.state.owner_ref,
             "pid": self.state.pid,
             "started_at_unix_ms": self.state.started_at_unix_ms,
             "child_pid": self.state.child_pid,
@@ -79,6 +86,9 @@ class FakeReconnectionClient:
             return {"host": self._host()}
         if action == "detach":
             self.attached_supervisor_id = None
+            return {"host": self._host()}
+        if action == "execute":
+            self.executions.append(base64.b64decode(fields["input_base64"]))
             return {"host": self._host()}
         if action == "write":
             self.writes.append(base64.b64decode(fields["input_base64"]))
@@ -97,6 +107,9 @@ class FakeReconnectionClient:
 
     def status(self):
         return self._host()
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
 
 
 class FakeReconnectionRegistry:
@@ -149,10 +162,16 @@ class TerminalHostTests(unittest.TestCase):
             client = registry.clients["anchor-rust-host"]
             self.assertEqual("RUST_RECONNECTION_HOST", created["backend_owner"])
             self.assertEqual("host-test", created["reconnection_host_id"])
-            self.assertIn(b"\x1b[1;1R", client.writes)
-            self.assertIn(b"cmd.exe /c echo RUST_HOST_MARKER\r\n", client.writes)
+            self.assertEqual([], client.writes)
+            self.assertEqual(
+                [b"\x1b[1;1Rcmd.exe /c echo RUST_HOST_MARKER\r\n"],
+                client.executions,
+            )
             launch = registry.launches[0]
             self.assertEqual(("/d", "/q", "/k"), launch["shell_args"])
+            self.assertEqual("SESSION", launch["host_kind"])
+            self.assertEqual("anchor-rust-host", launch["owner_ref"])
+            self.assertNotIn("startup_input", launch)
             self.assertEqual("xterm-256color", launch["environment"]["TERM"])
 
             second = TerminalHost(
@@ -173,7 +192,69 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual(created["pid"], recovered.live_pid())
             self.assertEqual("host-test", recovered.reconnection_host_id)
             self.assertEqual(2, client.generation)
-            second.close(created["terminal_id"])
+            detached = second.close(created["terminal_id"])
+            self.assertEqual("TERMINAL_DETACHED", detached["status"])
+            self.assertFalse(client.shutdown_called)
+
+            third = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            self.assertEqual(
+                "TERMINAL_REATTACHED",
+                third.reconcile_reconnection_hosts()[0]["status"],
+            )
+            terminated = third.terminate(created["terminal_id"])
+            self.assertEqual("TERMINAL_TERMINATED", terminated["status"])
+            self.assertTrue(client.shutdown_called)
+
+    def test_session_host_registers_identity_before_cli_execute(self) -> None:
+        registry = FakeReconnectionRegistry()
+        observations: list[tuple[int, bool]] = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "ORDERED"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(
+                audit_database_path=Path(tmp) / "audit.sqlite3",
+                reconnection_registry=registry,
+            )
+            original_launch = registry.launch
+
+            def launch(anchor_ref: str, **config):
+                client = original_launch(anchor_ref, **config)
+                original_request = client.request
+
+                def request(action: str, **fields):
+                    if action == "execute":
+                        sessions = list(host._sessions.values())
+                        observations.append(
+                            (
+                                len(sessions),
+                                bool(sessions)
+                                and Path(sessions[0].managed_shell_identity_file).is_file(),
+                            )
+                        )
+                    return original_request(action, **fields)
+
+                client.request = request
+                return client
+
+            registry.launch = launch
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-ordered-host",
+                provider="CODEX",
+                supervisor_session_id="provider-session",
+            )
+            self.assertEqual([(1, True)], observations)
+            host.terminate(created["terminal_id"])
 
     def test_reconcile_uses_complete_creation_history_for_live_registry_hosts(self) -> None:
         registry = FakeReconnectionRegistry()
@@ -257,7 +338,7 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(created["terminal_id"], listed[0]["terminal_id"])
         host.write(created["terminal_id"], b"hi")
         closed = host.close(created["terminal_id"])
-        self.assertEqual("TERMINAL_CLOSED", closed["status"])
+        self.assertEqual("TERMINAL_DETACHED", closed["status"])
         self.assertEqual([], host.list_sessions())
         with self.assertRaises(TerminalHostError):
             host.get(created["terminal_id"])
@@ -271,6 +352,7 @@ class TerminalHostTests(unittest.TestCase):
                 # inside a Supervisor-owned cmd bound to this exact Anchor.
                 "UNIVERSE_MANAGED_SHELL": "1",
                 "UNIVERSE_SESSION_ANCHOR_REF": TEST_ANCHOR,
+                "GROK_CLAUDE_HOOKS_ENABLED": "0",
                 "UNIVERSE_MODEL_REF": "",
                 "UNIVERSE_EFFORT": "AUTO",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
@@ -503,6 +585,50 @@ class TerminalHostTests(unittest.TestCase):
                 host.audit_events(terminal_id="term-orphan")[0]["event_type"],
             )
 
+    def test_rust_host_owned_shell_is_never_reclaimed_as_legacy_orphan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = TerminalHost(audit_database_path=root / "audit.sqlite3")
+            identity_path = root / "managed-shell.json"
+            identity_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.managed-shell-identity.v1",
+                        "terminal_id": "term-host-owned",
+                        "session_anchor_ref": TEST_ANCHOR,
+                        "shell_pid": 6262,
+                        "shell_started_at": 456.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            host.record_audit_event(
+                "TERMINAL_CREATED",
+                terminal={
+                    "terminal_id": "term-host-owned",
+                    "pid": 6262,
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "provider": "CODEX",
+                    "supervisor_session_id": "session-host-owned",
+                },
+                details={
+                    "managed_shell_identity_file": str(identity_path),
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                    "reconnection_host_id": "host-preserved",
+                    "session_anchor_ref": TEST_ANCHOR,
+                },
+            )
+            result = host.reclaim_orphaned_managed_shells(
+                start_time_of=lambda _pid: 456.5,
+                terminate_instance=lambda *_args: self.fail(
+                    "legacy reclaim must never terminate a Rust Host-owned shell"
+                ),
+            )
+            self.assertEqual("HOST_OWNED_ORPHAN_DEFERRED", result[0]["status"])
+            self.assertEqual("host-preserved", result[0]["host_id"])
+            self.assertTrue(identity_path.exists())
+
     def test_pid_reuse_never_terminates_an_unrelated_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -601,6 +727,17 @@ class TerminalHostTests(unittest.TestCase):
             ],
             startup_argv("CODEX", "abc", model_ref="gpt-5.6", effort="HIGH"),
         )
+
+    def test_fresh_codex_and_grok_sessions_receive_bounded_bootstrap_input(self) -> None:
+        expected = (
+            b"Initialize this Universe session without calling tools. "
+            b"Reply exactly SESSION_READY and wait for user instructions.\r"
+        )
+        for provider in ("CODEX", "GROK"):
+            self.assertEqual(expected, startup_input(provider, ""))
+        self.assertEqual(b"", startup_input("CODEX", "abc"))
+        self.assertEqual(b"", startup_input("GROK", "abc"))
+        self.assertEqual(b"", startup_input("CLAUDE", ""))
 
     def test_fresh_claude_terminal_uses_a_new_session_id_without_resume(self) -> None:
         spawned: list[tuple] = []
@@ -956,8 +1093,8 @@ class TerminalHostTests(unittest.TestCase):
             [
                 "TERMINAL_CREATED",
                 "INPUT_CONTROL_WRITTEN",
-                "CLOSE_REQUESTED",
-                "TERMINAL_CLOSED",
+                "DETACH_REQUESTED",
+                "TERMINAL_DETACHED",
             ],
             [event["event_type"] for event in events],
         )

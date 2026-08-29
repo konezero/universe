@@ -783,6 +783,7 @@ class SessionBus:
         *,
         terminal_id: str,
         session_anchor_ref: str,
+        message_id: str = "",
     ) -> dict[str, Any] | None:
         """Atomically bind one pending instruction to the live Session Anchor.
 
@@ -801,16 +802,22 @@ class SessionBus:
             limit=256,
         )
         tid = _text(terminal_id, "terminal_id", required=True, limit=80)
+        requested_message_id = _text(message_id, "message_id", limit=80)
         with self._lock:
-            candidate_ids = list(self._inbox.get(tid, []))
-            candidate_ids.extend(
-                message_id
-                for message_id, item in self._messages.items()
-                if str(item.get("recipient_anchor_ref") or "") == anchor
-                and message_id not in candidate_ids
+            candidate_ids = (
+                [requested_message_id]
+                if requested_message_id
+                else list(self._inbox.get(tid, []))
             )
-            for message_id in candidate_ids:
-                message = self._messages.get(message_id)
+            if not requested_message_id:
+                candidate_ids.extend(
+                    candidate_id
+                    for candidate_id, item in self._messages.items()
+                    if str(item.get("recipient_anchor_ref") or "") == anchor
+                    and candidate_id not in candidate_ids
+                )
+            for candidate_id in candidate_ids:
+                message = self._messages.get(candidate_id)
                 if not isinstance(message, dict):
                     continue
                 if message.get("kind") != "INSTRUCTION":
@@ -828,13 +835,13 @@ class SessionBus:
                 message.setdefault("lifecycle", {})["accepted_at"] = message[
                     "claimed_at"
                 ]
-                if message_id not in self._inbox.setdefault(tid, []):
-                    self._inbox[tid].append(message_id)
+                if candidate_id not in self._inbox.setdefault(tid, []):
+                    self._inbox[tid].append(candidate_id)
                 if previous_tid and previous_tid != tid:
                     self._inbox[previous_tid] = [
                         item
                         for item in self._inbox.get(previous_tid, [])
-                        if item != message_id
+                        if item != candidate_id
                     ]
                 self._persist_message(tid, message)
                 return dict(message)

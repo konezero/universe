@@ -190,15 +190,30 @@ class ServerOwnedCoordinateTests(unittest.TestCase):
     """Server-owned coordinates win when the caller omits node/mode."""
 
     def test_stored_mode_is_authoritative_when_body_omits_it(self) -> None:
-        source = (ROOT / "tools" / "universe_server.py").read_text(encoding="utf-8")
-        slice_ = source[
-            source.index("stored_session: Mapping[str, Any] = {}") : source.index(
-                "session_id = explicit_session_id or supervisor_session_id_for"
+        supervisor = _Supervisor(_sessions(), owner=IDENTITY_OWNER)
+        captured: dict[str, Any] = {}
+
+        def register(value: Mapping[str, Any]):
+            captured.update(value)
+            return dict(_sessions()[TARGET_SESSION]), False
+
+        supervisor.register_session = register
+        try:
+            perform_session_ref_inject(
+                session_supervisor=supervisor,
+                multi_rooms=_Rooms(),
+                body={
+                    "provider": "CODEX",
+                    "project_id": "universe",
+                    "supervisor_session_id": TARGET_SESSION,
+                },
+                environment={},
             )
-        ]
-        self.assertIn('stored_session.get("mode")', slice_)
-        self.assertIn('stored_session.get("node")', slice_)
-        self.assertIn("explicit_session_id", slice_)
+        except Exception:
+            pass
+
+        self.assertEqual("CONDUCTOR", captured["mode"])
+        self.assertEqual("universe", captured["node"])
 
 
 if __name__ == "__main__":

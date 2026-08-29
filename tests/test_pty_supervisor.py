@@ -120,18 +120,15 @@ class PtySupervisorTests(unittest.TestCase):
         finally:
             supervisor.close()
 
-    def test_reconnection_registry_requires_explicit_feature_switch(self) -> None:
+    def test_reconnection_registry_defaults_on_when_host_binary_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             binary = root / "universe-session-host.exe"
             binary.write_bytes(b"test")
             state_path = root / "pty-supervisor.json"
-            with patch.dict(os.environ, {}, clear=True):
-                self.assertIsNone(reconnection_registry_from_environment(state_path))
             with patch.dict(
                 os.environ,
                 {
-                    "UNIVERSE_RECONNECTION_HOST_ENABLED": "1",
                     "UNIVERSE_RECONNECTION_HOST_BINARY": str(binary),
                     "UNIVERSE_RECONNECTION_HOST_REGISTRY": str(root / "registry"),
                 },
@@ -145,6 +142,16 @@ class PtySupervisorTests(unittest.TestCase):
             self.assertEqual(root / "registry", registry.root)
             self.assertEqual(86400, registry.stale_after_seconds)
             prepare.assert_called_once_with()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "UNIVERSE_RECONNECTION_HOST_ENABLED": "0",
+                    "UNIVERSE_RECONNECTION_HOST_BINARY": str(binary),
+                },
+                clear=True,
+            ):
+                self.assertIsNone(reconnection_registry_from_environment(state_path))
 
     def test_spawn_supervisor_hides_its_windows_console(self) -> None:
         script = ROOT / "tools" / "universe_pty_supervisor.py"
@@ -199,7 +206,12 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual("RESTARTED", result["status"])
         self.assertEqual(1234, result["previous_pid"])
         self.assertEqual(5678, result["pid"])
-        self.assertTrue(result["active_terminals_ended"])
+        self.assertTrue(result["previous_supervisor_ended"])
+        self.assertEqual(
+            "HOST_OWNED_RECONCILED_LEGACY_ENDED",
+            result["terminal_continuity"],
+        )
+        self.assertNotIn("active_terminals_ended", result)
 
     def request(self, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
         body = None
@@ -371,14 +383,35 @@ class PtySupervisorTests(unittest.TestCase):
             [
                 "TERMINAL_CREATED",
                 "INPUT_CONTROL_WRITTEN",
-                "CLOSE_REQUESTED",
-                "TERMINAL_CLOSED",
+                "DETACH_REQUESTED",
+                "TERMINAL_DETACHED",
             ],
             [event["event_type"] for event in events],
         )
         self.assertEqual("PTY_SUPERVISOR_WRITE", events[1]["source"])
         self.assertEqual(["CTRL_C"], events[1]["details"]["control_classes"])
         self.assertEqual("PTY_SUPERVISOR_DELETE", events[2]["source"])
+
+
+    def test_http_terminate_is_distinct_from_delete_detach(self) -> None:
+        _status, created = self.request(
+            "POST",
+            "/v1/terminals",
+            {
+                "project_id": "universe",
+                "mode": "MASTER",
+                "cwd": str(ROOT),
+                "provider": "CODEX",
+                "supervisor_session_id": "session_master_terminate",
+            },
+        )
+        terminal_id = created["terminal"]["terminal_id"]
+
+        _status, terminated = self.request(
+            "POST", f"/v1/terminals/{terminal_id}/terminate", {}
+        )
+
+        self.assertEqual("TERMINAL_TERMINATED", terminated["status"])
 
 
 if __name__ == "__main__":

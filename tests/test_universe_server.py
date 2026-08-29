@@ -3443,12 +3443,52 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
         )
 
+    def test_native_chat_resolution_accepts_exact_private_join_during_catalog_lag(
+        self,
+    ) -> None:
+        chat_key = _vendor_chat_key("GROK", "grok-native-lag-001")
+        self.server.provider_chat_catalog = Mock(
+            return_value={
+                "rooms": [
+                    {
+                        "chat_key": chat_key,
+                        "provider": "GROK",
+                        "binding": {"state": "INDEPENDENT"},
+                    }
+                ]
+            }
+        )
+        self.server.resolve_provider_chat_session = Mock(
+            return_value={
+                "provider": "GROK",
+                "provider_session_ref": "grok-native-lag-001",
+                "supervisor_session_id": "supervisor-native-lag-001",
+                "origin_session_anchor_ref": "session-anchor-native-lag-001",
+            }
+        )
+
+        session = {
+            "session_id": "supervisor-native-lag-001",
+            "session_anchor_ref": "session-anchor-native-lag-001",
+            "provider": "GROK",
+            "provider_session_ref": "grok-native-lag-001",
+        }
+        self.assertEqual(
+            chat_key,
+            self.server._provider_chat_key_for_session_instruction(session=session),
+        )
+        self.assertIsNone(
+            self.server._provider_chat_key_for_session_instruction(
+                session={**session, "session_id": "supervisor-other"}
+            )
+        )
+
     def test_live_ui_instruction_dispatches_without_waiting_for_next_session_start(self) -> None:
         terminal = {
             "terminal_id": "term-live-session-hook-001",
             "project_id": "GCS",
             "mode": "MASTER",
-            "provider": "CLAUDE",
+            "provider": "CODEX",
             "state": "LIVE",
             "supervisor_session_id": "supervisor-live-session-hook-001",
         }
@@ -3470,48 +3510,58 @@ class UniverseLocalServiceTests(unittest.TestCase):
         ) -> dict[str, Any]:
             self.assertEqual(native_chat_key, chat_key)
             self.assertEqual(
+                "universe.host-message-channel.v1", value["schema"]
+            )
+            self.assertEqual(
                 "Reply with exactly: HOOK_DISPATCH_CONFIRMED",
-                value["body"],
+                value["content"],
             )
-            self.assertTrue(
-                str(value["idempotency_key"]).startswith("session-bus:msg_")
-            )
+            self.assertTrue(str(value["message_id"]).startswith("msg_"))
+            self.assertEqual("CODEX", value["meta"]["provider"])
             if on_accepted is not None:
                 on_accepted({"message_id": "provider-reply-001"})
             if on_terminal is not None:
-                timer = threading.Timer(
-                    0.01,
-                    lambda: on_terminal(
-                        {
-                            "message_id": "provider-reply-001",
-                            "state": "COMPLETED",
-                            "body": "HOOK_DISPATCH_CONFIRMED",
-                        }
-                    ),
+                on_terminal(
+                    {
+                        "message_id": "provider-reply-001",
+                        "state": "COMPLETED",
+                        "body": "HOOK_DISPATCH_CONFIRMED",
+                    }
                 )
-                timer.daemon = True
-                timer.start()
             return {
                 "status": "PROVIDER_SESSION_INPUT_ACCEPTED",
                 "message": {"message_id": "provider-user-001"},
                 "reply": {"message_id": "provider-reply-001"},
             }
 
-        self.server.provider_sessions.submit = Mock(side_effect=accept_native_turn)
+        self.server.provider_sessions.submit_channel = Mock(side_effect=accept_native_turn)
         self.server.session_supervisor.register_session(
             {
                 "session_id": "supervisor-live-session-hook-001",
                 "node": "GCS",
                 "project_id": "GCS",
                 "mode": "MASTER",
-                "provider": "CLAUDE",
-                "provider_session_ref": "claude-code:live-turn-001",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:live-turn-001",
                 "session_anchor_ref": "session-anchor-live-hook-001",
                 "state": "LIVE",
                 "currentness": "CURRENT",
             }
         )
 
+        older = self.server.session_bus.post(
+            self.server.terminal_host,
+            {
+                "to": {"terminal_id": terminal["terminal_id"]},
+                "from": {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "provider": "UI",
+                },
+                "kind": "INSTRUCTION",
+                "body_text": "OLDER_PENDING_MUST_NOT_BE_DISPATCHED",
+            },
+        )["messages"][0]
         posted = self.server.post_session_bus_message(
             {
                 "to": {"terminal_id": terminal["terminal_id"]},
@@ -3528,8 +3578,16 @@ class UniverseLocalServiceTests(unittest.TestCase):
         message = posted["messages"][0]
         self.assertEqual("DISPATCHED", message["delivery_state"])
         self.assertEqual("DISPATCHED", message["dispatch_status"])
-        self.server.provider_sessions.submit.assert_called_once()
+        self.server.provider_sessions.submit_channel.assert_called_once()
         self.server.terminal_host.write.assert_not_called()
+        pending = self.server.session_bus.inbox(
+            self.server._session_anchor_terminal_host(),
+            terminal_id=terminal["terminal_id"],
+        )["messages"]
+        older_after = next(
+            item for item in pending if item["message_id"] == older["message_id"]
+        )
+        self.assertEqual("PENDING", older_after["delivery_state"])
         deadline = time.monotonic() + 1.0
         results: list[Mapping[str, Any]] = []
         recipient_anchor_ref = str(message["recipient_anchor_ref"])
@@ -5386,7 +5444,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "provider": "CLAUDE",
                 "state": "LIVE",
                 "supervisor_session_id": registered["session_id"],
-                "active_session_anchor_ref": registered["session_anchor_ref"],
+                "session_anchor_ref": registered["session_anchor_ref"],
             }
         ]
         self.server.terminal_host = terminal_host

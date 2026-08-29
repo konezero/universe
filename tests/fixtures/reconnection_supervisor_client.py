@@ -42,6 +42,8 @@ def main() -> int:
             args.anchor,
             cwd=args.terminal_cwd,
             shell_args=("/Q",),
+            host_kind="SESSION",
+            owner_ref=args.anchor,
             environment={"UNIVERSE_HOST_TEST": "CONFIGURED"},
             cols=101,
             rows=37,
@@ -49,8 +51,10 @@ def main() -> int:
         supervisor_id = "supervisor-process-a"
         marker = b"UNIVERSE_PROCESS_A_CONFIGURED"
         pty = ReconnectionPty(client, supervisor_id)
-        pty.write(b"\x1b[1;1R")
-        pty.write(b"cd & echo UNIVERSE_PROCESS_A_%UNIVERSE_HOST_TEST%\r\n")
+        pty.execute(
+            b"\x1b[1;1R"
+            b"cd & echo UNIVERSE_PROCESS_A_%UNIVERSE_HOST_TEST%\r\n"
+        )
     else:
         client = registry.discover(args.anchor)
         supervisor_id = "supervisor-process-b"

@@ -2860,6 +2860,48 @@ class SessionSupervisorStore:
             "execution_assignment": "UNASSIGNED",
         }
 
+    def record_host_termination(
+        self, session_id: str, *, session_anchor_ref: str
+    ) -> dict[str, Any]:
+        normalized_id = _required_text(session_id, "session_id")
+        normalized_anchor = _required_text(
+            session_anchor_ref, "session_anchor_ref"
+        )
+        now = utc_now()
+        with self._connection(immediate=True) as connection:
+            row = self._require_session(connection, normalized_id)
+            if str(row["session_anchor_ref"] or "") != normalized_anchor:
+                raise SessionSupervisorError(
+                    "SESSION_ANCHOR_MISMATCH",
+                    "Host termination does not match the stored Session Anchor",
+                    status=409,
+                )
+            prior_state = str(row["state"] or "UNKNOWN")
+            if prior_state != "STOPPED":
+                connection.execute(
+                    """
+                    UPDATE session_record
+                    SET state = 'STOPPED', current_activity_state = 'TERMINATED',
+                        row_version = row_version + 1, updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (now, normalized_id),
+                )
+                self._event(
+                    connection,
+                    session_id=normalized_id,
+                    event_type="SESSION_HOST_TERMINATED",
+                    prior_state=prior_state,
+                    state="STOPPED",
+                    details={
+                        "session_anchor_ref": normalized_anchor,
+                        "authority_created": False,
+                    },
+                )
+            return self._session_material(
+                connection, self._require_session(connection, normalized_id)
+            )
+
     def sweep_stale_live_sessions(
         self, *, live_session_anchors: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -2896,12 +2938,13 @@ class SessionSupervisorStore:
                 ):
                     continue
                 prior_state = str(row["state"])
-                if prior_state in {"LIVE", "STARTING"}:
+                if prior_state == "LIVE":
                     continue
                 connection.execute(
                     """
                     UPDATE session_record
-                    SET state = 'LIVE', row_version = row_version + 1, updated_at = ?
+                    SET state = 'LIVE', current_activity_state = 'ATTACHED',
+                        row_version = row_version + 1, updated_at = ?
                     WHERE session_id = ?
                     """,
                     (now, session_id),

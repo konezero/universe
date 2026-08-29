@@ -171,6 +171,41 @@ class SessionBusTests(unittest.TestCase):
         self.assertEqual("DISPATCHED", completed["delivery_state"])
         self.assertEqual(0, self.host.bus.unread_count(self.universe["terminal_id"]))
 
+    def test_live_claim_can_select_the_exact_newer_instruction(self) -> None:
+        first = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "Older pending instruction.",
+            },
+        )["messages"][0]
+        second = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "New live instruction.",
+            },
+        )["messages"][0]
+
+        claim = self.host.bus.claim_instruction(
+            self.host,
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref="session_anchor_exact_live",
+            message_id=second["message_id"],
+        )
+
+        self.assertEqual(second["message_id"], claim["message_id"])
+        inbox = self.host.bus.inbox(
+            self.host, terminal_id=self.universe["terminal_id"]
+        )["messages"]
+        by_id = {item["message_id"]: item for item in inbox}
+        self.assertEqual("PENDING", by_id[first["message_id"]]["delivery_state"])
+        self.assertEqual("CLAIMED", by_id[second["message_id"]]["delivery_state"])
+
     def test_ui_instruction_carries_verified_direct_user_provenance(self) -> None:
         posted = self.host.bus.post(
             self.host,

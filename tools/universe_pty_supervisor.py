@@ -61,8 +61,13 @@ def reconnection_registry_from_environment(
     state_path: Path,
 ) -> ReconnectionHostRegistry | None:
     enabled = str(os.environ.get("UNIVERSE_RECONNECTION_HOST_ENABLED") or "")
-    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+    normalized_enabled = enabled.strip().lower()
+    if normalized_enabled in {"0", "false", "no", "off"}:
         return None
+    if normalized_enabled and normalized_enabled not in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "UNIVERSE_RECONNECTION_HOST_ENABLED must be a boolean value"
+        )
     configured = str(os.environ.get("UNIVERSE_RECONNECTION_HOST_BINARY") or "").strip()
     if configured:
         binary = Path(configured).expanduser()
@@ -74,6 +79,8 @@ def reconnection_registry_from_environment(
         )
         binary = next((path for path in candidates if path.is_file()), candidates[0])
     if not binary.is_file():
+        if not normalized_enabled:
+            return None
         raise RuntimeError(f"Rust Reconnection Host binary is absent: {binary}")
     registry_text = str(
         os.environ.get("UNIVERSE_RECONNECTION_HOST_REGISTRY") or ""
@@ -395,6 +402,31 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        channel_parts = path.split("/")
+        if (
+            len(channel_parts) == 5
+            and channel_parts[1:3] == ["v1", "terminals"]
+            and channel_parts[4] == "channel"
+        ):
+            try:
+                state = supervisor.host.channel_state(channel_parts[3])
+            except TerminalHostError as error:
+                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_state": state})
+            return
+        if (
+            len(channel_parts) == 7
+            and channel_parts[1:3] == ["v1", "terminals"]
+            and channel_parts[4:6] == ["channel", "results"]
+        ):
+            try:
+                result = supervisor.host.channel_result(channel_parts[3], channel_parts[6])
+            except TerminalHostError as error:
+                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_result": result})
+            return
         if path.startswith("/v1/terminals/") and path.count("/") == 3:
             terminal_id = path.rsplit("/", 1)[-1]
             try:
@@ -528,6 +560,25 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
             return
+        if (
+            path.startswith("/v1/terminals/")
+            and path.endswith("/terminate")
+            and path.count("/") == 4
+        ):
+            terminal_id = path.split("/")[3]
+            try:
+                result = supervisor.host.terminate(
+                    terminal_id,
+                    audit_context=self._audit_context("PTY_SUPERVISOR_TERMINATE"),
+                )
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.NOT_FOUND,
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                )
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/attach") and path.count("/") == 4:
             terminal_id = path.split("/")[3]
             try:
@@ -542,6 +593,15 @@ class Handler(BaseHTTPRequestHandler):
                 HTTPStatus.CREATED,
                 {"schema": API_SCHEMA, "status": "ATTACHED", "attach_id": attach_id},
             )
+            return
+        if path.startswith("/v1/terminals/") and path.endswith("/channel") and path.count("/") == 4:
+            terminal_id = path.split("/")[3]
+            try:
+                result = supervisor.host.push_channel(terminal_id, body)
+            except TerminalHostError as error:
+                self._send(HTTPStatus.CONFLICT, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_result": result})
             return
         if path.startswith("/v1/terminals/") and path.endswith("/write"):
             terminal_id = path.split("/")[3]

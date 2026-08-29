@@ -27,8 +27,8 @@ STATE_SCHEMA = "universe.reconnection-host-state.v1"
 RESPONSE_SCHEMA = "universe.reconnection-host-response.v1"
 MAX_STATE_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
-# The Rust Host accepts a 16 KiB JSON request. Base64 plus envelope metadata
-# leaves less than 12 KiB for raw PTY input, so stream larger writes safely.
+# Keep PTY write chunks well below the Host request limit after base64 and
+# envelope expansion so larger writes remain safe.
 HOST_WRITE_CHUNK_BYTES = 8 * 1024
 DEFAULT_STALE_AFTER_SECONDS = 24 * 60 * 60
 SESSION_MARKER_ENVIRONMENT = (
@@ -111,6 +111,8 @@ def _require_positive_int(value: Any, name: str) -> int:
 @dataclass(frozen=True)
 class ReconnectionHostState:
     anchor_ref: str
+    host_kind: str
+    owner_ref: str
     host_id: str
     endpoint: str
     pid: int
@@ -125,8 +127,13 @@ class ReconnectionHostState:
         child_pid = value.get("child_pid")
         if child_pid is not None:
             child_pid = _require_positive_int(child_pid, "child_pid")
+        host_kind = _require_string(value.get("host_kind"), "host_kind").upper()
+        if host_kind != "SESSION":
+            raise ReconnectionHostError("Host kind is unsupported")
         return cls(
             anchor_ref=_require_string(value.get("anchor_ref"), "anchor_ref"),
+            host_kind=host_kind,
+            owner_ref=_require_string(value.get("owner_ref"), "owner_ref"),
             host_id=_require_string(value.get("host_id"), "host_id"),
             endpoint=_require_string(value.get("endpoint"), "endpoint"),
             pid=_require_positive_int(value.get("pid"), "pid"),
@@ -363,6 +370,8 @@ class ReconnectionHostRegistry:
             ) from last_handshake_error
         comparisons = {
             "anchor_ref": state.anchor_ref,
+            "host_kind": state.host_kind,
+            "owner_ref": state.owner_ref,
             "host_id": state.host_id,
             "pid": state.pid,
             "started_at_unix_ms": state.started_at_unix_ms,
@@ -401,6 +410,11 @@ class ReconnectionHostRegistry:
         shell: str = "cmd.exe",
         cwd: Path | None = None,
         shell_args: Sequence[str] = (),
+        host_kind: str = "SESSION",
+        owner_ref: str | None = None,
+        channel_lookup_file: Path | None = None,
+        channel_bootstrap_token: str = "",
+        channel_session_token: str = "",
         environment: Mapping[str, str] | None = None,
         cols: int = 120,
         rows: int = 30,
@@ -425,6 +439,12 @@ class ReconnectionHostRegistry:
                         "Refusing to replace discovery for a live but unreachable Host"
                     ) from discovery_error
                 state_path.unlink()
+        normalized_host_kind = host_kind.strip().upper()
+        if normalized_host_kind != "SESSION":
+            raise ValueError("host_kind currently supports SESSION only")
+        normalized_owner_ref = (owner_ref or anchor_ref).strip()
+        if not normalized_owner_ref:
+            raise ValueError("owner_ref must not be empty")
         token = secrets.token_urlsafe(32)
         args = [
             str(self.binary),
@@ -433,6 +453,10 @@ class ReconnectionHostRegistry:
             str(state_path),
             "--anchor-ref",
             anchor_ref,
+            "--host-kind",
+            normalized_host_kind,
+            "--owner-ref",
+            normalized_owner_ref,
             "--token",
             token,
             "--shell",
@@ -442,6 +466,19 @@ class ReconnectionHostRegistry:
             "--rows",
             str(rows),
         ]
+        channel_parts = [
+            channel_lookup_file is not None,
+            bool(str(channel_bootstrap_token or "").strip()),
+            bool(str(channel_session_token or "").strip()),
+        ]
+        if any(channel_parts) and not all(channel_parts):
+            raise ValueError(
+                "channel lookup, bootstrap token, and session token are required together"
+            )
+        if channel_lookup_file is not None:
+            args.extend(("--channel-lookup-file", str(channel_lookup_file)))
+            args.extend(("--channel-bootstrap-token", str(channel_bootstrap_token)))
+            args.extend(("--channel-session-token", str(channel_session_token)))
         if cwd is not None:
             args.extend(("--cwd", str(cwd)))
         for value in shell_args:
@@ -516,6 +553,38 @@ class ReconnectionPty:
     @property
     def output_cursor(self) -> int:
         return self._cursor
+
+    def execute(self, data: bytes) -> None:
+        """Deliver one Supervisor execution request to the Host-owned channel."""
+        if self._closed:
+            raise ReconnectionHostError("PTY adapter is closed")
+        self.client.request(
+            "execute",
+            supervisor_id=self.supervisor_id,
+            input_base64=base64.b64encode(bytes(data)).decode("ascii"),
+        )
+
+    def channel_state(self) -> str:
+        result = self.client.request(
+            "channel_state", supervisor_id=self.supervisor_id, channel={}
+        ).get("channel")
+        return str((result or {}).get("status") or "UNAVAILABLE")
+
+    def channel_push(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        result = self.client.request(
+            "channel_push",
+            supervisor_id=self.supervisor_id,
+            channel=dict(payload),
+        ).get("channel")
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    def channel_result(self, message_id: str) -> dict[str, Any]:
+        result = self.client.request(
+            "channel_result_get",
+            supervisor_id=self.supervisor_id,
+            channel={"message_id": str(message_id)},
+        ).get("channel")
+        return dict(result) if isinstance(result, Mapping) else {}
 
     def write(self, data: bytes) -> None:
         if self._closed:

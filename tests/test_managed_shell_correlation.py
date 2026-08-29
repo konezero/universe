@@ -381,6 +381,7 @@ class ServerAttachAnchorTests(unittest.TestCase):
 
     def _server_host(self, terminal_anchor: str):
         recorded: list = []
+        recorded_evidence: list[dict[str, Any]] = []
 
         class _Host:
             def get(self, terminal_id: str):
@@ -396,10 +397,12 @@ class ServerAttachAnchorTests(unittest.TestCase):
 
             def record_managed_attach(self, terminal_id: str, evidence: Any):
                 recorded.append(terminal_id)
+                recorded_evidence.append(dict(evidence))
                 return {"status": "MANAGED_SHELL_ATTACHED"}
 
         host = _Host()
         host.recorded = recorded  # type: ignore[attr-defined]
+        host.recorded_evidence = recorded_evidence  # type: ignore[attr-defined]
         return host
 
     def _call(self, host, anchor_value, present=True):
@@ -413,7 +416,11 @@ class ServerAttachAnchorTests(unittest.TestCase):
         return _record_managed_shell_attachment(
             terminal_host=host,
             body={"managed_shell_attach": attach},
-            session={"session_anchor_ref": ANCHOR},
+            session={
+                "session_anchor_ref": ANCHOR,
+                "provider": "GROK",
+                "provider_session_ref": "grok-session-1",
+            },
             effective_session_id="session_a",
         )
 
@@ -446,6 +453,10 @@ class ServerAttachAnchorTests(unittest.TestCase):
         result = self._call(host, ANCHOR)
         self.assertEqual(result["status"], "MANAGED_SHELL_ATTACHED")
         self.assertEqual(host.recorded, [TERMINAL])
+        self.assertEqual(
+            "grok-session-1", host.recorded_evidence[0]["provider_session_ref"]
+        )
+        self.assertEqual("GROK", host.recorded_evidence[0]["provider"])
 
 
 class HookCandidateOrderTests(unittest.TestCase):

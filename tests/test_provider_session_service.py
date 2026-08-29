@@ -274,6 +274,58 @@ class ProviderSessionServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.service.close()
 
+    def test_common_message_channel_envelope_routes_codex_and_grok(self) -> None:
+        for index, provider in enumerate(("CODEX", "GROK"), start=1):
+            with self.subTest(provider=provider):
+                self.descriptor_overrides["provider"] = provider
+                message_id = f"msg-channel-{index}"
+                accepted = self.service.submit_channel(
+                    CHAT_KEY,
+                    {
+                        "schema": "universe.host-message-channel.v1",
+                        "message_id": message_id,
+                        "session_anchor_ref": "anchor-channel-test",
+                        "content": f"hello {provider.lower()}",
+                        "meta": {"provider": provider, "kind": "INSTRUCTION"},
+                    },
+                )
+                self.assertEqual(
+                    "PROVIDER_SESSION_INPUT_ACCEPTED", accepted["status"]
+                )
+                self.assertEqual(
+                    {
+                        "schema": "universe.host-message-channel.v1",
+                        "message_id": message_id,
+                        "session_anchor_ref": "anchor-channel-test",
+                        "adapter": "PROVIDER_NATIVE",
+                    },
+                    accepted["message_channel"],
+                )
+                self.assertTrue(self.service.wait_idle(CHAT_KEY))
+                self.assertEqual(
+                    f"hello {provider.lower()}",
+                    self.service.snapshot(CHAT_KEY)["messages"][-2]["body"],
+                )
+                self.service.close()
+                self.service = self._new_service()
+
+    def test_common_message_channel_rejects_unknown_schema(self) -> None:
+        with self.assertRaises(ProviderSessionError) as raised:
+            self.service.submit_channel(
+                CHAT_KEY,
+                {
+                    "schema": "unknown.channel.v1",
+                    "message_id": "msg-invalid-schema",
+                    "session_anchor_ref": "anchor-channel-test",
+                    "content": "must not dispatch",
+                    "meta": {},
+                },
+            )
+        self.assertEqual(
+            "PROVIDER_CHANNEL_SCHEMA_UNSUPPORTED", raised.exception.code
+        )
+        self.assertEqual([], self.hosts)
+
     def test_direct_turn_streams_without_room_queue_or_secret_projection(self) -> None:
         accepted = self.service.submit(
             CHAT_KEY,
