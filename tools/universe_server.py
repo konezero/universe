@@ -20241,6 +20241,26 @@ class UniverseStore:
         }
         universe_goal_nodes: dict[str, str] = {}
         goals = self.list_project_goals(project_id)
+        project_todos = [
+            todo for todo in self.list_todos()
+            if todo.get("project_id") == project_id
+        ]
+        todos_by_node_ref: dict[str, list[dict[str, Any]]] = {}
+        for todo in project_todos:
+            if todo.get("scope_kind") == "NODE" and todo.get("node_ref"):
+                todos_by_node_ref.setdefault(str(todo["node_ref"]), []).append(todo)
+        project_events = self.list_events(project_id, limit=200)
+        todo_activity_by_todo_id: dict[str, list[dict[str, Any]]] = {}
+        for event in project_events:
+            payload = event.get("payload")
+            if (
+                event.get("event_type") == "TODO_ACTION_APPLIED"
+                and isinstance(payload, Mapping)
+                and payload.get("todo_id")
+            ):
+                todo_activity_by_todo_id.setdefault(
+                    str(payload["todo_id"]), []
+                ).append(event)
         goal_nodes_by_node_ref: dict[str, list[str]] = {}
         goal_nodes_by_id: dict[str, str] = {}
         assigned_todos: set[str] = set()
@@ -20327,8 +20347,8 @@ class UniverseStore:
                 )
                 add_edge("GOAL_HAS_TODO", goal_node, todo_node, f"universe://todos/{todo_id}")
 
-        for todo in self.list_todos():
-            if todo.get("project_id") != project_id or str(todo["todo_id"]) in assigned_todos:
+        for todo in project_todos:
+            if str(todo["todo_id"]) in assigned_todos:
                 continue
             todo_id = str(todo["todo_id"])
             todo_node = add_node(
@@ -20962,13 +20982,81 @@ class UniverseStore:
         for feature in self.list_feature_nodes(project_id):
             feature_id = str(feature["feature_id"])
             feature_ref = f"universe://feature-nodes/{feature_id}"
+            feature_todos = todos_by_node_ref.get(feature_id, [])
+            state_counts = {
+                state: sum(1 for todo in feature_todos if todo.get("state") == state)
+                for state in ("BACKLOG", "READY", "IN_PROGRESS", "BLOCKED", "DONE")
+            }
+            todo_total = len(feature_todos)
+            todo_done = state_counts["DONE"]
+            if todo_total == 0:
+                execution_state = "EMPTY"
+            elif todo_done == todo_total:
+                execution_state = "DONE"
+            elif state_counts["BLOCKED"]:
+                execution_state = "BLOCKED"
+            elif state_counts["IN_PROGRESS"]:
+                execution_state = "EXECUTING"
+            elif state_counts["READY"]:
+                execution_state = "READY"
+            else:
+                execution_state = "PLANNED"
+            activity_events = [
+                event
+                for todo in feature_todos
+                for event in todo_activity_by_todo_id.get(str(todo["todo_id"]), [])
+            ]
+            evidence_refs: set[str] = set()
+            for event in activity_events:
+                payload = event.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                evidence_ref = str(payload.get("evidence_ref") or "")
+                if evidence_ref:
+                    evidence_refs.add(evidence_ref)
+                validation = payload.get("validation")
+                if isinstance(validation, Mapping):
+                    validation_ref = str(validation.get("evidence_ref") or "")
+                    if validation_ref:
+                        evidence_refs.add(validation_ref)
+            latest_activity_at = max(
+                [
+                    str(item.get("updated_at") or "")
+                    for item in feature_todos
+                ]
+                + [
+                    str(item.get("created_at") or "")
+                    for item in activity_events
+                ],
+                default="",
+            ) or None
+            work_projection = {
+                "schema": "universe.feature-work-projection.v1",
+                "derived": True,
+                "todo_total": todo_total,
+                "todo_done": todo_done,
+                "todo_open": todo_total - todo_done,
+                "progress_percent": (
+                    round(todo_done * 100 / todo_total) if todo_total else 0
+                ),
+                "execution_state": execution_state,
+                "state_counts": state_counts,
+                "active_todo_ids": [
+                    str(todo["todo_id"]) for todo in feature_todos
+                    if todo.get("state") in {"IN_PROGRESS", "BLOCKED"}
+                ],
+                "activity_count": len(activity_events),
+                "evidence_count": len(evidence_refs),
+                "latest_activity_at": latest_activity_at,
+                "activity_window_limit": 200,
+            }
             feature_node = add_node(
                 "FEATURE_NODE", feature_id, str(feature["title"]), str(feature["state"]),
                 "FEATURE_NODE", feature_ref,
                 {key: feature.get(key) for key in (
                     "feature_id", "project_id", "intent_text", "state", "meeting_room_id",
                     "created_by_role", "evidence_refs", "revision", "created_at", "updated_at",
-                )},
+                )} | {"work_projection": work_projection},
             )
             feature_nodes_by_id[feature_id] = feature_node
             add_edge("PROJECT_HAS_FEATURE_NODE", project_node, feature_node, feature_ref)
@@ -20977,6 +21065,15 @@ class UniverseStore:
                     "FEATURE_NODE_HAS_GOAL",
                     feature_node,
                     scoped_goal_node,
+                    feature_ref,
+                )
+            for scoped_todo in feature_todos:
+                if scoped_todo.get("goal_id"):
+                    continue
+                add_edge(
+                    "FEATURE_NODE_HAS_UNASSIGNED_TODO",
+                    feature_node,
+                    f"todo:{scoped_todo['todo_id']}",
                     feature_ref,
                 )
             meeting_room_id = str(feature.get("meeting_room_id") or "")
@@ -21274,7 +21371,7 @@ class UniverseStore:
                     f"universe://project-room/{project_id}/messages/{message_id}",
                 )
 
-        for event in self.list_events(project_id, limit=200):
+        for event in project_events:
             event_id = str(event.get("event_id") or "")
             if not event_id:
                 continue
@@ -21327,12 +21424,31 @@ class UniverseStore:
                     "source", "tier", "successful", "tests_run", "elapsed_seconds",
                     "target_seconds", "redaction_state",
                 ) if payload.get(key) is not None})
+            elif event_type == "TODO_ACTION_APPLIED" and isinstance(payload, Mapping):
+                entity_type = "TODO_ACTIVITY"
+                outcome = str(payload.get("outcome") or "OBSERVED")
+                label = f"Todo · {outcome}"
+                validation = payload.get("validation")
+                event_data.update({key: payload.get(key) for key in (
+                    "todo_id", "action_id", "outcome", "state", "source",
+                    "evidence_ref",
+                ) if payload.get(key) is not None})
+                if isinstance(validation, Mapping):
+                    event_data["validation"] = {
+                        key: validation.get(key)
+                        for key in ("status", "evidence_ref")
+                        if validation.get(key) is not None
+                    }
             event_node = add_node(
                 entity_type, event_id, label,
                 "OBSERVED", "PROJECT_EVENT", source_ref,
                 event_data,
             )
             add_edge("PROJECT_HAS_EVENT", project_node, event_node, source_ref)
+            if event_type == "TODO_ACTION_APPLIED" and isinstance(payload, Mapping):
+                todo_id = str(payload.get("todo_id") or "")
+                if todo_id and f"todo:{todo_id}" in node_ids:
+                    add_edge("TODO_HAS_ACTIVITY", f"todo:{todo_id}", event_node, source_ref)
             if (
                 event_type == "TEST_WORK_STATUS"
                 and isinstance(payload, Mapping)

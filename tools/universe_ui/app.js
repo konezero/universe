@@ -10174,10 +10174,38 @@ function todoStateColor(todoState) {
     IN_PROGRESS: "#22d3ee",
     READY: "#a3e635",
     BACKLOG: "#94a3b8",
+    DONE: "#4ade80",
   }[todoState] || "#f6c76a";
 }
 
+function featureWorkProjection(value) {
+  const semanticNode = value?.entity_type ? value : value?.data;
+  if (String(semanticNode?.entity_type || "").toUpperCase() !== "FEATURE_NODE") {
+    return null;
+  }
+  return semanticNode.data?.work_projection || null;
+}
+
 function todoProjectionForGraphNode(graphNode) {
+  const work = featureWorkProjection(graphNode);
+  if (work && Number(work.todo_total || 0) > 0) {
+    const stateName = {
+      BLOCKED: "BLOCKED",
+      EXECUTING: "IN_PROGRESS",
+      READY: "READY",
+      PLANNED: "BACKLOG",
+      DONE: "DONE",
+    }[work.execution_state] || "BACKLOG";
+    return {
+      count: Number(work.todo_open || 0),
+      total: Number(work.todo_total || 0),
+      done: Number(work.todo_done || 0),
+      progress: Number(work.progress_percent || 0),
+      state: stateName,
+      executionState: work.execution_state,
+      color: todoStateColor(stateName),
+    };
+  }
   const todos = openTodosForGraphNode(graphNode);
   if (!todos.length) return null;
   const rank = { BLOCKED: 0, IN_PROGRESS: 1, READY: 2, BACKLOG: 3 };
@@ -10259,6 +10287,26 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.strokeStyle = todoProjection.color;
     context.lineWidth = 2.5;
     context.stroke();
+    if (Number.isFinite(todoProjection.progress)) {
+      context.beginPath();
+      context.arc(item.x, item.y, r + 7, 0, Math.PI * 2);
+      context.strokeStyle = "rgba(148, 163, 184, 0.28)";
+      context.lineWidth = 2;
+      context.stroke();
+      if (todoProjection.progress > 0) {
+        context.beginPath();
+        context.arc(
+          item.x,
+          item.y,
+          r + 7,
+          -Math.PI / 2,
+          -Math.PI / 2 + Math.PI * 2 * Math.min(100, todoProjection.progress) / 100
+        );
+        context.strokeStyle = "#4ade80";
+        context.lineWidth = 2.5;
+        context.stroke();
+      }
+    }
   }
 
   context.shadowBlur = 0;
@@ -10347,6 +10395,12 @@ function updateGraphHoverTooltip(event, hovered) {
   const nameEl = document.createElement("span");
   nameEl.textContent = name;
   tip.append(kindEl, nameEl);
+  const work = featureWorkProjection(hovered);
+  if (work) {
+    const progressEl = document.createElement("small");
+    progressEl.textContent = `${work.execution_state} · ${work.todo_done}/${work.todo_total} done · ${work.progress_percent}% · activity ${work.activity_count} · evidence ${work.evidence_count}`;
+    tip.append(progressEl);
+  }
   tip.classList.remove("hidden");
   const wrap = elements.canvas?.parentElement;
   if (!wrap || !event) return;
@@ -11051,6 +11105,13 @@ function renderDetails() {
         ? "PROJECT_RUNTIME_UNINITIALIZED"
         : "CURRENT"
   );
+  const featureWork = featureWorkProjection(selected);
+  if (featureWork) {
+    addDetail(grid, "Execution", featureWork.execution_state);
+    addDetail(grid, "Progress", `${featureWork.todo_done}/${featureWork.todo_total} · ${featureWork.progress_percent}%`);
+    addDetail(grid, "Activity", featureWork.activity_count);
+    addDetail(grid, "Evidence", featureWork.evidence_count);
+  }
   if (data.kind) addDetail(grid, "Kind", data.kind);
   if (data.role) addDetail(grid, "Role", data.role);
   if (data.network_role) addDetail(grid, "Network role", data.network_role);
@@ -11268,6 +11329,7 @@ function semanticActivityItemsForGraphNode(graphNode) {
     "ROOM_CONTROL_EVENT",
     "ROOM_MESSAGE",
     "TASK_FRAME_RESULT",
+    "TODO_ACTIVITY",
   ]);
   const reachable = semanticDescendantIds(graphNode?.id);
   return (state.semanticGraph?.nodes || [])
@@ -12220,10 +12282,14 @@ function renderTodoOwnership(todo) {
 
 function todoLineageLabel(todo) {
   const labels = [];
+  const feature = todo.node_ref
+    ? semanticGraphNode(`feature_node:${todo.node_ref}`)
+    : null;
   const goal = todo.goal_id ? semanticGraphNode(`goal:${todo.goal_id}`) : null;
   const milestone = todo.milestone_id
     ? semanticGraphNode(`milestone:${todo.milestone_id}`)
     : null;
+  if (feature?.label) labels.push(feature.label);
   if (goal?.label) labels.push(goal.label);
   if (milestone?.label) labels.push(milestone.label);
   return labels.length ? labels.join(" / ") : todoScopeLabel(todo);
@@ -12664,6 +12730,50 @@ function renderGoalPlan() {
   }
 }
 
+function renderFleetFeatureSummaries(todos) {
+  const nodeRefs = [...new Set(
+    todos
+      .filter((todo) => todo.scope_kind === "NODE" && todo.node_ref)
+      .map((todo) => todo.node_ref)
+  )];
+  const summaries = nodeRefs
+    .map((nodeRef) => {
+      const feature = semanticGraphNode(`feature_node:${nodeRef}`);
+      const work = featureWorkProjection(feature);
+      return feature && work ? { feature, work } : null;
+    })
+    .filter(Boolean);
+  if (!summaries.length) return null;
+  const section = node("section", "fleet-feature-summaries");
+  section.append(node("h3", "", `Feature Nodes (${summaries.length})`));
+  const list = node("div", "fleet-feature-summary-list");
+  for (const { feature, work } of summaries) {
+    const card = node("article", "fleet-feature-summary");
+    card.dataset.state = work.execution_state;
+    const heading = node("div", "fleet-feature-summary-heading");
+    heading.append(
+      node("strong", "", feature.label),
+      node("span", "fleet-feature-state", work.execution_state)
+    );
+    const progress = node("div", "fleet-feature-progress");
+    const fill = node("span", "");
+    fill.style.width = `${work.progress_percent}%`;
+    progress.append(fill);
+    card.append(
+      heading,
+      node(
+        "small",
+        "",
+        `${work.todo_done}/${work.todo_total} done · ${work.todo_open} open · activity ${work.activity_count} · evidence ${work.evidence_count}`
+      ),
+      progress
+    );
+    list.append(card);
+  }
+  section.append(list);
+  return section;
+}
+
 function renderTodos() {
   if (!elements.todoList) return;
   const todos = visibleTodos();
@@ -12671,6 +12781,8 @@ function renderTodos() {
   elements.todoCount.textContent = `${todos.length} item${
     todos.length === 1 ? "" : "s"
   }`;
+  const featureSummaries = renderFleetFeatureSummaries(todos);
+  if (featureSummaries) elements.todoList.append(featureSummaries);
   if (!todos.length) {
     const empty = node("div", "todo-empty-block");
     empty.append(

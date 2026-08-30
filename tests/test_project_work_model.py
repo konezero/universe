@@ -229,6 +229,29 @@ class ProjectWorkModelTests(unittest.TestCase):
                 "sort_order": 0,
             }
         )
+        completed_todo = self.store.create_todo(
+            {
+                "scope_kind": "NODE",
+                "project_id": "feature-only",
+                "node_ref": feature["feature_id"],
+                "goal_id": goal["goal_id"],
+                "title": "Completed Feature Todo",
+                "detail": "Validated node-local work",
+                "priority": "P1",
+                "state": "DONE",
+                "source_kind": "USER",
+                "sort_order": 1,
+            }
+        )
+        self.store.apply_todo_action(
+            todo["todo_id"],
+            {
+                "action_id": "feature-progress-started",
+                "outcome": "STARTED",
+                "source": "TEST_HOOK",
+                "evidence_ref": "test-run://feature-progress/started",
+            },
+        )
 
         surface = self.store.project_work_surface(
             "feature-only", node_ref=feature["feature_id"]
@@ -239,12 +262,40 @@ class ProjectWorkModelTests(unittest.TestCase):
         self.assertEqual(feature["feature_id"], todo["node_ref"])
         self.assertEqual("FEATURE_NODE", surface["node"]["node_kind"])
         self.assertEqual([goal["goal_id"]], [item["goal_id"] for item in surface["node"]["goals"]])
-        self.assertEqual([todo["todo_id"]], [item["todo_id"] for item in surface["node"]["todos"]])
+        self.assertEqual(
+            {todo["todo_id"], completed_todo["todo_id"]},
+            {item["todo_id"] for item in surface["node"]["todos"]},
+        )
         self.assertEqual([], surface["node"]["documents"])
+
+        graph = self.store.semantic_project_graph("feature-only")
+        feature_node = next(
+            item for item in graph["nodes"]
+            if item["id"] == f"feature_node:{feature['feature_id']}"
+        )
+        work = feature_node["data"]["work_projection"]
+        self.assertTrue(work["derived"])
+        self.assertEqual(2, work["todo_total"])
+        self.assertEqual(1, work["todo_done"])
+        self.assertEqual(1, work["todo_open"])
+        self.assertEqual(50, work["progress_percent"])
+        self.assertEqual("EXECUTING", work["execution_state"])
+        self.assertEqual(1, work["activity_count"])
+        self.assertEqual(1, work["evidence_count"])
+        self.assertIn(todo["todo_id"], work["active_todo_ids"])
+        self.assertIn(
+            "TODO_ACTIVITY",
+            {item["entity_type"] for item in graph["nodes"]},
+        )
+        self.assertIn(
+            "TODO_HAS_ACTIVITY",
+            {item["edge_type"] for item in graph["edges"]},
+        )
 
     def test_ui_exposes_selected_node_goal_scope(self) -> None:
         app = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
         page = (ROOT / "tools" / "universe_ui" / "index.html").read_text(encoding="utf-8")
+        styles = (ROOT / "tools" / "universe_ui" / "styles.css").read_text(encoding="utf-8")
         self.assertIn('value="NODE">Selected node', page)
         self.assertIn("goalsForSelectedContext", app)
         self.assertIn("function graphNodeRef(graphNode)", app)
@@ -252,6 +303,10 @@ class ProjectWorkModelTests(unittest.TestCase):
         self.assertIn("node_ref: graphNodeRef(item)", app)
         self.assertIn("scope_kind: scopeKind", app)
         self.assertIn("node_ref: selectedNodeRef()", app)
+        self.assertIn("function featureWorkProjection(value)", app)
+        self.assertIn("function renderFleetFeatureSummaries(todos)", app)
+        self.assertIn("TODO_ACTIVITY", app)
+        self.assertIn(".fleet-feature-summary[data-state=\"EXECUTING\"]", styles)
 
 
 if __name__ == "__main__":
