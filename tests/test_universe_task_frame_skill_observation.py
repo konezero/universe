@@ -82,7 +82,7 @@ class UniverseTaskFrameSkillObservationTests(unittest.TestCase):
         (manifest_path.parent / "mode_registry.json").write_text(
             json.dumps(
                 {
-                    "schema": "ai-career.mode-registry.v1",
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "universe-test",
                     "repository_kind": "PROJECT",
                     "policy": "MASTER_MANAGED",
@@ -92,7 +92,6 @@ class UniverseTaskFrameSkillObservationTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     },
                 },

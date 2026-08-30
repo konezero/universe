@@ -2484,11 +2484,11 @@ class ProjectMasterHostTests(unittest.TestCase):
         registry.write_text(
             json.dumps(
                 {
+                    "schema": "ai-career.mode-registry.v2",
                     "modes": {
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     }
                 }
@@ -2714,11 +2714,11 @@ class ProjectMasterHostTests(unittest.TestCase):
         registry.write_text(
             json.dumps(
                 {
+                    "schema": "ai-career.mode-registry.v2",
                     "modes": {
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     }
                 }

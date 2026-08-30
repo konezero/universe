@@ -14,6 +14,7 @@ from typing import Any
 
 from host_profile import resolve_host_tool
 from release_profile_catalog import (
+    CONTEXT_CATALOG_SCHEMA,
     GovernanceCatalog,
     ReleaseProfileCatalog,
     ReleaseProfileError,
@@ -77,21 +78,6 @@ CREATE TABLE skill_profile_binding (
         REFERENCES load_profile(profile_id)
 );
 
-CREATE TABLE mode_profile (
-    mode_profile_id TEXT PRIMARY KEY,
-    overlay_policy TEXT NOT NULL
-);
-
-CREATE TABLE mode_profile_load (
-    mode_profile_id TEXT NOT NULL
-        REFERENCES mode_profile(mode_profile_id)
-        ON DELETE CASCADE,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    profile_id TEXT NOT NULL
-        REFERENCES load_profile(profile_id),
-    PRIMARY KEY(mode_profile_id, ordinal),
-    UNIQUE(mode_profile_id, profile_id)
-);
 
 CREATE TABLE governance_unit (
     governance_id TEXT PRIMARY KEY,
@@ -140,6 +126,43 @@ CREATE TABLE governance_override (
     PRIMARY KEY(
         base_governance_id, overriding_governance_id, applies_when_json
     )
+);
+"""
+
+
+LEGACY_PROFILE_SCHEMA_SQL = """
+CREATE TABLE mode_profile (
+    mode_profile_id TEXT PRIMARY KEY,
+    overlay_policy TEXT NOT NULL
+);
+
+CREATE TABLE mode_profile_load (
+    mode_profile_id TEXT NOT NULL
+        REFERENCES mode_profile(mode_profile_id)
+        ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    profile_id TEXT NOT NULL
+        REFERENCES load_profile(profile_id),
+    PRIMARY KEY(mode_profile_id, ordinal),
+    UNIQUE(mode_profile_id, profile_id)
+);
+"""
+
+CONTEXT_PROFILE_SCHEMA_SQL = """
+CREATE TABLE context_profile (
+    context_profile_id TEXT PRIMARY KEY,
+    overlay_policy TEXT NOT NULL
+);
+
+CREATE TABLE context_profile_load (
+    context_profile_id TEXT NOT NULL
+        REFERENCES context_profile(context_profile_id)
+        ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    profile_id TEXT NOT NULL
+        REFERENCES load_profile(profile_id),
+    PRIMARY KEY(context_profile_id, ordinal),
+    UNIQUE(context_profile_id, profile_id)
 );
 """
 
@@ -414,15 +437,19 @@ def _profile_material(
             "skill_binding_count": 0,
             "mode_profile_count": 0,
         }
-    return {
+    result = {
         "status": "PRESENT",
         "path": catalog_path,
         "sha256": blob_by_path[catalog_path].sha256,
         "catalog_digest": catalog.digest,
         "load_profile_count": len(catalog.load_profiles),
         "skill_binding_count": len(catalog.skill_bindings),
-        "mode_profile_count": len(catalog.mode_profiles),
     }
+    if catalog.schema == CONTEXT_CATALOG_SCHEMA:
+        result["context_profile_count"] = len(catalog.context_profiles)
+    else:
+        result["mode_profile_count"] = len(catalog.mode_profiles)
+    return result
 
 
 def _governance_material(
@@ -589,7 +616,16 @@ def build_release(
         ),
         "load_profile_count": str(profile_material["load_profile_count"]),
         "skill_binding_count": str(profile_material["skill_binding_count"]),
-        "mode_profile_count": str(profile_material["mode_profile_count"]),
+        (
+            "context_profile_count"
+            if "context_profile_count" in profile_material
+            else "mode_profile_count"
+        ): str(
+            profile_material.get(
+                "context_profile_count",
+                profile_material.get("mode_profile_count", 0),
+            )
+        ),
         "governance_catalog_status": str(governance_material["status"]),
         "governance_catalog_path": str(governance_material["path"]),
         "governance_catalog_sha256": str(governance_material["sha256"]),
@@ -614,6 +650,8 @@ def build_release(
             governance_material["governance_override_count"]
         ),
     }
+    if isinstance(profile_catalog, ReleaseProfileCatalog):
+        metadata["profile_catalog_schema"] = profile_catalog.schema
     if source_tree_root:
         metadata["source_tree_root"] = source_tree_root
     _write_database(database_path, metadata, blobs, catalog=profile_catalog)
@@ -666,6 +704,12 @@ def _write_database(
             connection.execute("PRAGMA synchronous = OFF")
             connection.execute("PRAGMA page_size = 4096")
             connection.executescript(SCHEMA_SQL)
+            if isinstance(catalog, ReleaseProfileCatalog):
+                connection.executescript(
+                    CONTEXT_PROFILE_SCHEMA_SQL
+                    if catalog.schema == CONTEXT_CATALOG_SCHEMA
+                    else LEGACY_PROFILE_SCHEMA_SQL
+                )
             with connection:
                 connection.executemany(
                     "INSERT INTO release_metadata(key, value) VALUES (?, ?)",
@@ -727,29 +771,45 @@ def _write_database(
                             for binding in catalog.skill_bindings
                         ],
                     )
+                    context_profile_table = (
+                        "context_profile"
+                        if catalog.schema == CONTEXT_CATALOG_SCHEMA
+                        else "mode_profile"
+                    )
+                    context_profile_id_column = (
+                        "context_profile_id"
+                        if catalog.schema == CONTEXT_CATALOG_SCHEMA
+                        else "mode_profile_id"
+                    )
+                    context_profile_load_table = (
+                        "context_profile_load"
+                        if catalog.schema == CONTEXT_CATALOG_SCHEMA
+                        else "mode_profile_load"
+                    )
                     connection.executemany(
-                        """
-                        INSERT INTO mode_profile(mode_profile_id, overlay_policy)
-                        VALUES (?, ?)
+                        f"""
+                        INSERT INTO {context_profile_table}(
+                            {context_profile_id_column}, overlay_policy
+                        ) VALUES (?, ?)
                         """,
                         [
-                            (profile.mode_profile_id, profile.overlay_policy)
-                            for profile in catalog.mode_profiles
+                            (profile.context_profile_id, profile.overlay_policy)
+                            for profile in catalog.context_profiles
                         ],
                     )
                     connection.executemany(
-                        """
-                        INSERT INTO mode_profile_load(
-                            mode_profile_id, ordinal, profile_id
+                        f"""
+                        INSERT INTO {context_profile_load_table}(
+                            {context_profile_id_column}, ordinal, profile_id
                         ) VALUES (?, ?, ?)
                         """,
                         [
                             (
-                                profile.mode_profile_id,
+                                profile.context_profile_id,
                                 ordinal,
                                 load_profile_id,
                             )
-                            for profile in catalog.mode_profiles
+                            for profile in catalog.context_profiles
                             for ordinal, load_profile_id in enumerate(
                                 profile.load_profiles
                             )
@@ -884,7 +944,14 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             raise CoreReleaseError("release database integrity check failed")
         metadata = dict(connection.execute("SELECT key, value FROM release_metadata"))
         schema = metadata.get("schema")
-        legacy_v2_objects = [
+        base_profile_objects = [
+            ("table", "load_profile"),
+            ("table", "load_profile_surface"),
+            ("table", "release_file"),
+            ("table", "release_metadata"),
+            ("table", "skill_profile_binding"),
+        ]
+        legacy_profile_objects = [
             ("table", "load_profile"),
             ("table", "load_profile_surface"),
             ("table", "mode_profile"),
@@ -893,15 +960,37 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             ("table", "release_metadata"),
             ("table", "skill_profile_binding"),
         ]
-        current_v2_objects = [
+        context_profile_objects = [
+            ("table", "context_profile"),
+            ("table", "context_profile_load"),
+            ("table", "load_profile"),
+            ("table", "load_profile_surface"),
+            ("table", "release_file"),
+            ("table", "release_metadata"),
+            ("table", "skill_profile_binding"),
+        ]
+        governance_objects = [
             ("table", "governance_dependency"),
             ("table", "governance_index"),
             ("table", "governance_override"),
             ("table", "governance_unit"),
-            *legacy_v2_objects,
         ]
+        legacy_v2_objects = legacy_profile_objects
+        current_v2_objects = [*governance_objects, *legacy_profile_objects]
+        current_v3_objects = [
+            *context_profile_objects[:2],
+            *governance_objects,
+            *context_profile_objects[2:],
+        ]
+        current_no_profile_objects = [*governance_objects, *base_profile_objects]
         expected_objects = (
-            {tuple(legacy_v2_objects), tuple(current_v2_objects)}
+            {
+                tuple(legacy_v2_objects),
+                tuple(current_v2_objects),
+                tuple(current_v3_objects),
+                tuple(current_no_profile_objects),
+                tuple(base_profile_objects),
+            }
             if schema == RELEASE_SCHEMA
             else {
                 (
@@ -936,14 +1025,20 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
             """
         ).fetchall()
         profile_rows = (
-            _read_profile_rows(connection)
+            _read_profile_rows(
+                connection,
+                context=metadata.get("profile_catalog_schema") == CONTEXT_CATALOG_SCHEMA,
+            )
             if schema == RELEASE_SCHEMA
             else None
         )
+        object_names = set(objects)
+        has_governance_tables = all(
+            item in object_names for item in governance_objects
+        )
         governance_rows = (
             _read_governance_rows(connection)
-            if schema == RELEASE_SCHEMA
-            and tuple(objects) == tuple(current_v2_objects)
+            if schema == RELEASE_SCHEMA and has_governance_tables
             else None
         )
     finally:
@@ -1064,8 +1159,41 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
     return result
 
 
-def _read_profile_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+def _read_profile_rows(
+    connection: sqlite3.Connection,
+    *,
+    context: bool = False,
+) -> dict[str, list[sqlite3.Row]]:
     connection.row_factory = sqlite3.Row
+    profile_table = "context_profile" if context else "mode_profile"
+    profile_load_table = (
+        "context_profile_load" if context else "mode_profile_load"
+    )
+    profile_id_column = (
+        "context_profile_id" if context else "mode_profile_id"
+    )
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (profile_table,),
+    ).fetchone()
+    if table_exists is None:
+        modes: list[sqlite3.Row] = []
+        mode_loads: list[sqlite3.Row] = []
+    else:
+        modes = connection.execute(
+            f"""
+            SELECT {profile_id_column} AS mode_profile_id, overlay_policy
+            FROM {profile_table}
+            ORDER BY {profile_id_column}
+            """
+        ).fetchall()
+        mode_loads = connection.execute(
+            f"""
+            SELECT {profile_id_column} AS mode_profile_id, ordinal, profile_id
+            FROM {profile_load_table}
+            ORDER BY {profile_id_column}, ordinal
+            """
+        ).fetchall()
     return {
         "profiles": connection.execute(
             "SELECT profile_id, description FROM load_profile ORDER BY profile_id"
@@ -1084,20 +1212,8 @@ def _read_profile_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3
             ORDER BY skill_id
             """
         ).fetchall(),
-        "modes": connection.execute(
-            """
-            SELECT mode_profile_id, overlay_policy
-            FROM mode_profile
-            ORDER BY mode_profile_id
-            """
-        ).fetchall(),
-        "mode_loads": connection.execute(
-            """
-            SELECT mode_profile_id, ordinal, profile_id
-            FROM mode_profile_load
-            ORDER BY mode_profile_id, ordinal
-            """
-        ).fetchall(),
+        "modes": modes,
+        "mode_loads": mode_loads,
     }
 
 
@@ -1152,13 +1268,20 @@ def _profile_catalog_raw(
         surfaces_by_profile.setdefault(row["profile_id"], []).append(
             {"path": row["path"], "required": bool(row["required"])}
         )
-    loads_by_mode: dict[str, list[str]] = {}
+    loads_by_context: dict[str, list[str]] = {}
     for row in rows["mode_loads"]:
-        loads_by_mode.setdefault(row["mode_profile_id"], []).append(
+        loads_by_context.setdefault(row["mode_profile_id"], []).append(
             row["profile_id"]
         )
-    return {
-        "schema": "ai-career.release-profile-catalog.v1",
+    schema = metadata.get("profile_catalog_schema")
+    if not schema:
+        schema = (
+            "ai-career.release-profile-catalog.v2"
+            if metadata.get("governance_catalog_status") == "PRESENT"
+            else "ai-career.release-profile-catalog.v1"
+        )
+    result: dict[str, Any] = {
+        "schema": schema,
         "owner": metadata.get("profile_catalog_owner", ""),
         "load_profiles": [
             {
@@ -1172,15 +1295,26 @@ def _profile_catalog_raw(
             {"skill_id": row["skill_id"], "profile_id": row["profile_id"]}
             for row in rows["skills"]
         ],
-        "mode_profiles": [
+    }
+    if schema == CONTEXT_CATALOG_SCHEMA:
+        result["context_profiles"] = [
+            {
+                "context_profile_id": row["mode_profile_id"],
+                "overlay_policy": row["overlay_policy"],
+                "load_profiles": loads_by_context.get(row["mode_profile_id"], []),
+            }
+            for row in rows["modes"]
+        ]
+    else:
+        result["mode_profiles"] = [
             {
                 "mode_profile_id": row["mode_profile_id"],
                 "overlay_policy": row["overlay_policy"],
-                "load_profiles": loads_by_mode.get(row["mode_profile_id"], []),
+                "load_profiles": loads_by_context.get(row["mode_profile_id"], []),
             }
             for row in rows["modes"]
-        ],
-    }
+        ]
+    return result
 
 
 def _governance_catalog_raw(
@@ -1211,7 +1345,10 @@ def _governance_catalog_raw(
         )
     raw.update(
         {
-            "schema": "ai-career.release-profile-catalog.v2",
+            "schema": metadata.get(
+                "profile_catalog_schema",
+                "ai-career.release-profile-catalog.v2",
+            ),
             "governance_units": [
                 {
                     "governance_id": row["governance_id"],
@@ -1347,7 +1484,11 @@ def _verified_profile_material(
             "catalog_digest": "NONE",
             "load_profile_count": 0,
             "skill_binding_count": 0,
-            "mode_profile_count": 0,
+            (
+                "context_profile_count"
+                if metadata.get("profile_catalog_schema") == CONTEXT_CATALOG_SCHEMA
+                else "mode_profile_count"
+            ): 0,
         }
     if catalog_status != "PRESENT":
         raise CoreReleaseError("release profile catalog status is invalid")
@@ -1368,8 +1509,17 @@ def _verified_profile_material(
     expected_counts = {
         "load_profile_count": len(catalog.load_profiles),
         "skill_binding_count": len(catalog.skill_bindings),
-        "mode_profile_count": len(catalog.mode_profiles),
     }
+    count_key = (
+        "context_profile_count"
+        if catalog.schema == CONTEXT_CATALOG_SCHEMA
+        else "mode_profile_count"
+    )
+    expected_counts[count_key] = len(
+        catalog.context_profiles
+        if catalog.schema == CONTEXT_CATALOG_SCHEMA
+        else catalog.mode_profiles
+    )
     for key, value in expected_counts.items():
         if metadata.get(key) != str(value):
             raise CoreReleaseError(f"release profile count mismatch: {key}")

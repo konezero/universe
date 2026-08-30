@@ -30,6 +30,7 @@ GOVERNANCE_SELECTOR_FIELDS = (
     "capability",
 )
 MAX_GOVERNANCE_CONTEXT_BYTES = 128 * 1024
+CONTEXT_CATALOG_SCHEMA = "ai-career.release-profile-catalog.v3"
 
 
 class ReleaseRuntimeError(ValueError):
@@ -256,15 +257,35 @@ class ReleaseRuntime:
                 """
             )
         ]
+        is_context_catalog = (
+            self.metadata.get("profile_catalog_schema") == CONTEXT_CATALOG_SCHEMA
+        )
+        profile_table = "context_profile" if is_context_catalog else "mode_profile"
+        profile_id_column = (
+            "context_profile_id" if is_context_catalog else "mode_profile_id"
+        )
+        profile_rows = self._connection.execute(
+            f"""
+            SELECT {profile_id_column} AS profile_id
+            FROM {profile_table}
+            ORDER BY {profile_id_column}
+            """
+        ).fetchall()
+        if is_context_catalog:
+            contexts = [
+                self.resolve_context_profile(row["profile_id"])
+                for row in profile_rows
+            ]
+            return {
+                "release_id": self.release_id,
+                "catalog_status": self.profile_catalog_status,
+                "load_profiles": load_profiles,
+                "skill_bindings": skills,
+                "context_profiles": contexts,
+            }
         modes = [
             self.resolve_mode_profile(row["mode_profile_id"])
-            for row in self._connection.execute(
-                """
-                SELECT mode_profile_id
-                FROM mode_profile
-                ORDER BY mode_profile_id
-                """
-            )
+            for row in profile_rows
         ]
         return {
             "release_id": self.release_id,
@@ -331,7 +352,46 @@ class ReleaseRuntime:
             ],
         }
 
+    def resolve_context_profile(self, context_profile_id: str) -> dict[str, Any]:
+        self._require_profiles()
+        if self.metadata.get("profile_catalog_schema") != CONTEXT_CATALOG_SCHEMA:
+            raise ReleaseRuntimeError("context profiles require a v3 profile catalog")
+        normalized = _required_text(
+            context_profile_id,
+            "context_profile_id",
+        ).upper()
+        context = self._connection.execute(
+            """
+            SELECT context_profile_id, overlay_policy
+            FROM context_profile
+            WHERE context_profile_id = ?
+            """,
+            (normalized,),
+        ).fetchone()
+        if context is None:
+            raise ReleaseRuntimeError(
+                f"Context profile is not registered: {normalized}"
+            )
+        profiles = [
+            row["profile_id"]
+            for row in self._connection.execute(
+                """
+                SELECT profile_id
+                FROM context_profile_load
+                WHERE context_profile_id = ?
+                ORDER BY ordinal
+                """,
+                (normalized,),
+            )
+        ]
+        return {
+            "context_profile_id": context["context_profile_id"],
+            "overlay_policy": context["overlay_policy"],
+            "load_profiles": profiles,
+        }
+
     def resolve_mode_profile(self, mode_profile_id: str) -> dict[str, Any]:
+        """Resolve a legacy v1/v2 release context by its old field name."""
         self._require_profiles()
         normalized = _required_text(
             mode_profile_id,
@@ -820,6 +880,8 @@ def parser() -> argparse.ArgumentParser:
     skill.add_argument("--skill", required=True)
     mode = commands.add_parser("resolve-mode")
     mode.add_argument("--mode-profile", required=True)
+    context = commands.add_parser("resolve-context")
+    context.add_argument("--context-profile", required=True)
     plan = commands.add_parser("plan")
     plan.add_argument("--target", type=Path, required=True)
     apply = commands.add_parser("apply")
@@ -841,6 +903,8 @@ def main() -> int:
                 result = runtime.resolve_skill(args.skill)
             elif args.command == "resolve-mode":
                 result = runtime.resolve_mode_profile(args.mode_profile)
+            elif args.command == "resolve-context":
+                result = runtime.resolve_context_profile(args.context_profile)
             elif args.command == "plan":
                 result = runtime.plan_project_install(args.target)
             else:

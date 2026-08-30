@@ -416,7 +416,7 @@ def run_isolated() -> SmokeReport:
         (runtime / "mode_registry.json").write_text(
             json.dumps(
                 {
-                    "schema": "ai-career.mode-registry.v1",
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "GCS",
                     "repository_kind": "PROJECT",
                     "policy": "MASTER_MANAGED",
@@ -426,7 +426,6 @@ def run_isolated() -> SmokeReport:
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     },
                 }
@@ -458,12 +457,10 @@ def run_isolated() -> SmokeReport:
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                         "CONDUCTOR": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                     },
                 }

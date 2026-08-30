@@ -310,6 +310,8 @@ def _retrieval_tokens(value: Any) -> frozenset[str]:
     )
 UNIVERSE_IDENTITY_SCHEMA = "universe.identity.v1"
 UNIVERSE_MODE_CONTRACT_SCHEMA = "universe.mode-contract.v1"
+MODE_REGISTRY_SCHEMA = "ai-career.mode-registry.v2"
+LEGACY_MODE_REGISTRY_SCHEMA = "ai-career.mode-registry.v1"
 PROJECT_SCHEMA = "universe.project-connection.v1"
 PROJECT_ATTACHMENT_SCHEMA = "universe.project-attachment.v1"
 RUNTIME_LEASE_SCHEMA = "universe.shared-runtime-lease.v1"
@@ -568,7 +570,6 @@ MASTER_MODE = "MASTER"
 CONDUCTOR_MODE = "CONDUCTOR"
 CONDUCTOR_ROLE = "CONDUCTOR"
 CONDUCTOR_SCOPE = "project-network/navigation/distribution"
-CONDUCTOR_MODE_PROFILE = "GOVERNANCE_ONLY"
 CONDUCTOR_MODE_INTENTS = {
     "CONDUCTOR": CONDUCTOR_MODE,
     "CONDUCTOR MODE": CONDUCTOR_MODE,
@@ -663,6 +664,12 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
             "UNIVERSE_MODE_REGISTRY_INVALID",
             "Universe Mode Registry must be an object",
         )
+    schema = registry.get("schema")
+    if schema not in {MODE_REGISTRY_SCHEMA, LEGACY_MODE_REGISTRY_SCHEMA}:
+        raise UniverseError(
+            "UNIVERSE_MODE_CONTRACT_MISMATCH",
+            "Universe Mode Registry schema is unsupported",
+        )
     if (
         registry.get("owner") != "universe"
         or registry.get("policy") != "MASTER_MANAGED"
@@ -682,12 +689,10 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
         MASTER_MODE: {
             "role": MASTER_MODE,
             "scope": "architecture/governance",
-            "mode_profile": "GOVERNANCE_ONLY",
         },
         CONDUCTOR_MODE: {
             "role": CONDUCTOR_ROLE,
             "scope": CONDUCTOR_SCOPE,
-            "mode_profile": CONDUCTOR_MODE_PROFILE,
         },
     }
     unexpected = sorted(set(modes) - set(expected))
@@ -698,26 +703,46 @@ def load_universe_mode_registry(path: Path) -> dict[str, Any]:
             "Universe Mode Registry entry does not match the required contract: "
             f"{(unexpected or missing)[0]}",
         )
-    for mode, definition in expected.items():
-        if modes.get(mode) != definition:
+    normalized_modes: dict[str, dict[str, str]] = {}
+    for mode, expected_definition in expected.items():
+        definition = modes.get(mode)
+        allowed_fields = (
+            {"role", "scope", "mode_profile"}
+            if schema == LEGACY_MODE_REGISTRY_SCHEMA
+            else {"role", "scope"}
+        )
+        if not isinstance(definition, dict) or set(definition) != allowed_fields:
             raise UniverseError(
                 "UNIVERSE_MODE_CONTRACT_MISMATCH",
                 f"Universe Mode Registry entry does not match the required contract: {mode}",
             )
-    return registry
+        if (
+            definition.get("role") != expected_definition["role"]
+            or definition.get("scope") != expected_definition["scope"]
+        ):
+            raise UniverseError(
+                "UNIVERSE_MODE_CONTRACT_MISMATCH",
+                f"Universe Mode Registry entry does not match the required contract: {mode}",
+            )
+        normalized_modes[mode] = dict(expected_definition)
+    normalized = dict(registry)
+    normalized["modes"] = normalized_modes
+    return normalized
 
 
 def universe_mode_contract(registry: dict[str, Any]) -> dict[str, Any]:
     definition = registry["modes"][CONDUCTOR_MODE]
-    return {
+    result = {
         "schema": UNIVERSE_MODE_CONTRACT_SCHEMA,
         "status": "ACTIVE",
         "mode": CONDUCTOR_MODE,
         "role": definition["role"],
         "scope": definition["scope"],
-        "mode_profile": definition["mode_profile"],
         "registry_revision": registry.get("revision", "UNKNOWN"),
     }
+    if registry.get("schema") == LEGACY_MODE_REGISTRY_SCHEMA:
+        result["notes"] = ["MODE_REGISTRY_LEGACY_FIELD_IGNORED"]
+    return result
 
 
 def unknown_universe_mode_contract() -> dict[str, Any]:
@@ -727,7 +752,6 @@ def unknown_universe_mode_contract() -> dict[str, Any]:
         "mode": CONDUCTOR_MODE,
         "role": CONDUCTOR_ROLE,
         "scope": CONDUCTOR_SCOPE,
-        "mode_profile": CONDUCTOR_MODE_PROFILE,
         "registry_revision": "UNKNOWN",
     }
 

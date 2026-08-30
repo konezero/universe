@@ -58,6 +58,7 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
             auto_start_project_masters=False,
             mode_contract=universe_mode_contract(
                 {
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "universe",
                     "policy": "MASTER_MANAGED",
                     "root_mode": "MASTER",
@@ -66,12 +67,10 @@ class UniverseLocalQueryApiTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                         "CONDUCTOR": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                     },
                 }

@@ -40,7 +40,7 @@ class UniverseMemoryTests(unittest.TestCase):
         (runtime / "mode_registry.json").write_text(
             json.dumps(
                 {
-                    "schema": "ai-career.mode-registry.v1",
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "GCS",
                     "repository_kind": "PROJECT",
                     "policy": "MASTER_MANAGED",
@@ -50,7 +50,6 @@ class UniverseMemoryTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     },
                 }
@@ -66,6 +65,7 @@ class UniverseMemoryTests(unittest.TestCase):
             auto_start_conductor_runtime=False,
             mode_contract=universe_mode_contract(
                 {
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "universe",
                     "policy": "MASTER_MANAGED",
                     "root_mode": "MASTER",
@@ -74,12 +74,10 @@ class UniverseMemoryTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                         "CONDUCTOR": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                     },
                 }

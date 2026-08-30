@@ -220,7 +220,7 @@ class IntentSkillRoutingApiTests(unittest.TestCase):
             database_path=root / "universe.sqlite3",
             token=self.token,
             auto_start_project_masters=False,
-            mode_contract=universe_mode_contract({"owner": "universe", "policy": "MASTER_MANAGED", "root_mode": "MASTER", "revision": 1, "modes": {"MASTER": {"role": "MASTER", "scope": "architecture/governance", "mode_profile": "GOVERNANCE_ONLY"}, "CONDUCTOR": {"role": "CONDUCTOR", "scope": "project-network/navigation/distribution", "mode_profile": "GOVERNANCE_ONLY"}}}),
+            mode_contract=universe_mode_contract({"schema": "ai-career.mode-registry.v2", "owner": "universe", "policy": "MASTER_MANAGED", "root_mode": "MASTER", "revision": 1, "modes": {"MASTER": {"role": "MASTER", "scope": "architecture/governance"}, "CONDUCTOR": {"role": "CONDUCTOR", "scope": "project-network/navigation/distribution"}}}),
             host_profile=HostProfileStore(root / "host.json"),
             service_state_path=root / "server.json",
             remote_gateway_state_path=root / "remote-gateway.json",

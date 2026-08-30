@@ -2,23 +2,28 @@
 
 Status: P0 and P1 implemented, released, installed, and verified
 
-## P0 - Mode Boot authority
+## P0 - Mode and Anchor authority
 
 - [x] Define one Host-owned SQLite database per Project.
-- [x] Store Project identity, Mode Registry snapshot, one Current Anchor per
-  Mode, Beyond Anchor history, and Mode Boot Binding.
+- [x] Store Project identity, the Mode Registry snapshot, one Current Anchor
+  per Mode, Beyond Anchor history, and provider/session observations.
 - [x] Reject Project identity rebinding and Registry revision conflicts.
-- [x] Make `prepare-session` create an opaque PREPARED binding.
-- [x] Make Session Boot claim it once, verify Mode/Role/Scope/Anchor/Registry,
-  activate it after Host activation, and fail closed on mismatch.
-- [x] Reject binding-free Session Boot after the Project Runtime database exists.
-- [x] Route Universe Conductor and Project Master startup through the binding.
+- [x] Have the SessionStart Hook and Anchor Graph establish and observe the
+  current Session Anchor; do not derive authority from a Mode Profile or an
+  installation default.
+- [x] Resolve authority, write scope, and execution assignment from the
+  current Anchor Graph records immediately before execution.
 - [x] Keep provider sessions and Workers read-only to the database.
 - [x] Commit the Career Runtime source change and produce an immutable release
   at `b98a74693d779841f2b913cfdc82cb388bfc2181` on ai-career PR #269.
 - [x] OS_UPDATE the Universe installation from that release and run live
   Conductor Mode dogfood through the Universe app/observatory without treating
   UNIVERSE as a Mode.
+
+The earlier binding-oriented wording in historical plans is superseded by the
+SessionStart Hook plus Anchor Graph path above. Existing release databases and
+their provenance remain immutable; a later release or MODE_CHANGE supersedes
+them rather than rewriting them.
 
 ## P1 - Runtime state consolidation
 

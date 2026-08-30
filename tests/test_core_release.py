@@ -21,6 +21,7 @@ from core_release import (  # noqa: E402
     build_release,
     verify_release,
 )
+from release_runtime import ReleaseRuntime  # noqa: E402
 from release_profile_catalog import (  # noqa: E402
     ReleaseProfileError,
     parse_release_governance_catalog,
@@ -635,6 +636,77 @@ class CoreReleaseTests(unittest.TestCase):
                 json.loads(json.dumps(catalog_value)),
                 selector,
             )
+
+    def test_v3_context_catalog_uses_context_tables_and_runtime_names(self) -> None:
+        self._write_fixture(with_governance=True)
+        catalog_path = (
+            self.repo
+            / ".ai"
+            / "distribution"
+            / "context_management_runtime_pack"
+            / "release_profile_catalog.json"
+        )
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        legacy_profiles = catalog.pop("mode_profiles")
+        catalog["schema"] = "ai-career.release-profile-catalog.v3"
+        catalog["context_profiles"] = [
+            {
+                "context_profile_id": profile["mode_profile_id"],
+                "overlay_policy": profile["overlay_policy"],
+                "load_profiles": profile["load_profiles"],
+            }
+            for profile in legacy_profiles
+        ]
+        self._write(catalog_path.relative_to(self.repo).as_posix(), json.dumps(catalog, sort_keys=True))
+        self.commit = self._commit("context-profile-catalog")
+
+        manifest = self._build()
+        verified = verify_release(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+
+        self.assertEqual(1, manifest["profile_catalog"]["context_profile_count"])
+        self.assertNotIn("mode_profile_count", manifest["profile_catalog"])
+        self.assertEqual(
+            manifest["profile_catalog"],
+            verified["profile_catalog"],
+        )
+        with ReleaseRuntime(
+            database_path=self.database,
+            manifest_path=self.manifest,
+        ) as runtime:
+            listing = runtime.list_profiles()
+            context = runtime.resolve_context_profile("master_base")
+        self.assertIn("context_profiles", listing)
+        self.assertNotIn("mode_profiles", listing)
+        self.assertEqual(
+            {
+                "context_profile_id": "MASTER_BASE",
+                "overlay_policy": "APPEND_ONLY",
+                "load_profiles": ["BOOT_CORE"],
+            },
+            context,
+        )
+
+        connection = sqlite3.connect(self.database)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                    """
+                )
+            }
+        finally:
+            connection.close()
+        self.assertIn("context_profile", tables)
+        self.assertIn("context_profile_load", tables)
+        self.assertNotIn("mode_profile", tables)
+        self.assertNotIn("mode_profile_load", tables)
 
     def test_governance_catalog_builds_and_verifies_release_database(self) -> None:
         self._write_fixture(with_governance=True)

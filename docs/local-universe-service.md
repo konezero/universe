@@ -709,12 +709,14 @@ The current web service is the UI transport adapter for the Universe-owned ACP
 Gateway. It is not advertised as a general external ACP stdio or socket endpoint
 and does not claim an unimplemented `session/cancel` surface in this slice.
 
-Before registration, the resident Host invokes the installed project's
-`prepare-session` command for registered `MASTER` Mode from inside the project
-root. The Project Runtime Host records the Registry snapshot, MASTER Current
-Anchor, and one-use Mode Boot Binding in the Project-owned Runtime database.
-Universe passes only the opaque binding ID to Session Boot and does not open or
-rewrite that database itself.
+Before registration, the resident Host resolves the exact
+provider Session Anchor observed by the SessionStart Hook and Session
+Supervisor. The Anchor Graph record is the coordinate for the resident
+provider session; if it is missing, stale, or mismatched, the Host stops
+instead of manufacturing a session or an authority record. Universe passes the
+verified opaque Anchor reference and does not open or rewrite the Project
+Runtime database.
+
 For every accepted Project Room user message, the Project Host invokes:
 
 ```text
@@ -725,8 +727,8 @@ mode-anchor observe-commander-input
 
 Only `coordinates.commander_surface` and `observed_at` may change. Mode,
 Anchor identity, execution coordinates, authority, and assignment remain
-project-owned and unchanged. A failed preparation or Commander Surface
-observation blocks the provider turn.
+project-owned and unchanged. A failed Session Anchor lookup or Commander
+Surface observation blocks the provider turn.
 
 Project Master response text is emitted as process-local stream events and the
 browser subscribes through:

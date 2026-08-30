@@ -331,14 +331,20 @@ their own evidence and adoption contracts.
 
 ### P0: Project Runtime database authority
 
-1. Store Project identity, Mode Registry snapshot, Mode Current Anchor, Beyond
-   Anchor history, and Mode Boot Binding in one Host-owned SQLite database.
-2. Make `prepare-session` create a one-use opaque binding and make
-   `session-boot` consume it instead of reusing the installation default Mode.
-3. Route Universe Conductor and Project Master startup through that binding and
-   fail closed on missing, stale, reused, or mismatched bindings.
-4. Migrate Assignment, Task Frame, continuity, and receipt tables only in later
-   slices after their existing authority boundaries are preserved in tests.
+1. Store Project identity, the Mode Registry snapshot, Mode Current Anchor,
+   Beyond Anchor history, and the observed provider/session coordinate in one
+   Host-owned SQLite database.
+2. Let the SessionStart Hook record the provider session and exact Anchor
+   observed by the Anchor Graph. Do not use an installation default or create
+   a second Mode-entry binding to establish currentness.
+3. Route Universe Conductor and Project Master startup through that observed
+   Anchor and fail closed on missing, stale, or mismatched currentness.
+4. Resolve authority, write scope, and execution assignment from their
+   current Anchor Graph records immediately before a mutation. Mode and Role
+   remain descriptive context.
+5. Migrate Assignment, Task Frame, continuity, and receipt tables only in
+   later slices after their existing authority boundaries are preserved in
+   tests.
 
 ### P0: Governance selector foundation
 

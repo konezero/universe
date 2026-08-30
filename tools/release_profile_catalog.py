@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 
 PROFILE_CATALOG_SCHEMA = "ai-career.release-profile-catalog.v1"
 GOVERNANCE_CATALOG_SCHEMA = "ai-career.release-profile-catalog.v2"
+CONTEXT_CATALOG_SCHEMA = "ai-career.release-profile-catalog.v3"
 PROFILE_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 SKILL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,127}$")
 GOVERNANCE_KIND_PATTERN = re.compile(r"^[A-Z][A-Z0-9_-]{0,63}$")
@@ -76,20 +77,59 @@ class ModeProfile:
 
 
 @dataclass(frozen=True)
+class ContextProfile:
+    context_profile_id: str
+    overlay_policy: str
+    load_profiles: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "context_profile_id": self.context_profile_id,
+            "overlay_policy": self.overlay_policy,
+            "load_profiles": list(self.load_profiles),
+        }
+
+
+@dataclass(frozen=True)
 class ReleaseProfileCatalog:
     owner: str
     load_profiles: tuple[LoadProfile, ...]
     skill_bindings: tuple[SkillBinding, ...]
-    mode_profiles: tuple[ModeProfile, ...]
+    context_profiles: tuple[ContextProfile, ...]
+    schema: str
+
+    @property
+    def mode_profiles(self) -> tuple[ModeProfile, ...]:
+        """Compatibility view for v1/v2 release artifacts only."""
+        return tuple(
+            ModeProfile(
+                mode_profile_id=profile.context_profile_id,
+                overlay_policy=profile.overlay_policy,
+                load_profiles=profile.load_profiles,
+            )
+            for profile in self.context_profiles
+        )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "schema": PROFILE_CATALOG_SCHEMA,
+        result: dict[str, Any] = {
+            "schema": self.schema,
             "owner": self.owner,
             "load_profiles": [profile.as_dict() for profile in self.load_profiles],
             "skill_bindings": [binding.as_dict() for binding in self.skill_bindings],
-            "mode_profiles": [profile.as_dict() for profile in self.mode_profiles],
         }
+        if self.schema in {PROFILE_CATALOG_SCHEMA, GOVERNANCE_CATALOG_SCHEMA}:
+            result["mode_profiles"] = [
+                profile.as_dict()
+                for profile in self.mode_profiles
+            ]
+        elif self.schema == CONTEXT_CATALOG_SCHEMA:
+            result["context_profiles"] = [
+                profile.as_dict()
+                for profile in self.context_profiles
+            ]
+        else:
+            raise ReleaseProfileError("release profile catalog schema is unsupported")
+        return result
 
     @property
     def digest(self) -> str:
@@ -194,7 +234,7 @@ class GovernanceCatalog(ReleaseProfileCatalog):
         result = super().as_dict()
         result.update(
             {
-                "schema": GOVERNANCE_CATALOG_SCHEMA,
+                "schema": self.schema,
                 "governance_units": [
                     unit.as_dict() for unit in self.governance_units
                 ],
@@ -248,19 +288,31 @@ def _parse_profile_model(
     value: Mapping[str, Any],
     *,
     packaged_paths: Iterable[str],
+    profile_field: str,
 ) -> tuple[
     str,
     list[LoadProfile],
     list[SkillBinding],
-    list[ModeProfile],
+    list[ContextProfile],
 ]:
     owner = _text(value.get("owner"), "owner")
     paths = frozenset(packaged_paths)
     load_profiles = _load_profiles(value.get("load_profiles"), paths)
     profile_ids = {profile.profile_id for profile in load_profiles}
     skill_bindings = _skill_bindings(value.get("skill_bindings"), profile_ids)
-    mode_profiles = _mode_profiles(value.get("mode_profiles"), profile_ids)
-    return owner, load_profiles, skill_bindings, mode_profiles
+    if profile_field == "mode_profiles":
+        legacy_profiles = _mode_profiles(value.get(profile_field), profile_ids)
+        context_profiles = [
+            ContextProfile(
+                context_profile_id=profile.mode_profile_id,
+                overlay_policy=profile.overlay_policy,
+                load_profiles=profile.load_profiles,
+            )
+            for profile in legacy_profiles
+        ]
+    else:
+        context_profiles = _context_profiles(value.get(profile_field), profile_ids)
+    return owner, load_profiles, skill_bindings, context_profiles
 
 
 def parse_release_profile_catalog(
@@ -278,9 +330,10 @@ def parse_release_profile_catalog(
         "mode_profiles",
     }:
         raise ReleaseProfileError("release profile catalog fields are invalid")
-    owner, load_profiles, skill_bindings, mode_profiles = _parse_profile_model(
+    owner, load_profiles, skill_bindings, context_profiles = _parse_profile_model(
         value,
         packaged_paths=packaged_paths,
+        profile_field="mode_profiles",
     )
     return ReleaseProfileCatalog(
         owner=owner,
@@ -290,9 +343,10 @@ def parse_release_profile_catalog(
         skill_bindings=tuple(
             sorted(skill_bindings, key=lambda binding: binding.skill_id)
         ),
-        mode_profiles=tuple(
-            sorted(mode_profiles, key=lambda profile: profile.mode_profile_id)
+        context_profiles=tuple(
+            sorted(context_profiles, key=lambda profile: profile.context_profile_id)
         ),
+        schema=PROFILE_CATALOG_SCHEMA,
     )
 
 
@@ -301,14 +355,20 @@ def parse_release_governance_catalog(
     *,
     packaged_paths: Iterable[str],
 ) -> GovernanceCatalog:
-    if not isinstance(value, dict) or value.get("schema") != GOVERNANCE_CATALOG_SCHEMA:
+    schema = value.get("schema") if isinstance(value, dict) else None
+    if schema not in {GOVERNANCE_CATALOG_SCHEMA, CONTEXT_CATALOG_SCHEMA}:
         raise ReleaseProfileError("governance catalog schema is unsupported")
+    profile_field = (
+        "mode_profiles"
+        if schema == GOVERNANCE_CATALOG_SCHEMA
+        else "context_profiles"
+    )
     if set(value) != {
         "schema",
         "owner",
         "load_profiles",
         "skill_bindings",
-        "mode_profiles",
+        profile_field,
         "governance_units",
         "governance_index",
         "governance_dependencies",
@@ -316,9 +376,10 @@ def parse_release_governance_catalog(
     }:
         raise ReleaseProfileError("governance catalog fields are invalid")
 
-    owner, load_profiles, skill_bindings, mode_profiles = _parse_profile_model(
+    owner, load_profiles, skill_bindings, context_profiles = _parse_profile_model(
         value,
         packaged_paths=packaged_paths,
+        profile_field=profile_field,
     )
     paths = frozenset(packaged_paths)
     units = _governance_units(value.get("governance_units"), paths)
@@ -341,9 +402,10 @@ def parse_release_governance_catalog(
         skill_bindings=tuple(
             sorted(skill_bindings, key=lambda binding: binding.skill_id)
         ),
-        mode_profiles=tuple(
-            sorted(mode_profiles, key=lambda profile: profile.mode_profile_id)
+        context_profiles=tuple(
+            sorted(context_profiles, key=lambda profile: profile.context_profile_id)
         ),
+        schema=schema,
         governance_units=tuple(
             sorted(units, key=lambda unit: unit.governance_id)
         ),
@@ -375,7 +437,10 @@ def parse_release_catalog(
             value,
             packaged_paths=packaged_paths,
         )
-    if isinstance(value, dict) and value.get("schema") == GOVERNANCE_CATALOG_SCHEMA:
+    if isinstance(value, dict) and value.get("schema") in {
+        GOVERNANCE_CATALOG_SCHEMA,
+        CONTEXT_CATALOG_SCHEMA,
+    }:
         return parse_release_governance_catalog(
             value,
             packaged_paths=packaged_paths,
@@ -389,7 +454,7 @@ def select_governance(
 ) -> GovernanceSelection:
     if not isinstance(catalog, GovernanceCatalog):
         raise ReleaseProfileError(
-            "governance selector requires release profile catalog v2"
+            "governance selector requires a governance release profile catalog"
         )
     normalized_selector = _selector(selector, "selector")
     matches = tuple(
@@ -896,6 +961,60 @@ def _mode_profiles(
         profiles.append(
             ModeProfile(
                 mode_profile_id=mode_profile_id,
+                overlay_policy=overlay_policy,
+                load_profiles=tuple(load_profile_ids),
+            )
+        )
+    return profiles
+
+
+def _context_profiles(
+    value: Any,
+    profile_ids: set[str],
+) -> list[ContextProfile]:
+    rows = _list(value, "context_profiles")
+    profiles: list[ContextProfile] = []
+    seen: set[str] = set()
+    for index, item in enumerate(rows):
+        context = f"context_profiles[{index}]"
+        if not isinstance(item, dict) or set(item) != {
+            "context_profile_id",
+            "overlay_policy",
+            "load_profiles",
+        }:
+            raise ReleaseProfileError(f"{context} fields are invalid")
+        context_profile_id = _profile_id(
+            item.get("context_profile_id"),
+            f"{context}.context_profile_id",
+        )
+        if context_profile_id in seen:
+            raise ReleaseProfileError(
+                "release profile catalog has duplicate context profiles"
+            )
+        seen.add(context_profile_id)
+        overlay_policy = _text(
+            item.get("overlay_policy"),
+            f"{context}.overlay_policy",
+        ).upper()
+        if overlay_policy not in OVERLAY_POLICIES:
+            raise ReleaseProfileError(f"{context}.overlay_policy is unsupported")
+        load_profile_ids = [
+            _profile_id(candidate, f"{context}.load_profiles[]")
+            for candidate in _list(
+                item.get("load_profiles"), f"{context}.load_profiles"
+            )
+        ]
+        if not load_profile_ids:
+            raise ReleaseProfileError(f"{context}.load_profiles must not be empty")
+        if len(load_profile_ids) != len(set(load_profile_ids)):
+            raise ReleaseProfileError(f"{context}.load_profiles contains duplicates")
+        if not set(load_profile_ids).issubset(profile_ids):
+            raise ReleaseProfileError(
+                f"{context} references an unknown load profile"
+            )
+        profiles.append(
+            ContextProfile(
+                context_profile_id=context_profile_id,
                 overlay_policy=overlay_policy,
                 load_profiles=tuple(load_profile_ids),
             )

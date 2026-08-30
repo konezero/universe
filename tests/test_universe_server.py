@@ -268,7 +268,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         (project_instance / "mode_registry.json").write_text(
             json.dumps(
                 {
-                    "schema": "ai-career.mode-registry.v1",
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "GCS",
                     "repository_kind": "PROJECT",
                     "policy": "MASTER_MANAGED",
@@ -278,7 +278,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         }
                     },
                 }
@@ -318,12 +317,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                         "CONDUCTOR": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                     },
                 }
@@ -849,7 +846,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "mode": "CONDUCTOR",
                 "role": "CONDUCTOR",
                 "scope": "project-network/navigation/distribution",
-                "mode_profile": "GOVERNANCE_ONLY",
                 "registry_revision": 3,
             },
             result["mode_contract"],
@@ -15240,6 +15236,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         registry_path.write_text(
             json.dumps(
                 {
+                    "schema": "ai-career.mode-registry.v2",
                     "owner": "universe",
                     "policy": "MASTER_MANAGED",
                     "root_mode": "MASTER",
@@ -15248,12 +15245,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
                         "MASTER": {
                             "role": "MASTER",
                             "scope": "architecture/governance",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                         "CONDUCTOR": {
                             "role": "CONDUCTOR",
                             "scope": "project-network/navigation/distribution",
-                            "mode_profile": "GOVERNANCE_ONLY",
                         },
                     },
                 }
@@ -15270,7 +15265,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "mode": "CONDUCTOR",
                 "role": "CONDUCTOR",
                 "scope": "project-network/navigation/distribution",
-                "mode_profile": "GOVERNANCE_ONLY",
                 "registry_revision": 3,
             },
             universe_mode_contract(registry),
@@ -15302,7 +15296,6 @@ class UniverseLocalServiceTests(unittest.TestCase):
         registry["modes"]["UNIVERSE"] = {
             "role": "CONDUCTOR",
             "scope": "project-network/navigation/distribution",
-            "mode_profile": "GOVERNANCE_ONLY",
         }
         registry_path.write_text(json.dumps(registry), encoding="utf-8")
         with self.assertRaisesRegex(UniverseError, "UNIVERSE"):
@@ -15313,6 +15306,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
         registry_path.write_text(json.dumps(registry), encoding="utf-8")
         with self.assertRaisesRegex(UniverseError, "CONDUCTOR"):
             load_universe_mode_registry(registry_path)
+
+
+    def test_legacy_universe_mode_registry_ignores_mode_profile(self) -> None:
+        registry_path = Path(self.temp.name) / "legacy-universe-mode-registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema": "ai-career.mode-registry.v1",
+                    "owner": "universe",
+                    "policy": "MASTER_MANAGED",
+                    "root_mode": "MASTER",
+                    "revision": 3,
+                    "modes": {
+                        "MASTER": {
+                            "role": "MASTER",
+                            "scope": "architecture/governance",
+                            "mode_profile": "EXECUTABLE_PROOF_REQUIRED",
+                        },
+                        "CONDUCTOR": {
+                            "role": "CONDUCTOR",
+                            "scope": "project-network/navigation/distribution",
+                            "mode_profile": "not-a-live-authority-value",
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        normalized = load_universe_mode_registry(registry_path)
+
+        self.assertNotIn("mode_profile", normalized["modes"]["MASTER"])
+        self.assertNotIn("mode_profile", normalized["modes"]["CONDUCTOR"])
+        self.assertEqual(
+            ["MODE_REGISTRY_LEGACY_FIELD_IGNORED"],
+            universe_mode_contract(normalized)["notes"],
+        )
 
     def test_remote_auth_types_are_reserved_without_runtime_implementation(
         self,

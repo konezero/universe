@@ -53,7 +53,9 @@ Implemented:
 - per-file Git object ID, size, and SHA-256 storage;
 - deterministic payload identity and external database digest;
 - read-only verification without Candidate execution;
-- ordered Skill Load Profiles and Mode Profiles in Release DB v2;
+- ordered Skill Load Profiles and context profiles in Release DB v3;
+- legacy Release DB v1/v2 verification and compatibility reads without
+  treating their historical Mode Profile fields as live policy;
 - legacy Release DB v1 verification without profile claims;
 - content-addressed Universe Catalog import;
 - read-only Project `OS_INSTALL`/`OS_UPDATE` lifecycle planning;

@@ -3171,9 +3171,6 @@ class ProjectModeCoordinator:
         return {
             "role": role,
             "scope": _text(definition.get("scope"), f"{self.requested_mode}.scope"),
-            "mode_profile": _text(
-                definition.get("mode_profile"), f"{self.requested_mode}.mode_profile"
-            ),
         }
 
     # Compatibility for callers that still use the old private helper name.
@@ -4406,9 +4403,9 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "This is a persistent, command-capable conversation Host connected to the "
         "Universe interface. Work from the repository at the configured cwd and "
         "follow its entry order and installed Runtime contracts. Mode, Role, BOOT, "
-        "or a chat message never creates mutation authority. A GOVERNANCE_ONLY Mode "
-        "controls the Mode-entry default; it does not veto a later explicitly approved "
-        "executable task. Handle read-only inspection, review, explanation, and audit "
+        "or a chat message never creates mutation authority. The Mode Current Anchor "
+        "provides coordination context; it does not veto or authorize executable work. "
+        "Handle read-only inspection, review, explanation, and audit directly. "
         "directly. For implementation or command requests that require Commander "
         "approval, create or reuse the installed durable Task Proposal first and stop "
         "after reporting its proposal_id, proposal_digest, scope, and boundary. Do not "
@@ -4424,9 +4421,9 @@ def _project_master_system_prompt(actor_label: str) -> str:
         "the parent proposal_id and proposal_digest as lineage, and continue without asking "
         "the Commander again. If scope or boundary changes, stop and create a new primary "
         "Task Proposal instead of inheriting approval. "
-        "When both Task and Evidence require executable proof, "
-        "request or attach the persistent project runtime host with "
-        "EXECUTABLE_PROOF_REQUIRED before execution. Invoke subordinate agents only as "
+        "When Task Frame and evidence requirements call for an executable host, "
+        "request or attach that host through the current Session Anchor and explicit "
+        "assignment path. Invoke subordinate agents only as "
         "declared Task Frame Workers. Route every mutation through Execution Guard and "
         "a receipt-aware write path. Never substitute a raw write, raw subordinate "
         "spawn, direct provider CLI, or inferred authority. If any required evidence "
