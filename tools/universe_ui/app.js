@@ -11699,12 +11699,22 @@ async function prepareProjectSeed() {
   }
 }
 
-function selectedNodeRef() {
-  const selected = state.selectedNode;
-  if (!selected || !["system", "related", "focus"].includes(selected.kind)) {
-    return null;
+function graphNodeRef(graphNode) {
+  if (!graphNode) return null;
+  if (["system", "related", "focus"].includes(graphNode.kind)) {
+    return graphNode.data?.node_id || null;
   }
-  return selected.data?.node_id || null;
+  if (
+    graphNode.kind === "feature" &&
+    String(graphNode.data?.entity_type || "").toUpperCase() === "FEATURE_NODE"
+  ) {
+    return graphNode.data?.data?.feature_id || null;
+  }
+  return null;
+}
+
+function selectedNodeRef() {
+  return graphNodeRef(state.selectedNode);
 }
 
 function conductorUiContext() {
@@ -11842,18 +11852,15 @@ function todoNodeOptions(projectId) {
   if (!projectId || state.selectedProject?.project_id !== projectId) return [];
   const seen = new Set();
   return state.graph.nodes
-    .filter(
-      (item) =>
-        ["system", "related", "focus"].includes(item.kind) &&
-        item.data?.node_id
-    )
-    .filter((item) => {
-      if (seen.has(item.data.node_id)) return false;
-      seen.add(item.data.node_id);
+    .map((item) => ({ item, node_ref: graphNodeRef(item) }))
+    .filter(({ node_ref }) => Boolean(node_ref))
+    .filter(({ node_ref }) => {
+      if (seen.has(node_ref)) return false;
+      seen.add(node_ref);
       return true;
     })
-    .map((item) => ({
-      node_ref: item.data.node_id,
+    .map(({ item, node_ref }) => ({
+      node_ref,
       label: item.label,
     }));
 }

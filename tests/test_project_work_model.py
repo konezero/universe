@@ -247,6 +247,9 @@ class ProjectWorkModelTests(unittest.TestCase):
         page = (ROOT / "tools" / "universe_ui" / "index.html").read_text(encoding="utf-8")
         self.assertIn('value="NODE">Selected node', page)
         self.assertIn("goalsForSelectedContext", app)
+        self.assertIn("function graphNodeRef(graphNode)", app)
+        self.assertIn("graphNode.data?.data?.feature_id", app)
+        self.assertIn("node_ref: graphNodeRef(item)", app)
         self.assertIn("scope_kind: scopeKind", app)
         self.assertIn("node_ref: selectedNodeRef()", app)
 
