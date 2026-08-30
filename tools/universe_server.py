@@ -10327,24 +10327,38 @@ class UniverseStore:
             goals.append(goal)
         return goals
 
+    def _node_coordinate_kind(self, project_id: str, node_ref: str) -> str | None:
+        normalized_project = _project_id(project_id)
+        normalized_node = _identifier(node_ref, "node_ref")
+        try:
+            seed = self.get_project_seed(normalized_project)
+        except UniverseError as error:
+            if error.code != "PROJECT_SEED_NOT_FOUND":
+                raise
+            seed = None
+        if seed is not None:
+            known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
+            if normalized_node in known_nodes:
+                return "PROJECT_SEED"
+        with self._connection() as connection:
+            feature = connection.execute(
+                "SELECT 1 FROM feature_node WHERE feature_id = ? AND project_id = ?",
+                (normalized_node, normalized_project),
+            ).fetchone()
+        return "FEATURE_NODE" if feature is not None else None
+
     def _validate_goal_scope(self, goal: Mapping[str, Any]) -> None:
         if goal["scope_kind"] != "NODE":
             return
-        try:
-            seed = self.get_project_seed(str(goal["project_id"]))
-        except UniverseError as error:
-            if error.code == "PROJECT_SEED_NOT_FOUND":
-                raise UniverseError(
-                    "GOAL_NODE_PROJECT_SEED_REQUIRED",
-                    "NODE Goal requires a current Project Seed",
-                    HTTPStatus.CONFLICT,
-                ) from error
-            raise
-        known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
-        if str(goal["node_ref"]) not in known_nodes:
+        if self._node_coordinate_kind(
+            str(goal["project_id"]), str(goal["node_ref"])
+        ) is None:
             raise UniverseError(
                 "GOAL_NODE_UNKNOWN",
-                f"node_ref is not present in the current Project Seed: {goal['node_ref']}",
+                (
+                    "node_ref is not a current Project Seed node or Feature Node: "
+                    f"{goal['node_ref']}"
+                ),
                 HTTPStatus.CONFLICT,
             )
 
@@ -10364,18 +10378,18 @@ class UniverseStore:
             if error.code != "PROJECT_SEED_NOT_FOUND":
                 raise
             seed = None
+        node_kind = None
         if normalized_node is not None:
-            if seed is None:
-                raise UniverseError(
-                    "WORK_SURFACE_PROJECT_SEED_REQUIRED",
-                    "node work surface requires a current Project Seed",
-                    HTTPStatus.CONFLICT,
-                )
-            known_nodes = {str(item["node_id"]) for item in seed.get("nodes") or []}
-            if normalized_node not in known_nodes:
+            node_kind = self._node_coordinate_kind(
+                project["project_id"], normalized_node
+            )
+            if node_kind is None:
                 raise UniverseError(
                     "WORK_SURFACE_NODE_UNKNOWN",
-                    f"node_ref is not present in the current Project Seed: {normalized_node}",
+                    (
+                        "node_ref is not a current Project Seed node or Feature Node: "
+                        f"{normalized_node}"
+                    ),
                     HTTPStatus.NOT_FOUND,
                 )
         documents = list(seed.get("documents") or []) if seed is not None else []
@@ -10401,6 +10415,7 @@ class UniverseStore:
             "node": (
                 {
                     "node_ref": normalized_node,
+                    "node_kind": node_kind,
                     "goals": [
                         item for item in goals
                         if item["scope_kind"] == "NODE" and item["node_ref"] == normalized_node
@@ -10571,6 +10586,14 @@ class UniverseStore:
         if goal["project_id"] != todo.get("project_id"):
             raise UniverseError(
                 "TODO_PLAN_COORDINATE_INVALID", "Todo and Goal must belong to the same project"
+            )
+        if (
+            goal["scope_kind"] != todo.get("scope_kind")
+            or goal["node_ref"] != todo.get("node_ref")
+        ):
+            raise UniverseError(
+                "TODO_PLAN_COORDINATE_INVALID",
+                "Todo and Goal must share the same project or node scope",
             )
         if universe_goal_id and goal["universe_goal_id"] not in {None, universe_goal_id}:
             raise UniverseError(
@@ -12045,10 +12068,11 @@ class UniverseStore:
                 ).fetchone()[0]
             )
             connection.execute(
-                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, 'PROJECT', NULL, NULL, ?, ?, 'UNASSIGNED', 'DESIGNING', ?, 1, ?, ?)",
+                "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, state, sort_order, revision, created_at, updated_at) VALUES (?, ?, 'NODE', ?, NULL, ?, ?, 'UNASSIGNED', 'DESIGNING', ?, 1, ?, ?)",
                 (
                     goal_id,
                     feature["project_id"],
+                    fid,
                     title,
                     description,
                     next_sort_order,
@@ -12541,7 +12565,7 @@ class UniverseStore:
                 milestone_ids.append(milestone_id)
                 for ti, item in enumerate(milestone["todos"]):
                     todo_id="todo_"+_json_sha256({"work_plan_id":candidate["work_plan_id"],"milestone":mi,"todo":ti})[:24]
-                    todo={"scope_kind":"PROJECT","project_id":goal["project_id"],"node_ref":None,"universe_goal_id":goal["universe_goal_id"],"goal_id":gid,"milestone_id":milestone_id,"title":item["title"],"detail":f"{item['detail']}\n\nAcceptance: {item['acceptance']}","priority":item["priority"],"state":"BACKLOG","source_kind":"USER","sort_order":ti*10}
+                    todo={"scope_kind":goal["scope_kind"],"project_id":goal["project_id"],"node_ref":goal["node_ref"],"universe_goal_id":goal["universe_goal_id"],"goal_id":gid,"milestone_id":milestone_id,"title":item["title"],"detail":f"{item['detail']}\n\nAcceptance: {item['acceptance']}","priority":item["priority"],"state":"BACKLOG","source_kind":"USER","sort_order":ti*10}
                     if todo["priority"] == "AUTO": todo["priority"] = infer_todo_priority(todo)["priority"]
                     self._insert_todo(connection,todo_id,todo,now)
                     todo_ids.append(todo_id)
@@ -20948,6 +20972,13 @@ class UniverseStore:
             )
             feature_nodes_by_id[feature_id] = feature_node
             add_edge("PROJECT_HAS_FEATURE_NODE", project_node, feature_node, feature_ref)
+            for scoped_goal_node in goal_nodes_by_node_ref.get(feature_id, []):
+                add_edge(
+                    "FEATURE_NODE_HAS_GOAL",
+                    feature_node,
+                    scoped_goal_node,
+                    feature_ref,
+                )
             meeting_room_id = str(feature.get("meeting_room_id") or "")
             if meeting_room_id in room_nodes_by_id:
                 add_edge("FEATURE_NODE_EXPLORED_IN_MEETING_ROOM", feature_node, room_nodes_by_id[meeting_room_id], feature_ref)

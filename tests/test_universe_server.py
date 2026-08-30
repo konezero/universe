@@ -8145,6 +8145,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("FEATURE_GOAL_MATERIALIZED", materialized["status"])
         self.assertEqual("DESIGNING", materialized["goal"]["state"])
         self.assertEqual("UNASSIGNED", materialized["goal"]["owner"])
+        self.assertEqual("NODE", materialized["goal"]["scope_kind"])
+        self.assertEqual(feature["feature_id"], materialized["goal"]["node_ref"])
         self.assertTrue(materialized["goal_created"])
         self.assertEqual(second_path["expected_path_id"], materialized["derivation"]["expected_path_id"])
         self.assertEqual(second_path["artifact_revision"], materialized["derivation"]["artifact_revision"])
@@ -8185,6 +8187,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("EXPECTED_PATH_STEP", node_types)
         self.assertIn("GOAL", node_types)
         self.assertIn("FEATURE_NODE_ADOPTS_EXPECTED_PATH", edge_types)
+        self.assertIn("FEATURE_NODE_HAS_GOAL", edge_types)
         self.assertIn("FEATURE_NODE_DERIVES_GOAL", edge_types)
         self.assertIn("EXPECTED_PATH_DERIVES_GOAL", edge_types)
         self.assertIn("EXPECTED_PATH_HAS_STEP", edge_types)
@@ -8299,6 +8302,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(2, applied["application"]["created_items"]["todo_count"])
         created_todos = [todo for todo in self.server.store.list_todos() if todo["project_id"] == "GCS"]
         self.assertEqual({"BACKLOG"}, {todo["state"] for todo in created_todos})
+        self.assertEqual({"NODE"}, {todo["scope_kind"] for todo in created_todos})
+        self.assertEqual(
+            {feature["feature_id"]}, {todo["node_ref"] for todo in created_todos}
+        )
 
         status, apply_replay = self.request(
             "POST",

@@ -188,6 +188,60 @@ class ProjectWorkModelTests(unittest.TestCase):
             connection.close()
         self.assertEqual(2, count)
 
+    def test_feature_node_is_a_node_work_coordinate_without_project_seed(self) -> None:
+        feature_root = Path(self.temp.name) / "feature-only"
+        feature_root.mkdir()
+        (feature_root / "REPOSITORY_MANIFEST.md").write_text(
+            "# Feature-only project\n", encoding="utf-8"
+        )
+        self.store.register_project(
+            {"project_id": "feature-only", "project_root": str(feature_root)}
+        )
+        feature, created = self.store.create_feature_node(
+            "feature-only",
+            {
+                "idempotency_key": "feature-only-node",
+                "title": "Feature-only node",
+                "intent_text": "Own node-local Goals and Todos without a Project Seed.",
+                "created_by_role": "USER",
+            },
+        )
+        self.assertTrue(created)
+        goal = self.store.create_goal(
+            "feature-only",
+            self.goal(
+                "Feature Goal",
+                scope_kind="NODE",
+                node_ref=feature["feature_id"],
+            ),
+        )
+        todo = self.store.create_todo(
+            {
+                "scope_kind": "NODE",
+                "project_id": "feature-only",
+                "node_ref": feature["feature_id"],
+                "goal_id": goal["goal_id"],
+                "title": "Feature Todo",
+                "detail": "Node-local implementation work",
+                "priority": "P0",
+                "state": "READY",
+                "source_kind": "USER",
+                "sort_order": 0,
+            }
+        )
+
+        surface = self.store.project_work_surface(
+            "feature-only", node_ref=feature["feature_id"]
+        )
+
+        self.assertEqual("NODE", goal["scope_kind"])
+        self.assertEqual(feature["feature_id"], goal["node_ref"])
+        self.assertEqual(feature["feature_id"], todo["node_ref"])
+        self.assertEqual("FEATURE_NODE", surface["node"]["node_kind"])
+        self.assertEqual([goal["goal_id"]], [item["goal_id"] for item in surface["node"]["goals"]])
+        self.assertEqual([todo["todo_id"]], [item["todo_id"] for item in surface["node"]["todos"]])
+        self.assertEqual([], surface["node"]["documents"])
+
     def test_ui_exposes_selected_node_goal_scope(self) -> None:
         app = (ROOT / "tools" / "universe_ui" / "app.js").read_text(encoding="utf-8")
         page = (ROOT / "tools" / "universe_ui" / "index.html").read_text(encoding="utf-8")

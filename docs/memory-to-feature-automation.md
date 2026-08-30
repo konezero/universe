@@ -27,6 +27,12 @@ The durable order remains Feature Node before Goal and Todo. A proposal does not
 become a Feature Node merely because a model produced it, and a Feature Node does
 not create execution authority.
 
+An adopted Feature Node is also the canonical `NODE` work coordinate for the Goal
+derived from its Expected Path. The derived Goal and every applied Work Plan Todo
+therefore retain `scope_kind=NODE` and `node_ref=feature_id`. Historical Project
+Seed nodes remain valid node coordinates, but a current Project Seed is not required
+to open the work surface for a durable Feature Node.
+
 ## Existing foundations
 
 Universe already provides:
