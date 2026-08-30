@@ -411,6 +411,10 @@ PROJECT_MASTER_HANDOFF_TASK_FRAME_BINDING_SCHEMA = (
 GOAL_TODO_EXECUTION_SELECTION_SCHEMA = (
     "universe.goal-todo-execution-selection.v1"
 )
+GOAL_TASK_FRAME_ATTEMPT_SCHEMA = "universe.goal-task-frame-attempt.v1"
+GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA = (
+    "universe.goal-task-frame-result-application.v1"
+)
 GOAL_AUTOMATION_SCHEDULER_SCHEMA = "universe.goal-automation-scheduler.v1"
 PROJECT_SKILL_PLAN_MASTER_APPLICATION_SCHEMA = (
     "universe.project-skill-plan-master-application.v1"
@@ -3559,10 +3563,10 @@ def normalize_goal_todo_execution_selection_request(value: Any) -> dict[str, Any
         _identifier(item, "todo_ids[]")
         for item in _array(request["todo_ids"], "todo_ids")
     ]
-    if not todo_ids or len(todo_ids) > 100 or len(set(todo_ids)) != len(todo_ids):
+    if len(todo_ids) > 100 or len(set(todo_ids)) != len(todo_ids):
         raise UniverseError(
             "GOAL_TODO_SELECTION_INVALID",
-            "todo_ids must contain 1..100 unique Todo ids",
+            "todo_ids must contain 0..100 unique Todo ids",
         )
     return {
         **_normalize_goal_automation_actor(request),
@@ -6228,6 +6232,40 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS goal_todo_execution_selection_goal
                 ON goal_todo_execution_selection(goal_id, selected_at, selection_id);
+
+                CREATE TABLE IF NOT EXISTS goal_task_frame_attempt (
+                    attempt_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    handoff_id TEXT NOT NULL
+                        REFERENCES project_master_handoff(handoff_id)
+                        ON DELETE CASCADE,
+                    task_frame_id TEXT NOT NULL UNIQUE,
+                    parent_task_frame_id TEXT NOT NULL,
+                    retry_of_result_ref TEXT,
+                    attempt_ordinal INTEGER NOT NULL,
+                    attempt_digest TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(goal_id, attempt_ordinal)
+                );
+
+                CREATE INDEX IF NOT EXISTS goal_task_frame_attempt_goal
+                ON goal_task_frame_attempt(goal_id, attempt_ordinal, attempt_id);
+
+                CREATE TABLE IF NOT EXISTS goal_task_frame_result_application (
+                    application_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_goal(goal_id)
+                        ON DELETE CASCADE,
+                    task_frame_id TEXT NOT NULL,
+                    result_ref TEXT NOT NULL,
+                    result_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome = 'SUCCEEDED'),
+                    application_digest TEXT NOT NULL UNIQUE,
+                    applied_at TEXT NOT NULL,
+                    UNIQUE(task_frame_id, result_ref)
+                );
 
                 CREATE TABLE IF NOT EXISTS goal_automation_scheduler (
                     goal_id TEXT PRIMARY KEY
@@ -15177,6 +15215,31 @@ class UniverseStore:
             ).fetchone()
         return None if row is None else self._master_handoff_task_frame_binding_row(row)
 
+    def find_master_handoff_task_frame_binding_for_frame(
+        self, project_id: str, proposal_id: str, task_frame_id: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        normalized_proposal = _identifier(proposal_id, "proposal_id")
+        normalized_frame = _identifier(task_frame_id, "task_frame_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT DISTINCT binding.*
+                FROM project_master_handoff_task_frame AS binding
+                LEFT JOIN goal_task_frame_attempt AS attempt
+                  ON attempt.handoff_id = binding.handoff_id
+                WHERE binding.project_id = ? AND binding.proposal_id = ?
+                  AND (binding.task_frame_id = ? OR attempt.task_frame_id = ?)
+                """,
+                (
+                    project["project_id"],
+                    normalized_proposal,
+                    normalized_frame,
+                    normalized_frame,
+                ),
+            ).fetchone()
+        return None if row is None else self._master_handoff_task_frame_binding_row(row)
+
     def record_master_handoff_task_frame_binding(
         self,
         *,
@@ -15239,6 +15302,176 @@ class UniverseStore:
         return self._master_handoff_task_frame_binding_row(row), True
 
     @staticmethod
+    def _goal_task_frame_attempt_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema": GOAL_TASK_FRAME_ATTEMPT_SCHEMA,
+            "attempt_id": str(row["attempt_id"]),
+            "goal_id": str(row["goal_id"]),
+            "handoff_id": str(row["handoff_id"]),
+            "task_frame_id": str(row["task_frame_id"]),
+            "parent_task_frame_id": str(row["parent_task_frame_id"]),
+            "retry_of_result_ref": row["retry_of_result_ref"],
+            "attempt_ordinal": int(row["attempt_ordinal"]),
+            "attempt_digest": str(row["attempt_digest"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def list_goal_task_frame_attempts(self, goal_id: str) -> list[dict[str, Any]]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM goal_task_frame_attempt WHERE goal_id = ? ORDER BY attempt_ordinal, attempt_id",
+                (normalized_goal,),
+            ).fetchall()
+        return [self._goal_task_frame_attempt_row(row) for row in rows]
+
+    def record_goal_task_frame_attempt(
+        self,
+        *,
+        goal_id: str,
+        handoff_id: str,
+        task_frame_id: str,
+        parent_task_frame_id: str,
+        retry_of_result_ref: str,
+    ) -> tuple[dict[str, Any], bool]:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        material = {
+            "schema": GOAL_TASK_FRAME_ATTEMPT_SCHEMA,
+            "goal_id": normalized_goal,
+            "handoff_id": _identifier(handoff_id, "handoff_id"),
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+            "parent_task_frame_id": _identifier(parent_task_frame_id, "parent_task_frame_id"),
+            "retry_of_result_ref": _required_text(retry_of_result_ref, "retry_of_result_ref"),
+        }
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM goal_task_frame_attempt WHERE task_frame_id = ?",
+                (material["task_frame_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = self._goal_task_frame_attempt_row(existing)
+                expected = {key: current[key] for key in material}
+                if expected != material:
+                    raise UniverseError(
+                        "GOAL_TASK_FRAME_RETRY_CONFLICT",
+                        "retry Task Frame is already bound to different lineage",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            ordinal = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(attempt_ordinal), 0) + 1 FROM goal_task_frame_attempt WHERE goal_id = ?",
+                    (normalized_goal,),
+                ).fetchone()[0]
+            )
+            digest = _json_sha256({**material, "attempt_ordinal": ordinal})
+            attempt_id = "goal_task_frame_attempt_" + digest[:24]
+            now = utc_now()
+            connection.execute(
+                """
+                INSERT INTO goal_task_frame_attempt(
+                    attempt_id, goal_id, handoff_id, task_frame_id,
+                    parent_task_frame_id, retry_of_result_ref, attempt_ordinal,
+                    attempt_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id, normalized_goal, material["handoff_id"],
+                    material["task_frame_id"], material["parent_task_frame_id"],
+                    material["retry_of_result_ref"], ordinal, digest, now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_task_frame_attempt WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        assert row is not None
+        return self._goal_task_frame_attempt_row(row), True
+
+    def get_goal_task_frame_result_application(
+        self, goal_id: str
+    ) -> dict[str, Any] | None:
+        normalized_goal = _identifier(goal_id, "goal_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM goal_task_frame_result_application WHERE goal_id = ?",
+                (normalized_goal,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "schema": GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA,
+            **{key: row[key] for key in row.keys()},
+        }
+
+    def apply_goal_only_task_frame_result(
+        self,
+        *,
+        goal_id: str,
+        expected_goal_revision: int,
+        task_frame_id: str,
+        result_ref: str,
+        result_digest: str,
+    ) -> tuple[dict[str, Any], bool]:
+        goal = self.get_goal(goal_id)
+        material = {
+            "schema": GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA,
+            "goal_id": goal["goal_id"],
+            "task_frame_id": _identifier(task_frame_id, "task_frame_id"),
+            "result_ref": _required_text(result_ref, "result_ref"),
+            "result_digest": _sha256(result_digest, "result_digest"),
+            "outcome": "SUCCEEDED",
+        }
+        digest = _json_sha256(material)
+        application_id = "goal_result_application_" + digest[:24]
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM goal_task_frame_result_application WHERE goal_id = ?",
+                (goal["goal_id"],),
+            ).fetchone()
+            if existing is not None:
+                current = {
+                    "schema": GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA,
+                    **{key: existing[key] for key in existing.keys()},
+                }
+                if current["application_digest"] != digest:
+                    raise UniverseError(
+                        "GOAL_TASK_FRAME_RESULT_APPLICATION_CONFLICT",
+                        "Goal already has a different applied terminal result",
+                        HTTPStatus.CONFLICT,
+                    )
+                return current, False
+            now = utc_now()
+            cursor = connection.execute(
+                "UPDATE project_goal SET state = 'DONE', revision = revision + 1, updated_at = ? WHERE goal_id = ? AND revision = ?",
+                (now, goal["goal_id"], expected_goal_revision),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError(
+                    "GOAL_REVISION_CONFLICT", "Goal revision changed", HTTPStatus.CONFLICT
+                )
+            connection.execute(
+                """
+                INSERT INTO goal_task_frame_result_application(
+                    application_id, goal_id, task_frame_id, result_ref,
+                    result_digest, outcome, application_digest, applied_at
+                ) VALUES (?, ?, ?, ?, ?, 'SUCCEEDED', ?, ?)
+                """,
+                (
+                    application_id, goal["goal_id"], material["task_frame_id"],
+                    material["result_ref"], material["result_digest"], digest, now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM goal_task_frame_result_application WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        assert row is not None
+        return {
+            "schema": GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA,
+            **{key: row[key] for key in row.keys()},
+        }, True
+
+    @staticmethod
     def _goal_todo_execution_selection_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "schema": GOAL_TODO_EXECUTION_SELECTION_SCHEMA,
@@ -15248,6 +15481,11 @@ class UniverseStore:
             "handoff_id": str(row["handoff_id"]),
             "task_frame_id": str(row["task_frame_id"]),
             "todo_ids": json.loads(row["todo_ids_json"]),
+            "selection_kind": (
+                "GOAL_ONLY"
+                if not json.loads(row["todo_ids_json"])
+                else "WORK_PLAN_TODOS"
+            ),
             "provider": str(row["provider"]),
             "provider_session_ref_hash": str(row["provider_session_ref_hash"]),
             "session_id": str(row["session_id"]),
@@ -17517,29 +17755,160 @@ class UniverseStore:
             "queued_at": row["queued_at"],
         }
 
+    def _master_handoff_delivered_payload(
+        self, handoff: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        message_id = str(handoff.get("room_message_id") or "")
+        if not message_id:
+            return {}
+        for message in self.list_room_messages(handoff["project_id"], limit=500):
+            if message.get("message_id") != message_id:
+                continue
+            try:
+                payload = json.loads(str(message.get("body") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            return dict(payload) if isinstance(payload, Mapping) else {}
+        return {}
+
+    def _master_handoff_delivered_goal_revision(
+        self, handoff: Mapping[str, Any] | None
+    ) -> int:
+        if not isinstance(handoff, Mapping):
+            return 0
+        source = handoff.get("source")
+        source_goal = source.get("goal") if isinstance(source, Mapping) else None
+        source_revision = (
+            int(source_goal.get("revision") or 0)
+            if isinstance(source_goal, Mapping)
+            else 0
+        )
+        payload = self._master_handoff_delivered_payload(handoff)
+        try:
+            return int(payload.get("goal_revision") or source_revision)
+        except (TypeError, ValueError):
+            return source_revision
+
+    def _master_handoff_delivery_projection_requires_update(
+        self, handoff: Mapping[str, Any]
+    ) -> bool:
+        payload = self._master_handoff_delivered_payload(handoff)
+        source = payload.get("source")
+        if not isinstance(source, Mapping) or source.get("kind") != "GOAL_WORK_PLAN":
+            return False
+        # Before the bounded projection existed, the Project Room message
+        # embedded the full immutable plan/application/adoption documents.
+        # Re-deliver those historical messages once through the compact ref form.
+        return any(key in source for key in ("adoption", "application", "work_plan"))
+
     def deliver_master_handoff(
         self, project_id: str, handoff_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
         normalize_master_handoff_delivery_request(value)
         handoff = self.get_master_handoff(project_id, handoff_id)
-        if handoff["delivery_state"] != "PROPOSAL_ONLY":
+        historical_source = json.loads(_canonical_json(handoff["source"]))
+        source = historical_source
+        goal_revision = 0
+        if historical_source.get("kind") == "GOAL_WORK_PLAN":
+            current_goal = self.get_goal(historical_source["goal"]["goal_id"])
+            goal_revision = int(current_goal["revision"])
+            application = historical_source.get("application", {})
+            todo_ids = application.get("created_items", {}).get("todo_ids", [])
+            todos = [self.get_todo(todo_id) for todo_id in todo_ids]
+            adoption = historical_source.get("adoption", {})
+            work_plan = historical_source.get("work_plan", {})
+            plan = work_plan.get("plan", {})
+            # Project Room messages are one JSONL input line. Keep immutable
+            # source material in the DB and deliver only the latest Goal plus
+            # compact execution references; the Master can retrieve full
+            # Work Plan and Todo detail by these opaque IDs.
+            source = {
+                "kind": "GOAL_WORK_PLAN",
+                "goal": current_goal,
+                "adoption_ref": {
+                    key: adoption[key]
+                    for key in ("adoption_id", "work_plan_id", "goal_id")
+                    if adoption.get(key) is not None
+                },
+                "application_ref": {
+                    "application_id": application.get("application_id"),
+                    "work_plan_id": application.get("work_plan_id"),
+                    "todo_ids": list(todo_ids),
+                },
+                "work_plan_ref": {
+                    "work_plan_id": work_plan.get("work_plan_id"),
+                    "plan_digest": work_plan.get("plan_digest"),
+                    "title": plan.get("title"),
+                },
+                "todos": [
+                    {
+                        key: todo[key]
+                        for key in (
+                            "todo_id",
+                            "title",
+                            "state",
+                            "priority",
+                            "milestone_id",
+                            "revision",
+                        )
+                        if todo.get(key) is not None
+                    }
+                    for todo in todos
+                ],
+                "retrieval_ref": handoff["instruction_ref"],
+            }
+        delivered_payload = self._master_handoff_delivered_payload(handoff)
+        delivered_revision = self._master_handoff_delivered_goal_revision(handoff)
+        revision_update = goal_revision > delivered_revision
+        projection_update = bool(delivered_payload) and _json_sha256(
+            delivered_payload.get("source")
+        ) != _json_sha256(source)
+        room_message_id = str(handoff.get("room_message_id") or "")
+        room_delivery_failed = bool(
+            room_message_id
+            and any(
+                item.get("message_id") == room_message_id
+                and item.get("delivery_state") in {"FAILED", "DELIVERY_FAILED"}
+                for item in self.list_room_messages(handoff["project_id"])
+            )
+        )
+        if (
+            handoff["delivery_state"] not in {"PROPOSAL_ONLY", "DELIVERY_FAILED"}
+            and not room_delivery_failed
+            and not revision_update
+            and not projection_update
+        ):
             return handoff, False
+        update_kind = (
+            "GOAL_REVISION_UPDATE"
+            if revision_update
+            else "DELIVERY_PROJECTION_UPDATE"
+            if projection_update
+            else "INITIAL_HANDOFF"
+        )
+        delivery_material = {
+            "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
+            "handoff_id": handoff["handoff_id"],
+            "handoff_digest": handoff["handoff_digest"],
+            "goal_revision": goal_revision,
+            "update_kind": update_kind,
+            "source": source,
+            "purpose": handoff.get("purpose", "PROJECT_MASTER_REVIEW"),
+            "next_operation": "PROJECT_MASTER_REVIEW_OR_TASK_FRAME_PROPOSAL",
+        }
+        delivery_material["delivery_digest"] = _json_sha256(delivery_material)
         message, _ = self.send_room_message(
             handoff["project_id"],
             {
                 "kind": "TASK_DRAFT",
                 "sender": "UNIVERSE_CONDUCTOR",
-                "idempotency_key": "master-handoff-" + handoff["handoff_id"],
-                "body": _canonical_json(
-                    {
-                        "schema": PROJECT_MASTER_HANDOFF_SCHEMA,
-                        "handoff_id": handoff["handoff_id"],
-                        "handoff_digest": handoff["handoff_digest"],
-                        "source": handoff["source"],
-                        "purpose": handoff.get("purpose", "PROJECT_MASTER_REVIEW"),
-                        "next_operation": "PROJECT_MASTER_REVIEW_OR_TASK_FRAME_PROPOSAL",
-                    }
+                "idempotency_key": (
+                    "master-handoff-"
+                    + handoff["handoff_id"]
+                    + "-delivery-"
+                    + delivery_material["delivery_digest"][:24]
                 ),
+                "body": _canonical_json(delivery_material),
             },
         )
         delivered_at = utc_now()
@@ -17548,7 +17917,7 @@ class UniverseStore:
                 """
                 UPDATE project_master_handoff
                 SET delivery_state = ?, room_message_id = ?, delivered_at = ?
-                WHERE project_id = ? AND handoff_id = ? AND delivery_state = 'PROPOSAL_ONLY'
+                WHERE project_id = ? AND handoff_id = ?
                 """,
                 (
                     message["delivery_state"],
@@ -18701,7 +19070,7 @@ class UniverseStore:
             value,
             delivery_state="RECORDED",
         )
-        if not created:
+        if not created and message["delivery_state"] != "DELIVERY_FAILED":
             return message, False
         try:
             bridge = self.get_master_bridge(project_id)
@@ -25381,6 +25750,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "proposal_id": primary_id,
             "proposal_digest": primary_digest,
             "request_ref": instruction_ref,
+            "source_ref": _required_text(proposal.get("source_ref"), "proposal.source_ref"),
         }
         try:
             self.ensure_project_master(project["project_id"])
@@ -25412,6 +25782,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             or host_proposal_reference.get("proposal_id") != primary_id
             or host_proposal_reference.get("proposal_digest") != primary_digest
             or host_proposal_reference.get("request_ref") != instruction_ref
+            or host_proposal_reference.get(
+                "source_ref", proposal_reference["source_ref"]
+            ) != proposal_reference["source_ref"]
         ):
             raise UniverseError(
                 "INSTRUCTION_TASK_FRAME_RECEIPT_INVALID",
@@ -25584,13 +25957,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         handoff = None
         matching_proposals: list[dict[str, Any]] = []
         binding = None
+        result_application = self.store.get_goal_task_frame_result_application(goal["goal_id"])
+        attempts = self.store.list_goal_task_frame_attempts(goal["goal_id"])
         todo_execution = {
             "eligible_todo_ids": [],
             "selection": None,
             "action_receipts": [],
             "task_frame_results": [],
+            "attempts": attempts,
+            "result_application": result_application,
         }
-        if application is None and goal_start_receipt is not None:
+        if result_application is not None and goal["state"] == "DONE":
+            state = "GOAL_COMPLETED"
+            next_operation = "NONE"
+        elif application is None and goal_start_receipt is not None:
             state = "READY_FOR_GOAL_START_PLAN"
             next_operation = "MATERIALIZE_GOAL_START_PLAN"
         elif application is None:
@@ -25603,13 +25983,50 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             handoff = self.store.find_goal_work_plan_handoff(
                 goal["project_id"], application["application_id"]
             )
+            if handoff is not None:
+                source_goal = handoff.get("source", {}).get("goal", {})
+                source_revision = source_goal.get("revision")
+                if (
+                    isinstance(source_revision, int)
+                    and not isinstance(source_revision, bool)
+                    and goal["revision"] > source_revision
+                ):
+                    # A revised Goal keeps the applied Work Plan as historical
+                    # evidence.  The latest Goal Task Frame may continue, but
+                    # the older plan's generated Todos are not executable.
+                    todo_execution["eligible_todo_ids"] = []
             if handoff is None:
                 state = "READY_FOR_MASTER_HANDOFF"
                 next_operation = "CREATE_AND_DELIVER_MASTER_HANDOFF"
-            elif handoff["delivery_state"] == "PROPOSAL_ONLY":
+            else:
+                room_message_id = str(handoff.get("room_message_id") or "")
+                room_delivery_failed = bool(
+                    room_message_id
+                    and any(
+                        item.get("message_id") == room_message_id
+                        and item.get("delivery_state") in {
+                            "FAILED",
+                            "DELIVERY_FAILED",
+                        }
+                        for item in self.store.list_room_messages(goal["project_id"])
+                    )
+                )
+            if handoff is not None and (
+                handoff["delivery_state"] in {"PROPOSAL_ONLY", "DELIVERY_FAILED"}
+                or room_delivery_failed
+            ):
                 state = "MASTER_HANDOFF_READY"
                 next_operation = "DELIVER_MASTER_HANDOFF"
-            else:
+            elif handoff is not None and (
+                goal["revision"]
+                > self.store._master_handoff_delivered_goal_revision(handoff)
+                or self.store._master_handoff_delivery_projection_requires_update(
+                    handoff
+                )
+            ):
+                state = "MASTER_HANDOFF_UPDATE_READY"
+                next_operation = "DELIVER_MASTER_HANDOFF_UPDATE"
+            elif handoff is not None:
                 instruction_ref = handoff.get("instruction_ref")
                 matching_proposals = [
                     proposal
@@ -25640,9 +26057,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         todo_execution["action_receipts"] = (
                             self.store.list_goal_todo_action_receipts(goal["goal_id"])
                         )
+                        active_task_frame_id = (
+                            attempts[-1]["task_frame_id"]
+                            if attempts
+                            else binding["task_frame_id"]
+                        )
+                        binding = {**binding, "active_task_frame_id": active_task_frame_id}
                         try:
                             lineage = self.task_frame_lineage.get_task_frame(
-                                binding["task_frame_id"]
+                                active_task_frame_id
                             )
                         except TaskFrameLineageError:
                             lineage = None
@@ -25652,13 +26075,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                                     "result_ref": result["result_ref"],
                                     "result_digest": result["result_digest"],
                                     "attached_at": result["attached_at"],
+                                    "outcome": self._task_frame_result_outcome(result),
                                 }
                                 for result in lineage.get("results", [])
                             ]
                         if selection is None:
                             next_operation = "SELECT_TODOS_FOR_EXECUTION"
                         elif todo_execution["task_frame_results"]:
-                            next_operation = "APPLY_TASK_FRAME_RESULT"
+                            latest_result = todo_execution["task_frame_results"][-1]
+                            next_operation = (
+                                "APPLY_TASK_FRAME_RESULT"
+                                if latest_result["outcome"] == "SUCCEEDED"
+                                else "RETRY_TASK_FRAME"
+                            )
                         else:
                             next_operation = "RUN_TASK_FRAME"
         return {
@@ -25681,6 +26110,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "execution_assignment_created": False,
             },
         }
+
+    @staticmethod
+    def _task_frame_result_outcome(result: Mapping[str, Any]) -> str:
+        payload = result.get("result")
+        if isinstance(payload, Mapping):
+            legacy_todo_actions = payload.get("todo_actions")
+            if isinstance(legacy_todo_actions, list) and legacy_todo_actions:
+                return "SUCCEEDED"
+        children = payload.get("child_results") if isinstance(payload, Mapping) else None
+        if not isinstance(children, list) or not children:
+            return "FAILED"
+        for child in children:
+            child_result = child.get("result") if isinstance(child, Mapping) else None
+            if not isinstance(child_result, Mapping) or child_result.get("outcome") != "SUCCEEDED":
+                return "FAILED"
+            validation = child_result.get("validation")
+            if not isinstance(validation, list) or not validation:
+                return "FAILED"
+            if any(
+                not isinstance(item, Mapping)
+                or str(item.get("status") or "").upper() != "PASS"
+                for item in validation
+            ):
+                return "FAILED"
+        return "SUCCEEDED"
 
     @staticmethod
     def _goal_todo_action_request(
@@ -25740,10 +26194,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         assert isinstance(application, Mapping)
         assert isinstance(handoff, Mapping)
         assert isinstance(binding, Mapping)
-        eligible = set(
-            application.get("created_items", {}).get("todo_ids", [])
-        )
+        eligible = set(surface["todo_execution"].get("eligible_todo_ids", []))
         requested_ids = request["todo_ids"]
+        if not requested_ids and eligible:
+            raise UniverseError(
+                "GOAL_TODO_SELECTION_EMPTY_NOT_ALLOWED",
+                "an empty selection is allowed only when the latest Goal supersedes the applied Work Plan Todos",
+                HTTPStatus.CONFLICT,
+            )
         if any(todo_id not in eligible for todo_id in requested_ids):
             raise UniverseError(
                 "GOAL_TODO_SELECTION_SCOPE_MISMATCH",
@@ -25834,9 +26292,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
         self.resolve_todo_mutation_session(request)
+        active_task_frame_id = str(
+            binding.get("active_task_frame_id") or binding["task_frame_id"]
+        )
         try:
             lineage = self.task_frame_lineage.get_task_frame(
-                binding["task_frame_id"]
+                active_task_frame_id
             )
         except TaskFrameLineageError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
@@ -25854,6 +26315,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "result_ref is not attached to the bound Goal Task Frame",
                 HTTPStatus.NOT_FOUND,
             )
+        if self._task_frame_result_outcome(result) != "SUCCEEDED":
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RESULT_FAILED",
+                "failed Task Frame result cannot be applied; create a retry Task Frame",
+                HTTPStatus.CONFLICT,
+            )
         result_payload = result.get("result")
         if not isinstance(result_payload, Mapping):
             raise UniverseError(
@@ -25861,6 +26328,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Task Frame result payload must be an object",
                 HTTPStatus.CONFLICT,
             )
+        if selection.get("selection_kind") == "GOAL_ONLY":
+            application, created = self.store.apply_goal_only_task_frame_result(
+                goal_id=goal["goal_id"],
+                expected_goal_revision=request["expected_goal_revision"],
+                task_frame_id=active_task_frame_id,
+                result_ref=result["result_ref"],
+                result_digest=result["result_digest"],
+            )
+            return {
+                "schema": API_SCHEMA,
+                "status": (
+                    "GOAL_TASK_FRAME_RESULT_APPLIED"
+                    if created
+                    else "GOAL_TASK_FRAME_RESULT_APPLICATION_REPLAYED"
+                ),
+                "goal_id": goal["goal_id"],
+                "binding": binding,
+                "selection": selection,
+                "result_application": application,
+                "actions": [],
+                "surface": self.goal_automation_surface(goal["goal_id"]),
+            }
         raw_actions = _array(
             result_payload.get("todo_actions"), "task_frame_result.todo_actions"
         )
@@ -25949,6 +26438,99 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "surface": self.goal_automation_surface(goal["goal_id"]),
         }
 
+    def retry_goal_task_frame(self, goal_id: str, value: Any) -> dict[str, Any]:
+        request = _exact_object_fields(
+            value,
+            field="goal_task_frame_retry_request",
+            required=frozenset(
+                {"approval", "expected_goal_revision", "result_ref", "task_frame"}
+            ),
+        )
+        if request["approval"] != "RETRY_FAILED_RESULT":
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RETRY_APPROVAL_REQUIRED",
+                "approval must be RETRY_FAILED_RESULT",
+                HTTPStatus.CONFLICT,
+            )
+        surface = self.goal_automation_surface(goal_id)
+        goal = surface["goal"]
+        if goal["revision"] != request["expected_goal_revision"]:
+            raise UniverseError(
+                "GOAL_REVISION_CONFLICT",
+                "Goal revision changed before Task Frame retry",
+                HTTPStatus.CONFLICT,
+            )
+        binding = surface.get("binding")
+        handoff = surface.get("handoff")
+        proposals = surface.get("matching_proposals")
+        results = surface.get("todo_execution", {}).get("task_frame_results", [])
+        failed = next(
+            (
+                item for item in results
+                if item.get("result_ref") == request["result_ref"]
+                and item.get("outcome") == "FAILED"
+            ),
+            None,
+        )
+        if not isinstance(binding, Mapping) or not isinstance(handoff, Mapping) or failed is None:
+            raise UniverseError(
+                "GOAL_TASK_FRAME_FAILED_RESULT_REQUIRED",
+                "retry requires an attached failed result from the active Task Frame",
+                HTTPStatus.CONFLICT,
+            )
+        if not isinstance(proposals, list) or len(proposals) != 1:
+            raise UniverseError(
+                "GOAL_AUTOMATION_MASTER_PROPOSAL_AMBIGUOUS",
+                "retry requires one exact Master proposal",
+                HTTPStatus.CONFLICT,
+            )
+        proposal = proposals[0]
+        created = self.create_instruction_authorized_task_frame(
+            goal["project_id"],
+            proposal["proposal_id"],
+            {
+                "proposal_digest": proposal["proposal_digest"],
+                "task_frame": request["task_frame"],
+            },
+        )
+        host_frame = created.get("task_frame")
+        new_frame_id = (
+            host_frame.get("task_frame_id") if isinstance(host_frame, Mapping) else None
+        )
+        if not isinstance(new_frame_id, str):
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RETRY_RECEIPT_INVALID",
+                "Project Master did not return the retry Task Frame coordinate",
+                HTTPStatus.CONFLICT,
+            )
+        active_frame_id = str(
+            binding.get("active_task_frame_id") or binding["task_frame_id"]
+        )
+        if new_frame_id == active_frame_id:
+            raise UniverseError(
+                "GOAL_TASK_FRAME_RETRY_FRAME_REQUIRED",
+                "retry must use a new Task Frame id",
+                HTTPStatus.CONFLICT,
+            )
+        attempt, attempt_created = self.store.record_goal_task_frame_attempt(
+            goal_id=goal["goal_id"],
+            handoff_id=handoff["handoff_id"],
+            task_frame_id=new_frame_id,
+            parent_task_frame_id=active_frame_id,
+            retry_of_result_ref=request["result_ref"],
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": (
+                "GOAL_TASK_FRAME_RETRY_CREATED"
+                if attempt_created
+                else "GOAL_TASK_FRAME_RETRY_REPLAYED"
+            ),
+            "attempt": attempt,
+            "task_frame": created,
+            "surface": self.goal_automation_surface(goal["goal_id"]),
+        }
+
     def advance_goal_automation(
         self, goal_id: str, value: Any
     ) -> dict[str, Any]:
@@ -25989,7 +26571,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "MASTER_HANDOFF_CREATED" if created else "MASTER_HANDOFF_REUSED"
             )
             surface = self.goal_automation_surface(goal["goal_id"])
-        if surface["automation_state"] == "MASTER_HANDOFF_READY":
+        if surface["automation_state"] in {"MASTER_HANDOFF_READY", "MASTER_HANDOFF_UPDATE_READY"}:
             handoff = surface["handoff"]
             assert isinstance(handoff, Mapping)
             _delivered, delivered, _application = self.deliver_master_handoff(
@@ -26349,6 +26931,54 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             safe_children.append(child)
         return safe_children
 
+    @staticmethod
+    def _task_frame_room_message_body(
+        task_frame_id: str, visible_result: Mapping[str, Any]
+    ) -> str:
+        body_text = json.dumps(visible_result, ensure_ascii=False, indent=2)
+        if len(body_text) <= 20000:
+            return body_text
+        compact_children: list[dict[str, Any]] = []
+        raw_children = visible_result.get("child_results")
+        if isinstance(raw_children, list):
+            for item in raw_children[:6]:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_result = item.get("result")
+                result = raw_result if isinstance(raw_result, Mapping) else {}
+                compact_children.append(
+                    {
+                        "turn_id": str(item.get("turn_id") or "")[:128],
+                        "role": str(item.get("role") or "")[:64],
+                        "status": str(item.get("status") or "")[:64],
+                        "outcome": str(result.get("outcome") or "")[:64],
+                        "summary": str(result.get("summary") or "")[:1200],
+                        "evidence_refs": [
+                            str(value)[:256]
+                            for value in (result.get("evidence_refs") or [])[:2]
+                            if isinstance(value, str) and value.strip()
+                        ],
+                        "validation": [
+                            {
+                                "plane": str(entry.get("plane") or "")[:128],
+                                "state": str(entry.get("state") or "")[:32],
+                            }
+                            for entry in (result.get("validation") or [])[:3]
+                            if isinstance(entry, Mapping)
+                        ],
+                    }
+                )
+        compact = {
+            "schema": "universe.task-frame-room-result.v1",
+            "task_frame_id": task_frame_id,
+            "status": visible_result.get("status"),
+            "boss_turn_id": visible_result.get("boss_turn_id"),
+            "child_results": compact_children,
+            "redaction_state": "COMPACT_SUMMARY_ONLY",
+            "full_result_ref": f"task-frame-lineage://{task_frame_id}",
+        }
+        return json.dumps(compact, ensure_ascii=False, indent=2)
+
     def _complete_task_frame_room(
         self,
         project_id: str,
@@ -26380,8 +27010,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 {
                     "author_role": "BOSS",
                     "kind": "MESSAGE",
-                    "body_text": json.dumps(
-                        visible_result, ensure_ascii=False, indent=2
+                    "body_text": self._task_frame_room_message_body(
+                        task_frame_id, visible_result
                     ),
                     "provider_event_id": f"task-frame-result:{task_frame_id}",
                     "correlation_id": task_frame_id,
@@ -26424,6 +27054,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except TaskFrameLineageError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
+    def _existing_instruction_task_frame_result(
+        self,
+        *,
+        project_id: str,
+        proposal_id: str,
+        proposal_digest: str,
+        task_frame_id: str,
+    ) -> dict[str, Any] | None:
+        binding = self.store.find_master_handoff_task_frame_binding_for_frame(
+            project_id, proposal_id, task_frame_id
+        )
+        if binding is None or binding["proposal_digest"] != proposal_digest:
+            return None
+        try:
+            frame = self.task_frame_lineage.get_task_frame(task_frame_id)
+        except TaskFrameLineageError:
+            return None
+        for attached in reversed(frame.get("results", [])):
+            payload = attached.get("result")
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("status") != "INSTRUCTION_TASK_FRAME_COMPLETED":
+                continue
+            host_result = {
+                **dict(payload),
+                "project_id": project_id,
+                "primary_proposal_id": proposal_id,
+                "task_frame_id": task_frame_id,
+                "redaction_state": "TERMINAL_RESULT_REUSED",
+            }
+            return {
+                "host_result": host_result,
+                "task_frame_result": {"result": attached, "created": False},
+            }
+        return None
+
     def run_instruction_authorized_task_frame(
         self,
         project_id: str,
@@ -26454,6 +27120,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         primary_digest = _sha256(
             proposal.get("proposal_digest"), "primary_proposal.proposal_digest"
         )
+        existing = self._existing_instruction_task_frame_result(
+            project_id=project["project_id"],
+            proposal_id=primary_id,
+            proposal_digest=primary_digest,
+            task_frame_id=frame_id,
+        )
+        if existing is not None:
+            host_result = existing["host_result"]
+            task_frame_room = self._complete_task_frame_room(
+                project["project_id"], frame_id, host_result
+            )
+            self.publish_project_room_changed(project["project_id"])
+            return {
+                "schema": API_SCHEMA,
+                "status": "INSTRUCTION_TASK_FRAME_COMPLETED",
+                "project_id": project["project_id"],
+                "primary_proposal_id": primary_id,
+                "task_frame": host_result,
+                "task_frame_result": existing["task_frame_result"],
+                "task_frame_room": task_frame_room,
+            }
         try:
             self.ensure_project_master(project["project_id"])
             bridge = self.store.get_master_bridge(project["project_id"])
@@ -26768,6 +27455,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         request = normalize_master_handoff_delivery_request(value)
         with self.project_skill_plan_application_lock:
             handoff = self.store.get_master_handoff(project_id, handoff_id)
+            # Bridge credentials are process-local.  A durable handoff may
+            # outlive a Universe server restart, so every delivery must first
+            # ensure and re-register the current resident Master bridge.
+            try:
+                self.ensure_project_master(project_id)
+            except (OSError, ProjectMasterHostError) as error:
+                raise UniverseError(
+                    "PROJECT_MASTER_UNAVAILABLE",
+                    str(error),
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                ) from error
             application = None
             source = handoff.get("source")
             if isinstance(source, Mapping) and source.get("kind") == "SKILL_PLAN":
@@ -32759,6 +33457,28 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return
         if status not in {"COMPLETED", "FAILED"}:
             return
+        if status == "FAILED":
+            message = next(
+                (
+                    item
+                    for item in self.store.list_room_messages(project_id)
+                    if item.get("message_id") == message_id
+                ),
+                None,
+            )
+            if message is not None and message.get("delivery_state") != "FAILED":
+                self.store._update_room_delivery(
+                    message,
+                    delivery_state="FAILED",
+                    delivery={
+                        **dict(message.get("delivery") or {}),
+                        "status": "FAILED",
+                        "failed_at": utc_now(),
+                        "detail": str(
+                            event.get("reason") or "PROJECT_MASTER_FAILED"
+                        ),
+                    },
+                )
         try:
             self.store.apply_master_message_todo_transition(
                 project_id,
@@ -38391,6 +39111,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self.server.select_goal_todos_for_execution(
                         unquote(goal_todo_selection.group(1)), body
+                    ),
+                )
+                return
+            goal_task_frame_retry = re.fullmatch(
+                r"/v1/goals/([^/]+)/automation/task-frame-retries", path
+            )
+            if goal_task_frame_retry is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.retry_goal_task_frame(
+                        unquote(goal_task_frame_retry.group(1)), body
                     ),
                 )
                 return

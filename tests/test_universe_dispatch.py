@@ -10,6 +10,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +165,49 @@ class UniverseDispatchTests(unittest.TestCase):
         finally:
             if previous is not None:
                 os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+    def test_task_frame_run_uses_its_dedicated_long_timeout(self) -> None:
+        observed: dict[str, float] = {}
+
+        class Response:
+            status = HTTPStatus.OK
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"status":"INSTRUCTION_TASK_FRAME_COMPLETED"}'
+
+        def open_request(_request: object, *, timeout: float):
+            observed["timeout"] = timeout
+            return Response()
+
+        previous = os.environ.get("UNIVERSE_TEST_MASTER_TOKEN")
+        os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = "bridge-test-token"
+        try:
+            with patch("universe_dispatch.urlopen", side_effect=open_request):
+                receipt = HttpProjectMasterBridge(
+                    endpoint="http://127.0.0.1:9010",
+                    credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+                    timeout_seconds=7.0,
+                    task_frame_timeout_seconds=1200.0,
+                ).run_instruction_authorized_task_frame(
+                    bridge={"project_id": "GCS"},
+                    task_frame_id="task-frame-001",
+                    primary_proposal_id="task-proposal-001",
+                    primary_proposal_digest="a" * 64,
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+            else:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
+
+        self.assertEqual("DELIVERED", receipt["status"])
+        self.assertEqual(1200.0, observed["timeout"])
 
     def test_master_bridge_delivers_a_bound_room_envelope(self) -> None:
         captured: dict[str, object] = {}

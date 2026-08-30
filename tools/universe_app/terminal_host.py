@@ -17,6 +17,7 @@ import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping
+from functools import wraps
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -51,6 +52,15 @@ from universe_app.reconnection_host import (
 
 
 MANAGED_SAMPLE_INTERVAL_SECONDS = 5.0
+
+
+def _serialize_reconnection_lifecycle(method):
+    @wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._reconnection_lifecycle_lock:
+            return method(self, *args, **kwargs)
+
+    return serialized
 
 
 def resolve_shell_identity(pid: int | None) -> ProcessIdentity | None:
@@ -688,6 +698,7 @@ class TerminalHost:
         self._managed_sample_interval = MANAGED_SAMPLE_INTERVAL_SECONDS
         self._spawn = spawn or spawn_conpty
         self._lock = threading.Lock()
+        self._reconnection_lifecycle_lock = threading.RLock()
         self._sessions: dict[str, TerminalSession] = {}
         self._reconnection_registry = reconnection_registry
         self.bus = SessionBus(database_path=database_path)
@@ -860,6 +871,7 @@ class TerminalHost:
             )
         return results
 
+    @_serialize_reconnection_lifecycle
     def reconcile_reconnection_hosts(self) -> list[dict[str, Any]]:
         """Rebuild process-local TerminalSession rows from live Rust Hosts."""
 
@@ -868,6 +880,11 @@ class TerminalHost:
             return []
         with self._lock:
             active_terminal_ids = set(self._sessions)
+            active_anchor_refs = {
+                session.session_anchor_ref
+                for session in self._sessions.values()
+                if session.state == "LIVE" and session.session_anchor_ref
+            }
         latest: dict[str, str] = {}
         for event in self.audit.list(limit=1000):
             terminal_id = str(event.get("terminal_id") or "").strip()
@@ -901,6 +918,9 @@ class TerminalHost:
             if details.get("backend_owner") != "RUST_RECONNECTION_HOST":
                 continue
             anchor_ref = str(details.get("session_anchor_ref") or "").strip()
+            if anchor_ref in active_anchor_refs:
+                unmatched_live_anchors.discard(anchor_ref)
+                continue
             cwd = str(details.get("cwd") or "").strip()
             executable = str(details.get("executable") or "").strip()
             if not anchor_ref or not cwd or not executable:
@@ -1041,6 +1061,7 @@ class TerminalHost:
             )
             self._ensure_pump(session)
             active_terminal_ids.add(terminal_id)
+            active_anchor_refs.add(anchor_ref)
             results.append(
                 {
                     "terminal_id": terminal_id,
@@ -1077,6 +1098,7 @@ class TerminalHost:
         self._refresh_session_state(session)
         return session
 
+    @_serialize_reconnection_lifecycle
     def create(
         self,
         *,
@@ -1088,6 +1110,7 @@ class TerminalHost:
         effort: str = "AUTO",
         supervisor_session_id: str = "",
         session_anchor_ref: str = "",
+        replace_terminal_id: str = "",
         resume_session_ref: str = "",
         launch_profile: str = "INTERACTIVE",
         provider_arguments: Sequence[str] = (),
@@ -1114,6 +1137,25 @@ class TerminalHost:
             raise TerminalHostError(
                 "TERMINAL_ANCHOR_REQUIRED",
                 "a resolved Session Anchor is required before spawning a terminal",
+            )
+        replacement_id = str(replace_terminal_id or "").strip()
+        if replacement_id:
+            with self._lock:
+                replacement = self._sessions.get(replacement_id)
+            if (
+                replacement is None
+                or replacement.state != "LIVE"
+                or replacement.session_anchor_ref != anchor_ref
+            ):
+                raise TerminalHostError(
+                    "TERMINAL_REPLACEMENT_IDENTITY_MISMATCH",
+                    "replacement must name the live terminal on this Session Anchor",
+                )
+            # create/reconcile share the lifecycle RLock, so the exact old Host
+            # cannot be rediscovered between this termination and the spawn.
+            self.terminate(
+                replacement_id,
+                audit_context={"reason": "ATOMIC_TERMINAL_REPLACEMENT"},
             )
         with self._lock:
             if any(
@@ -2035,11 +2077,13 @@ class TerminalHost:
         mode: str,
         provider: str = "",
         supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> dict[str, Any] | None:
         wanted_project = str(project_id or "").strip()
         wanted_mode = str(mode or "").strip().upper()
         wanted_provider = str(provider or "").strip().upper()
         wanted_supervisor = str(supervisor_session_id or "").strip()
+        wanted_anchor = str(session_anchor_ref or "").strip()
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
@@ -2058,6 +2102,10 @@ class TerminalHost:
             and (
                 not wanted_supervisor
                 or item.supervisor_session_id == wanted_supervisor
+            )
+            and (
+                not wanted_anchor
+                or item.session_anchor_ref == wanted_anchor
             )
         ]
         if not rows:

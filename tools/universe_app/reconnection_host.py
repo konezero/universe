@@ -48,6 +48,15 @@ class ReconnectionHostError(RuntimeError):
     """Raised when discovery, validation, or authenticated IPC fails."""
 
 
+class ReconnectionHostRuntimeStopped(ReconnectionHostError):
+    """An exact authenticated Host remains, but its owned runtime exited."""
+
+    def __init__(self, client: "ReconnectionHostClient", runtime_state: str) -> None:
+        super().__init__(f"Authenticated Host runtime is not LIVE: {runtime_state}")
+        self.client = client
+        self.runtime_state = runtime_state
+
+
 def provision_private_registry_directory(
     root: Path,
     *,
@@ -381,6 +390,9 @@ class ReconnectionHostRegistry:
                 raise ReconnectionHostError(
                     f"Authenticated Host handshake returned a different {name}"
                 )
+        runtime_state = str(observed.get("runtime_state") or "UNKNOWN")
+        if runtime_state != "LIVE":
+            raise ReconnectionHostRuntimeStopped(client, runtime_state)
         return client
 
     def list_live_clients(self) -> list[ReconnectionHostClient]:
@@ -427,18 +439,49 @@ class ReconnectionHostRegistry:
         if state_path.exists():
             try:
                 return self.discover(anchor_ref)
+            except ReconnectionHostRuntimeStopped as stopped_host:
+                stopped_host.client.shutdown()
+                deadline = time.monotonic() + min(max(timeout, 0.1), 5.0)
+                while process_is_alive(stopped_host.client.state.pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if process_is_alive(stopped_host.client.state.pid):
+                    raise ReconnectionHostError(
+                        "Authenticated stopped Host did not terminate for replacement"
+                    ) from stopped_host
+                state_path.unlink(missing_ok=True)
             except ReconnectionHostError as discovery_error:
                 try:
                     stale_state = self._read_state(anchor_ref)
                 except ReconnectionHostError as state_error:
-                    raise ReconnectionHostError(
-                        "Refusing to replace an unvalidated Host discovery record"
-                    ) from state_error
-                if process_is_alive(stale_state.pid):
-                    raise ReconnectionHostError(
-                        "Refusing to replace discovery for a live but unreachable Host"
-                    ) from discovery_error
-                state_path.unlink()
+                    # Early v1 Host records predate host_kind/owner_ref. They are
+                    # not trusted for live reattachment, but an exact same-schema,
+                    # same-Anchor record whose recorded PID is dead can be safely
+                    # reclaimed when this Anchor is explicitly requested again.
+                    try:
+                        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+                        legacy_pid = _require_positive_int(legacy.get("pid"), "pid")
+                        legacy_anchor = _require_string(
+                            legacy.get("anchor_ref"), "anchor_ref"
+                        )
+                        legacy_reclaimable = (
+                            legacy.get("schema") == STATE_SCHEMA
+                            and legacy_anchor == anchor_ref
+                            and not process_is_alive(legacy_pid)
+                        )
+                    except (OSError, json.JSONDecodeError, ReconnectionHostError):
+                        legacy_reclaimable = False
+                    if not legacy_reclaimable:
+                        raise ReconnectionHostError(
+                            "Refusing to replace an unvalidated Host discovery record "
+                            f"for {anchor_ref}: {state_error}"
+                        ) from state_error
+                    state_path.unlink()
+                else:
+                    if process_is_alive(stale_state.pid):
+                        raise ReconnectionHostError(
+                            "Refusing to replace discovery for a live but unreachable Host"
+                        ) from discovery_error
+                    state_path.unlink()
         normalized_host_kind = host_kind.strip().upper()
         if normalized_host_kind != "SESSION":
             raise ValueError("host_kind currently supports SESSION only")

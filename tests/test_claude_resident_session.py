@@ -17,6 +17,7 @@ from claude_resident_session import (  # noqa: E402
     SESSION_STOPPED,
     ClaudeResidentError,
     ClaudeResidentSession,
+    ClaudeStreamProcess,
 )
 
 
@@ -559,6 +560,133 @@ class ClaudeResidentSessionTests(unittest.TestCase):
             "CLAUDE_SESSION_RESUME_NOT_FOUND",
         ):
             session.send_message("go", lambda _d: None)
+
+
+class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
+    def test_existing_exact_host_terminal_is_reused_without_cli_relaunch(self) -> None:
+        import queue
+        from types import SimpleNamespace
+
+        class Host:
+            def __init__(self) -> None:
+                self.find_arguments: dict[str, Any] = {}
+                self.create_calls = 0
+                self.writes: list[tuple[str, bytes]] = []
+                self.waiter: queue.Queue = queue.Queue()
+
+            def find_live(self, **kwargs):
+                self.find_arguments = dict(kwargs)
+                return {
+                    "terminal_id": "term-existing",
+                    "session_anchor_ref": "anchor-exact",
+                    "launch_profile": "SUPERVISED_STDIO",
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                }
+
+            def create(self, **_kwargs):
+                self.create_calls += 1
+                raise AssertionError("existing Host terminal must be reused")
+
+            def subscribe(self, terminal_id):
+                self.subscribed = terminal_id
+                return self.waiter
+
+            def unsubscribe(self, _terminal_id, waiter):
+                waiter.put_nowait(None)
+
+            def close(self, terminal_id):
+                self.closed = terminal_id
+
+            def get(self, _terminal_id):
+                return SimpleNamespace(state="LIVE")
+
+            def write(self, terminal_id, data):
+                self.writes.append((terminal_id, bytes(data)))
+
+        host = Host()
+        process = ClaudeStreamProcess(
+            executable=Path("claude.exe"),
+            arguments=("-p",),
+            cwd=Path("."),
+            environment={},
+            event_handler=lambda _event: None,
+            terminal_host=host,
+            project_id="universe",
+            mode="MASTER",
+            supervisor_session_id="supervisor-master",
+            session_anchor_ref="anchor-exact",
+        )
+        try:
+            process.send_user_message("continue")
+            self.assertEqual(0, host.create_calls)
+            self.assertEqual("anchor-exact", host.find_arguments["session_anchor_ref"])
+            self.assertEqual("term-existing", host.subscribed)
+            self.assertEqual("term-existing", host.writes[0][0])
+        finally:
+            process.close()
+        self.assertFalse(hasattr(host, "closed"))
+
+    def test_process_bound_permission_channel_restarts_stale_host_terminal(self) -> None:
+        import queue
+        from types import SimpleNamespace
+
+        class Host:
+            def __init__(self) -> None:
+                self.created = 0
+                self.create_kwargs: dict[str, Any] = {}
+                self.waiter: queue.Queue = queue.Queue()
+
+            def find_live(self, **_kwargs):
+                return {
+                    "terminal_id": "term-stale",
+                    "session_anchor_ref": "anchor-exact",
+                    "launch_profile": "SUPERVISED_STDIO",
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                }
+
+            def create(self, **kwargs):
+                self.created += 1
+                self.create_kwargs = dict(kwargs)
+                return {
+                    "terminal_id": "term-fresh",
+                    "session_anchor_ref": "anchor-exact",
+                    "launch_profile": "SUPERVISED_STDIO",
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                }
+
+            def subscribe(self, _terminal_id):
+                return self.waiter
+
+            def unsubscribe(self, _terminal_id, waiter):
+                waiter.put_nowait(None)
+
+            def get(self, _terminal_id):
+                return SimpleNamespace(state="LIVE")
+
+            def write(self, _terminal_id, _data):
+                return None
+
+        host = Host()
+        process = ClaudeStreamProcess(
+            executable=Path("claude.exe"),
+            arguments=("-p",),
+            cwd=Path("."),
+            environment={},
+            event_handler=lambda _event: None,
+            terminal_host=host,
+            project_id="universe",
+            mode="MASTER",
+            supervisor_session_id="supervisor-master",
+            session_anchor_ref="anchor-exact",
+            reuse_live_terminal=False,
+        )
+        try:
+            self.assertEqual(1, host.created)
+            self.assertEqual(
+                "term-stale", host.create_kwargs["replace_terminal_id"]
+            )
+        finally:
+            process.close()
 
 
 if __name__ == "__main__":

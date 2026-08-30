@@ -123,12 +123,14 @@ class ClaudeStreamProcess:
         mode: str = "",
         supervisor_session_id: str = "",
         session_anchor_ref: str = "",
+        reuse_live_terminal: bool = True,
     ) -> None:
         self._executable = executable.expanduser().resolve()
         self._arguments = tuple(arguments)
         self._terminal_host = terminal_host
         self._terminal_id = ""
         self._terminal_waiter: queue.Queue | None = None
+        self._durable_terminal = False
         self._process = None
         if terminal_host is None:
             request = NativeCliRequest(
@@ -145,18 +147,56 @@ class ClaudeStreamProcess:
                 else open_native_cli(request, opener=opener)
             )
         else:
-            terminal = terminal_host.create(
-                project_id=project_id,
-                mode=mode,
-                cwd=str(cwd),
-                provider="CLAUDE",
-                supervisor_session_id=supervisor_session_id,
-                session_anchor_ref=session_anchor_ref,
-                launch_profile="SUPERVISED_STDIO",
-                provider_arguments=list(self._arguments),
-                provider_environment={str(k): str(v) for k, v in environment.items()},
-                cols=240,
-                rows=40,
+            find_live = getattr(terminal_host, "find_live", None)
+            terminal = (
+                find_live(
+                    project_id=project_id,
+                    mode=mode,
+                    provider="CLAUDE",
+                    supervisor_session_id=supervisor_session_id,
+                    session_anchor_ref=session_anchor_ref,
+                )
+                if callable(find_live)
+                else None
+            )
+            replace_terminal_id = ""
+            if terminal is not None and not reuse_live_terminal:
+                # The Permission MCP bootstrap is bound to the Claude process
+                # that consumed its one-time config.  Ask the Supervisor to
+                # replace that exact Host atomically, preventing its recovery
+                # poller from reattaching between terminate and create.
+                replace_terminal_id = str(terminal.get("terminal_id") or "")
+                if not replace_terminal_id:
+                    raise ClaudeResidentError(
+                        "CLAUDE_SUPERVISED_TERMINAL_RESTART_UNAVAILABLE"
+                    )
+                terminal = None
+            if terminal is None:
+                terminal = terminal_host.create(
+                    project_id=project_id,
+                    mode=mode,
+                    cwd=str(cwd),
+                    provider="CLAUDE",
+                    supervisor_session_id=supervisor_session_id,
+                    session_anchor_ref=session_anchor_ref,
+                    replace_terminal_id=replace_terminal_id,
+                    launch_profile="SUPERVISED_STDIO",
+                    provider_arguments=list(self._arguments),
+                    provider_environment={str(k): str(v) for k, v in environment.items()},
+                    cols=240,
+                    rows=40,
+                )
+            elif (
+                str(terminal.get("session_anchor_ref") or "") != session_anchor_ref
+                or str(terminal.get("launch_profile") or "")
+                != "SUPERVISED_STDIO"
+            ):
+                raise ClaudeResidentError(
+                    "CLAUDE_SUPERVISED_TERMINAL_IDENTITY_MISMATCH"
+                )
+            self._durable_terminal = (
+                str(terminal.get("backend_owner") or "")
+                == "RUST_RECONNECTION_HOST"
             )
             self._terminal_id = str(terminal.get("terminal_id") or "")
             if not self._terminal_id:
@@ -224,10 +264,11 @@ class ClaudeStreamProcess:
             waiter = self._terminal_waiter
             if waiter is not None:
                 self._terminal_host.unsubscribe(self._terminal_id, waiter)
-            try:
-                self._terminal_host.close(self._terminal_id)
-            except Exception:
-                pass
+            if not self._durable_terminal:
+                try:
+                    self._terminal_host.close(self._terminal_id)
+                except Exception:
+                    pass
         elif self._process is not None and self._process.poll() is None:
             self._process.terminate()
             try:
@@ -378,6 +419,10 @@ class ClaudeResidentSession:
             "mode": mode,
             "supervisor_session_id": supervisor_session_id,
             "session_anchor_ref": session_anchor_ref,
+            # A Permission MCP config is one-time and process-bound.  After a
+            # Supervisor restart, preserve the Claude conversation via
+            # --resume but do not reuse the process bound to the old broker.
+            "reuse_live_terminal": permission_mcp_config is None,
         }
         self.permission_bridge = permission_bridge
         # Blocks until the MCP permission server has registered. A turn must

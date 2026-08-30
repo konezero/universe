@@ -7575,6 +7575,40 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertIsNone(self.server.project_master_stream_snapshot("GCS"))
 
+    def test_master_completion_failure_persists_room_delivery_without_stream(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        message, _created = self.server.store.create_room_message(
+            "GCS",
+            {
+                "kind": "TASK_DRAFT",
+                "body": "Run the bounded Master turn.",
+                "idempotency_key": "room-master-completion-failed-001",
+            },
+            delivery_state="ACCEPTED_BY_MASTER",
+        )
+
+        self.server._observe_project_master_completion(
+            {
+                "status": "FAILED",
+                "project_id": "GCS",
+                "message_id": message["message_id"],
+                "provider_session_ref": "opaque-project-master-session",
+                "reason": "PROVIDER_REPLY_FAILED:ClaudeResidentError",
+            }
+        )
+
+        failed = next(
+            item
+            for item in self.server.store.list_room_messages("GCS")
+            if item["message_id"] == message["message_id"]
+        )
+        self.assertEqual("FAILED", failed["delivery_state"])
+        self.assertEqual("FAILED", failed["delivery"]["status"])
+        self.assertEqual(
+            "PROVIDER_REPLY_FAILED:ClaudeResidentError",
+            failed["delivery"]["detail"],
+        )
+
     def test_master_bridge_stream_event_is_authenticated_and_published(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, registered = self.request(
@@ -10676,6 +10710,68 @@ class UniverseLocalServiceTests(unittest.TestCase):
             forwarded["task_frame"]["source_review_result"],
         )
 
+    def test_task_frame_result_outcome_rejects_failed_workers(self) -> None:
+        failed = {
+            "result": {
+                "child_results": [
+                    {
+                        "result": {
+                            "outcome": "FAILED",
+                            "validation": [{"status": "FAIL"}],
+                        }
+                    }
+                ]
+            }
+        }
+        passed = {
+            "result": {
+                "child_results": [
+                    {
+                        "result": {
+                            "outcome": "SUCCEEDED",
+                            "validation": [{"status": "PASS"}],
+                        }
+                    }
+                ]
+            }
+        }
+        self.assertEqual("FAILED", self.server._task_frame_result_outcome(failed))
+        self.assertEqual("SUCCEEDED", self.server._task_frame_result_outcome(passed))
+
+    def test_goal_only_result_application_completes_goal_atomically(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        goal = self.server.store.create_goal(
+            "GCS",
+            {
+                "title": "Goal-only automation",
+                "description": "Complete without generated Todos.",
+                "owner": "CONDUCTOR",
+                "state": "ACTIVE",
+                "sort_order": 0,
+            },
+        )
+        application, created = self.server.store.apply_goal_only_task_frame_result(
+            goal_id=goal["goal_id"],
+            expected_goal_revision=goal["revision"],
+            task_frame_id="goal-only-frame-001",
+            result_ref="task-frame-terminal:goal-only-001",
+            result_digest="a" * 64,
+        )
+        self.assertTrue(created)
+        self.assertEqual("SUCCEEDED", application["outcome"])
+        completed = self.server.store.get_goal(goal["goal_id"])
+        self.assertEqual("DONE", completed["state"])
+        self.assertEqual(goal["revision"] + 1, completed["revision"])
+        replay, replay_created = self.server.store.apply_goal_only_task_frame_result(
+            goal_id=goal["goal_id"],
+            expected_goal_revision=completed["revision"],
+            task_frame_id="goal-only-frame-001",
+            result_ref="task-frame-terminal:goal-only-001",
+            result_digest="a" * 64,
+        )
+        self.assertFalse(replay_created)
+        self.assertEqual(application["application_id"], replay["application_id"])
+
     def test_instruction_task_frame_http_route_uses_proposal_reference_only(
         self,
     ) -> None:
@@ -10739,6 +10835,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "proposal_id": proposal["proposal_id"],
                 "proposal_digest": proposal["proposal_digest"],
                 "request_ref": proposal["request_ref"],
+                "source_ref": proposal["source_ref"],
             },
             forwarded["proposal_reference"],
         )
@@ -10823,6 +10920,80 @@ class UniverseLocalServiceTests(unittest.TestCase):
             client.run_instruction_authorized_task_frame.call_args.kwargs
         )
         self.assertNotIn("approval_evidence_ref", run_forwarded)
+
+        with (
+            patch.object(
+                self.server.store,
+                "find_master_handoff_task_frame_binding_for_frame",
+                return_value={
+                    "proposal_id": proposal["proposal_id"],
+                    "proposal_digest": proposal["proposal_digest"],
+                    "task_frame_id": "instruction-frame-001",
+                },
+            ),
+            patch.object(self.server, "ensure_project_master", return_value={}),
+            patch.object(self.server.store, "get_master_bridge", return_value=bridge),
+            patch("universe_server.HttpProjectMasterBridge", return_value=client),
+        ):
+            retry_status, retry_result = self.request(
+                "POST",
+                "/v1/projects/GCS/governance-proposals/"
+                "task_proposal_test_001/instruction-task-frames/"
+                "instruction-frame-001/run",
+                {},
+                self.token,
+            )
+
+        self.assertEqual(HTTPStatus.OK, retry_status)
+        self.assertFalse(retry_result["task_frame_result"]["created"])
+        self.assertEqual(
+            "TERMINAL_RESULT_REUSED",
+            retry_result["task_frame"]["redaction_state"],
+        )
+        self.assertEqual(1, client.run_instruction_authorized_task_frame.call_count)
+
+    def test_task_frame_room_message_compacts_oversized_result(self) -> None:
+        visible_result = {
+            "schema": "universe.task-frame-room-result.v1",
+            "task_frame_id": "oversized-frame-001",
+            "status": "INSTRUCTION_TASK_FRAME_COMPLETED",
+            "boss_turn_id": "boss",
+            "child_results": [
+                {
+                    "turn_id": f"qa-{index}",
+                    "role": "QA_REVIEWER",
+                    "status": "TURN_COMPLETED",
+                    "result": {
+                        "outcome": "SUCCEEDED",
+                        "summary": "evidence " * 2000,
+                        "evidence_refs": ["test://" + ("x" * 600)] * 32,
+                        "validation": [
+                            {
+                                "plane": "focused-tests-" + ("x" * 300),
+                                "state": "PASS",
+                                "evidence_refs": ["test://" + ("y" * 600)] * 8,
+                            }
+                        ]
+                        * 32,
+                    },
+                }
+                for index in range(8)
+            ],
+            "redaction_state": "STRUCTURED_SUMMARY_ONLY",
+        }
+
+        body_text = self.server._task_frame_room_message_body(
+            "oversized-frame-001", visible_result
+        )
+        compact = json.loads(body_text)
+
+        self.assertLessEqual(len(body_text), 20000)
+        self.assertEqual("COMPACT_SUMMARY_ONLY", compact["redaction_state"])
+        self.assertEqual(
+            "task-frame-lineage://oversized-frame-001",
+            compact["full_result_ref"],
+        )
+        self.assertEqual(6, len(compact["child_results"]))
 
     def test_closed_boss_room_history_projects_task_frame_timeline(self) -> None:
         self.server.runtime_host.repository_root = self.project_root
@@ -12776,12 +12947,171 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
         self.assertEqual("MASTER_HANDOFF_SOURCE_NOT_FOUND", unknown["error_code"])
 
+    def test_goal_automation_surface_treats_failed_handoff_as_retryable(self) -> None:
+        goal = {"goal_id": "goal_retry_001", "project_id": "GCS", "revision": 1}
+        application = {
+            "application_id": "work_plan_application_retry_001",
+            "created_items": {"todo_ids": ["todo_retry_001"]},
+        }
+        failed_handoff = {
+            "handoff_id": "handoff_retry_0123456789abcdef",
+            "delivery_state": "DELIVERY_FAILED",
+            "source": {"goal": {"revision": 1}},
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={"goal": goal, "application": application},
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_start_receipt_for_goal",
+                return_value=None,
+            ),
+            patch.object(
+                self.server.store, "get_goal_automation_scheduler", return_value=None
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_work_plan_handoff",
+                return_value=failed_handoff,
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual("MASTER_HANDOFF_READY", surface["automation_state"])
+        self.assertEqual("DELIVER_MASTER_HANDOFF", surface["next_operation"])
+        self.assertEqual(["todo_retry_001"], surface["todo_execution"]["eligible_todo_ids"])
+
+    def test_goal_automation_surface_retries_failed_master_room_turn(self) -> None:
+        goal = {"goal_id": "goal_room_retry_001", "project_id": "GCS", "revision": 1}
+        application = {
+            "application_id": "work_plan_application_room_retry_001",
+            "created_items": {"todo_ids": ["todo_room_retry_001"]},
+        }
+        handoff = {
+            "handoff_id": "handoff_room_retry_0123456789",
+            "delivery_state": "QUEUED_FOR_MASTER",
+            "room_message_id": "room_failed_master_turn_001",
+            "source": {"goal": {"revision": 1}},
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={"goal": goal, "application": application},
+            ),
+            patch.object(
+                self.server.store, "find_goal_start_receipt_for_goal", return_value=None
+            ),
+            patch.object(
+                self.server.store, "get_goal_automation_scheduler", return_value=None
+            ),
+            patch.object(
+                self.server.store, "find_goal_work_plan_handoff", return_value=handoff
+            ),
+            patch.object(
+                self.server.store,
+                "list_room_messages",
+                return_value=[
+                    {
+                        "message_id": "room_failed_master_turn_001",
+                        "delivery_state": "FAILED",
+                    }
+                ],
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual("MASTER_HANDOFF_READY", surface["automation_state"])
+        self.assertEqual("DELIVER_MASTER_HANDOFF", surface["next_operation"])
+
+    def test_goal_automation_surface_delivers_latest_goal_revision_update(self) -> None:
+        goal = {"goal_id": "goal_stale_001", "project_id": "GCS", "revision": 2}
+        application = {
+            "application_id": "work_plan_application_stale_001",
+            "created_items": {"todo_ids": ["todo_stale_001"]},
+        }
+        stale_handoff = {
+            "handoff_id": "handoff_stale_0123456789abcdef",
+            "delivery_state": "QUEUED_FOR_MASTER",
+            "source": {"goal": {"revision": 1}},
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={"goal": goal, "application": application},
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_start_receipt_for_goal",
+                return_value=None,
+            ),
+            patch.object(
+                self.server.store, "get_goal_automation_scheduler", return_value=None
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_work_plan_handoff",
+                return_value=stale_handoff,
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual("MASTER_HANDOFF_UPDATE_READY", surface["automation_state"])
+        self.assertEqual(
+            "DELIVER_MASTER_HANDOFF_UPDATE", surface["next_operation"]
+        )
+        self.assertEqual(
+            [], surface["todo_execution"]["eligible_todo_ids"]
+        )
+
+    def test_goal_automation_surface_redelivers_legacy_unbounded_projection(self) -> None:
+        goal = {"goal_id": "goal_projection_001", "project_id": "GCS", "revision": 2}
+        application = {
+            "application_id": "work_plan_application_projection_001",
+            "created_items": {"todo_ids": ["todo_projection_001"]},
+        }
+        handoff = {
+            "handoff_id": "handoff_projection_0123456789",
+            "delivery_state": "QUEUED_FOR_MASTER",
+            "source": {"goal": {"revision": 2}},
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={"goal": goal, "application": application},
+            ),
+            patch.object(
+                self.server.store, "find_goal_start_receipt_for_goal", return_value=None
+            ),
+            patch.object(
+                self.server.store, "get_goal_automation_scheduler", return_value=None
+            ),
+            patch.object(
+                self.server.store, "find_goal_work_plan_handoff", return_value=handoff
+            ),
+            patch.object(
+                self.server.store,
+                "_master_handoff_delivered_goal_revision",
+                return_value=2,
+            ),
+            patch.object(
+                self.server.store,
+                "_master_handoff_delivery_projection_requires_update",
+                return_value=True,
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual("MASTER_HANDOFF_UPDATE_READY", surface["automation_state"])
+        self.assertEqual("DELIVER_MASTER_HANDOFF_UPDATE", surface["next_operation"])
+
     def test_goal_automation_advance_creates_and_delivers_handoff_once(self) -> None:
         goal = {"goal_id": "goal_auto_001", "project_id": "GCS", "revision": 1}
         application = {"application_id": "work_plan_application_auto_001"}
         ready_handoff = {
             "handoff_id": "handoff_0123456789abcdef01234567",
-            "delivery_state": "PROPOSAL_ONLY",
+            "delivery_state": "DELIVERY_FAILED",
         }
         delivered_handoff = {
             **ready_handoff,

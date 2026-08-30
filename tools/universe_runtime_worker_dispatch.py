@@ -38,6 +38,7 @@ PROVIDER_ALIASES = {
 RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS = 90
 READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS = 240
+QA_WORKER_RESPONSE_TIMEOUT_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -357,14 +358,7 @@ class RuntimeWorkerDispatcher:
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
             "max_turns": request["max_turns"],
-            "response_timeout_seconds": (
-                max(
-                    self.worker_response_timeout_seconds,
-                    READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS,
-                )
-                if request["repository_write_scope"] == "NONE"
-                else self.worker_response_timeout_seconds
-            ),
+            "response_timeout_seconds": self._response_timeout_seconds_for(request),
             "result_mode": request["result_mode"],
         }
 
@@ -1097,12 +1091,14 @@ class RuntimeWorkerDispatcher:
             gateway = UniverseAcpGateway(
                 GrokAcpSession(
                     executable=executable,
-                    cwd=Path(tempfile.gettempdir()),
+                    cwd=self._worker_cwd(request),
                     environment=environment,
                     model=model,
                     system_prompt=self._system_prompt(runtime_profile),
                     session_id=None,
-                    permission_requester=self._reject_task_frame_permission,
+                    permission_requester=lambda permission: self._task_frame_permission(
+                        request, permission
+                    ),
                     session_observer=session_ids.append,
                     ephemeral=True,
                     response_timeout_seconds=float(
@@ -1160,12 +1156,14 @@ class RuntimeWorkerDispatcher:
             gateway = UniverseAcpGateway(
                 CodexAppServerSession(
                     executable=executable,
-                    cwd=Path(tempfile.gettempdir()),
+                    cwd=self._worker_cwd(request),
                     environment=environment,
                     model=model,
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
-                    permission_requester=self._reject_task_frame_permission,
+                    permission_requester=lambda permission: self._task_frame_permission(
+                        request, permission
+                    ),
                     session_observer=session_ids.append,
                     ephemeral=True,
                     response_timeout_seconds=float(
@@ -1234,15 +1232,17 @@ class RuntimeWorkerDispatcher:
             gateway = UniverseAcpGateway(
                 ClaudeCodeSession(
                     executable=executable,
-                    cwd=Path(tempfile.gettempdir()),
+                    cwd=self._worker_cwd(request),
                     environment=environment,
                     model=model,
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
-                    permission_requester=self._reject_task_frame_permission,
+                    permission_requester=lambda permission: self._task_frame_permission(
+                        request, permission
+                    ),
                     session_observer=session_ids.append,
                     ephemeral=True,
-                    allow_read_only_tools=False,
+                    allow_read_only_tools=self._is_qa_reviewer(request),
                     max_turns=int(request.get("max_turns", 8)),
                     response_timeout_seconds=float(
                         request["response_timeout_seconds"]
@@ -1295,9 +1295,10 @@ class RuntimeWorkerDispatcher:
         if runtime_profile == "TASK_FRAME_RUNTIME":
             return (
                 "You are a bounded Task Frame Runtime provider. You receive all "
-                "usable context in the supplied Context Pack. Do not inspect local "
-                "files, create files, modify files, invoke subagents, or claim "
-                "authority. Source mutation is Host-gateway-only. Return only the "
+                "usable context in the supplied Context Pack. Follow the Role Scope "
+                "at the end of the request. Do not create or modify files, invoke "
+                "subagents, or claim authority. Source mutation is Host-gateway-only. "
+                "Return only the "
                 "requested result content."
             )
         return (
@@ -1320,13 +1321,65 @@ class RuntimeWorkerDispatcher:
             if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON"
             else ""
         )
+        role_scope = (
+            "\n\nRole Scope: Read the necessary files and run tests, builds, and "
+            "validation commands. Report discovered problems with evidence and "
+            "reproduction steps. Do not modify files."
+            if RuntimeWorkerDispatcher._is_qa_reviewer(request)
+            else ""
+        )
         return (
             f"Task Frame ID: "
             f"{_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
             f"Turn ID: {_required_text(request.get('turn_id'), 'turn_id')}\n\n"
             f"Context Pack:\n{context_pack}\n\n"
-            f"Output Contract:\n{output_contract}{format_instruction}"
+            f"Output Contract:\n{output_contract}{format_instruction}{role_scope}"
         )
+
+    @staticmethod
+    def _is_qa_reviewer(request: Mapping[str, Any]) -> bool:
+        context = request.get("context_pack")
+        return isinstance(context, Mapping) and (
+            str(context.get("semantic_role") or "").upper() == "QA_REVIEWER"
+        )
+
+    def _response_timeout_seconds_for(self, request: Mapping[str, Any]) -> float:
+        if self._is_qa_reviewer(request):
+            return max(
+                self.worker_response_timeout_seconds,
+                QA_WORKER_RESPONSE_TIMEOUT_SECONDS,
+            )
+        if request["repository_write_scope"] == "NONE":
+            return max(
+                self.worker_response_timeout_seconds,
+                READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS,
+            )
+        return self.worker_response_timeout_seconds
+
+    def _worker_cwd(self, request: Mapping[str, Any]) -> Path:
+        return (
+            self.repository_root
+            if self._is_qa_reviewer(request)
+            else Path(tempfile.gettempdir())
+        )
+
+    @classmethod
+    def _task_frame_permission(
+        cls, task_request: Mapping[str, Any], permission: Mapping[str, Any]
+    ) -> str | None:
+        wanted = (
+            {"allow_once", "allow_always"}
+            if cls._is_qa_reviewer(task_request)
+            else {"reject_once", "reject_always"}
+        )
+        for option in permission.get("options", []):
+            if (
+                isinstance(option, Mapping)
+                and option.get("kind") in wanted
+                and isinstance(option.get("optionId"), str)
+            ):
+                return option["optionId"]
+        return None
 
     @staticmethod
     def _reject_task_frame_permission(request: Mapping[str, Any]) -> str | None:

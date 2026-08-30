@@ -4,6 +4,7 @@ import base64
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -254,6 +255,79 @@ class TerminalHostTests(unittest.TestCase):
                 supervisor_session_id="provider-session",
             )
             self.assertEqual([(1, True)], observations)
+            host.terminate(created["terminal_id"])
+
+    def test_create_serializes_host_attach_against_background_reconcile(self) -> None:
+        registry = FakeReconnectionRegistry()
+        reconcile_started = threading.Event()
+        reconcile_finished = threading.Event()
+        reconcile_thread: threading.Thread | None = None
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "ATOMIC"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(
+                audit_database_path=Path(tmp) / "audit.sqlite3",
+                reconnection_registry=registry,
+            )
+            host.record_audit_event(
+                "TERMINAL_CREATED",
+                terminal={
+                    "terminal_id": "term_previous",
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "provider": "CODEX",
+                    "supervisor_session_id": "provider-session-old",
+                },
+                details={
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                    "reconnection_host_id": "host-test",
+                    "session_anchor_ref": "anchor-atomic-host",
+                    "cwd": tmp,
+                    "executable": "cmd.exe",
+                    "created_at": "2026-08-29T00:00:00Z",
+                },
+            )
+            original_launch = registry.launch
+
+            def launch(anchor_ref: str, **config):
+                client = original_launch(anchor_ref, **config)
+                original_request = client.request
+
+                def request(action: str, **fields):
+                    nonlocal reconcile_thread
+                    if action == "execute":
+                        def reconcile() -> None:
+                            reconcile_started.set()
+                            host.reconcile_reconnection_hosts()
+                            reconcile_finished.set()
+
+                        reconcile_thread = threading.Thread(target=reconcile)
+                        reconcile_thread.start()
+                        self.assertTrue(reconcile_started.wait(1))
+                        self.assertFalse(reconcile_finished.wait(0.05))
+                    return original_request(action, **fields)
+
+                client.request = request
+                return client
+
+            registry.launch = launch
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-atomic-host",
+                provider="CODEX",
+                supervisor_session_id="provider-session-new",
+            )
+            self.assertIsNotNone(reconcile_thread)
+            reconcile_thread.join(timeout=1)
+            self.assertTrue(reconcile_finished.is_set())
+            self.assertEqual(1, registry.clients["anchor-atomic-host"].generation)
             host.terminate(created["terminal_id"])
 
     def test_reconcile_uses_complete_creation_history_for_live_registry_hosts(self) -> None:

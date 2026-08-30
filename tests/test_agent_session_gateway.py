@@ -704,6 +704,24 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertIsNotNone(observed)
         self.assertEqual(91.5, observed["config"]["creditUsagePercent"])
 
+    def test_grok_projects_extension_payment_failure_instead_of_missing_response(self) -> None:
+        class QuotaFailureTransport(FakeJsonRpcTransport):
+            def request(self, method: str, params: Mapping[str, Any], *, timeout_seconds: float = 300) -> Any:
+                if method != "session/prompt":
+                    return super().request(method, params, timeout_seconds=timeout_seconds)
+                self.requests.append((method, dict(params)))
+                self.notification_handler("_x.ai/session/update", {"sessionId": params["sessionId"], "update": {"sessionUpdate": "turn_completed", "stop_reason": "error", "agent_result": "API error (status 402 Payment Required): Grok Build usage balance exhausted"}})
+                return {"stopReason": "end_turn"}
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", QuotaFailureTransport):
+            session = GrokAcpSession(executable=self.root / "grok.exe", cwd=self.root, environment={}, system_prompt="System", session_id="grok-session-existing", permission_requester=lambda _request: None, session_observer=lambda _session_id: None)
+            with self.assertRaisesRegex(AgentSessionError, "GROK_ACP_QUOTA_EXHAUSTED") as captured:
+                session.prompt("Question", lambda _delta: None)
+            session.close()
+
+        self.assertNotIn("Payment Required", str(captured.exception))
+        self.assertNotIn("balance exhausted", str(captured.exception))
+
     def test_grok_returns_only_the_post_tool_assistant_message(self) -> None:
         class MultiMessageTransport(FakeJsonRpcTransport):
             def request(

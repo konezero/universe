@@ -48,6 +48,39 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_qa_role_runs_from_repository_and_allows_one_tool_use(self) -> None:
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        qa_request = {
+            **self.request,
+            "context_pack": {"semantic_role": "QA_REVIEWER"},
+        }
+        permission = {
+            "options": [
+                {"kind": "allow_once", "optionId": "allow-once"},
+                {"kind": "reject_once", "optionId": "reject-once"},
+            ]
+        }
+
+        self.assertEqual(self.root.resolve(), dispatcher._worker_cwd(qa_request))
+        self.assertEqual(900, dispatcher._response_timeout_seconds_for(qa_request))
+        self.assertEqual(
+            "allow-once",
+            dispatcher._task_frame_permission(qa_request, permission),
+        )
+        prompt = dispatcher._worker_prompt(qa_request)
+        self.assertIn("run tests, builds, and validation commands", prompt)
+        self.assertIn("Do not modify files", prompt)
+
+        review_request = {
+            **self.request,
+            "context_pack": {"semantic_role": "SECURITY_REVIEWER"},
+        }
+        self.assertNotEqual(self.root.resolve(), dispatcher._worker_cwd(review_request))
+        self.assertEqual(
+            "reject-once",
+            dispatcher._task_frame_permission(review_request, permission),
+        )
+
     def test_codex_task_frame_requests_ephemeral_provider_session(self) -> None:
         observed: list[tuple[bool, str, float]] = []
 

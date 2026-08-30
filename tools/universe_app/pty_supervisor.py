@@ -319,7 +319,13 @@ class SupervisedTerminalHost:
             detail = error.reason
             try:
                 parsed = json.loads(error.read().decode("utf-8"))
-                detail = str(parsed.get("error_code") or parsed.get("detail") or detail)
+                error_code = str(parsed.get("error_code") or "").strip()
+                error_detail = str(parsed.get("detail") or "").strip()
+                detail = (
+                    f"{error_code}: {error_detail}"
+                    if error_code and error_detail
+                    else error_code or error_detail or str(detail)
+                )
             except Exception:
                 pass
             raise TerminalHostError(str(detail), str(detail)) from error
@@ -358,7 +364,11 @@ class SupervisedTerminalHost:
 
     def create(self, **kwargs: Any) -> dict[str, Any]:
         payload = self._request(
-            "POST", "/v1/terminals", payload=kwargs, audit_source="UNIVERSE_TERMINAL_CREATE"
+            "POST",
+            "/v1/terminals",
+            payload=kwargs,
+            timeout=90.0,
+            audit_source="UNIVERSE_TERMINAL_CREATE",
         )
         terminal = payload.get("terminal")
         if not isinstance(terminal, dict):
@@ -499,9 +509,11 @@ class SupervisedTerminalHost:
         mode: str,
         provider: str = "",
         supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> dict[str, Any] | None:
         wanted_provider = str(provider or "").strip().upper()
         wanted_supervisor = str(supervisor_session_id or "").strip()
+        wanted_anchor = str(session_anchor_ref or "").strip()
         rows = [
             item
             for item in self.list_sessions()
@@ -517,6 +529,10 @@ class SupervisedTerminalHost:
                 not wanted_supervisor
                 or str(item.get("supervisor_session_id") or "")
                 == wanted_supervisor
+            )
+            and (
+                not wanted_anchor
+                or str(item.get("session_anchor_ref") or "") == wanted_anchor
             )
         ]
         if not rows:

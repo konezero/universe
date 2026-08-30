@@ -1210,6 +1210,7 @@ class GrokAcpSession:
         self._quota_snapshot = _unknown_quota_snapshot("GROK", "_x.ai/billing")
         self._active_delta: Callable[[str], None] | None = None
         self._active_message_reset: Callable[[], None] | None = None
+        self._active_failure_code: str | None = None
         self._bootstrap_pending = True
         self._git_trace2 = GitTrace2Observer(cwd)
         environment = self._git_trace2.environment(environment)
@@ -1264,6 +1265,7 @@ class GrokAcpSession:
 
         self._active_delta = receive
         self._active_message_reset = reset_message
+        self._active_failure_code = None
         prompt_text = text
         if self._bootstrap_pending:
             prompt_text = f"{self.system_prompt}\n\n{text}"
@@ -1288,6 +1290,8 @@ class GrokAcpSession:
         if not isinstance(result, Mapping):
             raise AgentSessionError("GROK_ACP_PROMPT_RESULT_INVALID")
         output = "".join(parts).strip()
+        if not output and self._active_failure_code is not None:
+            raise AgentSessionError(self._active_failure_code)
         if not output:
             raise AgentSessionError("GROK_ACP_RESPONSE_MISSING")
         return output
@@ -1459,12 +1463,23 @@ class GrokAcpSession:
             self.session_observer(session_id)
 
     def _handle_notification(self, method: str, params: Mapping[str, Any]) -> None:
-        if method != "session/update" or self._active_delta is None:
+        if method not in {"session/update", "_x.ai/session/update"} or self._active_delta is None:
             return
         update = params.get("update")
         if not isinstance(update, Mapping):
             return
         update_type = update.get("sessionUpdate")
+        if method == "_x.ai/session/update" and (
+            (update_type == "retry_state" and update.get("type") == "failed")
+            or (update_type == "turn_completed" and update.get("stop_reason") == "error")
+        ):
+            failure_text = str(update.get("message") or update.get("agent_result") or "").casefold()
+            self._active_failure_code = (
+                "GROK_ACP_QUOTA_EXHAUSTED"
+                if "402" in failure_text or "balance exhausted" in failure_text
+                else "GROK_ACP_TURN_FAILED"
+            )
+            return
         if update_type == "tool_call":
             if self._active_message_reset is not None:
                 self._active_message_reset()

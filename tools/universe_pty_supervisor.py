@@ -513,6 +513,7 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("supervisor_session_id") or ""
                     ),
                     session_anchor_ref=spawn_anchor_ref,
+                    replace_terminal_id=str(body.get("replace_terminal_id") or ""),
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
                     launch_profile=str(body.get("launch_profile") or "INTERACTIVE"),
                     provider_arguments=tuple(body.get("provider_arguments") or ()),
@@ -528,7 +529,12 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.CONFLICT,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
                 )
                 return
             self._send(

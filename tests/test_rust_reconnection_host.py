@@ -191,6 +191,43 @@ class RustReconnectionHostTests(unittest.TestCase):
                         time.sleep(0.05)
                     self.assertFalse(process_is_alive(host_pid))
 
+    def test_launch_replaces_exact_authenticated_host_after_child_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            anchor_ref = "anchor-stopped-runtime-recovery"
+            first = registry.launch(anchor_ref, cwd=root, shell_args=("/Q",))
+            first_status = first.status()
+            first_host_pid = int(first_status["pid"])
+            replacement = None
+            try:
+                import ctypes
+
+                child_pid = int(first_status["child_pid"])
+                handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, child_pid)
+                self.assertTrue(handle)
+                try:
+                    self.assertTrue(ctypes.windll.kernel32.TerminateProcess(handle, 0))
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                deadline = time.monotonic() + 5
+                while first.status().get("runtime_state") == "LIVE" and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertNotEqual("LIVE", first.status().get("runtime_state"))
+
+                replacement = registry.launch(anchor_ref, cwd=root, shell_args=("/Q",))
+                replacement_status = replacement.status()
+                self.assertEqual("LIVE", replacement_status["runtime_state"])
+                self.assertNotEqual(first_status["host_id"], replacement_status["host_id"])
+                self.assertNotEqual(first_host_pid, int(replacement_status["pid"]))
+            finally:
+                active = replacement or first
+                try:
+                    active.shutdown()
+                except Exception:
+                    pass
+                registry.reap_launched_process(anchor_ref)
+
     def test_shutdown_terminates_host_owned_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

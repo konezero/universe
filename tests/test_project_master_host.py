@@ -759,6 +759,20 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("same commander_surface and evidence_ref", prompt)
         self.assertIn("scope or boundary changes", prompt)
 
+    def test_resumed_project_room_prompt_repeats_headless_proposal_contract(self) -> None:
+        prompt = CodexProjectMasterRuntime._prompt(
+            {
+                "message_id": "msg-goal",
+                "kind": "ROOM_MESSAGE",
+                "sender": "UNIVERSE_CONDUCTOR",
+                "body": "goal handoff",
+            }
+        )
+        self.assertIn("never enter a provider-native Plan Mode", prompt)
+        self.assertIn("never call ExitPlanMode", prompt)
+        self.assertIn("create or reuse that Task Proposal", prompt)
+        self.assertIn("Do not wait inside the provider terminal", prompt)
+
     def test_legacy_provider_coordinate_is_migrated_without_deletion(self) -> None:
         database = self.root / "legacy-state.sqlite"
         legacy = ProjectMasterSessionStore(database, "GCS")
@@ -1704,6 +1718,26 @@ class ProjectMasterHostTests(unittest.TestCase):
             recovered["master_session_ref"],
         )
 
+    def test_recovery_prioritizes_latest_durable_message(self) -> None:
+        older = self._envelope()
+        older["message"]["message_id"] = "room_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        older["message"]["created_at"] = "2026-08-29T13:29:33Z"
+        newer = json.loads(json.dumps(older))
+        newer["message"]["message_id"] = "room_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        newer["message"]["created_at"] = "2026-08-29T13:56:48Z"
+        self.assertTrue(self.state.register(older))
+        self.assertTrue(self.state.register(newer))
+
+        recovered = self.state.recover()
+
+        self.assertEqual(
+            [
+                "room_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "room_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+            [item["message"]["message_id"] for item in recovered],
+        )
+
     def test_recovery_rejects_partial_transport_rebinding(self) -> None:
         with self.assertRaisesRegex(
             ProjectMasterHostError, "MASTER_RECOVERY_TRANSPORT_INCOMPLETE"
@@ -1759,6 +1793,27 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(self.provider.messages))
         self.assertEqual("COMPLETE", self.state.state(self._message_id()))
         self.assertEqual("bridge_abcdef0123456789abcd", self.replies[0]["bridge_id"])
+
+    def test_cancelled_claude_turn_is_recovered_on_reprepare(self) -> None:
+        self.assertTrue(self.state.register(self._envelope()))
+        self.assertTrue(self.state.claim(self._message_id()))
+        self.state.fail(
+            self._message_id(),
+            "ProjectMasterHostError: CLAUDE_TURN_CANCELLED",
+        )
+
+        worker = self._worker()
+        worker.start(
+            recovery_bridge_id="bridge_abcdef0123456789abcd",
+            recovery_session_ref="grok-acp:resumed-master-session",
+        )
+        try:
+            self.assertTrue(worker.wait_idle())
+        finally:
+            worker.close()
+
+        self.assertEqual(1, len(self.provider.messages))
+        self.assertEqual("COMPLETE", self.state.state(self._message_id()))
 
     def test_provider_start_timeout_is_requeued_only_by_explicit_recovery(self) -> None:
         self.assertTrue(self.state.register(self._envelope()))
@@ -3520,6 +3575,62 @@ class ProjectMasterHostTests(unittest.TestCase):
                 task_frame_id="frame-session-lineage-001", binding=binding
             )
 
+    def test_task_frame_source_evidence_is_bounded_to_declared_targets(self) -> None:
+        runtime_cli = self.root / ".ai/runtime/reference_runtime/cli.py"
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+        target = self.root / "tools" / "bounded.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("value = 2\n", encoding="utf-8")
+        requests = []
+
+        def native_runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="universe.windows-native-cli.v1",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout="diff --git a/tools/bounded.py b/tools/bounded.py\n",
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        coordinator = ProjectModeCoordinator(
+            self.root, "GCS", "codex:session-001", native_runner=native_runner
+        )
+        evidence = coordinator._task_frame_source_evidence(
+            source_ref="git:" + "a" * 40,
+            mutation_scope={"operations": ["MODIFY"], "targets": [str(target)]},
+        )
+        self.assertEqual("CAPTURED", evidence["diff_status"])
+        self.assertEqual(["tools/bounded.py"], [item["path"] for item in evidence["targets"]])
+        self.assertIn("tools/bounded.py", evidence["diff"])
+        self.assertEqual(("diff", "--no-ext-diff", "--unified=3"), requests[0].arguments[:3])
+        self.assertEqual(("--", "tools/bounded.py"), requests[0].arguments[-2:])
+
+    def test_runtime_turn_projection_restores_semantic_roles(self) -> None:
+        runtime_turns = [
+            {"turn_id": "boss", "role": "BOSS"},
+            {"turn_id": "impl", "role": "SUB_REVIEWER"},
+            {"turn_id": "qa", "role": "SUB_REVIEWER"},
+        ]
+        restored = ProjectModeCoordinator._restore_semantic_task_frame_turns(
+            runtime_turns,
+            lineage={
+                "turns": [
+                    {"turn_id": "boss", "role": "BOSS"},
+                    {"turn_id": "impl", "role": "IMPLEMENTER"},
+                    {"turn_id": "qa", "role": "QA_REVIEWER"},
+                ]
+            },
+        )
+        self.assertEqual(
+            ["BOSS", "IMPLEMENTER", "QA_REVIEWER"],
+            [turn["role"] for turn in restored],
+        )
+
     def test_instruction_authorized_task_frame_uses_v2_profile_without_approval_artifact(
         self,
     ) -> None:
@@ -3890,7 +4001,7 @@ class ProjectMasterHostTests(unittest.TestCase):
                     },
                 }
             if operation["operation"] == "submit_boss_allocations":
-                return {"status": "BOSS_ALLOCATIONS_RECORDED"}
+                return {"status": "BOSS_ALLOCATIONS_ALREADY_RECORDED"}
             return {"status": "TURN_INPUTS_READY", "inputs": []}
 
         with (
@@ -3905,7 +4016,23 @@ class ProjectMasterHostTests(unittest.TestCase):
                         "execution_gate": {
                             "approval_ref": "universe://projects/GCS/decisions/primary-001",
                             "execution_plan": plan,
-                        }
+                        },
+                        "boss_allocations": [
+                            {
+                                "boss_worker_id": "original-boss-worker-001",
+                                "turn_id": "implement",
+                                "worker_slot_ref": "implementation-worker",
+                                "worker_path": "/root/boss/implement",
+                                "task": "Implement the approved work.",
+                                "expected_output": {"result": "implementation"},
+                                "mutation_scope": {
+                                    "operations": ["MODIFY"],
+                                    "targets": [target],
+                                },
+                                "skill_bindings": [],
+                                "allocation_id": "allocation-existing",
+                            }
+                        ],
                     },
                 },
             ),
@@ -3925,7 +4052,7 @@ class ProjectMasterHostTests(unittest.TestCase):
         )
         self.assertEqual(["boss", "implement"], [call["turn_id"] for call in dispatches])
         self.assertTrue(dispatches[0]["defer_terminal_result"])
-        self.assertEqual("boss-worker-001", dispatches[1]["invoker_actor_ref"])
+        self.assertEqual("original-boss-worker-001", dispatches[1]["invoker_actor_ref"])
         self.assertEqual("BOUNDED", dispatches[1]["repository_write_scope"])
         self.assertEqual(
             {"operations": ["MODIFY"], "targets": [target]},
@@ -3945,6 +4072,33 @@ class ProjectMasterHostTests(unittest.TestCase):
             ["result://implementation"],
             result["child_results"][0]["result"]["evidence_refs"],
         )
+
+    def test_completed_child_result_is_reused_without_a_new_worker_claim(self) -> None:
+        reused = ProjectModeCoordinator._reused_completed_child_result(
+            {
+                "turn_id": "security-review",
+                "state": "COMPLETED",
+                "result": {
+                    "outcome": "SUCCEEDED",
+                    "summary": "Security review passed.",
+                    "evidence_refs": ["review://security"],
+                    "validation": [{"plane": "security", "status": "PASS"}],
+                },
+            },
+            semantic_role="SECURITY_REVIEWER",
+        )
+
+        self.assertEqual("TURN_COMPLETED_REUSED", reused["status"])
+        self.assertEqual("SECURITY_REVIEWER", reused["role"])
+        self.assertEqual("Security review passed.", reused["result"]["summary"])
+        with self.assertRaisesRegex(
+            ProjectMasterHostError,
+            "DESCENDANT_TASK_FRAME_COMPLETED_CHILD_RESULT_INVALID",
+        ):
+            ProjectModeCoordinator._reused_completed_child_result(
+                {"turn_id": "qa", "result": {"outcome": "FAILED"}},
+                semantic_role="QA_REVIEWER",
+            )
 
     def test_boss_allocations_fail_closed_on_missing_or_reviewer_mutation(self) -> None:
         target = str(self.root / "tools" / "app.py")
@@ -4510,7 +4664,17 @@ class ProjectMasterHostTests(unittest.TestCase):
                 first = manager.ensure(
                     {"project_id": "GCS", "project_root": str(self.root)}
                 )
+                handle = manager._handles["GCS"]
+                handle.worker.wait_idle = lambda _timeout: False
                 providers[0].alive = False
+                busy_reuse = manager.ensure(
+                    {"project_id": "GCS", "project_root": str(self.root)}
+                )
+                self.assertEqual("RESIDENT", busy_reuse["status"])
+                self.assertEqual(1, len(providers))
+                self.assertFalse(providers[0].closed)
+
+                handle.worker.wait_idle = lambda _timeout: True
                 second = manager.ensure(
                     {"project_id": "GCS", "project_root": str(self.root)}
                 )

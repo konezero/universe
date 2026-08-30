@@ -187,6 +187,7 @@ class HttpProjectMasterBridge:
     endpoint: str
     credential_env: str
     timeout_seconds: float = 5.0
+    task_frame_timeout_seconds: float = 1200.0
 
     def validate(self) -> str:
         _environment_name(self.credential_env)
@@ -540,7 +541,10 @@ class HttpProjectMasterBridge:
             },
         )
         try:
-            with urlopen(request, timeout=max(self.timeout_seconds, 300.0)) as response:  # nosec B310
+            with urlopen(
+                request,
+                timeout=max(self.timeout_seconds, self.task_frame_timeout_seconds),
+            ) as response:  # nosec B310
                 payload = json.loads(response.read().decode("utf-8"))
                 status_code = response.status
         except HTTPError as error:
