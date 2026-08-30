@@ -3301,6 +3301,55 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(posted["message_id"], results[0]["in_reply_to"])
 
+    def test_interactive_rust_host_codex_uses_host_input_before_native_chat(self) -> None:
+        terminal = {
+            "terminal_id": "term-rust-host-codex-001",
+            "project_id": "GCS",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-rust-host-codex-001",
+            "backend_owner": "RUST_RECONNECTION_HOST",
+            "launch_profile": "INTERACTIVE",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.write = Mock()
+        self.server._provider_chat_key_for_session_instruction = Mock(
+            return_value="chat_codex_native_should_not_run"
+        )
+        self.server.provider_sessions.submit_channel = Mock()
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "CONDUCTOR", "provider": "CODEX"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Continue through the visible Rust Host session.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": "supervisor-rust-host-codex-001",
+                "session_anchor_ref": "session-anchor-rust-host-codex-001",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-thread-native-001",
+                "mode": "CONDUCTOR",
+            },
+            trigger="TURN_IDLE",
+        )
+
+        self.assertEqual("DISPATCHED", dispatched["status"])
+        self.assertEqual("RUST_HOST_INPUT", dispatched["delivery_mode"])
+        self.assertEqual(posted["message_id"], dispatched["message_id"])
+        self.server.terminal_host.write.assert_called_once_with(
+            terminal["terminal_id"],
+            b"Continue through the visible Rust Host session.\r",
+        )
+        self.server.provider_sessions.submit_channel.assert_not_called()
+
     def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
         terminal = {
             "terminal_id": "term-session-channel-pending-001",

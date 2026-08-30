@@ -86,6 +86,7 @@ const state = {
   /** Expanded left-rail mode whose persistent session cards are visible. */
   selectedModeCoordinateKey: null,
   sessionBusUnread: {},
+  sessionBusWorking: {},
   pendingSessionBus: null,
   sessionBusProjection: "INBOX",
   observatoryShowAll: false,
@@ -1191,6 +1192,7 @@ async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
       api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
     ]);
     state.sessionBusUnread = busUnread?.counts || {};
+    state.sessionBusWorking = busUnread?.working_counts || {};
     state.runtimeAudit = audit;
     state.runtimePreflight = audit.preflight || null;
     state.supervisorSessions = audit.sessions || [];
@@ -2102,6 +2104,10 @@ const NODE_MODE_WORKING_ACTIVITY_STATES = new Set([
 ]);
 
 function nodeModeSessionActivityState(session) {
+  const terminalId = String(session?.terminal_id || "").trim();
+  if (terminalId && Number(state.sessionBusWorking?.[terminalId] || 0) > 0) {
+    return "WORKING";
+  }
   return String(
     session?.current_activity_state ||
       (session?.active_ing === true ? session?.state : "") ||
@@ -2401,6 +2407,7 @@ async function refreshSessionBusMessages() {
     "/v1/session-bus/inbox" + coordinateQuery + "&projection=" + encodeURIComponent(projection)
   );
   const rows = payload.messages || [];
+  const transferTargets = payload.transfer_targets || [];
   elements.sessionBusMessages.replaceChildren();
   if (!rows.length) {
     const emptyLabel = projection === "INBOX" ? "No inbox events" : `No ${projection.toLowerCase()} events`;
@@ -2410,10 +2417,13 @@ async function refreshSessionBusMessages() {
   for (const message of rows) {
     const item = node("article", "session-bus-item");
     const from = message.from || {};
+    const workState = String(
+      message.work_state || message.lifecycle_state || message.delivery_state || "UNKNOWN"
+    );
     const heading = node(
       "header",
       "session-bus-item-head",
-      `${message.kind || "NOTE"} · ${message.lifecycle_state || message.delivery_state || "UNKNOWN"} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
+      `${message.kind || "NOTE"} · ${workState} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
     );
     const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
     item.append(heading, body, renderSessionBusEvidence(message));
@@ -2428,8 +2438,56 @@ async function refreshSessionBusMessages() {
       });
       item.append(ack);
     }
+    if (projection === "INBOX" && workState === "NEEDS_TRANSFER") {
+      const sourceAnchor = String(message.recipient_anchor_ref || "").trim();
+      const availableTargets = transferTargets.filter(
+        (target) => String(target.session_anchor_ref || "").trim() !== sourceAnchor
+      );
+      if (availableTargets.length) {
+        const transferRow = node("div", "session-bus-transfer");
+        const select = node("select", "session-bus-transfer-target");
+        select.setAttribute("aria-label", "Transfer target");
+        for (const target of availableTargets) {
+          const option = node(
+            "option",
+            "",
+            `${target.project_id || "session"} / ${target.mode || "UNKNOWN"} / ${target.provider || "UNKNOWN"}`
+          );
+          option.value = JSON.stringify({
+            terminal_id: target.terminal_id,
+            session_anchor_ref: target.session_anchor_ref,
+          });
+          select.append(option);
+        }
+        const transfer = node("button", "secondary-button", "Transfer");
+        transfer.type = "button";
+        transfer.addEventListener("click", () => {
+          const target = JSON.parse(select.value || "{}");
+          transferSessionBusMessage(message.message_id, sourceAnchor, target).catch((error) =>
+            toast(error.message, true)
+          );
+        });
+        transferRow.append(select, transfer);
+        item.append(transferRow);
+      }
+    }
     elements.sessionBusMessages.append(item);
   }
+}
+
+async function transferSessionBusMessage(messageId, fromAnchorRef, target) {
+  await api("/v1/session-bus/messages/" + encodeURIComponent(messageId) + "/transfer", {
+    method: "POST",
+    body: {
+      from_anchor_ref: fromAnchorRef,
+      to_terminal_id: target.terminal_id,
+      to_anchor_ref: target.session_anchor_ref,
+    },
+  });
+  toast("Instruction transferred to the live Host");
+  await refreshSupervisorSessions();
+  renderNodeModes();
+  await refreshSessionBusMessages();
 }
 
 async function openSessionBusInbox(coordinate, session) {

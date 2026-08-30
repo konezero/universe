@@ -29880,6 +29880,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in directory.get("terminals") or []
                 if str(item.get("terminal_id") or "")
             },
+            "working_counts": self.session_bus.working_map(),
         }
 
     def session_bus_inbox(self, query: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -30096,6 +30097,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         except SessionBusError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
+
+    def transfer_session_bus_message(
+        self, message_id: str, value: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        payload = value if isinstance(value, Mapping) else {}
+        try:
+            message = self.session_bus.transfer_instruction(
+                self._session_anchor_terminal_host(),
+                message_id,
+                from_anchor_ref=str(payload.get("from_anchor_ref") or ""),
+                to_terminal_id=str(payload.get("to_terminal_id") or ""),
+                to_anchor_ref=str(payload.get("to_anchor_ref") or ""),
+            )
+            posted = {"messages": [message]}
+            self._dispatch_live_posted_session_instructions(posted)
+            return {
+                "schema": "universe.session-bus.v1",
+                "status": "TRANSFERRED",
+                "message": message,
+                "dispatch_status": message.get("dispatch_status"),
+            }
+        except SessionBusError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
     def provider_chat_catalog(self) -> dict[str, Any]:
         """Join provider-owned chat metadata to optional Universe bindings.
@@ -33923,11 +33949,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """Claim and deliver one anchor-bound bus instruction at a safe point.
 
         The common Runtime validates the claimed payload and selects provider
-        hook output.  A bound Provider Session receives the raw body through
-        its native user-turn adapter or, for Claude PTY sessions, the
-        authenticated Claude Code Channel. PTY is retained only as the
-        explicit fallback for non-Claude live manual terminals with no native
-        transport; Claude bus instructions fail closed until Channel is ready.
+        hook output. An interactive Rust Host is the authoritative connection
+        path: Claude uses its authenticated Host channel, while Codex and Grok
+        receive the user turn through the Host-owned terminal input channel.
+        Provider-native transport is reserved for explicitly headless Hosts.
         """
 
         if trigger not in {"SESSION_START", "TURN_IDLE"}:
@@ -34025,6 +34050,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "provider": provider,
             },
         }
+        rust_host_interactive = (
+            str(terminal.get("backend_owner") or "").upper()
+            == "RUST_RECONNECTION_HOST"
+            and str(terminal.get("launch_profile") or "INTERACTIVE").upper()
+            == "INTERACTIVE"
+        )
 
         # Claude's interactive CLI stays in the existing PTY/xterm, but a
         # session-bus instruction must not be typed into that PTY.  The
@@ -34108,6 +34139,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "session_anchor_ref": session_anchor_ref,
                     "hook_stdout": outcome.get("hook_stdout"),
                 }
+
+        if rust_host_interactive and provider in {"CODEX", "GROK"}:
+            try:
+                self.terminal_host.write(
+                    terminal_id,
+                    (str(delivery["body_text"]) + "\r").encode("utf-8"),
+                )
+                completed = self.session_bus.complete_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(delivery["message_id"]),
+                    session_anchor_ref=session_anchor_ref,
+                )
+            except (SessionBusError, TerminalHostError, UnicodeError) as error:
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {"status": "DELIVERY_FAILED", "detail": str(error)}
+            return {
+                "status": "DISPATCHED",
+                "delivery_mode": "RUST_HOST_INPUT",
+                "provider": provider,
+                "message_id": completed["message_id"],
+                "session_anchor_ref": session_anchor_ref,
+                "hook_stdout": outcome.get("hook_stdout"),
+            }
 
         native_chat_key = self._provider_chat_key_for_session_instruction(
             session=session,
@@ -37828,6 +37886,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     self.server.ack_session_bus_message(
                         unquote(session_bus_ack.group(1)),
+                        self._read_json(),
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        session_bus_transfer = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/transfer", path
+        )
+        if session_bus_transfer is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.transfer_session_bus_message(
+                        unquote(session_bus_transfer.group(1)),
                         self._read_json(),
                     ),
                 )

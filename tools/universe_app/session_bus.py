@@ -548,6 +548,21 @@ class SessionBus:
                 and _is_inbox_message(message)
             )
 
+    def working_map(self) -> dict[str, int]:
+        """Count accepted/started instructions by their current terminal."""
+
+        with self._lock:
+            result: dict[str, int] = {}
+            for message in self._messages.values():
+                terminal_id = str(message.get("_terminal_id") or "")
+                if (
+                    terminal_id
+                    and str(message.get("kind") or "").upper() == "INSTRUCTION"
+                    and _message_lifecycle(message) in {"ACCEPTED", "STARTED"}
+                ):
+                    result[terminal_id] = result.get(terminal_id, 0) + 1
+            return result
+
     def directory(self, host: Any) -> dict[str, Any]:
         counts = self.unread_map()
         terminals = []
@@ -996,6 +1011,27 @@ class SessionBus:
                 "BUS_INBOX_TARGET_REQUIRED",
                 "inbox requires terminal, Session Anchor, coordinate, room_id, or thread_id",
             )
+        live_terminals = [dict(item) for item in live_sessions(host)]
+        live_by_anchor = {
+            _terminal_anchor(item): item
+            for item in live_terminals
+            if _terminal_anchor(item)
+        }
+        transfer_targets = [
+            {
+                "terminal_id": str(item.get("terminal_id") or ""),
+                "session_anchor_ref": _terminal_anchor(item),
+                "project_id": str(item.get("project_id") or ""),
+                "mode": str(item.get("mode") or "").upper(),
+                "provider": str(item.get("provider") or "").upper(),
+            }
+            for item in live_terminals
+            if str(item.get("backend_owner") or "").upper()
+            == "RUST_RECONNECTION_HOST"
+            and str(item.get("launch_profile") or "INTERACTIVE").upper()
+            == "INTERACTIVE"
+            and _terminal_anchor(item)
+        ]
         messages: list[dict[str, Any]] = []
         with self._lock:
             scan = list(self._messages.values())
@@ -1030,12 +1066,26 @@ class SessionBus:
                     continue
                 if wanted_node and context["node_ref"] != wanted_node:
                     continue
-                if view == "INBOX" and not _is_inbox_message(message):
+                if view == "INBOX" and not (
+                    _is_inbox_message(message) or lifecycle == "STARTED"
+                ):
                     continue
                 if view == "RESULTS" and not _is_results_message(message):
                     continue
                 row = self._public_message(message, headers_only=headers_only)
                 row["terminal_id"] = stored_terminal
+                recipient_anchor = str(message.get("recipient_anchor_ref") or "")
+                live_target = live_by_anchor.get(recipient_anchor)
+                if lifecycle in {"ACCEPTED", "STARTED"}:
+                    work_state = "WORKING"
+                elif lifecycle in {"COMPLETED", "FAILED", "REPLIED", "CANCELLED", "DONE"}:
+                    work_state = "COMPLETE"
+                elif live_target is not None:
+                    work_state = "PENDING_DELIVERY"
+                else:
+                    work_state = "NEEDS_TRANSFER"
+                row["work_state"] = work_state
+                row["target_live"] = live_target is not None
                 messages.append(row)
         messages.sort(
             key=lambda item: (
@@ -1049,7 +1099,77 @@ class SessionBus:
             "status": "OK",
             "projection": view,
             "messages": messages,
+            "transfer_targets": transfer_targets,
         }
+
+    def transfer_instruction(
+        self,
+        host: Any,
+        message_id: str,
+        *,
+        from_anchor_ref: str,
+        to_terminal_id: str,
+        to_anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Retarget one queued instruction to an explicit live Rust Host."""
+
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        source_anchor = _text(from_anchor_ref, "from_anchor_ref", required=True, limit=256)
+        target_tid = _text(to_terminal_id, "to_terminal_id", required=True, limit=80)
+        target_anchor = _text(to_anchor_ref, "to_anchor_ref", required=True, limit=256)
+        terminal = _public_session(host, target_tid)
+        if str(terminal.get("state") or "").upper() != "LIVE":
+            raise SessionBusError("BUS_TRANSFER_TARGET_NOT_LIVE", "target terminal is not live", 409)
+        if str(terminal.get("backend_owner") or "").upper() != "RUST_RECONNECTION_HOST":
+            raise SessionBusError("BUS_TRANSFER_TARGET_HOST_REQUIRED", "target must be owned by a live Rust reconnection Host", 409)
+        if str(terminal.get("launch_profile") or "INTERACTIVE").upper() != "INTERACTIVE":
+            raise SessionBusError("BUS_TRANSFER_TARGET_INTERACTIVE_REQUIRED", "target must be an interactive session Host", 409)
+        if _terminal_anchor(terminal) != target_anchor:
+            raise SessionBusError("BUS_TRANSFER_TARGET_ANCHOR_MISMATCH", "target terminal does not own the selected Session Anchor", 409)
+        with self._lock:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict):
+                raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message does not exist", 404)
+            if str(message.get("kind") or "").upper() != "INSTRUCTION":
+                raise SessionBusError("BUS_TRANSFER_INSTRUCTION_REQUIRED", "only instructions can be transferred", 409)
+            if _message_lifecycle(message) != "QUEUED":
+                raise SessionBusError("BUS_TRANSFER_NOT_QUEUED", "only a queued instruction can be transferred", 409)
+            current_anchor = str(message.get("recipient_anchor_ref") or "")
+            if current_anchor != source_anchor:
+                raise SessionBusError("BUS_TRANSFER_SOURCE_MISMATCH", "instruction is no longer owned by the source Session Anchor", 409)
+            previous_tid = str(message.get("_terminal_id") or "")
+            now = utc_now()
+            lifecycle = message.setdefault("lifecycle", {})
+            history = lifecycle.setdefault("transfer_history", [])
+            if not isinstance(history, list):
+                history = []
+                lifecycle["transfer_history"] = history
+            history.append({
+                "from_anchor_ref": source_anchor,
+                "from_terminal_id": previous_tid,
+                "to_anchor_ref": target_anchor,
+                "to_terminal_id": target_tid,
+                "transferred_at": now,
+            })
+            target = dict(message.get("to") or {})
+            target.update({
+                "project_id": str(terminal.get("project_id") or ""),
+                "mode": str(terminal.get("mode") or "").upper(),
+                "provider": str(terminal.get("provider") or "").upper(),
+                "terminal_id": target_tid,
+                "session_anchor_ref": target_anchor,
+            })
+            message["to"] = target
+            message["_terminal_id"] = target_tid
+            message["session_anchor_ref"] = target_anchor
+            message["recipient_anchor_ref"] = target_anchor
+            message["updated_at"] = now
+            if previous_tid and previous_tid != target_tid:
+                self._inbox[previous_tid] = [item for item in self._inbox.get(previous_tid, []) if item != mid]
+            if mid not in self._inbox.setdefault(target_tid, []):
+                self._inbox[target_tid].append(mid)
+            self._persist_message(target_tid, message)
+            return self._public_message(message, headers_only=False)
 
     def ack(self, message_id: str, terminal_id: str) -> dict[str, Any]:
         mid = _text(message_id, "message_id", required=True, limit=80)

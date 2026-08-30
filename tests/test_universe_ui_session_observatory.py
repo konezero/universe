@@ -84,6 +84,8 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('state.sessionBusProjection || "INBOX"', APP)
         self.assertIn("function sessionBusEvidenceRows", APP)
         self.assertIn("function renderSessionBusEvidence", APP)
+        self.assertIn("sessionBusWorking", APP)
+        self.assertIn('return "WORKING";', APP)
         self.assertIn("message?.event_context", APP)
         self.assertIn("context.projection_state", APP)
         self.assertIn('"Source event"', APP)

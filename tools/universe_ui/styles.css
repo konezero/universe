@@ -4129,6 +4129,14 @@ body {
   color: var(--text-2);
   font-size: 12px;
 }
+.session-bus-transfer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.session-bus-transfer-target {
+  min-width: 0;
+}
 .session-bus-item-body {
   margin: 0;
   white-space: pre-wrap;

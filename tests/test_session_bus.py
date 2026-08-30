@@ -206,6 +206,77 @@ class SessionBusTests(unittest.TestCase):
         self.assertEqual("PENDING", by_id[first["message_id"]]["delivery_state"])
         self.assertEqual("CLAIMED", by_id[second["message_id"]]["delivery_state"])
 
+    def test_started_instruction_remains_visible_as_working(self) -> None:
+        posted = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "Keep this visible while it is being handled.",
+            },
+        )
+        anchor = _test_anchor("working")
+        self.host.bus.claim_instruction(
+            self.host,
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref=anchor,
+        )
+        self.host.bus.complete_instruction_claim(
+            terminal_id=self.universe["terminal_id"],
+            message_id=posted["message_id"],
+            session_anchor_ref=anchor,
+        )
+
+        inbox = self.host.bus.inbox(
+            self.host, terminal_id=self.universe["terminal_id"]
+        )
+
+        self.assertEqual(1, len(inbox["messages"]))
+        self.assertEqual("WORKING", inbox["messages"][0]["work_state"])
+        self.assertEqual(
+            1,
+            self.host.bus.working_map()[self.universe["terminal_id"]],
+        )
+
+    def test_queued_instruction_can_transfer_to_live_rust_host(self) -> None:
+        source_anchor = _test_anchor("t1")
+        posted = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "UI"},
+                "kind": "INSTRUCTION",
+                "body_text": "Transfer this after the old session ends.",
+            },
+        )
+        target_session = self.host.get(self.gcs["terminal_id"])
+        target_session.backend_owner = "RUST_RECONNECTION_HOST"
+        target_session.launch_profile = "INTERACTIVE"
+        self.host.close(self.universe["terminal_id"])
+        stale_inbox = self.host.bus.inbox(
+            self.host, session_anchor_ref=source_anchor
+        )
+        self.assertEqual("NEEDS_TRANSFER", stale_inbox["messages"][0]["work_state"])
+
+        transferred = self.host.bus.transfer_instruction(
+            self.host,
+            posted["message_id"],
+            from_anchor_ref=source_anchor,
+            to_terminal_id=self.gcs["terminal_id"],
+            to_anchor_ref=_test_anchor("t2"),
+        )
+
+        self.assertEqual(_test_anchor("t2"), transferred["recipient_anchor_ref"])
+        self.assertEqual(
+            source_anchor,
+            transferred["lifecycle"]["transfer_history"][0]["from_anchor_ref"],
+        )
+        target_inbox = self.host.bus.inbox(
+            self.host, terminal_id=self.gcs["terminal_id"]
+        )
+        self.assertEqual(posted["message_id"], target_inbox["messages"][0]["message_id"])
+
     def test_ui_instruction_carries_verified_direct_user_provenance(self) -> None:
         posted = self.host.bus.post(
             self.host,
