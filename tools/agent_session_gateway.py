@@ -1211,6 +1211,9 @@ class GrokAcpSession:
         self._active_delta: Callable[[str], None] | None = None
         self._active_message_reset: Callable[[], None] | None = None
         self._active_failure_code: str | None = None
+        self._active_final_text: str | None = None
+        self._active_update_types: set[str] = set()
+        self._last_response_diagnostic: dict[str, Any] = {}
         self._bootstrap_pending = True
         self._git_trace2 = GitTrace2Observer(cwd)
         environment = self._git_trace2.environment(environment)
@@ -1266,10 +1269,13 @@ class GrokAcpSession:
         self._active_delta = receive
         self._active_message_reset = reset_message
         self._active_failure_code = None
+        self._active_final_text = None
+        self._active_update_types = set()
         prompt_text = text
         if self._bootstrap_pending:
             prompt_text = f"{self.system_prompt}\n\n{text}"
             self._bootstrap_pending = False
+        result: Any = None
         try:
             result = self._transport.request(
                 "session/prompt",
@@ -1289,7 +1295,22 @@ class GrokAcpSession:
             self._active_message_reset = None
         if not isinstance(result, Mapping):
             raise AgentSessionError("GROK_ACP_PROMPT_RESULT_INVALID")
+        result_text = result.get("agentResult") or result.get("agent_result")
+        if not isinstance(result_text, str):
+            result_text = ""
         output = "".join(parts).strip()
+        if not output:
+            output = str(self._active_final_text or result_text).strip()
+            if output:
+                on_delta(output)
+        self._last_response_diagnostic = {
+            "result_keys": sorted(str(key) for key in result)[:16],
+            "update_types": sorted(self._active_update_types)[:16],
+            "stream_delta": bool(parts),
+            "fallback_text": bool(output and not parts),
+        }
+        self._active_final_text = None
+        self._active_update_types = set()
         if not output and self._active_failure_code is not None:
             raise AgentSessionError(self._active_failure_code)
         if not output:
@@ -1469,6 +1490,8 @@ class GrokAcpSession:
         if not isinstance(update, Mapping):
             return
         update_type = update.get("sessionUpdate")
+        if isinstance(update_type, str) and update_type:
+            self._active_update_types.add(update_type)
         if method == "_x.ai/session/update" and (
             (update_type == "retry_state" and update.get("type") == "failed")
             or (update_type == "turn_completed" and update.get("stop_reason") == "error")
@@ -1479,6 +1502,11 @@ class GrokAcpSession:
                 if "402" in failure_text or "balance exhausted" in failure_text
                 else "GROK_ACP_TURN_FAILED"
             )
+            return
+        if method == "_x.ai/session/update" and update_type == "turn_completed":
+            final_text = update.get("agent_result")
+            if isinstance(final_text, str) and final_text.strip():
+                self._active_final_text = final_text
             return
         if update_type == "tool_call":
             if self._active_message_reset is not None:
@@ -1625,6 +1653,7 @@ class CodexAppServerSession:
         if self._bootstrap_pending:
             prompt_text = f"{self.system_prompt}\n\n{text}"
             self._bootstrap_pending = False
+        turn_id = ""
         try:
             result = self._transport.request(
                 "turn/start",
@@ -1649,13 +1678,28 @@ class CodexAppServerSession:
             event = self._turn_events.setdefault(turn_id, threading.Event())
             if turn_id in self._completed_turns:
                 event.set()
-            if not event.wait(self.response_timeout_seconds):
-                raise AgentSessionError("CODEX_TURN_TIMED_OUT")
-            turn_status = self._turn_statuses.pop(turn_id, "completed")
+            if event.wait(self.response_timeout_seconds):
+                turn_status = self._turn_statuses.pop(turn_id, "completed")
+            else:
+                turn_status, recovered_text = self._reconcile_turn(turn_id)
+                if turn_status == "inProgress":
+                    extension = min(300.0, max(0.1, self.response_timeout_seconds))
+                    if event.wait(extension):
+                        turn_status = self._turn_statuses.pop(turn_id, "completed")
+                    else:
+                        turn_status, recovered_text = self._reconcile_turn(turn_id)
+                if recovered_text:
+                    self._active_final_text = recovered_text
+                if turn_status in {"UNKNOWN", "inProgress"}:
+                    raise AgentSessionError("CODEX_TURN_TIMED_OUT")
             if turn_status != "completed":
                 raise AgentSessionError("CODEX_TURN_FAILED")
         finally:
             self._active_delta = None
+            if turn_id:
+                self._turn_events.pop(turn_id, None)
+                self._completed_turns.discard(turn_id)
+                self._turn_statuses.pop(turn_id, None)
         final_text = self._active_final_text
         self._active_final_text = None
         if final_text is not None:
@@ -1667,6 +1711,76 @@ class CodexAppServerSession:
         if not output:
             raise AgentSessionError("CODEX_RESPONSE_MISSING")
         return output
+
+    @staticmethod
+    def _agent_message_text(items: Any, *, turn_id: str = "") -> str | None:
+        if not isinstance(items, list):
+            return None
+        messages: list[str] = []
+        for entry in items:
+            if not isinstance(entry, Mapping):
+                continue
+            if turn_id and entry.get("turnId") not in {None, turn_id}:
+                continue
+            item = entry.get("item") if isinstance(entry.get("item"), Mapping) else entry
+            if (
+                isinstance(item, Mapping)
+                and item.get("type") == "agentMessage"
+                and isinstance(item.get("text"), str)
+                and item["text"].strip()
+            ):
+                messages.append(item["text"].strip())
+        return messages[-1] if messages else None
+
+    def _reconcile_turn(self, turn_id: str) -> tuple[str, str | None]:
+        if not self.session_id:
+            return "UNKNOWN", None
+        try:
+            listed = self._transport.request(
+                "thread/turns/list",
+                {
+                    "threadId": self.session_id,
+                    "limit": 20,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                },
+                timeout_seconds=15,
+            )
+        except AgentSessionError:
+            return "UNKNOWN", None
+        if not isinstance(listed, Mapping) or not isinstance(listed.get("data"), list):
+            return "UNKNOWN", None
+        turn = next(
+            (
+                item
+                for item in listed["data"]
+                if isinstance(item, Mapping) and item.get("id") == turn_id
+            ),
+            None,
+        )
+        if not isinstance(turn, Mapping):
+            return "UNKNOWN", None
+        status = str(turn.get("status") or "UNKNOWN")
+        recovered = self._agent_message_text(turn.get("items"), turn_id=turn_id)
+        if status == "completed" and not recovered:
+            try:
+                item_page = self._transport.request(
+                    "thread/items/list",
+                    {
+                        "threadId": self.session_id,
+                        "turnId": turn_id,
+                        "limit": 100,
+                        "sortDirection": "asc",
+                    },
+                    timeout_seconds=15,
+                )
+            except AgentSessionError:
+                item_page = None
+            if isinstance(item_page, Mapping):
+                recovered = self._agent_message_text(
+                    item_page.get("data"), turn_id=turn_id
+                )
+        return status, recovered
 
     def drain_work_statuses(self) -> list[dict[str, Any]]:
         return self._git_trace2.drain_work_statuses()

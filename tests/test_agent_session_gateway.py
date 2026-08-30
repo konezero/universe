@@ -722,6 +722,72 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertNotIn("Payment Required", str(captured.exception))
         self.assertNotIn("balance exhausted", str(captured.exception))
 
+    def test_grok_recovers_agent_result_when_stream_deltas_are_absent(self) -> None:
+        class ResultOnlyTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "session/prompt":
+                    self.requests.append((method, dict(params)))
+                    return {"stopReason": "end_turn", "agentResult": "Recovered result"}
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", ResultOnlyTransport):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            deltas: list[str] = []
+            answer = session.prompt("Question", deltas.append)
+            diagnostic = dict(session._last_response_diagnostic)
+            session.close()
+
+        self.assertEqual("Recovered result", answer)
+        self.assertEqual(["Recovered result"], deltas)
+        self.assertEqual(["agentResult", "stopReason"], diagnostic["result_keys"])
+        self.assertTrue(diagnostic["fallback_text"])
+
+    def test_grok_recovers_successful_turn_completed_notification(self) -> None:
+        class CompletionNotificationTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "session/prompt":
+                    self.requests.append((method, dict(params)))
+                    self.notification_handler(
+                        "_x.ai/session/update",
+                        {
+                            "sessionId": params["sessionId"],
+                            "update": {
+                                "sessionUpdate": "turn_completed",
+                                "stop_reason": "end_turn",
+                                "agent_result": "Recovered notification",
+                                "message_id": "message-1",
+                            },
+                        },
+                    )
+                    return {"stopReason": "end_turn"}
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", CompletionNotificationTransport):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            answer = session.prompt("Question", lambda _delta: None)
+            diagnostic = dict(session._last_response_diagnostic)
+            session.close()
+
+        self.assertEqual("Recovered notification", answer)
+        self.assertEqual(["turn_completed"], diagnostic["update_types"])
+        self.assertNotIn("agent_result", diagnostic["result_keys"])
+
     def test_grok_returns_only_the_post_tool_assistant_message(self) -> None:
         class MultiMessageTransport(FakeJsonRpcTransport):
             def request(
@@ -1168,6 +1234,111 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         self.assertEqual("Final Codex answer", answer)
         self.assertEqual(["Final Codex answer"], deltas)
+
+    def test_codex_recovers_completed_turn_and_agent_message_after_timeout(self) -> None:
+        class ReconciledTurnTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "turn/start":
+                    self.requests.append((method, dict(params)))
+                    return {"turn": {"id": "codex-turn-late"}}
+                if method == "thread/turns/list":
+                    self.requests.append((method, dict(params)))
+                    return {
+                        "data": [
+                            {
+                                "id": "codex-turn-late",
+                                "status": "completed",
+                                "items": [],
+                            }
+                        ]
+                    }
+                if method == "thread/items/list":
+                    self.requests.append((method, dict(params)))
+                    return {
+                        "data": [
+                            {
+                                "turnId": "codex-turn-late",
+                                "item": {
+                                    "id": "agent-message-late",
+                                    "type": "agentMessage",
+                                    "text": "Recovered Codex answer",
+                                },
+                            }
+                        ]
+                    }
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", ReconciledTurnTransport):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-thread-existing",
+                response_timeout_seconds=0.01,
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            deltas: list[str] = []
+            answer = session.prompt("Question", deltas.append)
+            session.close()
+
+        methods = [method for method, _params in FakeJsonRpcTransport.instances[0].requests]
+        self.assertEqual("Recovered Codex answer", answer)
+        self.assertEqual(["Recovered Codex answer"], deltas)
+        self.assertIn("thread/turns/list", methods)
+        self.assertIn("thread/items/list", methods)
+
+    def test_codex_extends_wait_only_while_reconciled_turn_is_in_progress(self) -> None:
+        class SlowCompletedTurnTransport(FakeJsonRpcTransport):
+            reconcile_count = 0
+
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "turn/start":
+                    self.requests.append((method, dict(params)))
+                    return {"turn": {"id": "codex-turn-slow"}}
+                if method == "thread/turns/list":
+                    self.requests.append((method, dict(params)))
+                    type(self).reconcile_count += 1
+                    if type(self).reconcile_count == 1:
+                        return {
+                            "data": [
+                                {"id": "codex-turn-slow", "status": "inProgress", "items": []}
+                            ]
+                        }
+                    return {
+                        "data": [
+                            {
+                                "id": "codex-turn-slow",
+                                "status": "completed",
+                                "items": [
+                                    {
+                                        "id": "agent-message-slow",
+                                        "type": "agentMessage",
+                                        "text": "Recovered after bounded extension",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", SlowCompletedTurnTransport):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-thread-existing",
+                response_timeout_seconds=0.01,
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            answer = session.prompt("Question", lambda _delta: None)
+            session.close()
+
+        self.assertEqual("Recovered after bounded extension", answer)
+        self.assertEqual(2, SlowCompletedTurnTransport.reconcile_count)
 
     def test_codex_ephemeral_session_never_resumes_or_persists_thread(self) -> None:
         sessions: list[str] = []

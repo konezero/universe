@@ -2919,6 +2919,8 @@ class MultiRoomMeetingCoordinator:
         binding_ids: list[str] | tuple[str, ...] | None = None,
         protocol: str = "INCREMENTAL_DELTA_ONLY",
         participant_briefs: Mapping[str, Mapping[str, Any]] | None = None,
+        max_attempts_per_turn: int = 1,
+        required_reviewers: int | None = None,
     ) -> dict[str, Any]:
         rid = _text(room_id, "room_id", limit=80)
         with self._run_lock:
@@ -2939,6 +2941,8 @@ class MultiRoomMeetingCoordinator:
                 binding_ids=binding_ids,
                 protocol=protocol,
                 participant_briefs=participant_briefs,
+                max_attempts_per_turn=max_attempts_per_turn,
+                required_reviewers=required_reviewers,
             )
         finally:
             with self._run_lock:
@@ -2955,6 +2959,8 @@ class MultiRoomMeetingCoordinator:
         binding_ids: list[str] | tuple[str, ...] | None,
         protocol: str,
         participant_briefs: Mapping[str, Mapping[str, Any]] | None,
+        max_attempts_per_turn: int,
+        required_reviewers: int | None,
     ) -> dict[str, Any]:
         room = self.store.get_room(room_id)
         if room["room_type"] != "MEETING":
@@ -3012,6 +3018,40 @@ class MultiRoomMeetingCoordinator:
                 "MEETING_MODELS_UNAVAILABLE",
                 "meeting requires at least one active MODEL binding",
                 409,
+            )
+        try:
+            if isinstance(max_attempts_per_turn, bool):
+                raise ValueError
+            bounded_attempts = int(max_attempts_per_turn)
+        except (TypeError, ValueError) as error:
+            raise MultiRoomError(
+                "MEETING_RETRY_LIMIT_INVALID",
+                "max_attempts_per_turn must be an integer",
+            ) from error
+        if bounded_attempts < 1 or bounded_attempts > 3:
+            raise MultiRoomError(
+                "MEETING_RETRY_LIMIT_INVALID",
+                "max_attempts_per_turn must be between 1 and 3",
+            )
+        raw_required_reviewers = (
+            len(models)
+            if required_reviewers is None
+            and meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW"
+            else (1 if required_reviewers is None else required_reviewers)
+        )
+        try:
+            if isinstance(raw_required_reviewers, bool):
+                raise ValueError
+            reviewer_quorum = int(raw_required_reviewers)
+        except (TypeError, ValueError) as error:
+            raise MultiRoomError(
+                "MEETING_REVIEWER_QUORUM_INVALID",
+                "required_reviewers must be an integer",
+            ) from error
+        if reviewer_quorum < 1 or reviewer_quorum > len(models):
+            raise MultiRoomError(
+                "MEETING_REVIEWER_QUORUM_INVALID",
+                "required_reviewers must select between one and all MODEL bindings",
             )
         briefs: dict[str, dict[str, Any]] = {}
         if participant_briefs is not None:
@@ -3101,6 +3141,8 @@ class MultiRoomMeetingCoordinator:
                 "schema": MEETING_COORDINATOR_SCHEMA,
                 "run_id": meeting_run_id,
                 "max_turns": bounded_turns,
+                "max_attempts_per_turn": bounded_attempts,
+                "required_reviewers": reviewer_quorum,
                 "participant_order": [item["binding_id"] for item in models],
                 "delivery_mode": meeting_protocol,
                 "transcript_forwarded": False,
@@ -3131,6 +3173,17 @@ class MultiRoomMeetingCoordinator:
                         if reason == "BOUNDED_TURNS_REACHED":
                             reason = "CANCEL_CHECK_REQUESTED"
                         break
+                if (
+                    meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW"
+                    and turn_number == len(models)
+                    and len(proposal_outputs) < reviewer_quorum
+                ):
+                    status = "BLOCKED"
+                    reason = (
+                        f"MEETING_QUORUM_UNMET:PROPOSAL:"
+                        f"{len(proposal_outputs)}/{reviewer_quorum}"
+                    )
+                    break
                 binding = models[turn_number % len(models)]
                 if current_delta is None:
                     status = "FAILED"
@@ -3155,10 +3208,15 @@ class MultiRoomMeetingCoordinator:
                         )
                     else:
                         excerpt_budget = max(1000, min(5000, 14000 // len(models)))
+                        available_proposals = [
+                            item
+                            for item in models
+                            if str(item["binding_id"]) in proposal_outputs
+                        ]
                         proposal_text = "\n\n".join(
                             f"Candidate {index + 1} ({item.get('display_name') or item.get('provider')}):\n"
                             f"{proposal_outputs[str(item['binding_id'])]['body_text'][:excerpt_budget]}"
-                            for index, item in enumerate(models)
+                            for index, item in enumerate(available_proposals)
                         )
                         delta_body = (
                             f"{prompt[:6000]}\n\n{role_text}\n"
@@ -3188,72 +3246,94 @@ class MultiRoomMeetingCoordinator:
                 self.store.record_control_event(
                     room["room_id"], "MEETING_TURN_STARTED", turn
                 )
-                try:
-                    provider_result = self.invoke_provider(dict(binding), turn)
-                    if not isinstance(provider_result, Mapping):
-                        raise MultiRoomError(
-                            "MEETING_PROVIDER_RESULT_INVALID",
-                            "provider result must be an object",
+                provider_result: Mapping[str, Any] | None = None
+                body = ""
+                attempt_count = 0
+                failure_reason: str | None = None
+                interrupted_reason: str | None = None
+                for attempt_number in range(1, bounded_attempts + 1):
+                    attempt_count = attempt_number
+                    try:
+                        candidate_result = self.invoke_provider(dict(binding), turn)
+                        if not isinstance(candidate_result, Mapping):
+                            raise MultiRoomError(
+                                "MEETING_PROVIDER_RESULT_INVALID",
+                                "provider result must be an object",
+                            )
+                        provider_result = candidate_result
+                        provider_status = str(
+                            provider_result.get("status") or "COMPLETED"
+                        ).upper()
+                        if provider_status in {"CANCELLED", "INTERRUPTED", "ABORTED"}:
+                            interrupted_reason = str(
+                                provider_result.get("reason") or provider_status
+                            )
+                            break
+                        if provider_status in {"FAILED", "ERROR", "REJECTED"}:
+                            failure_reason = str(
+                                provider_result.get("reason") or provider_status
+                            )
+                        else:
+                            candidate_body = provider_result.get("body_text") or provider_result.get(
+                                "text"
+                            )
+                            if isinstance(candidate_body, str) and candidate_body.strip():
+                                body = candidate_body
+                                failure_reason = None
+                                break
+                            failure_reason = "PROVIDER_OUTPUT_MISSING"
+                    except Exception as error:
+                        error_code = str(
+                            getattr(error, "code", "") or type(error).__name__
                         )
-                except Exception as error:  # provider failure is observable and terminal
-                    status = "FAILED"
-                    error_code = str(getattr(error, "code", "") or type(error).__name__)
-                    error_detail = " ".join(str(error).split())[:240]
-                    reason = f"PROVIDER_ERROR:{error_code}:{error_detail}"
-                    turns.append(
-                        {
-                            "turn_number": turn_number,
-                            "binding_id": binding["binding_id"],
-                            "status": "FAILED",
-                            "reason": reason,
-                            "input_event_id": current_delta.get("room_event_id"),
-                            "output_event_id": None,
-                        }
-                    )
-                    break
-                provider_status = str(provider_result.get("status") or "COMPLETED").upper()
-                if provider_status in {"CANCELLED", "INTERRUPTED", "ABORTED"}:
+                        error_detail = " ".join(str(error).split())[:240]
+                        failure_reason = f"PROVIDER_ERROR:{error_code}:{error_detail}"
+                    if attempt_number < bounded_attempts:
+                        self.store.record_control_event(
+                            room["room_id"],
+                            "MEETING_TURN_RETRY",
+                            {
+                                "schema": MEETING_COORDINATOR_SCHEMA,
+                                "run_id": meeting_run_id,
+                                "turn_number": turn_number,
+                                "binding_id": binding["binding_id"],
+                                "attempt_number": attempt_number + 1,
+                                "reason": failure_reason,
+                            },
+                        )
+                if interrupted_reason is not None:
                     status = "INTERRUPTED"
-                    reason = str(provider_result.get("reason") or provider_status)
+                    reason = interrupted_reason
                     turns.append(
                         {
                             "turn_number": turn_number,
                             "binding_id": binding["binding_id"],
                             "status": "INTERRUPTED",
                             "reason": reason,
-                            "input_event_id": current_delta.get("room_event_id"),
+                            "attempt_count": attempt_count,
+                            "input_event_id": turn["delta"].get("room_event_id"),
                             "output_event_id": None,
                         }
                     )
                     break
-                if provider_status in {"FAILED", "ERROR", "REJECTED"}:
-                    status = "FAILED"
-                    reason = str(provider_result.get("reason") or provider_status)
+                if failure_reason is not None or provider_result is None:
+                    turn_failure_reason = failure_reason or "PROVIDER_RESULT_MISSING"
                     turns.append(
                         {
                             "turn_number": turn_number,
                             "binding_id": binding["binding_id"],
+                            "phase": phase,
                             "status": "FAILED",
-                            "reason": reason,
-                            "input_event_id": current_delta.get("room_event_id"),
+                            "reason": turn_failure_reason,
+                            "attempt_count": attempt_count,
+                            "input_event_id": turn["delta"].get("room_event_id"),
                             "output_event_id": None,
                         }
                     )
-                    break
-                body = provider_result.get("body_text") or provider_result.get("text")
-                if not isinstance(body, str) or not body.strip():
+                    if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
+                        continue
                     status = "FAILED"
-                    reason = "PROVIDER_OUTPUT_MISSING"
-                    turns.append(
-                        {
-                            "turn_number": turn_number,
-                            "binding_id": binding["binding_id"],
-                            "status": "FAILED",
-                            "reason": reason,
-                            "input_event_id": current_delta.get("room_event_id"),
-                            "output_event_id": None,
-                        }
-                    )
+                    reason = turn_failure_reason
                     break
                 output_artifact = None
                 room_body = body
@@ -3334,10 +3414,23 @@ class MultiRoomMeetingCoordinator:
                         "output_warning": provider_result.get("output_warning"),
                         "status": "COMPLETED",
                         "reason": "NONE",
+                        "attempt_count": attempt_count,
                         "input_event_id": turn["delta"].get("room_event_id"),
                         "output_event_id": output_message["room_event_id"],
                     }
                 )
+            if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW" and status == "COMPLETED":
+                completed_reviewers = {
+                    str(item["binding_id"])
+                    for item in turns
+                    if item.get("phase") == "REVIEW" and item.get("status") == "COMPLETED"
+                }
+                if len(completed_reviewers) < reviewer_quorum:
+                    status = "BLOCKED"
+                    reason = (
+                        f"MEETING_QUORUM_UNMET:REVIEW:"
+                        f"{len(completed_reviewers)}/{reviewer_quorum}"
+                    )
         finally:
             self._clear_cancel(meeting_run_id)
         finished_at = utc_now()
@@ -3350,6 +3443,8 @@ class MultiRoomMeetingCoordinator:
             "started_at": started_at,
             "completed_at": finished_at,
             "max_turns": bounded_turns,
+            "max_attempts_per_turn": bounded_attempts,
+            "required_reviewers": reviewer_quorum,
             "protocol": meeting_protocol,
             "participant_briefs": briefs,
             "turn_count": len(turns),

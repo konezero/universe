@@ -463,6 +463,125 @@ class MultiRoomStoreTests(unittest.TestCase):
         )
         self.assertEqual("proposal-0-Visionary", first_artifact["body_text"])
 
+    def test_role_meeting_retries_only_failed_participant_turn(self) -> None:
+        created = self.store.create_meeting_room(
+            {
+                "title": "Selective retry council",
+                "models": [
+                    {"provider": "CLAUDE", "display_name": "Architect"},
+                    {"provider": "CODEX", "display_name": "Implementer"},
+                ],
+            }
+        )
+        room_id = created["room"]["room_id"]
+        bindings = sorted(
+            [item for item in self.store.list_bindings(room_id) if item["slot_role"] == "MODEL"],
+            key=lambda item: (item["created_at"], item["binding_id"]),
+        )
+        briefs = {
+            binding["binding_id"]: {
+                "role": f"Reviewer {index + 1}",
+                "mandate": "produce and review a distinct route",
+                "assistants": [],
+            }
+            for index, binding in enumerate(bindings)
+        }
+        failed_binding_id = str(bindings[1]["binding_id"])
+        calls: list[tuple[int, str]] = []
+        attempts: dict[tuple[int, str], int] = {}
+
+        def invoke(binding, turn):
+            key = (int(turn["turn_number"]), str(binding["binding_id"]))
+            calls.append(key)
+            attempts[key] = attempts.get(key, 0) + 1
+            if key == (1, failed_binding_id) and attempts[key] == 1:
+                raise MultiRoomError("TRANSIENT_PROVIDER_FAILURE", "retry this participant")
+            return {
+                "status": "COMPLETED",
+                "body_text": f"candidate-{turn['turn_number']}-{binding['binding_id']}",
+            }
+
+        summary = MultiRoomMeetingCoordinator(self.store, invoke).run(
+            room_id,
+            prompt="compare two routes",
+            max_turns=4,
+            run_id="role-selective-retry-1",
+            protocol="INDEPENDENT_PROPOSAL_REVIEW",
+            participant_briefs=briefs,
+            max_attempts_per_turn=2,
+            required_reviewers=2,
+        )
+
+        self.assertEqual("COMPLETED", summary["status"])
+        self.assertEqual(2, summary["turns"][1]["attempt_count"])
+        self.assertEqual(5, len(calls))
+        self.assertEqual(2, len([item for item in calls if item[1] == bindings[0]["binding_id"]]))
+        self.assertEqual(3, len([item for item in calls if item[1] == failed_binding_id]))
+        model_messages = [
+            item
+            for item in self.store.list_messages(room_id)
+            if item.get("author_role") == "MODEL"
+            and item.get("correlation_id") == "role-selective-retry-1"
+        ]
+        self.assertEqual(4, len(model_messages))
+        self.assertEqual(4, len({item["room_event_id"] for item in model_messages}))
+        retries = [
+            item
+            for item in self.store.list_control_events(room_id)
+            if item["event_type"] == "MEETING_TURN_RETRY"
+        ]
+        self.assertEqual(1, len(retries))
+        self.assertEqual(failed_binding_id, retries[0]["payload"]["binding_id"])
+
+    def test_role_meeting_blocks_review_when_proposal_quorum_is_unmet(self) -> None:
+        created = self.store.create_meeting_room(
+            {
+                "title": "Proposal quorum council",
+                "models": [
+                    {"provider": "GROK", "display_name": "Visionary"},
+                    {"provider": "CLAUDE", "display_name": "Architect"},
+                    {"provider": "CODEX", "display_name": "Implementer"},
+                ],
+            }
+        )
+        room_id = created["room"]["room_id"]
+        bindings = sorted(
+            [item for item in self.store.list_bindings(room_id) if item["slot_role"] == "MODEL"],
+            key=lambda item: (item["created_at"], item["binding_id"]),
+        )
+        briefs = {
+            binding["binding_id"]: {
+                "role": f"Reviewer {index + 1}",
+                "mandate": "produce and review a distinct route",
+                "assistants": [],
+            }
+            for index, binding in enumerate(bindings)
+        }
+        failed_binding_id = str(bindings[1]["binding_id"])
+        calls: list[tuple[int, str]] = []
+
+        def invoke(binding, turn):
+            calls.append((int(turn["turn_number"]), str(binding["binding_id"])))
+            if str(binding["binding_id"]) == failed_binding_id:
+                raise MultiRoomError("PROVIDER_UNAVAILABLE", "proposal unavailable")
+            return {"status": "COMPLETED", "body_text": f"proposal-{turn['turn_number']}"}
+
+        summary = MultiRoomMeetingCoordinator(self.store, invoke).run(
+            room_id,
+            prompt="compare three routes",
+            max_turns=6,
+            run_id="role-proposal-quorum-1",
+            protocol="INDEPENDENT_PROPOSAL_REVIEW",
+            participant_briefs=briefs,
+            max_attempts_per_turn=1,
+            required_reviewers=3,
+        )
+
+        self.assertEqual("BLOCKED", summary["status"])
+        self.assertEqual("MEETING_QUORUM_UNMET:PROPOSAL:2/3", summary["reason"])
+        self.assertEqual(3, len(calls))
+        self.assertTrue(all(item["phase"] == "PROPOSAL" for item in summary["turns"]))
+
     def test_meeting_failure_preserves_provider_error_code_and_detail(self) -> None:
         room_id = self.store.create_meeting_room(
             {

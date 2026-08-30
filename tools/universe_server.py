@@ -32715,6 +32715,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(
                 "MEETING_TURN_LIMIT_INVALID", "max_turns must be an integer"
             ) from error
+        raw_attempts = request.get("max_attempts_per_turn", 2)
+        if isinstance(raw_attempts, bool):
+            raise UniverseError(
+                "MEETING_RETRY_LIMIT_INVALID",
+                "max_attempts_per_turn must be an integer",
+            )
+        try:
+            max_attempts_per_turn = int(raw_attempts)
+        except (TypeError, ValueError) as error:
+            raise UniverseError(
+                "MEETING_RETRY_LIMIT_INVALID",
+                "max_attempts_per_turn must be an integer",
+            ) from error
+        raw_required_reviewers = request.get("required_reviewers", len(bindings))
+        if isinstance(raw_required_reviewers, bool):
+            raise UniverseError(
+                "MEETING_REVIEWER_QUORUM_INVALID",
+                "required_reviewers must be an integer",
+            )
+        try:
+            required_reviewers = int(raw_required_reviewers)
+        except (TypeError, ValueError) as error:
+            raise UniverseError(
+                "MEETING_REVIEWER_QUORUM_INVALID",
+                "required_reviewers must be an integer",
+            ) from error
         run_id = _required_text(
             request.get("run_id") or "feature_meeting_" + secrets.token_hex(12),
             "run_id",
@@ -32791,6 +32817,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 binding_ids=[str(item["binding_id"]) for item in bindings],
                 protocol="INDEPENDENT_PROPOSAL_REVIEW",
                 participant_briefs=participant_briefs,
+                max_attempts_per_turn=max_attempts_per_turn,
+                required_reviewers=required_reviewers,
             )
         except MultiRoomError as error:
             raise UniverseError(error.code, str(error), HTTPStatus(error.status)) from error
