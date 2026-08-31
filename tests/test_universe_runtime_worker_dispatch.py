@@ -303,9 +303,14 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         )
 
     def test_grok_task_frame_does_not_publish_persistent_session_ref(self) -> None:
+        observed_timeouts: list[float | None] = []
+
         class FakeGrokSession:
-            def __init__(self, *, model, session_observer, **_kwargs) -> None:
+            def __init__(
+                self, *, model, response_timeout_seconds, session_observer, **_kwargs
+            ) -> None:
                 self.model = model
+                observed_timeouts.append(response_timeout_seconds)
                 self.session_ref = "grok-acp:ephemeral-1"
                 session_observer("ephemeral-1")
 
@@ -326,6 +331,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         ):
             result = dispatcher._invoke_grok(self.request)
 
+        self.assertEqual([None], observed_timeouts)
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
         self.assertFalse(result["universe_coordinate_persisted"])

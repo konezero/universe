@@ -199,7 +199,7 @@ class PtySupervisor:
     ) -> None:
         self.host = host or TerminalHost()
         self._lock = threading.Lock()
-        self._attaches: dict[str, tuple[str, queue.Queue]] = {}
+        self._attaches: dict[str, dict[str, Any]] = {}
         self._reclaim_poll_seconds = max(0.1, float(reclaim_poll_seconds))
         self._monitor_stop = threading.Event()
         self._reconcile_reconnection_hosts()
@@ -257,7 +257,13 @@ class PtySupervisor:
         waiter = self.host.subscribe(terminal_id)
         attach_id = "att_" + secrets.token_hex(8)
         with self._lock:
-            self._attaches[attach_id] = (terminal_id, waiter)
+            self._attaches[attach_id] = {
+                "terminal_id": terminal_id,
+                "waiter": waiter,
+                "lock": threading.Lock(),
+                "sequence": 0,
+                "pending": None,
+            }
         return attach_id
 
     def detach(self, attach_id: str) -> None:
@@ -265,22 +271,33 @@ class PtySupervisor:
             item = self._attaches.pop(attach_id, None)
         if item is None:
             return
-        terminal_id, waiter = item
-        self.host.unsubscribe(terminal_id, waiter)
+        self.host.unsubscribe(str(item["terminal_id"]), item["waiter"])
 
-    def read_attach(self, attach_id: str, timeout: float) -> tuple[bytes, bool]:
+    def read_attach(
+        self, attach_id: str, timeout: float, ack_sequence: int | None = None
+    ) -> tuple[bytes, bool, int | None]:
         with self._lock:
             item = self._attaches.get(attach_id)
         if item is None:
-            return b"", True
-        _terminal_id, waiter = item
-        try:
-            chunk = waiter.get(timeout=max(0.05, timeout))
-        except queue.Empty:
-            return b"", False
-        if chunk is None:
-            return b"", True
-        return bytes(chunk), False
+            return b"", True, None
+        with item["lock"]:
+            pending = item["pending"]
+            if pending is not None:
+                sequence, chunk, closed = pending
+                if ack_sequence != sequence:
+                    return chunk, closed, sequence
+                item["pending"] = None
+            waiter = item["waiter"]
+            try:
+                value = waiter.get(timeout=max(0.05, timeout))
+            except queue.Empty:
+                return b"", False, None
+            chunk = b"" if value is None else bytes(value)
+            closed = value is None
+            item["sequence"] = int(item["sequence"]) + 1
+            sequence = int(item["sequence"])
+            item["pending"] = (sequence, chunk, closed)
+            return chunk, closed, sequence
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -456,7 +473,24 @@ class Handler(BaseHTTPRequestHandler):
                     timeout = float(query["timeout"][0])
                 except ValueError:
                     timeout = 0.2
-            chunk, closed = supervisor.read_attach(attach_read[5], timeout)
+            ack_sequence = None
+            ack_raw = str((query.get("ack_sequence") or [""])[0]).strip()
+            if ack_raw:
+                try:
+                    ack_sequence = int(ack_raw)
+                except ValueError:
+                    self._send(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "ERROR",
+                            "error_code": "TERMINAL_ATTACH_ACK_INVALID",
+                        },
+                    )
+                    return
+            chunk, closed, sequence = supervisor.read_attach(
+                attach_read[5], timeout, ack_sequence
+            )
             self._send(
                 HTTPStatus.OK,
                 {
@@ -464,6 +498,7 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "OK",
                     "data_b64": base64.b64encode(chunk).decode("ascii") if chunk else "",
                     "closed": closed,
+                    "sequence": sequence,
                 },
             )
             return

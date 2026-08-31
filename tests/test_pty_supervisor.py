@@ -24,7 +24,7 @@ from universe_app.pty_supervisor import (  # noqa: E402
     restart_supervisor,
     spawn_supervisor,
 )
-from universe_app.terminal_host import TerminalHost  # noqa: E402
+from universe_app.terminal_host import TerminalHost, TerminalHostError  # noqa: E402
 from universe_pty_supervisor import (  # noqa: E402
     PtySupervisor,
     Server,
@@ -323,6 +323,19 @@ class PtySupervisorTests(unittest.TestCase):
             if chunk.get("data_b64"):
                 seen += base64.b64decode(chunk["data_b64"])
         self.assertIn(b"hello-supervisor", seen)
+        self.assertEqual(1, chunk["sequence"])
+        _status, replayed = self.request(
+            "GET",
+            f"/v1/terminals/{terminal_id}/attach/{attach_id}/read?timeout=0.2",
+        )
+        self.assertEqual(chunk["data_b64"], replayed["data_b64"])
+        self.assertEqual(chunk["sequence"], replayed["sequence"])
+        _status, acknowledged = self.request(
+            "GET",
+            f"/v1/terminals/{terminal_id}/attach/{attach_id}/read?timeout=0.05&ack_sequence=1",
+        )
+        self.assertEqual("", acknowledged["data_b64"])
+        self.assertIsNone(acknowledged["sequence"])
         self.request("DELETE", f"/v1/terminals/{terminal_id}/attach/{attach_id}")
         _status, listed_after = self.request("GET", "/v1/terminals")
         self.assertEqual(1, len(listed_after["terminals"]))
@@ -396,6 +409,65 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertIn(b"hello-supervisor", seen)
         second.unsubscribe(terminal_id, waiter)
 
+    def test_supervised_subscription_does_not_drop_machine_json_bytes(self) -> None:
+        host = object.__new__(SupervisedTerminalHost)
+        expected = [f'{{"index":{index}}}\n'.encode("ascii") for index in range(300)]
+        pending = list(expected)
+
+        def request(method: str, path: str, **_kwargs: object) -> dict[str, object]:
+            if method == "POST" and path.endswith("/attach"):
+                return {"attach_id": "attach-lossless"}
+            if pending:
+                return {
+                    "data_b64": base64.b64encode(pending.pop(0)).decode("ascii"),
+                    "closed": False,
+                }
+            return {"data_b64": "", "closed": True}
+
+        with patch.object(host, "_request", side_effect=request):
+            waiter = host.subscribe("terminal-lossless")
+            waiter.thread.join(timeout=2)
+
+        received: list[bytes] = []
+        while True:
+            chunk = waiter.get(timeout=1)
+            if chunk is None:
+                break
+            received.append(chunk)
+        self.assertEqual(0, waiter.maxsize)
+        self.assertEqual(expected, received)
+
+    def test_supervised_subscription_retries_transient_read_for_live_host(self) -> None:
+        host = object.__new__(SupervisedTerminalHost)
+        read_attempts = 0
+        read_paths: list[str] = []
+
+        def request(method: str, path: str, **_kwargs: object) -> dict[str, object]:
+            nonlocal read_attempts
+            if method == "POST":
+                return {"attach_id": "attach-retry"}
+            if path.endswith("/terminal-retry"):
+                return {"terminal": {"state": "LIVE"}}
+            read_attempts += 1
+            read_paths.append(path)
+            if read_attempts == 1:
+                raise TerminalHostError("PTY_SUPERVISOR_READ_FAILED", "transient")
+            if read_attempts == 2:
+                return {
+                    "data_b64": base64.b64encode(b'{"status":"ok"}\n').decode("ascii"),
+                    "closed": False,
+                    "sequence": 1,
+                }
+            return {"data_b64": "", "closed": True, "sequence": 2}
+
+        with patch.object(host, "_request", side_effect=request):
+            waiter = host.subscribe("terminal-retry")
+            self.assertEqual(b'{"status":"ok"}\n', waiter.get(timeout=2))
+            self.assertIsNone(waiter.get(timeout=1))
+
+        self.assertEqual(3, read_attempts)
+        self.assertNotIn("ack_sequence", read_paths[1])
+        self.assertIn("ack_sequence=1", read_paths[2])
 
     def test_http_control_and_delete_are_durably_attributed(self) -> None:
         _status, created = self.request(

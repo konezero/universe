@@ -20,6 +20,7 @@ from agent_session_gateway import (  # noqa: E402
     CodexAppServerSession,
     GrokAcpSession,
     GitTrace2Observer,
+    JsonRpcStdioProcess,
     GitTrace2RepositoryObserver,
     _supervised_json_lines,
     build_platform_approval_evidence,
@@ -179,6 +180,66 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual(
             '{"type":"result","subtype":"success"}',
             next(_supervised_json_lines(resident_waiter)),
+        )
+
+        class DelayedContinuationQueue(queue.Queue):
+            def __init__(self) -> None:
+                super().__init__()
+                self._reads = iter(
+                    (
+                        b'{"type":"result","result":"GROK_\r\n',
+                        b'\x1b[39;240HOK"}\r\n',
+                        None,
+                    )
+                )
+
+            def get(self, block: bool = True, timeout: float | None = None) -> Any:
+                del block
+                if timeout is not None:
+                    raise queue.Empty
+                return next(self._reads)
+
+        delayed_waiter = DelayedContinuationQueue()
+        self.assertEqual(
+            ['{"type":"result","result":"GROK_OK"}'],
+            list(_supervised_json_lines(delayed_waiter)),
+        )
+
+        hard_wrap_waiter: queue.Queue = queue.Queue()
+        hard_wrap_waiter.put(
+            b'{"jsonrpc":"2.0","method":"session/update","params":{"text":"'
+            + (b"x" * 12_000)
+            + b'\r\ny"}}\r\n'
+        )
+        hard_wrap_waiter.put(
+            b'{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}\r\n'
+        )
+        hard_wrap_waiter.put(None)
+        repaired_messages = [
+            json.loads(line) for line in _supervised_json_lines(hard_wrap_waiter)
+        ]
+        self.assertEqual("x" * 12_000 + "y", repaired_messages[0]["params"]["text"])
+        self.assertEqual(5, repaired_messages[1]["id"])
+
+    def test_json_rpc_request_allows_unbounded_wait_until_response(self) -> None:
+        transport = object.__new__(JsonRpcStdioProcess)
+        transport._pending_lock = threading.Lock()
+        transport._pending = {}
+        transport._next_id = 1
+
+        def send(_message: Mapping[str, Any]) -> None:
+            def complete() -> None:
+                with transport._pending_lock:
+                    pending = transport._pending.pop(1)
+                pending.result = {"status": "completed"}
+                pending.event.set()
+
+            threading.Timer(0.02, complete).start()
+
+        transport._send = send
+        self.assertEqual(
+            {"status": "completed"},
+            transport.request("session/prompt", {}, timeout_seconds=None),
         )
 
     def test_git_trace2_observer_emits_terminal_commit_and_push_once(self) -> None:

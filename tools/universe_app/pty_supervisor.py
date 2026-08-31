@@ -547,7 +547,10 @@ class SupervisedTerminalHost:
         attach_id = str(attach.get("attach_id") or "")
         if not attach_id:
             raise TerminalHostError("TERMINAL_ATTACH_FAILED", "supervisor attach failed")
-        waiter: queue.Queue = queue.Queue(maxsize=256)
+        # Machine JSONL is lossless. A bounded client queue made a slow
+        # parser silently discard arbitrary protocol bytes and even the close
+        # sentinel, so attachment backlogs must remain intact until consumed.
+        waiter: queue.Queue = queue.Queue()
         stop = threading.Event()
 
         def pump() -> None:
@@ -555,26 +558,32 @@ class SupervisedTerminalHost:
                 f"/v1/terminals/{quote(terminal_id, safe='')}"
                 f"/attach/{quote(attach_id, safe='')}/read"
             )
+            ack_sequence: int | None = None
             while not stop.is_set():
+                query = "?timeout=0.2"
+                if ack_sequence is not None:
+                    query += f"&ack_sequence={ack_sequence}"
                 try:
-                    payload = self._request("GET", path + "?timeout=0.2", timeout=3.0)
+                    payload = self._request("GET", path + query, timeout=3.0)
                 except TerminalHostError:
-                    break
+                    try:
+                        terminal = self.get(terminal_id).payload
+                    except TerminalHostError:
+                        break
+                    if str(terminal.get("state") or "").upper() != "LIVE":
+                        break
+                    if stop.wait(0.5):
+                        break
+                    continue
                 chunk_b64 = str(payload.get("data_b64") or "")
                 if chunk_b64:
-                    try:
-                        waiter.put_nowait(base64.b64decode(chunk_b64))
-                    except queue.Full:
-                        try:
-                            waiter.get_nowait()
-                        except queue.Empty:
-                            pass
+                    waiter.put_nowait(base64.b64decode(chunk_b64))
+                sequence = payload.get("sequence")
+                if isinstance(sequence, int) and sequence > 0:
+                    ack_sequence = sequence
                 if payload.get("closed"):
                     break
-            try:
-                waiter.put_nowait(None)
-            except queue.Full:
-                pass
+            waiter.put_nowait(None)
 
         thread = threading.Thread(
             target=pump, name=f"pty-sup-{terminal_id}", daemon=True

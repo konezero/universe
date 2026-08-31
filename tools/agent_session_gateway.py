@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 from collections import deque
 from dataclasses import dataclass
 import hashlib
@@ -716,7 +717,6 @@ _SUPERVISED_SOFT_WRAP = re.compile(r"\r?\n\x1b\[\d+;\d+H")
 _SUPERVISED_DUPLICATED_SOFT_WRAP = re.compile(
     r"(.)\r?\n\x1b\[\d+;\d+H\1", re.DOTALL
 )
-_SUPERVISED_CURSOR_PREFIX = re.compile(r"\x1b\[\d*(?:;\d*)?")
 
 
 def _join_supervised_soft_wraps(text: str) -> str:
@@ -724,48 +724,66 @@ def _join_supervised_soft_wraps(text: str) -> str:
     return _SUPERVISED_SOFT_WRAP.sub("", collapsed)
 
 
+def _remove_json_string_line_breaks(text: str) -> str:
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            elif character in "\r\n":
+                continue
+        elif character == '"':
+            in_string = True
+        repaired.append(character)
+    return "".join(repaired)
+
+
 def _supervised_json_lines(waiter: queue.Queue) -> Any:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    json_decoder = json.JSONDecoder()
     buffer = ""
     closed = False
     while not closed:
-        force_boundary = False
-        try:
-            chunk = (
-                waiter.get(timeout=0.25)
-                if "\n" in buffer
-                else waiter.get()
-            )
-        except queue.Empty:
-            # A resident process does not close stdout after each turn. Once no
-            # cursor-position continuation arrives within one attach poll, the
-            # trailing newline is a real JSONL boundary.
-            chunk = b""
-            force_boundary = True
+        chunk = waiter.get()
         if chunk is None:
+            buffer += decoder.decode(b"", final=True)
             closed = True
-            force_boundary = True
         else:
-            buffer += bytes(chunk).decode("utf-8", errors="replace")
-        buffer = _join_supervised_soft_wraps(buffer)
-        while "\n" in buffer:
-            line_end = buffer.find("\n")
-            suffix = buffer[line_end + 1 :]
-            if not force_boundary and (
-                not suffix or _SUPERVISED_CURSOR_PREFIX.fullmatch(suffix)
-            ):
-                # A ConPTY soft wrap may be split across subscription chunks.
-                # Wait until the following cursor-position sequence is complete
-                # before deciding whether this is a real JSONL boundary.
+            buffer += decoder.decode(bytes(chunk), final=False)
+        buffer = _ANSI_ESCAPE.sub("", _join_supervised_soft_wraps(buffer))
+        while True:
+            opening = buffer.find("{")
+            if opening < 0:
+                if closed:
+                    buffer = ""
+                elif len(buffer) > 4096:
+                    buffer = buffer[-4096:]
                 break
-            line, buffer = buffer.split("\n", 1)
-            cleaned = _ANSI_ESCAPE.sub("", line).strip("\r ")
-            opening = cleaned.find("{")
-            if opening >= 0:
-                yield cleaned[opening:]
-    cleaned = _ANSI_ESCAPE.sub("", _join_supervised_soft_wraps(buffer)).strip("\r ")
-    opening = cleaned.find("{")
-    if opening >= 0:
-        yield cleaned[opening:]
+            if opening:
+                buffer = buffer[opening:]
+            try:
+                _value, end = json_decoder.raw_decode(buffer)
+            except json.JSONDecodeError as error:
+                if error.msg.startswith("Invalid control character"):
+                    pending_wrap = buffer[error.pos :]
+                    if re.fullmatch(r"\r?\n(?:\x1b\[[0-9;]*)?", pending_wrap):
+                        break
+                    repaired = _remove_json_string_line_breaks(buffer)
+                    if repaired != buffer:
+                        buffer = repaired
+                        continue
+                # A ConPTY continuation can arrive after any polling interval.
+                # Keep incomplete candidates, but repair raw terminal hard-wrap
+                # line breaks that ConPTY inserted inside one JSON string.
+                break
+            yield buffer[:end]
+            buffer = buffer[end:].lstrip("\r\n ")
 
 
 def _supervised_process_identity(
@@ -885,7 +903,7 @@ class JsonRpcStdioProcess:
         method: str,
         params: Mapping[str, Any],
         *,
-        timeout_seconds: float = 300,
+        timeout_seconds: float | None = 300,
     ) -> Any:
         with self._pending_lock:
             request_id = self._next_id
@@ -900,7 +918,12 @@ class JsonRpcStdioProcess:
                 "params": _json_object(params),
             }
         )
-        if not pending.event.wait(max(1.0, float(timeout_seconds))):
+        completed = (
+            pending.event.wait()
+            if timeout_seconds is None
+            else pending.event.wait(max(1.0, float(timeout_seconds)))
+        )
+        if not completed:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
             raise AgentSessionError(f"AGENT_RPC_TIMEOUT:{method}")
@@ -1180,7 +1203,7 @@ class GrokAcpSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
-        response_timeout_seconds: float = 300,
+        response_timeout_seconds: float | None = 300,
         terminal_host: Any | None = None,
         project_id: str = "",
         mode: str = "",
@@ -1200,8 +1223,12 @@ class GrokAcpSession:
         # An ephemeral session is bounded: it never resumes a stored session
         # and never reports its id back, so nothing can be resumed later.
         self.ephemeral = bool(ephemeral)
-        self.response_timeout_seconds = _positive_timeout_seconds(
-            response_timeout_seconds, "GROK_RESPONSE_TIMEOUT_INVALID"
+        self.response_timeout_seconds = (
+            None
+            if response_timeout_seconds is None
+            else _positive_timeout_seconds(
+                response_timeout_seconds, "GROK_RESPONSE_TIMEOUT_INVALID"
+            )
         )
         self.session_id = None if self.ephemeral else session_id
         self.model = _text(model, "model")

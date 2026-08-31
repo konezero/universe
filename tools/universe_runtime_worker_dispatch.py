@@ -1117,8 +1117,10 @@ class RuntimeWorkerDispatcher:
                     ),
                     session_observer=session_ids.append,
                     ephemeral=True,
-                    response_timeout_seconds=float(
-                        request["response_timeout_seconds"]
+                    response_timeout_seconds=(
+                        None
+                        if runtime_profile == "TASK_FRAME_RUNTIME"
+                        else float(request["response_timeout_seconds"])
                     ),
                     **supervisor_transport,
                 )
