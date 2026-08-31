@@ -354,6 +354,24 @@ class SupervisedTerminalHost:
             raise TerminalHostError("TERMINAL_NOT_FOUND", "terminal session does not exist")
         return SupervisedSession(terminal)
 
+    def get_host(self, host_session_ref: str) -> SupervisedSession:
+        wanted = str(host_session_ref or "").strip()
+        if not wanted:
+            raise TerminalHostError(
+                "HOST_SESSION_REF_REQUIRED", "host_session_ref is required"
+            )
+        matches = [
+            item
+            for item in self.list_sessions()
+            if str(item.get("host_session_ref") or item.get("reconnection_host_id") or "")
+            == wanted
+        ]
+        if len(matches) != 1:
+            raise TerminalHostError(
+                "HOST_SESSION_NOT_FOUND", "Host session does not exist"
+            )
+        return SupervisedSession(matches[0])
+
     def history(
         self, terminal_id: str, *, before_cursor: int | None = None, limit: int = 100
     ) -> dict[str, Any]:

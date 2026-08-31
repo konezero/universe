@@ -447,6 +447,22 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual(0, waiter.maxsize)
         self.assertEqual(expected, received)
 
+    def test_supervised_get_host_resolves_host_owned_terminal(self) -> None:
+        host = object.__new__(SupervisedTerminalHost)
+        with patch.object(
+            host,
+            "list_sessions",
+            return_value=[
+                {
+                    "terminal_id": "term-hosted",
+                    "host_session_ref": "host-current",
+                    "state": "LIVE",
+                }
+            ],
+        ):
+            hosted = host.get_host("host-current")
+        self.assertEqual("term-hosted", hosted.terminal_id)
+
     def test_supervised_subscription_retries_transient_read_for_live_host(self) -> None:
         host = object.__new__(SupervisedTerminalHost)
         read_attempts = 0
