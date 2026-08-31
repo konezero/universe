@@ -550,7 +550,7 @@ class RuntimeWorkerDispatcher:
                 else WorkerDispatchError(
                     "WORKER_INITIALIZATION_UNEXPECTED_FAILURE",
                     "WORKER_ADAPTER",
-                    type(error).__name__,
+                    f"{type(error).__name__}: {str(error).strip()[:512]}",
                 )
             )
             raise self._recover_claim_failure(
