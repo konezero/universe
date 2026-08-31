@@ -291,6 +291,28 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertIn("OSError", payload["detail"])
         self.assertIn("206", payload["detail"])
 
+    def test_create_forwards_exact_host_replacement_coordinate(self) -> None:
+        with patch.object(
+            self.server.supervisor.host,
+            "create",
+            return_value={"terminal_id": "term-replaced"},
+        ) as create:
+            status, _payload = self.request(
+                "POST",
+                "/v1/terminals",
+                {
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "cwd": str(ROOT),
+                    "provider": "CLAUDE",
+                    "session_anchor_ref": TEST_ANCHOR,
+                    "replace_host_session_ref": "host-stale",
+                },
+            )
+
+        self.assertEqual(201, status)
+        self.assertEqual("host-stale", create.call_args.kwargs["replace_host_session_ref"])
+
     def test_create_list_and_read_survives_client_disconnect_model(self) -> None:
         status, created = self.request(
             "POST",

@@ -620,6 +620,9 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     session_anchor_ref=spawn_anchor_ref,
                     replace_terminal_id=str(body.get("replace_terminal_id") or ""),
+                    replace_host_session_ref=str(
+                        body.get("replace_host_session_ref") or ""
+                    ),
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
                     launch_profile=str(body.get("launch_profile") or "INTERACTIVE"),
                     provider_arguments=tuple(body.get("provider_arguments") or ()),
