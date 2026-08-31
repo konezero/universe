@@ -430,6 +430,12 @@ class SessionInjectHookTests(unittest.TestCase):
                 "binding": {"binding_id": "bind_1"},
                 "room": {"room_id": "room_1"},
                 "bridge_line": "bridge",
+                "runtime_attachment": {
+                    "schema": "universe.session-runtime-attachment.v1",
+                    "status": "WORK_READY",
+                    "session_id": "session-1",
+                    "session_anchor_ref": "anchor-1",
+                },
             }
             with mock.patch(
                 "universe_session_inject_hook.endpoint_reachable",
@@ -451,6 +457,10 @@ class SessionInjectHookTests(unittest.TestCase):
                 )
         self.assertEqual("INJECTED", result["status"])
         self.assertEqual("bind_1", result["inject_response"]["binding_id"])
+        self.assertEqual(
+            "WORK_READY",
+            result["inject_response"]["runtime_attachment"]["status"],
+        )
         self.assertEqual("session_start", result["trigger"])
 
     def test_session_start_binds_live_pty_before_provider_id_exists(self) -> None:

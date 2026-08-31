@@ -54,6 +54,10 @@ class UniverseConductorRuntime:
         *,
         session_node: str = "CONDUCTOR",
         requested_mode: str = "CONDUCTOR",
+        exact_session_id: str = "",
+        session_location: str = "UNIVERSE_LOCAL_SERVICE",
+        parent_actor_ref: str = "universe-conductor",
+        register_process_lease: bool = True,
         native_runner: NativeRunner = run_native_cli,
         source_binding_resolver: SourceBindingResolver | None = None,
         process_factory: ProcessFactory = subprocess.Popen,
@@ -63,6 +67,10 @@ class UniverseConductorRuntime:
         self.repository_root = repository_root.expanduser().resolve(strict=True)
         self.session_node = _text(session_node, "session_node")
         self.requested_mode = _text(requested_mode, "requested_mode").upper()
+        self.exact_session_id = str(exact_session_id or "").strip()
+        self.session_location = _text(session_location, "session_location")
+        self.parent_actor_ref = _text(parent_actor_ref, "parent_actor_ref")
+        self.register_process_lease = bool(register_process_lease)
         self._mode_role: str | None = None
         self.native_runner = native_runner
         self.source_binding_resolver = source_binding_resolver
@@ -127,7 +135,7 @@ class UniverseConductorRuntime:
             "--host-action",
             "PERSISTENT_SESSION_ATTACH",
             "--session-location",
-            "UNIVERSE_LOCAL_SERVICE",
+            self.session_location,
             "--commander-surface",
             "UNIVERSE_UI",
             "--execution-surface",
@@ -202,7 +210,7 @@ class UniverseConductorRuntime:
                     runtime_state["executable_runtime_currentness"]
                 ),
                 "attachment_path": "ANCHOR_GRAPH",
-                "parent_actor_ref": "universe-conductor",
+                "parent_actor_ref": self.parent_actor_ref,
                 "parent_evidence_ref": (
                     f"session-anchor://{self.session_node}/{self.requested_mode}/{anchor_id}"
                 ),
@@ -211,12 +219,13 @@ class UniverseConductorRuntime:
                     f"{self.session_node}/{self.requested_mode.lower()}-runtime/{session_id}"
                 ),
             }
-            self._register_process_lease(
-                process=process,
-                command=command,
-                endpoint=endpoint,
-                token=token,
-            )
+            if self.register_process_lease:
+                self._register_process_lease(
+                    process=process,
+                    command=command,
+                    endpoint=endpoint,
+                    token=token,
+                )
             return dict(self._binding)
         except Exception:
             self.stop()
@@ -227,6 +236,17 @@ class UniverseConductorRuntime:
 
         if self.session_supervisor is None:
             return None
+        if self.exact_session_id:
+            try:
+                session = self.session_supervisor.get_session(self.exact_session_id)
+            except SessionSupervisorError:
+                return None
+            if (
+                str(session.get("node") or "") != self.session_node
+                or str(session.get("mode") or "").upper() != self.requested_mode
+            ):
+                return None
+            return session
         candidates = [
             item
             for item in self.session_supervisor.list_sessions(

@@ -106,11 +106,10 @@ SESSION_BOOTSTRAP_PROMPT = (
 # Matches ANSI CSI (`ESC[...letter`) and OSC (`ESC]...BEL`/`ESC]...ESC\`)
 # sequences so terminal output can be checked as plain text.
 _ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
-# The CLI renders each word of its --dangerously-load-development-channels
-# confirmation prompt with its own cursor-column jump instead of a literal
-# space, so after stripping escapes the words land back to back with no
-# separator at all - hence no `\s*` between "local" and "development" below.
-_DEV_CHANNEL_PROMPT_RE = re.compile(rb"localdevelopment", re.IGNORECASE)
+# Claude has emitted this phrase both as ordinary text (with a space) and with
+# a cursor-column jump between the words.  Stripping ANSI escapes collapses the
+# latter to ``localdevelopment``, so accept either representation.
+_DEV_CHANNEL_PROMPT_RE = re.compile(rb"local\s*development", re.IGNORECASE)
 
 
 def provider_cli_ready_for_bootstrap(provider: str, output: bytes) -> bool:

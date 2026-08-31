@@ -3169,6 +3169,70 @@ class UniverseLocalServiceTests(unittest.TestCase):
             injected["supervisor_session"]["provider_session_ref"],
         )
 
+    def test_session_runtime_attachment_is_exact_idempotent_and_redacts_token(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-runtime-attach-001",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-runtime-attach-001",
+                "anchor_ref": "session-anchor-runtime-attach-001",
+                "state": "STARTING",
+            }
+        )
+        starts: list[tuple[Path, dict[str, Any]]] = []
+
+        class FakeSessionRuntime:
+            def __init__(self, root: Path, value: dict[str, Any]) -> None:
+                starts.append((root, value))
+
+            def start(self) -> dict[str, Any]:
+                return {
+                    "endpoint": "http://127.0.0.1:41994",
+                    "token": "must-not-leak",
+                    "session_id": session["session_id"],
+                    "origin_anchor_ref": session["session_anchor_ref"],
+                    "origin_frame_id": "current",
+                    "attachment_path": "ANCHOR_GRAPH",
+                    "runtime_currentness_observation": "CURRENT",
+                    "binding_evidence_ref": "process-local://session-runtime",
+                }
+
+            def stop(self) -> None:
+                return None
+
+        self.server._session_runtime_factory = FakeSessionRuntime
+        first = self.server.ensure_session_runtime_attachment(session)
+        second = self.server.ensure_session_runtime_attachment(session)
+
+        self.assertEqual("WORK_READY", first["status"])
+        self.assertEqual(session["session_anchor_ref"], first["session_anchor_ref"])
+        self.assertNotIn("endpoint", first)
+        self.assertNotIn("token", first)
+        self.assertEqual(first, second)
+        self.assertEqual(1, len(starts))
+
+        triggered = self.server.attach_session_runtime_from_hook(
+            {
+                "hook_observation": {
+                    "schema": "universe.hook-session-observation.v1",
+                    "trigger": "session_start",
+                }
+            },
+            {
+                "supervisor_session": session,
+                "managed_shell_attachment": {
+                    "status": "MANAGED_SHELL_ATTACHED"
+                },
+            },
+        )
+        self.assertEqual("WORK_READY", triggered["status"])
+
     def test_claude_session_without_channel_does_not_inject_pty(self) -> None:
         terminal = {
             "terminal_id": "term-session-hook-001",

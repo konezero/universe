@@ -17,6 +17,8 @@ TEST_ANCHOR = "session_anchor_test"
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.terminal_host import (  # noqa: E402
+    _ANSI_ESCAPE_RE,
+    _DEV_CHANNEL_PROMPT_RE,
     MANAGED_SHELL_IDENTITY_MISSING,
     ProcessIdentity,
     TerminalHost,
@@ -130,6 +132,22 @@ class FakeReconnectionRegistry:
 
 
 class TerminalHostTests(unittest.TestCase):
+    def test_claude_development_channel_prompt_matches_real_screen_forms(self) -> None:
+        ordinary = b"Yes, I am using this for local development"
+        cursor_positioned = (
+            b"Yes, I am using this for local"
+            b"\x1b[12;42Hdevelopment"
+        )
+
+        for screen in (ordinary, cursor_positioned):
+            with self.subTest(screen=screen):
+                plain = _ANSI_ESCAPE_RE.sub(b"", screen)
+                self.assertIsNotNone(_DEV_CHANNEL_PROMPT_RE.search(plain))
+
+        self.assertIsNone(
+            _DEV_CHANNEL_PROMPT_RE.search(b"local production environment")
+        )
+
     def test_rust_host_creation_and_audit_reconstruction_share_one_terminal(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(

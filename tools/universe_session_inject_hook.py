@@ -1210,6 +1210,7 @@ def run_hook(
                 "pending_instruction_dispatch": response.get(
                     "pending_instruction_dispatch"
                 ),
+                "runtime_attachment": response.get("runtime_attachment"),
             },
             **base,
         )

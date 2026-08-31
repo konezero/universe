@@ -24595,6 +24595,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         *,
         auto_start_conductor_runtime: bool = False,
         conductor_runtime_factory: Any = None,
+        session_runtime_factory: Any = None,
         conductor_session_provider_factory: Any = None,
         conductor_delegation_executor: Any = None,
         auto_start_project_masters: bool = True,
@@ -24713,6 +24714,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._conductor_session_error: dict[str, str] | None = None
         self._conductor_session_provider_factory = conductor_session_provider_factory
         self._conductor_runtime_factory = conductor_runtime_factory
+        self._session_runtime_factory = session_runtime_factory
+        self._session_runtime_lock = threading.RLock()
+        self._session_runtimes: dict[str, UniverseConductorRuntime] = {}
+        self._session_runtime_bindings: dict[str, dict[str, Any]] = {}
         self._conductor_session_host_lock = threading.RLock()
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
@@ -25545,6 +25550,125 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             session_supervisor=self.session_supervisor,
         )
+
+    def ensure_session_runtime_attachment(
+        self, session: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Attach Project Runtime to the exact SessionStart-owned Anchor.
+
+        The hook supplies provider identity and the Supervisor coordinate. The
+        server owns the Runtime endpoint/token and keeps them out of provider
+        hook output; callers receive only non-secret attachment evidence.
+        """
+
+        session_id = _required_text(session.get("session_id"), "session_id")
+        anchor_ref = _required_text(
+            session.get("session_anchor_ref"), "session_anchor_ref"
+        )
+        project_id = _required_text(
+            session.get("project_id") or session.get("node"), "project_id"
+        )
+        mode = _required_text(session.get("mode"), "mode").upper()
+        with self._session_runtime_lock:
+            existing = self._session_runtime_bindings.get(session_id)
+            if (
+                existing is not None
+                and existing.get("origin_anchor_ref") == anchor_ref
+            ):
+                return self._public_session_runtime_attachment(existing)
+            stale = self._session_runtimes.pop(session_id, None)
+            self._session_runtime_bindings.pop(session_id, None)
+            if stale is not None:
+                stale.stop()
+            project = self.store.get_project(project_id)
+            project_root = Path(
+                _required_text(project.get("project_root"), "project_root")
+            )
+            if self._session_runtime_factory is not None:
+                runtime = self._session_runtime_factory(project_root, dict(session))
+            else:
+                runtime = UniverseConductorRuntime(
+                    project_root,
+                    session_node=str(session.get("node") or project_id),
+                    requested_mode=mode,
+                    exact_session_id=session_id,
+                    session_location="UNIVERSE_SESSION_HOST",
+                    parent_actor_ref=f"universe-session-host:{session_id}",
+                    register_process_lease=False,
+                    source_binding_resolver=(
+                        lambda _root: self.store.selected_project_release_binding(
+                            project_id
+                        )
+                    ),
+                    session_supervisor=self.session_supervisor,
+                )
+            binding = dict(runtime.start())
+            if binding.get("origin_anchor_ref") != anchor_ref:
+                runtime.stop()
+                raise UniverseError(
+                    "SESSION_RUNTIME_ANCHOR_MISMATCH",
+                    "Project Runtime attached to a different Session Anchor",
+                    HTTPStatus.CONFLICT,
+                )
+            self._session_runtimes[session_id] = runtime
+            self._session_runtime_bindings[session_id] = binding
+            return self._public_session_runtime_attachment(binding)
+
+    def attach_session_runtime_from_hook(
+        self,
+        body: Mapping[str, Any],
+        inject_result: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        hook = body.get("hook_observation")
+        if (
+            not isinstance(hook, Mapping)
+            or str(hook.get("trigger") or "").strip().lower() != "session_start"
+        ):
+            return None
+        supervised = inject_result.get("supervisor_session")
+        managed = inject_result.get("managed_shell_attachment")
+        if (
+            not isinstance(supervised, Mapping)
+            or not isinstance(managed, Mapping)
+            or managed.get("status") != "MANAGED_SHELL_ATTACHED"
+        ):
+            return None
+        try:
+            return self.ensure_session_runtime_attachment(supervised)
+        except (
+            OSError,
+            SessionSupervisorError,
+            UniverseConductorRuntimeError,
+            UniverseError,
+        ) as error:
+            return {
+                "schema": "universe.session-runtime-attachment.v1",
+                "status": "ATTACH_FAILED",
+                "session_id": supervised.get("session_id"),
+                "session_anchor_ref": supervised.get("session_anchor_ref"),
+                "error_code": getattr(
+                    error,
+                    "code",
+                    str(error) or type(error).__name__,
+                ),
+            }
+
+    @staticmethod
+    def _public_session_runtime_attachment(
+        binding: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "schema": "universe.session-runtime-attachment.v1",
+            "status": "WORK_READY",
+            "session_id": binding.get("session_id"),
+            "session_anchor_ref": binding.get("origin_anchor_ref"),
+            "frame_id": binding.get("origin_frame_id"),
+            "attachment_path": binding.get("attachment_path"),
+            "runtime_currentness": binding.get(
+                "runtime_currentness_observation"
+            ),
+            "binding_evidence_ref": binding.get("binding_evidence_ref"),
+        }
 
     def _ensure_conductor_planning_runtime(self) -> dict[str, Any] | None:
         """Lazily attach the runtime required by the Conductor room worker."""
@@ -36190,6 +36314,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if self.conductor_runtime is not None:
             close_step("conductor_runtime", self.conductor_runtime.stop)
             self.conductor_runtime = None
+        with self._session_runtime_lock:
+            session_runtimes = list(self._session_runtimes.items())
+            self._session_runtimes.clear()
+            self._session_runtime_bindings.clear()
+        for session_id, runtime in session_runtimes:
+            close_step(f"session_runtime:{session_id}", runtime.stop)
         if self.rendezvous_service is not None:
             close_step("rendezvous_service", self.rendezvous_service.stop)
             self.rendezvous_service = None
@@ -38590,6 +38720,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         body=body or {},
                         terminal_host=self.server.terminal_host,
                     )
+                    runtime_attachment = (
+                        self.server.attach_session_runtime_from_hook(
+                            body or {}, result
+                        )
+                    )
+                    if runtime_attachment is not None:
+                        result["runtime_attachment"] = runtime_attachment
                     hook_observation = self.server.record_session_hook_observation(
                         body or {}, result
                     )

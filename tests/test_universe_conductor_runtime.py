@@ -46,6 +46,84 @@ class FakeProcess:
 
 
 class UniverseConductorRuntimeTests(unittest.TestCase):
+    def test_exact_session_attachment_does_not_replace_host_process_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+            supervisor = SessionSupervisorStore(root / "universe.sqlite3")
+            session, _ = supervisor.register_session(
+                {
+                    "session_id": "session-host-001",
+                    "node": "GCS",
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "provider": "CLAUDE",
+                    "provider_session_ref": "claude-session-001",
+                    "anchor_ref": "SESSION-ANCHOR-001",
+                    "state": "STARTING",
+                }
+            )
+            captured: list[str] = []
+
+            def process_factory(command: list[str], **_: Any) -> FakeProcess:
+                captured.extend(command)
+                token = command[command.index("--token") + 1]
+                return FakeProcess(
+                    {
+                        "status": "PERSISTENT_SESSION_ATTACHED",
+                        "host_adapter": {
+                            "endpoint": "http://127.0.0.1:41993",
+                            "token": token,
+                        },
+                        "runtime_state": {
+                            "anchor_id": session["session_anchor_ref"],
+                            "mode": "MASTER",
+                            "role": "UNASSIGNED",
+                            "session_id": session["session_id"],
+                            "executable_runtime_currentness": "CURRENT",
+                        },
+                        "attachment_path": "ANCHOR_GRAPH",
+                    }
+                )
+
+            runtime = UniverseConductorRuntime(
+                root,
+                session_node="GCS",
+                requested_mode="MASTER",
+                exact_session_id=session["session_id"],
+                session_location="UNIVERSE_SESSION_HOST",
+                parent_actor_ref="universe-session-host:session-host-001",
+                register_process_lease=False,
+                source_binding_resolver=lambda _root: {
+                    "status": "SELECTED",
+                    "release_id": "core-test",
+                    "source_repository": "fixture/universe-private",
+                    "source_commit": "b" * 40,
+                    "database_sha256": "c" * 64,
+                },
+                process_factory=process_factory,
+                session_supervisor=supervisor,
+            )
+            with patch(
+                "universe_conductor_runtime._required_host_executable",
+                return_value=Path(sys.executable),
+            ):
+                binding = runtime.start()
+
+            self.assertEqual(
+                session["session_anchor_ref"], binding["origin_anchor_ref"]
+            )
+            self.assertEqual(
+                "UNIVERSE_SESSION_HOST",
+                captured[captured.index("--session-location") + 1],
+            )
+            self.assertIsNone(
+                supervisor.get_session(session["session_id"])["process_lease"]
+            )
+            runtime.stop()
+
     def test_start_requires_selected_release_database(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
