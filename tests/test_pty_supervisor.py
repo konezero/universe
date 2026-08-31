@@ -311,6 +311,7 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual("MAX", created["terminal"]["effort"])
         _status, listed = self.request("GET", "/v1/terminals")
         self.assertEqual(1, len(listed["terminals"]))
+        self.assertIn("hosts", listed)
         _status, attached = self.request("POST", f"/v1/terminals/{terminal_id}/attach")
         attach_id = attached["attach_id"]
         seen = b""
@@ -374,6 +375,7 @@ class PtySupervisorTests(unittest.TestCase):
         listed = second.list_sessions()
         self.assertEqual(1, len(listed))
         self.assertEqual(terminal_id, listed[0]["terminal_id"])
+        self.assertIsInstance(second.list_hosts(), list)
         history = second.history(terminal_id, limit=10)
         replay = b"".join(
             base64.b64decode(chunk["data_base64"])

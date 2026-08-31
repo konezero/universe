@@ -344,6 +344,9 @@ class SupervisedTerminalHost:
     def list_sessions(self) -> list[dict[str, Any]]:
         return list(self._request("GET", "/v1/terminals").get("terminals") or [])
 
+    def list_hosts(self) -> list[dict[str, Any]]:
+        return list(self._request("GET", "/v1/terminals").get("hosts") or [])
+
     def get(self, terminal_id: str) -> SupervisedSession:
         payload = self._request("GET", f"/v1/terminals/{quote(terminal_id, safe='')}")
         terminal = payload.get("terminal")

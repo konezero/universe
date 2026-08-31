@@ -422,9 +422,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/v1/terminals":
             rows = [supervisor.public_session(item) for item in supervisor.host.list_sessions()]
+            hosts = supervisor.host.list_hosts()
             self._send(
                 HTTPStatus.OK,
-                {"schema": API_SCHEMA, "status": "OK", "terminals": rows},
+                {
+                    "schema": API_SCHEMA,
+                    "status": "OK",
+                    "terminals": rows,
+                    "hosts": hosts,
+                },
             )
             return
         terminal_history = path.split("/")
