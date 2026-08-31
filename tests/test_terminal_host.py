@@ -1005,6 +1005,14 @@ class TerminalHostTests(unittest.TestCase):
             supervisor_session_id="session_a",
         )
         self.assertEqual(first["terminal_id"], found["terminal_id"])
+        anchor_found = host.find_live(
+            project_id="universe",
+            mode="MASTER",
+            provider="GROK",
+            supervisor_session_id="session_b",
+            session_anchor_ref=TEST_ANCHOR,
+        )
+        self.assertEqual(first["terminal_id"], anchor_found["terminal_id"])
         self.assertIsNone(
             host.find_live(
                 project_id="universe",

@@ -2191,7 +2191,8 @@ class TerminalHost:
                 or item.provider == wanted_provider
             )
             and (
-                not wanted_supervisor
+                wanted_anchor
+                or not wanted_supervisor
                 or item.supervisor_session_id == wanted_supervisor
             )
             and (

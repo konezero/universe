@@ -390,6 +390,14 @@ class PtySupervisorTests(unittest.TestCase):
         )
         self.assertIsNotNone(found)
         self.assertEqual(terminal_id, found["terminal_id"])
+        anchor_found = second.find_live(
+            project_id="universe",
+            mode="MASTER",
+            provider="GROK",
+            supervisor_session_id="session_master_2",
+            session_anchor_ref=TEST_ANCHOR,
+        )
+        self.assertEqual(terminal_id, anchor_found["terminal_id"])
         self.assertIsNone(
             second.find_live(
                 project_id="universe",

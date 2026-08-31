@@ -529,7 +529,8 @@ class SupervisedTerminalHost:
                 or str(item.get("provider") or "").upper() == wanted_provider
             )
             and (
-                not wanted_supervisor
+                wanted_anchor
+                or not wanted_supervisor
                 or str(item.get("supervisor_session_id") or "")
                 == wanted_supervisor
             )
