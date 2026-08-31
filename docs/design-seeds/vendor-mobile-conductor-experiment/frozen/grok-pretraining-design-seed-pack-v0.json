@@ -1,0 +1,458 @@
+{
+  "pack_id": "grok-pretraining-design-seed-pack-v0",
+  "vendor": "GROK",
+  "elicitation_kind": "MODEL_RECALL",
+  "model_self_report": {
+    "vendor": "GROK",
+    "self_identified_model_family": "Grok 4 family (xAI); no exact checkpoint claimed",
+    "recall_posture": "Compressed design-history schemata reconstructed as forms and practices, not literal document recovery. Stronger on widely taught HCI, Unix, smartphone, and ops tropes than on niche primary industrial sources.",
+    "known_blind_spots": [
+      "Cannot verify dates, attributions, or wording without retrieval",
+      "Western/US product canon overweight",
+      "Coding-agent CLI/diff/PR tropes overweight relative to physical ops",
+      "Weak on non-English super-app lived practice",
+      "Aviation and process-control details may be textbook-flattened",
+      "No access to other vendor packs or product source"
+    ]
+  },
+  "extraction_scope_coverage": {
+    "lineages_required": 17,
+    "lineages_covered": 17,
+    "seeds_per_lineage": 1,
+    "total_seeds": 17,
+    "max_total_seeds": 36,
+    "min_max_per_lineage": [
+      1,
+      3
+    ],
+    "web_research": false,
+    "rag_retrieval": false,
+    "product_source_inspection": false,
+    "precise_citations_invented": false,
+    "eras_distinct": true
+  },
+  "lineage_catalog": [
+    {
+      "lineage_id": "hci-interaction",
+      "label": "HCI / interaction"
+    },
+    {
+      "lineage_id": "computing-interfaces",
+      "label": "Computing interfaces"
+    },
+    {
+      "lineage_id": "mobile-messaging",
+      "label": "Mobile / messaging"
+    },
+    {
+      "lineage_id": "industrial-design",
+      "label": "Industrial design"
+    },
+    {
+      "lineage_id": "technology-evolution",
+      "label": "Technology evolution"
+    },
+    {
+      "lineage_id": "graphic-visual-communication",
+      "label": "Graphic / visual communication"
+    },
+    {
+      "lineage_id": "architecture-spatial",
+      "label": "Architecture / spatial"
+    },
+    {
+      "lineage_id": "accessibility",
+      "label": "Accessibility"
+    },
+    {
+      "lineage_id": "social-cultural-behavior",
+      "label": "Social / cultural behavior"
+    },
+    {
+      "lineage_id": "command-lines",
+      "label": "Command lines"
+    },
+    {
+      "lineage_id": "dashboards-control-rooms",
+      "label": "Dashboards / control rooms"
+    },
+    {
+      "lineage_id": "approvals-notifications",
+      "label": "Approvals / notifications"
+    },
+    {
+      "lineage_id": "progressive-disclosure",
+      "label": "Progressive disclosure"
+    },
+    {
+      "lineage_id": "long-running-monitoring",
+      "label": "Long-running monitoring"
+    },
+    {
+      "lineage_id": "multi-agent-coordination",
+      "label": "Multi-agent coordination"
+    },
+    {
+      "lineage_id": "trust-explainability",
+      "label": "Trust / explainability"
+    },
+    {
+      "lineage_id": "desktop-mobile-continuity",
+      "label": "Desktop / mobile continuity"
+    }
+  ],
+  "seeds": [
+    {
+      "seed_id": "grok-hci-direct-manipulation-1980s",
+      "primary_lineage": "hci-interaction",
+      "era_or_date_range": "1980s GUI generation",
+      "observed_example": "Bitmapped GUI: pointing at visible objects, drag, menus, WYSIWYG instead of remembered command syntax.",
+      "problem_or_conditions": "Recall-heavy command languages failed casual users; needed recognition and reversible spatial action.",
+      "enabling_technology_or_constraints": "Bitmapped displays, mouse, enough RAM for overlapping windows.",
+      "interaction_form": "spatial direct manipulation",
+      "remembered_reaction_or_critique": "Praised for learnability; experts lost keystroke speed; not every task had a visible object. Uncertainty: intensity of expert backlash varies by community.",
+      "suspected_source_or_example": "HCI textbook and 1980s GUI demo class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — form is canonical; specific product genealogy is flattened in memory.",
+      "relevance_clue": "Agent command surfaces that hide work objects behind chat lose the recognition path direct manipulation was built for.",
+      "coding_agent_bias": "Tool-using chat and CLI training overweights typed commands and underweights object-first spatial UIs."
+    },
+    {
+      "seed_id": "grok-computing-notebook-2010s",
+      "primary_lineage": "computing-interfaces",
+      "era_or_date_range": "2010s notebook generation",
+      "observed_example": "Computational notebook: interleaved prose, code cells, and captured outputs as the session’s visible state.",
+      "problem_or_conditions": "Exploratory work needed continuity of control and inspectable intermediate state, not a hidden compiler.",
+      "enabling_technology_or_constraints": "Browser clients, kernel RPC, cheap local or cloud runtimes.",
+      "interaction_form": "edit-run-inspect cells",
+      "remembered_reaction_or_critique": "Loved for teaching and exploration; criticized for hidden execution order and unreproducible saved outputs.",
+      "suspected_source_or_example": "Data-science notebook product class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — the form and the reproducibility critique are widely repeated.",
+      "relevance_clue": "Autonomous agents need a durable, inspectable state surface, not only a transcript of intents.",
+      "coding_agent_bias": "IDE/CLI/diff training treats notebooks as messy compared with files and tests, biasing recall toward ‘real’ code workflows."
+    },
+    {
+      "seed_id": "grok-mobile-notification-shade-2010s",
+      "primary_lineage": "mobile-messaging",
+      "era_or_date_range": "2010s smartphone OS generation",
+      "observed_example": "Lock-screen banners and a pull-down shade as mixed inbox, status, and tap-through remote control; chat apps acting like a home surface.",
+      "problem_or_conditions": "Always-on apps competing for attention when the user is not in the app.",
+      "enabling_technology_or_constraints": "Push networks, background app limits, small screens, social expectation of immediate reply.",
+      "interaction_form": "notification + glance + tap-through",
+      "remembered_reaction_or_critique": "Convenient; high interruption cost, banner blindness, lock-screen privacy leaks. Uncertainty: cultural reply-speed norms differ.",
+      "suspected_source_or_example": "Smartphone OS and messenger product class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — shade-as-inbox is a lived, widely discussed form.",
+      "relevance_clue": "Agent progress and asks will be judged by interruption cost, not only by message completeness.",
+      "coding_agent_bias": "Coding-agent logs flatten notifications into stdout lines and miss social interrupt etiquette."
+    },
+    {
+      "seed_id": "grok-industrial-cockpit-mode-errors",
+      "primary_lineage": "industrial-design",
+      "era_or_date_range": "late analog into glass-cockpit decades",
+      "observed_example": "Cockpit and handheld controls using shape, detents, and placement so a hand confirms mode; similar-looking switches still induce mode errors.",
+      "problem_or_conditions": "High-stakes control under stress where looking away or mis-reading a mode is costly.",
+      "enabling_technology_or_constraints": "Physical panels, later multifunction glass displays that reuse the same surface for many modes.",
+      "interaction_form": "haptic spatial control",
+      "remembered_reaction_or_critique": "Tactile coding praised; automation surprise and look-alike controls blamed in incident folklore. Uncertainty: specific incident details not recalled as facts.",
+      "suspected_source_or_example": "Aviation human-factors literature class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — the mode-error pattern is standard; I am not recovering a particular report.",
+      "relevance_clue": "Silent agent mode changes without tactile or explicit confirmation recreate classic mode errors.",
+      "coding_agent_bias": "Flag/config mental models make mode feel like a typed setting rather than a physical trap."
+    },
+    {
+      "seed_id": "grok-tech-push-always-on-2000s",
+      "primary_lineage": "technology-evolution",
+      "era_or_date_range": "2000s–2010s always-on mobile",
+      "observed_example": "Shift from poll-when-open to push and background compute: work continues off-screen until it spends battery or attention.",
+      "problem_or_conditions": "Users cannot wait at a terminal; servers and devices stay reachable.",
+      "enabling_technology_or_constraints": "Cellular data, app sandboxes, battery budgets, cloud vs on-device tradeoffs.",
+      "interaction_form": "background then interrupt",
+      "remembered_reaction_or_critique": "Praised for freshness; blamed for drain, opaque background work, and attention tax.",
+      "suspected_source_or_example": "Mobile platform architecture folklore",
+      "observation_vs_inference": "INFERENCE",
+      "uncertainty": "MEDIUM — causal story (push because poll failed) is constructed; the technologies are recalled.",
+      "relevance_clue": "Local vs cloud agents inherit battery, radio, and attention budgets, not just model quality.",
+      "coding_agent_bias": "Server-side agent training assumes always-on compute and underweights device energy and radio constraints."
+    },
+    {
+      "seed_id": "grok-graphic-glanceable-status-type",
+      "primary_lineage": "graphic-visual-communication",
+      "era_or_date_range": "1990s–2000s dashboard era",
+      "observed_example": "Sparse status typography and color/weight hierarchy for health-at-a-glance versus dense tables that require reading.",
+      "problem_or_conditions": "Operators must separate normal variance from exception without reading every cell.",
+      "enabling_technology_or_constraints": "Color displays, limited wall or laptop pixels, printing/PDF still used for dense records.",
+      "interaction_form": "glance then drill-down",
+      "remembered_reaction_or_critique": "Glanceability praised; color-only status fails color vision; decoration mistaken for signal.",
+      "suspected_source_or_example": "Dashboard and information-design book class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — principles are canonical; I am not attaching a title or page.",
+      "relevance_clue": "Agent run state needs a glanceable exception language, not a wall of undifferentiated tokens.",
+      "coding_agent_bias": "Terminal color and log volume feel like ‘enough visualization’ and distort density judgments."
+    },
+    {
+      "seed_id": "grok-architecture-control-room-place",
+      "primary_lineage": "architecture-spatial",
+      "era_or_date_range": "mid–late 20th century ops centers, still current",
+      "observed_example": "Control/war rooms: wall overview, assigned seats, people pointing at shared surfaces as a place, not a window.",
+      "problem_or_conditions": "Teams need shared situational awareness that a personal screen cannot hold.",
+      "enabling_technology_or_constraints": "Large displays, room acoustics, seating hierarchy, later video walls.",
+      "interaction_form": "spatial co-presence + wall monitor",
+      "remembered_reaction_or_critique": "Effective for coordination; also theater—rooms can signal importance without improving control. Uncertainty: how often theater dominates.",
+      "suspected_source_or_example": "Operations-center photo and ethnography class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — the spatial pattern is remembered; causal claims about effectiveness are softer.",
+      "relevance_clue": "Software ‘places’ for agents (rooms vs threads) change who sees state and who may speak.",
+      "coding_agent_bias": "IDE-as-workshop flattens place into files and terminals."
+    },
+    {
+      "seed_id": "grok-accessibility-screen-reader-linearization",
+      "primary_lineage": "accessibility",
+      "era_or_date_range": "1990s–2010s web a11y generation",
+      "observed_example": "Screen readers turn spatial GUIs into a spoken/braille stream; names, headings, focus order, and skip links are the real UI.",
+      "problem_or_conditions": "Pointer-first visual layouts exclude non-visual and motor-limited users; recovery after interrupt is hard.",
+      "enabling_technology_or_constraints": "OS accessibility APIs, semantic markup, later ARIA live regions.",
+      "interaction_form": "sequential navigation + announcement",
+      "remembered_reaction_or_critique": "Unlabeled controls, focus traps, and live-region storms are recurring failures; contrast-only status also fails.",
+      "suspected_source_or_example": "Accessibility practice and standards-guidance class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — linearization and unlabeled-control failures are stable memories.",
+      "relevance_clue": "Agent surfaces that exist only as visual cards will be unusable for sequential and motor-limited access, and for interrupt recovery.",
+      "coding_agent_bias": "Generated UIs optimize for looking right in a screenshot, not for names, focus, or cognitive load."
+    },
+    {
+      "seed_id": "grok-social-delegation-interrupt-etiquette",
+      "primary_lineage": "social-cultural-behavior",
+      "era_or_date_range": "undated workplace pattern, digitized later",
+      "observed_example": "Delegation through secretaries, deputies, or bots: the intermediary filters interrupts and speaks with borrowed status.",
+      "problem_or_conditions": "Principals cannot take every ask; groups need etiquette for who may barge in.",
+      "enabling_technology_or_constraints": "Org hierarchy; later email/IM; still later software agents as stand-ins.",
+      "interaction_form": "mediated request + callback",
+      "remembered_reaction_or_critique": "Efficient when trusted; blame and lost face when the deputy errs; over-interruption of high-status people. Uncertainty: cultural variation is large.",
+      "suspected_source_or_example": "Workplace ethnography and org-behavior class",
+      "observation_vs_inference": "INFERENCE",
+      "uncertainty": "MEDIUM — I am assembling a causal story from a familiar social pattern, not a single study.",
+      "relevance_clue": "Autonomous agents act as deputies; interrupt etiquette and borrowed authority become design constraints.",
+      "coding_agent_bias": "Chat-with-tools training treats the user as always-present principal with full authority."
+    },
+    {
+      "seed_id": "grok-cli-unix-job-control-1970s",
+      "primary_lineage": "command-lines",
+      "era_or_date_range": "1970s–1980s Unix generation, still current",
+      "observed_example": "Shell/REPL: typed commands, pipes, job control (fg/bg/kill), stdout/stderr as evidence, dangerous flags with little preview.",
+      "problem_or_conditions": "Compose small tools without a GUI; keep control across long jobs on a tty.",
+      "enabling_technology_or_constraints": "ttys, processes, cheap text I/O; no guaranteed undo.",
+      "interaction_form": "command language",
+      "remembered_reaction_or_critique": "Praised for composability; blamed for irreparable commands, cryptic flags, and expert-only recovery.",
+      "suspected_source_or_example": "Unix folklore and man-page culture class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — this is a high-frequency remembered form.",
+      "relevance_clue": "Agent-issued shell is a high-power, low-preview control surface; stdout is treated as proof.",
+      "coding_agent_bias": "This lineage is overweighted by coding-agent training (CLI, diffs, tests) relative to all others."
+    },
+    {
+      "seed_id": "grok-dashboard-alarm-vs-status",
+      "primary_lineage": "dashboards-control-rooms",
+      "era_or_date_range": "industrial HMI decades, still current",
+      "observed_example": "Overview-first boards that try to separate alarm (act now) from status (normal); wall vs handheld density differs.",
+      "problem_or_conditions": "Operators must not hunt; alarm floods hide the real event; authority to silence or act is assigned.",
+      "enabling_technology_or_constraints": "SCADA/annunciator panels, later large LCDs and paging to handhelds.",
+      "interaction_form": "monitor + acknowledge",
+      "remembered_reaction_or_critique": "Alarm flooding and silenced annunciators are a standing operational critique; overview-first is often violated in practice.",
+      "suspected_source_or_example": "Industrial HMI guidance class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — pattern is standard; plant-specific practice is not firsthand.",
+      "relevance_clue": "Agent errors, retries, and progress must not share one alarm channel.",
+      "coding_agent_bias": "CI red/green and log errors get treated as alarms even when they are routine status."
+    },
+    {
+      "seed_id": "grok-approvals-two-person-and-push",
+      "primary_lineage": "approvals-notifications",
+      "era_or_date_range": "older dual-control practice; mobile push-approve in 2010s",
+      "observed_example": "Two-person/dual-control for high-risk acts; later phone push as blocking or silent consent.",
+      "problem_or_conditions": "Single-actor error or malice; need consent that can interrupt or wait in an inbox.",
+      "enabling_technology_or_constraints": "Policy and staffing; later crypto tokens and mobile push.",
+      "interaction_form": "approval / blocking vs silent consent",
+      "remembered_reaction_or_critique": "Rubber-stamping, notification fatigue, and pre-checked silent consent are known failure modes. Uncertainty: prevalence by industry.",
+      "suspected_source_or_example": "Security-ops and banking-control practice class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — dual-control and push-approve are distinct remembered forms.",
+      "relevance_clue": "Agent tool use needs a grain of consent: interrupt, inbox, or silent—each with different miss costs.",
+      "coding_agent_bias": "Local tool auto-approval in agent loops normalizes silent consent."
+    },
+    {
+      "seed_id": "grok-progressive-disclosure-novice-expert",
+      "primary_lineage": "progressive-disclosure",
+      "era_or_date_range": "1980s–1990s GUI pattern, still current",
+      "observed_example": "Simple default path with advanced controls behind menus, shortcuts, or ‘more’; details on demand.",
+      "problem_or_conditions": "One surface cannot serve first-run and expert speed without hiding power.",
+      "enabling_technology_or_constraints": "GUI widget sets, later settings search; CLI still exposes everything.",
+      "interaction_form": "novice path + details-on-demand",
+      "remembered_reaction_or_critique": "Learnability gains; hidden power and leaky abstractions when the simple model is false.",
+      "suspected_source_or_example": "HCI pattern-catalog class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — the pattern name and tradeoff are stable in memory.",
+      "relevance_clue": "Agent defaults vs expert override will leak whenever the hidden layer is the true control plane.",
+      "coding_agent_bias": "Expert CLI users assume everyone wants full power visible."
+    },
+    {
+      "seed_id": "grok-longrun-jobs-outlive-session",
+      "primary_lineage": "long-running-monitoring",
+      "era_or_date_range": "batch/daemon era through CI and space ops",
+      "observed_example": "Submit a job, detach, watch heartbeats/logs/pagers, reattach later; work outlives the human session.",
+      "problem_or_conditions": "Builds, plants, spacecraft, and daemons cannot be babysat at a blocking prompt.",
+      "enabling_technology_or_constraints": "Queues, daemons, pagers, log stores, shift handoff.",
+      "interaction_form": "submit + monitor + reattach",
+      "remembered_reaction_or_critique": "Log volume and orphaned jobs; ownership unclear across shifts. Uncertainty: spacecraft vs CI similarity is analogical.",
+      "suspected_source_or_example": "Ops/CI practice and mission-ops folklore class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — detach/monitor/reattach is a stable form across domains.",
+      "relevance_clue": "Autonomous agents that outlive a chat turn need reattach, ownership, and heartbeat language.",
+      "coding_agent_bias": "Chat sessions are trained as if they contain the whole job."
+    },
+    {
+      "seed_id": "grok-multiagent-atc-readback",
+      "primary_lineage": "multi-agent-coordination",
+      "era_or_date_range": "20th-century ATC and trading floors, still current",
+      "observed_example": "Many actors, one shared picture, protocol talk, readback/dissent; collision is the failure.",
+      "problem_or_conditions": "Parallel work on shared resources without a single operator seeing everything.",
+      "enabling_technology_or_constraints": "Radio, tickets/tickers, shared boards; later electronic strips and matching engines.",
+      "interaction_form": "protocol + shared state + dissent",
+      "remembered_reaction_or_critique": "Readback praised; authority gradient can silence dissent; lost updates still happen. Uncertainty: I am not recalling a specific incident file.",
+      "suspected_source_or_example": "ATC and trading-floor account class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — coordination pattern is remembered; software multi-agent mapping is analogical.",
+      "relevance_clue": "Software multi-agent systems need shared state and an explicit dissent/readback path, not just parallel tool calls.",
+      "coding_agent_bias": "Orchestrated subagents get modeled as function calls without human protocol costs."
+    },
+    {
+      "seed_id": "grok-trust-audit-override-after-surprise",
+      "primary_lineage": "trust-explainability",
+      "era_or_date_range": "safety-engineering decades; ML opacity 2010s",
+      "observed_example": "Belief via audit trails and replay; black boxes plus an expert override when the system surprises.",
+      "problem_or_conditions": "Operators must recover after a wrong automated act; ‘why’ is demanded after the fact.",
+      "enabling_technology_or_constraints": "Logs, later opaque models; override can be policy-disabled.",
+      "interaction_form": "inspect + expert override",
+      "remembered_reaction_or_critique": "Unreadable logs, disabled overrides, and post-hoc rationalizations undermine trust. Uncertainty: how often override is truly available.",
+      "suspected_source_or_example": "Safety-engineering and explainable-AI discourse class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "MEDIUM — the need for override after surprise is stable; ML-specific claims are noisier.",
+      "relevance_clue": "Agent command surfaces need recoverable surprise: evidence, override, and a trail, not only a confident summary.",
+      "coding_agent_bias": "Test logs and diffs get treated as sufficient explanation for trust."
+    },
+    {
+      "seed_id": "grok-desktop-mobile-handoff-2010s",
+      "primary_lineage": "desktop-mobile-continuity",
+      "era_or_date_range": "2010s companion-device generation",
+      "observed_example": "Start on desktop, continue via phone ping; small screen used as glance, approve, or remote control—not a full workspace.",
+      "problem_or_conditions": "Tasks cross devices; the phone is reachable when the desk is not.",
+      "enabling_technology_or_constraints": "Account sync, local handoff radios, notification as remote affordance.",
+      "interaction_form": "notification as remote control",
+      "remembered_reaction_or_critique": "Handoff praised when it works; deep work and dense diffs fail on small screens; notifications become impoverished IDEs.",
+      "suspected_source_or_example": "Smartphone-era OS continuity feature class",
+      "observation_vs_inference": "OBSERVATION",
+      "uncertainty": "LOW — companion/handoff and ‘what belongs on a small screen’ are well-worn memories.",
+      "relevance_clue": "Agent command must be partitioned: approve/stop/glance on the small surface; authoring and evidence on the large one.",
+      "coding_agent_bias": "Agents dump full patches and logs onto whatever surface is attached, including phones."
+    }
+  ],
+  "candidate_cross_domain_links": [
+    {
+      "from": "hci-interaction",
+      "to": "command-lines",
+      "relation": "recognition-vs-recall tradeoff",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "mobile-messaging",
+      "to": "approvals-notifications",
+      "relation": "interrupt channel reused as consent",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "industrial-design",
+      "to": "trust-explainability",
+      "relation": "mode error and automation surprise",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "dashboards-control-rooms",
+      "to": "graphic-visual-communication",
+      "relation": "glanceability vs density",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "long-running-monitoring",
+      "to": "desktop-mobile-continuity",
+      "relation": "reattach on the reachable small screen",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "multi-agent-coordination",
+      "to": "social-cultural-behavior",
+      "relation": "authority gradient silencing dissent",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "progressive-disclosure",
+      "to": "accessibility",
+      "relation": "hidden power vs sequential discoverability",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "technology-evolution",
+      "to": "mobile-messaging",
+      "relation": "push economics of attention",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "architecture-spatial",
+      "to": "dashboards-control-rooms",
+      "relation": "wall overview vs handheld",
+      "status": "candidate interpretation"
+    },
+    {
+      "from": "computing-interfaces",
+      "to": "command-lines",
+      "relation": "continuity of control vs visible state",
+      "status": "candidate interpretation"
+    }
+  ],
+  "coding_agent_bias_notes": "Recall is skewed toward Unix shells, diffs, PRs, tests, CI red/green, and chat-with-tools loops. That overweight makes command language, stdout-as-evidence, and silent local tool approval feel more ‘natural’ than spatial, haptic, a11y-sequential, or interrupt-etiquette forms. Physical ops, non-English super-apps, and control-room authority are under-sampled and should be treated as thinner memories. Do not read this pack as a product UI proposal.",
+  "uncertainty_summary": "Coverage is complete at one short seed per lineage. Confidence is higher for CLI, GUI, smartphone notification, notebook, and a11y linearization forms; medium for cockpit, ATC, industrial HMI, and social-delegation causal stories. No dates, quotes, DOIs, URLs, or page numbers were invented. Cross-domain links are candidates only and are not primary lineage. This is MODEL_RECALL, not training-data recovery.",
+  "raw_preservation": {
+    "phase": "PHASE_1_MODEL_RECALL",
+    "turn_id": "grok-seed",
+    "vendor": "GROK",
+    "pack_id": "grok-pretraining-design-seed-pack-v0",
+    "keep_seeds_short": true,
+    "one_seed_per_lineage": true,
+    "web": false,
+    "repo_inspect": false,
+    "other_vendor_packs": false,
+    "precise_citations": false,
+    "seed_slugs_emitted": [
+      "grok-hci-direct-manipulation-1980s",
+      "grok-computing-notebook-2010s",
+      "grok-mobile-notification-shade-2010s",
+      "grok-industrial-cockpit-mode-errors",
+      "grok-tech-push-always-on-2000s",
+      "grok-graphic-glanceable-status-type",
+      "grok-architecture-control-room-place",
+      "grok-accessibility-screen-reader-linearization",
+      "grok-social-delegation-interrupt-etiquette",
+      "grok-cli-unix-job-control-1970s",
+      "grok-dashboard-alarm-vs-status",
+      "grok-approvals-two-person-and-push",
+      "grok-progressive-disclosure-novice-expert",
+      "grok-longrun-jobs-outlive-session",
+      "grok-multiagent-atc-readback",
+      "grok-trust-audit-override-after-surprise",
+      "grok-desktop-mobile-handoff-2010s"
+    ],
+    "freeze": true,
+    "note": "First emission; pack frozen unchanged after this object."
+  }
+}

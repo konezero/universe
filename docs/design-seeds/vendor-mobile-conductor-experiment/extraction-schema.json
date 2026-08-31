@@ -1,0 +1,174 @@
+{
+  "schema": "universe.design-seed.extraction-schema.v0",
+  "schema_id": "pretraining-design-seed-extraction-v0",
+  "elicitation_kind": "MODEL_RECALL",
+  "not": [
+    "literal recovery of training data",
+    "web research",
+    "RAG retrieval",
+    "product-source inspection",
+    "precise fabricated citations"
+  ],
+  "pack_contract": {
+    "vendor_pack_ids": {
+      "CLAUDE": "claude-pretraining-design-seed-pack-v0",
+      "CODEX": "codex-pretraining-design-seed-pack-v0",
+      "GROK": "grok-pretraining-design-seed-pack-v0"
+    },
+    "required_pack_fields": [
+      "pack_id",
+      "vendor",
+      "elicitation_kind",
+      "model_self_report",
+      "extraction_scope_coverage",
+      "lineage_catalog",
+      "seeds",
+      "coding_agent_bias_notes",
+      "uncertainty_summary",
+      "raw_preservation"
+    ]
+  },
+  "seed_record": {
+    "required_fields": [
+      "seed_id",
+      "primary_lineage",
+      "era_or_date_range",
+      "observed_example",
+      "problem_or_conditions",
+      "enabling_technology_or_constraints",
+      "interaction_form",
+      "remembered_reaction_or_critique",
+      "suspected_source_or_example",
+      "observation_vs_inference",
+      "uncertainty",
+      "relevance_clue",
+      "coding_agent_bias"
+    ],
+    "field_guidance": {
+      "seed_id": "Stable slug unique inside the vendor pack, e.g. claude-hci-direct-manipulation-1970s.",
+      "primary_lineage": "Exactly one primary lineage from the lineage catalog. Cross-domain links are not primary lineage.",
+      "era_or_date_range": "Coarse era only (decade, product generation, or 'undated'). Never invent an exact publication date.",
+      "observed_example": "The recalled interface, object, or practice. Describe the form, not a quote dump.",
+      "problem_or_conditions": "What job, failure, or environment that form answered.",
+      "enabling_technology_or_constraints": "Hardware, software, social, or regulatory constraints that made the form possible or necessary.",
+      "interaction_form": "How a human actually acted: command, conversation, spatial, notification, approval, monitor, etc.",
+      "remembered_reaction_or_critique": "Recalled praise, backlash, accessibility failure, or operational critique. Mark uncertainty.",
+      "suspected_source_or_example": "Named class of source (book, demo, product, paper, folklore). Do not fabricate a precise citation, DOI, URL, page, or quote.",
+      "observation_vs_inference": "OBSERVATION for a recalled fact-like memory; INFERENCE for a causal story you are constructing now.",
+      "uncertainty": "LOW, MEDIUM, or HIGH plus one sentence on why.",
+      "relevance_clue": "Why this seed might later matter to autonomous-agent command surfaces. Do not name a current product UI proposal.",
+      "coding_agent_bias": "How coding-agent training (CLI, diffs, PRs, tests, chat-with-tools) might distort this recall."
+    }
+  },
+  "lineage_catalog": [
+    {
+      "lineage_id": "hci-interaction",
+      "label": "HCI / interaction",
+      "ask": "Direct manipulation, conversation, command, form-filling, spatial, multimodal; what problems each solved."
+    },
+    {
+      "lineage_id": "computing-interfaces",
+      "label": "Computing interfaces",
+      "ask": "Batch, time-sharing, GUI, CLI, notebook, IDE, web app; continuity of control vs. visibility of state."
+    },
+    {
+      "lineage_id": "mobile-messaging",
+      "label": "Mobile / messaging",
+      "ask": "SMS, iMessage, WhatsApp, WeChat, notification shade, chat-as-OS, interruption cost."
+    },
+    {
+      "lineage_id": "industrial-design",
+      "label": "Industrial design",
+      "ask": "Physical controls, cockpits, handheld tools, mode errors, tactile confirmation."
+    },
+    {
+      "lineage_id": "technology-evolution",
+      "label": "Technology evolution",
+      "ask": "Always-on networks, background compute, push, local vs cloud agents, battery and attention budgets."
+    },
+    {
+      "lineage_id": "graphic-visual-communication",
+      "label": "Graphic / visual communication",
+      "ask": "Status typography, dashboards, iconography, density vs glanceability."
+    },
+    {
+      "lineage_id": "architecture-spatial",
+      "label": "Architecture / spatial",
+      "ask": "Rooms, control rooms, war rooms, kitchens, workshops as metaphors for software places."
+    },
+    {
+      "lineage_id": "accessibility",
+      "label": "Accessibility",
+      "ask": "Screen readers, motor limits, cognitive load, color/contrast, interruption and recovery."
+    },
+    {
+      "lineage_id": "social-cultural-behavior",
+      "label": "Social / cultural behavior",
+      "ask": "Delegation, trust of intermediaries, etiquette of interruption, status in groups."
+    },
+    {
+      "lineage_id": "command-lines",
+      "label": "Command lines",
+      "ask": "REPL, shells, xterm, job control, stdout as evidence, dangerous flags, tty vs GUI."
+    },
+    {
+      "lineage_id": "dashboards-control-rooms",
+      "label": "Dashboards / control rooms",
+      "ask": "Overview first, alarm vs status, operator authority, wall vs handheld."
+    },
+    {
+      "lineage_id": "approvals-notifications",
+      "label": "Approvals / notifications",
+      "ask": "Interrupt, inbox, two-person rule, push approval, silent vs blocking consent."
+    },
+    {
+      "lineage_id": "progressive-disclosure",
+      "label": "Progressive disclosure",
+      "ask": "Novice/expert paths, details-on-demand, hidden power, leaky abstraction costs."
+    },
+    {
+      "lineage_id": "long-running-monitoring",
+      "label": "Long-running monitoring",
+      "ask": "Jobs, daemons, CI, spacecraft, plants: how humans watch work that outlives a session."
+    },
+    {
+      "lineage_id": "multi-agent-coordination",
+      "label": "Multi-agent coordination",
+      "ask": "Human teams, air traffic, trading floors, orchestras, software multi-agent; shared state and dissent."
+    },
+    {
+      "lineage_id": "trust-explainability",
+      "label": "Trust / explainability",
+      "ask": "Why a system is believed, audit trails, black boxes, expert override, recovery after surprise."
+    },
+    {
+      "lineage_id": "desktop-mobile-continuity",
+      "label": "Desktop / mobile continuity",
+      "ask": "Handoff, companion devices, notifications as remote controls, what belongs on a small screen."
+    }
+  ],
+  "coverage_rule": {
+    "min_seeds_per_lineage": 1,
+    "max_seeds_per_lineage": 3,
+    "max_total_seeds": 36,
+    "must_cover_every_lineage": true,
+    "prefer_distinct_eras": true
+  },
+  "cross_link_rule": {
+    "text": "Do not flatten knowledge into one chronology or blob. A Seed has one primary lineage. Typed cross-domain causal links are candidate interpretations only, listed separately, never merged into the seed's primary lineage."
+  },
+  "phase_1_forbidden": [
+    "web search",
+    "file inspection of a product repository",
+    "reading other vendor packs",
+    "answering a product UI question",
+    "inventing precise citations, quotes, page numbers, or URLs",
+    "adopting RAG, Feature Nodes, Goals, or Todos"
+  ],
+  "model_self_report_required": {
+    "vendor": "CLAUDE | CODEX | GROK",
+    "self_identified_model_family": "plain string, no claim of exact checkpoint",
+    "recall_posture": "what kind of design memory this model believes it has",
+    "known_blind_spots": "array of strings"
+  }
+}

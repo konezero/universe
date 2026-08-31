@@ -1,0 +1,18 @@
+{
+  "schema": "universe.design-seed.freeze-digest.v1",
+  "run_id": "vendor-mobile-conductor-20260830-r3-corrected",
+  "phase": 1,
+  "vendor": "claude",
+  "pack_id": "claude-pretraining-design-seed-pack-v0",
+  "frozen_file": "C:\\workspace\\universe\\docs\\design-seeds\\vendor-mobile-conductor-experiment\\frozen\\claude-pretraining-design-seed-pack-v0-r3.json",
+  "frozen_content_sha256": "d50ce558f3bfe758dfe07898ccd2dba129027a70d66bce2d127465a48565b6ea",
+  "frozen_content_bytes": 27529,
+  "raw_envelope_file": "C:\\workspace\\universe\\docs\\design-seeds\\vendor-mobile-conductor-experiment\\raw\\claude-pretraining-design-seed-pack-v0-r3.raw-envelope.json",
+  "raw_envelope_sha256": "cc1797ea21f5967a1ed946e8f411930148fa8e4987c1bd61515e76b2ecbb7865",
+  "raw_envelope_bytes": 93082,
+  "source": "exact formal child result summary bytes",
+  "provenance": "MODEL_RECALL",
+  "verification_status": "NOT_PERFORMED_PHASE_1",
+  "freeze_status": "FROZEN_AFTER_GATEWAY_CREATE",
+  "frozen_pack_is_immutable_input": true
+}

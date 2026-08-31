@@ -1,0 +1,44 @@
+{
+  "schema": "universe.design-seed.frozen-pack-index.v0",
+  "task_frame_id": "tf-vendor-mobile-conductor-experiment-20260830",
+  "phase": "PHASE_1_FROZEN",
+  "immutable": true,
+  "packs": [
+    {
+      "pack_id": "claude-pretraining-design-seed-pack-v0",
+      "vendor": "CLAUDE",
+      "elicitation_kind": "MODEL_RECALL",
+      "frozen_at": "2026-08-30T08:38:06.747150Z",
+      "worker_id": "universe-runtime-worker:9be5dd190c104c619332a97a9c21b74f",
+      "worker_run_ref": "universe-runtime-host:51945c38ead64a008f749b467512ad82",
+      "result_receipt_ref": "claude-code:8ca96266-4832-4dd8-bbea-2087f46ce40e:universe-runtime-host:51945c38ead64a008f749b467512ad82",
+      "raw_envelope_sha256": "cacf195fb02fabe3b79ffa93d7cae4fe793c4408cf21a79399bfc06712f78262",
+      "frozen_pack_sha256": "ef1b49a059d8a086d4c0eaf10be3f2e74b8edc77b18d993726d231f9b2714ed0",
+      "seed_count": 17
+    },
+    {
+      "pack_id": "codex-pretraining-design-seed-pack-v0",
+      "vendor": "CODEX",
+      "elicitation_kind": "MODEL_RECALL",
+      "frozen_at": "2026-08-30T08:38:07.237102Z",
+      "worker_id": "universe-runtime-worker:e49f856588454d47a26ea7f01b9ce285",
+      "worker_run_ref": "universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+      "result_receipt_ref": "codex-app-server:01a051cb-9596-7b82-a459-fa0d164dcdb7:universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+      "raw_envelope_sha256": "2b7448190730ebcf93171e8ee5d8860bb8e97398de9854ebf614624cca2d002a",
+      "frozen_pack_sha256": "45bfef68393f2534af816357886c34972ab9808280c2bb15b15e5efa4a018f7a",
+      "seed_count": 17
+    },
+    {
+      "pack_id": "grok-pretraining-design-seed-pack-v0",
+      "vendor": "GROK",
+      "elicitation_kind": "MODEL_RECALL",
+      "frozen_at": "2026-08-30T08:38:07.726044Z",
+      "worker_id": "universe-runtime-worker:2b49c9fc4b614d18bd654392213cf456",
+      "worker_run_ref": "universe-runtime-host:f68c5f3f8c864e9ca2247718444256d6",
+      "result_receipt_ref": "grok-acp:01a051ce-0de1-70a1-b0e9-28e5a7d9c44b:universe-runtime-host:f68c5f3f8c864e9ca2247718444256d6",
+      "raw_envelope_sha256": "e283bd5b1a8e3761bbcbf022504d678267c0f1659f82857457be4fea846688fe",
+      "frozen_pack_sha256": "e0469e7bad327e8ee217c5b4b5852cd79c6cbf0ab8275cccc2044a614a7e3349",
+      "seed_count": 17
+    }
+  ]
+}

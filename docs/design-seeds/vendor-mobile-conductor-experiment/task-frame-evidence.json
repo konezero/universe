@@ -1,0 +1,37 @@
+{
+  "schema": "universe.design-seed.task-frame-evidence.v0",
+  "task_frame_id": "tf-vendor-mobile-conductor-experiment-20260830",
+  "profile_id": "task-frame-instruction-v2",
+  "proposal_id": "task_frame_plan_7b90b5dbfed7217919db31a3",
+  "plan_digest": "7b90b5dbfed7217919db31a3d90b6457c71e5ae26fc483f9eb3f28dbb45059c0",
+  "authority_basis": "DIRECT_USER_INSTRUCTION",
+  "instruction_id": "user-approval-vendor-mobile-conductor-experiment-20260830",
+  "instruction_ref": "user://approval/start-separate-design-seed-task-frame",
+  "work_receipt_id": "work_869d643783c44d2fa61dd15b",
+  "mode": "CONDUCTOR",
+  "origin_anchor_ref": "CONDUCTOR-CURRENT-3E0ED94C1D8AC4AA",
+  "session_id": "conductor-vendor-mobile-seed-20260830",
+  "journal_database": ".ai/runtime/task_frames/ff50c3e137055361102810d5.sqlite3",
+  "journal_digest": "9ea3cfb9186be15d180a107506ab50d6115bd45adfc0a2d9e3e7f22aff773529",
+  "host": {
+    "persistent_task_frame_host": "AVAILABLE",
+    "worker_invocation": "AVAILABLE",
+    "providers": {
+      "CLAUDE": {"status": "AVAILABLE", "model": "opus"},
+      "CODEX": {"status": "AVAILABLE", "model": "gpt-5.6-luna"},
+      "GROK": {"status": "AVAILABLE", "model": "grok-build"}
+    }
+  },
+  "turns": [
+    {"turn_id": "boss", "role": "BOSS", "provider": "GROK", "model": "grok-build"},
+    {"turn_id": "claude-seed", "role": "SUB_REVIEWER", "provider": "CLAUDE", "model": "opus"},
+    {"turn_id": "codex-seed", "role": "SUB_REVIEWER", "provider": "CODEX", "model": "gpt-5.6-luna"},
+    {"turn_id": "grok-seed", "role": "SUB_REVIEWER", "provider": "GROK", "model": "grok-build"},
+    {"turn_id": "claude-predict", "role": "SUB_REVIEWER", "provider": "CLAUDE", "model": "opus"},
+    {"turn_id": "codex-predict", "role": "SUB_REVIEWER", "provider": "CODEX", "model": "gpt-5.6-luna"},
+    {"turn_id": "grok-predict", "role": "SUB_REVIEWER", "provider": "GROK", "model": "grok-build"},
+    {"turn_id": "synthesis-review", "role": "SUB_REVIEWER", "provider": "GROK", "model": "grok-build"}
+  ],
+  "isolated_from": "Mode Profile retirement Goal",
+  "repository_write_scope": "NONE"
+}

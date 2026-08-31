@@ -1,0 +1,557 @@
+{
+  "status": "TURN_COMPLETED",
+  "worker_id": "universe-runtime-worker:3af895aceebf4573bb9251ceb32e14ef",
+  "worker_run_ref": "universe-runtime-host:b7cb8fa277414f9eb8e17d7e7591fa19",
+  "result_receipt_ref": "grok-acp:01a051f4-0666-7f50-a07a-1aa8f3460570:universe-runtime-host:b7cb8fa277414f9eb8e17d7e7591fa19",
+  "structured_result": {
+    "outcome": "SUCCEEDED",
+    "summary": "Independent synthesis after incomplete Meeting Room close (D8: Codex and Grok reviewers absent; Claude completed both rounds). The withheld compound product question is disaggregated: frozen packs do not corroborate adopting ChatGPT-style conversation-first mobile as a unit. Strongest grounded split is companion partition plus glanceable status/alarm separation: mobile as decision-and-deferral (approve/stop/glance, consent grain, reattach), named places as shared-picture stations rather than hamburger orphans, conversation as exception/blocker channel rather than home, raw xterm desktop-only. Conversation-first is an imported metaphor facing a first-class missing-conversation-lineage gap across all 51 seeds. Derived-field convergence (reattach/handover; consent grain; faithful trace) is treated as stronger than exemplar unanimity, which the meeting marks as a coverage-floor artifact. Cross-domain links X1–X13 remain typed candidates, not adopted. Dissent preserved. Web verification not run. Goal/Fleet/Galaxy/Rooms are cited only as question-named surfaces, not adopted product ontology.",
+    "evidence_refs": [
+      "frozen_pack_index",
+      "claude-pretraining-design-seed-pack-v0",
+      "codex-pretraining-design-seed-pack-v0",
+      "grok-pretraining-design-seed-pack-v0",
+      "meeting_summary:claims_survived_pack_share",
+      "meeting_summary:dissent_preserved",
+      "meeting_summary:ideas_appeared_only_after_pack_sharing",
+      "meeting_dissent:D8",
+      "meeting_dissent:D1_amended",
+      "meeting_dissent:claude_schema_self_attestation_mismatch",
+      "claude-pretraining-design-seed-pack-v0:claude-hci-direct-manipulation-1980s",
+      "claude-pretraining-design-seed-pack-v0:claude-dashboards-overview-first-alarm-1990s",
+      "claude-pretraining-design-seed-pack-v0:claude-desktop-mobile-continuity-watch-companion-2010s",
+      "claude-pretraining-design-seed-pack-v0:claude-approvals-two-person-rule-cold-war",
+      "codex-pretraining-design-seed-pack-v0:codex-desktop-mobile-handoff-2010s",
+      "codex-pretraining-design-seed-pack-v0:codex-control-room-alarm-1960s",
+      "codex-pretraining-design-seed-pack-v0:codex-long-running-batch-daemons-1960s",
+      "grok-pretraining-design-seed-pack-v0:grok-computing-notebook-2010s",
+      "grok-pretraining-design-seed-pack-v0:grok-mobile-notification-shade-2010s",
+      "grok-pretraining-design-seed-pack-v0:grok-dashboard-alarm-vs-status",
+      "grok-pretraining-design-seed-pack-v0:grok-desktop-mobile-handoff-2010s",
+      "grok-pretraining-design-seed-pack-v0:grok-architecture-control-room-place"
+    ],
+    "validation": [
+      {
+        "plane": "freeze_integrity_sha256_match",
+        "state": "PASS",
+        "evidence_refs": [
+          "meeting_summary:claims_survived_pack_share",
+          "frozen_pack_index"
+        ]
+      },
+      {
+        "plane": "frozen_pack_immutability_no_rewrite",
+        "state": "PASS",
+        "evidence_refs": [
+          "allocation:task",
+          "frozen_pack_index"
+        ]
+      },
+      {
+        "plane": "meeting_cross_review_completeness",
+        "state": "FAIL",
+        "evidence_refs": [
+          "meeting_dissent:D8",
+          "meeting_summary:participants"
+        ]
+      },
+      {
+        "plane": "web_verification_annotation",
+        "state": "NOT_RUN",
+        "evidence_refs": [
+          "meeting_summary:web_verification_not_written"
+        ]
+      },
+      {
+        "plane": "product_question_withheld_until_meeting_close",
+        "state": "PASS",
+        "evidence_refs": [
+          "allocation:task"
+        ]
+      },
+      {
+        "plane": "candidate_cross_links_remain_unadopted",
+        "state": "PASS",
+        "evidence_refs": [
+          "meeting_summary:claims_survived_pack_share"
+        ]
+      },
+      {
+        "plane": "dissent_preservation",
+        "state": "PASS",
+        "evidence_refs": [
+          "meeting_dissent:D8",
+          "meeting_dissent:D1_amended",
+          "meeting_dissent:claude_schema_self_attestation_mismatch"
+        ]
+      },
+      {
+        "plane": "non_adoption_of_rag_feature_nodes_goals_todos",
+        "state": "PASS",
+        "evidence_refs": [
+          "allocation:task"
+        ]
+      }
+    ],
+    "prediction": {
+      "kind": "independent-synthesis",
+      "predicted_path_count": 5,
+      "compound_question_stance": {
+        "adopt_as_unit": false,
+        "disaggregated": {
+          "chatgpt_style_conversation_first_mobile_home": "NOT_SUPPORTED_AS_PRIMARY",
+          "goal_fleet_galaxy_rooms_status_behind_top_menu": "NOT_SUPPORTED_FOR_STATUS_OR_SHARED_PICTURE; burial of named places is a rival to architecture-spatial shared-picture seeds",
+          "surface_only_approvals_blockers_in_conversation": "CONDITIONALLY_SUPPORTED as conversation role, not as proof that conversation is home",
+          "reserve_raw_xterm_for_desktop": "SUPPORTED as companion partition, not as proof of chat-home"
+        }
+      },
+      "predicted_paths": [
+        {
+          "path_id": "P1",
+          "name": "Companion partition: mobile decision-and-deferral, desktop evidence/xterm",
+          "grounding_strength": "HIGH_RELATIVE_TO_PACKS",
+          "post_share_only": false,
+          "thesis": "Universe mobile for long-running agents is a notification/companion surface: glance, acknowledge, approve/deny/stop, or escalate. Authoring, faithful traces, and raw xterm stay on desktop. Conversation is a narrow exception channel, not the home object.",
+          "mobile_home_surface": "glanceable status plus consent cards; not a ChatGPT transcript",
+          "conversation_role": "blocking asks, notify-and-proceed, and escalation etiquette only",
+          "named_places_goal_fleet_galaxy_rooms": "reachable stations for ownership/evidence, not hamburger-only; cited as question-named surfaces only",
+          "xterm_locus": "desktop",
+          "why_this_path": "Desktop-mobile continuity seeds across all three packs describe notification-as-remote-control and safe handoff without pretending the small surface contains full context. Command-line job-control seeds treat captured stdout as proof, which is a large-surface evidence job."
+        },
+        {
+          "path_id": "P2",
+          "name": "Conversation-first bundle as asked",
+          "grounding_strength": "LOW",
+          "post_share_only": false,
+          "thesis": "Mobile home is a ChatGPT-style stream; Goal/Fleet/Galaxy/Rooms/status live behind a top menu; only approvals/blockers enter the stream; raw xterm is desktop-only.",
+          "mobile_home_surface": "conversation transcript",
+          "conversation_role": "home plus residual blocker cards",
+          "named_places_goal_fleet_galaxy_rooms": "buried behind top menu",
+          "xterm_locus": "desktop",
+          "why_this_path": "SMS/keyword-reply and two-person-rule seeds can be read as supporting compact consent in a message channel. This path is the imported product metaphor. Meeting claim: missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question, so P2 is hypothesized, not pack-corroborated."
+        },
+        {
+          "path_id": "P3",
+          "name": "Overview-first control room: alarm separated from status",
+          "grounding_strength": "HIGH_RELATIVE_TO_PACKS",
+          "post_share_only": false,
+          "thesis": "Concurrent long-running agents will alarm-flood a conversation home. Mobile home is an overview with a small fixed status vocabulary; demand-for-action is a distinct channel; conversation is one station among rooms, not the shared picture.",
+          "mobile_home_surface": "glanceable overview / status language",
+          "conversation_role": "one station for protocol/readback and exception talk, not health",
+          "named_places_goal_fleet_galaxy_rooms": "spatial stations (rooms vs threads) that change who sees state and who may speak",
+          "xterm_locus": "desktop or expert drilldown, not the glance surface",
+          "why_this_path": "Dashboard/control-room, graphic glanceable-status, industrial cockpit mode-readability, architecture war-room/control-room-place, and multi-agent handoff/readback seeds converge on overview-plus-override rather than utterance-first control."
+        },
+        {
+          "path_id": "P4",
+          "name": "Delegation envelopes: staffed watch versus unattended batch as opposite operating modes",
+          "grounding_strength": "MEDIUM",
+          "post_share_only": true,
+          "post_share_marker": "X5_staffed_watch_vs_unattended_batch_appeared_only_after_pack_sharing_typed_candidate_not_adopted",
+          "thesis": "Autonomy UI is a delegation envelope (silent / report / ask), not a chat persona. Staffed-watch (mission-control handover) and unattended-batch (submit/detach/reattach) are opposite answers to the same timesharing tension. A single conversation-first home collapses both.",
+          "mobile_home_surface": "mode-readable envelope: watch board OR batch inbox, never mixed undifferentiated tokens",
+          "conversation_role": "periodic reporting and exception escalation, not per-action narration",
+          "named_places_goal_fleet_galaxy_rooms": "authority and ownership places; burial hides the chain of consent",
+          "xterm_locus": "desktop evidence for batch jobs; not a live watch channel",
+          "why_this_path": "Social-delegation, long-running monitoring, timesharing batch-versus-interactive, approvals consent-grain, and push/battery interruption-budget seeds. X5 is a post-share candidate interpretation linking staffed watch to unattended batch as opposites, not one lineage."
+        },
+        {
+          "path_id": "P5",
+          "name": "Inspectable-state first: reattach to jobs/objects, transcript as evidence not control plane",
+          "grounding_strength": "MEDIUM",
+          "post_share_only": false,
+          "thesis": "Long-running agents need a durable inspectable state surface (jobs, cells, objects) that survives chat turns. Conversation-first hides work objects and substitutes persuasive narrative for faithful trace, which fails after surprise.",
+          "mobile_home_surface": "reattachable job/object list with heartbeat and ownership",
+          "conversation_role": "on-demand justification and override talk beside the object, not instead of it",
+          "named_places_goal_fleet_galaxy_rooms": "if they are the object graph, they cannot be details-on-demand only; progressive disclosure still requires the object to be findable",
+          "xterm_locus": "desktop expert inspect of stdout/trace; mobile gets summary plus escalate",
+          "why_this_path": "Direct-manipulation visibility/reversibility, Grok notebook edit-run-inspect, command-line job control, trust/audit/override-after-surprise, progressive-disclosure details-on-demand, and long-run reattach seeds. Derived-field meeting claim: reattach/handover and faithful trace beat exemplar unanimity."
+        }
+      ],
+      "challenge_to_conversation_first_ui": {
+        "claim": "Conversation-first is the wrong primary mobile frame for long-running autonomous agents.",
+        "arguments": [
+          "Work is mostly invisible and non-spatial; HCI direct-manipulation seeds say the visibility-and-reversibility promise must be re-earned by other means than pointing—or than uttering. Hiding work objects behind chat loses the recognition path.",
+          "Dashboards/alarm seeds: many concurrent agents generate alarm flood unless status and demand-for-action are separated. A ChatGPT stream recodes both as messages.",
+          "Accessibility linearization and SMS-constraint seeds: serial channels have high interruption cost; the real requirement is 'what changed since I last listened,' not an ever-growing transcript.",
+          "Industrial cockpit seeds: autonomous vs supervised and dry-run vs live must be readable from the surface, not from conversational memory. Silent mode changes recreate classic mode errors.",
+          "Architecture-spatial seeds: several agents still need a single place where the shared picture lives and where authority to commit is visible. Burying Goal/Fleet/Galaxy/Rooms/status behind a top menu is the opposite of that place.",
+          "Trust/explainability seeds: a faithful trace earns trust differently from a persuasive narrative; the difference matters most after surprise. Conversation-first biases toward narrative.",
+          "Meeting claim: missing conversation lineage across all 51 seeds is a first-class gap. The ChatGPT home is an imported metaphor, not a pack-grounded interaction form. Coverage-floor (17 seeds, one per lineage) makes any apparent agreement on chat-like exemplars a weak corroboration."
+        ],
+        "does_not_defeat": "Using conversation as a narrow consent/exception channel (approvals/blockers, keyword-scale replies) remains compatible with P1/P3/P4. The challenge is to conversation-as-home and to burial of status/places, not to talking at all."
+      },
+      "risks": [
+        {
+          "risk_id": "R-alarm-flood",
+          "path_ids": [
+            "P2"
+          ],
+          "text": "Mixing health, progress, retries, and blockers in one transcript recreates alarm flood and hides the blocking item."
+        },
+        {
+          "risk_id": "R-mode-error-silent-consent",
+          "path_ids": [
+            "P2",
+            "P4"
+          ],
+          "text": "Unread mode plus silent consent on a push channel yields missable high-impact actions; notification shade can become an adversarial consent channel (post-share candidate X3, not adopted)."
+        },
+        {
+          "risk_id": "R-handover-failure",
+          "path_ids": [
+            "P2",
+            "P5"
+          ],
+          "text": "Work that outlives a session fails if re-entry is scrollback rather than explicit handover/reattach language."
+        },
+        {
+          "risk_id": "R-attention-battery-budget",
+          "path_ids": [
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "text": "Always-on agents spend from a shared attention-and-power budget they do not control; conversation-first encourages over-narration."
+        },
+        {
+          "risk_id": "R-narrative-not-trace",
+          "path_ids": [
+            "P2",
+            "P5"
+          ],
+          "text": "After surprise, a confident summary without recoverable evidence/override/audit trail produces false trust."
+        },
+        {
+          "risk_id": "R-hidden-layer-is-control-plane",
+          "path_ids": [
+            "P2",
+            "P5"
+          ],
+          "text": "Progressive disclosure fails when the buried Goal/Fleet/Galaxy/Rooms/status layer is the true control plane."
+        },
+        {
+          "risk_id": "R-incomplete-meeting-overconfidence",
+          "path_ids": [
+            "P1",
+            "P2",
+            "P3",
+            "P4",
+            "P5"
+          ],
+          "text": "D8: advancing to prediction with 2/3 meeting reviewers absent is not a full cross-review. Synthesis confidence is capped by missing Codex/Grok meeting turns."
+        },
+        {
+          "risk_id": "R-coverage-floor-false-corroboration",
+          "path_ids": [
+            "P2"
+          ],
+          "text": "One seed per lineage × 17 makes exemplar agreement a method artifact (D1 amended). Do not treat chat-like wording overlap as independent votes for conversation-first."
+        },
+        {
+          "risk_id": "R-ontology-smuggling",
+          "path_ids": [
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "text": "Adopting question-named Goal/Fleet/Galaxy/Rooms as product ontology would violate non-adoption of Goals/Todos; they remain labels in the withheld question."
+        },
+        {
+          "risk_id": "R-candidate-link-adoption",
+          "path_ids": [
+            "P4"
+          ],
+          "text": "Treating X3/X5/X8 as settled causes would flatten typed candidate interpretations into chronology."
+        }
+      ],
+      "confidence": {
+        "overall": "LOW_TO_MEDIUM",
+        "numeric_0_to_1": 0.47,
+        "cap_reason": "D8 incomplete cross-review; missing conversation seed; coverage-floor; candidate links unadopted; web verification NOT_RUN; Claude schema/self-attestation mismatch on LOW-to-MEDIUM remains unresolved.",
+        "per_path": {
+          "P1": 0.62,
+          "P2": 0.28,
+          "P3": 0.6,
+          "P4": 0.44,
+          "P5": 0.55
+        },
+        "what_would_raise": [
+          "Codex and Grok meeting-reviewer completion or a replacement full cross-review",
+          "discriminating prototype results below",
+          "separate adoption or rejection of X3/X5/X8",
+          "web-verification annotation file that does not rewrite frozen packs"
+        ]
+      },
+      "unresolved_dissent": [
+        {
+          "dissent_id": "D8",
+          "status": "PRESERVED",
+          "text": "Codex meeting reviewer TIMED_OUT both rounds; Grok meeting reviewer ACP_RESPONSE_MISSING both rounds; Claude completed both rounds. Advancing to prediction with 2/3 reviewers absent is not a full cross-review."
+        },
+        {
+          "dissent_id": "D1_amended",
+          "status": "PRESERVED",
+          "text": "Exemplar convergence is a method artifact of the 17-seed coverage floor; R1–R3 derived-field convergence (reattach/handover; consent grain; faithful trace) is not the same claim and is not flattened into exemplar unanimity."
+        },
+        {
+          "dissent_id": "claude_schema_self_attestation_mismatch",
+          "status": "PRESERVED",
+          "text": "Schema/self-attestation mismatch on Claude LOW-to-MEDIUM uncertainty is unresolved and is not used to upgrade or downgrade pack weight."
+        },
+        {
+          "dissent_id": "codex_echo_scope",
+          "status": "PRESERVED_AS_MEETING_CLAIM",
+          "text": "Codex echo is seed-local, not pack-wide; do not treat Codex pack as globally derivative."
+        },
+        {
+          "dissent_id": "synthesis_note_on_P2",
+          "status": "SYNTHESIS_NOT_MEETING",
+          "text": "This reviewer treats P2 (conversation-first bundle) as a live rival path with low pack grounding, not as a meeting-adopted recommendation. No vendor meeting majority exists to contradict because Codex and Grok did not complete."
+        }
+      ],
+      "smallest_discriminating_prototypes_or_user_tests": [
+        {
+          "test_id": "T1",
+          "discriminates": [
+            "P1",
+            "P2",
+            "P3"
+          ],
+          "procedure": "Build two otherwise identical mobile shells for one long-running dual-agent scenario. Shell A: ChatGPT-style transcript home, Goal/Fleet/Galaxy/Rooms/status behind a top menu, blocker cards inline. Shell B: persistent glanceable status rail plus separate blocker inbox; conversation is a tab. Same approval grammar. Measure time-to-notice a silent failure, time-to-approve a blocking ask, and mis-taps of status-as-alarm.",
+          "smallest_because": "Holds consent cards constant; varies only home-surface."
+        },
+        {
+          "test_id": "T2",
+          "discriminates": [
+            "P2",
+            "P5"
+          ],
+          "procedure": "Four-hour away-from-phone handover. On return, task is to answer 'what changed, who owns it, what is blocked.' Shell A: scroll the transcript. Shell B: reattach summary (delta, ownership, heartbeat) with trace one gesture away.",
+          "smallest_because": "Tests the meeting derived-field 'reattach/handover' without adding new ontology."
+        },
+        {
+          "test_id": "T3",
+          "discriminates": [
+            "P1",
+            "P4"
+          ],
+          "procedure": "Three-grain consent drill: silent, notify-and-proceed, hard block. Inject one missable high-impact action into the notification shade versus an in-app blocking card. Count misses, false proceeds, and whether users can state the current mode without memory.",
+          "smallest_because": "Isolates consent grain and cockpit mode-readability; X3 remains a candidate explanation if shade-consent underperforms."
+        },
+        {
+          "test_id": "T4",
+          "discriminates": [
+            "P3",
+            "P2"
+          ],
+          "procedure": "Two concurrent agents, one healthy-retrying and one failed. User may not open the top menu for 30 seconds. Success = distinguish status from alarm from the first screen. Failure = burial/conversation-home hypothesis."
+        },
+        {
+          "test_id": "T5",
+          "discriminates": [
+            "P1",
+            "P2"
+          ],
+          "procedure": "Hung job requiring stdout. Mobile-only xterm versus 'escalate to desktop' affordance. Measure completion, error, and whether users treat stdout as proof.",
+          "smallest_because": "Tests xterm reservation without assuming chat-home."
+        },
+        {
+          "test_id": "T6",
+          "discriminates": [
+            "P3",
+            "P5"
+          ],
+          "procedure": "Screen-reader pass: sequential navigation plus 'announce what changed since last listen.' Conversation-only cards fail if deltas are not queryable independently of visual layout."
+        }
+      ],
+      "lineage_predicted_path_to_meeting_claim_to_pack_seed_ids": [
+        {
+          "predicted_path_id": "P1",
+          "do_not_flatten_with": [
+            "P3",
+            "P4",
+            "P5"
+          ],
+          "meeting_claims": [
+            "derived-field convergence on reattach/handover and consent grain is stronger than exemplar unanimity",
+            "candidate cross-links remain candidates (not adopted)"
+          ],
+          "pack_seed_ids": [
+            "claude-pretraining-design-seed-pack-v0:claude-desktop-mobile-continuity-watch-companion-2010s",
+            "claude-pretraining-design-seed-pack-v0:claude-approvals-two-person-rule-cold-war",
+            "claude-pretraining-design-seed-pack-v0:claude-command-lines-job-control-1980s",
+            "claude-pretraining-design-seed-pack-v0:claude-technology-evolution-push-battery-2000s",
+            "claude-pretraining-design-seed-pack-v0:claude-mobile-messaging-sms-constraint-1990s",
+            "codex-pretraining-design-seed-pack-v0:codex-desktop-mobile-handoff-2010s",
+            "codex-pretraining-design-seed-pack-v0:codex-approvals-two-person-rule-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-command-lines-job-control-1970s",
+            "codex-pretraining-design-seed-pack-v0:codex-technology-push-background-2000s",
+            "grok-pretraining-design-seed-pack-v0:grok-desktop-mobile-handoff-2010s",
+            "grok-pretraining-design-seed-pack-v0:grok-approvals-two-person-and-push",
+            "grok-pretraining-design-seed-pack-v0:grok-cli-unix-job-control-1970s",
+            "grok-pretraining-design-seed-pack-v0:grok-mobile-notification-shade-2010s",
+            "grok-pretraining-design-seed-pack-v0:grok-tech-push-always-on-2000s"
+          ]
+        },
+        {
+          "predicted_path_id": "P2",
+          "do_not_flatten_with": [
+            "P1",
+            "P3"
+          ],
+          "meeting_claims": [
+            "missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question",
+            "coverage-floor effect makes exemplar agreement a weak corroboration"
+          ],
+          "pack_seed_ids": [
+            "claude-pretraining-design-seed-pack-v0:claude-mobile-messaging-sms-constraint-1990s",
+            "claude-pretraining-design-seed-pack-v0:claude-computing-interfaces-timesharing-1960s",
+            "claude-pretraining-design-seed-pack-v0:claude-approvals-two-person-rule-cold-war",
+            "claude-pretraining-design-seed-pack-v0:claude-progressive-disclosure-wizard-1990s",
+            "codex-pretraining-design-seed-pack-v0:codex-mobile-sms-1990s",
+            "codex-pretraining-design-seed-pack-v0:codex-computing-timesharing-1960s",
+            "codex-pretraining-design-seed-pack-v0:codex-approvals-two-person-rule-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-progressive-disclosure-expert-modes-1980s",
+            "grok-pretraining-design-seed-pack-v0:grok-social-delegation-interrupt-etiquette",
+            "grok-pretraining-design-seed-pack-v0:grok-approvals-two-person-and-push",
+            "grok-pretraining-design-seed-pack-v0:grok-progressive-disclosure-novice-expert"
+          ],
+          "lineage_note": "P2 borrows messaging/approval/progressive-disclosure seeds as analogical support only. No pack contains a conversation-as-home seed. That absence is evidence against grounding, not a silent vote for ChatGPT UI."
+        },
+        {
+          "predicted_path_id": "P3",
+          "do_not_flatten_with": [
+            "P1",
+            "P2"
+          ],
+          "meeting_claims": [
+            "derived-field convergence on consent grain and faithful trace is stronger than exemplar unanimity",
+            "Grok interaction_form labels are the most machine-comparable overlay candidate (X8 remains candidate, not adopted)"
+          ],
+          "pack_seed_ids": [
+            "claude-pretraining-design-seed-pack-v0:claude-dashboards-overview-first-alarm-1990s",
+            "claude-pretraining-design-seed-pack-v0:claude-graphic-visual-status-typography-1970s",
+            "claude-pretraining-design-seed-pack-v0:claude-architecture-spatial-war-room-1940s",
+            "claude-pretraining-design-seed-pack-v0:claude-industrial-design-cockpit-mode-error-1980s",
+            "claude-pretraining-design-seed-pack-v0:claude-multi-agent-air-traffic-handoff-1970s",
+            "claude-pretraining-design-seed-pack-v0:claude-accessibility-screen-reader-linearization-1990s",
+            "codex-pretraining-design-seed-pack-v0:codex-control-room-alarm-1960s",
+            "codex-pretraining-design-seed-pack-v0:codex-graphic-status-typography-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-architecture-control-room-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-industrial-cockpit-controls-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-multi-agent-air-traffic-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-accessibility-screen-reader-1990s",
+            "grok-pretraining-design-seed-pack-v0:grok-dashboard-alarm-vs-status",
+            "grok-pretraining-design-seed-pack-v0:grok-graphic-glanceable-status-type",
+            "grok-pretraining-design-seed-pack-v0:grok-architecture-control-room-place",
+            "grok-pretraining-design-seed-pack-v0:grok-industrial-cockpit-mode-errors",
+            "grok-pretraining-design-seed-pack-v0:grok-multiagent-atc-readback",
+            "grok-pretraining-design-seed-pack-v0:grok-accessibility-screen-reader-linearization"
+          ]
+        },
+        {
+          "predicted_path_id": "P4",
+          "do_not_flatten_with": [
+            "P1",
+            "P5"
+          ],
+          "meeting_claims": [
+            "staffed watch vs unattended batch as opposite answers, not one lineage (post-share idea X5, typed candidate, not adopted)",
+            "derived-field: consent grain",
+            "missing conversation lineage as the grounding gap for interrupt-etiquette INFERENCE seeds (post-share)"
+          ],
+          "pack_seed_ids": [
+            "claude-pretraining-design-seed-pack-v0:claude-social-delegation-etiquette-undated",
+            "claude-pretraining-design-seed-pack-v0:claude-long-running-monitoring-mission-control-1960s",
+            "claude-pretraining-design-seed-pack-v0:claude-computing-interfaces-timesharing-1960s",
+            "claude-pretraining-design-seed-pack-v0:claude-approvals-two-person-rule-cold-war",
+            "codex-pretraining-design-seed-pack-v0:codex-social-delegation-intermediaries-undated",
+            "codex-pretraining-design-seed-pack-v0:codex-long-running-batch-daemons-1960s",
+            "codex-pretraining-design-seed-pack-v0:codex-computing-timesharing-1960s",
+            "grok-pretraining-design-seed-pack-v0:grok-social-delegation-interrupt-etiquette",
+            "grok-pretraining-design-seed-pack-v0:grok-longrun-jobs-outlive-session",
+            "grok-pretraining-design-seed-pack-v0:grok-approvals-two-person-and-push"
+          ],
+          "cross_domain_link": {
+            "id": "X5",
+            "type": "candidate_interpretation",
+            "adopted": false,
+            "text": "Staffed watch and unattended batch remain opposite operating modes, not a merged chronology."
+          }
+        },
+        {
+          "predicted_path_id": "P5",
+          "do_not_flatten_with": [
+            "P2",
+            "P3"
+          ],
+          "meeting_claims": [
+            "derived-field convergence on reattach/handover and faithful trace",
+            "missing conversation seed is a gap, which this path treats as positive pressure toward non-transcript state surfaces"
+          ],
+          "pack_seed_ids": [
+            "claude-pretraining-design-seed-pack-v0:claude-hci-direct-manipulation-1980s",
+            "claude-pretraining-design-seed-pack-v0:claude-trust-explainability-expert-systems-1980s",
+            "claude-pretraining-design-seed-pack-v0:claude-command-lines-job-control-1980s",
+            "claude-pretraining-design-seed-pack-v0:claude-progressive-disclosure-wizard-1990s",
+            "claude-pretraining-design-seed-pack-v0:claude-long-running-monitoring-mission-control-1960s",
+            "codex-pretraining-design-seed-pack-v0:codex-hci-direct-manipulation-1970s",
+            "codex-pretraining-design-seed-pack-v0:codex-trust-audit-override-20c",
+            "codex-pretraining-design-seed-pack-v0:codex-long-running-batch-daemons-1960s",
+            "codex-pretraining-design-seed-pack-v0:codex-progressive-disclosure-expert-modes-1980s",
+            "grok-pretraining-design-seed-pack-v0:grok-hci-direct-manipulation-1980s",
+            "grok-pretraining-design-seed-pack-v0:grok-computing-notebook-2010s",
+            "grok-pretraining-design-seed-pack-v0:grok-trust-audit-override-after-surprise",
+            "grok-pretraining-design-seed-pack-v0:grok-longrun-jobs-outlive-session",
+            "grok-pretraining-design-seed-pack-v0:grok-progressive-disclosure-novice-expert"
+          ]
+        }
+      ],
+      "ideas_emerged_only_after_pack_sharing": [
+        {
+          "idea": "Treat Codex echo per seed, not per pack.",
+          "origin": "meeting_after_pack_share",
+          "adopted_here": false,
+          "used_as": "constraint_on_weighting_not_a_predicted_path"
+        },
+        {
+          "idea": "Missing conversation lineage as the grounding gap for interrupt-etiquette INFERENCE seeds.",
+          "origin": "meeting_after_pack_share",
+          "adopted_here": false,
+          "used_as": "grounds_P2_low_confidence_and_challenge_to_conversation_first"
+        },
+        {
+          "idea": "Grok interaction-form vocabulary as an overlay spine (X8).",
+          "origin": "meeting_after_pack_share",
+          "adopted_here": false,
+          "type": "candidate_interpretation",
+          "used_as": "comparability_hint_only"
+        },
+        {
+          "idea": "Notification shade as an adversarial consent channel (X3).",
+          "origin": "meeting_after_pack_share",
+          "adopted_here": false,
+          "type": "candidate_interpretation",
+          "used_as": "risk_R-mode-error-silent-consent_and_test_T3"
+        },
+        {
+          "idea": "Staffed watch vs unattended batch as opposite answers, not one lineage (X5).",
+          "origin": "meeting_after_pack_share",
+          "adopted_here": false,
+          "type": "candidate_interpretation",
+          "used_as": "P4_rival_path_not_merged_into_P1_or_P5"
+        }
+      ],
+      "post_meeting_close_synthesis_acts_not_pack_seeds": [
+        "Mapping the withheld four-part Universe mobile question onto frozen packs",
+        "Disaggregating the compound bundle instead of answering yes/no",
+        "Treating Goal/Fleet/Galaxy/Rooms as question-named surfaces only, not adopted Goals/Todos ontology"
+      ],
+      "candidate_cross_links_not_adopted": [
+        "X1-X13 remain typed candidate interpretations; this synthesis cites only X3, X5, X8 as named in the Meeting Room summary and does not adopt them as causes."
+      ],
+      "web_verification": "NOT_WRITTEN; separate later annotation only; must not rewrite frozen MODEL_RECALL packs."
+    }
+  }
+}

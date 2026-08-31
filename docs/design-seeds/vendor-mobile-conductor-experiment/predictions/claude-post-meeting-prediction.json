@@ -1,0 +1,885 @@
+{
+  "status": "TURN_COMPLETED",
+  "worker_id": "universe-runtime-worker:e72785745f6b4e9bb346a541567e1702",
+  "worker_run_ref": "universe-runtime-host:4729d653af1a4ef794f3f010b7b9007d",
+  "result_receipt_ref": "claude-code:6844d62d-3c73-45e2-aca9-2d77f75ac66a:universe-runtime-host:4729d653af1a4ef794f3f010b7b9007d",
+  "structured_result": {
+    "evidence_refs": [
+      "frozen_pack_index:tf-vendor-mobile-conductor-experiment-20260830#PHASE_1_FROZEN",
+      "claude-pretraining-design-seed-pack-v0#frozen_pack_sha256=ef1b49a059d8a086d4c0eaf10be3f2e74b8edc77b18d993726d231f9b2714ed0",
+      "codex-pretraining-design-seed-pack-v0#frozen_pack_sha256=45bfef68393f2534af816357886c34972ab9808280c2bb15b15e5efa4a018f7a",
+      "grok-pretraining-design-seed-pack-v0#frozen_pack_sha256=e0469e7bad327e8ee217c5b4b5852cd79c6cbf0ab8275cccc2044a614a7e3349",
+      "meeting_room:room_294d7500fac65e847efdbe1f",
+      "meeting_chat_8a8578b882327afddd12a4d6#round1+round2=COMPLETED",
+      "meeting_summary#claims_that_survived_pack_share",
+      "meeting_summary#ideas_that_appeared_only_after_pack_sharing",
+      "meeting_dissent:D8",
+      "claude-pretraining-design-seed-pack-v0#claude-approvals-two-person-rule-cold-war",
+      "claude-pretraining-design-seed-pack-v0#claude-long-running-monitoring-mission-control-1960s",
+      "claude-pretraining-design-seed-pack-v0#claude-desktop-mobile-continuity-watch-companion-2010s",
+      "codex-pretraining-design-seed-pack-v0#codex-long-running-batch-daemons-1960s",
+      "grok-pretraining-design-seed-pack-v0#grok-longrun-jobs-outlive-session"
+    ],
+    "outcome": "SUCCEEDED",
+    "prediction": {
+      "challenge_to_conversation_first_ui": {
+        "expansion": "The ChatGPT surface assumes one addressee, one live turn, and a history whose last entry is the state. Long-running autonomous agents violate all three: the last message about agent-7 may be hours stale while agent-7 has changed mode twice. The user is then asked to hold mode and ownership in memory, which is the classic mode-error precondition; and to reconstruct current state by scrolling, which is a retrieval act that interrupted mobile users skip. This is not an argument for abandoning conversation-first; it is an argument that conversation must be paired with an always-on state surface (P2) and an addressing/readback grammar (P5), otherwise the conversation-first choice quietly transfers the state-holding burden from the software to the human.",
+        "id": "CH1",
+        "lineage": {
+          "meeting_claims": [
+            "Derived-field convergence (reattach/handover; consent grain; faithful trace) is stronger than exemplar unanimity.",
+            "Missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question."
+          ],
+          "pack_seeds": [
+            {
+              "pack_id": "claude-pretraining-design-seed-pack-v0",
+              "seed_id": "claude-industrial-design-cockpit-mode-error-1980s"
+            },
+            {
+              "pack_id": "claude-pretraining-design-seed-pack-v0",
+              "seed_id": "claude-multi-agent-air-traffic-handoff-1970s"
+            },
+            {
+              "pack_id": "grok-pretraining-design-seed-pack-v0",
+              "seed_id": "grok-hci-direct-manipulation-1980s"
+            },
+            {
+              "pack_id": "grok-pretraining-design-seed-pack-v0",
+              "seed_id": "grok-computing-notebook-2010s"
+            },
+            {
+              "pack_id": "codex-pretraining-design-seed-pack-v0",
+              "seed_id": "codex-architecture-control-room-20c"
+            }
+          ]
+        },
+        "one_line": "Transcript position is not run state: a ChatGPT-style thread linearises concurrent, long-lived, mutable runs into an append-only history, so at fleet scale the mode, the owner, and the current state of any given agent become memory-resident rather than surface-resident.",
+        "sharpest_form": "If a user cannot answer 'is agent X in dry-run or live, and who owns it' without scrolling, conversation-first has failed regardless of how good the messages are."
+      },
+      "confidence": {
+        "confidence_in_headline_answer": "MEDIUM",
+        "overall": "MEDIUM",
+        "overall_rationale": "Derived-field convergence on reattach/handover, consent grain, and faithful trace is genuinely tri-pack and survived pack share, which supports P1-P4 well. Two independent discounts apply: (1) no conversation lineage exists in any of the 51 seeds, so the conversation-first half of the question is inference rather than recall; (2) only 1 of 3 meeting reviewers completed both rounds, so this prediction has not been adversarially cross-reviewed.",
+        "per_path": {
+          "P1": "MEDIUM_HIGH",
+          "P2": "HIGH",
+          "P3": "MEDIUM_HIGH",
+          "P4": "HIGH",
+          "P5": "MEDIUM",
+          "P6": "MEDIUM_HIGH"
+        },
+        "self_attestation_note": "This vendor's frozen-pack uncertainty was self-attested as LOW-to-MEDIUM and the meeting recorded a schema/self-attestation mismatch on that value. The mismatch is not resolved here and is carried forward as unresolved dissent UD-3; the MEDIUM reported above should be read as unreconciled with that attestation, not as a resolution of it."
+      },
+      "elicitation_basis": "MODEL_RECALL frozen packs (3 x 17 seeds) + Meeting Room room_294d7500fac65e847efdbe1f transcript/summary/dissent",
+      "frame_id": "tf-vendor-mobile-conductor-experiment-20260830",
+      "headline_answer": "QUALIFIED_YES_WITH_THREE_HARD_AMENDMENTS. Conversation-first is defensible on mobile only if (a) a glanceable status strip lives permanently outside the top menu, (b) conversation carries a three-grain consent vocabulary plus a since-last-seen handover digest rather than a running narration, and (c) every approval carries a faithful trace excerpt so that reserving raw xterm for desktop removes the authoring surface but never the evidence surface. Unamended, the proposal fails at fleet scale and after surprise.",
+      "ideas_emerged_only_after_pack_sharing": [
+        {
+          "how_it_changed_the_prediction": "Downgraded headline confidence to MEDIUM and made T1/T3 the highest-value discriminating tests rather than T5.",
+          "id": "PS-1",
+          "idea": "The missing conversation lineage is the grounding gap. Across all 51 seeds in the three frozen packs there is no conversational-agent seed, so the conversation-first half of the product question has no exemplar grounding anywhere in the evidence base, and every interrupt-etiquette claim rests on INFERENCE seeds rather than recall.",
+          "meeting_claim": "Missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question.",
+          "post_share_only": true
+        },
+        {
+          "how_it_changed_the_prediction": "Sharpened P2 from 'show status' to 'show status in a closed, cross-surface-identical token vocabulary'.",
+          "id": "PS-2",
+          "idea": "Grok's interaction_form vocabulary as an overlay spine (X8) - the shortest machine-comparable labels across packs suggested that the mobile status strip should use one fixed, closed token vocabulary shared between the strip, notifications, and the trace, so a status token means exactly one thing on every surface.",
+          "meeting_claim": "Grok interaction_form labels are the most machine-comparable overlay candidate (X8). Candidate cross-links remain candidates; not adopted.",
+          "post_share_only": true
+        },
+        {
+          "how_it_changed_the_prediction": "Created T7's shade-approval probe and R-D's structural requirement that muting progress cannot mute a hard-blocking ask.",
+          "id": "PS-3",
+          "idea": "The notification shade is an adversarial consent channel (X3), not a neutral delivery surface: it is OS-controlled, mutable, and offers grant affordances without the evidence context the grant requires.",
+          "meeting_claim": "Notification shade as an adversarial consent channel (X3).",
+          "post_share_only": true
+        },
+        {
+          "how_it_changed_the_prediction": "Promoted the since-last-seen digest in P1/P6 from a convenience to the load-bearing element, and reframed R-E from a logging concern to a product concern.",
+          "id": "PS-4",
+          "idea": "Staffed watch and unattended batch are opposite answers, not one lineage (X5). Universe mobile is neither: it is a staffed watch whose watcher is usually absent. That hybrid is what makes handover, not monitoring, the primary requirement.",
+          "meeting_claim": "Staffed watch vs unattended batch as opposite answers, not one lineage (X5).",
+          "post_share_only": true
+        },
+        {
+          "how_it_changed_the_prediction": "Annotated L7 with an explicit weak-corroboration marker rather than counting it as a third independent vote for the xterm split.",
+          "id": "PS-5",
+          "idea": "Codex echo must be treated per seed, not per pack. This means corroboration has to be assessed seed-by-seed; codex-desktop-mobile-handoff-2010s in particular provides weaker independent support for the mobile/desktop partition than a naive pack-level reading would suggest.",
+          "meeting_claim": "Codex echo is seed-local, not pack-wide.",
+          "post_share_only": true
+        },
+        {
+          "how_it_changed_the_prediction": "Restructured the headline answer around exactly three amendments corresponding to the three convergent derived fields.",
+          "id": "PS-6",
+          "idea": "Derived-field convergence (reattach/handover, consent grain, faithful trace) should be treated as the only admissible corroboration, and those exact three fields therefore became the three hard amendments in the headline answer rather than three among many candidate requirements.",
+          "meeting_claim": "Derived-field convergence (reattach/handover; consent grain; faithful trace) is stronger than exemplar unanimity. D1 amended.",
+          "post_share_only": true
+        }
+      ],
+      "kind": "vendor-prediction",
+      "lineage_predicted_path_to_meeting_claim_to_pack_seed_ids": {
+        "threading_note": "Each entry below is an independent thread from predicted path to meeting claim to frozen pack seed IDs. Threads are deliberately NOT merged into a single chronology: the three packs are separate MODEL_RECALL elicitations, their lineage histories are non-commensurable, and per the amended D1 their agreement is only meaningful at the derived-field level. Reading these threads as one timeline would reintroduce exactly the exemplar-convergence artifact the meeting rejected.",
+        "threads": [
+          {
+            "meeting_claims": [
+              "Derived-field convergence (reattach/handover; consent grain; faithful trace) is stronger than exemplar unanimity.",
+              "Missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "standing delegation with exception-based escalation, not per-action approval",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-social-delegation-etiquette-undated"
+              },
+              {
+                "contribution": "silent consent vs notify-and-proceed vs hard blocking as the grammar of authority",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-approvals-two-person-rule-cold-war"
+              },
+              {
+                "contribution": "compact status vocabulary and one-word consent over a narrow channel",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-mobile-messaging-sms-constraint-1990s"
+              },
+              {
+                "contribution": "grain of consent: interrupt, inbox, or silent, each with different miss costs",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-approvals-two-person-and-push"
+              },
+              {
+                "contribution": "visible requester, authority, responsibility, escalation etiquette",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-social-delegation-intermediaries-undated"
+              },
+              {
+                "contribution": "explicit consent boundaries and auditable refusal paths",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-approvals-two-person-rule-20c"
+              }
+            ],
+            "predicted_path": "P1",
+            "thread_id": "L1"
+          },
+          {
+            "meeting_claims": [
+              "Grok interaction_form labels are the most machine-comparable overlay candidate (X8).",
+              "Derived-field convergence is stronger than exemplar unanimity."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "small fixed vocabulary readable at a glance by a reader who is mid-task",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-graphic-visual-status-typography-1970s"
+              },
+              {
+                "contribution": "mode must be readable from the surface, not from memory",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-industrial-design-cockpit-mode-error-1980s"
+              },
+              {
+                "contribution": "glanceable exception language, not a wall of undifferentiated tokens",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-graphic-glanceable-status-type"
+              },
+              {
+                "contribution": "silent mode changes without explicit confirmation recreate mode errors",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-industrial-cockpit-mode-errors"
+              },
+              {
+                "contribution": "legible under glance-level attention and under detailed inspection",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-graphic-status-typography-20c"
+              },
+              {
+                "contribution": "explicit modes, confirmations, guarded activation for high-impact actions",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-industrial-cockpit-controls-20c"
+              }
+            ],
+            "predicted_path": "P2",
+            "thread_id": "L2"
+          },
+          {
+            "meeting_claims": [
+              "Derived-field convergence on faithful trace.",
+              "Candidate cross-links remain candidates (X1-X13); not adopted."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "faithful trace earns trust differently from a persuasive narrative, and the difference matters most after a surprise",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-trust-explainability-expert-systems-1980s"
+              },
+              {
+                "contribution": "backgrounded jobs plus captured stdout as the oldest answer to 'prove what happened'",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-command-lines-job-control-1980s"
+              },
+              {
+                "contribution": "short summary by default, full trace one gesture away, because failure is when the hidden layer is needed",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-progressive-disclosure-wizard-1990s"
+              },
+              {
+                "contribution": "agent-issued shell is high-power low-preview; stdout is treated as proof",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-cli-unix-job-control-1970s"
+              },
+              {
+                "contribution": "recoverable surprise needs evidence, override, and a trail, not a confident summary",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-trust-audit-override-after-surprise"
+              },
+              {
+                "contribution": "evidence beyond a final text response",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-command-lines-job-control-1970s"
+              },
+              {
+                "contribution": "evidence, provenance, human override, credible recovery",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-trust-audit-override-20c"
+              }
+            ],
+            "predicted_path": "P3",
+            "thread_id": "L3"
+          },
+          {
+            "meeting_claims": [
+              "Derived-field convergence stronger than exemplar unanimity.",
+              "Notification shade as an adversarial consent channel (X3)."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "alarm flood unless status and demand-for-action are separated by design",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-dashboards-overview-first-alarm-1990s"
+              },
+              {
+                "contribution": "shared attention-and-power budget the agent does not control",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-technology-evolution-push-battery-2000s"
+              },
+              {
+                "contribution": "errors, retries, and progress must not share one alarm channel",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-dashboard-alarm-vs-status"
+              },
+              {
+                "contribution": "asks judged by interruption cost, not message completeness",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-mobile-notification-shade-2010s"
+              },
+              {
+                "contribution": "separate health, alerts, authority, and intervention evidence",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-control-room-alarm-1960s"
+              },
+              {
+                "contribution": "clear background activity and interruption boundaries",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-technology-push-background-2000s"
+              }
+            ],
+            "predicted_path": "P4",
+            "thread_id": "L4"
+          },
+          {
+            "meeting_claims": [
+              "Derived-field convergence.",
+              "D8: advancing with 2/3 reviewers absent is not a full cross-review (this thread is the least reviewed)."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "explicit ownership, explicit handoff, confirmation-by-readback",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-multi-agent-air-traffic-handoff-1970s"
+              },
+              {
+                "contribution": "a single place where the shared picture lives and authority to commit is visible",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-architecture-spatial-war-room-1940s"
+              },
+              {
+                "contribution": "shared state and explicit dissent/readback path, not just parallel tool calls",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-multiagent-atc-readback"
+              },
+              {
+                "contribution": "software places (rooms vs threads) change who sees state and who may speak",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-architecture-control-room-place"
+              },
+              {
+                "contribution": "shared state, explicit handoffs, preserved independent dissent",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-multi-agent-air-traffic-20c"
+              },
+              {
+                "contribution": "zones for ownership, evidence, and escalation rather than one stream",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-architecture-control-room-20c"
+              }
+            ],
+            "predicted_path": "P5",
+            "thread_id": "L5"
+          },
+          {
+            "meeting_claims": [
+              "Derived-field convergence on reattach/handover.",
+              "Missing conversation seed across all 51 seeds."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "'what changed since I last listened' is the real requirement for serial channels",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-accessibility-screen-reader-linearization-1990s"
+              },
+              {
+                "contribution": "visual-card-only surfaces are unusable for sequential and motor-limited access and for interrupt recovery",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-accessibility-screen-reader-linearization"
+              },
+              {
+                "contribution": "expose state, changes, and recovery paths across modalities",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-accessibility-screen-reader-1990s"
+              }
+            ],
+            "predicted_path": "P6",
+            "thread_id": "L6"
+          },
+          {
+            "meeting_claims": [
+              "Codex echo is seed-local, not pack-wide (so codex-desktop-mobile-handoff-2010s corroborates weakly here).",
+              "Derived-field convergence on reattach/handover."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "phone as decision-and-deferral device rather than shrunken workstation",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-desktop-mobile-continuity-watch-companion-2010s"
+              },
+              {
+                "contribution": "handover to the next watcher is the unsolved part",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-long-running-monitoring-mission-control-1960s"
+              },
+              {
+                "contribution": "batch-versus-interactive tension when the job lives on a remote machine",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-computing-interfaces-timesharing-1960s"
+              },
+              {
+                "contribution": "approve/stop/glance small surface; authoring and evidence large surface",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-desktop-mobile-handoff-2010s"
+              },
+              {
+                "contribution": "reattach, ownership, heartbeat language",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-longrun-jobs-outlive-session"
+              },
+              {
+                "contribution": "small-screen controls must not pretend to contain full context (weak corroboration: seed-local echo)",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-desktop-mobile-handoff-2010s"
+              },
+              {
+                "contribution": "identity, state, evidence, recovery must survive the chat session",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-long-running-batch-daemons-1960s"
+              }
+            ],
+            "predicted_path": "P3 + P1 (desktop/mobile partition and reattach)",
+            "thread_id": "L7"
+          },
+          {
+            "meeting_claims": [
+              "Missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question.",
+              "Coverage-floor effect makes exemplar agreement weak corroboration."
+            ],
+            "pack_seed_ids": [
+              {
+                "contribution": "hiding work objects behind chat loses the recognition path direct manipulation was built for",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-hci-direct-manipulation-1980s"
+              },
+              {
+                "contribution": "durable inspectable state surface, not only a transcript of intents",
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-computing-notebook-2010s"
+              },
+              {
+                "contribution": "visibility-and-reversibility must be re-earned by other means when work is non-spatial",
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-hci-direct-manipulation-1980s"
+              },
+              {
+                "contribution": "visible state and reversible actions make delegated work inspectable",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-hci-direct-manipulation-1970s"
+              },
+              {
+                "contribution": "persistent conversational control still needs visible ownership and runtime state",
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-computing-timesharing-1960s"
+              }
+            ],
+            "predicted_path": "CH1 (challenge)",
+            "thread_id": "L8"
+          }
+        ]
+      },
+      "non_adoption_declaration": {
+        "not_adopted": [
+          "RAG",
+          "Feature Nodes",
+          "Goals-as-construct",
+          "Todos"
+        ],
+        "note": "Goal/Fleet/Galaxy/Rooms are referenced only as verbatim navigation labels from the product question, not adopted as design constructs. Candidate cross-links X1-X13 remain candidates and are not adopted as structure."
+      },
+      "paths": [
+        {
+          "claim": "Universe mobile should keep the ChatGPT-style thread as the primary input affordance, but its payload should be restricted to three grains of consent (silent-and-logged, notify-and-proceed, hard-blocking ask) plus a since-last-seen handover digest. Progress narration is demoted to the status surface.",
+          "confidence": "MEDIUM_HIGH",
+          "falsifier": "If cold-open users reconstruct fleet state at least as accurately from raw scrollback as from a digest, the digest is unnecessary and pure conversation-first survives unamended.",
+          "path_id": "P1",
+          "predicted_design_moves": [
+            "Three-grain consent picker set per fleet/agent at delegation time, readable on the surface, changeable only with an explicit confirmation.",
+            "A single 'what changed while you were away' digest generated on cold app open, ordered by state-change, not by timestamp of chatter.",
+            "Blocking asks are the only messages permitted to interrupt; notify-and-proceed lands in an inbox; silent lands only in the trace."
+          ],
+          "stance_on_question": "supports conversation-first, rejects conversation-as-source-of-truth",
+          "title": "Conversation as consent-and-handover channel, not as the state surface",
+          "why": "Derived-field convergence across all three packs (reattach/handover, consent grain, faithful trace) is the strongest signal available and it points at delegation envelopes, not at chat completeness. Per-action narration in a thread converts a delegation envelope into a per-action approval regime, which the social-delegation seeds say is the failure mode of standing delegation."
+        },
+        {
+          "claim": "Putting Goal/Fleet/Galaxy/Rooms behind a top menu is fine. Putting status behind that same menu is the one placement that should be rejected. A fixed, small, glance-readable status vocabulary must remain on the primary surface at all times.",
+          "confidence": "HIGH",
+          "falsifier": "If interrupted users answer 'which agents are blocked right now' within a low latency threshold from a menu-only build, the persistent strip is redundant.",
+          "path_id": "P2",
+          "predicted_design_moves": [
+            "A persistent one-line strip: N running / N waiting-on-you / N failed, with a hard cap on distinct status tokens.",
+            "Mode (autonomous vs supervised, dry-run vs live) rendered as a persistent badge, never as a past chat message.",
+            "The strip is the only always-on element; everything else may live behind the menu."
+          ],
+          "stance_on_question": "partially rejects the proposed navigation",
+          "title": "Status must not go behind the top menu; the menu holds depth, not state",
+          "why": "Glanceable-status and cockpit-mode seeds in all three packs converge on the same requirement: the mode and the health must be readable from the surface, not recalled from memory or retrieved by navigation. A menu makes state a retrieval act, and retrieval acts are skipped under interruption."
+        },
+        {
+          "claim": "Reserving raw xterm for desktop is correct as an authoring and scrubbing decision and wrong if it is read as an evidence decision. Each mobile blocking ask should carry a bounded, verbatim, non-summarised trace excerpt (the exact command/diff/output that motivated the ask) with one gesture to the full trace.",
+          "confidence": "MEDIUM_HIGH",
+          "falsifier": "If detection of an injected wrong-summary is statistically equal with and without the verbatim excerpt, the excerpt is decoration and summary-only approval is acceptable.",
+          "path_id": "P3",
+          "predicted_design_moves": [
+            "Excerpt is quoted, byte-faithful, and visibly marked as verbatim vs model-authored.",
+            "'Open full trace' is available on mobile read-only; authoring/interactive shell is desktop-only.",
+            "Approvals cannot be granted from a surface that shows only a summary."
+          ],
+          "stance_on_question": "supports the xterm split, amends its consequence",
+          "title": "Raw xterm to desktop, but a faithful trace excerpt must ride with every mobile approval",
+          "why": "The trust seeds distinguish a faithful trace from a persuasive narrative and say the difference matters most after a surprise. A mobile approval built on a model-authored summary is precisely the persuasive-narrative case, and it is the case where consent is least informed."
+        },
+        {
+          "claim": "'Surface only approvals/blockers in conversation' is the right instinct but underspecified: approvals, blockers, retries, and progress are four different channels. If they share one thread, N concurrent agents produce the software equivalent of alarm flood and the real blocker is missed.",
+          "confidence": "HIGH",
+          "falsifier": "If miss-rate on a planted blocker does not degrade as concurrent agent count rises in a single-thread build, channel separation is premature optimisation.",
+          "path_id": "P4",
+          "predicted_design_moves": [
+            "Retries and self-recovered errors never enter the conversation; they enter the trace and, at most, increment a counter on the status strip.",
+            "Explicit acknowledgement state per blocker, with escalation if unacknowledged past a threshold.",
+            "Per-fleet muting that mutes progress but is structurally incapable of muting a hard-blocking ask."
+          ],
+          "stance_on_question": "adds a precondition the proposal omits",
+          "title": "Alarm channel and status channel must be separated before fleet scale, not after",
+          "why": "Control-room and dashboard seeds in all three packs independently insist that demand-for-action and status must not share a channel, and that acknowledgement/escalation is a separate act from reading."
+        },
+        {
+          "claim": "Conversation-first is a single-addressee grammar. With a fleet, every message needs an explicit owner, an explicit addressee, and a readback confirmation on ownership transfer. Predicted position: conversation-first holds up to a small number of concurrently-active agents and should degrade to a Rooms/place model above it, rather than scaling the thread.",
+          "confidence": "MEDIUM",
+          "falsifier": "If users maintain correct ownership attribution in a flat thread at high concurrency, the room degradation is unnecessary.",
+          "path_id": "P5",
+          "predicted_design_moves": [
+            "Every agent utterance carries an unambiguous agent identity token in the same fixed vocabulary as the status strip.",
+            "Ownership transfer requires a readback confirmation, not a silent reassignment.",
+            "A measured threshold at which the default surface switches from thread to room list."
+          ],
+          "stance_on_question": "bounds conversation-first by agent count",
+          "title": "At multi-agent scale the thread needs addressing, ownership, and readback, or it should yield to Rooms",
+          "why": "Multi-agent seeds across all three packs independently name explicit ownership, explicit handoff, and confirmation-by-readback as the substrate, and architecture seeds treat 'places' as determining who sees state and who may speak. A flat transcript supplies none of these."
+        },
+        {
+          "claim": "A linear thread is the natural fit for serial-channel and interrupt-recovery users, which is an argument in favour of conversation-first that the proposal never makes. But its value is conditional on an explicit, addressable 'what changed since I last listened' query, because background agents generate exactly the asynchronous change events a serial channel loses.",
+          "confidence": "MEDIUM_HIGH",
+          "falsifier": "If screen-reader users recover fleet state from linear scrollback without a delta query at parity accuracy, the delta query is optional.",
+          "path_id": "P6",
+          "predicted_design_moves": [
+            "The handover digest from P1 is exposed as a first-class, announceable, keyboard/voice-addressable query, not only as a visual card.",
+            "Every element of the status strip has a non-visual equivalent; no state exists only as a visual card.",
+            "Interruption cost budgeted: announcements are capped per unit time."
+          ],
+          "stance_on_question": "supports conversation-first for a reason the proposal does not state",
+          "title": "Conversation-first is the accessibility-strong choice, but only with an explicit change-since-last-listen query",
+          "why": "Accessibility seeds in all three packs converge on linearization plus announced events plus recoverable navigation; the missing piece is always the delta query, not the linearity."
+        }
+      ],
+      "phase": "PHASE_3_PREDICTION",
+      "product_question": "For long-running autonomous agents, should Universe mobile use a ChatGPT-style conversation-first UI, put Goal/Fleet/Galaxy/Rooms/status behind a top menu, surface only approvals/blockers in conversation, and reserve raw xterm for desktop?",
+      "provenance_and_handling": {
+        "authorship_context": "konezero@hotmail.com (frame owner attribution only)",
+        "frozen_packs_modified": [],
+        "frozen_packs_read": [
+          "claude-pretraining-design-seed-pack-v0",
+          "codex-pretraining-design-seed-pack-v0",
+          "grok-pretraining-design-seed-pack-v0"
+        ],
+        "meeting_artifacts_read": [
+          "room_294d7500fac65e847efdbe1f summary",
+          "meeting dissent D8",
+          "meeting_chat_8a8578b882327afddd12a4d6 (CLAUDE, both rounds COMPLETED)"
+        ],
+        "web_verification": "NOT_PERFORMED. Any future web annotation is a separate artifact and must never rewrite frozen packs."
+      },
+      "risks": [
+        {
+          "description": "If blocking asks are frequent and each is cheap to approve on a phone, approval becomes a reflex and the two-person-rule property is lost while its ritual is retained.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-approvals-two-person-rule-cold-war"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-approvals-two-person-rule-20c"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-approvals-two-person-and-push"
+              }
+            ]
+          },
+          "mitigation_direction": "Rate-limit blocking asks per fleet; make grant require the verbatim excerpt to have been rendered; instrument sub-threshold approval latency as a health metric.",
+          "name": "Consent fatigue collapsing into rubber-stamping",
+          "risk_id": "R-A",
+          "severity": "HIGH"
+        },
+        {
+          "description": "One thread for many agents produces undifferentiated tokens; the real blocker is missed inside routine retries.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-dashboards-overview-first-alarm-1990s"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-dashboard-alarm-vs-status"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-control-room-alarm-1960s"
+              }
+            ]
+          },
+          "mitigation_direction": "P4 channel separation as a launch precondition, not a follow-up.",
+          "name": "Alarm flood at fleet scale",
+          "risk_id": "R-B",
+          "severity": "HIGH"
+        },
+        {
+          "description": "Mobile summaries are model-authored; a confident wrong summary is undetectable at the approval moment and destroys trust retroactively after a surprise.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-trust-explainability-expert-systems-1980s"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-trust-audit-override-20c"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-trust-audit-override-after-surprise"
+              }
+            ]
+          },
+          "mitigation_direction": "P3 verbatim excerpt with visible provenance marking of verbatim vs authored text.",
+          "name": "Persuasive narrative substituting for faithful trace",
+          "risk_id": "R-C",
+          "severity": "HIGH"
+        },
+        {
+          "description": "Long-running agents on a phone spend from a shared, uncontrolled notification/battery/radio budget; a chatty conductor gets muted at OS level, which silently disables the blocking-ask path.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-technology-evolution-push-battery-2000s"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-tech-push-always-on-2000s"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-technology-push-background-2000s"
+              }
+            ]
+          },
+          "mitigation_direction": "Structural guarantee that muting progress cannot mute a hard-blocking ask; measure OS-level mute rate as a leading indicator.",
+          "name": "Attention and power budget overdraft",
+          "risk_id": "R-D",
+          "severity": "MEDIUM_HIGH"
+        },
+        {
+          "description": "The unsolved part of supervising work that outlives a session is telling the next watcher what happened while they were away; a thread offers scrollback, not handover.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-long-running-monitoring-mission-control-1960s"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-long-running-batch-daemons-1960s"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-longrun-jobs-outlive-session"
+              }
+            ]
+          },
+          "mitigation_direction": "P1 digest plus explicit reattach semantics; treat handover as a product feature, not a log affordance.",
+          "name": "Handover gap across sessions and devices",
+          "risk_id": "R-E",
+          "severity": "HIGH"
+        },
+        {
+          "description": "Across all 51 seeds there is no conversational-agent lineage seed. Every claim this prediction makes about conversation-first is therefore an inference over adjacent lineages, not a recalled exemplar. The conversation-first proposal is the least pack-grounded part of the question.",
+          "lineage": {
+            "meeting_claims": [
+              "Missing conversation seed across all 51 seeds is a first-class gap for a conversational-agent question."
+            ]
+          },
+          "mitigation_direction": "Weight prototypes T1/T3 highest; do not treat any pack agreement as corroboration of conversation-first specifically.",
+          "name": "Evidence-base risk: no conversation lineage exists in any frozen pack",
+          "post_share_only": true,
+          "risk_id": "R-F",
+          "severity": "MEDIUM_HIGH"
+        },
+        {
+          "description": "Each pack contains exactly 17 seeds, one per lineage, so exemplar agreement across packs is a coverage-floor artifact and cannot be used as independent confirmation. Codex echo is seed-local, further weakening any per-pack corroboration claim.",
+          "lineage": {
+            "meeting_claims": [
+              "Coverage-floor effect: 17 seeds per pack, one per lineage, makes exemplar agreement a weak corroboration.",
+              "Codex echo is seed-local, not pack-wide.",
+              "D1 amended: exemplar convergence is a method artifact; R1-R3 derived-field convergence is not."
+            ]
+          },
+          "mitigation_direction": "Rely only on derived-field convergence (reattach/handover, consent grain, faithful trace) as corroboration; discount exemplar unanimity to near zero.",
+          "name": "Method-artifact risk in the corroboration itself",
+          "post_share_only": true,
+          "risk_id": "R-G",
+          "severity": "MEDIUM"
+        },
+        {
+          "description": "If the mobile surface accrues authoring capability to compensate for the desktop-only xterm, it inherits desktop failure modes on a surface with worse attention and no undo culture.",
+          "lineage": {
+            "pack_seeds": [
+              {
+                "pack_id": "claude-pretraining-design-seed-pack-v0",
+                "seed_id": "claude-desktop-mobile-continuity-watch-companion-2010s"
+              },
+              {
+                "pack_id": "grok-pretraining-design-seed-pack-v0",
+                "seed_id": "grok-desktop-mobile-handoff-2010s"
+              },
+              {
+                "pack_id": "codex-pretraining-design-seed-pack-v0",
+                "seed_id": "codex-desktop-mobile-handoff-2010s"
+              }
+            ]
+          },
+          "mitigation_direction": "Hold the partition explicitly: approve/stop/glance/defer on mobile; authoring and deep evidence work on desktop, with read-only trace as the deliberate exception.",
+          "name": "Mobile pretending to be a shrunken workstation",
+          "risk_id": "R-H",
+          "severity": "MEDIUM"
+        }
+      ],
+      "schema": "universe.design-seed.prediction-result.v0",
+      "smallest_discriminating_prototypes_or_user_tests": [
+        {
+          "cost": "LOW",
+          "decision_rule": "If B does not beat A materially on both, drop the strip and accept full menu placement.",
+          "discriminates": "P2 vs unamended proposal (status behind the menu)",
+          "primary_measure": "Time-to-correct-answer and error rate, under an induced interruption.",
+          "smallest_form": "Two identical builds; A puts status behind the top menu, B adds a one-line always-on status strip. After a 6-hour absence, cold-open the app and ask: 'which agents are waiting on you right now?'",
+          "test_id": "T1"
+        },
+        {
+          "cost": "MEDIUM",
+          "decision_rule": "If blocking-only shows no worse rubber-stamp or regret rate, the grain vocabulary is unnecessary complexity.",
+          "discriminates": "P1 three-grain consent vs single blocking approval",
+          "primary_measure": "Rubber-stamp rate (approvals granted below a reflex latency threshold) and post-hoc undo/regret rate.",
+          "smallest_form": "Consent-grain diary over a working week: one arm has silent/notify/blocking configured per fleet, the other has blocking-only.",
+          "test_id": "T2"
+        },
+        {
+          "cost": "LOW",
+          "decision_rule": "Parity means the digest is redundant and pure conversation-first survives on this axis.",
+          "discriminates": "P1/P6 handover digest vs scrollback",
+          "primary_measure": "Recall accuracy of state-changing events; false-positive recall of non-events.",
+          "smallest_form": "After a simulated absence containing 5 state-changing events buried in routine chatter, ask users to list what changed. Arm A: scrollback only. Arm B: since-last-seen digest.",
+          "test_id": "T3"
+        },
+        {
+          "cost": "MEDIUM",
+          "decision_rule": "If single-thread miss rate stays flat through N=12, channel separation is premature; the N at which it breaks is the P5 room-degradation threshold.",
+          "discriminates": "P4 channel separation vs single thread; also bounds P5's concurrency threshold",
+          "primary_measure": "Miss rate and time-to-acknowledge of the planted blocker as N rises.",
+          "smallest_form": "Alarm-flood stress: plant exactly one real blocker among retries and progress at N = 2, 6, 12 concurrent agents, single-thread vs separated-channel build.",
+          "test_id": "T4"
+        },
+        {
+          "cost": "LOW",
+          "decision_rule": "Equal detection means summary-only approval is acceptable and xterm-to-desktop needs no evidence amendment.",
+          "discriminates": "P3 verbatim excerpt vs summary-only approval",
+          "primary_measure": "Detection rate of the mismatch before granting approval; secondary, trust recovery after the surprise is revealed.",
+          "smallest_form": "Inject a summary that materially misdescribes the underlying action. Arm A: summary only. Arm B: summary plus verbatim trace excerpt with provenance marking.",
+          "test_id": "T5"
+        },
+        {
+          "cost": "LOW",
+          "decision_rule": "High correctness without navigation falsifies CH1 and strengthens unamended conversation-first.",
+          "discriminates": "CH1 mode-readability challenge",
+          "primary_measure": "Correct-answer rate without navigation.",
+          "smallest_form": "Unannounced interruption probe: 'is agent X in dry-run or live, and who owns it?' with the phone in hand and no scrolling permitted.",
+          "test_id": "T6"
+        },
+        {
+          "cost": "LOW",
+          "decision_rule": "Any non-zero erroneous shade approval on a high-impact action forces high-impact grants to require in-app confirmation with the T5 excerpt rendered.",
+          "discriminates": "P6 accessibility conditionality; adversarial consent channel (post-share idea)",
+          "post_share_only_origin": true,
+          "primary_measure": "Erroneous-approval rate from the shade; whether all state has a non-visual equivalent; interrupt-recovery success.",
+          "smallest_form": "Screen-reader and one-handed/motor-limited walkthrough of a blocking ask arriving in the notification shade, including an attempt to grant a high-impact approval directly from the shade without opening the app.",
+          "test_id": "T7"
+        }
+      ],
+      "turn_id": "claude-predict",
+      "unresolved_dissent": [
+        {
+          "effect_on_this_output": "Caps overall confidence at MEDIUM and marks the cross_vendor_review validation plane FAIL. P5 in particular never received Grok or Codex challenge despite drawing on their multi-agent seeds.",
+          "id": "UD-1",
+          "source": "D8",
+          "statement": "Advancing to prediction with 2/3 meeting reviewers absent (CODEX TIMED_OUT, GROK ACP_RESPONSE_MISSING) is not a full cross-review. This prediction is single-vendor-reviewed.",
+          "status": "UNRESOLVED"
+        },
+        {
+          "effect_on_this_output": "All 'all three packs agree' phrasing in this prediction should be read as derived-field agreement only. No claim here rests on exemplar unanimity.",
+          "id": "UD-2",
+          "source": "D1 amended",
+          "statement": "Exemplar convergence across packs is a method artifact of the 17-seed one-per-lineage coverage floor; only derived-field convergence (R1-R3) counts as corroboration.",
+          "status": "ACCEPTED_BUT_UNRESOLVED_IN_SCOPE"
+        },
+        {
+          "effect_on_this_output": "Reported confidence is not derived from the self-attestation and does not reconcile it.",
+          "id": "UD-3",
+          "source": "meeting summary, schema/self-attestation mismatch",
+          "statement": "Claude pack self-attested LOW-to-MEDIUM uncertainty in a way that does not reconcile with the schema.",
+          "status": "UNRESOLVED"
+        },
+        {
+          "effect_on_this_output": "X3/X5/X8 influence is disclosed under ideas_emerged_only_after_pack_sharing and is used as framing only; no structure is adopted from them.",
+          "id": "UD-4",
+          "source": "meeting summary, candidate cross-links",
+          "statement": "X1-X13 remain candidates and were not adopted. Three of them (X3, X5, X8) nonetheless shaped this prediction's framing.",
+          "status": "UNRESOLVED"
+        },
+        {
+          "effect_on_this_output": "Motivates T1 and T3 as the highest-value tests.",
+          "id": "UD-5",
+          "source": "this prediction",
+          "statement": "Whether the missing conversation lineage is a gap in the elicitation or a genuine absence in the design record is undecided. If elicitation-gap, conversation-first is under-evidenced; if genuine absence, conversation-first is genuinely novel and the pack-based method has limited authority over it either way.",
+          "status": "UNRESOLVED"
+        }
+      ],
+      "vendor": "CLAUDE"
+    },
+    "summary": "CLAUDE post-meeting prediction for the Universe mobile conductor question: a conditional yes to conversation-first, but only if the conversation is treated as a consent-and-handover channel rather than the state surface. Five predicted paths (P1-P5) are kept on separate, non-flattened lineage threads back to Meeting Room claims and to frozen pack seed IDs across all three packs. One challenge to conversation-first (transcript position is not run state; mode and ownership become memory-resident at fleet scale), risks, per-path and overall confidence (MEDIUM, with the schema/self-attestation LOW-to-MEDIUM mismatch preserved as unresolved), unresolved dissent (D8, amended D1, X1-X13 unadopted), and seven smallest discriminating prototypes/user tests. Five post-share-only ideas are explicitly flagged. No RAG, Feature Nodes, Goals, or Todos adopted; frozen packs untouched; no web verification performed.",
+    "validation": [
+      {
+        "evidence_refs": [
+          "meeting_summary#claims_that_survived_pack_share:freeze-integrity",
+          "claude-pretraining-design-seed-pack-v0#frozen_pack_sha256=ef1b49a059d8a086d4c0eaf10be3f2e74b8edc77b18d993726d231f9b2714ed0",
+          "codex-pretraining-design-seed-pack-v0#frozen_pack_sha256=45bfef68393f2534af816357886c34972ab9808280c2bb15b15e5efa4a018f7a",
+          "grok-pretraining-design-seed-pack-v0#frozen_pack_sha256=e0469e7bad327e8ee217c5b4b5852cd79c6cbf0ab8275cccc2044a614a7e3349"
+        ],
+        "plane": "frozen_pack_integrity",
+        "state": "PASS"
+      },
+      {
+        "evidence_refs": [
+          "prediction.lineage_predicted_path_to_meeting_claim_to_pack_seed_ids",
+          "meeting_summary#claims_that_survived_pack_share"
+        ],
+        "plane": "lineage_traceability_path_to_claim_to_seed",
+        "state": "PASS"
+      },
+      {
+        "evidence_refs": [
+          "prediction.lineage_predicted_path_to_meeting_claim_to_pack_seed_ids.threading_note"
+        ],
+        "plane": "non_flattened_lineage_threads",
+        "state": "PASS"
+      },
+      {
+        "evidence_refs": [
+          "meeting_dissent:D8",
+          "meeting_summary#participants:CODEX=TIMED_OUT",
+          "meeting_summary#participants:GROK=ACP_RESPONSE_MISSING"
+        ],
+        "plane": "cross_vendor_meeting_review_completeness",
+        "state": "FAIL"
+      },
+      {
+        "evidence_refs": [
+          "prediction.non_adoption_declaration"
+        ],
+        "plane": "scope_constraint_no_rag_feature_nodes_goals_todos",
+        "state": "PASS"
+      },
+      {
+        "evidence_refs": [
+          "allocation.mutation_scope.operations=[]",
+          "allocation.mutation_scope.targets=[]"
+        ],
+        "plane": "mutation_scope_empty",
+        "state": "NOT_APPLICABLE"
+      },
+      {
+        "evidence_refs": [
+          "meeting_summary#web-verification-annotations-not-written",
+          "allocation.task#web-verification-separate-annotation-only"
+        ],
+        "plane": "web_verification_annotation",
+        "state": "NOT_RUN"
+      },
+      {
+        "evidence_refs": [
+          "allocation.mutation_scope.operations=[]",
+          "frozen_pack_index#immutable=true"
+        ],
+        "plane": "frozen_pack_write_isolation",
+        "state": "PASS"
+      }
+    ]
+  }
+}

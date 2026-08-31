@@ -1,0 +1,445 @@
+{
+  "status": "TURN_COMPLETED",
+  "worker_id": "universe-runtime-worker:e49f856588454d47a26ea7f01b9ce285",
+  "worker_run_ref": "universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+  "result_receipt_ref": "codex-app-server:01a051cb-9596-7b82-a459-fa0d164dcdb7:universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+  "structured_result": {
+    "outcome": "SUCCEEDED",
+    "summary": "CODEX model-recall pack with one short seed for each of 17 lineages; no external retrieval or repository inspection used.",
+    "evidence_refs": [
+      "context-pack:extraction-schema-v0",
+      "self-recall:codex:phase-1"
+    ],
+    "validation": [
+      {
+        "plane": "coverage",
+        "state": "PASS",
+        "evidence_refs": [
+          "context-pack:coverage-rule",
+          "self-recall:17-lineages-covered"
+        ]
+      },
+      {
+        "plane": "schema",
+        "state": "PASS",
+        "evidence_refs": [
+          "context-pack:extraction-schema-v0",
+          "output-contract:vendor-pack-result-v0"
+        ]
+      },
+      {
+        "plane": "retrieval-boundary",
+        "state": "PASS",
+        "evidence_refs": [
+          "context-pack:phase-1-forbidden",
+          "self-recall:no-external-retrieval"
+        ]
+      }
+    ],
+    "pack": {
+      "pack_id": "codex-pretraining-design-seed-pack-v0",
+      "vendor": "CODEX",
+      "elicitation_kind": "MODEL_RECALL",
+      "model_self_report": {
+        "vendor": "CODEX",
+        "self_identified_model_family": "OpenAI Codex model family; exact checkpoint unspecified.",
+        "recall_posture": "Associative design-history recall synthesized from learned patterns; not literal training-data recovery or source verification.",
+        "known_blind_spots": [
+          "Exact dates and attribution may blur.",
+          "Reactions and accessibility outcomes are less reliable than canonical interface forms.",
+          "Coding-centric examples may be overrepresented."
+        ]
+      },
+      "extraction_scope_coverage": {
+        "seed_count": 17,
+        "one_seed_per_lineage": true,
+        "covered_lineage_count": 17,
+        "all_lineages_covered": true,
+        "external_retrieval_used": false,
+        "repository_inspection_used": false,
+        "other_vendor_packs_used": false
+      },
+      "lineage_catalog": [
+        {
+          "lineage_id": "hci-interaction",
+          "label": "HCI / interaction",
+          "ask": "Direct manipulation, conversation, command, form-filling, spatial, multimodal; what problems each solved."
+        },
+        {
+          "lineage_id": "computing-interfaces",
+          "label": "Computing interfaces",
+          "ask": "Batch, time-sharing, GUI, CLI, notebook, IDE, web app; continuity of control vs. visibility of state."
+        },
+        {
+          "lineage_id": "mobile-messaging",
+          "label": "Mobile / messaging",
+          "ask": "SMS, iMessage, WhatsApp, WeChat, notification shade, chat-as-OS, interruption cost."
+        },
+        {
+          "lineage_id": "industrial-design",
+          "label": "Industrial design",
+          "ask": "Physical controls, cockpits, handheld tools, mode errors, tactile confirmation."
+        },
+        {
+          "lineage_id": "technology-evolution",
+          "label": "Technology evolution",
+          "ask": "Always-on networks, background compute, push, local vs cloud agents, battery and attention budgets."
+        },
+        {
+          "lineage_id": "graphic-visual-communication",
+          "label": "Graphic / visual communication",
+          "ask": "Status typography, dashboards, iconography, density vs glanceability."
+        },
+        {
+          "lineage_id": "architecture-spatial",
+          "label": "Architecture / spatial",
+          "ask": "Rooms, control rooms, war rooms, kitchens, workshops as metaphors for software places."
+        },
+        {
+          "lineage_id": "accessibility",
+          "label": "Accessibility",
+          "ask": "Screen readers, motor limits, cognitive load, color/contrast, interruption and recovery."
+        },
+        {
+          "lineage_id": "social-cultural-behavior",
+          "label": "Social / cultural behavior",
+          "ask": "Delegation, trust of intermediaries, etiquette of interruption, status in groups."
+        },
+        {
+          "lineage_id": "command-lines",
+          "label": "Command lines",
+          "ask": "REPL, shells, xterm, job control, stdout as evidence, dangerous flags, tty vs GUI."
+        },
+        {
+          "lineage_id": "dashboards-control-rooms",
+          "label": "Dashboards / control rooms",
+          "ask": "Overview first, alarm vs status, operator authority, wall vs handheld."
+        },
+        {
+          "lineage_id": "approvals-notifications",
+          "label": "Approvals / notifications",
+          "ask": "Interrupt, inbox, two-person rule, push approval, silent vs blocking consent."
+        },
+        {
+          "lineage_id": "progressive-disclosure",
+          "label": "Progressive disclosure",
+          "ask": "Novice/expert paths, details-on-demand, hidden power, leaky abstraction costs."
+        },
+        {
+          "lineage_id": "long-running-monitoring",
+          "label": "Long-running monitoring",
+          "ask": "Jobs, daemons, CI, spacecraft, plants: how humans watch work that outlives a session."
+        },
+        {
+          "lineage_id": "multi-agent-coordination",
+          "label": "Multi-agent coordination",
+          "ask": "Human teams, air traffic, trading floors, orchestras, software multi-agent; shared state and dissent."
+        },
+        {
+          "lineage_id": "trust-explainability",
+          "label": "Trust / explainability",
+          "ask": "Why a system is believed, audit trails, black boxes, expert override, recovery after surprise."
+        },
+        {
+          "lineage_id": "desktop-mobile-continuity",
+          "label": "Desktop / mobile continuity",
+          "ask": "Handoff, companion devices, notifications as remote controls, what belongs on a small screen."
+        }
+      ],
+      "seeds": [
+        {
+          "seed_id": "codex-hci-direct-manipulation-1970s",
+          "primary_lineage": "hci-interaction",
+          "era_or_date_range": "1970s",
+          "observed_example": "Sketchpad-like graphical workspace where points, lines, and constraints are manipulated with a pointing device.",
+          "problem_or_conditions": "Make geometric design visible and interactive instead of repeatedly describing it textually.",
+          "enabling_technology_or_constraints": "Interactive display, pointing hardware, incremental graphics, and limited compute.",
+          "interaction_form": "Direct manipulation with selection and immediate visual feedback.",
+          "remembered_reaction_or_critique": "Foundational and intuitive, but expensive hardware and narrow task scope limited reach; MEDIUM confidence.",
+          "suspected_source_or_example": "HCI history, demonstrations, and retrospective teaching material.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—canonical form is clear, while implementation details blur.",
+          "relevance_clue": "Visible state and reversible actions can make delegated work inspectable.",
+          "coding_agent_bias": "Coding-agent training may overvalue manipulable artifacts and underweight embodied access."
+        },
+        {
+          "seed_id": "codex-computing-timesharing-1960s",
+          "primary_lineage": "computing-interfaces",
+          "era_or_date_range": "1960s-1980s",
+          "observed_example": "Time-sharing terminals gave users an ongoing text session on shared remote compute.",
+          "problem_or_conditions": "Improve over batch submission by providing continuity of control and incremental feedback.",
+          "enabling_technology_or_constraints": "Shared CPUs, terminals, operating-system scheduling, and scarce compute resources.",
+          "interaction_form": "Session-based text interaction with commands, prompts, and responses.",
+          "remembered_reaction_or_critique": "More responsive than batch, but queues, disconnections, and hidden system state remained frustrating; MEDIUM confidence.",
+          "suspected_source_or_example": "Computing-interface history and operating-system retrospectives.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—general pattern is stable, but examples and chronology are blended.",
+          "relevance_clue": "Persistent conversational control still needs visible ownership and runtime state.",
+          "coding_agent_bias": "Training may treat terminal continuity as the default and understate nontechnical users’ barriers."
+        },
+        {
+          "seed_id": "codex-mobile-sms-1990s",
+          "primary_lineage": "mobile-messaging",
+          "era_or_date_range": "1990s-2000s",
+          "observed_example": "Short asynchronous text messages delivered to constrained mobile phones and later organized into threads.",
+          "problem_or_conditions": "Coordinate without requiring a live call or shared schedule.",
+          "enabling_technology_or_constraints": "Cellular networks, small displays, tiny keyboards, store-and-forward delivery, and limited bandwidth.",
+          "interaction_form": "Compose, send, receive notification, and reply asynchronously.",
+          "remembered_reaction_or_critique": "Low friction and socially powerful, but interruptions and missing context can create pressure; LOW confidence.",
+          "suspected_source_or_example": "Mobile-communication history and usage folklore.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—form and tradeoffs are familiar, but reactions vary by culture and era.",
+          "relevance_clue": "Asynchronous agent commands need durable replies, context, and interruption policy.",
+          "coding_agent_bias": "Chat-with-tools training may overestimate text’s ability to carry urgency and context."
+        },
+        {
+          "seed_id": "codex-industrial-cockpit-controls-20c",
+          "primary_lineage": "industrial-design",
+          "era_or_date_range": "20th century-modern",
+          "observed_example": "Cockpit-like panels with dedicated switches, knobs, guarded controls, and status annunciators.",
+          "problem_or_conditions": "Prevent mode errors and support rapid action under stress.",
+          "enabling_technology_or_constraints": "Reliable physical controls, tactile feedback, instrument panels, and high-consequence operations.",
+          "interaction_form": "Physical selection, tactile confirmation, guarded activation, and visual status checking.",
+          "remembered_reaction_or_critique": "Dedicated controls aid confidence, while alarm overload and mode confusion remain persistent; MEDIUM confidence.",
+          "suspected_source_or_example": "Aviation human-factors practice and incident studies.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—cockpit patterns are clear, but specific reactions are generalized.",
+          "relevance_clue": "High-impact agent actions benefit from explicit modes, confirmations, and safe guards.",
+          "coding_agent_bias": "Software examples can flatten physical affordances into buttons and miss tactile or embodied cues."
+        },
+        {
+          "seed_id": "codex-technology-push-background-2000s",
+          "primary_lineage": "technology-evolution",
+          "era_or_date_range": "2000s-2020s",
+          "observed_example": "Always-connected phones and cloud services perform background synchronization and push notifications.",
+          "problem_or_conditions": "Avoid stale polling and preserve service continuity across intermittent attention.",
+          "enabling_technology_or_constraints": "Mobile networks, cloud infrastructure, event delivery, background execution, battery, and attention budgets.",
+          "interaction_form": "Background event processing with notification-driven re-entry.",
+          "remembered_reaction_or_critique": "Convenient continuity increased attention drain and made background state opaque; LOW confidence.",
+          "suspected_source_or_example": "Platform history and engineering discussions of push and sync.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—technology pattern is familiar, but causal effects are broad generalizations.",
+          "relevance_clue": "Agents can outlive a conversation, requiring clear background activity and interruption boundaries.",
+          "coding_agent_bias": "Coding-agent training may assume abundant compute, network access, and battery."
+        },
+        {
+          "seed_id": "codex-graphic-status-typography-20c",
+          "primary_lineage": "graphic-visual-communication",
+          "era_or_date_range": "20th century-present",
+          "observed_example": "Operational displays use typography, symbols, color, hierarchy, and compact status summaries for scanning.",
+          "problem_or_conditions": "Make changing information understandable at a glance without reading every detail.",
+          "enabling_technology_or_constraints": "Display technology, visual conventions, limited attention, and varying viewing distances.",
+          "interaction_form": "Visual scan followed by selective focus and drilldown.",
+          "remembered_reaction_or_critique": "Dense hierarchy can be glanceable, but color-only coding and badge overload fail users; LOW confidence.",
+          "suspected_source_or_example": "Information-design manuals and operational-screen practice.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—principles are stable, while specific examples vary.",
+          "relevance_clue": "Agent status should remain legible under glance-level attention and detailed inspection.",
+          "coding_agent_bias": "Coding-agent training may favor monospace logs, diff colors, and status badges over broader visual access."
+        },
+        {
+          "seed_id": "codex-architecture-control-room-20c",
+          "primary_lineage": "architecture-spatial",
+          "era_or_date_range": "20th century",
+          "observed_example": "Control rooms and war rooms arrange people, maps, displays, and communication channels around shared work.",
+          "problem_or_conditions": "Coordinate attention, responsibility, and decisions across a complex operation.",
+          "enabling_technology_or_constraints": "Shared physical presence, wall displays, dedicated stations, and communication infrastructure.",
+          "interaction_form": "Move between stations, inspect shared surfaces, confer, and hand off responsibility.",
+          "remembered_reaction_or_critique": "Shared overview helps coordination, but centralized rooms can create theater and exclude remote participants; MEDIUM confidence.",
+          "suspected_source_or_example": "Organizational architecture and control-room history.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—spatial pattern is clear, critique is interpretive.",
+          "relevance_clue": "Persistent agent work may need zones for ownership, evidence, and escalation rather than one stream.",
+          "coding_agent_bias": "Repository and workspace metaphors may overfit physical-room analogies."
+        },
+        {
+          "seed_id": "codex-accessibility-screen-reader-1990s",
+          "primary_lineage": "accessibility",
+          "era_or_date_range": "1990s-present",
+          "observed_example": "Screen readers and keyboard navigation expose semantic structure and focus order without relying on vision or pointing.",
+          "problem_or_conditions": "Enable interaction for blind, low-vision, motor-limited, and cognitively diverse users.",
+          "enabling_technology_or_constraints": "Semantic markup, speech synthesis, keyboard focus, assistive technologies, and accessibility standards.",
+          "interaction_form": "Linear focus traversal, commands, announcements, and recoverable navigation.",
+          "remembered_reaction_or_critique": "Essential when semantics are preserved; dynamic unlabeled updates and focus loss remain common failures; LOW confidence.",
+          "suspected_source_or_example": "Accessibility standards, user reports, and assistive-technology practice.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—general accessibility requirements are well known, examples are unsourced.",
+          "relevance_clue": "Agent controls must expose state, changes, and recovery paths across modalities.",
+          "coding_agent_bias": "Coding datasets overrepresent visual desktop and keyboard workflows."
+        },
+        {
+          "seed_id": "codex-social-delegation-intermediaries-undated",
+          "primary_lineage": "social-cultural-behavior",
+          "era_or_date_range": "undated",
+          "observed_example": "Assistants, dispatchers, and coordinators triage requests between principals and the wider group.",
+          "problem_or_conditions": "Protect attention while distributing work and preserving social accountability.",
+          "enabling_technology_or_constraints": "Role norms, shared channels, organizational hierarchy, and trust in intermediaries.",
+          "interaction_form": "Request, triage, delegate, escalate, acknowledge, and report back.",
+          "remembered_reaction_or_critique": "Trusted intermediaries reduce interruption, but authority and credit can become ambiguous; MEDIUM confidence.",
+          "suspected_source_or_example": "Organizational ethnography and delegation folklore.",
+          "observation_vs_inference": "INFERENCE",
+          "uncertainty": "HIGH—pattern is broad and culturally variable.",
+          "relevance_clue": "Delegated agent work needs visible requester, authority, responsibility, and escalation etiquette.",
+          "coding_agent_bias": "Coding-agent training may reduce social delegation to tickets, assignees, and roles."
+        },
+        {
+          "seed_id": "codex-command-lines-job-control-1970s",
+          "primary_lineage": "command-lines",
+          "era_or_date_range": "1970s-1980s",
+          "observed_example": "Unix-like shells combine commands, pipelines, background jobs, signals, terminals, and textual output.",
+          "problem_or_conditions": "Compose powerful operations and let work continue beyond the immediate foreground interaction.",
+          "enabling_technology_or_constraints": "TTYs, process models, pipes, files, signals, and modest interfaces.",
+          "interaction_form": "Enter commands, detach or foreground jobs, inspect stdout, and respond to errors.",
+          "remembered_reaction_or_critique": "Powerful and reproducible, but dangerous flags, weak discoverability, and opaque process state remain risks; LOW confidence.",
+          "suspected_source_or_example": "Shell manuals and command-line history.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—core mechanisms are canonical, details vary across shells.",
+          "relevance_clue": "Agent actions need explicit lifecycle controls and evidence beyond a final text response.",
+          "coding_agent_bias": "This lineage is likely overrepresented because coding agents are trained on CLI use."
+        },
+        {
+          "seed_id": "codex-control-room-alarm-1960s",
+          "primary_lineage": "dashboards-control-rooms",
+          "era_or_date_range": "1960s-present",
+          "observed_example": "Industrial control rooms combine overview displays, alarm panels, trend views, and operator intervention points.",
+          "problem_or_conditions": "Monitor many signals while distinguishing routine status from conditions requiring action.",
+          "enabling_technology_or_constraints": "Sensors, supervisory systems, wall displays, dedicated operators, and alarm channels.",
+          "interaction_form": "Scan overview, acknowledge alarm, drill down, intervene, and verify outcome.",
+          "remembered_reaction_or_critique": "Overview supports situational awareness, while alarm floods and status-alarm confusion impair response; LOW confidence.",
+          "suspected_source_or_example": "Process-control practice and human-factors studies.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—pattern is stable, exact studies are not recalled precisely.",
+          "relevance_clue": "Agent command surfaces should separate health, alerts, authority, and intervention evidence.",
+          "coding_agent_bias": "Software dashboards may be reduced to green/red metrics and omit operator context."
+        },
+        {
+          "seed_id": "codex-approvals-two-person-rule-20c",
+          "primary_lineage": "approvals-notifications",
+          "era_or_date_range": "20th century-present",
+          "observed_example": "Sensitive operations use approval queues, two-person rules, and explicit acknowledge or deny actions.",
+          "problem_or_conditions": "Require independent consent before high-risk or irreversible work proceeds.",
+          "enabling_technology_or_constraints": "Identity systems, access logs, workflow software, and organizational separation of duties.",
+          "interaction_form": "Receive request, inspect context, approve or deny, and escalate when blocked.",
+          "remembered_reaction_or_critique": "Improves accountability but can produce approval fatigue, rubber-stamping, or harmful interruption pressure; LOW confidence.",
+          "suspected_source_or_example": "Security operations and workflow practice.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—control pattern is familiar, operational effects vary.",
+          "relevance_clue": "Autonomous actions need explicit consent boundaries and auditable refusal paths.",
+          "coding_agent_bias": "Pull-request review patterns may obscure real-world availability, coercion, and urgency."
+        },
+        {
+          "seed_id": "codex-progressive-disclosure-expert-modes-1980s",
+          "primary_lineage": "progressive-disclosure",
+          "era_or_date_range": "1980s-present",
+          "observed_example": "Interfaces expose common actions first while placing advanced options, flags, and diagnostics behind details-on-demand.",
+          "problem_or_conditions": "Serve novices without removing expert power.",
+          "enabling_technology_or_constraints": "Layered menus, help systems, responsive layouts, and increasing feature complexity.",
+          "interaction_form": "Use guided defaults, then open advanced controls or inspect details when needed.",
+          "remembered_reaction_or_critique": "Reduces overload but hides power and creates leaky abstractions; MEDIUM confidence.",
+          "suspected_source_or_example": "HCI teaching and recurring product-interface patterns.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—principle is canonical, examples are blended.",
+          "relevance_clue": "Agent controls can provide safe defaults while preserving expert inspection and override.",
+          "coding_agent_bias": "Coding agents tend to prefer shortcut-heavy expert paths and assume documentation access."
+        },
+        {
+          "seed_id": "codex-long-running-batch-daemons-1960s",
+          "primary_lineage": "long-running-monitoring",
+          "era_or_date_range": "1960s-present",
+          "observed_example": "Batch jobs, daemons, and later CI systems continue after submission and expose logs, status, and results.",
+          "problem_or_conditions": "Run work that outlives an interactive session or operator’s constant attention.",
+          "enabling_technology_or_constraints": "Schedulers, persistent storage, process supervision, logs, and notification systems.",
+          "interaction_form": "Submit, detach, poll or subscribe, inspect evidence, and recover or retry.",
+          "remembered_reaction_or_critique": "Frees operators from constant presence, but stale logs and orphaned work cause confusion; LOW confidence.",
+          "suspected_source_or_example": "Operations practice and computing history.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—general lifecycle is clear, examples span eras.",
+          "relevance_clue": "Agent identity, state, evidence, and failure recovery must survive the chat session.",
+          "coding_agent_bias": "Coding-agent training may equate process completion with successful task completion."
+        },
+        {
+          "seed_id": "codex-multi-agent-air-traffic-20c",
+          "primary_lineage": "multi-agent-coordination",
+          "era_or_date_range": "20th century-present",
+          "observed_example": "Air-traffic and mission-control teams coordinate through shared displays, radio protocols, role assignments, and handoffs.",
+          "problem_or_conditions": "Maintain shared situational awareness while multiple operators act under time pressure.",
+          "enabling_technology_or_constraints": "Shared sensing, communication protocols, role separation, and procedural training.",
+          "interaction_form": "Coordinate, acknowledge, hand off, challenge, and resolve conflicting interpretations.",
+          "remembered_reaction_or_critique": "Structured callouts reduce ambiguity, while hierarchy and congestion can suppress dissent; MEDIUM confidence.",
+          "suspected_source_or_example": "Aviation and operations studies.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—coordination pattern is familiar, specific critique is generalized.",
+          "relevance_clue": "Multiple agents need shared state, explicit handoffs, and preserved independent dissent.",
+          "coding_agent_bias": "Software collaboration is often reduced to branches, tickets, and synchronous chat."
+        },
+        {
+          "seed_id": "codex-trust-audit-override-20c",
+          "primary_lineage": "trust-explainability",
+          "era_or_date_range": "20th century-present",
+          "observed_example": "Safety-critical and financial systems retain audit trails and provide expert review, override, or rollback paths.",
+          "problem_or_conditions": "Verify automated decisions and recover after surprising behavior.",
+          "enabling_technology_or_constraints": "Logging, provenance, access control, review workflows, and reversible operations.",
+          "interaction_form": "Inspect evidence, question rationale, approve or override, and audit the result.",
+          "remembered_reaction_or_critique": "Auditability supports trust, but post-hoc explanations can become reassuring theater; MEDIUM confidence.",
+          "suspected_source_or_example": "Safety-critical systems practice and explainability literature.",
+          "observation_vs_inference": "INFERENCE",
+          "uncertainty": "MEDIUM—mechanisms are familiar, trust effects are interpretive.",
+          "relevance_clue": "Agents need evidence, provenance, human override, and credible recovery after surprise.",
+          "coding_agent_bias": "Training may treat tests and logs as sufficient proof while underweighting social trust."
+        },
+        {
+          "seed_id": "codex-desktop-mobile-handoff-2010s",
+          "primary_lineage": "desktop-mobile-continuity",
+          "era_or_date_range": "2010s-present",
+          "observed_example": "Cloud sync, push notifications, shared clipboard, and handoff let work move between desktop and phone.",
+          "problem_or_conditions": "Resume work or respond to events while changing location or device.",
+          "enabling_technology_or_constraints": "Cloud identity, push delivery, synchronized state, and small-screen limits.",
+          "interaction_form": "Receive notification, inspect or respond on mobile, then continue on desktop.",
+          "remembered_reaction_or_critique": "Convenient but fragmented; mobile often lacks context and can expose information accidentally; LOW confidence.",
+          "suspected_source_or_example": "Platform history and usage reports.",
+          "observation_vs_inference": "OBSERVATION",
+          "uncertainty": "MEDIUM—continuity pattern is clear, reactions vary by implementation.",
+          "relevance_clue": "Small-screen controls should support safe handoff without pretending to contain full context.",
+          "coding_agent_bias": "Chat-based coding training may overstate continuity because text context appears portable."
+        }
+      ],
+      "cross_domain_links": [
+        {
+          "from_seed_id": "codex-command-lines-job-control-1970s",
+          "to_seed_id": "codex-long-running-batch-daemons-1960s",
+          "relation": "job-control-supports-detached-work-and-monitoring",
+          "status": "CANDIDATE_INFERENCE"
+        },
+        {
+          "from_seed_id": "codex-mobile-sms-1990s",
+          "to_seed_id": "codex-technology-push-background-2000s",
+          "relation": "asynchronous-messaging-prefigures-push-driven-background-interaction",
+          "status": "CANDIDATE_INFERENCE"
+        },
+        {
+          "from_seed_id": "codex-industrial-cockpit-controls-20c",
+          "to_seed_id": "codex-approvals-two-person-rule-20c",
+          "relation": "high-consequence-controls-motivate-explicit-confirmation-and-separation",
+          "status": "CANDIDATE_INFERENCE"
+        },
+        {
+          "from_seed_id": "codex-control-room-alarm-1960s",
+          "to_seed_id": "codex-trust-audit-override-20c",
+          "relation": "operational-overview-needs-evidence-and-recovery-for-trust",
+          "status": "CANDIDATE_INFERENCE"
+        }
+      ],
+      "coding_agent_bias_notes": [
+        "CLI, terminal, repository, diff, test, and pull-request patterns are likely overrepresented in this recall.",
+        "Textual evidence and reproducibility may be privileged over embodiment, accessibility, social etiquette, and uncertainty.",
+        "Software lifecycle metaphors may distort physical, organizational, and cultural examples."
+      ],
+      "uncertainty_summary": "Overall MEDIUM. Canonical interface patterns are more reliable than exact dates, attribution, implementation details, and remembered reactions. No precise citations, quotations, DOIs, or URLs are asserted.",
+      "raw_preservation": {
+        "preserved": true,
+        "representation": "This emitted JSON is the unaugmented Phase 1 structured elicitation record.",
+        "method": "Single-pass model recall with no web search, repository inspection, RAG retrieval, or other vendor-pack comparison."
+      }
+    }
+  }
+}

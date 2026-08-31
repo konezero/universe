@@ -1,0 +1,126 @@
+{
+  "schema": "universe.vendor-mobile-conductor-task-frame-evidence.v1",
+  "run_id": "vendor-mobile-conductor-experiment-20260830-r2",
+  "status": "BLOCKED_PROVIDER_TRANSPORT",
+  "research_question": "For an AI system like Universe with long-running autonomous work, compare conversation-first mobile command surfaces with explicit Goal/Fleet/Galaxy/Rooms/status navigation and desktop-only raw xterm.",
+  "origin": {
+    "current_anchor": "CONDUCTOR-CURRENT-037631315B937A24",
+    "session_id": "session_de0e5a92a7fb5df928b6c568",
+    "frame_id": "current",
+    "registry_source": "project_runtime.sqlite3:mode_registry_snapshot",
+    "registry_revision": 6,
+    "registry_digest": "132debc6ac36e52b35f5a9e0517f1faaa4ee0ec32f02dc05a329e5ecf62acfb8"
+  },
+  "proposal": {
+    "proposal_id": "task_proposal_9eaf75bb5d7e39815b088b14",
+    "proposal_digest": "9eaf75bb5d7e39815b088b147555691b98161ae25bb1b12846252d9687e01867",
+    "instruction_ref": "user://approval/independent-multi-vendor-design-seed-experiment-20260830-r2",
+    "repository_write_scope": "NONE",
+    "vendor_brief_schema": "common brief; 8-15 seeds; observed/inferred lineage; exactly 3 paths including a premise challenge; named risk set; bias/confidence; non-canonical recommendation",
+    "sibling_output_access": "FORBIDDEN"
+  },
+  "project_master_recovery": {
+    "action": "NEW",
+    "session_anchor_ref": "session_anchor_1a5aaaa30679bf3cf7cdca2b",
+    "supervisor_session_id": "session_8e9727c6e6ecb0233edd8e43",
+    "preparation_path": "ANCHOR_GRAPH",
+    "status": "SESSION_PREPARED",
+    "career_retirement_goal_touched": false
+  },
+  "frames": [
+    {
+      "vendor": "CLAUDE",
+      "frame_id": "tf-vendor-mobile-conductor-r2-claude",
+      "room_id": "room_534df7cbaaa4a1f4ac8cdc29",
+      "origin_session_anchor_ref": "session_anchor_363de1787d4782186ec5368c",
+      "create_http_status": 201,
+      "child_turn_id": "claude-vendor",
+      "declared_model": "opus",
+      "status": "CREATED_PROVIDER_RUN_BLOCKED",
+      "worker_attempts": [
+        {
+          "worker_id": "universe-runtime-worker:522f033d08864d9e9413048595a14a3e",
+          "worker_run_ref": "universe-runtime-host:a5b21f9cbeb84d538dc43d69b0e85321",
+          "failure_code": "WORKER_PROVIDER_FAILED",
+          "failure_detail": "CLAUDE_CODE_CLAUDE_CODE_RESULT_FAILED; native_status=TIMED_OUT; payload_parsed=false; structured_output_present=false",
+          "host_evidence_ref": "universe-host-evidence://worker-initialization/worker_failure_880e92fa61ccd583c9e081de#sha256=880e92fa61ccd583c9e081de21ba295bf5cd3041013c92d3e0cd6192cce64d4c"
+        },
+        {
+          "worker_id": "universe-runtime-worker:b1988ceca5784d81abef39ef1f0e8afd",
+          "worker_run_ref": "universe-runtime-host:6174b5d1fdba4287a53195a3bbb1b7b3",
+          "failure_code": "WORKER_PROVIDER_FAILED",
+          "failure_detail": "CLAUDE_CODE_CLAUDE_CODE_RESULT_FAILED; native_status=TIMED_OUT; payload_parsed=false; structured_output_present=false",
+          "host_evidence_ref": "universe-host-evidence://worker-initialization/worker_failure_320783b29d894f9b569f592d#sha256=320783b29d894f9b569f592d2ec8c15808bb39360ec7117f8948deac76df78b8",
+          "retry_generation": 2
+        }
+      ],
+      "submission": "NOT_SUBMITTED"
+    },
+    {
+      "vendor": "CODEX",
+      "frame_id": "tf-vendor-mobile-conductor-r2-codex",
+      "room_id": "room_1d6d1f4bea3320c9f07e6d26",
+      "origin_session_anchor_ref": "session_anchor_363de1787d4782186ec5368c",
+      "create_http_status": 201,
+      "child_turn_id": "codex-vendor",
+      "declared_model": "gpt-5.6-luna",
+      "status": "CREATED_PROVIDER_RUN_BLOCKED",
+      "worker_attempts": [
+        {
+          "worker_id": "universe-runtime-worker:2eb6c1687cc146919d4cf7bc2486c6f9",
+          "worker_run_ref": "universe-runtime-host:bea7227b43114132946e15d5b4e2bd41",
+          "failure_code": "WORKER_PROVIDER_FAILED",
+          "failure_detail": "CODEX_APP_SERVER_CODEX_TURN_TIMED_OUT",
+          "host_evidence_ref": "universe-host-evidence://worker-initialization/worker_failure_27cffec2e49b91eda0cfa39#sha256=27cffecc2e49b91eda0cfa39f69b790ac89baadcd2bcd7dfbdad111db2c19a85",
+          "retry_generation": 1
+        }
+      ],
+      "submission": "NOT_SUBMITTED"
+    },
+    {
+      "vendor": "GROK",
+      "frame_id": "tf-vendor-mobile-conductor-r2-grok",
+      "room_id": "room_ee766e76eb40ab2b3f221243",
+      "origin_session_anchor_ref": "session_anchor_363de1787d4782186ec5368c",
+      "create_http_status": 201,
+      "child_turn_id": "grok-vendor",
+      "declared_model": "grok-build",
+      "status": "CREATED_PROVIDER_RUN_BLOCKED",
+      "worker_attempts": [
+        {
+          "worker_id": "universe-runtime-worker:d63b9e99710340dd81de66df872876f5",
+          "worker_run_ref": "universe-runtime-host:13ad63a42c21420e9674b9489eb6a0e2",
+          "failure_code": "WORKER_PROVIDER_FAILED",
+          "failure_detail": "GROK_ACP_AGENT_RPC_TIMEOUT:session/prompt",
+          "host_evidence_ref": "universe-host-evidence://worker-initialization/worker_failure_81f882cd986766f4cdf41266#sha256=81f882cd986766f4cdf41266010542f0af8e21a6398f4e13e0252734407634ed",
+          "retry_generation": 1
+        }
+      ],
+      "submission": "NOT_SUBMITTED"
+    }
+  ],
+  "synthesis": {
+    "status": "NOT_STARTED",
+    "reason": "all-three-submitted gate not met; no vendor result envelope exists"
+  },
+  "bus": {
+    "message_id": "msg_160228569b6d6487",
+    "thread_id": "tf-vendor-mobile-conductor-r2",
+    "recipient_anchor_ref": "CONDUCTOR-CURRENT-037631315B937A24",
+    "status": "CREATED"
+  },
+  "artifacts": {
+    "vendor_status_records": [
+      "claude-20260830-r2.blocked.md",
+      "codex-20260830-r2.blocked.md",
+      "grok-20260830-r2.blocked.md"
+    ],
+    "synthesis_status_record": "synthesis-20260830-r2.blocked.md",
+    "adoption": "CANDIDATE_STATUS_ONLY",
+    "rag_adoption": false,
+    "feature_goal_todo_creation": false,
+    "product_source_mutation": false,
+    "commit": false,
+    "push": false
+  }
+}

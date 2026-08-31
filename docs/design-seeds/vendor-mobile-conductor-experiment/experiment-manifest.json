@@ -1,0 +1,48 @@
+{
+  "schema": "universe.design-seed.vendor-mobile-conductor-experiment.v0",
+  "experiment_id": "vendor-mobile-conductor-experiment-20260830",
+  "status": "PHASE_3_CANDIDATE_COMPLETE",
+  "conductor_role": "SECOND_UNIVERSE_CONDUCTOR",
+  "mode": "CONDUCTOR",
+  "origin_anchor_ref": "CONDUCTOR-CURRENT-3E0ED94C1D8AC4AA",
+  "session_id": "conductor-vendor-mobile-seed-20260830",
+  "instruction_id": "user-approval-vendor-mobile-conductor-experiment-20260830",
+  "instruction_ref": "user://approval/start-separate-design-seed-task-frame",
+  "work_receipt_id": "work_869d643783c44d2fa61dd15b",
+  "isolated_from": "Mode Profile retirement Goal",
+  "task_frame_id": "tf-vendor-mobile-conductor-experiment-20260830",
+  "proposal_id": "task_frame_plan_7b90b5dbfed7217919db31a3",
+  "plan_digest": "7b90b5dbfed7217919db31a3d90b6457c71e5ae26fc483f9eb3f28dbb45059c0",
+  "meeting_room_id": "room_294d7500fac65e847efdbe1f",
+  "phases": {
+    "phase_1_seed_extraction": "FROZEN",
+    "phase_2_meeting_assemble": "PARTIAL",
+    "phase_3_prediction_synthesis": "CANDIDATE"
+  },
+  "vendor_packs": {
+    "CLAUDE": {
+      "pack_id": "claude-pretraining-design-seed-pack-v0",
+      "sha256": "ef1b49a059d8a086d4c0eaf10be3f2e74b8edc77b18d993726d231f9b2714ed0"
+    },
+    "CODEX": {
+      "pack_id": "codex-pretraining-design-seed-pack-v0",
+      "sha256": "45bfef68393f2534af816357886c34972ab9808280c2bb15b15e5efa4a018f7a"
+    },
+    "GROK": {
+      "pack_id": "grok-pretraining-design-seed-pack-v0",
+      "sha256": "e0469e7bad327e8ee217c5b4b5852cd79c6cbf0ab8275cccc2044a614a7e3349"
+    }
+  },
+  "write_root": "C:\\workspace\\universe\\docs\\design-seeds\\vendor-mobile-conductor-experiment",
+  "adoption_state": "CANDIDATE",
+  "forbidden": [
+    "RAG_ADOPTION",
+    "FEATURE_NODE",
+    "GOAL",
+    "TODO",
+    "PRODUCT_SOURCE_MODIFICATION",
+    "COMMIT",
+    "PUSH",
+    "RAW_DB_MUTATION"
+  ]
+}

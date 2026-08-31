@@ -1,0 +1,36 @@
+{
+  "schema": "universe.vendor-mobile-conductor-run-manifest.v1",
+  "run_id": "vendor-mobile-conductor-experiment-20260830-r2",
+  "status": "BLOCKED_PROVIDER_TRANSPORT",
+  "persisted_under": "C:\\workspace\\universe\\docs\\design-seeds\\vendor-mobile-conductor-experiment",
+  "preserved_existing_artifacts": true,
+  "proposal_id": "task_proposal_9eaf75bb5d7e39815b088b14",
+  "proposal_digest": "9eaf75bb5d7e39815b088b147555691b98161ae25bb1b12846252d9687e01867",
+  "current_anchor": "CONDUCTOR-CURRENT-037631315B937A24",
+  "bus_message_id": "msg_160228569b6d6487",
+  "task_frame_ids": [
+    "tf-vendor-mobile-conductor-r2-claude",
+    "tf-vendor-mobile-conductor-r2-codex",
+    "tf-vendor-mobile-conductor-r2-grok"
+  ],
+  "vendor_files": {
+    "claude": {"path": "claude-20260830-r2.blocked.md", "state": "STATUS_ONLY_NOT_SUBMITTED"},
+    "codex": {"path": "codex-20260830-r2.blocked.md", "state": "STATUS_ONLY_NOT_SUBMITTED"},
+    "grok": {"path": "grok-20260830-r2.blocked.md", "state": "STATUS_ONLY_NOT_SUBMITTED"}
+  },
+  "synthesis_file": {"path": "synthesis-20260830-r2.blocked.md", "state": "NOT_STARTED"},
+  "task_frame_evidence_file": {"path": "task-frame-evidence-20260830-r2.json", "state": "PERSISTED"},
+  "worker_output_count": 0,
+  "synthesis_started": false,
+  "forbidden_side_effects": {
+    "rag": false,
+    "feature_node": false,
+    "goal": false,
+    "todo": false,
+    "product_source": false,
+    "release_history_rewrite": false,
+    "commit": false,
+    "push": false
+  },
+  "blocker": "All three provider Workers timed out before structured result capture; no research content is available to compare or synthesize."
+}

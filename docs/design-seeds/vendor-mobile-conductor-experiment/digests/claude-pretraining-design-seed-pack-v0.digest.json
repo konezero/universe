@@ -1,0 +1,12 @@
+{
+  "pack_id": "claude-pretraining-design-seed-pack-v0",
+  "vendor": "CLAUDE",
+  "elicitation_kind": "MODEL_RECALL",
+  "frozen_at": "2026-08-30T08:38:06.747150Z",
+  "worker_id": "universe-runtime-worker:9be5dd190c104c619332a97a9c21b74f",
+  "worker_run_ref": "universe-runtime-host:51945c38ead64a008f749b467512ad82",
+  "result_receipt_ref": "claude-code:8ca96266-4832-4dd8-bbea-2087f46ce40e:universe-runtime-host:51945c38ead64a008f749b467512ad82",
+  "raw_envelope_sha256": "cacf195fb02fabe3b79ffa93d7cae4fe793c4408cf21a79399bfc06712f78262",
+  "frozen_pack_sha256": "ef1b49a059d8a086d4c0eaf10be3f2e74b8edc77b18d993726d231f9b2714ed0",
+  "seed_count": 17
+}

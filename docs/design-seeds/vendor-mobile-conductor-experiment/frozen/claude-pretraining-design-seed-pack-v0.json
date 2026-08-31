@@ -1,0 +1,457 @@
+{
+  "candidate_cross_domain_links": [
+    {
+      "claim": "Destructive-flag errors and cockpit mode errors may be the same class of failure: authority exercised in an unreadable mode.",
+      "from_seed": "claude-industrial-design-cockpit-mode-error-1980s",
+      "link_type": "analogy-candidate",
+      "status": "candidate interpretation only; not merged into either primary lineage",
+      "to_seed": "claude-command-lines-job-control-1980s"
+    },
+    {
+      "claim": "Push scarcity may force approvals to be batched or pre-delegated rather than per-action.",
+      "from_seed": "claude-technology-evolution-push-battery-2000s",
+      "link_type": "constraint-candidate",
+      "status": "candidate interpretation only",
+      "to_seed": "claude-approvals-two-person-rule-cold-war"
+    },
+    {
+      "claim": "Alarm rationalization and serial-channel announcement discipline may be the same requirement seen from visual and auditory sides.",
+      "from_seed": "claude-dashboards-overview-first-alarm-1990s",
+      "link_type": "pattern-candidate",
+      "status": "candidate interpretation only",
+      "to_seed": "claude-accessibility-screen-reader-linearization-1990s"
+    },
+    {
+      "claim": "Externalized shared state artifacts may descend from co-present room practice rather than from computing.",
+      "from_seed": "claude-architecture-spatial-war-room-1940s",
+      "link_type": "lineage-candidate",
+      "status": "candidate interpretation only",
+      "to_seed": "claude-multi-agent-air-traffic-handoff-1970s"
+    }
+  ],
+  "coding_agent_bias_notes": {
+    "biases": [
+      "Text-stream primacy: I convert spatial, tactile, and social forms into logs, flags, and transcripts.",
+      "Per-action approval bias: PR review and tool-permission prompts make me forget standing delegation and blocking two-person control.",
+      "Binary outcome bias: red/green CI collapses the status-versus-alarm distinction and the notion of degraded-but-running.",
+      "Session bias: I assume work ends when the conversation ends, underweighting daemons, shifts, and handover.",
+      "Transparency-as-dump: I mistake full log output for progressive disclosure.",
+      "Viewport bias: I assume a wide terminal, which corrupts reasoning about glance surfaces and small screens.",
+      "Recency and Anglophone bias: my design canon skews US/West-Coast and desktop, thinning non-Western mobile and industrial practice.",
+      "Citation pressure: technical training rewards precise references, which raises fabrication risk exactly where I am least reliable — so sources here are named only as classes."
+    ],
+    "summary": "Coding-agent training is a systematic lens that distorts design recall in predictable directions."
+  },
+  "elicitation_kind": "MODEL_RECALL",
+  "extraction_scope_coverage": {
+    "coverage_rule_satisfied": true,
+    "era_spread": "1960s through 2020s, one distinct era emphasis per seed where possible",
+    "excluded_by_rule": [
+      "web search",
+      "repository or file inspection",
+      "other vendor packs",
+      "product UI answers",
+      "precise citations, quotes, page numbers, DOIs, URLs",
+      "RAG, Feature Nodes, Goals, Todos"
+    ],
+    "lineages_covered": 17,
+    "lineages_in_catalog": 17,
+    "phase": "PHASE_1_MODEL_RECALL",
+    "seeds_per_lineage": 1,
+    "seeds_total": 17
+  },
+  "frozen": true,
+  "lineage_catalog": [
+    {
+      "label": "HCI / interaction",
+      "lineage_id": "hci-interaction"
+    },
+    {
+      "label": "Computing interfaces",
+      "lineage_id": "computing-interfaces"
+    },
+    {
+      "label": "Mobile / messaging",
+      "lineage_id": "mobile-messaging"
+    },
+    {
+      "label": "Industrial design",
+      "lineage_id": "industrial-design"
+    },
+    {
+      "label": "Technology evolution",
+      "lineage_id": "technology-evolution"
+    },
+    {
+      "label": "Graphic / visual communication",
+      "lineage_id": "graphic-visual-communication"
+    },
+    {
+      "label": "Architecture / spatial",
+      "lineage_id": "architecture-spatial"
+    },
+    {
+      "label": "Accessibility",
+      "lineage_id": "accessibility"
+    },
+    {
+      "label": "Social / cultural behavior",
+      "lineage_id": "social-cultural-behavior"
+    },
+    {
+      "label": "Command lines",
+      "lineage_id": "command-lines"
+    },
+    {
+      "label": "Dashboards / control rooms",
+      "lineage_id": "dashboards-control-rooms"
+    },
+    {
+      "label": "Approvals / notifications",
+      "lineage_id": "approvals-notifications"
+    },
+    {
+      "label": "Progressive disclosure",
+      "lineage_id": "progressive-disclosure"
+    },
+    {
+      "label": "Long-running monitoring",
+      "lineage_id": "long-running-monitoring"
+    },
+    {
+      "label": "Multi-agent coordination",
+      "lineage_id": "multi-agent-coordination"
+    },
+    {
+      "label": "Trust / explainability",
+      "lineage_id": "trust-explainability"
+    },
+    {
+      "label": "Desktop / mobile continuity",
+      "lineage_id": "desktop-mobile-continuity"
+    }
+  ],
+  "model_self_report": {
+    "known_blind_spots": [
+      "Exact dates, authorship, and publication venues blur together; I default to plausible-sounding attributions and must be restrained from that.",
+      "Strong Anglophone and US/West-Coast bias; WeChat, Japanese keitai, Nordic telecom, and Global South mobile practice are thinner in my memory.",
+      "Non-visual and non-textual design (haptics, audio-first, tactile controls) is recalled through written description, not experience.",
+      "Recent-era memory is truncated and I cannot distinguish what shipped from what was announced.",
+      "Coding-agent training pulls every design question toward text streams, diffs, and approvals; embodied and spatial forms get flattened.",
+      "Critiques are remembered as generic consensus opinions, so I may report backlash that was actually niche."
+    ],
+    "recall_posture": "I hold diffuse, paraphrase-level memory of design history: forms, critiques, and folklore about interfaces, not verbatim text or verifiable citations. What follows is reconstructed gist, sometimes blended across sources, and should be treated as recall to be checked rather than evidence.",
+    "self_identified_model_family": "Claude (Anthropic large language model family)",
+    "vendor": "CLAUDE"
+  },
+  "pack_id": "claude-pretraining-design-seed-pack-v0",
+  "raw_preservation": {
+    "explicit_non_actions": [
+      "did not run web search",
+      "did not inspect any repository or file",
+      "did not read other vendor packs",
+      "did not answer any product UI question",
+      "did not produce any citation, quote, page number, DOI, or URL",
+      "did not adopt RAG, Feature Nodes, Goals, or Todos"
+    ],
+    "method": "Single-pass MODEL_RECALL over 17 lineages, one seed each, no retrieval of any kind. No files read, no web access, no other vendor packs consulted, no product source inspected.",
+    "note": "Raw first-pass recall preserved verbatim in intent; no seed was rewritten after emission. Pack frozen.",
+    "raw_marginalia": [
+      "Repeated instinct during drafting: reach for a named author or year, then suppress it — flagged as the primary fabrication pressure in this task.",
+      "Repeated instinct: reduce every lineage to 'it's basically a CLI' — suppressed and logged as coding-agent bias.",
+      "The social-cultural seed is the only one I could not ground in a fact-like memory, so it is marked INFERENCE rather than dressed up as recall.",
+      "Undated was used once deliberately, to prove the era field can decline to guess."
+    ]
+  },
+  "seeds": [
+    {
+      "coding_agent_bias": "My coding-agent training treats text commands as natural, so I may undersell how much of ordinary computing was won by making state visible rather than utterable.",
+      "enabling_technology_or_constraints": "Bitmapped displays, pointing devices, enough cycles to redraw on every gesture; expensive enough that the argument had to be made rhetorically before hardware was common.",
+      "era_or_date_range": "late 1970s–1980s",
+      "interaction_form": "Spatial pointing and dragging with continuous feedback; no intermediate command utterance.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Direct manipulation as a named ideal: continuously visible objects, physical-feeling selection and drag, rapid reversible actions, and immediate visible effect instead of typed command names.",
+      "primary_lineage": "hci-interaction",
+      "problem_or_conditions": "Command languages required users to remember syntax and to imagine hidden system state; novices failed and experts made silent mode errors.",
+      "relevance_clue": "Autonomous work is mostly invisible and non-spatial, so the visibility-and-reversibility promise has to be re-earned by other means than pointing at objects.",
+      "remembered_reaction_or_critique": "Celebrated as the core GUI justification, but criticized for not scaling to bulk, repetitive, or abstract operations, and for lacking a record of what was done. Uncertainty on how early that critique was voiced.",
+      "seed_id": "claude-hci-direct-manipulation-1980s",
+      "suspected_source_or_example": "HCI textbook / research-paper tradition plus early personal-computer demo folklore.",
+      "uncertainty": "LOW — the form and its standard critique are broadly attested in my memory even though exact wording is not."
+    },
+    {
+      "coding_agent_bias": "I romanticize the REPL because my own tool use is REPL-shaped, and may underweight how good batch was at accountability and scheduling.",
+      "enabling_technology_or_constraints": "Interrupt-driven scheduling, cheap terminals, and the political willingness to spend machine time on human latency instead of throughput.",
+      "era_or_date_range": "1960s",
+      "interaction_form": "Conversational command-and-response at a session terminal, with the job still living on a remote machine.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Time-sharing terminals replacing batch card decks: a person sits at a teletype, submits a small step, sees a response, and adjusts, instead of handing a job to an operator and returning hours later.",
+      "primary_lineage": "computing-interfaces",
+      "problem_or_conditions": "Batch turnaround destroyed the debugging loop; a single typo cost a day, so people over-verified and still guessed at machine state.",
+      "relevance_clue": "The batch-versus-interactive tension recurs whenever an agent does long work off-session: someone must choose between throughput and a human-paced loop.",
+      "remembered_reaction_or_critique": "Remembered as liberating for programmers and resisted by operations staff who saw wasted machine efficiency; I am unsure how widespread the resistance actually was.",
+      "seed_id": "claude-computing-interfaces-timesharing-1960s",
+      "suspected_source_or_example": "Computing-history books and lab folklore about early time-sharing systems.",
+      "uncertainty": "MEDIUM — the arc is solid, but I blend several systems into one narrative."
+    },
+    {
+      "coding_agent_bias": "I tend to read SMS as an early CLI, which overstates command semantics and understates that it was mostly social presence.",
+      "enabling_technology_or_constraints": "Spare signalling capacity, per-message billing, keypads that made typing costly, and carrier interoperability rules.",
+      "era_or_date_range": "1990s–early 2000s",
+      "interaction_form": "Terse asynchronous message exchange, plus keyword replies acting as approvals.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "SMS as an accidental interface: a 160-character control channel becomes the universal asynchronous surface, then grows command-like usage — short codes, keyword replies, YES/STOP confirmations.",
+      "primary_lineage": "mobile-messaging",
+      "problem_or_conditions": "Voice calls were synchronous, expensive, and rude to initiate; people needed a cheap way to signal without demanding attention immediately.",
+      "relevance_clue": "Severe message-length limits forced designers to invent compact status vocabularies and one-word consent — a template for narrow channels to a working agent.",
+      "remembered_reaction_or_critique": "Praised for reach and etiquette-friendliness; criticized for ambiguity, absent delivery truth, and the way abbreviation culture excluded some users. Reaction detail uncertain.",
+      "seed_id": "claude-mobile-messaging-sms-constraint-1990s",
+      "suspected_source_or_example": "Telecom product history and mobile-culture commentary.",
+      "uncertainty": "MEDIUM — the constraint story is well remembered, the sociology less precisely."
+    },
+    {
+      "coding_agent_bias": "Coding tooling gives me confirm-flags and dry-run flags as the obvious answer, which biases me away from tactile and shape-based mode signalling.",
+      "enabling_technology_or_constraints": "Digital flight control, CRT/LCD panels, certification regimes that demanded annunciation, and cost pressure to reduce discrete instruments.",
+      "era_or_date_range": "1980s–1990s glass-cockpit generation",
+      "interaction_form": "Monitoring plus discrete mode selection; occasional intervention by override.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Glass cockpits and mode-annunciator panels: physical levers and gauges replaced by multifunction displays where the same control means different things in different modes, with a small text field announcing the current mode.",
+      "primary_lineage": "industrial-design",
+      "problem_or_conditions": "Automation could act correctly for a mode the crew was not in; the aircraft's intent stopped being legible from the shape of the controls.",
+      "relevance_clue": "An agent with modes (autonomous vs supervised, dry-run vs live) inherits the same failure: the mode must be readable from the surface, not from memory.",
+      "remembered_reaction_or_critique": "Strongly remembered critique of 'automation surprise' and 'what is it doing now?' — investigators repeatedly cited mode confusion. Exact incidents I will not name.",
+      "seed_id": "claude-industrial-design-cockpit-mode-error-1980s",
+      "suspected_source_or_example": "Human-factors literature and accident-investigation summaries.",
+      "uncertainty": "LOW-to-MEDIUM — the phenomenon is firmly recalled; specific case attribution is not."
+    },
+    {
+      "coding_agent_bias": "My server-side habits make me assume compute is free and continuous, which erases the battery and gatekeeper constraints entirely.",
+      "enabling_technology_or_constraints": "Persistent low-power radio connections, platform gatekeeping of background execution, and hard battery and data-plan budgets.",
+      "era_or_date_range": "2000s–2010s",
+      "interaction_form": "Notification-driven interruption; the device is a passive listener until told to surface something.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Push notification infrastructure: a single always-on system channel wakes devices on the network's schedule, replacing per-application polling, and becomes the metering point for background work.",
+      "primary_lineage": "technology-evolution",
+      "problem_or_conditions": "Polling drained batteries and saturated radios; background daemons on a pocket device were economically impossible without a shared wake path.",
+      "relevance_clue": "Any agent that outlives a session on a phone must spend from a shared attention-and-power budget it does not control.",
+      "remembered_reaction_or_critique": "Praised for battery life, then blamed for notification overload and platform gatekeeping power; developers complained about losing background freedom.",
+      "seed_id": "claude-technology-evolution-push-battery-2000s",
+      "suspected_source_or_example": "Mobile platform documentation-era discourse and developer-community commentary.",
+      "uncertainty": "MEDIUM — direction is clear, the sequencing of platform restrictions is fuzzy."
+    },
+    {
+      "coding_agent_bias": "Terminal output trains me toward monospaced logs and density, which is the opposite of glanceability.",
+      "enabling_technology_or_constraints": "Standardized fabrication, corporate identity manuals, and the physical constraint of viewing distance and lighting.",
+      "era_or_date_range": "1960s–1970s transit and signage modernism",
+      "interaction_form": "Glance-level monitoring with no input; the surface only answers 'where am I and what is happening'.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Systematized signage and status boards: a restricted typeface, fixed color meanings, and a strict grid so that a traveller reads position and state in a glance from distance, under stress.",
+      "primary_lineage": "graphic-visual-communication",
+      "problem_or_conditions": "Heterogeneous hand-made signs failed for hurried, unfamiliar, non-native-reading crowds; consistency mattered more than expressiveness.",
+      "relevance_clue": "Agent status needs a small fixed vocabulary readable at a glance, since the reader is usually mid-task and not studying the screen.",
+      "remembered_reaction_or_critique": "Held up as a design-standards triumph; later criticized as rigid, culturally narrow, and hostile to exceptions the manual never anticipated.",
+      "seed_id": "claude-graphic-visual-status-typography-1970s",
+      "suspected_source_or_example": "Graphic-design standards-manual tradition and transit design case studies.",
+      "uncertainty": "MEDIUM — I recall the genre confidently but merge multiple transit systems."
+    },
+    {
+      "coding_agent_bias": "I convert rooms into dashboards and dashboards into log tails, losing co-presence, sightlines, and the social reading of who is in charge.",
+      "enabling_technology_or_constraints": "Pre-digital communications, human plotters, and a building designed for sightlines, acoustics, and continuous occupancy.",
+      "era_or_date_range": "1940s–1960s",
+      "interaction_form": "Spatial co-presence: monitoring a shared artifact, verbal command, visible chain of authority.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "The war room / plotting room: a shared physical space where a wall-sized map holds the authoritative picture, junior staff physically move tokens, and commanders stand where they can see everything and each other.",
+      "primary_lineage": "architecture-spatial",
+      "problem_or_conditions": "Distributed reports arriving by phone and telex had to be fused into one situation picture fast enough to decide, with clear authority about who could commit action.",
+      "relevance_clue": "When several agents work at once, someone still needs a single place where the shared picture lives and where authority to commit is visible.",
+      "remembered_reaction_or_critique": "Remembered as extraordinarily effective at shared awareness, and criticized for fragility — one room, one picture, and the picture always lagging reality.",
+      "seed_id": "claude-architecture-spatial-war-room-1940s",
+      "suspected_source_or_example": "Military and organizational history books, museum reconstructions, documentary footage.",
+      "uncertainty": "MEDIUM — imagery is vivid, operational detail is reconstructed."
+    },
+    {
+      "coding_agent_bias": "I may treat plain text as automatically accessible, ignoring that a streaming log is a linearization nightmare of its own.",
+      "enabling_technology_or_constraints": "Accessibility APIs exposing an object tree, speech synthesis quality, and later live-region conventions and legal accessibility mandates.",
+      "era_or_date_range": "1990s–2000s",
+      "interaction_form": "Sequential keyboard navigation plus announced events; interruption cost is high because speech is serial.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Screen readers rendering a graphical desktop as a linear speech stream, with users navigating by headings, landmarks, and shortcuts, and hunting for what changed after an asynchronous update.",
+      "primary_lineage": "accessibility",
+      "problem_or_conditions": "GUIs assumed simultaneous visual scanning; a spoken serial channel has no periphery, so status that appeared 'somewhere on screen' simply vanished.",
+      "relevance_clue": "Background agents produce exactly the asynchronous change-events that serial-channel users lose; the ability to ask 'what changed since I last listened' is the real requirement.",
+      "remembered_reaction_or_critique": "Persistent critique that dynamic and auto-updating interfaces are hostile — either silent or so chatty that users disable announcements. Recalled as a durable complaint.",
+      "seed_id": "claude-accessibility-screen-reader-linearization-1990s",
+      "suspected_source_or_example": "Accessibility guideline documents and practitioner community writing.",
+      "uncertainty": "LOW-to-MEDIUM — the failure pattern is well attested; specifics of API generations blur."
+    },
+    {
+      "coding_agent_bias": "Tool-approval training pushes me toward per-call consent, which is the opposite of how humans actually delegate.",
+      "enabling_technology_or_constraints": "Social norms and role authority rather than technology; reputational accountability and reversibility of most decisions.",
+      "era_or_date_range": "undated (long-standing office and household practice)",
+      "interaction_form": "Standing delegation, exception-based escalation, periodic reporting rather than per-action approval.",
+      "observation_vs_inference": "INFERENCE",
+      "observed_example": "Delegation to a trusted intermediary — an executive assistant, a dispatcher, a household steward — who acts with standing authority within a bounded envelope and knows which decisions must be escalated and when interruption is warranted.",
+      "primary_lineage": "social-cultural-behavior",
+      "problem_or_conditions": "A principal cannot attend to everything; trust must be granted in advance, calibrated by the intermediary's demonstrated judgment about scope and timing.",
+      "relevance_clue": "Autonomy surfaces are really delegation envelopes: what may be done silently, what must be reported, what must be asked.",
+      "remembered_reaction_or_critique": "Folk wisdom that the good intermediary is judged by what they did not bother you with, and that the cost of over-escalation is losing the point of delegation. Reported as consensus, not documented finding.",
+      "seed_id": "claude-social-delegation-etiquette-undated",
+      "suspected_source_or_example": "Management literature and workplace folklore.",
+      "uncertainty": "MEDIUM — I am assembling a causal story from scattered social memory rather than recalling one source."
+    },
+    {
+      "coding_agent_bias": "This is my native habitat, so I over-generalize it and assume everyone reads logs; that is a strong distortion to correct for.",
+      "enabling_technology_or_constraints": "Process groups, signals, ttys, and pipelines — plus the cultural decision to make text the universal interchange.",
+      "era_or_date_range": "1970s–1980s Unix generation",
+      "interaction_form": "Typed command with composition, backgrounding, and post-hoc log reading as the evidence trail.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Shell job control: backgrounding with &, suspend and resume, jobs listings, and redirecting stdout to a file so a long task's evidence survives the terminal — plus the terror of a destructive flag typed one word wrong.",
+      "primary_lineage": "command-lines",
+      "problem_or_conditions": "One terminal, many tasks; work needed to outlive attention while remaining recoverable and inspectable after the fact.",
+      "relevance_clue": "Backgrounded jobs plus captured stdout is the oldest working answer to 'the work outlives my attention, prove what happened'.",
+      "remembered_reaction_or_critique": "Revered by experts for composability; criticized for unforgiving destructive defaults, invisible state, and near-total illegibility to newcomers.",
+      "seed_id": "claude-command-lines-job-control-1980s",
+      "suspected_source_or_example": "Unix documentation tradition and practitioner folklore.",
+      "uncertainty": "LOW — this is among my densest memories."
+    },
+    {
+      "coding_agent_bias": "CI-red/green training makes me treat every failure as an alarm, collapsing the status/alarm distinction that control rooms learned the hard way.",
+      "enabling_technology_or_constraints": "Distributed control systems, cheap alarm configuration (so everything got an alarm), and regulatory scrutiny after incidents.",
+      "era_or_date_range": "1980s–1990s process-control era",
+      "interaction_form": "Continuous monitoring with acknowledgment, escalation, and authoritative manual override.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Plant and utility control rooms with a wall overview plus operator consoles for detail, and an explicit distinction between alarms demanding action and status merely being true.",
+      "primary_lineage": "dashboards-control-rooms",
+      "problem_or_conditions": "During upsets, hundreds of alarms fired at once and operators could not tell which one was causal; 'alarm flood' made the safety system a hazard.",
+      "relevance_clue": "Many concurrent agents will generate the software equivalent of alarm flood unless status and demand-for-action are separated by design.",
+      "remembered_reaction_or_critique": "Widely recalled critique that alarm rationalization was necessary — an alarm should mean 'you must act now', and everything else belongs in status. Uncertain on standards names.",
+      "seed_id": "claude-dashboards-overview-first-alarm-1990s",
+      "suspected_source_or_example": "Process-safety human-factors literature and incident reviews.",
+      "uncertainty": "MEDIUM — the principle is solid; institutional detail is not."
+    },
+    {
+      "coding_agent_bias": "PR-review training makes me assume approval is asynchronous and comment-shaped, hiding the blocking, coercion-resistant variant.",
+      "enabling_technology_or_constraints": "Mechanical interlocks and key distance, plus formal procedure and audit; later mirrored in software as dual authorization and signed approvals.",
+      "era_or_date_range": "mid-20th century onward",
+      "interaction_form": "Blocking approval — work simply cannot proceed without a second explicit consent.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Two-person control: an irreversible action requires two independent authorized humans acting nearly simultaneously, with physical separation so one person cannot complete it alone.",
+      "primary_lineage": "approvals-notifications",
+      "problem_or_conditions": "Some actions cannot be undone and cannot be trusted to a single actor's judgment, error, or coercion.",
+      "relevance_clue": "Distinguishing silent consent, notify-and-proceed, and hard blocking consent is the core grammar of agent authority.",
+      "remembered_reaction_or_critique": "Respected as the canonical control for catastrophic actions; criticized in practice for ritualized rubber-stamping when the second approver lacks real context.",
+      "seed_id": "claude-approvals-two-person-rule-cold-war",
+      "suspected_source_or_example": "Security and safety procedure literature; later corporate change-management practice.",
+      "uncertainty": "MEDIUM — the concept is clear, and the rubber-stamp critique is my recalled generalization."
+    },
+    {
+      "coding_agent_bias": "I default to dumping full logs 'for transparency', which is disclosure without progression and just as unusable.",
+      "enabling_technology_or_constraints": "GUI toolkits with collapsible containers, mass-market software shipping to unknown skill levels, and support-cost pressure.",
+      "era_or_date_range": "1990s desktop-software generation",
+      "interaction_form": "Form-filling along a default path, with details on demand.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Wizards, 'Advanced…' buttons, and expandable detail panes: a short guided path for the common case with the full parameter surface deliberately folded away behind one gesture.",
+      "primary_lineage": "progressive-disclosure",
+      "problem_or_conditions": "Feature growth made dialogs unusable for novices while experts still needed every knob; hiding options was cheaper than splitting products.",
+      "relevance_clue": "An agent surface must default to a short summary yet keep the full trace one gesture away, because failure is precisely when the hidden layer is needed.",
+      "remembered_reaction_or_critique": "Praised for onboarding; criticized because hidden power became undiscoverable and the abstraction leaked exactly when something failed — the novice path gives no vocabulary for the error.",
+      "seed_id": "claude-progressive-disclosure-wizard-1990s",
+      "suspected_source_or_example": "Interface design guideline books and usability practitioner writing.",
+      "uncertainty": "LOW-to-MEDIUM — pattern and critique both well recalled."
+    },
+    {
+      "coding_agent_bias": "CI dashboards make me think monitoring means checking a status at the end, not staffing a continuous watch with handover.",
+      "enabling_technology_or_constraints": "Continuous telemetry downlink, dedicated voice loops, shift rotation, and rehearsed procedure with pre-agreed abort criteria.",
+      "era_or_date_range": "1960s–1970s",
+      "interaction_form": "Continuous monitoring plus discipline-scoped assent, escalating to a single decision-maker.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Mission control consoles: each specialist owns a narrow telemetry slice for a mission lasting days, calls go/no-go on their own domain, and a flight director holds the single authority to act on the fused picture.",
+      "primary_lineage": "long-running-monitoring",
+      "problem_or_conditions": "The work outlives any one shift and cannot be paused; the vehicle keeps running whether or not anyone is watching, so watching had to be structured, staffed, and handed over.",
+      "relevance_clue": "Handover — telling the next watcher what happened while they were away — is the unsolved part of supervising work that outlives a session.",
+      "remembered_reaction_or_critique": "Remembered as the gold standard for supervising autonomous-ish systems; the operational critique is the crushing staffing cost and dependence on rehearsal.",
+      "seed_id": "claude-long-running-monitoring-mission-control-1960s",
+      "suspected_source_or_example": "Spaceflight histories, memoirs, and documentary footage.",
+      "uncertainty": "MEDIUM — vivid but partly cinematic memory."
+    },
+    {
+      "coding_agent_bias": "Merge conflicts and locks are my instinctive metaphor, which reduces coordination to write contention and drops the social readback that makes it safe.",
+      "enabling_technology_or_constraints": "Radar plus radio, strict phraseology, sector geometry designed for workload limits, and heavy regulation of staffing and training.",
+      "era_or_date_range": "1960s–1990s",
+      "interaction_form": "Command with mandatory readback, explicit ownership transfer, and shared artifacts as the coordination substrate.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Air traffic control sectors: each controller owns aircraft in a volume, hands off by explicit verbal transfer with readback, and uses strips or tags as the shared externalized state of who holds what.",
+      "primary_lineage": "multi-agent-coordination",
+      "problem_or_conditions": "Many simultaneous moving actors, no single actor able to hold the whole picture, and ambiguity about ownership being lethal.",
+      "relevance_clue": "Concurrent agents need explicit ownership, explicit handoff, and confirmation-by-readback rather than assumed shared understanding.",
+      "remembered_reaction_or_critique": "Praised for safety record; recalled critiques concern workload saturation and the loss of a tactile shared artifact when paper strips were replaced by screens.",
+      "seed_id": "claude-multi-agent-air-traffic-handoff-1970s",
+      "suspected_source_or_example": "Human-factors and CSCW field studies of control work.",
+      "uncertainty": "MEDIUM — the strip-study genre is well remembered; findings are paraphrased loosely."
+    },
+    {
+      "coding_agent_bias": "Diff-and-test culture makes me equate explanation with 'show the change plus a passing test', which is evidence of outcome, not of reasoning.",
+      "enabling_technology_or_constraints": "Rule-based symbolic architectures whose inference chain was literally inspectable — an explanation was a trace, not a reconstruction.",
+      "era_or_date_range": "1980s",
+      "interaction_form": "Question-and-answer consultation with on-demand justification and expert override.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Expert systems with an explanation facility: the user could ask WHY the system was asking, and HOW it reached a conclusion, and receive the chain of rules that fired.",
+      "primary_lineage": "trust-explainability",
+      "problem_or_conditions": "Domain professionals would not act on a machine recommendation in a consequential setting without being able to inspect and challenge the reasoning.",
+      "relevance_clue": "An audit trail that is a faithful trace earns trust differently from a persuasive narrative, and the difference matters most after a surprise.",
+      "remembered_reaction_or_critique": "Remembered as a genuine achievement that nonetheless underdelivered: rule traces were verbose, brittle at knowledge-base edges, and did not match how experts wanted to be convinced. Contributed to disillusionment.",
+      "seed_id": "claude-trust-explainability-expert-systems-1980s",
+      "suspected_source_or_example": "Classic AI textbooks and retrospective accounts of the expert-systems era.",
+      "uncertainty": "MEDIUM — the era's shape is clear; I merge several named systems."
+    },
+    {
+      "coding_agent_bias": "I assume a terminal-sized viewport and full text scrollback, which makes me put far too much on a glance surface.",
+      "enabling_technology_or_constraints": "Paired-device Bluetooth, shared account state and cloud session sync, tiny display area, and glance-duration attention budgets.",
+      "era_or_date_range": "2010s",
+      "interaction_form": "Notification-as-remote-control: acknowledge, choose from a short set, or escalate to the big screen.",
+      "observation_vs_inference": "OBSERVATION",
+      "observed_example": "Smartwatch and companion-device patterns: the small device shows a glanceable summary and offers two or three canned responses, while anything longer explicitly punts the user to the larger screen; handoff resumes the same task across devices.",
+      "primary_lineage": "desktop-mobile-continuity",
+      "problem_or_conditions": "A wrist or lock screen cannot host authoring or deep inspection, but it is the surface actually present when something needs a fast yes/no.",
+      "relevance_clue": "A phone-sized surface over autonomous work is plausibly a decision-and-deferral device rather than a shrunken workstation.",
+      "remembered_reaction_or_critique": "Early backlash about wrist notification overload; the design lesson recalled is that the small screen should decide and defer, not display everything. Confidence moderate.",
+      "seed_id": "claude-desktop-mobile-continuity-watch-companion-2010s",
+      "suspected_source_or_example": "Platform design guidelines and mainstream product reviews of that generation.",
+      "uncertainty": "MEDIUM — pattern is well recalled, critique intensity is my generalization."
+    }
+  ],
+  "uncertainty_summary": {
+    "by_level": {
+      "HIGH": [],
+      "LOW": [
+        "claude-command-lines-job-control-1980s",
+        "claude-hci-direct-manipulation-1980s"
+      ],
+      "LOW_TO_MEDIUM": [
+        "claude-industrial-design-cockpit-mode-error-1980s",
+        "claude-accessibility-screen-reader-linearization-1990s",
+        "claude-progressive-disclosure-wizard-1990s"
+      ],
+      "MEDIUM": [
+        "claude-computing-interfaces-timesharing-1960s",
+        "claude-mobile-messaging-sms-constraint-1990s",
+        "claude-technology-evolution-push-battery-2000s",
+        "claude-graphic-visual-status-typography-1970s",
+        "claude-architecture-spatial-war-room-1940s",
+        "claude-social-delegation-etiquette-undated",
+        "claude-dashboards-overview-first-alarm-1990s",
+        "claude-approvals-two-person-rule-cold-war",
+        "claude-long-running-monitoring-mission-control-1960s",
+        "claude-multi-agent-air-traffic-handoff-1970s",
+        "claude-trust-explainability-expert-systems-1980s",
+        "claude-desktop-mobile-continuity-watch-companion-2010s"
+      ]
+    },
+    "inference_flagged_seeds": [
+      "claude-social-delegation-etiquette-undated"
+    ],
+    "no_citations_asserted": true,
+    "overall": "MEDIUM. Forms and critiques are recalled with reasonable confidence; attributions, dates, and the intensity of historical reactions are the weakest parts and are deliberately kept coarse."
+  },
+  "vendor": "CLAUDE"
+}

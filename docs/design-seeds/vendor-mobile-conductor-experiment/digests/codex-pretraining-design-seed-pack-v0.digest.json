@@ -1,0 +1,12 @@
+{
+  "pack_id": "codex-pretraining-design-seed-pack-v0",
+  "vendor": "CODEX",
+  "elicitation_kind": "MODEL_RECALL",
+  "frozen_at": "2026-08-30T08:38:07.237102Z",
+  "worker_id": "universe-runtime-worker:e49f856588454d47a26ea7f01b9ce285",
+  "worker_run_ref": "universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+  "result_receipt_ref": "codex-app-server:01a051cb-9596-7b82-a459-fa0d164dcdb7:universe-runtime-host:8a1dc2c63c0a4266a7cb93714ec05d23",
+  "raw_envelope_sha256": "2b7448190730ebcf93171e8ee5d8860bb8e97398de9854ebf614624cca2d002a",
+  "frozen_pack_sha256": "45bfef68393f2534af816357886c34972ab9808280c2bb15b15e5efa4a018f7a",
+  "seed_count": 17
+}
