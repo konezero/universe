@@ -156,6 +156,42 @@ class FakeReconnectionRegistry:
 
 
 class TerminalHostTests(unittest.TestCase):
+    def test_reused_new_host_relaunches_provider_command(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["/c", "echo", "RELAUNCH_PROVIDER"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            first = TerminalHost(reconnection_registry=registry)
+            first.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-relaunch-provider",
+                provider="CLAUDE",
+            )
+            second = TerminalHost(reconnection_registry=registry)
+            second.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-relaunch-provider",
+                provider="CLAUDE",
+            )
+
+        self.assertEqual(
+            [
+                b"\x1b[1;1Rcmd.exe /c echo RELAUNCH_PROVIDER\r\n",
+                b"\x1b[1;1Rcmd.exe /c echo RELAUNCH_PROVIDER\r\n",
+            ],
+            registry.clients["anchor-relaunch-provider"].executions,
+        )
+
     def test_claude_development_channel_prompt_matches_real_screen_forms(self) -> None:
         ordinary = b"Yes, I am using this for local development"
         cursor_positioned = (

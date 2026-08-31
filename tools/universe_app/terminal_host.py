@@ -1457,7 +1457,10 @@ class TerminalHost:
         with self._lock:
             self._sessions[terminal_id] = session
         if isinstance(session.backend, ReconnectionPty):
-            if not session.backend.reused_existing:
+            if (
+                not session.backend.reused_existing
+                or session.protocol_state in {"NEW", "FAILED"}
+            ):
                 try:
                     session.backend.execute(
                         b"\x1b[1;1R"
