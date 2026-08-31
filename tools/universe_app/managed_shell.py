@@ -24,6 +24,7 @@ currentness are decided elsewhere and are never derived from these states.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -479,6 +480,50 @@ def managed_provider_command_line(
         # transparent console-to-pipe bridge inside the one managed cmd.
         joined = f"more | {joined}"
     return joined
+
+
+def managed_host_provider_command(
+    command: Sequence[str], *, pipe_console_input: bool = False
+) -> tuple[str, dict[str, str]]:
+    """Build a command written into an already-running Host-owned cmd shell.
+
+    ``cmd /s`` cannot safely carry literal quotes, so the launch-time builder
+    above remains fail-closed. A Rust Host writes this command only after its
+    persistent cmd shell exists. Arguments that cmd could expand or reinterpret
+    are placed in Host-owned environment slots as an already encoded Windows
+    argv token and inserted with delayed expansion. Expansion happens after cmd
+    has parsed operators, while the child still receives the exact
+    CommandLineToArgvW representation.
+    """
+
+    parts = [str(part) for part in command if str(part).strip()]
+    if not parts:
+        raise ManagedShellError(
+            "MANAGED_SHELL_COMMAND_REQUIRED", "a CLI command is required"
+        )
+    rendered: list[str] = []
+    environment: dict[str, str] = {}
+    for index, part in enumerate(parts):
+        for character in _FORBIDDEN_ARGUMENT_CHARACTERS:
+            if character in part:
+                raise ManagedShellError(
+                    "MANAGED_SHELL_ARGUMENT_UNSAFE",
+                    "argument contains a character that cannot cross a command line",
+                )
+        if (
+            '"' in part
+            or _CMD_EXPANSION_CHARACTER in part
+            or _CMD_DELAYED_EXPANSION_CHARACTER in part
+        ):
+            name = f"UNIVERSE_PROVIDER_ARGUMENT_{index:04d}"
+            environment[name] = subprocess.list2cmdline([part])
+            rendered.append(f"!{name}!")
+        else:
+            rendered.append(quote_windows_argument(part))
+    joined = " ".join(rendered)
+    if pipe_console_input:
+        joined = f"more | {joined}"
+    return joined, environment
 
 
 def managed_shell_cmdline(

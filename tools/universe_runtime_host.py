@@ -283,15 +283,6 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
             "READ_ONLY_SCOPE_REQUIRED",
             "Runtime Host accepts read-only Task Frame turns only",
         )
-    max_turns = value.get("max_turns", 1)
-    if (
-        not isinstance(max_turns, int)
-        or isinstance(max_turns, bool)
-        or not 1 <= max_turns <= 4
-    ):
-        raise RuntimeHostError(
-            "RUNTIME_WORKER_REQUEST_INVALID", "max_turns must be 1..4"
-        )
     result_mode = _required_text(
         value.get("result_mode", "REDACTED"), "result_mode"
     ).upper()
@@ -316,7 +307,6 @@ def normalize_read_only_request(value: Mapping[str, Any]) -> dict[str, Any]:
         "mutation_scope": {"operations": [], "targets": []},
         "context_pack": _mapping(value.get("context_pack"), "context_pack"),
         "output_contract": _mapping(value.get("output_contract"), "output_contract"),
-        "max_turns": max_turns,
         "result_mode": result_mode,
     }
 
@@ -335,7 +325,6 @@ def redacted_invocation_record(value: Mapping[str, Any]) -> dict[str, Any]:
         "mutation_scope": {"operations": [], "targets": []},
         "context_pack_digest": _digest(request["context_pack"]),
         "output_contract_digest": _digest(request["output_contract"]),
-        "max_turns": request["max_turns"],
         "result_mode": request["result_mode"],
     }
     record["request_digest"] = _digest(record)
@@ -645,7 +634,6 @@ class UniverseRuntimeHost:
                         "context": refinement_request["context"],
                     },
                     "output_contract": refinement_request["output_contract"],
-                    "max_turns": 1,
                     "result_mode": "STRUCTURED_JSON",
                 }
             )
@@ -956,7 +944,6 @@ class UniverseRuntimeHost:
                         ],
                     },
                     "output_contract": output_contract,
-                    "max_turns": 1,
                     "result_mode": "STRUCTURED_JSON",
                 }
             )

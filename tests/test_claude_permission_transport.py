@@ -575,7 +575,7 @@ class PendingPermissionShutdownTests(unittest.TestCase):
             system_prompt="probe",
             session_id=None,
             session_observer=lambda _s: None,
-            turn_timeout_seconds=10.0,
+            turn_timeout_seconds=None,
             process_factory=HangingProcess,
         )
         errors: list[Exception] = []

@@ -4,6 +4,7 @@ import json
 import queue
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
@@ -143,6 +144,10 @@ class FakeJsonRpcTransport:
 
     def close(self) -> None:
         self.closed = True
+
+    @property
+    def is_closed(self) -> bool:
+        return self.closed
 
 
 class AgentSessionGatewayTests(unittest.TestCase):
@@ -373,6 +378,12 @@ class AgentSessionGatewayTests(unittest.TestCase):
             "Read,Glob,Grep",
             requests[0].arguments[requests[0].arguments.index("--tools") + 1],
         )
+        self.assertEqual(
+            "default",
+            requests[0].arguments[
+                requests[0].arguments.index("--permission-mode") + 1
+            ],
+        )
 
     def test_claude_ephemeral_session_disables_tools_and_persistence(self) -> None:
         requests = []
@@ -417,6 +428,9 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("default", arguments[arguments.index("--model") + 1])
         self.assertEqual("System", arguments[arguments.index("--system-prompt") + 1])
         self.assertEqual("", arguments[arguments.index("--tools") + 1])
+        self.assertEqual(
+            "default", arguments[arguments.index("--permission-mode") + 1]
+        )
         self.assertEqual([], sessions)
 
     def test_claude_ephemeral_review_can_enable_read_only_tools(self) -> None:
@@ -452,6 +466,38 @@ class AgentSessionGatewayTests(unittest.TestCase):
         arguments = requests[0].arguments
         self.assertIn("--no-session-persistence", arguments)
         self.assertEqual("Read,Glob,Grep", arguments[arguments.index("--tools") + 1])
+
+    def test_claude_can_omit_provider_loop_turn_cap(self) -> None:
+        requests = []
+
+        def runner(request):
+            requests.append(request)
+            return NativeCliResult(
+                contract="test",
+                status="COMPLETED",
+                return_code=0,
+                duration_ms=1,
+                stdout=json.dumps({"result": "Completed", "is_error": False}),
+                stderr="",
+                stdout_truncated=False,
+                stderr_truncated=False,
+            )
+
+        session = ClaudeCodeSession(
+            executable=self.root / "claude.exe",
+            cwd=self.root,
+            environment={},
+            system_prompt="Task Frame",
+            session_id=None,
+            permission_requester=lambda _request: None,
+            session_observer=lambda _session_id: None,
+            ephemeral=True,
+            max_turns=None,
+            native_runner=runner,
+        )
+        session.prompt("Implement", lambda _delta: None)
+
+        self.assertNotIn("--max-turns", requests[0].arguments)
 
     def test_claude_structured_session_binds_schema_and_uses_structured_output(
         self,
@@ -1053,6 +1099,66 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertFalse(start["ephemeral"])
         self.assertTrue(transport.closed)
 
+    def test_codex_file_change_permission_includes_observed_patch_paths(self) -> None:
+        selected: list[dict[str, Any]] = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id=None,
+                permission_requester=lambda request: (
+                    selected.append(dict(request)) or "accept"
+                ),
+                session_observer=lambda _session_id: None,
+            )
+            session._handle_notification(
+                "item/fileChange/patchUpdated",
+                {
+                    "threadId": session.session_id,
+                    "turnId": "turn-file",
+                    "itemId": "item-file",
+                    "changes": [
+                        {
+                            "path": "tools/example.py",
+                            "kind": {"type": "update"},
+                            "diff": "@@",
+                        },
+                        {
+                            "path": "tests/new_example.py",
+                            "kind": {"type": "add"},
+                            "diff": "@@",
+                        },
+                    ],
+                },
+            )
+            decision = session._handle_request(
+                "item/fileChange/requestApproval",
+                {
+                    "threadId": session.session_id,
+                    "turnId": "turn-file",
+                    "itemId": "item-file",
+                    "startedAtMs": 1,
+                    "reason": "bounded patch",
+                    "grantRoot": None,
+                },
+            )
+            session.close()
+
+        self.assertEqual({"decision": "accept"}, decision)
+        self.assertEqual(str(self.root), selected[0]["tool_call"]["cwd"])
+        self.assertEqual(
+            [
+                {"path": "tools/example.py", "type": "update"},
+                {"path": "tests/new_example.py", "type": "add"},
+            ],
+            selected[0]["tool_call"]["fileChanges"],
+        )
+
     def test_codex_new_thread_uses_developer_bootstrap_and_passes_effort(self) -> None:
         with patch(
             "agent_session_gateway.JsonRpcStdioProcess",
@@ -1339,6 +1445,91 @@ class AgentSessionGatewayTests(unittest.TestCase):
 
         self.assertEqual("Recovered after bounded extension", answer)
         self.assertEqual(2, SlowCompletedTurnTransport.reconcile_count)
+
+    def test_codex_unbounded_turn_waits_for_completion_without_reconciliation(self) -> None:
+        class DelayedCompletedTurnTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "turn/start":
+                    self.requests.append((method, dict(params)))
+                    turn_id = "codex-turn-unbounded"
+
+                    def complete() -> None:
+                        self.notification_handler(
+                            "item/completed",
+                            {
+                                "threadId": params["threadId"],
+                                "turnId": turn_id,
+                                "item": {
+                                    "id": "agent-message-unbounded",
+                                    "type": "agentMessage",
+                                    "text": "Completed without a timer",
+                                },
+                            },
+                        )
+                        self.notification_handler(
+                            "turn/completed",
+                            {
+                                "threadId": params["threadId"],
+                                "turn": {"id": turn_id, "status": "completed"},
+                            },
+                        )
+
+                    threading.Timer(0.02, complete).start()
+                    return {"turn": {"id": turn_id}}
+                if method == "thread/turns/list":
+                    raise AssertionError("unbounded turns must not reconcile on a timer")
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            DelayedCompletedTurnTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-thread-existing",
+                response_timeout_seconds=None,
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            answer = session.prompt("Question", lambda _delta: None)
+            session.close()
+
+        methods = [method for method, _params in FakeJsonRpcTransport.instances[0].requests]
+        self.assertEqual("Completed without a timer", answer)
+        self.assertNotIn("thread/turns/list", methods)
+
+    def test_codex_unbounded_turn_stops_when_transport_closes(self) -> None:
+        class ClosedTurnTransport(FakeJsonRpcTransport):
+            def request(self, method, params, *, timeout_seconds=300):
+                if method == "turn/start":
+                    self.requests.append((method, dict(params)))
+                    threading.Timer(
+                        0.02,
+                        lambda: setattr(self, "closed", True),
+                    ).start()
+                    return {"turn": {"id": "codex-turn-closed"}}
+                return super().request(method, params, timeout_seconds=timeout_seconds)
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", ClosedTurnTransport):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="codex-thread-existing",
+                response_timeout_seconds=None,
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+            with self.assertRaisesRegex(
+                AgentSessionError,
+                "CODEX_TURN_TRANSPORT_CLOSED",
+            ):
+                session.prompt("Question", lambda _delta: None)
+            session.close()
 
     def test_codex_ephemeral_session_never_resumes_or_persists_thread(self) -> None:
         sessions: list[str] = []

@@ -43,7 +43,6 @@ from project_master_host import (  # noqa: E402
     ResidentRoomParticipantHostManager,
     _default_state_db,
     _project_master_system_prompt,
-    _task_frame_child_max_turns,
 )
 from windows_native_cli import NativeCliResult  # noqa: E402
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
@@ -482,6 +481,80 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertIn("PROVIDER_SESSION_ATTACHED", event_types)
         self.assertEqual("codex-1", state.session_ref_for("CODEX"))
         self.assertIsNone(state.session_ref_for("GROK"))
+
+    def test_owned_supervisor_session_replaces_stale_disconnected_coordinate(
+        self,
+    ) -> None:
+        supervisor = SessionSupervisorStore(self.root / "owned-session.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "owned-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        original = state.ensure_supervisor_session(
+            "CLAUDE",
+            owner_key="TASK_FRAME_BOSS",
+        )
+        self.assertIsNotNone(original)
+        supervisor.register_session(
+            {
+                "session_id": original["session_id"],
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": None,
+                "state": "DISCONNECTED",
+                "currentness": "STALE",
+                "activity_state": "DETACHED",
+            }
+        )
+
+        replacement = state.ensure_supervisor_session(
+            "CLAUDE",
+            owner_key="TASK_FRAME_BOSS",
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(original["session_id"], replacement["session_id"])
+        self.assertNotEqual(
+            original["session_anchor_ref"], replacement["session_anchor_ref"]
+        )
+        self.assertEqual("REGISTERED", replacement["state"])
+        self.assertEqual("UNKNOWN", replacement["currentness"])
+
+    def test_project_master_owner_preserves_stable_session_lineage(self) -> None:
+        supervisor = SessionSupervisorStore(self.root / "master-owner.sqlite3")
+        state = ProjectMasterSessionStore(
+            self.root / "master-owner-project.sqlite",
+            "universe",
+            session_supervisor=supervisor,
+            requested_mode="MASTER",
+        )
+        original = state.ensure_supervisor_session(
+            "CLAUDE",
+            owner_key="PROJECT_MASTER",
+        )
+        self.assertIsNotNone(original)
+        supervisor.register_session(
+            {
+                "session_id": original["session_id"],
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": None,
+                "state": "DISCONNECTED",
+                "currentness": "STALE",
+            }
+        )
+
+        reused = state.ensure_supervisor_session(
+            "CLAUDE",
+            owner_key="PROJECT_MASTER",
+        )
+
+        self.assertEqual(original["session_id"], reused["session_id"])
+        self.assertEqual(original["session_anchor_ref"], reused["session_anchor_ref"])
 
     def test_provider_binding_retries_after_host_activity_advances_row(self) -> None:
         supervisor = SessionSupervisorStore(self.root / "provider-bind-race.sqlite3")
@@ -4051,6 +4124,8 @@ class ProjectMasterHostTests(unittest.TestCase):
             task_frame_id="gcs-primary-001",
         )
         self.assertEqual(["boss", "implement"], [call["turn_id"] for call in dispatches])
+        self.assertNotIn("max_turns", dispatches[0])
+        self.assertNotIn("max_turns", dispatches[1])
         self.assertTrue(dispatches[0]["defer_terminal_result"])
         self.assertEqual("original-boss-worker-001", dispatches[1]["invoker_actor_ref"])
         self.assertEqual("BOUNDED", dispatches[1]["repository_write_scope"])
@@ -4169,9 +4244,103 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("work_receipt", canonical[0])
         self.assertEqual([], canonical[0]["mutation_scope"]["operations"])
 
-    def test_read_only_worker_gets_review_budget_without_write_authority(self) -> None:
-        self.assertEqual(16, _task_frame_child_max_turns(write_enabled=False))
-        self.assertEqual(1, _task_frame_child_max_turns(write_enabled=True))
+    def test_task_frame_turns_persist_server_resolved_worker_binding(self) -> None:
+        requests: list[dict[str, object]] = []
+        runtime_cli = (
+            self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        )
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+
+        def resolve(request):
+            requests.append(dict(request))
+            return {
+                "status": "WORKER_BINDING_RESOLVED",
+                "snapshot": {
+                    "schema": "universe.worker-binding-snapshot.v1",
+                    "profile_id": "worker-binding-implementer",
+                    "scope_kind": "PROJECT",
+                    "scope_id": "GCS",
+                    "worker_role": "IMPLEMENTER",
+                    "task_type": "*",
+                    "provider": "CLAUDE",
+                    "model_ref": "claude-opus-5",
+                    "effort": "HIGH",
+                    "skill_refs": [],
+                    "enabled": True,
+                    "revision": 3,
+                    "updated_at": "2026-08-31T00:00:00Z",
+                    "binding_digest": "a" * 64,
+                },
+            }
+
+        coordinator = ProjectModeCoordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+            worker_dispatcher=object(),
+            worker_binding_resolver=resolve,
+        )
+        bound = coordinator._bind_task_frame_turns(
+            [
+                {
+                    "turn_id": "implement",
+                    "role": "IMPLEMENTER",
+                    "worker_slot_ref": "implementation-worker",
+                    "provider": "CODEX",
+                    "model": "old-model",
+                    "reasoning_effort": "low",
+                }
+            ]
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "project_id": "GCS",
+                    "worker_role": "IMPLEMENTER",
+                    "task_type": "*",
+                }
+            ],
+            requests,
+        )
+        self.assertEqual("CLAUDE", bound[0]["provider"])
+        self.assertEqual("claude-opus-5", bound[0]["model"])
+        self.assertEqual("high", bound[0]["reasoning_effort"])
+        self.assertEqual(
+            "a" * 64,
+            bound[0]["worker_binding_snapshot"]["binding_digest"],
+        )
+        runtime_turn = coordinator._runtime_execution_turns(bound)[0]
+        self.assertNotIn("worker_binding_snapshot", runtime_turn)
+
+    def test_default_coordinator_forwards_terminal_and_binding_resolvers(self) -> None:
+        terminal_host = object()
+        runtime_cli = (
+            self.root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+        )
+        runtime_cli.parent.mkdir(parents=True, exist_ok=True)
+        runtime_cli.write_text("# test runtime\n", encoding="utf-8")
+
+        def resolve(_request):
+            return {"status": "WORKER_BINDING_RESOLVED", "snapshot": {}}
+
+        manager = ResidentProjectMasterHostManager(
+            universe_endpoint="http://127.0.0.1:41992",
+            bridge_registrar=lambda _project_id, _binding: ({}, True),
+            terminal_host=terminal_host,
+            worker_binding_resolver=resolve,
+        )
+        coordinator = manager._default_coordinator(
+            self.root,
+            "GCS",
+            "codex:session-001",
+        )
+
+        self.assertIs(terminal_host, coordinator.terminal_host)
+        self.assertIs(resolve, coordinator.worker_binding_resolver)
+        self.assertIs(terminal_host, coordinator.worker_dispatcher.terminal_host)
+        self.assertEqual("GCS", coordinator.worker_dispatcher.project_id)
 
     def test_boss_allocation_contract_binds_exact_declared_identities(self) -> None:
         turns = [

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -55,6 +56,70 @@ API_SCHEMA = "universe.pty-supervisor-api.v1"
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class SupervisorInstanceLock:
+    """Keep one PTY Supervisor per discovery state file.
+
+    The Rust Host remains the session and output owner.  This lock only stops
+    concurrent Supervisor starters from both reconciling the same live Hosts
+    and repeatedly replacing their single attached output reader.
+    """
+
+    def __init__(self, state_path: Path) -> None:
+        identity = str(state_path.expanduser().resolve()).casefold().encode("utf-8")
+        self.name = "Local\\UniversePtySupervisor-" + hashlib.sha256(identity).hexdigest()
+        self.path = state_path.with_suffix(state_path.suffix + ".lock")
+        self._handle: Any = None
+
+    def acquire(self) -> bool:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_wchar_p,
+            )
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            handle = kernel32.CreateMutexW(None, True, self.name)
+            if not handle:
+                raise OSError("could not create PTY Supervisor instance mutex")
+            if int(kernel32.GetLastError()) == 183:  # ERROR_ALREADY_EXISTS
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+                return False
+            self._handle = handle
+            return True
+
+        import fcntl
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+b")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.ReleaseMutex(ctypes.c_void_p(handle))
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return
+
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def reconnection_registry_from_environment(
@@ -537,6 +602,17 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            except Exception as error:  # noqa: BLE001 - keep local transport diagnosable
+                self._send(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": "PTY_SUPERVISOR_CREATE_FAILED",
+                        "detail": f"{type(error).__name__}:{error}",
+                    },
+                )
+                return
             self._send(
                 HTTPStatus.CREATED,
                 {
@@ -700,48 +776,56 @@ class Server(ThreadingHTTPServer):
 
 def main() -> int:
     state_path = default_state_path()
-    token = secrets.token_urlsafe(24)
-    audit_database_path = state_path.parent / "universe.sqlite3"
-    reconnection_registry = reconnection_registry_from_environment(state_path)
-    terminal_host = TerminalHost(
-        audit_database_path=audit_database_path,
-        reconnection_registry=reconnection_registry,
-    )
-    server = Server(token, host=terminal_host)
-    host, port = server.server_address[:2]
-    endpoint = f"http://{host}:{port}"
-    _write_json_atomic(
-        state_path,
-        {
-            "schema": SCHEMA,
-            "status": "READY",
-            "pid": os.getpid(),
-            "started_at": server.started_at,
-            "endpoint": endpoint,
-            "token": token,
-        },
-    )
-    terminal_host.record_audit_event(
-        "SUPERVISOR_STARTED",
-        context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
-        details={
-            "pid": os.getpid(),
-            "endpoint": endpoint,
-            "reconnection_host_enabled": reconnection_registry is not None,
-        },
-    )
+    instance_lock = SupervisorInstanceLock(state_path)
+    if not instance_lock.acquire():
+        return 0
+    server: Server | None = None
+    terminal_host: TerminalHost | None = None
     try:
+        token = secrets.token_urlsafe(24)
+        audit_database_path = state_path.parent / "universe.sqlite3"
+        reconnection_registry = reconnection_registry_from_environment(state_path)
+        terminal_host = TerminalHost(
+            audit_database_path=audit_database_path,
+            reconnection_registry=reconnection_registry,
+        )
+        server = Server(token, host=terminal_host)
+        host, port = server.server_address[:2]
+        endpoint = f"http://{host}:{port}"
+        _write_json_atomic(
+            state_path,
+            {
+                "schema": SCHEMA,
+                "status": "READY",
+                "pid": os.getpid(),
+                "started_at": server.started_at,
+                "endpoint": endpoint,
+                "token": token,
+            },
+        )
+        terminal_host.record_audit_event(
+            "SUPERVISOR_STARTED",
+            context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+            details={
+                "pid": os.getpid(),
+                "endpoint": endpoint,
+                "reconnection_host_enabled": reconnection_registry is not None,
+            },
+        )
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        terminal_host.record_audit_event(
-            "SUPERVISOR_STOPPING",
-            context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
-            details={"pid": os.getpid()},
-        )
-        server.supervisor.close()
-        server.server_close()
+        if terminal_host is not None:
+            terminal_host.record_audit_event(
+                "SUPERVISOR_STOPPING",
+                context={"source": "PTY_SUPERVISOR", "access_surface": "SUPERVISOR"},
+                details={"pid": os.getpid()},
+            )
+        if server is not None:
+            server.supervisor.close()
+            server.server_close()
+        instance_lock.close()
     return 0
 
 

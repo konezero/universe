@@ -79,6 +79,15 @@ PROJECT_MASTER_HOST_SCHEMA = "universe.project-master-live-host.v1"
 PROJECT_MASTER_SESSION_SCHEMA = "universe.project-master-session.v1"
 PROVIDER_SESSION_CONNECTION_SCHEMA = "universe.provider-session-connection.v1"
 SUPPORTED_PROVIDERS = frozenset({"GROK", "CODEX", "CLAUDE"})
+TASK_FRAME_WORKER_BINDING_ROLES = {
+    "BOSS": "REVIEWER",
+    "IMPLEMENTER": "IMPLEMENTER",
+    "SECURITY_REVIEWER": "REVIEWER",
+    "QA_REVIEWER": "QA",
+    "SUB_REVIEWER": "REVIEWER",
+    "SCOUT": "SCOUT",
+    "ROUTINE": "ROUTINE",
+}
 TASK_PROPOSAL_DATABASE_RELATIVE_PATH = Path(
     ".ai/runtime/task_frames/task-proposals.sqlite3"
 )
@@ -88,20 +97,10 @@ TASK_FRAME_PROFILE_RELATIVE_PATH = Path(
 TASK_FRAME_INSTRUCTION_PROFILE_RELATIVE_PATH = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json"
 )
-WRITE_ENABLED_WORKER_MAX_TURNS = 1
-READ_ONLY_WORKER_MAX_TURNS = 16
 
 
 class ProjectMasterHostError(RuntimeError):
     pass
-
-
-def _task_frame_child_max_turns(*, write_enabled: bool) -> int:
-    return (
-        WRITE_ENABLED_WORKER_MAX_TURNS
-        if write_enabled
-        else READ_ONLY_WORKER_MAX_TURNS
-    )
 
 
 _WindowsKillOnCloseJob = WindowsKillOnCloseJob
@@ -144,6 +143,7 @@ NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 BridgeRegistrar = Callable[[str, Mapping[str, Any]], tuple[dict[str, Any], bool]]
 SourceBindingResolver = Callable[[Path], Mapping[str, Any]]
 GovernanceContextResolver = Callable[[str], Mapping[str, Any]]
+WorkerBindingResolver = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 RetrievalContextResolver = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 NativeRoomObserver = Callable[[Mapping[str, Any]], None]
 RoomPermissionObserver = Callable[
@@ -175,6 +175,8 @@ class ProjectModeCoordinator:
         source_binding_resolver: SourceBindingResolver | None = None,
         session_supervisor: SessionSupervisorStore | None = None,
         worker_dispatcher: RuntimeWorkerDispatcher | None = None,
+        terminal_host: Any | None = None,
+        worker_binding_resolver: WorkerBindingResolver | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve(strict=True)
         self.project_id = _text(project_id, "project_id")
@@ -185,6 +187,9 @@ class ProjectModeCoordinator:
         self.native_runner = native_runner
         self.source_binding_resolver = source_binding_resolver
         self.session_supervisor = session_supervisor
+        self.terminal_host = terminal_host
+        self.worker_binding_resolver = worker_binding_resolver
+        self._worker_session_store: ProjectMasterSessionStore | None = None
         self.runtime_cli = (
             self.project_root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
         )
@@ -206,11 +211,60 @@ class ProjectModeCoordinator:
             failure_evidence_store=WorkerFailureEvidenceStore(
                 _default_state_db(self.project_id)
             ),
-            # Source-backed implementation turns routinely exceed the generic
-            # 90 second adapter probe while inspecting and validating a bounded
-            # diff. Keep the limit finite but align it with read-only workers.
+            # This is a provider transport watchdog, not a task-completion or
+            # work-size estimate. Task Frame completion comes from its terminal
+            # structured result rather than a semantic turn budget.
             worker_response_timeout_seconds=240,
+            terminal_host=self.terminal_host,
+            project_id=self.project_id,
+            mode=self.requested_mode,
+            worker_host_coordinate_resolver=self._worker_host_coordinate,
         )
+
+    def _worker_host_coordinate(
+        self,
+        provider: str,
+        task_frame_id: str,
+        turn_id: str,
+    ) -> Mapping[str, Any]:
+        if self.terminal_host is None:
+            return {}
+        if self.session_supervisor is None:
+            raise ProjectMasterHostError("TASK_FRAME_WORKER_SUPERVISOR_UNAVAILABLE")
+        if self._worker_session_store is None:
+            self._worker_session_store = ProjectMasterSessionStore(
+                _default_state_db(self.project_id),
+                self.project_id,
+                session_supervisor=self.session_supervisor,
+                requested_mode=self.requested_mode,
+            )
+        owner_material = json.dumps(
+            {
+                "task_frame_id": _text(task_frame_id, "task_frame_id"),
+                "turn_id": _text(turn_id, "turn_id"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        owner_key = (
+            "TASK_FRAME_"
+            + hashlib.sha256(owner_material.encode("utf-8")).hexdigest()[:24].upper()
+        )
+        session = self._worker_session_store.ensure_supervisor_session(
+            _provider(provider),
+            owner_key=owner_key,
+        )
+        if not isinstance(session, Mapping):
+            raise ProjectMasterHostError("TASK_FRAME_WORKER_COORDINATE_UNAVAILABLE")
+        supervisor_session_id = str(session.get("session_id") or "").strip()
+        session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
+        if not supervisor_session_id or not session_anchor_ref:
+            raise ProjectMasterHostError("TASK_FRAME_WORKER_COORDINATE_UNAVAILABLE")
+        return {
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
 
     def prepare(self) -> Mapping[str, Any]:
         """Prepare the live conversation coordinate without starting Runtime Boot.
@@ -1023,6 +1077,7 @@ class ProjectModeCoordinator:
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_TURNS_INVALID")
         lineage = self._task_frame_session_lineage(frame_id)
         turns = self._restore_semantic_task_frame_turns(turns, lineage=lineage)
+        turns = [self._execution_turn_binding(turn) for turn in turns]
         parent_mutation_scope = plan.get("mutation_scope")
         if not isinstance(parent_mutation_scope, Mapping):
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_SCOPE_INVALID")
@@ -1081,10 +1136,14 @@ class ProjectModeCoordinator:
             "output_contract": self._boss_allocation_output_contract(
                 turns, parent_mutation_scope=parent_mutation_scope
             ),
-            "max_turns": 1,
             "result_mode": "STRUCTURED_JSON",
             "defer_terminal_result": True,
         }
+        boss_binding_snapshot = boss.get("worker_binding_snapshot")
+        if isinstance(boss_binding_snapshot, Mapping):
+            boss_request["context_pack"]["worker_binding_snapshot"] = dict(
+                boss_binding_snapshot
+            )
         self._recover_stale_boss_claim(
             binding=binding,
             task_frame_id=frame_id,
@@ -1234,11 +1293,13 @@ class ProjectModeCoordinator:
                     "output_contract": self._child_result_output_contract(
                         mutation_evidence_required=write_enabled
                     ),
-                    "max_turns": _task_frame_child_max_turns(
-                        write_enabled=write_enabled
-                    ),
                     "result_mode": "STRUCTURED_JSON",
                 }
+                worker_binding_snapshot = turn.get("worker_binding_snapshot")
+                if isinstance(worker_binding_snapshot, Mapping):
+                    request["context_pack"]["worker_binding_snapshot"] = dict(
+                        worker_binding_snapshot
+                    )
                 try:
                     child_result = self.worker_dispatcher.dispatch(request)
                 except WorkerDispatchError as error:
@@ -1827,9 +1888,13 @@ class ProjectModeCoordinator:
         for turn in runtime_turns:
             turn_id = _text(turn.get("turn_id"), "execution_plan.turn.turn_id")
             item = dict(turn)
+            semantic_turn = semantic_by_id[turn_id]
             item["role"] = _text(
-                semantic_by_id[turn_id].get("role"), "lineage.turn.role"
+                semantic_turn.get("role"), "lineage.turn.role"
             ).upper()
+            binding_snapshot = semantic_turn.get("worker_binding_snapshot")
+            if isinstance(binding_snapshot, Mapping):
+                item["worker_binding_snapshot"] = dict(binding_snapshot)
             restored.append(item)
         return restored
 
@@ -1841,7 +1906,17 @@ class ProjectModeCoordinator:
 
         projected: list[dict[str, Any]] = []
         for turn in turns:
-            runtime_turn = dict(turn)
+            runtime_turn = {
+                key: turn[key]
+                for key in (
+                    "turn_id",
+                    "worker_slot_ref",
+                    "provider",
+                    "model",
+                    "reasoning_effort",
+                )
+                if key in turn
+            }
             runtime_turn["role"] = (
                 "BOSS" if str(turn.get("role") or "").strip().upper() == "BOSS"
                 else "SUB_REVIEWER"
@@ -1954,6 +2029,81 @@ class ProjectModeCoordinator:
             "instruction_ref": approval_evidence_ref,
         }
 
+    def _bind_task_frame_turns(
+        self,
+        turns: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.worker_binding_resolver is None:
+            return [dict(turn) for turn in turns]
+        bound_turns: list[dict[str, Any]] = []
+        for turn in turns:
+            normalized = dict(turn)
+            semantic_role = _text(
+                normalized.get("role"), "task_frame.turn.role"
+            ).upper()
+            worker_role = TASK_FRAME_WORKER_BINDING_ROLES.get(semantic_role)
+            if worker_role is None:
+                raise ProjectMasterHostError("WORKER_BINDING_ROLE_UNSUPPORTED")
+            resolution = self.worker_binding_resolver(
+                {
+                    "project_id": self.project_id,
+                    "worker_role": worker_role,
+                    "task_type": "*",
+                }
+            )
+            snapshot = (
+                resolution.get("snapshot")
+                if isinstance(resolution, Mapping)
+                else None
+            )
+            if (
+                not isinstance(resolution, Mapping)
+                or resolution.get("status") != "WORKER_BINDING_RESOLVED"
+                or not isinstance(snapshot, Mapping)
+                or snapshot.get("schema")
+                != "universe.worker-binding-snapshot.v1"
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(snapshot.get("binding_digest") or "").lower(),
+                )
+            ):
+                raise ProjectMasterHostError("WORKER_BINDING_RESOLUTION_INVALID")
+            configured_provider_value = _text(
+                snapshot.get("provider"), "worker_binding.provider"
+            ).upper()
+            configured_provider = (
+                "AUTO"
+                if configured_provider_value == "AUTO"
+                else _provider(configured_provider_value)
+            )
+            if configured_provider != "AUTO":
+                normalized["provider"] = configured_provider
+            model_ref = str(snapshot.get("model_ref") or "").strip()
+            if model_ref:
+                normalized["model"] = model_ref
+            configured_effort = str(snapshot.get("effort") or "AUTO").strip().upper()
+            if configured_effort != "AUTO":
+                normalized["reasoning_effort"] = configured_effort.lower()
+            normalized["worker_binding_snapshot"] = dict(snapshot)
+            bound_turns.append(normalized)
+        return bound_turns
+
+    def _execution_turn_binding(self, turn: Mapping[str, Any]) -> dict[str, Any]:
+        current = dict(turn)
+        if isinstance(current.get("worker_binding_snapshot"), Mapping):
+            return current
+        resolved = self._bind_task_frame_turns([current])[0]
+        if self.worker_binding_resolver is None:
+            return resolved
+        for key in ("provider", "model"):
+            if str(resolved.get(key) or "") != str(current.get(key) or ""):
+                raise ProjectMasterHostError("WORKER_BINDING_PLAN_MISMATCH")
+        if str(resolved.get("reasoning_effort") or "").upper() != str(
+            current.get("reasoning_effort") or ""
+        ).upper():
+            raise ProjectMasterHostError("WORKER_BINDING_PLAN_MISMATCH")
+        return resolved
+
     def _approved_task_frame_request(
         self,
         *,
@@ -2044,7 +2194,7 @@ class ProjectModeCoordinator:
                 "operations": operations,
                 "targets": normalized_targets,
             },
-            "turns": [dict(turn) for turn in turns],
+            "turns": self._bind_task_frame_turns(turns),
             "instruction_id": _text(
                 task_frame.get("instruction_id"), "task_frame.instruction_id"
             ),
@@ -3551,6 +3701,7 @@ class ProjectMasterSessionStore:
         normalized_owner = str(owner_key or "").strip().upper()
         if normalized_owner:
             metadata_key = f"supervisor_session_id:{normalized_owner}"
+            require_live_host = normalized_owner.startswith("TASK_FRAME_")
             existing_id = ""
             if not new_session:
                 with self._connection() as connection:
@@ -3571,6 +3722,10 @@ class ProjectMasterSessionStore:
                     == self.requested_mode
                     and str(existing.get("provider") or "").upper()
                     in {"", normalized_provider}
+                    and (
+                        not require_live_host
+                        or str(existing.get("state") or "").upper() == "LIVE"
+                    )
                 ):
                     return dict(existing)
             supervisor_session_id = "session_" + secrets.token_hex(12)
@@ -6979,6 +7134,7 @@ class ResidentProjectMasterHostManager:
         governance_context_resolver: GovernanceContextResolver | None = None,
         retrieval_context_resolver: RetrievalContextResolver | None = None,
         release_source_binding_resolver: GovernanceContextResolver | None = None,
+        worker_binding_resolver: WorkerBindingResolver | None = None,
         completion_observer: Callable[[Mapping[str, Any]], None] | None = None,
         room_event_observer: NativeRoomObserver | None = None,
     ) -> None:
@@ -6997,6 +7153,7 @@ class ResidentProjectMasterHostManager:
         self.governance_context_resolver = governance_context_resolver
         self.retrieval_context_resolver = retrieval_context_resolver
         self.release_source_binding_resolver = release_source_binding_resolver
+        self.worker_binding_resolver = worker_binding_resolver
         self.completion_observer = completion_observer
         self.room_event_observer = room_event_observer
         self._handles: dict[str, ResidentProjectMasterHandle] = {}
@@ -8030,6 +8187,8 @@ class ResidentProjectMasterHostManager:
                 else None
             ),
             session_supervisor=self.session_supervisor,
+            terminal_host=self.terminal_host,
+            worker_binding_resolver=self.worker_binding_resolver,
         )
 
     @staticmethod

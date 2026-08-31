@@ -51,10 +51,10 @@ CLAUDE_STREAM_ARGUMENTS = (
     "--verbose",
 )
 
-# Claude routes a permission prompt to the MCP tool named here. plan mode is
-# what keeps file edits and file-modifying shell commands off the auto-approve
-# path so they reach the prompt tool.
-CLAUDE_PERMISSION_MODE = "plan"
+# Claude routes every non-preapproved permission prompt to the MCP tool named
+# here. Default mode lets bounded implementation work proceed only after that
+# Host-owned bridge returns an explicit decision.
+CLAUDE_PERMISSION_MODE = "default"
 CLAUDE_PERMISSION_TOOL_SERVER = "universe_permission"
 CLAUDE_PERMISSION_TOOL_NAME = "approve"
 CLAUDE_PERMISSION_PROMPT_TOOL = (
@@ -399,8 +399,9 @@ class ClaudeResidentSession:
         session_observer: Callable[[str], None],
         model: str = "default",
         effort: str = "AUTO",
+        json_schema: Mapping[str, Any] | None = None,
         extra_arguments: tuple[str, ...] = (),
-        turn_timeout_seconds: float = 600.0,
+        turn_timeout_seconds: float | None = 600.0,
         permission_mcp_config: Path | None = None,
         permission_bridge: Any | None = None,
         permission_ready: Callable[[], bool] | None = None,
@@ -442,6 +443,7 @@ class ClaudeResidentSession:
         self.effort = str(effort or "AUTO").strip().upper()
         if self.effort not in PROVIDER_EFFORTS:
             raise ClaudeResidentError("CLAUDE_EFFORT_INVALID")
+        self.json_schema = dict(json_schema) if json_schema is not None else None
         # Always give a fresh resident an explicit provider session id.  Claude
         # can terminate an input-stream process that has no initial
         # ``--session-id`` before the first user turn, which would publish a
@@ -451,7 +453,11 @@ class ClaudeResidentSession:
         self._resume = bool(session_id)
         self.session_observer = session_observer
         self.extra_arguments = tuple(extra_arguments)
-        self.turn_timeout_seconds = float(turn_timeout_seconds)
+        self.turn_timeout_seconds = (
+            None
+            if turn_timeout_seconds is None
+            else float(turn_timeout_seconds)
+        )
         self._process_factory = process_factory or ClaudeStreamProcess
 
         self._process: ClaudeStreamProcess | None = None
@@ -763,8 +769,8 @@ class ClaudeResidentSession:
             arguments.extend(("--session-id", self.session_id))
         if self.permission_mcp_config is not None:
             # Route every prompt that is not pre-approved to the Universe
-            # permission UI. plan mode keeps file edits and file-modifying
-            # shell commands off the auto-approve path.
+            # permission UI. Default mode does not preapprove file edits or
+            # file-modifying shell commands; they still reach the prompt tool.
             arguments.extend(
                 (
                     "--permission-mode",
@@ -774,6 +780,19 @@ class ClaudeResidentSession:
                     "--strict-mcp-config",
                     "--permission-prompt-tool",
                     CLAUDE_PERMISSION_PROMPT_TOOL,
+                )
+            )
+        if self.json_schema is not None:
+            arguments.extend(
+                (
+                    "--json-schema",
+                    json.dumps(
+                        self.json_schema,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                 )
             )
         arguments.extend(self.extra_arguments)
@@ -945,6 +964,25 @@ class ClaudeResidentSession:
             return
         if event.get("is_error") is True or subtype != "success":
             self._turn_error = f"CLAUDE_RESULT_FAILED:{subtype or 'unknown'}"
+            self._turn_done.set()
+            return
+        if self.json_schema is not None:
+            structured_output = event.get("structured_output")
+            if not isinstance(structured_output, Mapping):
+                self._turn_error = "CLAUDE_STRUCTURED_OUTPUT_MISSING"
+                self._turn_done.set()
+                return
+            self._turn_text = []
+            self._turn_deltas = []
+            self._emit(
+                json.dumps(
+                    dict(structured_output),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
             self._turn_done.set()
             return
         if not self._turn_text:

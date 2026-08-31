@@ -14,6 +14,7 @@ from universe_runtime_worker_dispatch import (  # noqa: E402
     RuntimeWorkerDispatcher,
     WorkerDispatchError,
 )
+from universe_app.terminal_host import TerminalHostError  # noqa: E402
 from worker_failure_evidence import WorkerFailureEvidenceStore  # noqa: E402
 
 
@@ -48,7 +49,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_qa_role_runs_from_repository_and_allows_one_tool_use(self) -> None:
+    def test_task_frame_roles_run_from_repository_with_bounded_tool_permissions(self) -> None:
         dispatcher = RuntimeWorkerDispatcher(self.root)
         qa_request = {
             **self.request,
@@ -75,10 +76,90 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             **self.request,
             "context_pack": {"semantic_role": "SECURITY_REVIEWER"},
         }
-        self.assertNotEqual(self.root.resolve(), dispatcher._worker_cwd(review_request))
+        self.assertEqual(self.root.resolve(), dispatcher._worker_cwd(review_request))
         self.assertEqual(
             "reject-once",
             dispatcher._task_frame_permission(review_request, permission),
+        )
+
+        read_permission = {
+            "tool_call": {"toolName": "Read", "input": {"file_path": __file__}},
+            "options": permission["options"],
+        }
+        self.assertEqual(
+            "allow-once",
+            dispatcher._task_frame_permission(review_request, read_permission),
+        )
+
+        target = str(self.root / "tools" / "app.py")
+        implement_request = {
+            **self.request,
+            "repository_write_scope": "BOUNDED",
+            "mutation_scope": {
+                "operations": ["CREATE", "MODIFY"],
+                "targets": [target],
+            },
+            "context_pack": {"semantic_role": "IMPLEMENTER"},
+        }
+        write_permission = {
+            "tool_call": {
+                "toolName": "Write",
+                "path": target,
+                "input": {"file_path": target, "content": "updated"},
+            },
+            "options": permission["options"],
+        }
+        self.assertEqual(
+            "allow-once",
+            dispatcher._task_frame_permission(implement_request, write_permission),
+        )
+        write_permission["tool_call"]["path"] = str(self.root / "outside.py")
+        write_permission["tool_call"]["input"]["file_path"] = str(
+            self.root / "outside.py"
+        )
+        self.assertEqual(
+            "reject-once",
+            dispatcher._task_frame_permission(implement_request, write_permission),
+        )
+
+        codex_file_permission = {
+            "tool_call": {
+                "title": "item/fileChange/requestApproval",
+                "cwd": str(self.root),
+                "grantRoot": None,
+                "fileChanges": [
+                    {"path": "tools/app.py", "type": "update"},
+                ],
+            },
+            "options": permission["options"],
+        }
+        self.assertEqual(
+            "allow-once",
+            dispatcher._task_frame_permission(
+                implement_request, codex_file_permission
+            ),
+        )
+        codex_file_permission["tool_call"]["fileChanges"] = [
+            {"path": "tools/outside.py", "type": "update"},
+        ]
+        self.assertEqual(
+            "reject-once",
+            dispatcher._task_frame_permission(
+                implement_request, codex_file_permission
+            ),
+        )
+        codex_file_permission["tool_call"]["fileChanges"] = [
+            {
+                "path": "tools/app.py",
+                "type": "update",
+                "move_path": "tools/moved.py",
+            },
+        ]
+        self.assertEqual(
+            "reject-once",
+            dispatcher._task_frame_permission(
+                implement_request, codex_file_permission
+            ),
         )
 
     def test_task_frame_system_prompt_follows_validated_task_scope(self) -> None:
@@ -93,7 +174,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertNotIn("Do not create or modify files", prompt)
 
     def test_codex_task_frame_requests_ephemeral_provider_session(self) -> None:
-        observed: list[tuple[bool, str, float]] = []
+        observed: list[tuple[bool, str, float | None]] = []
 
         class FakeCodexSession:
             def __init__(
@@ -120,11 +201,84 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         ):
             result = dispatcher._invoke_codex(self.request)
 
-        self.assertEqual([(True, "test-model", 90.0)], observed)
+        self.assertEqual([(True, "test-model", None)], observed)
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
         self.assertFalse(result["universe_coordinate_persisted"])
         self.assertEqual("NOT_PERSISTED", result["provider_durable_chat_state"])
+
+    def test_codex_task_frame_uses_exact_managed_host_coordinate(self) -> None:
+        terminal_host = object()
+        observed: list[dict[str, object]] = []
+
+        class FakeCodexSession:
+            def __init__(self, *, session_observer, **kwargs) -> None:
+                observed.append(dict(kwargs))
+                self.session_ref = "codex-app-server:managed-1"
+                session_observer("managed-1")
+
+        request = {
+            **self.request,
+            "effort": "MAX",
+            "supervisor_transport": {
+                "terminal_host": terminal_host,
+                "project_id": "universe",
+                "mode": "MASTER",
+                "supervisor_session_id": "session-worker-1",
+                "session_anchor_ref": "session-anchor-worker-1",
+            },
+        }
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        with (
+            patch(
+                "universe_runtime_worker_dispatch._resolve_codex",
+                return_value=(self.root / "codex.exe", {}, "test-model"),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.CodexAppServerSession",
+                FakeCodexSession,
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.UniverseAcpGateway",
+                FakeGateway,
+            ),
+        ):
+            result = dispatcher._invoke_codex(request)
+
+        self.assertIs(terminal_host, observed[0]["terminal_host"])
+        self.assertEqual("session-worker-1", observed[0]["supervisor_session_id"])
+        self.assertEqual("session-anchor-worker-1", observed[0]["session_anchor_ref"])
+        self.assertEqual("MAX", observed[0]["effort"])
+        self.assertTrue(result["universe_coordinate_persisted"])
+        self.assertEqual("session-worker-1", result["host_session_ref"])
+
+    def test_dispatcher_resolves_one_host_coordinate_per_declared_turn(self) -> None:
+        terminal_host = object()
+        observed: list[tuple[str, str, str]] = []
+
+        def resolve(provider, frame_id, turn_id):
+            observed.append((provider, frame_id, turn_id))
+            return {
+                "supervisor_session_id": "session-worker-2",
+                "session_anchor_ref": "session-anchor-worker-2",
+            }
+
+        dispatcher = RuntimeWorkerDispatcher(
+            self.root,
+            terminal_host=terminal_host,
+            project_id="universe",
+            mode="MASTER",
+            worker_host_coordinate_resolver=resolve,
+        )
+        transport = dispatcher._supervisor_transport(
+            "CLAUDE",
+            {"frame_id": "frame-1", "turn_id": "implement"},
+        )
+
+        self.assertEqual([("CLAUDE", "frame-1", "implement")], observed)
+        self.assertIs(terminal_host, transport["terminal_host"])
+        self.assertEqual("session-worker-2", transport["supervisor_session_id"])
+        self.assertEqual("session-anchor-worker-2", transport["session_anchor_ref"])
 
     def test_dispatch_normalizes_runtime_provider_aliases(self) -> None:
         dispatcher = RuntimeWorkerDispatcher(self.root)
@@ -178,7 +332,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("UNKNOWN", result["provider_durable_chat_state"])
 
     def test_claude_task_frame_disables_session_persistence(self) -> None:
-        observed: list[tuple[bool, bool, int, float, str, object]] = []
+        observed: list[tuple[bool, bool, int | None, float, str, object]] = []
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -220,18 +374,196 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             result = dispatcher._invoke_claude(
                 {
                     **self.request,
-                    "max_turns": 5,
                     "result_mode": "STRUCTURED_JSON",
                     "output_contract": {"json_schema": schema},
                 }
             )
 
-        self.assertEqual([(True, False, 5, 90.0, "test-model", schema)], observed)
+        self.assertEqual([(True, False, None, 90.0, "test-model", schema)], observed)
         self.assertEqual("CLAUDE_CODE_CLI_ADAPTER", result["runtime_provider"])
         self.assertEqual("EPHEMERAL", result["session_persistence"])
         self.assertEqual("UNKNOWN", result["persistent_session_ref"])
         self.assertFalse(result["universe_coordinate_persisted"])
         self.assertEqual("NOT_PERSISTED", result["provider_durable_chat_state"])
+        self.assertEqual("default", result["permission_mode"])
+
+    def test_claude_task_frame_uses_managed_stream_host(self) -> None:
+        terminal_host = object()
+        observed: list[dict[str, object]] = []
+
+        class FakeBroker:
+            def start(self):
+                return self
+
+            def write_mcp_config(self, path):
+                return path
+
+            @staticmethod
+            def provider_environment(environment):
+                return dict(environment)
+
+            @staticmethod
+            def wait_for_registration():
+                return True
+
+            @staticmethod
+            def close():
+                return None
+
+        class FakeClaudeResidentSession:
+            def __init__(self, *, session_observer, **kwargs) -> None:
+                observed.append(dict(kwargs))
+                self.session_id = "managed-claude-1"
+                self.session_ref = "claude-code:managed-claude-1"
+                session_observer(self.session_id)
+
+        request = {
+            **self.request,
+            "effort": "HIGH",
+            "result_mode": "STRUCTURED_JSON",
+            "output_contract": {"json_schema": {"type": "object"}},
+            "supervisor_transport": {
+                "terminal_host": terminal_host,
+                "project_id": "universe",
+                "mode": "MASTER",
+                "supervisor_session_id": "session-claude-worker",
+                "session_anchor_ref": "session-anchor-claude-worker",
+            },
+        }
+        dispatcher = RuntimeWorkerDispatcher(
+            self.root,
+            project_id="universe",
+            mode="MASTER",
+        )
+        with (
+            patch(
+                "universe_runtime_worker_dispatch._resolve_claude",
+                return_value=(self.root / "claude.exe", {}, "test-model"),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.ClaudePermissionBroker",
+                return_value=FakeBroker(),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.ClaudeResidentSession",
+                FakeClaudeResidentSession,
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.UniverseAcpGateway",
+                FakeGateway,
+            ),
+        ):
+            result = dispatcher._invoke_claude(request)
+
+        self.assertIs(terminal_host, observed[0]["terminal_host"])
+        self.assertEqual("HIGH", observed[0]["effort"])
+        self.assertEqual({"type": "object"}, observed[0]["json_schema"])
+        self.assertIn("--no-session-persistence", observed[0]["extra_arguments"])
+        self.assertIsNone(observed[0]["turn_timeout_seconds"])
+        self.assertEqual("CLAUDE_CODE_STREAM_ADAPTER", result["runtime_provider"])
+        self.assertTrue(result["universe_coordinate_persisted"])
+        self.assertEqual("session-claude-worker", result["host_session_ref"])
+
+    def test_managed_claude_preserves_rust_host_launch_failure_detail(self) -> None:
+        class FakeBroker:
+            def start(self):
+                return self
+
+            def write_mcp_config(self, path):
+                return path
+
+            @staticmethod
+            def provider_environment(environment):
+                return dict(environment)
+
+            @staticmethod
+            def wait_for_registration():
+                return True
+
+            @staticmethod
+            def close():
+                return None
+
+        class FailingClaudeResidentSession:
+            def __init__(self, **_kwargs) -> None:
+                raise TerminalHostError(
+                    "TERMINAL_SPAWN_FAILED",
+                    "[WinError 206] The filename or extension is too long",
+                )
+
+        request = {
+            **self.request,
+            "supervisor_transport": {
+                "terminal_host": object(),
+                "project_id": "universe",
+                "mode": "MASTER",
+                "supervisor_session_id": "session-claude-worker",
+                "session_anchor_ref": "session-anchor-claude-worker",
+            },
+        }
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        with (
+            patch(
+                "universe_runtime_worker_dispatch._resolve_claude",
+                return_value=(self.root / "claude.exe", {}, "test-model"),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.ClaudePermissionBroker",
+                return_value=FakeBroker(),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.ClaudeResidentSession",
+                FailingClaudeResidentSession,
+            ),
+        ):
+            with self.assertRaises(WorkerDispatchError) as captured:
+                dispatcher._invoke_claude(request)
+
+        self.assertEqual("WORKER_TRANSPORT_FAILED", captured.exception.code)
+        self.assertEqual("RUST_HOST", captured.exception.stage)
+        self.assertEqual(
+            "TERMINAL_SPAWN_FAILED:[WinError 206] The filename or extension is too long",
+            captured.exception.reason,
+        )
+
+    def test_managed_codex_preserves_rust_host_transport_failure_detail(self) -> None:
+        class FailingCodexAppServerSession:
+            def __init__(self, **_kwargs) -> None:
+                raise TerminalHostError(
+                    "PTY_SUPERVISOR_UNAVAILABLE",
+                    "Remote end closed connection without response",
+                )
+
+        request = {
+            **self.request,
+            "supervisor_transport": {
+                "terminal_host": object(),
+                "project_id": "universe",
+                "mode": "MASTER",
+                "supervisor_session_id": "session-codex-worker",
+                "session_anchor_ref": "session-anchor-codex-worker",
+            },
+        }
+        dispatcher = RuntimeWorkerDispatcher(self.root)
+        with (
+            patch(
+                "universe_runtime_worker_dispatch._resolve_codex",
+                return_value=(self.root / "codex.exe", {}, "test-model"),
+            ),
+            patch(
+                "universe_runtime_worker_dispatch.CodexAppServerSession",
+                FailingCodexAppServerSession,
+            ),
+        ):
+            with self.assertRaises(WorkerDispatchError) as captured:
+                dispatcher._invoke_codex(request)
+
+        self.assertEqual("WORKER_TRANSPORT_FAILED", captured.exception.code)
+        self.assertEqual("RUST_HOST", captured.exception.stage)
+        self.assertEqual(
+            "PTY_SUPERVISOR_UNAVAILABLE:Remote end closed connection without response",
+            captured.exception.reason,
+        )
 
     def test_claude_structured_task_frame_requires_json_schema(self) -> None:
         dispatcher = RuntimeWorkerDispatcher(self.root)
@@ -314,7 +646,6 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             "mutation_scope": {"operations": [], "targets": []},
             "context_pack": {"goal": "review"},
             "output_contract": {"type": "text"},
-            "max_turns": 1,
             "response_timeout_seconds": 90,
             "result_mode": "REDACTED",
         }
@@ -392,28 +723,12 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("provider-worker-1", result["provider_worker_ref"])
         self.assertEqual([240], observed_timeouts)
 
-    def test_read_only_worker_allows_extended_review_turn_budget(self) -> None:
+    def test_task_frame_ignores_legacy_turn_budget(self) -> None:
         dispatcher = RuntimeWorkerDispatcher(self.root)
         normalized = dispatcher._normalize_request(
             {**self._dispatch_request(), "max_turns": 16}
         )
-        self.assertEqual(16, normalized["max_turns"])
-
-        target = str(self.root / "tools" / "app.py")
-        with self.assertRaises(WorkerDispatchError) as captured:
-            dispatcher._normalize_request(
-                {
-                    **self._dispatch_request(),
-                    "repository_write_scope": "BOUNDED",
-                    "mutation_scope": {
-                        "operations": ["MODIFY"],
-                        "targets": [target],
-                    },
-                    "max_turns": 16,
-                }
-            )
-        self.assertEqual("WORKER_TRANSPORT_FAILED", captured.exception.code)
-        self.assertEqual("MAX_TURNS_INVALID", captured.exception.reason)
+        self.assertNotIn("max_turns", normalized)
 
     def test_read_only_review_records_fail_conclusion_without_mutation_receipt(self) -> None:
         result = {

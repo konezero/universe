@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -226,6 +227,47 @@ class TerminalHostTests(unittest.TestCase):
             terminated = third.terminate(created["terminal_id"])
             self.assertEqual("TERMINAL_TERMINATED", terminated["status"])
             self.assertTrue(client.shutdown_called)
+
+    def test_rust_host_defers_claude_json_schema_through_environment(self) -> None:
+        registry = FakeReconnectionRegistry()
+        schema = '{"type":"object","description":"A&B %PATH% !literal!"}'
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable",
+            return_value="claude.exe",
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-rust-host-schema",
+                provider="CLAUDE",
+                supervisor_session_id="worker-session",
+                launch_profile="SUPERVISED_STDIO",
+                provider_arguments=["-p", "--json-schema", schema],
+            )
+            try:
+                launch = registry.launches[0]
+                self.assertEqual(("/d", "/q", "/v:on", "/k"), launch["shell_args"])
+                name = "UNIVERSE_PROVIDER_ARGUMENT_0003"
+                self.assertEqual(
+                    subprocess.list2cmdline([schema]),
+                    launch["environment"][name],
+                )
+                self.assertEqual(
+                    [
+                        (
+                            "\x1b[1;1Rmore | claude.exe -p --json-schema "
+                            f"!{name}!\r\n"
+                        ).encode("utf-8")
+                    ],
+                    registry.clients["anchor-rust-host-schema"].executions,
+                )
+            finally:
+                host.terminate(created["terminal_id"])
 
     def test_session_host_registers_identity_before_cli_execute(self) -> None:
         registry = FakeReconnectionRegistry()

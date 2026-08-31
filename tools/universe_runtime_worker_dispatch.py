@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import time
 from typing import Any, Callable, Mapping
@@ -20,7 +21,11 @@ from agent_session_gateway import (
     UniverseAcpGateway,
     cli_auto_approve_status,
 )
+from claude_permission_bridge import ClaudePermissionBridge
+from claude_permission_broker import ClaudePermissionBroker
+from claude_resident_session import ClaudeResidentError, ClaudeResidentSession
 from host_profile import resolve_host_tool
+from universe_app.terminal_host import TerminalHostError
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
 from worker_failure_evidence import (
     WorkerFailureEvidenceError,
@@ -60,6 +65,7 @@ class WorkerDispatchError(Exception):
 
 NativeRunner = Callable[[NativeCliRequest], NativeCliResult]
 PostJson = Callable[[str, str, str, Mapping[str, Any]], dict[str, Any]]
+WorkerHostCoordinateResolver = Callable[[str, str, str], Mapping[str, Any]]
 
 
 def _worker_response_timeout_seconds(value: Any) -> float:
@@ -221,11 +227,19 @@ class RuntimeWorkerDispatcher:
         post: PostJson = post_json,
         failure_evidence_store: WorkerFailureEvidenceStore | None = None,
         worker_response_timeout_seconds: float = TASK_FRAME_WORKER_RESPONSE_TIMEOUT_SECONDS,
+        terminal_host: Any | None = None,
+        project_id: str = "",
+        mode: str = "MASTER",
+        worker_host_coordinate_resolver: WorkerHostCoordinateResolver | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.native_runner = native_runner
         self.post = post
         self.failure_evidence_store = failure_evidence_store
+        self.terminal_host = terminal_host
+        self.project_id = str(project_id or "").strip()
+        self.mode = str(mode or "MASTER").strip().upper()
+        self.worker_host_coordinate_resolver = worker_host_coordinate_resolver
         self.worker_response_timeout_seconds = _worker_response_timeout_seconds(
             worker_response_timeout_seconds
         )
@@ -331,6 +345,9 @@ class RuntimeWorkerDispatcher:
         # provider. The Task Frame, created under the owning Node/Mode Master,
         # is the authority for the declared model of this turn.
         planned_model = _required_text(planned_invocation.get("model"), "model")
+        planned_effort = str(
+            planned_invocation.get("reasoning_effort") or "AUTO"
+        ).strip().upper()
         if request["defer_terminal_result"] and planned_invocation.get("role") != "BOSS":
             raise WorkerDispatchError(
                 "WORKER_DEFERRED_RESULT_INVALID",
@@ -341,6 +358,7 @@ class RuntimeWorkerDispatcher:
         skill_bindings = self._skill_bindings(planned_invocation)
         worker_id = f"universe-runtime-worker:{uuid4().hex}"
         worker_run_ref = f"universe-runtime-host:{uuid4().hex}"
+        supervisor_transport = self._supervisor_transport(provider, request)
         worker_request = {
             "schema": {
                 "GROK": "universe.grok-worker-request.v1",
@@ -349,17 +367,20 @@ class RuntimeWorkerDispatcher:
             }[provider],
             "runtime_profile": "TASK_FRAME_RUNTIME",
             "model": planned_model,
+            "effort": planned_effort,
             "task_frame_id": request["frame_id"],
             "turn_id": request["turn_id"],
             "worker_id": worker_id,
             "worker_run_ref": worker_run_ref,
-            "repository_write_scope": request["repository_write_scope"],
+            "repository_write_scope": str(
+                request.get("repository_write_scope") or "NONE"
+            ).upper(),
             "mutation_scope": request["mutation_scope"],
             "context_pack": request["context_pack"],
             "output_contract": request["output_contract"],
-            "max_turns": request["max_turns"],
             "response_timeout_seconds": self._response_timeout_seconds_for(request),
             "result_mode": request["result_mode"],
+            "supervisor_transport": supervisor_transport,
         }
 
         claim = self.post(
@@ -422,7 +443,8 @@ class RuntimeWorkerDispatcher:
             if (
                 worker.get("session_persistence") != "EPHEMERAL"
                 or worker.get("persistent_session_ref") != "UNKNOWN"
-                or worker.get("universe_coordinate_persisted") is not False
+                or worker.get("universe_coordinate_persisted")
+                is not bool(supervisor_transport)
             ):
                 raise WorkerDispatchError(
                     "WORKER_SESSION_BOUNDARY_INVALID",
@@ -496,6 +518,8 @@ class RuntimeWorkerDispatcher:
                     "provider_durable_chat_state": worker.get(
                         "provider_durable_chat_state", "UNKNOWN"
                     ),
+                    "host_session_ref": worker.get("host_session_ref", "UNKNOWN"),
+                    "session_anchor_ref": worker.get("session_anchor_ref", "UNKNOWN"),
                     "worker_envelope": envelope,
                 }
             result = self.post(
@@ -558,6 +582,8 @@ class RuntimeWorkerDispatcher:
             "provider_durable_chat_state": worker.get(
                 "provider_durable_chat_state", "UNKNOWN"
             ),
+            "host_session_ref": worker.get("host_session_ref", "UNKNOWN"),
+            "session_anchor_ref": worker.get("session_anchor_ref", "UNKNOWN"),
             "runtime_result": result,
         }
         if structured_result is not None:
@@ -851,18 +877,6 @@ class RuntimeWorkerDispatcher:
                 "BOUNDED_MUTATION_SCOPE_REQUIRED",
             )
 
-        max_turns = raw.get("max_turns", 1)
-        max_turn_limit = 16 if repository_write_scope == "NONE" else 8
-        if (
-            not isinstance(max_turns, int)
-            or isinstance(max_turns, bool)
-            or not 1 <= max_turns <= max_turn_limit
-        ):
-            raise WorkerDispatchError(
-                "WORKER_TRANSPORT_FAILED",
-                "REQUEST_LOAD",
-                "MAX_TURNS_INVALID",
-            )
         defer_terminal_result = raw.get("defer_terminal_result", False)
         if not isinstance(defer_terminal_result, bool):
             raise WorkerDispatchError(
@@ -884,7 +898,6 @@ class RuntimeWorkerDispatcher:
             "mutation_scope": {"operations": operations, "targets": targets},
             "context_pack": _mapping(raw.get("context_pack"), "context_pack"),
             "output_contract": _mapping(raw.get("output_contract"), "output_contract"),
-            "max_turns": max_turns,
             "result_mode": result_mode,
             "defer_terminal_result": defer_terminal_result,
         }
@@ -1079,6 +1092,8 @@ class RuntimeWorkerDispatcher:
                 "GROK_CLI_UNAVAILABLE",
             )
         model = self._request_model(request)
+        effort = self._request_effort(request)
+        supervisor_transport = self._request_supervisor_transport(request)
         runtime_profile = str(request.get("runtime_profile", "READ_ONLY")).upper()
         if runtime_profile not in {"READ_ONLY", "TASK_FRAME_RUNTIME"}:
             raise WorkerDispatchError(
@@ -1094,6 +1109,7 @@ class RuntimeWorkerDispatcher:
                     cwd=self._worker_cwd(request),
                     environment=environment,
                     model=model,
+                    effort=effort,
                     system_prompt=self._system_prompt(runtime_profile),
                     session_id=None,
                     permission_requester=lambda permission: self._task_frame_permission(
@@ -1104,6 +1120,7 @@ class RuntimeWorkerDispatcher:
                     response_timeout_seconds=float(
                         request["response_timeout_seconds"]
                     ),
+                    **supervisor_transport,
                 )
             )
             try:
@@ -1138,8 +1155,14 @@ class RuntimeWorkerDispatcher:
             "repository_write_scope": "NONE",
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",
-            "universe_coordinate_persisted": False,
+            "universe_coordinate_persisted": bool(supervisor_transport),
             "provider_durable_chat_state": "UNKNOWN",
+            "host_session_ref": supervisor_transport.get(
+                "supervisor_session_id", "UNKNOWN"
+            ),
+            "session_anchor_ref": supervisor_transport.get(
+                "session_anchor_ref", "UNKNOWN"
+            ),
         }
 
     def _invoke_codex(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1151,6 +1174,8 @@ class RuntimeWorkerDispatcher:
                 "CODEX_CLI_UNAVAILABLE",
             )
         model = self._request_model(request)
+        effort = self._request_effort(request)
+        supervisor_transport = self._request_supervisor_transport(request)
         session_ids: list[str] = []
         try:
             gateway = UniverseAcpGateway(
@@ -1159,6 +1184,7 @@ class RuntimeWorkerDispatcher:
                     cwd=self._worker_cwd(request),
                     environment=environment,
                     model=model,
+                    effort=effort,
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
                     permission_requester=lambda permission: self._task_frame_permission(
@@ -1166,9 +1192,11 @@ class RuntimeWorkerDispatcher:
                     ),
                     session_observer=session_ids.append,
                     ephemeral=True,
-                    response_timeout_seconds=float(
-                        request["response_timeout_seconds"]
-                    ),
+                    # Task Frame turns end on provider completion, explicit
+                    # cancellation, or Host/provider failure. Their bounded
+                    # assignment is not a wall-clock execution estimate.
+                    response_timeout_seconds=None,
+                    **supervisor_transport,
                 )
             )
             try:
@@ -1179,6 +1207,12 @@ class RuntimeWorkerDispatcher:
                 session_ref = gateway.session_ref
             finally:
                 gateway.close()
+        except TerminalHostError as error:
+            raise WorkerDispatchError(
+                "WORKER_TRANSPORT_FAILED",
+                "RUST_HOST",
+                f"{error.code}:{error.detail}",
+            ) from error
         except AgentSessionError as error:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED",
@@ -1201,8 +1235,14 @@ class RuntimeWorkerDispatcher:
             "repository_write_scope": "NONE",
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",
-            "universe_coordinate_persisted": False,
+            "universe_coordinate_persisted": bool(supervisor_transport),
             "provider_durable_chat_state": "NOT_PERSISTED",
+            "host_session_ref": supervisor_transport.get(
+                "supervisor_session_id", "UNKNOWN"
+            ),
+            "session_anchor_ref": supervisor_transport.get(
+                "session_anchor_ref", "UNKNOWN"
+            ),
         }
 
     def _invoke_claude(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1214,6 +1254,8 @@ class RuntimeWorkerDispatcher:
                 "CLAUDE_CLI_UNAVAILABLE",
             )
         model = self._request_model(request)
+        effort = self._request_effort(request)
+        supervisor_transport = self._request_supervisor_transport(request)
         json_schema: dict[str, Any] | None = None
         if str(request.get("result_mode", "REDACTED")).upper() == "STRUCTURED_JSON":
             output_contract = _mapping(
@@ -1227,6 +1269,16 @@ class RuntimeWorkerDispatcher:
                     "CLAUDE_JSON_SCHEMA_REQUIRED",
                 )
             json_schema = dict(raw_schema)
+        if supervisor_transport:
+            return self._invoke_managed_claude(
+                request,
+                executable=executable,
+                environment=environment,
+                model=model,
+                effort=effort,
+                json_schema=json_schema,
+                supervisor_transport=supervisor_transport,
+            )
         session_ids: list[str] = []
         try:
             gateway = UniverseAcpGateway(
@@ -1243,7 +1295,11 @@ class RuntimeWorkerDispatcher:
                     session_observer=session_ids.append,
                     ephemeral=True,
                     allow_read_only_tools=self._is_qa_reviewer(request),
-                    max_turns=int(request.get("max_turns", 8)),
+                    # Task Frames complete on a terminal structured result. A
+                    # provider-loop turn cap would make tool use itself look
+                    # like task completion, so this adapter intentionally omits
+                    # the Claude CLI --max-turns option for this runtime.
+                    max_turns=None,
                     response_timeout_seconds=float(
                         request["response_timeout_seconds"]
                     ),
@@ -1278,17 +1334,204 @@ class RuntimeWorkerDispatcher:
                 f"claude-code:{session_id}:{request['worker_run_ref']}"
             ),
             "result": {"text": text, "stop_reason": "COMPLETED"},
-            "permission_mode": "plan",
+            "permission_mode": "default",
             "repository_write_scope": "NONE",
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",
             "universe_coordinate_persisted": False,
             "provider_durable_chat_state": "NOT_PERSISTED",
+            "host_session_ref": "UNKNOWN",
+            "session_anchor_ref": "UNKNOWN",
+        }
+
+    def _invoke_managed_claude(
+        self,
+        request: Mapping[str, Any],
+        *,
+        executable: Path,
+        environment: Mapping[str, str],
+        model: str,
+        effort: str,
+        json_schema: Mapping[str, Any] | None,
+        supervisor_transport: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        session_ids: list[str] = []
+        broker: ClaudePermissionBroker | None = None
+        config_root: Path | None = None
+        gateway: UniverseAcpGateway | None = None
+        try:
+            bridge = ClaudePermissionBridge(
+                session_ref=f"claude-code:pending:{uuid4().hex}",
+                permission_requester=lambda permission: self._task_frame_permission(
+                    request, permission
+                ),
+            )
+            broker = ClaudePermissionBroker(
+                bridge=bridge,
+                target=(
+                    f"{self.project_id}/{self.mode}/"
+                    f"{request['task_frame_id']}/{request['turn_id']}"
+                ),
+            ).start()
+            config_root = Path(tempfile.mkdtemp(prefix="universe-task-frame-claude-mcp-"))
+            mcp_config = broker.write_mcp_config(config_root / "mcp.json")
+
+            def observe_session(session_id: str) -> None:
+                session_ids.append(session_id)
+                bridge.bind_session_ref(f"claude-code:{session_id}")
+
+            session = ClaudeResidentSession(
+                executable=executable,
+                cwd=self._worker_cwd(request),
+                environment=broker.provider_environment(dict(environment)),
+                model=model,
+                effort=effort,
+                json_schema=json_schema,
+                system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
+                session_id=None,
+                session_observer=observe_session,
+                extra_arguments=("--no-session-persistence",),
+                # A Task Frame finishes on the provider's terminal structured
+                # result (or an explicit cancel/failure). Editing and review do
+                # not have a defensible wall-clock duration, so the managed
+                # Claude path intentionally has no per-turn timer.
+                turn_timeout_seconds=None,
+                permission_mcp_config=mcp_config,
+                permission_bridge=bridge,
+                permission_ready=broker.wait_for_registration,
+                permission_failure=broker.close,
+                **dict(supervisor_transport),
+            )
+            bridge.bind_session_ref(session.session_ref)
+            gateway = UniverseAcpGateway(session)
+            text = gateway.reply_stream(
+                self._worker_prompt(request),
+                lambda _delta: None,
+            )
+            session_ref = gateway.session_ref
+        except TerminalHostError as error:
+            raise WorkerDispatchError(
+                "WORKER_TRANSPORT_FAILED",
+                "RUST_HOST",
+                f"{error.code}:{error.detail}",
+            ) from error
+        except (AgentSessionError, ClaudeResidentError) as error:
+            raise WorkerDispatchError(
+                "WORKER_PROVIDER_FAILED",
+                "WORKER_ADAPTER",
+                f"CLAUDE_CODE_{error}",
+            ) from error
+        finally:
+            if gateway is not None:
+                gateway.close()
+            if broker is not None:
+                broker.close()
+            if config_root is not None:
+                shutil.rmtree(config_root, ignore_errors=True)
+        session_id = (
+            session_ids[-1]
+            if session_ids
+            else session_ref.split(":", 1)[-1]
+        )
+        return {
+            "schema": "universe.claude-worker-result.v1",
+            "status": "COMPLETED",
+            "runtime_provider": "CLAUDE_CODE_STREAM_ADAPTER",
+            "runtime_profile": "TASK_FRAME_RUNTIME",
+            "source_mutation": "HOST_GATEWAY_ONLY",
+            "worker_id": f"claude-code:{session_id}",
+            "worker_run_ref": request["worker_run_ref"],
+            "result_receipt_ref": (
+                f"claude-code:{session_id}:{request['worker_run_ref']}"
+            ),
+            "result": {"text": text, "stop_reason": "COMPLETED"},
+            "permission_mode": "default",
+            "repository_write_scope": str(
+                request.get("repository_write_scope") or "NONE"
+            ).upper(),
+            "session_persistence": "EPHEMERAL",
+            "persistent_session_ref": "UNKNOWN",
+            "universe_coordinate_persisted": True,
+            "provider_durable_chat_state": "NOT_PERSISTED",
+            "host_session_ref": supervisor_transport["supervisor_session_id"],
+            "session_anchor_ref": supervisor_transport["session_anchor_ref"],
         }
 
     @staticmethod
     def _request_model(request: Mapping[str, Any]) -> str:
         return _required_text(request.get("model"), "model")
+
+    @staticmethod
+    def _request_effort(request: Mapping[str, Any]) -> str:
+        effort = str(request.get("effort") or "AUTO").strip().upper()
+        if effort not in {"AUTO", "LOW", "MEDIUM", "HIGH", "MAX"}:
+            raise WorkerDispatchError(
+                "WORKER_TRANSPORT_FAILED",
+                "REQUEST_LOAD",
+                "WORKER_EFFORT_INVALID",
+            )
+        return effort
+
+    def _supervisor_transport(
+        self,
+        provider: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.terminal_host is None:
+            return {}
+        if (
+            not self.project_id
+            or not self.mode
+            or self.worker_host_coordinate_resolver is None
+        ):
+            raise WorkerDispatchError(
+                "WORKER_HOST_COORDINATE_UNAVAILABLE",
+                "WORKER_ADAPTER",
+                "RUST_HOST_COORDINATE_RESOLVER_UNAVAILABLE",
+            )
+        coordinate = self.worker_host_coordinate_resolver(
+            provider,
+            request["frame_id"],
+            request["turn_id"],
+        )
+        if not isinstance(coordinate, Mapping):
+            raise WorkerDispatchError(
+                "WORKER_HOST_COORDINATE_UNAVAILABLE",
+                "WORKER_ADAPTER",
+                "RUST_HOST_COORDINATE_INVALID",
+            )
+        supervisor_session_id = str(
+            coordinate.get("supervisor_session_id") or ""
+        ).strip()
+        session_anchor_ref = str(coordinate.get("session_anchor_ref") or "").strip()
+        if not supervisor_session_id or not session_anchor_ref:
+            raise WorkerDispatchError(
+                "WORKER_HOST_COORDINATE_UNAVAILABLE",
+                "WORKER_ADAPTER",
+                "RUST_HOST_COORDINATE_INCOMPLETE",
+            )
+        return {
+            "terminal_host": self.terminal_host,
+            "project_id": self.project_id,
+            "mode": self.mode,
+            "supervisor_session_id": supervisor_session_id,
+            "session_anchor_ref": session_anchor_ref,
+        }
+
+    @staticmethod
+    def _request_supervisor_transport(
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        value = request.get("supervisor_transport")
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise WorkerDispatchError(
+                "WORKER_HOST_COORDINATE_UNAVAILABLE",
+                "WORKER_ADAPTER",
+                "RUST_HOST_TRANSPORT_INVALID",
+            )
+        return dict(value)
 
     @staticmethod
     def _system_prompt(runtime_profile: str) -> str:
@@ -1357,19 +1600,99 @@ class RuntimeWorkerDispatcher:
         return self.worker_response_timeout_seconds
 
     def _worker_cwd(self, request: Mapping[str, Any]) -> Path:
-        return (
-            self.repository_root
-            if self._is_qa_reviewer(request)
-            else Path(tempfile.gettempdir())
-        )
+        if str(request.get("runtime_profile") or "").upper() == "TASK_FRAME_RUNTIME":
+            return self.repository_root
+        return Path(tempfile.gettempdir())
 
     @classmethod
     def _task_frame_permission(
         cls, task_request: Mapping[str, Any], permission: Mapping[str, Any]
     ) -> str | None:
+        tool_call = permission.get("tool_call")
+        tool_name = (
+            str(tool_call.get("toolName") or tool_call.get("title") or "").strip()
+            if isinstance(tool_call, Mapping)
+            else ""
+        )
+        allow = tool_name.casefold() in {"read", "glob", "grep"}
+        if cls._is_qa_reviewer(task_request):
+            allow = True
+        elif (
+            str(task_request.get("repository_write_scope") or "").upper()
+            == "BOUNDED"
+            and isinstance(tool_call, Mapping)
+        ):
+            mutation_scope = task_request.get("mutation_scope")
+            if isinstance(mutation_scope, Mapping):
+                targets = mutation_scope.get("targets")
+                operations = {
+                    str(item).upper()
+                    for item in mutation_scope.get("operations", [])
+                    if isinstance(item, str)
+                }
+                target_values = targets if isinstance(targets, list) else []
+                normalized_targets = {
+                    str(Path(str(item)).resolve(strict=False)).casefold()
+                    for item in target_values
+                    if isinstance(item, str)
+                }
+                cwd = Path(str(tool_call.get("cwd") or Path.cwd()))
+
+                def normalize_requested_path(value: Any) -> str:
+                    raw_path = str(value or "").strip()
+                    if not raw_path:
+                        return ""
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = cwd / path
+                    return str(path.resolve(strict=False)).casefold()
+
+                tool_input = tool_call.get("input")
+                if isinstance(tool_input, Mapping):
+                    requested_path = normalize_requested_path(
+                        tool_call.get("path")
+                        or tool_input.get("file_path")
+                        or tool_input.get("notebook_path")
+                    )
+                    required_operations = {
+                        "write": {"CREATE", "MODIFY"},
+                        "edit": {"MODIFY"},
+                        "notebookedit": {"MODIFY"},
+                    }.get(tool_name.casefold(), set())
+                    allow = bool(
+                        requested_path
+                        and requested_path in normalized_targets
+                        and required_operations.intersection(operations)
+                    )
+                elif (
+                    tool_name.casefold()
+                    == "item/filechange/requestapproval"
+                    and not tool_call.get("grantRoot")
+                ):
+                    changes = tool_call.get("fileChanges")
+                    required_by_change = {
+                        "add": "CREATE",
+                        "update": "MODIFY",
+                    }
+                    allow = bool(changes) and isinstance(changes, list)
+                    for change in changes if isinstance(changes, list) else []:
+                        if not isinstance(change, Mapping) or change.get("move_path"):
+                            allow = False
+                            break
+                        required_operation = required_by_change.get(
+                            str(change.get("type") or "").casefold()
+                        )
+                        requested_path = normalize_requested_path(change.get("path"))
+                        if (
+                            required_operation is None
+                            or required_operation not in operations
+                            or requested_path not in normalized_targets
+                        ):
+                            allow = False
+                            break
         wanted = (
-            {"allow_once", "allow_always"}
-            if cls._is_qa_reviewer(task_request)
+            {"allow_once"}
+            if allow
             else {"reject_once", "reject_always"}
         )
         for option in permission.get("options", []):

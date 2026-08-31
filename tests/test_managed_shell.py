@@ -8,6 +8,7 @@ PID.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -33,6 +34,7 @@ from universe_app.managed_shell import (  # noqa: E402
     ManagedShellError,
     ProcessIdentity,
     ShellObservation,
+    managed_host_provider_command,
     managed_provider_command_line,
     managed_shell_cmdline,
     observe_process_tree,
@@ -104,6 +106,18 @@ class ManagedShellCmdlineTests(unittest.TestCase):
                 ["C:\\Program Files\\Claude\\claude.exe", "--flag", "value"]
             ),
         )
+
+    def test_host_command_defers_structured_json_without_losing_argv_bytes(self) -> None:
+        schema = '{"type":"object","description":"A&B %PATH% !literal!"}'
+
+        line, environment = managed_host_provider_command(
+            ["claude.exe", "--json-schema", schema],
+            pipe_console_input=True,
+        )
+
+        name = "UNIVERSE_PROVIDER_ARGUMENT_0002"
+        self.assertEqual(f"more | claude.exe --json-schema !{name}!", line)
+        self.assertEqual(subprocess.list2cmdline([schema]), environment[name])
 
     def test_stream_protocol_can_receive_console_input_through_one_cmd(self) -> None:
         line = managed_shell_cmdline(

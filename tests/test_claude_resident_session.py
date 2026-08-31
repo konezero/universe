@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -129,6 +130,70 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         )
         self.assertIn("--verbose", arguments)
         self.assertEqual("max", arguments[arguments.index("--effort") + 1])
+
+    def test_json_schema_uses_native_structured_output(self) -> None:
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string"}},
+        }
+
+        def factory(**kwargs):
+            process = FakeClaudeProcess(**kwargs)
+            process.script = [
+                [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "discard me"}],
+                        },
+                    },
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "structured_output": {"summary": "bounded"},
+                        "session_id": "structured-session",
+                    },
+                ]
+            ]
+            return process
+
+        session = self._session(json_schema=schema, process_factory=factory)
+        answer = session.send_message("one", lambda _d: None)
+        arguments = FakeClaudeProcess.instances[0].arguments
+
+        self.assertEqual({"summary": "bounded"}, json.loads(answer))
+        self.assertEqual(
+            schema,
+            json.loads(arguments[arguments.index("--json-schema") + 1]),
+        )
+
+    def test_json_schema_missing_structured_output_fails_closed(self) -> None:
+        schema = {"type": "object"}
+
+        def factory(**kwargs):
+            process = FakeClaudeProcess(**kwargs)
+            process.script = [
+                [
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "result": "unconstrained text",
+                        "session_id": "structured-session",
+                    }
+                ]
+            ]
+            return process
+
+        session = self._session(json_schema=schema, process_factory=factory)
+        with self.assertRaisesRegex(
+            ClaudeResidentError, "CLAUDE_STRUCTURED_OUTPUT_MISSING"
+        ):
+            session.send_message("one", lambda _d: None)
 
     def test_delta_order_is_preserved(self) -> None:
         session = self._session()
@@ -424,7 +489,7 @@ class ClaudeResidentSessionTests(unittest.TestCase):
         arguments = FakeClaudeProcess.instances[0].arguments
 
         self.assertEqual(
-            "plan", arguments[arguments.index("--permission-mode") + 1]
+            "default", arguments[arguments.index("--permission-mode") + 1]
         )
         self.assertEqual(
             str(config), arguments[arguments.index("--mcp-config") + 1]

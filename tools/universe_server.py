@@ -7720,8 +7720,8 @@ class UniverseStore:
                 "updated_at": None,
             }
         snapshot = {
-            "schema": "universe.worker-binding-snapshot.v1",
             **selected,
+            "schema": "universe.worker-binding-snapshot.v1",
         }
         snapshot["binding_digest"] = _json_sha256(snapshot)
         return {
@@ -24845,6 +24845,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         project_id
                     )
                 ),
+                worker_binding_resolver=self.store.resolve_worker_binding,
                 completion_observer=self._observe_project_master_completion,
                 room_event_observer=self._observe_native_room_event,
             )

@@ -28,14 +28,14 @@ PERMISSION_KINDS = frozenset(
 )
 GROK_PERMISSION_MODE = "default"
 CODEX_APPROVAL_POLICY = "on-request"
-CLAUDE_PERMISSION_MODE = "plan"
+CLAUDE_PERMISSION_MODE = "default"
 PROVIDER_EFFORTS = frozenset({"AUTO", "LOW", "MEDIUM", "HIGH", "MAX"})
 
 # Claude Code routes permission prompts to the MCP tool named by
 # --permission-prompt-tool. Verified against claude-code 2.1.212: the flag is
-# accepted (it is hidden from --help), and in plan mode file edits and
-# file-modifying shell commands are never auto-approved -- they reach the
-# prompt tool instead.
+# accepted (it is hidden from --help), and in default mode file edits and
+# file-modifying shell commands are not pre-approved -- they reach the prompt
+# tool instead.
 CLAUDE_PERMISSION_TOOL_SERVER = "universe_permission"
 CLAUDE_PERMISSION_TOOL_NAME = "approve"
 CLAUDE_PERMISSION_PROMPT_TOOL = (
@@ -195,7 +195,7 @@ def cli_auto_approve_status(
     if normalized == "CODEX":
         return "OFF" if CODEX_APPROVAL_POLICY == "on-request" else "UNKNOWN"
     if normalized == "CLAUDE":
-        return "OFF" if CLAUDE_PERMISSION_MODE == "plan" else "UNKNOWN"
+        return "OFF" if CLAUDE_PERMISSION_MODE == "default" else "UNKNOWN"
     return "UNKNOWN"
 
 
@@ -919,6 +919,10 @@ class JsonRpcStdioProcess:
             message["params"] = _json_object(params)
         self._send(message)
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed.is_set()
+
     def close(self) -> None:
         if self._closed.is_set():
             return
@@ -1562,7 +1566,7 @@ class CodexAppServerSession:
         permission_requester: PermissionRequester,
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
-        response_timeout_seconds: float = 300,
+        response_timeout_seconds: float | None = 300,
         terminal_host: Any | None = None,
         project_id: str = "",
         mode: str = "",
@@ -1591,14 +1595,19 @@ class CodexAppServerSession:
             "CODEX", "account/rateLimits/read"
         )
         self.ephemeral = bool(ephemeral)
-        self.response_timeout_seconds = _positive_timeout_seconds(
-            response_timeout_seconds, "CODEX_RESPONSE_TIMEOUT_INVALID"
+        self.response_timeout_seconds = (
+            None
+            if response_timeout_seconds is None
+            else _positive_timeout_seconds(
+                response_timeout_seconds, "CODEX_RESPONSE_TIMEOUT_INVALID"
+            )
         )
         self._active_delta: Callable[[str], None] | None = None
         self._active_final_text: str | None = None
         self._turn_events: dict[str, threading.Event] = {}
         self._completed_turns: set[str] = set()
         self._turn_statuses: dict[str, str] = {}
+        self._pending_file_changes: dict[str, list[dict[str, str]]] = {}
         self._bootstrap_pending = False
         self._git_trace2 = GitTrace2Observer(cwd)
         environment = self._git_trace2.environment(environment)
@@ -1678,7 +1687,16 @@ class CodexAppServerSession:
             event = self._turn_events.setdefault(turn_id, threading.Event())
             if turn_id in self._completed_turns:
                 event.set()
-            if event.wait(self.response_timeout_seconds):
+            if self.response_timeout_seconds is None:
+                # Task Frame implementation and review turns are bounded by
+                # their assignment and explicit lifecycle signals, not by a
+                # guessed wall-clock duration. Poll only so a closed Host or
+                # provider transport wakes this otherwise unbounded wait.
+                while not event.wait(0.25):
+                    if bool(getattr(self._transport, "is_closed", False)):
+                        raise AgentSessionError("CODEX_TURN_TRANSPORT_CLOSED")
+                turn_status = self._turn_statuses.pop(turn_id, "completed")
+            elif event.wait(self.response_timeout_seconds):
                 turn_status = self._turn_statuses.pop(turn_id, "completed")
             else:
                 turn_status, recovered_text = self._reconcile_turn(turn_id)
@@ -1923,6 +1941,39 @@ class CodexAppServerSession:
             ):
                 self._active_final_text = item["text"]
             return
+        if method == "item/fileChange/patchUpdated":
+            item_id = params.get("itemId")
+            changes = params.get("changes")
+            if isinstance(item_id, str) and item_id and isinstance(changes, list):
+                normalized: list[dict[str, str]] = []
+                for change in changes:
+                    if not isinstance(change, Mapping):
+                        continue
+                    path = change.get("path")
+                    kind = change.get("kind")
+                    change_type = (
+                        kind.get("type") if isinstance(kind, Mapping) else None
+                    )
+                    if (
+                        isinstance(path, str)
+                        and path.strip()
+                        and isinstance(change_type, str)
+                        and change_type in {"add", "update", "delete"}
+                    ):
+                        normalized_change = {
+                            "path": path.strip(),
+                            "type": change_type,
+                        }
+                        move_path = (
+                            kind.get("move_path")
+                            if isinstance(kind, Mapping)
+                            else None
+                        )
+                        if isinstance(move_path, str) and move_path.strip():
+                            normalized_change["move_path"] = move_path.strip()
+                        normalized.append(normalized_change)
+                self._pending_file_changes[item_id] = normalized
+            return
         if method != "turn/completed":
             return
         turn = params.get("turn")
@@ -1982,18 +2033,30 @@ class CodexAppServerSession:
             for decision in decisions
             if isinstance(decision, str) and decision in option_kinds
         ]
+        item_id = params.get("itemId")
+        tool_call: dict[str, Any] = {
+            "toolCallId": item_id,
+            "title": method,
+            "command": params.get("command"),
+            "cwd": params.get("cwd") or str(self.cwd),
+            "reason": params.get("reason"),
+        }
+        if method == "item/fileChange/requestApproval":
+            tool_call["fileChanges"] = self._pending_file_changes.pop(
+                str(item_id or ""), []
+            )
+            tool_call["grantRoot"] = params.get("grantRoot")
+        elif method == "item/commandExecution/requestApproval":
+            tool_call["commandActions"] = params.get("commandActions")
+            tool_call["additionalPermissions"] = params.get(
+                "additionalPermissions"
+            )
         request = normalize_permission_request(
             {
                 "request_id": f"permission_{uuid4().hex}",
                 "provider": "CODEX",
                 "session_id": params.get("threadId"),
-                "tool_call": {
-                    "toolCallId": params.get("itemId"),
-                    "title": method,
-                    "command": params.get("command"),
-                    "cwd": params.get("cwd"),
-                    "reason": params.get("reason"),
-                },
+                "tool_call": tool_call,
                 "options": options,
             }
         )
@@ -2077,7 +2140,7 @@ class ClaudeCodeSession:
         session_observer: Callable[[str], None],
         ephemeral: bool = False,
         allow_read_only_tools: bool = False,
-        max_turns: int = 8,
+        max_turns: int | None = 8,
         response_timeout_seconds: float = 300,
         json_schema: Mapping[str, Any] | None = None,
         native_runner: Callable[[NativeCliRequest], NativeCliResult] = run_native_cli,
@@ -2098,7 +2161,7 @@ class ClaudeCodeSession:
         self.session_observer = session_observer
         self.ephemeral = bool(ephemeral)
         self.allow_read_only_tools = bool(allow_read_only_tools)
-        self.max_turns = max(1, int(max_turns))
+        self.max_turns = None if max_turns is None else max(1, int(max_turns))
         self.response_timeout_seconds = _positive_timeout_seconds(
             response_timeout_seconds, "CLAUDE_RESPONSE_TIMEOUT_INVALID"
         )
@@ -2128,8 +2191,6 @@ class ClaudeCodeSession:
             CLAUDE_PERMISSION_MODE,
             "--model",
             self.model,
-            "--max-turns",
-            str(self.max_turns),
             "--strict-mcp-config",
             "--tools",
             (
@@ -2138,6 +2199,8 @@ class ClaudeCodeSession:
                 else ""
             ),
         ]
+        if self.max_turns is not None:
+            arguments.extend(("--max-turns", str(self.max_turns)))
         if self.ephemeral:
             arguments.append("--no-session-persistence")
         elif self._resume_session and self.session_id:

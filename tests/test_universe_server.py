@@ -5810,6 +5810,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {"project_id": "GCS", "worker_role": "REVIEWER"},
         )
         self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "universe.worker-binding-snapshot.v1",
+            inherited["snapshot"]["schema"],
+        )
         self.assertEqual("CLAUDE", inherited["snapshot"]["provider"])
         first_digest = inherited["snapshot"]["binding_digest"]
         self.assertEqual(64, len(first_digest))

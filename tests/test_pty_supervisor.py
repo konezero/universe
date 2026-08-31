@@ -28,6 +28,7 @@ from universe_app.terminal_host import TerminalHost  # noqa: E402
 from universe_pty_supervisor import (  # noqa: E402
     PtySupervisor,
     Server,
+    SupervisorInstanceLock,
     reconnection_registry_from_environment,
 )
 
@@ -177,6 +178,21 @@ class PtySupervisorTests(unittest.TestCase):
             popen.call_args.kwargs["env"]["UNIVERSE_RECONNECTION_HOST_ENABLED"],
         )
 
+    def test_instance_lock_prevents_duplicate_supervisor_for_same_state(self) -> None:
+        state_path = Path(tempfile.mkdtemp(prefix="pty-instance-")) / "pty-supervisor.json"
+        first = SupervisorInstanceLock(state_path)
+        duplicate = SupervisorInstanceLock(state_path)
+        replacement = SupervisorInstanceLock(state_path)
+        try:
+            self.assertTrue(first.acquire())
+            self.assertFalse(duplicate.acquire())
+            first.close()
+            self.assertTrue(replacement.acquire())
+        finally:
+            first.close()
+            duplicate.close()
+            replacement.close()
+
     def test_restart_ends_existing_supervisor_before_starting_replacement(self) -> None:
         state_path = Path(tempfile.mkdtemp(prefix="pty-restart-")) / "pty-supervisor.json"
         state_path.write_text(
@@ -226,7 +242,10 @@ class PtySupervisorTests(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=4) as response:
                 return response.status, json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
-            return error.code, json.loads(error.read().decode("utf-8"))
+            try:
+                return error.code, json.loads(error.read().decode("utf-8"))
+            finally:
+                error.close()
 
     def test_managed_attach_route_forwards_to_terminal_host(self) -> None:
         evidence = {
@@ -249,6 +268,28 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("MANAGED_SHELL_ATTACHED", payload["status"])
         record.assert_called_once_with("term_owned", evidence)
+
+    def test_create_returns_diagnostic_for_unexpected_host_failure(self) -> None:
+        with patch.object(
+            self.server.supervisor.host,
+            "create",
+            side_effect=OSError(206, "The filename or extension is too long"),
+        ):
+            status, payload = self.request(
+                "POST",
+                "/v1/terminals",
+                {
+                    "project_id": "universe",
+                    "mode": "MASTER",
+                    "cwd": str(ROOT),
+                    "provider": "CLAUDE",
+                },
+            )
+
+        self.assertEqual(500, status)
+        self.assertEqual("PTY_SUPERVISOR_CREATE_FAILED", payload["error_code"])
+        self.assertIn("OSError", payload["detail"])
+        self.assertIn("206", payload["detail"])
 
     def test_create_list_and_read_survives_client_disconnect_model(self) -> None:
         status, created = self.request(

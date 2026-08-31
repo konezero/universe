@@ -131,7 +131,6 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             "mutation_scope": {"operations": [], "targets": []},
             "context_pack": {"summary": "read only"},
             "output_contract": {"kind": "review"},
-            "max_turns": 1,
         }
 
     def test_redacted_record_excludes_endpoint_token_and_bodies(self) -> None:
@@ -140,6 +139,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         self.assertNotIn("transient-token", encoded)
         self.assertNotIn("127.0.0.1:17777", encoded)
         self.assertNotIn("read only", encoded)
+        self.assertNotIn("max_turns", record)
         self.assertIn("context_pack_digest", record)
         self.assertEqual("REDACTED", record["result_mode"])
 
@@ -190,6 +190,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             "universe.task-frame-worker-dispatch-request.v1",
             dispatcher.dispatch_calls[0]["schema"],
         )
+        self.assertNotIn("max_turns", dispatcher.dispatch_calls[0])
         self.assertEqual("REDACTED", dispatcher.dispatch_calls[0]["result_mode"])
 
     def test_unattested_worker_session_boundary_is_rejected(self) -> None:

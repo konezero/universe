@@ -39,7 +39,7 @@ from universe_app.managed_shell import (
     ProcessIdentity,
     ShellObservation,
     host_process_probes,
-    managed_provider_command_line,
+    managed_host_provider_command,
     managed_shell_cmdline,
     observe_process_tree,
     plan_hook_timeout_recovery,
@@ -1295,32 +1295,46 @@ class TerminalHost:
         pipe_console_input = (
             profile == "SUPERVISED_STDIO" and resolved_provider == "CLAUDE"
         )
-        provider_command = managed_provider_command_line(
-            [executable, *argv],
-            pipe_console_input=pipe_console_input,
-        )
+        provider_command = ""
+        provider_command_environment: dict[str, str] = {}
+        if self._reconnection_registry is not None:
+            provider_command, provider_command_environment = (
+                managed_host_provider_command(
+                    [executable, *argv],
+                    pipe_console_input=pipe_console_input,
+                )
+            )
         provider_bootstrap_input = (
             startup_input(resolved_provider, resume_session_ref)
             if profile == "INTERACTIVE"
             else b""
         )
         session.bootstrap_input = provider_bootstrap_input
-        shell_argv = managed_shell_cmdline(
-            [executable, *argv],
-            pipe_console_input=pipe_console_input,
+        shell_argv = (
+            managed_shell_cmdline(
+                [executable, *argv],
+                pipe_console_input=pipe_console_input,
+            )
+            if self._reconnection_registry is None
+            else ""
         )
         child_environment["UNIVERSE_MANAGED_SHELL"] = "1"
         child_environment["UNIVERSE_SESSION_ANCHOR_REF"] = anchor_ref
         try:
             if self._reconnection_registry is not None:
                 host_environment = dict(child_environment)
+                host_environment.update(provider_command_environment)
                 host_environment.setdefault("TERM", "xterm-256color")
                 host_environment.setdefault("COLORTERM", "truecolor")
+                shell_args = ["/d", "/q"]
+                if provider_command_environment:
+                    shell_args.append("/v:on")
+                shell_args.append("/k")
                 client = self._reconnection_registry.launch(
                     anchor_ref,
                     shell=shell_executable,
                     cwd=Path(session.cwd),
-                    shell_args=("/d", "/q", "/k"),
+                    shell_args=tuple(shell_args),
                     host_kind="SESSION",
                     owner_ref=anchor_ref,
                     channel_lookup_file=(
