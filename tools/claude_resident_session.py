@@ -29,6 +29,7 @@ from agent_session_gateway import (
     _supervised_process_identity,
 )
 from process_identity import launched_process_identity
+from universe_app.terminal_host import TerminalHostError
 from windows_native_cli import NativeCliRequest, open_native_cli
 
 # Environment names that carry the permission capability token. They belong to
@@ -174,21 +175,45 @@ class ClaudeStreamProcess:
                         "CLAUDE_HOST_REPLACEMENT_UNAVAILABLE"
                     )
                 terminal = None
-            if terminal is None:
-                terminal = terminal_host.create(
+            def create_terminal(replace_ref: str = "") -> Mapping[str, Any]:
+                return terminal_host.create(
                     project_id=project_id,
                     mode=mode,
                     cwd=str(cwd),
                     provider="CLAUDE",
                     supervisor_session_id=supervisor_session_id,
                     session_anchor_ref=session_anchor_ref,
-                    replace_host_session_ref=replace_host_session_ref,
+                    replace_host_session_ref=replace_ref,
                     launch_profile="SUPERVISED_STDIO",
                     provider_arguments=list(self._arguments),
                     provider_environment={str(k): str(v) for k, v in environment.items()},
                     cols=240,
                     rows=40,
                 )
+
+            if terminal is None:
+                try:
+                    terminal = create_terminal(replace_host_session_ref)
+                except TerminalHostError as error:
+                    if (
+                        reuse_live_terminal
+                        or error.code != "TERMINAL_ANCHOR_ALREADY_HOSTED"
+                    ):
+                        raise
+                    # Reconciliation can attach the exact Host after the first
+                    # lookup but before create. Resolve it once more and replace
+                    # that Host atomically for this new process-bound MCP broker.
+                    terminal = find_live(
+                        project_id=project_id,
+                        mode=mode,
+                        provider="CLAUDE",
+                        supervisor_session_id=supervisor_session_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    replacement = str((terminal or {}).get("host_session_ref") or "")
+                    if not replacement:
+                        raise
+                    terminal = create_terminal(replacement)
             elif (
                 str(terminal.get("session_anchor_ref") or "") != session_anchor_ref
                 or str(terminal.get("launch_profile") or "")

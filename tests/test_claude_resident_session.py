@@ -767,6 +767,77 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
         finally:
             process.close()
 
+    def test_process_bound_permission_channel_retries_reconciliation_race(self) -> None:
+        import queue
+        from types import SimpleNamespace
+
+        from universe_app.terminal_host import TerminalHostError
+
+        class Host:
+            def __init__(self) -> None:
+                self.find_calls = 0
+                self.create_calls: list[dict[str, Any]] = []
+                self.waiter: queue.Queue = queue.Queue()
+
+            def find_live(self, **_kwargs):
+                self.find_calls += 1
+                if self.find_calls == 1:
+                    return None
+                return {
+                    "terminal_id": "term-raced",
+                    "host_session_ref": "host-raced",
+                    "session_anchor_ref": "anchor-exact",
+                    "launch_profile": "SUPERVISED_STDIO",
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                }
+
+            def create(self, **kwargs):
+                self.create_calls.append(dict(kwargs))
+                if len(self.create_calls) == 1:
+                    raise TerminalHostError(
+                        "TERMINAL_ANCHOR_ALREADY_HOSTED",
+                        "Host attached during reconciliation",
+                    )
+                return {
+                    "terminal_id": "term-fresh",
+                    "host_session_ref": "host-fresh",
+                    "session_anchor_ref": "anchor-exact",
+                    "launch_profile": "SUPERVISED_STDIO",
+                    "backend_owner": "RUST_RECONNECTION_HOST",
+                }
+
+            def subscribe(self, _terminal_id):
+                return self.waiter
+
+            def unsubscribe(self, _terminal_id, waiter):
+                waiter.put_nowait(None)
+
+            def get_host(self, host_session_ref):
+                return SimpleNamespace(state="LIVE", reconnection_host_id=host_session_ref)
+
+        host = Host()
+        process = ClaudeStreamProcess(
+            executable=Path("claude.exe"),
+            arguments=("-p",),
+            cwd=Path("."),
+            environment={},
+            event_handler=lambda _event: None,
+            terminal_host=host,
+            project_id="universe",
+            mode="MASTER",
+            supervisor_session_id="supervisor-master",
+            session_anchor_ref="anchor-exact",
+            reuse_live_terminal=False,
+        )
+        try:
+            self.assertEqual(2, host.find_calls)
+            self.assertEqual(2, len(host.create_calls))
+            self.assertEqual(
+                "host-raced", host.create_calls[1]["replace_host_session_ref"]
+            )
+        finally:
+            process.close()
+
 
 if __name__ == "__main__":
     unittest.main()
