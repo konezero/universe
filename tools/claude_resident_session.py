@@ -197,7 +197,9 @@ class ClaudeStreamProcess:
                 except TerminalHostError as error:
                     if (
                         reuse_live_terminal
-                        or error.code != "TERMINAL_ANCHOR_ALREADY_HOSTED"
+                        or not str(error.code).startswith(
+                            "TERMINAL_ANCHOR_ALREADY_HOSTED"
+                        )
                     ):
                         raise
                     # Reconciliation can attach the exact Host after the first
