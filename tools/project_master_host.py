@@ -1303,7 +1303,7 @@ class ProjectModeCoordinator:
                 try:
                     child_result = self.worker_dispatcher.dispatch(request)
                 except WorkerDispatchError as error:
-                    raise ProjectMasterHostError(error.code) from error
+                    raise ProjectMasterHostError(f"{error.code}: {error}") from error
                 terminal_status = _text(child_result.get("status"), "child.status")
                 if terminal_status not in {
                     "TASK_COMPLETED",
@@ -1349,7 +1349,7 @@ class ProjectModeCoordinator:
                 boss_request, captured_envelope
             )
         except WorkerDispatchError as error:
-            raise ProjectMasterHostError(error.code) from error
+            raise ProjectMasterHostError(f"{error.code}: {error}") from error
         if boss_completion.get("status") != "TASK_COMPLETED":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_COMPLETION_FAILED")
         return {
@@ -1583,7 +1583,7 @@ class ProjectModeCoordinator:
                 failure_reason=_text(reason, "boss_finalization_reason"),
             )
         except WorkerDispatchError as error:
-            raise ProjectMasterHostError(error.code) from error
+            raise ProjectMasterHostError(f"{error.code}: {error}") from error
 
     @staticmethod
     def _boss_allocation_output_contract(
@@ -3090,7 +3090,7 @@ class ProjectModeCoordinator:
                 failure_reason="replacement Host found a claimed Boss without allocation or result evidence",
             )
         except WorkerDispatchError as error:
-            raise ProjectMasterHostError(error.code) from error
+            raise ProjectMasterHostError(f"{error.code}: {error}") from error
 
     def _register_process_lease(
         self,
