@@ -9,15 +9,19 @@ import subprocess  # nosec B404
 import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, TextIO
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from host_profile import resolve_host_tool
 from process_identity import WindowsKillOnCloseJob, launched_process_identity
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
+from universe_action_registry import find_forbidden_caller_fields
 
 
 PLANNING_RUNTIME_BINDING_SCHEMA = "universe.planning-runtime-binding.v1"
+ACTION_ENDPOINT_PATH = "/v1/actions"
 
 
 class UniverseConductorRuntimeError(RuntimeError):
@@ -63,6 +67,7 @@ class UniverseConductorRuntime:
         process_factory: ProcessFactory = subprocess.Popen,
         startup_timeout: float = 30,
         session_supervisor: SessionSupervisorStore | None = None,
+        action_endpoint: str | None = None,
     ) -> None:
         self.repository_root = repository_root.expanduser().resolve(strict=True)
         self.session_node = _text(session_node, "session_node")
@@ -77,6 +82,7 @@ class UniverseConductorRuntime:
         self.process_factory = process_factory
         self.startup_timeout = startup_timeout
         self.session_supervisor = session_supervisor
+        self.action_endpoint = str(action_endpoint or "").strip().rstrip("/")
         self.runtime_cli = (
             self.repository_root
             / ".ai"
@@ -259,6 +265,21 @@ class UniverseConductorRuntime:
         if len(candidates) != 1:
             return None
         return candidates[0]
+
+    def invoke_action(
+        self, action_id: str, request: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        binding = self._binding
+        if not isinstance(binding, Mapping):
+            raise UniverseConductorRuntimeError(
+                "UNIVERSE_ACTION_RUNTIME_BINDING_UNAVAILABLE"
+            )
+        endpoint = str(self.action_endpoint or binding.get("endpoint") or "").strip()
+        token = str(binding.get("token") or "").strip()
+        return invoke_server_action(endpoint, token, action_id, request)
+
+    dispatch_action = invoke_action
+    execute_action = invoke_action
 
     def observe(self, message_id: str) -> Mapping[str, Any]:
         normalized_id = _text(message_id, "message_id")
@@ -575,6 +596,59 @@ class UniverseConductorRuntime:
         }
         self._source_binding = binding
         return dict(binding)
+
+def invoke_server_action(
+    endpoint: str,
+    token: str,
+    action_id: str,
+    request: Mapping[str, Any],
+    *,
+    timeout: float = 30.0,
+) -> Mapping[str, Any]:
+    """Send the canonical Action envelope to the server-owned handler."""
+
+    endpoint = str(endpoint or "").strip().rstrip("/")
+    token = str(token or "").strip()
+    action_id = str(action_id or "").strip()
+    if not endpoint or not token or not action_id:
+        raise UniverseConductorRuntimeError("UNIVERSE_ACTION_BINDING_INVALID")
+    if not isinstance(request, Mapping):
+        raise UniverseConductorRuntimeError("UNIVERSE_ACTION_REQUEST_INVALID")
+    forbidden = find_forbidden_caller_fields(request)
+    if forbidden:
+        raise UniverseConductorRuntimeError(
+            "ACTION_CALLER_CONTEXT_FORBIDDEN:" + ",".join(forbidden)
+        )
+    body = json.dumps(
+        {"action_id": action_id, "request": dict(request)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    http_request = Request(
+        endpoint + ACTION_ENDPOINT_PATH,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(http_request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise UniverseConductorRuntimeError(
+            f"UNIVERSE_ACTION_REQUEST_FAILED:{error.code}:{detail}"
+        ) from error
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UniverseConductorRuntimeError(
+            "UNIVERSE_ACTION_REQUEST_FAILED"
+        ) from error
+    if not isinstance(payload, Mapping):
+        raise UniverseConductorRuntimeError("UNIVERSE_ACTION_RESULT_INVALID")
+    return dict(payload)
+
 
 def _required_host_executable(tool: str) -> Path:
     resolved = resolve_host_tool(tool)

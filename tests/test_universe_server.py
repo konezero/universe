@@ -8834,6 +8834,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(all("plan" not in node["data"] for node in work_plan_nodes))
         self.assertTrue(all(node["data"]["plan_in_graph"] is False for node in work_plan_nodes))
 
+    def test_action_server_rejects_client_context_claims(self) -> None:
+        with self.assertRaises(UniverseError) as raised:
+            self.server.execute_action(
+                "feature.goal.start",
+                {"feature_id": "feature-for-test", "mode": "MASTER"},
+                source="TEST_CALLER",
+            )
+        self.assertEqual("ACTION_CALLER_CONTEXT_FORBIDDEN", raised.exception.code)
+        context = self.server.resolve_action_context("feature.goal.start", "TEST")
+        self.assertEqual("USER", context["actor"]["role"])
+        self.assertNotEqual("TEST_CALLER", context["source"])
+
     def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
         self.server.store.register_project(self.registration())
         room = self.server.multi_rooms.create_meeting_room(
@@ -8929,6 +8941,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CREATED, status)
         self.assertEqual("FEATURE_GOAL_STARTED", started["status"])
         self.assertEqual("ACTIVE", started["goal_start_receipt"]["status"])
+        self.assertEqual(
+            "universe.feature-goal-start-receipt.v1",
+            started["goal_start_receipt"]["schema"],
+        )
+        expected_receipt_id = "goal_start_" + hashlib.sha256(
+            json.dumps(
+                {
+                    "feature_id": feature["feature_id"],
+                    "expected_path_id": paths[1]["expected_path_id"],
+                    "expected_path_digest": paths[1]["route_digest"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        self.assertEqual(expected_receipt_id, started["goal_start_receipt"]["receipt_id"])
         self.assertEqual(paths[1]["route_digest"], started["goal_start_receipt"]["expected_path_digest"])
         self.assertEqual("PUSH_PROHIBITED", started["goal_start_receipt"]["push_policy"])
         self.assertTrue(started["goal_created"])
@@ -8955,6 +8984,54 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertFalse(replay["goal_created"])
         self.assertFalse(replay["authority_created"])
         self.assertEqual(started["goal"]["goal_id"], replay["goal"]["goal_id"])
+
+        status, action_replay = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "feature.goal.start",
+                "request": {"feature_id": feature["feature_id"], **request},
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("FEATURE_GOAL_START_REPLAYED", action_replay["status"])
+        self.assertEqual(
+            started["goal_start_receipt"]["receipt_id"],
+            action_replay["goal_start_receipt"]["receipt_id"],
+        )
+        self.assertEqual(
+            started["goal_start_receipt"]["expected_path_digest"],
+            action_replay["goal_start_receipt"]["expected_path_digest"],
+        )
+        status, legacy_equivalent = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}/goal-start-receipts",
+            request,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(action_replay["status"], legacy_equivalent["status"])
+        self.assertEqual(
+            action_replay["goal_start_receipt"],
+            legacy_equivalent["goal_start_receipt"],
+        )
+
+        status, push_rejected = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "feature.goal.start",
+                "request": {
+                    "feature_id": feature["feature_id"],
+                    **request,
+                    "push_policy": "PUSH_ALLOWED",
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("GOAL_START_PUSH_POLICY_INVALID", push_rejected["error_code"])
 
         status, conflict = self.request(
             "POST",

@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_conductor_runtime import (  # noqa: E402
     UniverseConductorRuntime,
     UniverseConductorRuntimeError,
+    invoke_server_action,
 )
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore  # noqa: E402
 from windows_native_cli import NativeCliResult  # noqa: E402
@@ -46,6 +47,58 @@ class FakeProcess:
 
 
 class UniverseConductorRuntimeTests(unittest.TestCase):
+    def test_action_client_uses_one_server_envelope_and_rejects_context_claims(self) -> None:
+        class ActionResponse:
+            status = 200
+
+            @staticmethod
+            def read() -> bytes:
+                return b'{"status":"FEATURE_GOAL_START_REPLAYED"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+            runtime = UniverseConductorRuntime(
+                root, action_endpoint="http://127.0.0.1:41992"
+            )
+            runtime._binding = {
+                "endpoint": "http://127.0.0.1:41991",
+                "token": "credential-ref-only",
+            }
+            with patch(
+                "universe_conductor_runtime.urlopen",
+                return_value=ActionResponse(),
+            ) as opened:
+                result = runtime.invoke_action(
+                    "feature.goal.start", {"feature_id": "feature-1"}
+                )
+            request = opened.call_args.args[0]
+            payload = json.loads(request.data.decode("utf-8"))
+            self.assertEqual("http://127.0.0.1:41992/v1/actions", request.full_url)
+            self.assertEqual("FEATURE_GOAL_START_REPLAYED", result["status"])
+            self.assertEqual("feature.goal.start", payload["action_id"])
+            self.assertEqual({"feature_id": "feature-1"}, payload["request"])
+            self.assertNotIn("actor", payload)
+            self.assertNotIn("context", payload)
+            self.assertNotIn("mode", payload["request"])
+            with self.assertRaisesRegex(
+                UniverseConductorRuntimeError, "ACTION_CALLER_CONTEXT_FORBIDDEN"
+            ):
+                invoke_server_action(
+                    "http://127.0.0.1:41991",
+                    "credential-ref-only",
+                    "feature.goal.start",
+                    {"feature_id": "feature-1", "mode": "MASTER"},
+                )
+
     def test_exact_session_attachment_does_not_replace_host_process_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

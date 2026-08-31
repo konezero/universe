@@ -755,7 +755,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('/meeting-runs', APP)
         self.assertIn('/feature-nodes', APP)
         self.assertIn('/expected-paths', APP)
-        self.assertIn('/goal-start-receipts', APP)
+        self.assertIn('/v1/actions', APP)
+        self.assertIn('async function invokeServerAction', APP)
+        self.assertIn('"feature.goal.start"', APP)
         feature_slice = APP[
             APP.index("async function refreshActiveRoomFeatures") : APP.index(
                 "async function openMultiRoom"
@@ -764,6 +766,19 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("expected_feature_revision: feature.revision", feature_slice)
         self.assertIn("expected_path_digest: path.route_digest", feature_slice)
         self.assertIn('push_policy: "PUSH_PROHIBITED"', feature_slice)
+        goal_start_slice = APP[
+            APP.index("async function startExpectedPathGoal") : APP.index(
+                "async function materializeFeatureGoal"
+            )
+        ]
+        self.assertIn('invokeServerAction("feature.goal.start"', goal_start_slice)
+        self.assertIn("feature_id: feature.feature_id", goal_start_slice)
+        self.assertNotIn("actor:", goal_start_slice)
+        self.assertNotIn("context:", goal_start_slice)
+        self.assertNotIn("authority:", goal_start_slice)
+        self.assertNotIn("mode:", goal_start_slice)
+        self.assertNotIn("role:", goal_start_slice)
+        self.assertNotIn("approval:", goal_start_slice)
         self.assertIn("Adopt + Start Goal", feature_slice)
         self.assertIn("result.automation?.surface?.automation_state", feature_slice)
         self.assertIn("path.artifact_revision", APP)

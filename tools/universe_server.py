@@ -178,6 +178,14 @@ from universe_conductor_runtime import (
     UniverseConductorRuntime,
     UniverseConductorRuntimeError,
 )
+from universe_action_registry import (
+    ACTION_CONTEXT_SCHEMA,
+    FEATURE_GOAL_START_ACTION_ID,
+    ActionRegistryError,
+    UnknownActionError,
+    build_default_action_registry,
+    find_forbidden_caller_fields,
+)
 from universe_remote_gateway import (
     GatewayError,
     default_gateway_state_path,
@@ -24693,6 +24701,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             failure_evidence_database=store.database_path,
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
+        self.action_registry = build_default_action_registry(
+            self._handle_feature_goal_start_action
+        )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_error: dict[str, str] | None = None
         self._planning_binding_lock = threading.RLock()
@@ -25535,6 +25546,152 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         return self.planning_binding_status()
 
+    def resolve_action_context(
+        self, action_id: str, source: str = "SERVER"
+    ) -> dict[str, Any]:
+        contract = self.action_registry.lookup(action_id)
+        mode = str(self.mode_contract.get("mode") or "UNKNOWN").upper()
+        role = str(self.mode_contract.get("role") or "UNKNOWN").upper()
+        return {
+            "schema": ACTION_CONTEXT_SCHEMA,
+            "action_id": contract.action_id,
+            "source": source,
+            "actor": {
+                "actor_ref": "server://loopback-user",
+                "kind": "USER",
+                "role": "USER",
+            },
+            "context": {
+                "mode": mode,
+                "role": role,
+                "authority": self.mode_contract.get("authority") or "UNKNOWN",
+                "assignment": self.mode_contract.get("assignment") or "UNKNOWN",
+                "approval": self.mode_contract.get("approval") or "UNKNOWN",
+            },
+        }
+
+    @staticmethod
+    def action_http_status(result: Mapping[str, Any]) -> HTTPStatus:
+        return (
+            HTTPStatus.CREATED
+            if result.get("status") == "FEATURE_GOAL_STARTED"
+            else HTTPStatus.OK
+        )
+
+    def _action_server_endpoint(self) -> str:
+        host, port = self.server_address[:2]
+        host_text = host.decode("ascii") if isinstance(host, bytes) else host
+        return f"http://{host_text}:{port}"
+
+    def execute_action(
+        self,
+        action_id: str,
+        request: Mapping[str, Any],
+        *,
+        source: str = "SERVER",
+    ) -> dict[str, Any]:
+        if not isinstance(action_id, str) or not action_id.strip():
+            raise UniverseError("ACTION_ID_INVALID", "action_id is required")
+        if not isinstance(request, Mapping):
+            raise UniverseError("ACTION_REQUEST_INVALID", "Action request must be an object")
+        forbidden = find_forbidden_caller_fields(request)
+        if forbidden:
+            raise UniverseError(
+                "ACTION_CALLER_CONTEXT_FORBIDDEN",
+                "server-owned fields are not accepted: " + ", ".join(forbidden),
+                HTTPStatus.FORBIDDEN,
+            )
+        try:
+            context = self.resolve_action_context(action_id.strip(), source)
+            return self.action_registry.dispatch(action_id.strip(), request, context)
+        except UnknownActionError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+        except ActionRegistryError as error:
+            status = (
+                HTTPStatus.FORBIDDEN
+                if error.code == "ACTION_CALLER_CONTEXT_FORBIDDEN"
+                else HTTPStatus.BAD_REQUEST
+            )
+            raise UniverseError(error.code, error.detail, status) from error
+
+    dispatch_action = execute_action
+    handle_action = execute_action
+
+    def _handle_feature_goal_start_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "feature.goal.start requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request,
+            field="feature_goal_start_action",
+            required=frozenset(
+                {
+                    "feature_id",
+                    "expected_path_id",
+                    "expected_feature_revision",
+                    "expected_path_digest",
+                    "approved_scope",
+                    "constraints",
+                    "validation",
+                    "local_commit_policy",
+                    "push_policy",
+                    "rationale",
+                }
+            ),
+            optional=frozenset({"evidence_refs"}),
+        )
+        feature_id = _identifier(action.pop("feature_id"), "feature_id")
+        action["started_by_role"] = "USER"
+        return self._complete_feature_goal_start(feature_id, action)
+
+    def _complete_feature_goal_start(
+        self, feature_id: str, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        receipt, adoption, derivation, goal, created = self.store.start_feature_goal(
+            feature_id, value
+        )
+        feature = self.store.get_feature_node(feature_id)
+        plan_materialization, _plan_created = (
+            self.store.materialize_goal_start_work_plan(goal["goal_id"])
+        )
+        try:
+            automation = self.advance_goal_automation(
+                goal["goal_id"],
+                {"approval": "ADVANCE", "expected_goal_revision": goal["revision"]},
+            )
+        except UniverseError as error:
+            automation = {
+                "schema": API_SCHEMA,
+                "status": "GOAL_AUTOMATION_BLOCKED",
+                "error_code": error.code,
+                "detail": error.detail,
+                "surface": self.goal_automation_surface(goal["goal_id"]),
+            }
+        return {
+            "schema": API_SCHEMA,
+            "status": "FEATURE_GOAL_STARTED" if created else "FEATURE_GOAL_START_REPLAYED",
+            "feature": feature,
+            "goal_start_receipt": receipt,
+            "adoption": adoption,
+            "derivation": derivation,
+            "goal": goal,
+            "plan_materialization": plan_materialization,
+            "automation": automation,
+            "goal_created": created,
+            "authority_created": created,
+            "execution_assignment_created": False,
+            "task_frame_created": False,
+            "rag_adopted": False,
+            "repository_pushed": False,
+            "next_operation": automation["surface"]["next_operation"],
+        }
+
     def _new_conductor_runtime(self) -> UniverseConductorRuntime:
         if self._conductor_runtime_factory is not None:
             return self._conductor_runtime_factory(
@@ -25544,6 +25701,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             Path(__file__).resolve().parents[1],
             session_node="universe",
             requested_mode="CONDUCTOR",
+            action_endpoint=self._action_server_endpoint(),
             source_binding_resolver=(
                 lambda _root: self.store.selected_project_release_binding(
                     "universe"
@@ -25592,6 +25750,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     project_root,
                     session_node=str(session.get("node") or project_id),
                     requested_mode=mode,
+                    action_endpoint=self._action_server_endpoint(),
                     exact_session_id=session_id,
                     session_location="UNIVERSE_SESSION_HOST",
                     parent_actor_ref=f"universe-session-host:{session_id}",
@@ -38106,6 +38265,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self._read_json()
+            if path == "/v1/actions":
+                action_envelope = _exact_object_fields(
+                    body,
+                    field="action",
+                    required=frozenset({"action_id", "request"}),
+                )
+                result = self.server.execute_action(
+                    action_envelope["action_id"],
+                    action_envelope["request"],
+                    source="HTTP_ACTION",
+                )
+                self._send(self.server.action_http_status(result), result)
+                return
             if path == "/v1/conductor-session/prepare":
                 self._send(
                     HTTPStatus.OK,
@@ -39435,49 +39607,27 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             feature_goal_starts = re.fullmatch(r"/v1/feature-nodes/([^/]+)/goal-start-receipts", path)
+            # Required legacy compatibility boundary for goal-start only.
+            # owner: UniverseHTTPServer and its registered Action adapter.
+            # scope: POST /v1/feature-nodes/{feature_id}/goal-start-receipts.
+            # removal condition: all callers use /v1/actions and this route is retired.
+            # regression evidence: UniverseLocalServiceTests.test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority.
             if feature_goal_starts is not None:
-                receipt, adoption, derivation, goal, created = self.server.store.start_feature_goal(
-                    unquote(feature_goal_starts.group(1)),
-                    {**body, "started_by_role": "USER"},
-                )
-                feature = self.server.store.get_feature_node(unquote(feature_goal_starts.group(1)))
-                plan_materialization, _plan_created = self.server.store.materialize_goal_start_work_plan(
-                    goal["goal_id"]
-                )
-                try:
-                    automation = self.server.advance_goal_automation(
-                        goal["goal_id"],
-                        {"approval": "ADVANCE", "expected_goal_revision": goal["revision"]},
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "REQUEST_INVALID", "feature goal start body must be an object"
                     )
-                except UniverseError as error:
-                    automation = {
-                        "schema": API_SCHEMA,
-                        "status": "GOAL_AUTOMATION_BLOCKED",
-                        "error_code": error.code,
-                        "detail": error.detail,
-                        "surface": self.server.goal_automation_surface(goal["goal_id"]),
-                    }
-                self._send(
-                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                legacy_request = dict(body)
+                legacy_request.pop("started_by_role", None)
+                result = self.server.execute_action(
+                    FEATURE_GOAL_START_ACTION_ID,
                     {
-                        "schema": API_SCHEMA,
-                        "status": "FEATURE_GOAL_STARTED" if created else "FEATURE_GOAL_START_REPLAYED",
-                        "feature": feature,
-                        "goal_start_receipt": receipt,
-                        "adoption": adoption,
-                        "derivation": derivation,
-                        "goal": goal,
-                        "plan_materialization": plan_materialization,
-                        "automation": automation,
-                        "goal_created": created,
-                        "authority_created": created,
-                        "execution_assignment_created": False,
-                        "task_frame_created": False,
-                        "rag_adopted": False,
-                        "repository_pushed": False,
-                        "next_operation": automation["surface"]["next_operation"],
+                        **legacy_request,
+                        "feature_id": unquote(feature_goal_starts.group(1)),
                     },
+                    source="LEGACY_DIRECT",
                 )
+                self._send(self.server.action_http_status(result), result)
                 return
             goal_work_plan_runs = re.fullmatch(r"/v1/goals/([^/]+)/work-plan-runs", path)
             if goal_work_plan_runs is not None:

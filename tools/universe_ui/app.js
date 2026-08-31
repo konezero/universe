@@ -1172,6 +1172,13 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function invokeServerAction(actionId, request) {
+  return api("/v1/actions", {
+    method: "POST",
+    body: { action_id: actionId, request },
+  });
+}
+
 async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
   if (state.supervisorRefreshPromise) return state.supervisorRefreshPromise;
   const maxAge = Math.max(0, Number(maxAgeMs) || 0);
@@ -6866,25 +6873,23 @@ async function startExpectedPathGoal(expectedPathId) {
   if (!window.confirm("Adopt this Expected Path and create its bounded Goal Start Receipt?")) {
     return;
   }
-  const result = await api(`/v1/feature-nodes/${encodeURIComponent(feature.feature_id)}/goal-start-receipts`, {
-    method: "POST",
-    body: {
-      expected_path_id: expectedPathId,
-      expected_feature_revision: feature.revision,
-      expected_path_digest: path.route_digest,
-      approved_scope: { project_id: feature.project_id, node_refs: [], write_roots: [] },
-      constraints: [
-        "Conductor execution stays within the adopted Expected Path and approved project scope",
-        "Scope expansion stops for USER approval",
-      ],
-      validation: path.route.acceptance_conditions?.length
-        ? path.route.acceptance_conditions
-        : ["Validate the selected Expected Path before Goal completion"],
-      local_commit_policy: "LOCAL_COMMITS_ALLOWED",
-      push_policy: "PUSH_PROHIBITED",
-      rationale,
-      evidence_refs: [`universe://chat-rooms/${room.room_id}`],
-    },
+  const result = await invokeServerAction("feature.goal.start", {
+    feature_id: feature.feature_id,
+    expected_path_id: expectedPathId,
+    expected_feature_revision: feature.revision,
+    expected_path_digest: path.route_digest,
+    approved_scope: { project_id: feature.project_id, node_refs: [], write_roots: [] },
+    constraints: [
+      "Conductor execution stays within the adopted Expected Path and approved project scope",
+      "Scope expansion stops for USER approval",
+    ],
+    validation: path.route.acceptance_conditions?.length
+      ? path.route.acceptance_conditions
+      : ["Validate the selected Expected Path before Goal completion"],
+    local_commit_policy: "LOCAL_COMMITS_ALLOWED",
+    push_policy: "PUSH_PROHIBITED",
+    rationale,
+    evidence_refs: [`universe://chat-rooms/${room.room_id}`],
   });
   elements.meetingFeatureRationale.value = "";
   await refreshActiveRoomFeatures({ render: false });
