@@ -1152,7 +1152,7 @@ class ProjectModeCoordinator:
         try:
             boss_result = self.worker_dispatcher.dispatch(boss_request)
         except WorkerDispatchError as error:
-            raise ProjectMasterHostError(error.code) from error
+            raise ProjectMasterHostError(f"{error.code}: {error}") from error
         if boss_result.get("status") != "WORKER_OUTPUT_CAPTURED":
             raise ProjectMasterHostError("DESCENDANT_TASK_FRAME_BOSS_CAPTURE_FAILED")
         captured_envelope = boss_result.get("worker_envelope")
