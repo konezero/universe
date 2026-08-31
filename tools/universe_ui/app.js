@@ -76,6 +76,7 @@ const state = {
   accessSurface: "LOCAL_BROWSER",
   supervisorSessions: [],
   supervisorTerminals: [],
+  supervisorHosts: [],
   roomSessionBindings: [],
   selectedSupervisorAnchorKey: null,
   /** A mode can expose many persistent sessions; this is its one chat selection. */
@@ -2074,14 +2075,36 @@ function nodeModeSessionIsCurrent(session) {
   return session?.is_default === true && currentness !== "STALE";
 }
 
+function hostSessionRef(session) {
+  return String(
+    session?.host_session_ref ||
+      session?.pty_binding?.host_session_ref ||
+      session?.pty_binding?.reconnection_host_id ||
+      ""
+  ).trim();
+}
+
+function hostForSession(session) {
+  const wanted = hostSessionRef(session);
+  if (!wanted) return null;
+  return (state.supervisorHosts || []).find(
+    (host) => String(host.host_session_ref || host.host_id || "").trim() === wanted
+  ) || null;
+}
+
+function hostReconnectEligible(session) {
+  const host = hostForSession(session);
+  if (host) return host.reconnect_eligible === true;
+  return session?.pty_binding?.host_reconnect_eligible === true;
+}
+
+function sessionTerminalId(session) {
+  return String(
+    session?.terminal_id || session?.pty_binding?.terminal_id || ""
+  ).trim();
+}
+
 function vendorStreamStateForSession(session) {
-  const terminalId = String(session?.terminal_id || "").trim();
-  if (terminalId) {
-    const live = (state.supervisorTerminals || state.terminals || []).find(
-      (item) => item.terminal_id === terminalId && String(item.state || "").toUpperCase() === "LIVE"
-    );
-    if (live) return "LIVE";
-  }
   const room =
     providerSessionRoomForChatKey(session?.chat_key) ||
     providerChatRoomForSupervisorSession(session);
@@ -2111,10 +2134,6 @@ const NODE_MODE_WORKING_ACTIVITY_STATES = new Set([
 ]);
 
 function nodeModeSessionActivityState(session) {
-  const terminalId = String(session?.terminal_id || "").trim();
-  if (terminalId && Number(state.sessionBusWorking?.[terminalId] || 0) > 0) {
-    return "WORKING";
-  }
   return String(
     session?.current_activity_state ||
       (session?.active_ing === true ? session?.state : "") ||
@@ -2200,14 +2219,6 @@ function nodeModeCoordinates() {
     coordinates.set(key, coordinate);
   };
 
-  for (const terminal of state.supervisorTerminals || state.terminals || []) {
-    if (String(terminal.state || "").toUpperCase() !== "LIVE") continue;
-    const terminalSession = sessionFromPtyTerminal(terminal);
-    record(terminal.project_id, terminal.mode, {
-      hasSession: true,
-      active: nodeModeSessionIsWorking(terminalSession),
-    });
-  }
   for (const session of [
     ...(state.projectAnchorSessions || []),
     ...(state.supervisorSessions || []),
@@ -2322,21 +2333,25 @@ function openNodeModeSessionActions(coordinate, session) {
     elements.nodeSessionActionTitle.textContent = sessionDisplayName(session);
   }
   if (elements.nodeSessionActionSubtitle) {
-    const live = session.terminal_id
-      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
-      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
-    elements.nodeSessionActionSubtitle.textContent = live;
+    const host = hostForSession(session);
+    const compatibility = String(
+      host?.compatibility || session?.pty_binding?.host_compatibility || "UNKNOWN"
+    ).toUpperCase();
+    elements.nodeSessionActionSubtitle.textContent =
+      `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)} / Host ${compatibility.replaceAll("_", " ")}`;
   }
+  const terminalId = sessionTerminalId(session);
   if (elements.nodeSessionStop) {
-    elements.nodeSessionStop.disabled = !String(session.terminal_id || "").trim();
+    elements.nodeSessionStop.disabled = !terminalId;
   }
   if (elements.nodeSessionInbox) {
-    elements.nodeSessionInbox.disabled = !String(session.terminal_id || "").trim();
+    elements.nodeSessionInbox.disabled = !terminalId;
   }
   if (elements.nodeSessionOpen) {
-    elements.nodeSessionOpen.textContent = session.terminal_id
+    elements.nodeSessionOpen.textContent = terminalId
       ? "Open PTY"
       : "PTY Binding";
+    elements.nodeSessionOpen.disabled = Boolean(hostSessionRef(session)) && !hostReconnectEligible(session);
   }
   if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
     elements.nodeSessionActionDialog.showModal();
@@ -2344,7 +2359,7 @@ function openNodeModeSessionActions(coordinate, session) {
 }
 
 function sessionBusTarget(session, coordinate) {
-  const terminalId = String(session?.terminal_id || "").trim();
+  const terminalId = sessionTerminalId(session);
   const anchorRef = sessionAnchorRef(session);
   if (terminalId || anchorRef) {
     return {
@@ -2569,7 +2584,9 @@ function openPtySessionInspectSummary(coordinate, session) {
       ["Project", String(session.project_id || session.node || coordinate?.project?.project_id || "")],
       ["Mode", String(session.mode || coordinate?.mode || "").toUpperCase()],
       ["Provider", String(session.provider || "UNKNOWN").toUpperCase()],
-      ["PTY", session.terminal_id ? `${session.terminal_id}${session.pid ? ` / ${session.pid}` : ""}` : "none"],
+      ["Host", hostSessionRef(session) || "none"],
+      ["Host compatibility", String(hostForSession(session)?.compatibility || session?.pty_binding?.host_compatibility || "UNKNOWN")],
+      ["PTY", sessionTerminalId(session) || "none"],
       ["State", String(session.state || vendorStreamStateForSession(session) || "")],
     ];
     for (const [label, value] of facts) {
@@ -2595,7 +2612,7 @@ async function inspectNodeModeSession(coordinate, session) {
 }
 
 async function endNodeModePtySession(session) {
-  const terminalId = String(session?.terminal_id || "").trim();
+  const terminalId = sessionTerminalId(session);
   if (!terminalId) throw new Error("No live PTY session to end");
   if (typeof stopTerminalSession === "function") {
     await stopTerminalSession(terminalId);
@@ -2628,38 +2645,10 @@ function ptyLiveTerminalsForCoordinate(coordinate) {
   return (state.supervisorTerminals || state.terminals || []).filter(
     (item) =>
       String(item.state || "").toUpperCase() === "LIVE" &&
+      item.host_reconnect_eligible === true &&
       String(item.project_id || "") === projectId &&
       String(item.mode || "").toUpperCase() === mode
   );
-}
-
-function sessionFromPtyTerminal(terminal) {
-  const supervisorSessionId = String(terminal?.supervisor_session_id || "").trim();
-  const supervised = (state.supervisorSessions || []).find(
-    (session) => String(session.session_id || "") === supervisorSessionId
-  );
-  return {
-    ...(supervised || {}),
-    terminal_id: terminal.terminal_id,
-    supervisor_session_id: supervisorSessionId,
-    project_id: terminal.project_id,
-    node: terminal.project_id,
-    mode: terminal.mode,
-    provider: terminal.provider,
-    alias: supervised?.alias || `${terminal.project_id} ${terminal.mode}`,
-    terminal_state: terminal.state || "LIVE",
-    state: supervised?.state || "UNKNOWN",
-    current_activity_state: supervised?.current_activity_state || "IDLE",
-    pid: terminal.pid,
-    executable: terminal.executable,
-    cwd: terminal.cwd,
-    session_kind: "PTY_LIVE",
-    last_seen_at: supervised?.last_seen_at || terminal.created_at,
-    session_anchor_ref:
-      supervised?.session_anchor_ref ||
-      terminal.session_anchor_ref ||
-      `pty:${terminal.terminal_id}`,
-  };
 }
 
 const NODE_MODE_RECENT_SESSION_LIMIT = 5;
@@ -2687,24 +2676,19 @@ function recentAnchorSessionsForCoordinate(coordinate) {
 }
 
 function nodeModePanelSessionBuckets(coordinate) {
-  // LIVE PTYs always win. Durable anchors fill the remaining recent slots.
-  const live = ptyLiveTerminalsForCoordinate(coordinate).map(sessionFromPtyTerminal);
-  const seenAnchorKeys = new Set(live.map(anchorSessionKey).filter(Boolean));
-  const recentCandidates = recentAnchorSessionsForCoordinate(coordinate).filter(
-    (session) => {
-      const anchorKey = anchorSessionKey(session);
-      if (!anchorKey || seenAnchorKeys.has(anchorKey)) return false;
-      seenAnchorKeys.add(anchorKey);
-      return true;
-    }
+  // Session and Anchor records are authoritative. PTY data can decorate an
+  // existing record but never creates or promotes a session card.
+  const sessions = recentAnchorSessionsForCoordinate(coordinate).slice(
+    0,
+    NODE_MODE_RECENT_SESSION_LIMIT
   );
-  const recentSlots = Math.max(0, NODE_MODE_RECENT_SESSION_LIMIT - live.length);
-  const recent = recentCandidates.slice(0, recentSlots);
   return {
-    working: live.filter(nodeModeSessionIsWorking),
-    idle: live.filter((session) => !nodeModeSessionIsWorking(session)),
-    recent,
-    sessions: [...live, ...recent],
+    working: sessions.filter(nodeModeSessionIsWorking),
+    idle: sessions.filter(
+      (session) => nodeModeSessionIsCurrent(session) && !nodeModeSessionIsWorking(session)
+    ),
+    recent: sessions.filter((session) => !nodeModeSessionIsCurrent(session)),
+    sessions,
   };
 }
 
@@ -2719,9 +2703,6 @@ function renderNodeModeSessionCards(coordinate) {
   const sessions = nodeModePanelSessions(coordinate);
   const selected = nodeModeSelectedSession(coordinate);
   const ordered = [...sessions].sort((left, right) => {
-    const leftLive = left.terminal_id ? 0 : 1;
-    const rightLive = right.terminal_id ? 0 : 1;
-    if (leftLive !== rightLive) return leftLive - rightLive;
     const leftCurrent = nodeModeSessionIsCurrent(left) ? 0 : 1;
     const rightCurrent = nodeModeSessionIsCurrent(right) ? 0 : 1;
     if (leftCurrent !== rightCurrent) return leftCurrent - rightCurrent;
@@ -2759,43 +2740,44 @@ function renderNodeModeSessionCards(coordinate) {
       String(Boolean(selected && anchorSessionKey(selected) === anchorSessionKey(session)))
     );
     const label = node("span", "node-mode-session-copy");
-    const detail = session.terminal_id
-      ? `${String(session.provider || "UNKNOWN").toUpperCase()} / PTY${session.pid ? ` ${session.pid}` : ""}`
-      : `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}`;
+    const host = hostForSession(session);
+    const compatibility = String(
+      host?.compatibility || session?.pty_binding?.host_compatibility || ""
+    ).toUpperCase();
+    const hostLabel = compatibility
+      ? ` / Host ${compatibility.replaceAll("_", " ")}`
+      : "";
+    const detail = `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}${hostLabel}`;
     label.append(
       node("strong", "", sessionDisplayName(session)),
       node("small", "", detail)
     );
     const activityState = nodeModeSessionActivityState(session);
     const current = nodeModeSessionIsCurrent(session);
-    const livePty = Boolean(session.terminal_id);
     let visualState = "RECENT";
     let statusLabel = "RECENT";
-    if (livePty) {
-      visualState = nodeModeSessionIsWorking(session) ? activityState : "IDLE";
-      statusLabel = visualState === "ACTIVE" ? "WORKING" : visualState;
-    } else if (session.active_ing === true) {
-      const offlineState = String(session.state || "ING").toUpperCase();
-      visualState = "OFFLINE";
-      statusLabel = `${offlineState} · OFFLINE`;
+    if (compatibility === "INCOMPATIBLE") {
+      visualState = "INCOMPATIBLE";
+      statusLabel = "HOST INCOMPATIBLE";
+    } else if (nodeModeSessionIsWorking(session)) {
+      visualState = activityState;
+      statusLabel = activityState === "ACTIVE" ? "WORKING" : activityState;
     } else if (current) {
-      visualState = "OFFLINE";
-      statusLabel = "CURRENT · OFFLINE";
+      visualState = "CURRENT";
+      statusLabel = "CURRENT";
     }
     const status = node("span", "node-mode-session-status", statusLabel);
     status.dataset.state = visualState;
     status.dataset.current = String(current);
-    const unread = Number(state.sessionBusUnread?.[session.terminal_id] || 0);
+    const unread = Number(state.sessionBusUnread?.[sessionTerminalId(session)] || 0);
     card.append(label, status);
     if (unread > 0) {
       card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
     }
-    card.title = livePty
-      ? current
-        ? "Inspect the DB Current connected session"
-        : "Inspect this connected session"
+    card.title = compatibility === "INCOMPATIBLE"
+      ? "This Host is incompatible and cannot receive new work"
       : current
-        ? "Inspect the DB Current session anchor (PTY offline)"
+        ? "Inspect the DB Current session anchor"
         : "Inspect this recent session anchor";
     card.dataset.current = String(nodeModeSessionIsCurrent(session));
     card.addEventListener("click", () => {
@@ -2970,15 +2952,8 @@ function renderSessionRail() {
     if (!["BOUND", "ANCHOR_OBSERVED"].includes(binding.state)) {
       group.unbound.push(room);
     } else if (
-      (binding.is_default === true &&
-        binding.observer_currentness === "CURRENT") ||
-      (state.supervisorTerminals || []).some(
-        (t) =>
-          String(t.state || "").toUpperCase() === "LIVE" &&
-          String(t.project_id || "") === String(binding.node || binding.current_project_id || "") &&
-          String(t.mode || "").toUpperCase() === String(binding.mode || "").toUpperCase() &&
-          String(t.provider || "").toUpperCase() === String(room.provider || "").toUpperCase()
-      )
+      binding.is_default === true &&
+      binding.observer_currentness === "CURRENT"
     ) {
       group.current.push(room);
     } else {

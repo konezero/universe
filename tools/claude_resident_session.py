@@ -129,6 +129,7 @@ class ClaudeStreamProcess:
         self._arguments = tuple(arguments)
         self._terminal_host = terminal_host
         self._terminal_id = ""
+        self._host_session_ref = ""
         self._terminal_waiter: queue.Queue | None = None
         self._durable_terminal = False
         self._process = None
@@ -159,16 +160,18 @@ class ClaudeStreamProcess:
                 if callable(find_live)
                 else None
             )
-            replace_terminal_id = ""
+            replace_host_session_ref = ""
             if terminal is not None and not reuse_live_terminal:
                 # The Permission MCP bootstrap is bound to the Claude process
                 # that consumed its one-time config.  Ask the Supervisor to
                 # replace that exact Host atomically, preventing its recovery
                 # poller from reattaching between terminate and create.
-                replace_terminal_id = str(terminal.get("terminal_id") or "")
-                if not replace_terminal_id:
+                replace_host_session_ref = str(
+                    terminal.get("host_session_ref") or ""
+                )
+                if not replace_host_session_ref:
                     raise ClaudeResidentError(
-                        "CLAUDE_SUPERVISED_TERMINAL_RESTART_UNAVAILABLE"
+                        "CLAUDE_HOST_REPLACEMENT_UNAVAILABLE"
                     )
                 terminal = None
             if terminal is None:
@@ -179,7 +182,7 @@ class ClaudeStreamProcess:
                     provider="CLAUDE",
                     supervisor_session_id=supervisor_session_id,
                     session_anchor_ref=session_anchor_ref,
-                    replace_terminal_id=replace_terminal_id,
+                    replace_host_session_ref=replace_host_session_ref,
                     launch_profile="SUPERVISED_STDIO",
                     provider_arguments=list(self._arguments),
                     provider_environment={str(k): str(v) for k, v in environment.items()},
@@ -201,6 +204,9 @@ class ClaudeStreamProcess:
             self._terminal_id = str(terminal.get("terminal_id") or "")
             if not self._terminal_id:
                 raise ClaudeResidentError("CLAUDE_SUPERVISED_TERMINAL_ID_MISSING")
+            self._host_session_ref = str(terminal.get("host_session_ref") or "")
+            if self._durable_terminal and not self._host_session_ref:
+                raise ClaudeResidentError("CLAUDE_HOST_SESSION_REF_MISSING")
             self._terminal_waiter = terminal_host.subscribe(self._terminal_id)
         self._event_handler = event_handler
         self._write_lock = threading.Lock()
@@ -227,11 +233,15 @@ class ClaudeStreamProcess:
             return False
         if self._terminal_host is not None:
             try:
-                terminal = self._terminal_host.get(self._terminal_id)
+                self._terminal_host.get_host(self._host_session_ref)
             except Exception:
                 return False
-            return str(getattr(terminal, "state", "")) == "LIVE"
+            return True
         return self._process is not None and self._process.poll() is None
+
+    @property
+    def host_session_ref(self) -> str:
+        return self._host_session_ref
 
     def send_user_message(self, text: str) -> None:
         """Write one JSONL user message to the resident process stdin."""
@@ -484,6 +494,11 @@ class ClaudeResidentSession:
     @property
     def session_ref(self) -> str:
         return f"claude-code:{self.session_id}" if self.session_id else "claude-code:pending"
+
+    @property
+    def host_session_ref(self) -> str:
+        process = self._process
+        return process.host_session_ref if process is not None else ""
 
     @property
     def launch_count(self) -> int:

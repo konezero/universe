@@ -5390,6 +5390,54 @@ class UniverseLocalServiceTests(unittest.TestCase):
             rows=32,
         )
 
+    def test_cli_terminal_rebinds_only_the_exact_compatible_host_ref(self) -> None:
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_host_rebind",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:vendor-thread-host",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        hosted = {
+            "terminal_id": "term_host_rebind",
+            "host_session_ref": "host-exact",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "supervisor_session_id": supervised["session_id"],
+            "session_anchor_ref": supervised["session_anchor_ref"],
+            "host_compatibility": "CURRENT",
+            "host_reconnect_eligible": True,
+            "state": "LIVE",
+        }
+        managed = Mock()
+        managed.public.return_value = hosted
+        terminal_host = Mock()
+        terminal_host.get_host.return_value = managed
+        self.server.terminal_host = terminal_host
+
+        attached = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CODEX",
+                "supervisor_session_id": supervised["session_id"],
+                "host_session_ref": "host-exact",
+            }
+        )
+
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached["status"])
+        self.assertEqual(hosted, attached["terminal"])
+        terminal_host.get_host.assert_called_once_with("host-exact")
+        terminal_host.find_live.assert_not_called()
+        terminal_host.create.assert_not_called()
+
     def test_cli_terminal_pty_binding_resolves_verified_anchor_provider_ref(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None

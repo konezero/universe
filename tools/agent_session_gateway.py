@@ -840,6 +840,7 @@ class JsonRpcStdioProcess:
         self._arguments = tuple(arguments)
         self._terminal_host = terminal_host
         self._terminal_id = ""
+        self._host_session_ref = ""
         self._terminal_waiter: queue.Queue | None = None
         self._process = None
         if terminal_host is None:
@@ -874,6 +875,13 @@ class JsonRpcStdioProcess:
             self._terminal_id = str(terminal.get("terminal_id") or "")
             if not self._terminal_id:
                 raise AgentSessionError("AGENT_SUPERVISED_TERMINAL_ID_MISSING")
+            self._host_session_ref = str(terminal.get("host_session_ref") or "")
+            if (
+                str(terminal.get("backend_owner") or "")
+                == "RUST_RECONNECTION_HOST"
+                and not self._host_session_ref
+            ):
+                raise AgentSessionError("AGENT_HOST_SESSION_REF_MISSING")
             self._terminal_waiter = terminal_host.subscribe(self._terminal_id)
         self._request_handler = request_handler
         self._notification_handler = notification_handler
@@ -945,6 +953,31 @@ class JsonRpcStdioProcess:
     @property
     def is_closed(self) -> bool:
         return self._closed.is_set()
+
+    @property
+    def host_session_ref(self) -> str:
+        return self._host_session_ref
+
+    def begin_protocol_initialization(self) -> str:
+        if self._terminal_host is None:
+            return "INITIALIZING"
+        return str(
+            self._terminal_host.begin_provider_initialization(
+                self._host_session_ref
+            )
+        )
+
+    def complete_protocol_initialization(self) -> None:
+        if self._terminal_host is not None:
+            self._terminal_host.complete_provider_initialization(
+                self._host_session_ref
+            )
+
+    def fail_protocol_initialization(self) -> None:
+        if self._terminal_host is not None:
+            self._terminal_host.fail_provider_initialization(
+                self._host_session_ref
+            )
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -1136,6 +1169,10 @@ class UniverseAcpGateway:
     def session_ref(self) -> str:
         return self.session.session_ref
 
+    @property
+    def host_session_ref(self) -> str:
+        return str(getattr(self.session, "host_session_ref", "") or "")
+
     def reply_stream(
         self,
         message: str,
@@ -1266,7 +1303,39 @@ class GrokAcpSession:
             **self._supervisor_transport,
         )
         try:
-            self._initialize()
+            begin_protocol = getattr(
+                self._transport, "begin_protocol_initialization", None
+            )
+            if (
+                not callable(begin_protocol)
+                and str(getattr(self._transport, "host_session_ref", "")).strip()
+            ):
+                raise AgentSessionError("GROK_HOST_PROTOCOL_CONTROL_UNAVAILABLE")
+            protocol_state = (
+                str(begin_protocol()) if callable(begin_protocol) else "INITIALIZING"
+            )
+            if protocol_state == "INITIALIZING":
+                try:
+                    can_load = self._initialize_protocol()
+                    complete_protocol = getattr(
+                        self._transport, "complete_protocol_initialization", None
+                    )
+                    if callable(complete_protocol):
+                        complete_protocol()
+                except Exception:
+                    fail_protocol = getattr(
+                        self._transport, "fail_protocol_initialization", None
+                    )
+                    if callable(fail_protocol):
+                        fail_protocol()
+                    raise
+            elif protocol_state == "INITIALIZED":
+                can_load = True
+            else:
+                raise AgentSessionError(
+                    f"GROK_HOST_PROTOCOL_STATE_INVALID:{protocol_state}"
+                )
+            self._start_session(can_load=can_load)
         except Exception:
             self._transport.close()
             raise
@@ -1278,6 +1347,10 @@ class GrokAcpSession:
             if self.session_id
             else "grok-acp:initializing"
         )
+
+    @property
+    def host_session_ref(self) -> str:
+        return self._transport.host_session_ref
 
     def set_permission_requester(self, requester: PermissionRequester) -> None:
         self.permission_requester = requester
@@ -1457,7 +1530,7 @@ class GrokAcpSession:
         self.cwd = target
         return str(target)
 
-    def _initialize(self) -> None:
+    def _initialize_protocol(self) -> bool:
         result = self._transport.request(
             "initialize",
             {"protocolVersion": 1, "clientCapabilities": {}},
@@ -1482,6 +1555,9 @@ class GrokAcpSession:
         can_load = isinstance(capabilities, Mapping) and bool(
             capabilities.get("loadSession")
         )
+        return can_load
+
+    def _start_session(self, *, can_load: bool) -> None:
         session_result: Any = None
         if self.session_id and can_load and not self.ephemeral:
             try:
@@ -1658,7 +1734,37 @@ class CodexAppServerSession:
             **self._supervisor_transport,
         )
         try:
-            self._initialize()
+            begin_protocol = getattr(
+                self._transport, "begin_protocol_initialization", None
+            )
+            if (
+                not callable(begin_protocol)
+                and str(getattr(self._transport, "host_session_ref", "")).strip()
+            ):
+                raise AgentSessionError("CODEX_HOST_PROTOCOL_CONTROL_UNAVAILABLE")
+            protocol_state = (
+                str(begin_protocol()) if callable(begin_protocol) else "INITIALIZING"
+            )
+            if protocol_state == "INITIALIZING":
+                try:
+                    self._initialize_protocol()
+                    complete_protocol = getattr(
+                        self._transport, "complete_protocol_initialization", None
+                    )
+                    if callable(complete_protocol):
+                        complete_protocol()
+                except Exception:
+                    fail_protocol = getattr(
+                        self._transport, "fail_protocol_initialization", None
+                    )
+                    if callable(fail_protocol):
+                        fail_protocol()
+                    raise
+            elif protocol_state != "INITIALIZED":
+                raise AgentSessionError(
+                    f"CODEX_HOST_PROTOCOL_STATE_INVALID:{protocol_state}"
+                )
+            self._start_thread()
         except Exception:
             self._transport.close()
             raise
@@ -1670,6 +1776,10 @@ class CodexAppServerSession:
             if self.session_id
             else "codex-app-server:initializing"
         )
+
+    @property
+    def host_session_ref(self) -> str:
+        return self._transport.host_session_ref
 
     def set_permission_requester(self, requester: PermissionRequester) -> None:
         self.permission_requester = requester
@@ -1888,7 +1998,7 @@ class CodexAppServerSession:
         self.cwd = target
         return str(target)
 
-    def _initialize(self) -> None:
+    def _initialize_protocol(self) -> None:
         result = self._transport.request(
             "initialize",
             {
@@ -1908,6 +2018,8 @@ class CodexAppServerSession:
             raise AgentSessionError("CODEX_APP_INITIALIZE_INVALID")
         self._transport.notify("initialized")
         self._refresh_quota()
+
+    def _start_thread(self) -> None:
         if self.session_id and not self.ephemeral:
             try:
                 session_result = self._transport.request(

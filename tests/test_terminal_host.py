@@ -54,6 +54,8 @@ class FakePty:
 
 class FakeReconnectionClient:
     def __init__(self, anchor_ref: str) -> None:
+        self.reused_existing = False
+        self.protocol_state = "NEW"
         self.state = SimpleNamespace(
             anchor_ref=anchor_ref,
             host_kind="SESSION",
@@ -81,6 +83,11 @@ class FakeReconnectionClient:
             "attachment_generation": self.generation,
             "attached_supervisor_id": self.attached_supervisor_id,
             "runtime_state": "LIVE",
+            "protocol_state": self.protocol_state,
+            "server_version": "UniverseLocal/1",
+            "supervisor_version": "UniverseSupervisor/1",
+            "host_version": "UniverseSessionHost/1",
+            "pty_version": "UniverseConPty/1",
         }
 
     def request(self, action: str, **fields):
@@ -107,6 +114,16 @@ class FakeReconnectionClient:
                     "truncated": False,
                 },
             }
+        if action == "protocol_initialize_begin":
+            if self.protocol_state in {"NEW", "FAILED"}:
+                self.protocol_state = "INITIALIZING"
+            return {"host": self._host()}
+        if action == "protocol_initialize_complete":
+            self.protocol_state = "INITIALIZED"
+            return {"host": self._host()}
+        if action == "protocol_initialize_failed":
+            self.protocol_state = "FAILED"
+            return {"host": self._host()}
         return {"host": self._host()}
 
     def status(self):
@@ -123,7 +140,13 @@ class FakeReconnectionRegistry:
 
     def launch(self, anchor_ref: str, **config):
         self.launches.append({"anchor_ref": anchor_ref, **config})
-        return self.clients.setdefault(anchor_ref, FakeReconnectionClient(anchor_ref))
+        client = self.clients.get(anchor_ref)
+        if client is None:
+            client = FakeReconnectionClient(anchor_ref)
+            self.clients[anchor_ref] = client
+        else:
+            client.reused_existing = True
+        return client
 
     def discover(self, anchor_ref: str):
         return self.clients[anchor_ref]

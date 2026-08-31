@@ -30,6 +30,10 @@ struct Config {
     shell_args: Vec<String>,
     host_kind: String,
     owner_ref: String,
+    server_version: String,
+    supervisor_version: String,
+    host_version: String,
+    pty_version: String,
     channel_lookup_file: Option<PathBuf>,
     channel_bootstrap_token: Option<String>,
     channel_session_token: Option<String>,
@@ -45,12 +49,18 @@ struct HostSnapshot {
     anchor_ref: String,
     host_kind: String,
     owner_ref: String,
+    server_version: String,
+    supervisor_version: String,
+    host_version: String,
+    pty_version: String,
     endpoint: String,
     pid: u32,
     started_at_unix_ms: u128,
     attachment_generation: u64,
     attached_supervisor_id: Option<String>,
     runtime_state: String,
+    protocol_state: String,
+    protocol_owner_id: Option<String>,
     shell: String,
     cwd: Option<String>,
     child_pid: Option<u32>,
@@ -97,12 +107,17 @@ struct PublicSnapshot {
     anchor_ref: String,
     host_kind: String,
     owner_ref: String,
+    server_version: String,
+    supervisor_version: String,
+    host_version: String,
+    pty_version: String,
     endpoint: String,
     pid: u32,
     started_at_unix_ms: u128,
     attachment_generation: u64,
     attached_supervisor_id: Option<String>,
     runtime_state: String,
+    protocol_state: String,
     shell: String,
     cwd: Option<String>,
     child_pid: Option<u32>,
@@ -450,12 +465,17 @@ impl From<&HostSnapshot> for PublicSnapshot {
             anchor_ref: value.anchor_ref.clone(),
             host_kind: value.host_kind.clone(),
             owner_ref: value.owner_ref.clone(),
+            server_version: value.server_version.clone(),
+            supervisor_version: value.supervisor_version.clone(),
+            host_version: value.host_version.clone(),
+            pty_version: value.pty_version.clone(),
             endpoint: value.endpoint.clone(),
             pid: value.pid,
             started_at_unix_ms: value.started_at_unix_ms,
             attachment_generation: value.attachment_generation,
             attached_supervisor_id: value.attached_supervisor_id.clone(),
             runtime_state: value.runtime_state.clone(),
+            protocol_state: value.protocol_state.clone(),
             shell: value.shell.clone(),
             cwd: value.cwd.clone(),
             child_pid: value.child_pid,
@@ -537,7 +557,7 @@ fn parse_config() -> Result<Config, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("serve") {
         return Err(
-            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --host-kind SESSION --owner-ref REF --token TOKEN [--shell PATH] [--cwd PATH] [--shell-arg VALUE] [--env NAME=VALUE] [--cols N] [--rows N]"
+            "usage: universe-session-host serve --state-file PATH --anchor-ref REF --host-kind SESSION --owner-ref REF --server-version VERSION --supervisor-version VERSION --host-version VERSION --pty-version VERSION --token TOKEN [--shell PATH] [--cwd PATH] [--shell-arg VALUE] [--env NAME=VALUE] [--cols N] [--rows N]"
                 .to_owned(),
         );
     }
@@ -574,6 +594,10 @@ fn parse_config() -> Result<Config, String> {
         shell_args: repeated_args(&args, "--shell-arg")?,
         host_kind,
         owner_ref: required_arg(&args, "--owner-ref")?,
+        server_version: required_arg(&args, "--server-version")?,
+        supervisor_version: required_arg(&args, "--supervisor-version")?,
+        host_version: required_arg(&args, "--host-version")?,
+        pty_version: required_arg(&args, "--pty-version")?,
         channel_lookup_file,
         channel_bootstrap_token,
         channel_session_token,
@@ -769,6 +793,67 @@ fn apply_request(
             state.attached_supervisor_id = None;
             success(state)
         }
+        "protocol_initialize_begin" => {
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let supervisor_id = request.supervisor_id.unwrap_or_default();
+            match state.protocol_state.as_str() {
+                "NEW" | "FAILED" => {
+                    state.protocol_state = "INITIALIZING".to_owned();
+                    state.protocol_owner_id = Some(supervisor_id);
+                    success(state)
+                }
+                "INITIALIZED" => success(state),
+                "INITIALIZING"
+                    if state.protocol_owner_id.as_deref() == Some(supervisor_id.as_str()) =>
+                {
+                    success(state)
+                }
+                "INITIALIZING" => failure(
+                    "HOST_PROTOCOL_INITIALIZATION_OWNED",
+                    "another Supervisor owns provider initialization",
+                ),
+                _ => failure(
+                    "HOST_PROTOCOL_STATE_INVALID",
+                    "provider protocol state cannot begin initialization",
+                ),
+            }
+        }
+        "protocol_initialize_complete" => {
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let supervisor_id = request.supervisor_id.unwrap_or_default();
+            if state.protocol_state != "INITIALIZING"
+                || state.protocol_owner_id.as_deref() != Some(supervisor_id.as_str())
+            {
+                return failure(
+                    "HOST_PROTOCOL_INITIALIZATION_MISMATCH",
+                    "only the initialization owner may complete provider initialization",
+                );
+            }
+            state.protocol_state = "INITIALIZED".to_owned();
+            state.protocol_owner_id = None;
+            success(state)
+        }
+        "protocol_initialize_failed" => {
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let supervisor_id = request.supervisor_id.unwrap_or_default();
+            if state.protocol_state != "INITIALIZING"
+                || state.protocol_owner_id.as_deref() != Some(supervisor_id.as_str())
+            {
+                return failure(
+                    "HOST_PROTOCOL_INITIALIZATION_MISMATCH",
+                    "only the initialization owner may fail provider initialization",
+                );
+            }
+            state.protocol_state = "FAILED".to_owned();
+            state.protocol_owner_id = None;
+            success(state)
+        }
         "shutdown" => {
             if state.runtime_state == "LIVE"
                 && let Some(terminal) = terminal
@@ -925,6 +1010,8 @@ fn handle_connection(
     let before_generation = state.attachment_generation;
     let before_supervisor = state.attached_supervisor_id.clone();
     let before_runtime_state = state.runtime_state.clone();
+    let before_protocol_state = state.protocol_state.clone();
+    let before_protocol_owner = state.protocol_owner_id.clone();
     let before_exit_code = state.child_exit_code;
     let before_channel_registered = state.channel_registered;
     if let Err(error) = refresh_runtime_state(&mut state, &terminal) {
@@ -942,6 +1029,8 @@ fn handle_connection(
         && (before_generation != state.attachment_generation
             || before_supervisor != state.attached_supervisor_id
             || before_runtime_state != state.runtime_state
+            || before_protocol_state != state.protocol_state
+            || before_protocol_owner != state.protocol_owner_id
             || before_exit_code != state.child_exit_code
             || before_channel_registered != state.channel_registered)
         && let Err(error) = atomic_write_state(&state_file, &state)
@@ -980,12 +1069,18 @@ fn serve(config: Config) -> Result<(), String> {
         anchor_ref: config.anchor_ref,
         host_kind: config.host_kind,
         owner_ref: config.owner_ref,
+        server_version: config.server_version,
+        supervisor_version: config.supervisor_version,
+        host_version: config.host_version,
+        pty_version: config.pty_version,
         endpoint: format!("tcp://{address}"),
         pid: process::id(),
         started_at_unix_ms: started_at,
         attachment_generation: 0,
         attached_supervisor_id: None,
         runtime_state: "LIVE".to_owned(),
+        protocol_state: "NEW".to_owned(),
+        protocol_owner_id: None,
         shell: config.shell,
         cwd,
         child_pid,
@@ -1062,12 +1157,18 @@ mod tests {
             anchor_ref: "anchor-test".to_owned(),
             host_kind: "SESSION".to_owned(),
             owner_ref: "anchor-test".to_owned(),
+            server_version: "UniverseLocal/1".to_owned(),
+            supervisor_version: "UniverseSupervisor/1".to_owned(),
+            host_version: "UniverseSessionHost/1".to_owned(),
+            pty_version: "UniverseConPty/1".to_owned(),
             endpoint: "tcp://127.0.0.1:1".to_owned(),
             pid: 1,
             started_at_unix_ms: 1,
             attachment_generation: 0,
             attached_supervisor_id: None,
             runtime_state: "LIVE".to_owned(),
+            protocol_state: "NEW".to_owned(),
+            protocol_owner_id: None,
             shell: "cmd.exe".to_owned(),
             cwd: None,
             child_pid: Some(2),
@@ -1152,6 +1253,77 @@ mod tests {
         assert_eq!(response.error_code, Some("HOST_UNAUTHORIZED"));
         assert_eq!(state.attachment_generation, 0);
         assert!(state.attached_supervisor_id.is_none());
+    }
+
+    #[test]
+    fn protocol_initialization_is_owned_by_host_across_supervisor_rebind() {
+        let mut state = snapshot();
+        let shutdown = AtomicBool::new(false);
+        let request = |action: &str, supervisor: &str| HostRequest {
+            token: "token".to_owned(),
+            action: action.to_owned(),
+            supervisor_id: Some(supervisor.to_owned()),
+            input: None,
+            input_base64: None,
+            after_cursor: None,
+            cols: None,
+            rows: None,
+            channel: None,
+        };
+
+        assert_eq!(
+            apply_request(
+                &mut state,
+                request("attach", "supervisor-a"),
+                &shutdown,
+                None,
+                None,
+            )
+            .status,
+            "OK"
+        );
+        assert_eq!(
+            apply_request(
+                &mut state,
+                request("protocol_initialize_begin", "supervisor-a"),
+                &shutdown,
+                None,
+                None,
+            )
+            .status,
+            "OK"
+        );
+        assert_eq!(state.protocol_state, "INITIALIZING");
+        assert_eq!(
+            apply_request(
+                &mut state,
+                request("protocol_initialize_complete", "supervisor-a"),
+                &shutdown,
+                None,
+                None,
+            )
+            .status,
+            "OK"
+        );
+        assert_eq!(state.protocol_state, "INITIALIZED");
+
+        apply_request(
+            &mut state,
+            request("attach", "supervisor-b"),
+            &shutdown,
+            None,
+            None,
+        );
+        let rebound = apply_request(
+            &mut state,
+            request("protocol_initialize_begin", "supervisor-b"),
+            &shutdown,
+            None,
+            None,
+        );
+        assert_eq!(rebound.status, "OK");
+        assert_eq!(state.protocol_state, "INITIALIZED");
+        assert!(state.protocol_owner_id.is_none());
     }
 
     #[test]

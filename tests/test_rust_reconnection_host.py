@@ -18,8 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.reconnection_host import (  # noqa: E402
+    CURRENT_RUNTIME_VERSIONS,
     ReconnectionHostRegistry,
     ReconnectionPty,
+    evaluate_runtime_compatibility,
 )
 from universe_app.windows_process import process_is_alive  # noqa: E402
 from universe_app.terminal_host import TerminalHost  # noqa: E402
@@ -148,6 +150,26 @@ class RustReconnectionHostTests(unittest.TestCase):
                 self.assertEqual(first["host_id"], reused["host_id"])
                 self.assertEqual(first["host_pid"], reused["pid"])
                 self.assertEqual(first["child_pid"], reused["child_pid"])
+                self.assertEqual(
+                    CURRENT_RUNTIME_VERSIONS,
+                    {
+                        field: reused[field]
+                        for field in CURRENT_RUNTIME_VERSIONS
+                    },
+                )
+                self.assertEqual("CURRENT", evaluate_runtime_compatibility(reused))
+                persisted = json.loads(
+                    registry.state_path("anchor-cross-process").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    CURRENT_RUNTIME_VERSIONS,
+                    {
+                        field: persisted[field]
+                        for field in CURRENT_RUNTIME_VERSIONS
+                    },
+                )
 
                 second = self.run_supervisor(
                     "reattach",

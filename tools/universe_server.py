@@ -1230,6 +1230,11 @@ def _public_pty_binding(binding: Mapping[str, Any] | None) -> dict[str, Any]:
         "provider": str(binding.get("provider") or "") or None,
         "backend_owner": str(binding.get("backend_owner") or "") or None,
         "reconnection_host_id": str(binding.get("reconnection_host_id") or "") or None,
+        "host_session_ref": str(binding.get("host_session_ref") or "") or None,
+        "host_runtime_versions": dict(binding.get("host_runtime_versions") or {}),
+        "host_compatibility": str(binding.get("host_compatibility") or "UNKNOWN").upper(),
+        "host_reconnect_eligible": binding.get("host_reconnect_eligible") is True,
+        "host_protocol_state": str(binding.get("host_protocol_state") or "UNKNOWN").upper(),
     }
 
 
@@ -29602,68 +29607,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "provider": terminal.get("provider"),
             "backend_owner": terminal.get("backend_owner"),
             "reconnection_host_id": terminal.get("reconnection_host_id"),
+            "host_session_ref": terminal.get("host_session_ref"),
+            "host_runtime_versions": terminal.get("host_runtime_versions"),
+            "host_compatibility": terminal.get("host_compatibility"),
+            "host_reconnect_eligible": terminal.get("host_reconnect_eligible"),
+            "host_protocol_state": terminal.get("host_protocol_state"),
         }
-
-    def _pty_anchor_session(
-        self,
-        project_id: str,
-        terminal: Mapping[str, Any],
-        anchor_ref: str,
-    ) -> dict[str, Any]:
-        """Project one live PTY the Anchor and session store do not cover.
-
-        The record reports the terminal that is observably alive and the
-        Supervisor session it is bound to.  It never borrows Mode Current
-        Anchor currentness, Authority, or Execution Assignment from that
-        liveness.
-        """
-
-        supervisor_id = str(terminal.get("supervisor_session_id") or "").strip()
-        session: Mapping[str, Any] = {}
-        if supervisor_id:
-            try:
-                session = self.session_supervisor.get_session(supervisor_id)
-            except SessionSupervisorError:
-                session = {}
-        provider = str(
-            terminal.get("provider") or session.get("provider") or "UNKNOWN"
-        ).upper()
-        observer = str(session.get("provider_session_ref") or "")
-        _observer_provider, chat_key = _chat_key_for_observer(observer)
-        anchor_pending = not anchor_ref
-        return _public_anchor_session(
-            project_id=project_id,
-            mode=str(terminal.get("mode") or session.get("mode") or "").upper(),
-            session_id=supervisor_id or str(terminal.get("terminal_id") or ""),
-            provider=provider,
-            session_anchor_ref=anchor_ref,
-            current_anchor_ref=anchor_ref,
-            origin_anchor_ref=anchor_ref,
-            temporality="SESSION",
-            currentness="UNKNOWN" if anchor_pending else "NOT_CURRENT",
-            currentness_source="PTY_LIVENESS",
-            state="LIVE",
-            last_seen_at=str(
-                session.get("last_seen_at") or terminal.get("created_at") or ""
-            ),
-            chat_key=chat_key,
-            store_present=False,
-            observer_session_ref=observer,
-            pty_binding=self._pty_binding_material(
-                terminal,
-                "ANCHOR_PENDING" if anchor_pending else "BOUND",
-            ),
-        )
 
     def _join_live_pty_bindings(
         self, project_id: str, sessions: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Collapse a verified PTY binding and its session into one record.
+        """Attach PTY observations to already-authoritative session records.
 
-        A live PTY whose active Session Anchor matches an Anchor record renders
-        as that single record in a LIVE state instead of a separate live PTY
-        card beside an offline Anchor card.  A live PTY without a verified
-        Session Anchor renders ANCHOR_PENDING and must not imply a binding.
+        PTY/PID liveness never creates a session record and never changes the
+        session lifecycle or activity state.  Reconnect eligibility belongs to
+        the Rust Host compatibility projection carried inside ``pty_binding``.
         """
 
         terminals = [
@@ -29676,13 +29634,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return sessions
         bound: dict[str, Mapping[str, Any]] = {}
         bound_by_provider_session: dict[tuple[str, str], Mapping[str, Any]] = {}
-        anchor_pending: list[Mapping[str, Any]] = []
         for terminal in terminals:
             anchor_ref = str(terminal.get("active_session_anchor_ref") or "").strip()
             if anchor_ref:
                 bound.setdefault(anchor_ref, terminal)
-            else:
-                anchor_pending.append(terminal)
             supervisor_id = str(
                 terminal.get("supervisor_session_id") or ""
             ).strip()
@@ -29703,7 +29658,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 bound_by_provider_session.setdefault(identity, terminal)
 
         joined: list[dict[str, Any]] = []
-        matched_terminal_ids: set[str] = set()
         for session in sessions:
             anchor_ref = str(session.get("session_anchor_ref") or "").strip()
             terminal = bound.get(anchor_ref) if anchor_ref else None
@@ -29716,23 +29670,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if terminal is None:
                 joined.append(session)
                 continue
-            matched_terminal_ids.add(str(terminal.get("terminal_id") or ""))
             record = dict(session)
             record["pty_binding"] = _public_pty_binding(
                 self._pty_binding_material(terminal, "BOUND")
             )
-            record["state"] = "LIVE"
-            record["active_ing"] = True
             joined.append(record)
-
-        for anchor_ref, terminal in bound.items():
-            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
-                continue
-            joined.append(self._pty_anchor_session(project_id, terminal, anchor_ref))
-        for terminal in anchor_pending:
-            if str(terminal.get("terminal_id") or "") in matched_terminal_ids:
-                continue
-            joined.append(self._pty_anchor_session(project_id, terminal, ""))
         return joined
 
     def list_all_project_anchor_sessions(self) -> list[dict[str, Any]]:
@@ -29749,10 +29691,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return sessions
 
     def list_cli_terminals(self) -> dict[str, Any]:
+        terminal_host = self._session_anchor_terminal_host()
         return {
             "schema": API_SCHEMA,
             "status": "CLI_TERMINALS_COLLECTED",
-            "terminals": self._session_anchor_terminal_host().list_sessions(),
+            "terminals": terminal_host.list_sessions(),
+            "hosts": terminal_host.list_hosts(),
         }
 
     def list_cli_terminal_audit_events(
@@ -29948,6 +29892,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         supervisor_session_id = str(
             payload.get("supervisor_session_id") or ""
         ).strip()
+        requested_host_session_ref = str(
+            payload.get("host_session_ref") or ""
+        ).strip()
         if supervisor_session_id:
             try:
                 supervised = self.session_supervisor.get_session(
@@ -30044,6 +29991,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Supervisor could not resolve a Session Anchor before spawn",
                 HTTPStatus.CONFLICT,
             )
+        if requested_host_session_ref:
+            try:
+                managed_host = self._session_anchor_terminal_host().get_host(
+                    requested_host_session_ref
+                )
+            except TerminalHostError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+            hosted = managed_host.public()
+            coordinate_matches = (
+                str(hosted.get("project_id") or "").casefold() == project_id.casefold()
+                and str(hosted.get("mode") or "").upper() == mode
+                and str(hosted.get("session_anchor_ref") or "") == spawn_anchor_ref
+                and (
+                    provider in {"", "AUTO"}
+                    or str(hosted.get("provider") or "").upper() == provider
+                )
+                and (
+                    not supervisor_session_id
+                    or str(hosted.get("supervisor_session_id") or "")
+                    == supervisor_session_id
+                )
+            )
+            if not coordinate_matches:
+                raise UniverseError(
+                    "HOST_SESSION_COORDINATE_MISMATCH",
+                    "Host session does not match the requested Session Anchor coordinate",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "CLI_TERMINAL_ATTACHED",
+                "terminal": hosted,
+            }
         existing = self._session_anchor_terminal_host().find_live(
             project_id=project_id,
             mode=mode,

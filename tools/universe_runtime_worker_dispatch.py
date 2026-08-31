@@ -1102,6 +1102,7 @@ class RuntimeWorkerDispatcher:
                 "GROK_RUNTIME_PROFILE_INVALID",
             )
         session_ids: list[str] = []
+        host_session_ref = ""
         try:
             gateway = UniverseAcpGateway(
                 GrokAcpSession(
@@ -1131,6 +1132,7 @@ class RuntimeWorkerDispatcher:
                     lambda _delta: None,
                 )
                 session_ref = gateway.session_ref
+                host_session_ref = gateway.host_session_ref
             finally:
                 gateway.close()
         except AgentSessionError as error:
@@ -1159,9 +1161,7 @@ class RuntimeWorkerDispatcher:
             "persistent_session_ref": "UNKNOWN",
             "universe_coordinate_persisted": bool(supervisor_transport),
             "provider_durable_chat_state": "UNKNOWN",
-            "host_session_ref": supervisor_transport.get(
-                "supervisor_session_id", "UNKNOWN"
-            ),
+            "host_session_ref": host_session_ref or "UNKNOWN",
             "session_anchor_ref": supervisor_transport.get(
                 "session_anchor_ref", "UNKNOWN"
             ),
@@ -1179,6 +1179,7 @@ class RuntimeWorkerDispatcher:
         effort = self._request_effort(request)
         supervisor_transport = self._request_supervisor_transport(request)
         session_ids: list[str] = []
+        host_session_ref = ""
         try:
             gateway = UniverseAcpGateway(
                 CodexAppServerSession(
@@ -1207,6 +1208,7 @@ class RuntimeWorkerDispatcher:
                     lambda _delta: None,
                 )
                 session_ref = gateway.session_ref
+                host_session_ref = gateway.host_session_ref
             finally:
                 gateway.close()
         except TerminalHostError as error:
@@ -1239,9 +1241,7 @@ class RuntimeWorkerDispatcher:
             "persistent_session_ref": "UNKNOWN",
             "universe_coordinate_persisted": bool(supervisor_transport),
             "provider_durable_chat_state": "NOT_PERSISTED",
-            "host_session_ref": supervisor_transport.get(
-                "supervisor_session_id", "UNKNOWN"
-            ),
+            "host_session_ref": host_session_ref or "UNKNOWN",
             "session_anchor_ref": supervisor_transport.get(
                 "session_anchor_ref", "UNKNOWN"
             ),
@@ -1358,6 +1358,7 @@ class RuntimeWorkerDispatcher:
         supervisor_transport: Mapping[str, Any],
     ) -> dict[str, Any]:
         session_ids: list[str] = []
+        host_session_ref = ""
         broker: ClaudePermissionBroker | None = None
         config_root: Path | None = None
         gateway: UniverseAcpGateway | None = None
@@ -1411,6 +1412,7 @@ class RuntimeWorkerDispatcher:
                 lambda _delta: None,
             )
             session_ref = gateway.session_ref
+            host_session_ref = session.host_session_ref
         except TerminalHostError as error:
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
@@ -1455,7 +1457,7 @@ class RuntimeWorkerDispatcher:
             "persistent_session_ref": "UNKNOWN",
             "universe_coordinate_persisted": True,
             "provider_durable_chat_state": "NOT_PERSISTED",
-            "host_session_ref": supervisor_transport["supervisor_session_id"],
+            "host_session_ref": host_session_ref or "UNKNOWN",
             "session_anchor_ref": supervisor_transport["session_anchor_ref"],
         }
 

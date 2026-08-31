@@ -26,7 +26,6 @@ class _ProjectionServer:
     """Borrow the projection methods under test without a live service."""
 
     _pty_binding_material = UniverseHTTPServer._pty_binding_material
-    _pty_anchor_session = UniverseHTTPServer._pty_anchor_session
     _join_live_pty_bindings = UniverseHTTPServer._join_live_pty_bindings
     list_git_work_history = UniverseHTTPServer.list_git_work_history
 
@@ -57,6 +56,16 @@ def _terminal(**overrides):
         "pid": 4242,
         "backend_owner": "RUST_RECONNECTION_HOST",
         "reconnection_host_id": "host-bound",
+        "host_session_ref": "host-bound",
+        "host_runtime_versions": {
+            "server_version": "UniverseLocal/1",
+            "supervisor_version": "UniverseSupervisor/1",
+            "host_version": "UniverseSessionHost/1",
+            "pty_version": "UniverseConPty/1",
+        },
+        "host_compatibility": "CURRENT",
+        "host_reconnect_eligible": True,
+        "host_protocol_state": "INITIALIZED",
         "created_at": "2026-08-25T00:00:00Z",
         "supervisor_session_id": "session_bound",
         "active_session_anchor_ref": BOUND_ANCHOR,
@@ -96,7 +105,7 @@ def _anchor_record(**overrides):
 class AnchorPtyProjectionTests(unittest.TestCase):
     """A verified binding is one record; liveness never implies authority."""
 
-    def test_verified_binding_collapses_into_one_live_record(self) -> None:
+    def test_verified_binding_attaches_observation_without_promoting_state(self) -> None:
         server = _ProjectionServer(
             terminals=[_terminal()], sessions=_bound_session()
         )
@@ -106,8 +115,8 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         self.assertEqual(len(joined), 1, "one binding must not render two cards")
         only = joined[0]
         self.assertEqual(only["currentness"], "CURRENT")
-        self.assertEqual(only["state"], "LIVE")
-        self.assertTrue(only["active_ing"])
+        self.assertEqual(only["state"], "CURRENT")
+        self.assertFalse(only["active_ing"])
         self.assertEqual(only["pty_binding"]["status"], "BOUND")
         self.assertEqual(only["pty_binding"]["terminal_id"], "term_bound")
         self.assertEqual(only["pty_binding"]["pid"], 4242)
@@ -115,8 +124,10 @@ class AnchorPtyProjectionTests(unittest.TestCase):
             only["pty_binding"]["backend_owner"], "RUST_RECONNECTION_HOST"
         )
         self.assertEqual(only["pty_binding"]["reconnection_host_id"], "host-bound")
+        self.assertEqual(only["pty_binding"]["host_compatibility"], "CURRENT")
+        self.assertTrue(only["pty_binding"]["host_reconnect_eligible"])
 
-    def test_live_pty_without_anchor_reports_anchor_pending(self) -> None:
+    def test_live_pty_without_anchor_cannot_create_a_session(self) -> None:
         server = _ProjectionServer(
             terminals=[
                 _terminal(
@@ -128,17 +139,7 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         )
         joined = server._join_live_pty_bindings(PROJECT, [])
 
-        self.assertEqual(len(joined), 1)
-        pending = joined[0]
-        self.assertEqual(pending["pty_binding"]["status"], "ANCHOR_PENDING")
-        self.assertEqual(pending["pty_binding"]["terminal_id"], "term_pending")
-        self.assertEqual(pending["state"], "LIVE")
-        self.assertNotEqual(
-            pending["currentness"],
-            "CURRENT",
-            "an unbound live PTY must never imply Anchor currentness",
-        )
-        self.assertEqual(pending["currentness_source"], "PTY_LIVENESS")
+        self.assertEqual(joined, [])
 
     def test_verified_provider_identity_joins_current_anchor_to_live_pty(self) -> None:
         server = _ProjectionServer(
@@ -154,7 +155,7 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         only = joined[0]
         self.assertEqual(only["session_anchor_ref"], CURRENT_ANCHOR)
         self.assertEqual(only["currentness"], "CURRENT")
-        self.assertEqual(only["state"], "LIVE")
+        self.assertEqual(only["state"], "CURRENT")
         self.assertEqual(only["pty_binding"]["terminal_id"], "term_bound")
 
     def test_shared_provider_identity_only_joins_the_current_record(self) -> None:
@@ -179,15 +180,17 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         joined = server._join_live_pty_bindings(PROJECT, [current, past])
 
         self.assertEqual(len(joined), 2)
-        live_records = [item for item in joined if item["state"] == "LIVE"]
+        bound_records = [
+            item for item in joined if item["pty_binding"]["status"] == "BOUND"
+        ]
         self.assertEqual(
-            len(live_records),
+            len(bound_records),
             1,
-            "only the CURRENT record may borrow the live PTY binding",
+            "only the CURRENT record may receive the PTY observation",
         )
-        self.assertEqual(live_records[0]["session_anchor_ref"], CURRENT_ANCHOR)
+        self.assertEqual(bound_records[0]["session_anchor_ref"], CURRENT_ANCHOR)
         stale = next(item for item in joined if item["session_anchor_ref"] == "session_anchor_past")
-        self.assertNotEqual(stale["state"], "LIVE")
+        self.assertEqual(stale["state"], "READY")
         self.assertEqual(stale["pty_binding"]["status"], "UNBOUND")
 
     def test_live_binding_does_not_borrow_a_different_current_anchor(self) -> None:
@@ -196,10 +199,8 @@ class AnchorPtyProjectionTests(unittest.TestCase):
         )
         joined = server._join_live_pty_bindings(PROJECT, [_anchor_record()])
 
-        self.assertEqual(len(joined), 2, "distinct Anchors stay distinct records")
-        by_anchor = {item["session_anchor_ref"]: item for item in joined}
-        current = by_anchor[CURRENT_ANCHOR]
-        live = by_anchor[BOUND_ANCHOR]
+        self.assertEqual(len(joined), 1, "PTY liveness cannot synthesize another Anchor")
+        current = joined[0]
 
         self.assertEqual(current["currentness"], "CURRENT")
         self.assertEqual(
@@ -207,10 +208,6 @@ class AnchorPtyProjectionTests(unittest.TestCase):
             "UNBOUND",
             "the Mode Current Anchor must not claim another terminal's PTY",
         )
-        self.assertEqual(live["state"], "LIVE")
-        self.assertEqual(live["pty_binding"]["status"], "BOUND")
-        self.assertEqual(live["currentness"], "NOT_CURRENT")
-        self.assertEqual(live["currentness_source"], "PTY_LIVENESS")
 
     def test_records_without_a_live_pty_stay_unbound(self) -> None:
         server = _ProjectionServer(terminals=[])
@@ -342,6 +339,21 @@ class ActionInboxUiContractTests(unittest.TestCase):
         self.assertIn('entry.attribution === "EXACT"', card)
         self.assertIn("entry.terminal_id", card)
         self.assertIn("UNATTRIBUTED", card)
+
+    def test_ui_never_synthesizes_sessions_or_currentness_from_pty(self) -> None:
+        self.assertNotIn("function sessionFromPtyTerminal", APP)
+        coordinates = APP[
+            APP.index("function nodeModeCoordinates()") : APP.index(
+                "function nodeModeStatusLabel(coordinate)"
+            )
+        ]
+        self.assertNotIn("state.supervisorTerminals", coordinates)
+        rail = APP[
+            APP.index("function renderSessionRail()") : APP.index(
+                "function renderSessionObservatory()"
+            )
+        ]
+        self.assertNotIn("state.supervisorTerminals", rail)
 
 
 if __name__ == "__main__":

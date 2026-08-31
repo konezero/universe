@@ -643,6 +643,7 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
                 self.find_arguments = dict(kwargs)
                 return {
                     "terminal_id": "term-existing",
+                    "host_session_ref": "host-existing",
                     "session_anchor_ref": "anchor-exact",
                     "launch_profile": "SUPERVISED_STDIO",
                     "backend_owner": "RUST_RECONNECTION_HOST",
@@ -664,6 +665,11 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
 
             def get(self, _terminal_id):
                 return SimpleNamespace(state="LIVE")
+
+            def get_host(self, host_session_ref):
+                return SimpleNamespace(
+                    state="LIVE", reconnection_host_id=host_session_ref
+                )
 
             def write(self, terminal_id, data):
                 self.writes.append((terminal_id, bytes(data)))
@@ -704,6 +710,7 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
             def find_live(self, **_kwargs):
                 return {
                     "terminal_id": "term-stale",
+                    "host_session_ref": "host-stale",
                     "session_anchor_ref": "anchor-exact",
                     "launch_profile": "SUPERVISED_STDIO",
                     "backend_owner": "RUST_RECONNECTION_HOST",
@@ -714,6 +721,7 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
                 self.create_kwargs = dict(kwargs)
                 return {
                     "terminal_id": "term-fresh",
+                    "host_session_ref": "host-fresh",
                     "session_anchor_ref": "anchor-exact",
                     "launch_profile": "SUPERVISED_STDIO",
                     "backend_owner": "RUST_RECONNECTION_HOST",
@@ -727,6 +735,11 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
 
             def get(self, _terminal_id):
                 return SimpleNamespace(state="LIVE")
+
+            def get_host(self, host_session_ref):
+                return SimpleNamespace(
+                    state="LIVE", reconnection_host_id=host_session_ref
+                )
 
             def write(self, _terminal_id, _data):
                 return None
@@ -748,8 +761,9 @@ class ClaudeStreamProcessHostReuseTests(unittest.TestCase):
         try:
             self.assertEqual(1, host.created)
             self.assertEqual(
-                "term-stale", host.create_kwargs["replace_terminal_id"]
+                "host-stale", host.create_kwargs["replace_host_session_ref"]
             )
+            self.assertNotIn("replace_terminal_id", host.create_kwargs)
         finally:
             process.close()
 

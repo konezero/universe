@@ -596,6 +596,7 @@ async function createTerminalTab(coordinate, session) {
       effort: String(coordinate?.effort || "AUTO").toUpperCase(),
       supervisor_session_id: terminalSupervisorSessionId(session),
       pty_binding_anchor_ref: String(session?.session_anchor_ref || "").trim(),
+      host_session_ref: typeof hostSessionRef === "function" ? hostSessionRef(session) : "",
       resume_session_ref: terminalResumeRef(coordinate, session),
     },
   });
@@ -661,7 +662,9 @@ async function closeTerminalTab(terminalId) {
 }
 
 function focusTerminalForSession(coordinate, session) {
-  const wantedId = String(session?.terminal_id || "").trim();
+  const wantedId = typeof sessionTerminalId === "function"
+    ? sessionTerminalId(session)
+    : String(session?.terminal_id || session?.pty_binding?.terminal_id || "").trim();
   if (wantedId) {
     const exact = (state.terminals || []).find((item) => item.terminal_id === wantedId);
     if (exact) {
@@ -709,6 +712,7 @@ async function loadTerminalTabs() {
     const payload = await api("/v1/terminals");
     const incoming = payload.terminals || [];
     state.supervisorTerminals = incoming;
+    state.supervisorHosts = payload.hosts || [];
     const liveIds = new Set(incoming.map((item) => item.terminal_id));
     state.dismissedTerminalIds = state.dismissedTerminalIds || {};
     for (const id of Object.keys(state.dismissedTerminalIds)) {

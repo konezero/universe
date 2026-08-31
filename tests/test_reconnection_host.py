@@ -14,15 +14,86 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.reconnection_host import (  # noqa: E402
+    CURRENT_RUNTIME_VERSIONS,
     ReconnectionHostError,
     ReconnectionHostRegistry,
     ReconnectionPty,
     STATE_SCHEMA,
+    evaluate_runtime_compatibility,
     provision_private_registry_directory,
 )
 
 
 class ReconnectionHostRegistryTests(unittest.TestCase):
+    def test_declared_matrix_projects_current_old_and_incompatible_tuples(self) -> None:
+        current_tuple = tuple(CURRENT_RUNTIME_VERSIONS.values())
+        old_tuple = (
+            "UniverseLocal/0",
+            "UniverseSupervisor/0",
+            "UniverseSessionHost/0",
+            "UniverseConPty/0",
+        )
+        matrix = {"CURRENT": {current_tuple}, "COMPATIBLE_OLD": {old_tuple}}
+
+        self.assertEqual(
+            evaluate_runtime_compatibility(CURRENT_RUNTIME_VERSIONS, matrix=matrix),
+            "CURRENT",
+        )
+        self.assertEqual(
+            evaluate_runtime_compatibility(
+                dict(
+                    zip(
+                        CURRENT_RUNTIME_VERSIONS,
+                        old_tuple,
+                        strict=True,
+                    )
+                ),
+                matrix=matrix,
+            ),
+            "COMPATIBLE_OLD",
+        )
+        incompatible = dict(CURRENT_RUNTIME_VERSIONS)
+        incompatible["pty_version"] = "UniverseConPty/99"
+        self.assertEqual(
+            evaluate_runtime_compatibility(incompatible, matrix=matrix),
+            "INCOMPATIBLE",
+        )
+
+    def test_replaced_host_history_is_redacted_and_never_reconnect_eligible(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(
+                "universe_app.reconnection_host.provision_private_registry_directory"
+            ),
+        ):
+            root = Path(temp)
+            registry = ReconnectionHostRegistry(root, root / "host.exe")
+            state_path = self.write_state(
+                registry,
+                "anchor-history",
+                pid=1001,
+                started_at=10,
+            )
+            registry._archive_state_record(
+                state_path, reason="INCOMPATIBLE_HOST_REPLACED"
+            )
+            archived_path = next((root / "history").glob("host-*.json"))
+            archived = json.loads(archived_path.read_text(encoding="utf-8"))
+            self.assertNotIn("auth_token", archived)
+            self.assertEqual("REPLACED", archived["runtime_state"])
+            self.assertFalse(archived["reconnect_eligible"])
+
+            with patch(
+                "universe_app.reconnection_host.process_is_alive",
+                return_value=False,
+            ):
+                projected = registry.list_observed_hosts()
+            historical = next(
+                item for item in projected if item.get("runtime_state") == "REPLACED"
+            )
+            self.assertEqual("host-1001", historical["host_session_ref"])
+            self.assertFalse(historical["reconnect_eligible"])
+
     def write_state(
         self,
         registry: ReconnectionHostRegistry,
@@ -46,6 +117,7 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
                     "started_at_unix_ms": int(started_at * 1000),
                     "auth_token": "test-token",
                     "child_pid": None,
+                    **CURRENT_RUNTIME_VERSIONS,
                 }
             ),
             encoding="utf-8",

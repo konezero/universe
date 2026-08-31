@@ -48,6 +48,8 @@ from universe_app.reconnection_host import (
     ReconnectionHostError,
     ReconnectionHostRegistry,
     ReconnectionPty,
+    evaluate_runtime_compatibility,
+    runtime_version_snapshot,
 )
 
 
@@ -480,6 +482,9 @@ class TerminalSession:
     managed_shell_identity_file: str = ""
     backend_owner: str = "PYTHON_CONPTY"
     reconnection_host_id: str = ""
+    host_runtime_versions: dict[str, str] = field(default_factory=dict)
+    host_compatibility: str = "NOT_APPLICABLE"
+    protocol_state: str = "UNKNOWN"
     bootstrap_input: bytes = b""
     bootstrap_delivered: bool = False
 
@@ -498,6 +503,15 @@ class TerminalSession:
             "managed_shell_identity_file": self.managed_shell_identity_file,
             "backend_owner": self.backend_owner,
             "reconnection_host_id": self.reconnection_host_id,
+            "host_session_ref": self.reconnection_host_id,
+            "host_runtime_versions": dict(self.host_runtime_versions),
+            "host_compatibility": self.host_compatibility,
+            "host_protocol_state": self.protocol_state,
+            "host_reconnect_eligible": bool(
+                self.reconnection_host_id
+                and self.state == "LIVE"
+                and self.host_compatibility in {"CURRENT", "COMPATIBLE_OLD"}
+            ),
             "shell_process": (
                 self.managed_shell.shell.as_dict()
                 if getattr(self.managed_shell, "shell", None) is not None
@@ -711,6 +725,12 @@ class TerminalHost:
         rows = [item.public() for item in sessions]
         rows.sort(key=lambda item: str(item.get("created_at") or ""))
         return rows
+
+    def list_hosts(self) -> list[dict[str, Any]]:
+        registry = self._reconnection_registry
+        if registry is None:
+            return []
+        return registry.list_observed_hosts()
 
     def audit_events(self, *, terminal_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
         return self.audit.list(terminal_id=terminal_id, limit=limit)
@@ -991,6 +1011,9 @@ class TerminalHost:
                 ),
                 backend_owner="RUST_RECONNECTION_HOST",
                 reconnection_host_id=str(status.get("host_id") or backend.host_id),
+                host_runtime_versions=runtime_version_snapshot(status),
+                host_compatibility=evaluate_runtime_compatibility(status),
+                protocol_state=str(status.get("protocol_state") or "UNKNOWN"),
             )
             managed = ManagedShell(
                 terminal_id=terminal_id,
@@ -1110,6 +1133,7 @@ class TerminalHost:
         supervisor_session_id: str = "",
         session_anchor_ref: str = "",
         replace_terminal_id: str = "",
+        replace_host_session_ref: str = "",
         resume_session_ref: str = "",
         launch_profile: str = "INTERACTIVE",
         provider_arguments: Sequence[str] = (),
@@ -1138,6 +1162,28 @@ class TerminalHost:
                 "a resolved Session Anchor is required before spawning a terminal",
             )
         replacement_id = str(replace_terminal_id or "").strip()
+        replacement_host_ref = str(replace_host_session_ref or "").strip()
+        if replacement_id and replacement_host_ref:
+            raise TerminalHostError(
+                "HOST_REPLACEMENT_COORDINATE_CONFLICT",
+                "replace exactly one Host or legacy terminal coordinate",
+            )
+        if replacement_host_ref:
+            with self._lock:
+                host_matches = [
+                    item
+                    for item in self._sessions.values()
+                    if item.reconnection_host_id == replacement_host_ref
+                ]
+            if (
+                len(host_matches) != 1
+                or host_matches[0].session_anchor_ref != anchor_ref
+            ):
+                raise TerminalHostError(
+                    "HOST_REPLACEMENT_IDENTITY_MISMATCH",
+                    "replacement must name the Host owned by this Session Anchor",
+                )
+            replacement_id = host_matches[0].terminal_id
         if replacement_id:
             with self._lock:
                 replacement = self._sessions.get(replacement_id)
@@ -1157,14 +1203,29 @@ class TerminalHost:
                 audit_context={"reason": "ATOMIC_TERMINAL_REPLACEMENT"},
             )
         with self._lock:
-            if any(
-                item.state == "LIVE" and item.session_anchor_ref == anchor_ref
+            anchored_hosts = [
+                item
                 for item in self._sessions.values()
+                if item.state == "LIVE" and item.session_anchor_ref == anchor_ref
+            ]
+        for anchored in anchored_hosts:
+            self._refresh_host_projection(anchored)
+            if (
+                not anchored.reconnection_host_id
+                or anchored.host_compatibility in {"CURRENT", "COMPATIBLE_OLD"}
             ):
                 raise TerminalHostError(
                     "TERMINAL_ANCHOR_ALREADY_HOSTED",
-                    "this Session Anchor already has a live terminal",
+                    "this Session Anchor already has a compatible live Host",
                 )
+            self.terminate(
+                anchored.terminal_id,
+                audit_context={
+                    "reason": "INCOMPATIBLE_HOST_REPLACEMENT",
+                    "host_session_ref": anchored.reconnection_host_id,
+                    "host_compatibility": anchored.host_compatibility,
+                },
+            )
         selected = str(provider or "AUTO").strip().upper()
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
@@ -1349,9 +1410,18 @@ class TerminalHost:
                 session.backend = ReconnectionPty(
                     client,
                     f"terminal-host-{os.getpid()}-{terminal_id}",
+                    after_cursor=(
+                        (2**64 - 1)
+                    if profile == "SUPERVISED_STDIO"
+                    and bool(getattr(client, "reused_existing", False))
+                        else 0
+                    ),
                 )
                 session.backend_owner = "RUST_RECONNECTION_HOST"
                 session.reconnection_host_id = session.backend.host_id
+                session.host_runtime_versions = session.backend.runtime_versions
+                session.host_compatibility = session.backend.compatibility
+                session.protocol_state = session.backend.protocol_state
             else:
                 session.backend = self._spawn(
                     shell_executable,
@@ -1387,24 +1457,25 @@ class TerminalHost:
         with self._lock:
             self._sessions[terminal_id] = session
         if isinstance(session.backend, ReconnectionPty):
-            try:
-                session.backend.execute(
-                    b"\x1b[1;1R"
-                    + provider_command.encode("utf-8")
-                    + b"\r\n"
-                )
-            except Exception as error:  # noqa: BLE001 - surface Host dispatch failure
-                session.managed_shell.record_failure_evidence(
-                    "CLI_START_FAILED", {"detail": str(error)}
-                )
+            if not session.backend.reused_existing:
                 try:
-                    self.terminate(terminal_id, audit_context=audit_context)
-                except Exception:
-                    pass
-                raise TerminalHostError(
-                    "TERMINAL_SPAWN_FAILED",
-                    str(error) or "failed to dispatch CLI through Session Host",
-                ) from error
+                    session.backend.execute(
+                        b"\x1b[1;1R"
+                        + provider_command.encode("utf-8")
+                        + b"\r\n"
+                    )
+                except Exception as error:  # noqa: BLE001 - surface Host dispatch failure
+                    session.managed_shell.record_failure_evidence(
+                        "CLI_START_FAILED", {"detail": str(error)}
+                    )
+                    try:
+                        self.terminate(terminal_id, audit_context=audit_context)
+                    except Exception:
+                        pass
+                    raise TerminalHostError(
+                        "TERMINAL_SPAWN_FAILED",
+                        str(error) or "failed to dispatch CLI through Session Host",
+                    ) from error
         created = session.public()
         self.record_audit_event(
             "TERMINAL_CREATED",
@@ -2105,6 +2176,13 @@ class TerminalHost:
             item
             for item in sessions
             if item.state == "LIVE"
+            and (
+                item.backend_owner != "RUST_RECONNECTION_HOST"
+                or (
+                    bool(item.reconnection_host_id)
+                    and item.host_compatibility in {"CURRENT", "COMPATIBLE_OLD"}
+                )
+            )
             and item.project_id == wanted_project
             and item.mode == wanted_mode
             and (
@@ -2126,6 +2204,69 @@ class TerminalHost:
         rows.sort(key=lambda item: item.created_at, reverse=True)
         return rows[0].public()
 
+    def get_host(self, host_session_ref: str) -> TerminalSession:
+        wanted = str(host_session_ref or "").strip()
+        if not wanted:
+            raise TerminalHostError(
+                "HOST_SESSION_REF_REQUIRED", "host_session_ref is required"
+            )
+        with self._lock:
+            matches = [
+                session
+                for session in self._sessions.values()
+                if session.reconnection_host_id == wanted
+            ]
+        if len(matches) != 1:
+            raise TerminalHostError(
+                "HOST_SESSION_NOT_FOUND", "host_session_ref is not uniquely managed"
+            )
+        session = matches[0]
+        self._refresh_session_state(session)
+        self._refresh_host_projection(session)
+        if session.state != "LIVE":
+            raise TerminalHostError("HOST_SESSION_NOT_LIVE", "Host session is not live")
+        if session.host_compatibility not in {"CURRENT", "COMPATIBLE_OLD"}:
+            raise TerminalHostError(
+                "HOST_SESSION_INCOMPATIBLE", "Host session runtime tuple is incompatible"
+            )
+        return session
+
+    def begin_provider_initialization(self, host_session_ref: str) -> str:
+        session = self.get_host(host_session_ref)
+        transition = getattr(session.backend, "protocol_initialize_begin", None)
+        if not callable(transition):
+            raise TerminalHostError(
+                "HOST_PROTOCOL_CONTROL_UNAVAILABLE",
+                "Host does not own provider protocol state",
+            )
+        state = str(transition() or "UNKNOWN")
+        session.protocol_state = state
+        return state
+
+    def complete_provider_initialization(self, host_session_ref: str) -> str:
+        session = self.get_host(host_session_ref)
+        transition = getattr(session.backend, "protocol_initialize_complete", None)
+        if not callable(transition):
+            raise TerminalHostError(
+                "HOST_PROTOCOL_CONTROL_UNAVAILABLE",
+                "Host does not own provider protocol state",
+            )
+        state = str(transition() or "UNKNOWN")
+        session.protocol_state = state
+        return state
+
+    def fail_provider_initialization(self, host_session_ref: str) -> str:
+        session = self.get_host(host_session_ref)
+        transition = getattr(session.backend, "protocol_initialize_failed", None)
+        if not callable(transition):
+            raise TerminalHostError(
+                "HOST_PROTOCOL_CONTROL_UNAVAILABLE",
+                "Host does not own provider protocol state",
+            )
+        state = str(transition() or "UNKNOWN")
+        session.protocol_state = state
+        return state
+
     @staticmethod
     def _backend_is_alive(backend: Any) -> bool | None:
         checker = getattr(backend, "is_alive", None)
@@ -2138,9 +2279,27 @@ class TerminalHost:
         except Exception:
             return None
 
+    @staticmethod
+    def _refresh_host_projection(session: TerminalSession) -> None:
+        if session.backend_owner != "RUST_RECONNECTION_HOST":
+            return
+        backend = session.backend
+        if backend is None:
+            session.host_compatibility = "INCOMPATIBLE"
+            session.protocol_state = "UNKNOWN"
+            return
+        try:
+            session.host_runtime_versions = backend.runtime_versions
+            session.host_compatibility = backend.compatibility
+            session.protocol_state = backend.protocol_state
+        except ReconnectionHostError:
+            session.host_compatibility = "INCOMPATIBLE"
+            session.protocol_state = "UNKNOWN"
+
     def _refresh_session_state(self, session: TerminalSession) -> None:
         if session.state != "LIVE":
             return
+        self._refresh_host_projection(session)
         backend = session.backend
         if backend is None or self._backend_is_alive(backend) is not False:
             return

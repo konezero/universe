@@ -47,7 +47,21 @@ class FakeJsonRpcTransport:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.notifications: list[tuple[str, dict[str, Any] | None]] = []
         self.closed = False
+        self.protocol_state = "NEW"
         self.instances.append(self)
+
+    def begin_protocol_initialization(self) -> str:
+        if self.protocol_state in {"NEW", "FAILED"}:
+            self.protocol_state = "INITIALIZING"
+        return self.protocol_state
+
+    def complete_protocol_initialization(self) -> str:
+        self.protocol_state = "INITIALIZED"
+        return self.protocol_state
+
+    def fail_protocol_initialization(self) -> str:
+        self.protocol_state = "FAILED"
+        return self.protocol_state
 
     def request(
         self,
@@ -739,6 +753,7 @@ class AgentSessionGatewayTests(unittest.TestCase):
             answer = session.prompt("Question", deltas.append)
             observation = session.runtime_observation()
             self.assertEqual("AVAILABLE", observation["quota_state"])
+
             self.assertEqual(25.0, observation["quota"]["windows"][0]["used_percent"])
             permission = session._handle_request(
                 "session/request_permission",
@@ -780,6 +795,31 @@ class AgentSessionGatewayTests(unittest.TestCase):
         self.assertEqual("allow-once", permission["outcome"]["optionId"])
         self.assertEqual("GROK", selected[0]["provider"])
         self.assertTrue(transport.closed)
+
+    def test_rebound_initialized_host_skips_provider_initialize(self) -> None:
+        class ReboundTransport(FakeJsonRpcTransport):
+            def begin_protocol_initialization(self) -> str:
+                self.protocol_state = "INITIALIZED"
+                return self.protocol_state
+
+        ReboundTransport.instances = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            ReboundTransport,
+        ):
+            session = GrokAcpSession(
+                executable=self.root / "grok.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id="grok-session-existing",
+                permission_requester=lambda _request: None,
+                session_observer=lambda _session_id: None,
+            )
+
+        methods = [method for method, _params in session._transport.requests]
+        self.assertNotIn("initialize", methods)
+        self.assertIn("session/load", methods)
 
     def test_grok_local_billing_fallback_reads_official_log_shape(self) -> None:
         profile = self.root / "profile"

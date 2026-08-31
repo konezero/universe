@@ -22,6 +22,7 @@ class FakeGateway:
     def __init__(self, session) -> None:
         self.session = session
         self.session_ref = session.session_ref
+        self.host_session_ref = str(getattr(session, "host_session_ref", ""))
 
     def reply_stream(self, _prompt, _on_delta) -> str:
         return "bounded result"
@@ -215,6 +216,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             def __init__(self, *, session_observer, **kwargs) -> None:
                 observed.append(dict(kwargs))
                 self.session_ref = "codex-app-server:managed-1"
+                self.host_session_ref = "host-codex-managed-1"
                 session_observer("managed-1")
 
         request = {
@@ -250,7 +252,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("session-anchor-worker-1", observed[0]["session_anchor_ref"])
         self.assertEqual("MAX", observed[0]["effort"])
         self.assertTrue(result["universe_coordinate_persisted"])
-        self.assertEqual("session-worker-1", result["host_session_ref"])
+        self.assertEqual("host-codex-managed-1", result["host_session_ref"])
 
     def test_dispatcher_resolves_one_host_coordinate_per_declared_turn(self) -> None:
         terminal_host = object()
@@ -421,6 +423,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
                 observed.append(dict(kwargs))
                 self.session_id = "managed-claude-1"
                 self.session_ref = "claude-code:managed-claude-1"
+                self.host_session_ref = "host-claude-managed-1"
                 session_observer(self.session_id)
 
         request = {
@@ -468,7 +471,7 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertIsNone(observed[0]["turn_timeout_seconds"])
         self.assertEqual("CLAUDE_CODE_STREAM_ADAPTER", result["runtime_provider"])
         self.assertTrue(result["universe_coordinate_persisted"])
-        self.assertEqual("session-claude-worker", result["host_session_ref"])
+        self.assertEqual("host-claude-managed-1", result["host_session_ref"])
 
     def test_managed_claude_preserves_rust_host_launch_failure_detail(self) -> None:
         class FakeBroker:

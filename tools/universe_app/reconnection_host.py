@@ -25,6 +25,22 @@ from .windows_process import process_is_alive, process_start_time
 
 STATE_SCHEMA = "universe.reconnection-host-state.v1"
 RESPONSE_SCHEMA = "universe.reconnection-host-response.v1"
+CURRENT_RUNTIME_VERSIONS = {
+    "server_version": "UniverseLocal/1",
+    "supervisor_version": "UniverseSupervisor/1",
+    "host_version": "UniverseSessionHost/1",
+    "pty_version": "UniverseConPty/1",
+}
+RUNTIME_VERSION_FIELDS = tuple(CURRENT_RUNTIME_VERSIONS)
+# Compatibility is deliberately declared as tuples.  Reuse never falls back to
+# pairwise equality, PID liveness, or a terminal state.  Older tuples are added
+# here only after their complete Server/Supervisor/Host/PTY contract is tested.
+DECLARED_COMPATIBILITY_MATRIX = {
+    "CURRENT": {
+        tuple(CURRENT_RUNTIME_VERSIONS[field] for field in RUNTIME_VERSION_FIELDS)
+    },
+    "COMPATIBLE_OLD": set(),
+}
 MAX_STATE_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 # Keep PTY write chunks well below the Host request limit after base64 and
@@ -55,6 +71,41 @@ class ReconnectionHostRuntimeStopped(ReconnectionHostError):
         super().__init__(f"Authenticated Host runtime is not LIVE: {runtime_state}")
         self.client = client
         self.runtime_state = runtime_state
+
+
+class ReconnectionHostIncompatible(ReconnectionHostError):
+    """A live authenticated Host cannot be reused by the current Supervisor."""
+
+    def __init__(
+        self,
+        client: "ReconnectionHostClient",
+        host: Mapping[str, Any],
+    ) -> None:
+        super().__init__("Authenticated Host runtime tuple is INCOMPATIBLE")
+        self.client = client
+        self.host = dict(host)
+        self.compatibility = "INCOMPATIBLE"
+
+
+def runtime_version_snapshot(value: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        field: str(value.get(field) or "UNKNOWN").strip() or "UNKNOWN"
+        for field in RUNTIME_VERSION_FIELDS
+    }
+
+
+def evaluate_runtime_compatibility(
+    value: Mapping[str, Any],
+    *,
+    matrix: Mapping[str, set[tuple[str, ...]]] = DECLARED_COMPATIBILITY_MATRIX,
+) -> str:
+    snapshot = runtime_version_snapshot(value)
+    version_tuple = tuple(snapshot[field] for field in RUNTIME_VERSION_FIELDS)
+    if version_tuple in matrix.get("CURRENT", set()):
+        return "CURRENT"
+    if version_tuple in matrix.get("COMPATIBLE_OLD", set()):
+        return "COMPATIBLE_OLD"
+    return "INCOMPATIBLE"
 
 
 def provision_private_registry_directory(
@@ -128,6 +179,10 @@ class ReconnectionHostState:
     started_at_unix_ms: int
     auth_token: str
     child_pid: int | None
+    server_version: str
+    supervisor_version: str
+    host_version: str
+    pty_version: str
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ReconnectionHostState":
@@ -151,6 +206,7 @@ class ReconnectionHostState:
             ),
             auth_token=_require_string(value.get("auth_token"), "auth_token"),
             child_pid=child_pid,
+            **runtime_version_snapshot(value),
         )
 
 
@@ -158,6 +214,7 @@ class ReconnectionHostClient:
     def __init__(self, state: ReconnectionHostState, *, timeout: float = 5.0) -> None:
         self.state = state
         self.timeout = timeout
+        self.reused_existing = True
 
     def request(self, action: str, **fields: Any) -> dict[str, Any]:
         endpoint = self.state.endpoint
@@ -207,6 +264,15 @@ class ReconnectionHostClient:
                     time.sleep(0.025)
         raise ReconnectionHostError(f"Host status failed: {last_error}") from last_error
 
+    def protocol_initialize_begin(self) -> dict[str, Any]:
+        return self.request("protocol_initialize_begin")["host"]
+
+    def protocol_initialize_complete(self) -> dict[str, Any]:
+        return self.request("protocol_initialize_complete")["host"]
+
+    def protocol_initialize_failed(self) -> dict[str, Any]:
+        return self.request("protocol_initialize_failed")["host"]
+
     def shutdown(self) -> None:
         self.request("shutdown")
 
@@ -234,6 +300,34 @@ class ReconnectionHostRegistry:
             return
         provision_private_registry_directory(self.root)
         self._prepared = True
+
+    def _archive_state_record(self, path: Path, *, reason: str) -> None:
+        """Preserve a redacted, non-reusable Host lifecycle observation."""
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload.pop("auth_token", None)
+        payload.update(
+            {
+                "runtime_state": "REPLACED",
+                "reconnect_eligible": False,
+                "archived_reason": str(reason or "HOST_REPLACED"),
+                "archived_at_unix_ms": int(time.time() * 1000),
+            }
+        )
+        history_root = self.root / "history"
+        history_root.mkdir(parents=True, exist_ok=True)
+        identity = hashlib.sha256(
+            f"{payload.get('host_id')}:{time.time_ns()}".encode("utf-8")
+        ).hexdigest()
+        target = history_root / f"host-{identity}.json"
+        staged = history_root / f".{target.name}.{secrets.token_hex(4)}.tmp"
+        staged.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(staged, target)
 
     def state_path(self, anchor_ref: str) -> Path:
         if not anchor_ref.strip():
@@ -393,6 +487,9 @@ class ReconnectionHostRegistry:
         runtime_state = str(observed.get("runtime_state") or "UNKNOWN")
         if runtime_state != "LIVE":
             raise ReconnectionHostRuntimeStopped(client, runtime_state)
+        compatibility = evaluate_runtime_compatibility(observed)
+        if compatibility == "INCOMPATIBLE":
+            raise ReconnectionHostIncompatible(client, observed)
         return client
 
     def list_live_clients(self) -> list[ReconnectionHostClient]:
@@ -414,6 +511,93 @@ class ReconnectionHostRegistry:
                 continue
             clients.append(client)
         return clients
+
+    def list_observed_hosts(self) -> list[dict[str, Any]]:
+        """Project live, stale, and incompatible Hosts without granting reuse."""
+
+        self.prepare()
+        observed_hosts: list[dict[str, Any]] = []
+        for path in sorted(self.root.glob("anchor-*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                state = self._read_state_path(path)
+            except ReconnectionHostError as error:
+                observed_hosts.append(
+                    {
+                        "host_session_ref": "UNKNOWN",
+                        "runtime_state": "UNKNOWN",
+                        "compatibility": "INCOMPATIBLE",
+                        "reconnect_eligible": False,
+                        "detail": str(error),
+                    }
+                )
+                continue
+            snapshot: dict[str, Any] = {
+                "host_session_ref": state.host_id,
+                "host_id": state.host_id,
+                "session_anchor_ref": state.anchor_ref,
+                "host_kind": state.host_kind,
+                "owner_ref": state.owner_ref,
+                "pid": state.pid,
+                "child_pid": state.child_pid,
+                **runtime_version_snapshot(state.__dict__),
+            }
+            if not process_is_alive(state.pid):
+                snapshot.update(
+                    {
+                        "runtime_state": "EXITED",
+                        "protocol_state": "UNKNOWN",
+                        "compatibility": evaluate_runtime_compatibility(snapshot),
+                        "reconnect_eligible": False,
+                    }
+                )
+                observed_hosts.append(snapshot)
+                continue
+            try:
+                host = ReconnectionHostClient(state).status()
+                snapshot.update(host)
+            except ReconnectionHostError as error:
+                snapshot.update(
+                    {
+                        "runtime_state": "UNREACHABLE",
+                        "protocol_state": "UNKNOWN",
+                        "detail": str(error),
+                    }
+                )
+            compatibility = evaluate_runtime_compatibility(snapshot)
+            snapshot["compatibility"] = compatibility
+            snapshot["reconnect_eligible"] = bool(
+                snapshot.get("runtime_state") == "LIVE"
+                and compatibility in {"CURRENT", "COMPATIBLE_OLD"}
+            )
+            snapshot.pop("auth_token", None)
+            observed_hosts.append(snapshot)
+        history_root = self.root / "history"
+        if history_root.is_dir():
+            for path in sorted(history_root.glob("host-*.json")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    archived = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(archived, dict):
+                    continue
+                archived.pop("auth_token", None)
+                archived["host_session_ref"] = str(
+                    archived.get("host_id") or "UNKNOWN"
+                )
+                archived["session_anchor_ref"] = str(
+                    archived.get("anchor_ref") or "UNKNOWN"
+                )
+                archived["compatibility"] = evaluate_runtime_compatibility(archived)
+                archived["reconnect_eligible"] = False
+                observed_hosts.append(archived)
+        observed_hosts.sort(
+            key=lambda item: int(item.get("started_at_unix_ms") or 0), reverse=True
+        )
+        return observed_hosts
 
     def launch(
         self,
@@ -439,6 +623,22 @@ class ReconnectionHostRegistry:
         if state_path.exists():
             try:
                 return self.discover(anchor_ref)
+            except ReconnectionHostIncompatible as incompatible_host:
+                incompatible_host.client.shutdown()
+                deadline = time.monotonic() + min(max(timeout, 0.1), 5.0)
+                while (
+                    process_is_alive(incompatible_host.client.state.pid)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+                if process_is_alive(incompatible_host.client.state.pid):
+                    raise ReconnectionHostError(
+                        "Authenticated incompatible Host did not terminate for replacement"
+                    ) from incompatible_host
+                self._archive_state_record(
+                    state_path, reason="INCOMPATIBLE_HOST_REPLACED"
+                )
+                state_path.unlink(missing_ok=True)
             except ReconnectionHostRuntimeStopped as stopped_host:
                 stopped_host.client.shutdown()
                 deadline = time.monotonic() + min(max(timeout, 0.1), 5.0)
@@ -448,6 +648,9 @@ class ReconnectionHostRegistry:
                     raise ReconnectionHostError(
                         "Authenticated stopped Host did not terminate for replacement"
                     ) from stopped_host
+                self._archive_state_record(
+                    state_path, reason="STOPPED_HOST_REPLACED"
+                )
                 state_path.unlink(missing_ok=True)
             except ReconnectionHostError as discovery_error:
                 try:
@@ -500,6 +703,14 @@ class ReconnectionHostRegistry:
             normalized_host_kind,
             "--owner-ref",
             normalized_owner_ref,
+            "--server-version",
+            CURRENT_RUNTIME_VERSIONS["server_version"],
+            "--supervisor-version",
+            CURRENT_RUNTIME_VERSIONS["supervisor_version"],
+            "--host-version",
+            CURRENT_RUNTIME_VERSIONS["host_version"],
+            "--pty-version",
+            CURRENT_RUNTIME_VERSIONS["pty_version"],
             "--token",
             token,
             "--shell",
@@ -553,6 +764,7 @@ class ReconnectionHostRegistry:
         while time.monotonic() < deadline:
             try:
                 client = self.discover(anchor_ref)
+                client.reused_existing = False
                 try:
                     os.chmod(state_path, 0o600)
                 except OSError:
@@ -592,6 +804,46 @@ class ReconnectionPty:
     @property
     def anchor_ref(self) -> str:
         return self.client.state.anchor_ref
+
+    @property
+    def reused_existing(self) -> bool:
+        return bool(getattr(self.client, "reused_existing", False))
+
+    @property
+    def runtime_versions(self) -> dict[str, str]:
+        return runtime_version_snapshot(self.client.status())
+
+    @property
+    def compatibility(self) -> str:
+        return evaluate_runtime_compatibility(self.client.status())
+
+    @property
+    def protocol_state(self) -> str:
+        return str(self.client.status().get("protocol_state") or "UNKNOWN")
+
+    def protocol_initialize_begin(self) -> str:
+        return str(
+            self.client.request(
+                "protocol_initialize_begin", supervisor_id=self.supervisor_id
+            )["host"].get("protocol_state")
+            or "UNKNOWN"
+        )
+
+    def protocol_initialize_complete(self) -> str:
+        return str(
+            self.client.request(
+                "protocol_initialize_complete", supervisor_id=self.supervisor_id
+            )["host"].get("protocol_state")
+            or "UNKNOWN"
+        )
+
+    def protocol_initialize_failed(self) -> str:
+        return str(
+            self.client.request(
+                "protocol_initialize_failed", supervisor_id=self.supervisor_id
+            )["host"].get("protocol_state")
+            or "UNKNOWN"
+        )
 
     @property
     def output_cursor(self) -> int:
