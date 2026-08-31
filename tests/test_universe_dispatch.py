@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +209,49 @@ class UniverseDispatchTests(unittest.TestCase):
 
         self.assertEqual("DELIVERED", receipt["status"])
         self.assertEqual(1200.0, observed["timeout"])
+
+    def test_task_frame_run_preserves_bounded_bridge_error_detail(self) -> None:
+        class ResponseError(HTTPError):
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "error_code": "WORKER_STRUCTURED_RESULT_INVALID",
+                        "detail": "WORKER_ADAPTER: WORKER_RESULT_JSON_INVALID",
+                    }
+                ).encode("utf-8")
+
+        previous = os.environ.get("UNIVERSE_TEST_MASTER_TOKEN")
+        os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = "bridge-test-token"
+        try:
+            with patch(
+                "universe_dispatch.urlopen",
+                side_effect=ResponseError(
+                    "http://127.0.0.1:9010",
+                    HTTPStatus.CONFLICT,
+                    "Conflict",
+                    {},
+                    None,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    DispatchError,
+                    "WORKER_STRUCTURED_RESULT_INVALID: WORKER_ADAPTER: "
+                    "WORKER_RESULT_JSON_INVALID",
+                ):
+                    HttpProjectMasterBridge(
+                        endpoint="http://127.0.0.1:9010",
+                        credential_env="UNIVERSE_TEST_MASTER_TOKEN",
+                    ).run_instruction_authorized_task_frame(
+                        bridge={"project_id": "GCS"},
+                        task_frame_id="task-frame-001",
+                        primary_proposal_id="task-proposal-001",
+                        primary_proposal_digest="a" * 64,
+                    )
+        finally:
+            if previous is None:
+                os.environ.pop("UNIVERSE_TEST_MASTER_TOKEN", None)
+            else:
+                os.environ["UNIVERSE_TEST_MASTER_TOKEN"] = previous
 
     def test_master_bridge_delivers_a_bound_room_envelope(self) -> None:
         captured: dict[str, object] = {}

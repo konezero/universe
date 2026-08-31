@@ -548,12 +548,15 @@ class HttpProjectMasterBridge:
                 payload = json.loads(response.read().decode("utf-8"))
                 status_code = response.status
         except HTTPError as error:
+            reason = ""
             try:
                 detail = json.loads(error.read().decode("utf-8"))
                 code = str(detail.get("error_code") or f"HTTP_{error.code}")
+                reason = str(detail.get("detail") or "").strip()[:512]
             except (UnicodeError, json.JSONDecodeError):
                 code = f"HTTP_{error.code}"
-            raise DispatchError("MASTER_TASK_FRAME_RUN_" + code) from error
+            suffix = f": {reason}" if reason else ""
+            raise DispatchError("MASTER_TASK_FRAME_RUN_" + code + suffix) from error
         except (URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
             raise DispatchError("MASTER_TASK_FRAME_RUN_UNAVAILABLE") from error
         if not 200 <= status_code < 300 or not isinstance(payload, dict):
