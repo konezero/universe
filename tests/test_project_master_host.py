@@ -4137,6 +4137,10 @@ class ProjectMasterHostTests(unittest.TestCase):
             "universe.task-frame-child-result.v1",
             dispatches[1]["output_contract"]["schema"],
         )
+        self.assertIn(
+            "as the final assistant message, not as internal reasoning",
+            dispatches[1]["output_contract"]["instruction"],
+        )
         self.assertEqual("submit_boss_allocations", operations[1]["operation"])
         self.assertEqual("IMPLEMENTER", result["child_results"][0]["role"])
         self.assertEqual(

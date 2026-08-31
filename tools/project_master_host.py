@@ -1752,8 +1752,9 @@ class ProjectModeCoordinator:
             "schema": "universe.task-frame-child-result.v1",
             "mutation_evidence_required": mutation_evidence_required,
             "instruction": (
-                "Return only the structured result. outcome must be SUCCEEDED, "
-                "include evidence references and at least one PASS validation."
+                "Return only the structured result as the final assistant message, "
+                "not as internal reasoning. outcome must be SUCCEEDED, include "
+                "evidence references and at least one PASS validation."
             ),
             "json_schema": {
                 "type": "object",
