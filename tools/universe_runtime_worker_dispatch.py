@@ -1295,11 +1295,11 @@ class RuntimeWorkerDispatcher:
         if runtime_profile == "TASK_FRAME_RUNTIME":
             return (
                 "You are a bounded Task Frame Runtime provider. You receive all "
-                "usable context in the supplied Context Pack. Follow the Role Scope "
-                "at the end of the request. Do not create or modify files, invoke "
-                "subagents, or claim authority. Source mutation is Host-gateway-only. "
-                "Return only the "
-                "requested result content."
+                "usable context in the supplied Context Pack. Perform the assigned "
+                "task according to its Runtime-validated purpose, scope, and output "
+                "contract. Do not invoke subagents or claim authority. Any source "
+                "mutation must remain within the declared mutation scope and use "
+                "the Host gateway. Return only the requested result content."
             )
         return (
             "You are a bounded read-only Task Frame worker. You receive all "

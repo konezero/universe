@@ -81,6 +81,17 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
             dispatcher._task_frame_permission(review_request, permission),
         )
 
+    def test_task_frame_system_prompt_follows_validated_task_scope(self) -> None:
+        prompt = RuntimeWorkerDispatcher._system_prompt("TASK_FRAME_RUNTIME")
+
+        self.assertIn("Perform the assigned task", prompt)
+        self.assertIn(
+            "Runtime-validated purpose, scope, and output contract", prompt
+        )
+        self.assertIn("declared mutation scope", prompt)
+        self.assertIn("Host gateway", prompt)
+        self.assertNotIn("Do not create or modify files", prompt)
+
     def test_codex_task_frame_requests_ephemeral_provider_session(self) -> None:
         observed: list[tuple[bool, str, float]] = []
 
