@@ -666,6 +666,43 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        host_protocol = path.split("/")
+        if (
+            len(host_protocol) == 6
+            and host_protocol[1:3] == ["v1", "hosts"]
+            and host_protocol[4] == "provider-initialization"
+            and host_protocol[5] in {"begin", "complete", "failed"}
+        ):
+            host_session_ref = host_protocol[3]
+            transition = host_protocol[5]
+            methods = {
+                "begin": supervisor.host.begin_provider_initialization,
+                "complete": supervisor.host.complete_provider_initialization,
+                "failed": supervisor.host.fail_provider_initialization,
+            }
+            try:
+                protocol_state = methods[transition](host_session_ref)
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "OK",
+                    "host_session_ref": host_session_ref,
+                    "protocol_state": protocol_state,
+                },
+            )
+            return
         if (
             path.startswith("/v1/terminals/")
             and path.endswith("/managed-attach")

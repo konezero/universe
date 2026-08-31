@@ -269,6 +269,21 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual("MANAGED_SHELL_ATTACHED", payload["status"])
         record.assert_called_once_with("term_owned", evidence)
 
+    def test_host_protocol_route_forwards_to_terminal_host(self) -> None:
+        with patch.object(
+            self.server.supervisor.host,
+            "begin_provider_initialization",
+            return_value="INITIALIZING",
+        ) as begin:
+            status, payload = self.request(
+                "POST",
+                "/v1/hosts/host-owned/provider-initialization/begin",
+                {},
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("INITIALIZING", payload["protocol_state"])
+        begin.assert_called_once_with("host-owned")
+
     def test_create_returns_diagnostic_for_unexpected_host_failure(self) -> None:
         with patch.object(
             self.server.supervisor.host,
@@ -484,6 +499,35 @@ class PtySupervisorTests(unittest.TestCase):
         ):
             hosted = host.get_host("host-current")
         self.assertEqual("term-hosted", hosted.terminal_id)
+
+    def test_supervised_host_protocol_transitions_use_host_route(self) -> None:
+        host = object.__new__(SupervisedTerminalHost)
+        with patch.object(
+            host,
+            "_request",
+            side_effect=[
+                {"protocol_state": "INITIALIZING"},
+                {"protocol_state": "INITIALIZED"},
+                {"protocol_state": "FAILED"},
+            ],
+        ) as request:
+            self.assertEqual(
+                "INITIALIZING", host.begin_provider_initialization("host-current")
+            )
+            self.assertEqual(
+                "INITIALIZED", host.complete_provider_initialization("host-current")
+            )
+            self.assertEqual(
+                "FAILED", host.fail_provider_initialization("host-current")
+            )
+        self.assertEqual(
+            [
+                "/v1/hosts/host-current/provider-initialization/begin",
+                "/v1/hosts/host-current/provider-initialization/complete",
+                "/v1/hosts/host-current/provider-initialization/failed",
+            ],
+            [call.args[1] for call in request.call_args_list],
+        )
 
     def test_supervised_subscription_retries_transient_read_for_live_host(self) -> None:
         host = object.__new__(SupervisedTerminalHost)

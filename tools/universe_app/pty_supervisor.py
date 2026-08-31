@@ -372,6 +372,30 @@ class SupervisedTerminalHost:
             )
         return SupervisedSession(matches[0])
 
+    def begin_provider_initialization(self, host_session_ref: str) -> str:
+        return self._provider_initialization_transition(host_session_ref, "begin")
+
+    def complete_provider_initialization(self, host_session_ref: str) -> str:
+        return self._provider_initialization_transition(host_session_ref, "complete")
+
+    def fail_provider_initialization(self, host_session_ref: str) -> str:
+        return self._provider_initialization_transition(host_session_ref, "failed")
+
+    def _provider_initialization_transition(
+        self, host_session_ref: str, transition: str
+    ) -> str:
+        wanted = str(host_session_ref or "").strip()
+        if not wanted:
+            raise TerminalHostError(
+                "HOST_SESSION_REF_REQUIRED", "host_session_ref is required"
+            )
+        payload = self._request(
+            "POST",
+            f"/v1/hosts/{quote(wanted, safe='')}/provider-initialization/{transition}",
+            audit_source="UNIVERSE_HOST_PROTOCOL",
+        )
+        return str(payload.get("protocol_state") or "UNKNOWN")
+
     def history(
         self, terminal_id: str, *, before_cursor: int | None = None, limit: int = 100
     ) -> dict[str, Any]:
