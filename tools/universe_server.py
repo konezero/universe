@@ -381,11 +381,7 @@ PROJECT_MASTER_ACTIVE_STREAM_MAX_BYTES = 256 * 1024
 GOVERNANCE_APPROVAL_COMMANDS = frozenset(
     {
         "\uc2b9\uc778",
-        "\uc9c4\ud589",
-        "\uace0\uace0",
         "\uc2b9\uc778\ud574",
-        "\uc9c4\ud589\ud574",
-        "\uace0\uace0\ud574",
         "approve",
     }
 )

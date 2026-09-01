@@ -11642,11 +11642,22 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_governance_approval_command_accepts_korean_and_ascii(self) -> None:
         self.assertTrue(is_governance_approval_command("승인"))
+        self.assertTrue(is_governance_approval_command("승인해"))
         self.assertTrue(is_governance_approval_command(" approve "))
         self.assertTrue(
             is_governance_approval_command("approve task_proposal_test_001")
         )
         self.assertFalse(is_governance_approval_command("승인해줘"))
+
+        for progress_phrase in (
+            "진행",
+            "진행해",
+            "고고",
+            "고고해",
+            "진행해야겠다",
+            "진행하자",
+        ):
+            self.assertFalse(is_governance_approval_command(progress_phrase))
 
     def test_conductor_approval_reconciles_legacy_runtime_approval(self) -> None:
         proposal = self.create_task_proposal_fixture()
