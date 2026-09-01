@@ -453,6 +453,50 @@ class MemoryCandidateApiTests(unittest.TestCase):
             unsupported_budget["error_code"],
         )
 
+    def test_memory_batch_action_and_legacy_surface_share_the_run_envelope(self) -> None:
+        self.configure("FAST_EXTRACT", dry_run=True)
+        activity_batch = {
+            "source": {
+                "provider": "CODEX",
+                "provider_session_id": "session-action-1",
+                "source_id": "source-action-1",
+            },
+            "activity_refs": [
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 1,
+                    "activity_digest": "a" * 64,
+                }
+            ],
+        }
+        status, action_result = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "memory.batch.run",
+                "request": {
+                    "project_id": "TEST",
+                    "stage": "FAST_EXTRACT",
+                    "activity_batches": [activity_batch],
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("memory.batch.run", action_result["action_id"])
+        self.assertEqual("DRY_RUN_COMPLETED", action_result["run"]["status"])
+
+        status, legacy_result = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-batches/run",
+            {"stage": "FAST_EXTRACT", "activity_batches": [activity_batch]},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("memory.batch.run", legacy_result["action_id"])
+        self.assertEqual("DRY_RUN_COMPLETED", legacy_result["run"]["status"])
+        self.assertEqual(action_result["run"]["run_id"], legacy_result["run"]["run_id"])
+        self.assertEqual(action_result["config"], legacy_result["config"])
+
     def test_delegation_is_durable_and_does_not_block_chat(self) -> None:
         status, queued = self.request(
             "POST",

@@ -16,6 +16,10 @@ from universe_action_registry import (  # noqa: E402
     ActionContractError,
     ActionRegistry,
     DuplicateActionError,
+    LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE,
+    MEMORY_BATCH_RUN_ACTION_ID,
+    MEMORY_BATCH_RUN_REQUEST_SCHEMA,
+    MEMORY_BATCH_RUN_RESULT_SCHEMA,
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_REQUEST_SCHEMA,
     RAG_ADOPT_RESULT_SCHEMA,
@@ -81,7 +85,12 @@ class UniverseActionRegistryTests(unittest.TestCase):
         registry.register_uncovered_surface("future.direct.surface")
         self.assertEqual(COVERED, registry.classify_surface("feature.goal.start"))
         self.assertEqual(COVERED, registry.classify_surface(RAG_ADOPT_ACTION_ID))
+        self.assertEqual(COVERED, registry.classify_surface(MEMORY_BATCH_RUN_ACTION_ID))
         self.assertEqual(LEGACY_DIRECT, registry.classify_surface("UniverseStore.start_feature_goal"))
+        self.assertEqual(
+            LEGACY_DIRECT,
+            registry.classify_surface(LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE),
+        )
         self.assertEqual(UNCOVERED, registry.classify_surface("future.direct.surface"))
         coverage = registry.coverage()
         self.assertEqual(COVERED, coverage["feature.goal.start"])
@@ -90,6 +99,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
         report = registry.coverage_report()
         self.assertIn("feature.goal.start", report["registered_action_ids"])
         self.assertIn(RAG_ADOPT_ACTION_ID, report["registered_action_ids"])
+        self.assertIn(MEMORY_BATCH_RUN_ACTION_ID, report["registered_action_ids"])
         self.assertEqual(coverage, registry.coverage_classification())
         self.assertEqual(
             "universe.feature-goal-start-receipt.v1",
@@ -98,6 +108,17 @@ class UniverseActionRegistryTests(unittest.TestCase):
         rag_contract = build_default_action_registry().lookup(RAG_ADOPT_ACTION_ID)
         self.assertEqual(RAG_ADOPT_REQUEST_SCHEMA, rag_contract.request_schema_ref)
         self.assertEqual(RAG_ADOPT_RESULT_SCHEMA, rag_contract.result_schema_ref)
+        memory_batch_contract = build_default_action_registry().lookup(
+            MEMORY_BATCH_RUN_ACTION_ID
+        )
+        self.assertEqual(
+            MEMORY_BATCH_RUN_REQUEST_SCHEMA,
+            memory_batch_contract.request_schema_ref,
+        )
+        self.assertEqual(
+            MEMORY_BATCH_RUN_RESULT_SCHEMA,
+            memory_batch_contract.result_schema_ref,
+        )
         self.assertEqual(
             {"COVERED", "LEGACY_DIRECT", "UNCOVERED"},
             {item["classification"] for item in report["coverage"]},

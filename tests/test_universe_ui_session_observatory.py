@@ -1092,5 +1092,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('candidate.state === "KEEP" && candidate.kind === "MEMORY"', review)
         self.assertIn('"Adopt to RAG"', review)
 
+    def test_memory_batch_run_uses_the_common_action_surface(self) -> None:
+        run_start = APP.index('const run = node("button", "primary-button compact-action", "Run stage")')
+        run_end = APP.index("actions.append(save, run);", run_start)
+        run_slice = APP[run_start:run_end]
+        self.assertIn('invokeServerAction("memory.batch.run", {', run_slice)
+        self.assertIn("project_id: state.selectedProject.project_id", run_slice)
+        self.assertNotIn("memory-batches/run`", run_slice)
+
 if __name__ == "__main__":
     unittest.main()

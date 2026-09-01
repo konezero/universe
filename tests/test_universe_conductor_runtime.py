@@ -99,6 +99,51 @@ class UniverseConductorRuntimeTests(unittest.TestCase):
                     {"feature_id": "feature-1", "mode": "MASTER"},
                 )
 
+    def test_memory_batch_action_uses_the_same_conductor_envelope(self) -> None:
+        class ActionResponse:
+            status = 200
+
+            @staticmethod
+            def read() -> bytes:
+                return b'{"status":"MEMORY_BATCH_RUN_COMPLETED","action_id":"memory.batch.run"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_cli = root / ".ai" / "runtime" / "reference_runtime" / "cli.py"
+            runtime_cli.parent.mkdir(parents=True)
+            runtime_cli.write_text("# runtime cli\n", encoding="utf-8")
+            runtime = UniverseConductorRuntime(
+                root, action_endpoint="http://127.0.0.1:41992"
+            )
+            runtime._binding = {
+                "endpoint": "http://127.0.0.1:41991",
+                "token": "credential-ref-only",
+            }
+            with patch(
+                "universe_conductor_runtime.urlopen",
+                return_value=ActionResponse(),
+            ) as opened:
+                result = runtime.invoke_action(
+                    "memory.batch.run",
+                    {"project_id": "TEST", "stage": "FAST_EXTRACT"},
+                )
+            request = opened.call_args.args[0]
+            payload = json.loads(request.data.decode("utf-8"))
+            self.assertEqual("MEMORY_BATCH_RUN_COMPLETED", result["status"])
+            self.assertEqual("memory.batch.run", payload["action_id"])
+            self.assertEqual(
+                {"project_id": "TEST", "stage": "FAST_EXTRACT"},
+                payload["request"],
+            )
+            self.assertNotIn("actor", payload)
+            self.assertNotIn("context", payload)
+
     def test_exact_session_attachment_does_not_replace_host_process_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

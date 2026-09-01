@@ -38,6 +38,16 @@ RAG_ADOPT_REQUEST_SCHEMA = "universe.rag-adopt-action-request.v1"
 RAG_ADOPT_RESULT_SCHEMA = "universe.rag-adopt-receipt.v1"
 RAG_ADOPT_ACTION_SURFACE = "rag.adopt"
 
+MEMORY_BATCH_RUN_ACTION_ID = "memory.batch.run"
+MEMORY_BATCH_RUN_REQUEST_SCHEMA = "universe.memory-batch-run-action-request.v1"
+# The action returns the existing local-service envelope and keeps the durable
+# run payload under universe.memory-batch-run.v1.
+MEMORY_BATCH_RUN_RESULT_SCHEMA = "universe.local-service.v1"
+MEMORY_BATCH_RUN_ACTION_SURFACE = "memory.batch.run"
+LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE = (
+    "/v1/projects/{project_id}/memory-batches/run"
+)
+
 SERVER_RESOLVED_CALLER_FIELDS = frozenset(
     {
         "actor",
@@ -415,6 +425,7 @@ def build_default_action_registry(
     handler: ActionHandler | None = None,
     *,
     rag_adopt_handler: ActionHandler | None = None,
+    memory_batch_run_handler: ActionHandler | None = None,
 ) -> ActionRegistry:
     """Build the currently modeled mutating surface registry."""
 
@@ -443,6 +454,21 @@ def build_default_action_registry(
         rag_adopt_handler,
         surfaces=(RAG_ADOPT_ACTION_SURFACE,),
     )
+    registry.register(
+        ActionContract(
+            action_id=MEMORY_BATCH_RUN_ACTION_ID,
+            request_schema_ref=MEMORY_BATCH_RUN_REQUEST_SCHEMA,
+            result_schema_ref=MEMORY_BATCH_RUN_RESULT_SCHEMA,
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "run_schema": "universe.memory-batch-run.v1",
+                "provider_invocation": "MAY_RUN",
+            },
+        ),
+        memory_batch_run_handler,
+        surfaces=(MEMORY_BATCH_RUN_ACTION_SURFACE,),
+    )
+    registry.register_legacy_surface(LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE)
     return registry
 
 
@@ -468,6 +494,11 @@ __all__ = [
     "LEGACY_DIRECT",
     "LEGACY_FEATURE_GOAL_START_HTTP_SURFACE",
     "LEGACY_FEATURE_GOAL_START_STORE_SURFACE",
+    "LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE",
+    "MEMORY_BATCH_RUN_ACTION_ID",
+    "MEMORY_BATCH_RUN_ACTION_SURFACE",
+    "MEMORY_BATCH_RUN_REQUEST_SCHEMA",
+    "MEMORY_BATCH_RUN_RESULT_SCHEMA",
     "RAG_ADOPT_ACTION_ID",
     "RAG_ADOPT_ACTION_SURFACE",
     "RAG_ADOPT_REQUEST_SCHEMA",

@@ -181,6 +181,7 @@ from universe_conductor_runtime import (
 from universe_action_registry import (
     ACTION_CONTEXT_SCHEMA,
     FEATURE_GOAL_START_ACTION_ID,
+    MEMORY_BATCH_RUN_ACTION_ID,
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_RESULT_SCHEMA,
     ActionRegistryError,
@@ -24953,6 +24954,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.action_registry = build_default_action_registry(
             self._handle_feature_goal_start_action,
             rag_adopt_handler=self._handle_rag_adopt_action,
+            memory_batch_run_handler=self._handle_memory_batch_run_action,
         )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_error: dict[str, str] | None = None
@@ -25948,6 +25950,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             },
             "next_operation": memory["next_operation"],
         }
+
+    def _handle_memory_batch_run_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "memory.batch.run requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request,
+            field="memory_batch_run_action",
+            required=frozenset({"project_id", "stage"}),
+            optional=frozenset(
+                {
+                    "activity_batches",
+                    "source_ids",
+                    "kinds",
+                    "runtime_binding",
+                }
+            ),
+        )
+        project_id = _identifier(action.pop("project_id"), "project_id")
+        result = self.run_memory_batch(project_id, action)
+        return {**result, "action_id": MEMORY_BATCH_RUN_ACTION_ID}
 
     def _complete_feature_goal_start(
         self, feature_id: str, value: Mapping[str, Any]
@@ -41289,9 +41318,32 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/memory-batches/run":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "MEMORY_BATCH_REQUEST_INVALID",
+                        "memory batch run body must be an object",
+                    )
+                action_request = {
+                    "project_id": parts[0],
+                    **{
+                        key: body[key]
+                        for key in (
+                            "stage",
+                            "activity_batches",
+                            "source_ids",
+                            "kinds",
+                            "runtime_binding",
+                        )
+                        if key in body
+                    },
+                }
                 self._send(
                     HTTPStatus.OK,
-                    self.server.run_memory_batch(parts[0], body),
+                    self.server.execute_action(
+                        MEMORY_BATCH_RUN_ACTION_ID,
+                        action_request,
+                        source="LEGACY_DIRECT",
+                    ),
                 )
                 return
             if parts is not None and parts[1] == "/memory-candidates":

@@ -14416,12 +14416,10 @@ function renderMemoryBatchStages() {
     run.disabled = config.enabled === false;
     run.addEventListener("click", async () => {
       try {
-        const result = await api(
-          `/v1/projects/${encodeURIComponent(
-            state.selectedProject.project_id
-          )}/memory-batches/run`,
-          { method: "POST", body: { stage: config.stage } }
-        );
+        const result = await invokeServerAction("memory.batch.run", {
+          project_id: state.selectedProject.project_id,
+          stage: config.stage,
+        });
         state.memoryBatchRuns = [result.run, ...state.memoryBatchRuns];
         const candidates = await api(
           `/v1/projects/${encodeURIComponent(
