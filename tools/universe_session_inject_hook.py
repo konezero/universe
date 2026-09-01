@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote, urlsplit
 
+from universe_host_state import is_universe_managed_host
+
 HOOK_SCHEMA = "universe.session-inject-hook.v1"
 PROVIDERS = frozenset({"CLAUDE", "CODEX", "GROK"})
 
@@ -1063,6 +1065,39 @@ def run_hook(
         return _result(
             "SKIPPED",
             detail="project_id not resolved",
+            **base,
+        )
+    trigger = str(args.trigger or "").strip().lower()
+    if trigger in {"session_start", "mode_change"} and not is_universe_managed_host(
+        env
+    ):
+        standalone = None
+        if session_ref:
+            scripts = (
+                Path(__file__).resolve().parent.parent
+                / ".ai"
+                / "skills"
+                / "common"
+                / "standalone-bootstrap"
+                / "scripts"
+            )
+            sys.path.insert(0, str(scripts))
+            from bootstrap_standalone import bootstrap as standalone_bootstrap
+
+            standalone = standalone_bootstrap(
+                repo_root,
+                {
+                    "provider": provider,
+                    "session_id": session_ref,
+                    "requested_mode": mode,
+                },
+                dict(env),
+            )
+        return _result(
+            "SKIPPED",
+            detail="unmanaged host; managed hook skipped",
+            host_state="UNMANAGED",
+            standalone_bootstrap=standalone,
             **base,
         )
 

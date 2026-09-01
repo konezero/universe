@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_session_inject_hook import (  # noqa: E402
     _claude_settings_hook,
     _supervisor_identity_observation,
+    is_universe_managed_host,
     main,
     provider_hook_stdout,
     resolve_mode,
@@ -338,7 +339,24 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual("UNASSIGNED", result["authority"])
         self.assertTrue(result.get("observation_path"))
 
-    def test_generic_session_start_leaves_mode_for_server_identity_resolution(self) -> None:
+    def test_is_universe_managed_host(self) -> None:
+        self.assertFalse(is_universe_managed_host({}))
+        self.assertFalse(is_universe_managed_host({"GROK_AGENT": "1"}))
+        self.assertTrue(
+            is_universe_managed_host(
+                {"UNIVERSE_SUPERVISOR_SESSION_ID": "session_1"}
+            )
+        )
+        self.assertTrue(
+            is_universe_managed_host(
+                {
+                    "UNIVERSE_TERMINAL_ID": "term_1",
+                    "UNIVERSE_MANAGED_SHELL": "1",
+                }
+            )
+        )
+
+    def test_unmanaged_session_start_skips_inject(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".ai" / "runtime" / "tmp").mkdir(parents=True)
@@ -351,7 +369,62 @@ class SessionInjectHookTests(unittest.TestCase):
                     dry_run=True,
                     trigger="session_start",
                 ),
-                environment={},
+                environment={"GROK_AGENT": "1"},
+            )
+        self.assertEqual("SKIPPED", result["status"])
+        self.assertEqual("UNMANAGED", result["host_state"])
+        self.assertEqual(
+            "unmanaged host; managed hook skipped",
+            result["detail"],
+        )
+        self.assertEqual(
+            "STANDALONE_BOOTSTRAP_COMPLETE",
+            result["standalone_bootstrap"]["status"],
+        )
+        self.assertNotIn("inject_body", result)
+
+    def test_unmanaged_mode_change_skips_inject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ai" / "runtime" / "tmp").mkdir(parents=True)
+            result = run_hook(
+                _args(
+                    repo_root=root,
+                    project_id="proj_current_mode",
+                    provider="GROK",
+                    session_ref="cli-session",
+                    dry_run=True,
+                    trigger="mode_change",
+                ),
+                environment={"GROK_AGENT": "1"},
+            )
+        self.assertEqual("SKIPPED", result["status"])
+        self.assertEqual("UNMANAGED", result["host_state"])
+        self.assertEqual(
+            "unmanaged host; managed hook skipped",
+            result["detail"],
+        )
+        self.assertEqual(
+            "STANDALONE_BOOTSTRAP_COMPLETE",
+            result["standalone_bootstrap"]["status"],
+        )
+
+    def test_managed_session_start_leaves_mode_for_server_identity_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ai" / "runtime" / "tmp").mkdir(parents=True)
+            result = run_hook(
+                _args(
+                    repo_root=root,
+                    project_id="proj_current_mode",
+                    provider="CODEX",
+                    session_ref="current-provider-ref",
+                    dry_run=True,
+                    trigger="session_start",
+                ),
+                environment={
+                    "UNIVERSE_SUPERVISOR_SESSION_ID": "session_managed_1"
+                },
             )
         self.assertEqual("DRY_RUN", result["status"])
         self.assertEqual("", result["mode"])
@@ -453,7 +526,9 @@ class SessionInjectHookTests(unittest.TestCase):
                         state_file=state,
                         trigger="session_start",
                     ),
-                    environment={},
+                    environment={
+                        "UNIVERSE_SUPERVISOR_SESSION_ID": "session_managed_inject"
+                    },
                 )
         self.assertEqual("INJECTED", result["status"])
         self.assertEqual("bind_1", result["inject_response"]["binding_id"])
