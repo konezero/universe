@@ -23,6 +23,12 @@ Conductor conversation
   -> Activity, evidence, result, and Memory candidates feed the next loop
 ```
 
+When the user confirms a product or architecture decision directly, the
+Conductor records it through the `rag.record-decision` Action as a linked
+`DECISION_NOTE`. This gives the next Node Planning Context the decision as
+canonical retrieval evidence without creating a Seed revision, authority,
+Assignment, or Task Frame.
+
 The durable order remains Feature Node before Goal and Todo. A proposal does not
 become a Feature Node merely because a model produced it, and a Feature Node does
 not create execution authority.
@@ -163,11 +169,17 @@ and produce local commits. Scope expansion stops for user direction.
    - Replaces repeated user gates for Work Plan adoption/application when those choices
      stay within the approved Goal scope; the Conductor records those decisions.
 
-3. `rag.adopt`
+3. `rag.record-decision`
+   - Records an already-confirmed user product or architecture decision as linked,
+     retrieval-ready canonical Memory.
+   - The stable decision reference is replay-safe and conflicting revisions fail closed.
+   - It creates no Seed, authority, Assignment, Task Frame, or repository change.
+
+4. `rag.adopt`
    - Promotes selected candidate knowledge to canonical reusable RAG.
    - Product exploration does not imply canonical knowledge adoption.
 
-4. `repository.push`
+5. `repository.push`
    - Publishes exact local commits to a remote repository.
 
 ## Automation state machine

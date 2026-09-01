@@ -184,6 +184,8 @@ from universe_action_registry import (
     MEMORY_BATCH_RUN_ACTION_ID,
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_RESULT_SCHEMA,
+    RAG_RECORD_DECISION_ACTION_ID,
+    RAG_RECORD_DECISION_RESULT_SCHEMA,
     ActionRegistryError,
     UnknownActionError,
     build_default_action_registry,
@@ -16918,6 +16920,147 @@ class UniverseStore:
             )
         return material
 
+    def record_project_decision_memory(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Record one explicit user decision as a linked canonical Memory.
+
+        ``decision_ref`` is the stable logical identity for this decision.  A
+        retry with the same identity and content replays the existing Memory;
+        changing content under an existing identity fails closed instead of
+        overwriting the previous decision.
+        """
+
+        project = self.get_project(project_id)
+        action = _exact_object_fields(
+            value,
+            field="project_decision_memory",
+            required=frozenset({"decision_ref", "title", "body", "node_ref"}),
+            optional=frozenset({"graph"}),
+        )
+        decision_ref = _identifier(action["decision_ref"], "decision_ref")
+        node_ref = _required_text(action["node_ref"], "node_ref")
+        origin_ref = (
+            "universe://projects/"
+            f"{quote(project['project_id'], safe='')}/decision-notes/"
+            f"{quote(decision_ref, safe='')}"
+        )
+        try:
+            request = normalize_memory_create(
+                {
+                    "title": action["title"],
+                    "body": action["body"],
+                    "state": "DECISION_NOTE",
+                    "node_ref": node_ref,
+                    "graph": action.get("graph", "functional"),
+                    "origin_ref": origin_ref,
+                }
+            )
+        except MemoryError as error:
+            raise UniverseError(error.code, error.message) from error
+
+        now = utc_now()
+        material = {
+            "schema": MEMORY_SCHEMA,
+            "project_id": project["project_id"],
+            "decision_ref": decision_ref,
+            "title": request["title"],
+            "body": request["body"],
+            "state": "DECISION_NOTE",
+            "link_state": "LINKED",
+            "node_ref": request["node_ref"],
+            "graph": request["graph"],
+            "origin_ref": origin_ref,
+            "effects": {
+                "seed_write": "NONE",
+                "candidate": "NONE",
+                "queue_publication": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+            },
+            "next_operation": "RETRIEVAL_READY",
+        }
+        material["memory_digest"] = _json_sha256(material)
+        material["memory_id"] = "memory_" + material["memory_digest"][:24]
+        material["created_at"] = now
+        material["updated_at"] = now
+
+        def matches(memory: Mapping[str, Any]) -> bool:
+            return all(
+                memory.get(field) == material[field]
+                for field in (
+                    "project_id",
+                    "decision_ref",
+                    "title",
+                    "body",
+                    "state",
+                    "link_state",
+                    "node_ref",
+                    "graph",
+                    "origin_ref",
+                )
+            )
+
+        with self._connection() as connection:
+            # Serialize the read/insert pair.  The existing project_memory
+            # schema predates a unique origin index, so the transaction itself
+            # is the conflict boundary for concurrent Action retries.
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT memory_json, created_at, updated_at
+                FROM project_memory
+                WHERE project_id = ? AND origin_ref = ?
+                ORDER BY memory_id
+                """,
+                (project["project_id"], origin_ref),
+            ).fetchall()
+            if rows:
+                memories: list[dict[str, Any]] = []
+                for row in rows:
+                    existing = json.loads(row["memory_json"])
+                    existing["created_at"] = row["created_at"]
+                    existing["updated_at"] = row["updated_at"]
+                    memories.append(existing)
+                if not all(matches(existing) for existing in memories):
+                    raise UniverseError(
+                        "RAG_DECISION_STORAGE_CONFLICT",
+                        "canonical decision origin is bound to different content",
+                        HTTPStatus.CONFLICT,
+                    )
+                return memories[0], False
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO project_memory(
+                        memory_id, project_id, title, body, state, link_state,
+                        node_ref, graph, origin_ref, memory_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        material["memory_id"],
+                        project["project_id"],
+                        material["title"],
+                        material["body"],
+                        material["state"],
+                        material["link_state"],
+                        material["node_ref"],
+                        material["graph"],
+                        material["origin_ref"],
+                        _canonical_json(material),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise UniverseError(
+                    "RAG_DECISION_STORAGE_CONFLICT",
+                    "canonical decision could not be recorded",
+                    HTTPStatus.CONFLICT,
+                ) from error
+        return material, True
+
     def _find_project_memory_by_origin_ref(
         self, project_id: str, origin_ref: str
     ) -> dict[str, Any] | None:
@@ -24954,6 +25097,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.action_registry = build_default_action_registry(
             self._handle_feature_goal_start_action,
             rag_adopt_handler=self._handle_rag_adopt_action,
+            rag_record_decision_handler=self._handle_rag_record_decision_action,
             memory_batch_run_handler=self._handle_memory_batch_run_action,
         )
         self._planning_binding: dict[str, Any] | None = None
@@ -25826,7 +25970,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def action_http_status(result: Mapping[str, Any]) -> HTTPStatus:
         return (
             HTTPStatus.CREATED
-            if result.get("status") in {"FEATURE_GOAL_STARTED", "RAG_MEMORY_ADOPTED"}
+            if result.get("status")
+            in {
+                "FEATURE_GOAL_STARTED",
+                "RAG_MEMORY_ADOPTED",
+                "RAG_DECISION_RECORDED",
+            }
             else HTTPStatus.OK
         )
 
@@ -25947,6 +26096,58 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "execution_assignment": "NONE",
                 "task_frame": "NONE",
                 "auto_linked": False,
+            },
+            "next_operation": memory["next_operation"],
+        }
+
+    def _handle_rag_record_decision_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "rag.record-decision requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request,
+            field="rag_record_decision_action",
+            required=frozenset(
+                {"project_id", "decision_ref", "title", "body", "node_ref"}
+            ),
+            optional=frozenset({"graph"}),
+        )
+        project_id = _identifier(action.pop("project_id"), "project_id")
+        decision_ref = _identifier(action["decision_ref"], "decision_ref")
+        action["decision_ref"] = decision_ref
+        memory, created = self.store.record_project_decision_memory(
+            project_id, action
+        )
+        return {
+            "schema": RAG_RECORD_DECISION_RESULT_SCHEMA,
+            "status": (
+                "RAG_DECISION_RECORDED"
+                if created
+                else "RAG_DECISION_RECORD_REPLAYED"
+            ),
+            "action_id": RAG_RECORD_DECISION_ACTION_ID,
+            "project_id": project_id,
+            "decision_ref": decision_ref,
+            "memory": memory,
+            "recorded": created,
+            "canonical_memory_created": created,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "task_frame_created": False,
+            "repository_pushed": False,
+            "effects": {
+                "canonical_rag": "CREATED" if created else "IDEMPOTENT_REPLAY",
+                "memory": "LINKED_DECISION_NOTE",
+                "seed_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
             },
             "next_operation": memory["next_operation"],
         }
@@ -41301,6 +41502,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/memories":
+                if (
+                    isinstance(body, Mapping)
+                    and str(body.get("state") or "").strip().upper()
+                    == "DECISION_NOTE"
+                ):
+                    raise UniverseError(
+                        "MEMORY_DECISION_ACTION_REQUIRED",
+                        "DECISION_NOTE must be recorded through rag.record-decision",
+                        HTTPStatus.CONFLICT,
+                    )
                 memory = self.server.store.create_project_memory(parts[0], body)
                 self._send(
                     HTTPStatus.CREATED,

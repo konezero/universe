@@ -1092,6 +1092,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('candidate.state === "KEEP" && candidate.kind === "MEMORY"', review)
         self.assertIn('"Adopt to RAG"', review)
 
+    def test_direct_decision_registration_uses_the_action_gateway(self) -> None:
+        render_start = APP.index("function renderMemory()")
+        render = APP[render_start:]
+        self.assertIn('invokeServerAction("rag.record-decision", {', render)
+        self.assertIn("project_id: state.selectedProject.project_id", render)
+        self.assertIn("decision_ref: decisionRef.value.trim()", render)
+        self.assertIn("node_ref: nodeRef", render)
+        self.assertIn('state: "BRAINSTORM"', render)
+        self.assertIn("RAG_DECISION_RECORDED", render)
+
     def test_memory_batch_run_uses_the_common_action_surface(self) -> None:
         run_start = APP.index('const run = node("button", "primary-button compact-action", "Run stage")')
         run_end = APP.index("actions.append(save, run);", run_start)

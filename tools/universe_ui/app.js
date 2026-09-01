@@ -14675,7 +14675,7 @@ function renderMemory() {
   title.placeholder = "Title";
   title.maxLength = 160;
   const body = node("textarea", "memory-body-input");
-  body.placeholder = "Brainstorm, question, observation, or decision note";
+  body.placeholder = "Brainstorm, question, or observation";
   body.rows = 3;
   body.maxLength = 8000;
   const add = node("button", "primary-button compact-action", "Save memory");
@@ -14712,6 +14712,76 @@ function renderMemory() {
   });
   create.append(title, body, add);
   elements.memoryPanel.append(create);
+
+  const decisionCreate = node("div", "detail-group memory-create");
+  decisionCreate.append(node("h3", "", "Register decision"));
+  decisionCreate.append(
+    node(
+      "p",
+      "context-copy",
+      "Confirmed decisions are linked to a Node and become retrieval-ready. This does not create Seed, authority, Assignment, or Task Frame state."
+    )
+  );
+  const decisionRef = node("input", "memory-decision-ref-input");
+  decisionRef.placeholder = "Decision ref (stable key)";
+  decisionRef.maxLength = 128;
+  const decisionTitle = node("input", "memory-decision-title-input");
+  decisionTitle.placeholder = "Decision title";
+  decisionTitle.maxLength = 160;
+  const decisionNode = node("input", "memory-decision-node-input");
+  decisionNode.placeholder = "Node ref (for example, universe)";
+  decisionNode.maxLength = 160;
+  decisionNode.value = selectedNode || "";
+  const decisionBody = node("textarea", "memory-decision-body-input");
+  decisionBody.placeholder = "What was decided and why";
+  decisionBody.rows = 4;
+  decisionBody.maxLength = 8000;
+  const recordDecision = node(
+    "button",
+    "primary-button compact-action",
+    "Register decision"
+  );
+  recordDecision.type = "button";
+  recordDecision.addEventListener("click", async () => {
+    try {
+      const nodeRef = decisionNode.value.trim();
+      if (!nodeRef) throw new Error("Select or enter a Node ref first");
+      const result = await invokeServerAction("rag.record-decision", {
+        project_id: state.selectedProject.project_id,
+        decision_ref: decisionRef.value.trim(),
+        title:
+          decisionTitle.value.trim() || decisionBody.value.trim().slice(0, 80),
+        body: decisionBody.value.trim(),
+        node_ref: nodeRef,
+        graph: "functional",
+      });
+      state.memories = [
+        result.memory,
+        ...state.memories.filter(
+          (item) => item.memory_id !== result.memory.memory_id
+        ),
+      ];
+      decisionRef.value = "";
+      decisionTitle.value = "";
+      decisionBody.value = "";
+      renderMemory();
+      toast(
+        result.status === "RAG_DECISION_RECORDED"
+          ? "Decision registered in canonical RAG"
+          : "Decision already registered"
+      );
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  decisionCreate.append(
+    decisionRef,
+    decisionTitle,
+    decisionNode,
+    decisionBody,
+    recordDecision
+  );
+  elements.memoryPanel.append(decisionCreate);
 
   const unlinked = state.memories.filter((item) => item.link_state === "UNLINKED");
   const linked = state.memories.filter((item) => item.link_state !== "UNLINKED");

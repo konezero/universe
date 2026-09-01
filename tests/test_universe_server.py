@@ -7927,15 +7927,22 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.store.register_project(self.registration())
         status, memory_payload = self.request(
             "POST",
-            "/v1/projects/GCS/memories",
+            "/v1/actions",
             {
-                "title": "Rust native semantic editor protocol",
-                "body": "Use compact symbol IR for agent editing.",
-                "state": "DECISION_NOTE",
+                "action_id": "rag.record-decision",
+                "request": {
+                    "project_id": "GCS",
+                    "decision_ref": "semantic-editor-protocol",
+                    "title": "Rust native semantic editor protocol",
+                    "body": "Use compact symbol IR for agent editing.",
+                    "node_ref": "universe",
+                    "graph": "functional",
+                },
             },
             self.token,
         )
         self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("RAG_DECISION_RECORDED", memory_payload["status"])
         memory_id = memory_payload["memory"]["memory_id"]
 
         status, generated = self.request(
@@ -9136,6 +9143,82 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("RAG_ADOPT_REVIEW_REQUIRED", payload["error_code"])
         self.assertEqual([], self.server.store.list_project_memories("GCS"))
+
+    def test_rag_record_decision_is_linked_idempotent_and_conflict_safe(self) -> None:
+        self.server.store.register_project(self.registration())
+        direct_status, direct_blocked = self.request(
+            "POST",
+            "/v1/projects/GCS/memories",
+            {
+                "title": "Unrouted decision",
+                "body": "Use the Action Gateway.",
+                "state": "DECISION_NOTE",
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, direct_status)
+        self.assertEqual(
+            "MEMORY_DECISION_ACTION_REQUIRED", direct_blocked["error_code"]
+        )
+
+        action_request = {
+            "action_id": "rag.record-decision",
+            "request": {
+                "project_id": "GCS",
+                "decision_ref": "universe-governance-loop",
+                "title": "Universe governance loop",
+                "body": "Conductor coordinates the user-approved project loop.",
+                "node_ref": "universe",
+                "graph": "functional",
+            },
+        }
+        status, recorded = self.request(
+            "POST", "/v1/actions", action_request, self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("RAG_DECISION_RECORDED", recorded["status"])
+        self.assertEqual(
+            "universe.rag-record-decision-receipt.v1", recorded["schema"]
+        )
+        self.assertTrue(recorded["recorded"])
+        self.assertFalse(recorded["authority_created"])
+        self.assertFalse(recorded["execution_assignment_created"])
+        self.assertFalse(recorded["task_frame_created"])
+        memory = recorded["memory"]
+        self.assertEqual("DECISION_NOTE", memory["state"])
+        self.assertEqual("LINKED", memory["link_state"])
+        self.assertEqual("universe", memory["node_ref"])
+        self.assertEqual("functional", memory["graph"])
+        self.assertEqual("universe-governance-loop", memory["decision_ref"])
+        self.assertEqual(
+            "universe://projects/GCS/decision-notes/universe-governance-loop",
+            memory["origin_ref"],
+        )
+        self.assertEqual("RETRIEVAL_READY", memory["next_operation"])
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
+
+        status, replay = self.request(
+            "POST", "/v1/actions", action_request, self.token
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RAG_DECISION_RECORD_REPLAYED", replay["status"])
+        self.assertFalse(replay["recorded"])
+        self.assertEqual(memory["memory_id"], replay["memory"]["memory_id"])
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
+
+        changed_request = {
+            "action_id": "rag.record-decision",
+            "request": {
+                **action_request["request"],
+                "body": "Replace the approved decision silently.",
+            },
+        }
+        status, conflict = self.request(
+            "POST", "/v1/actions", changed_request, self.token
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RAG_DECISION_STORAGE_CONFLICT", conflict["error_code"])
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
 
     def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
         self.server.store.register_project(self.registration())

@@ -126,6 +126,40 @@ POST /v1/actions
 }
 ```
 
+## Direct user decision recording
+
+An already-confirmed product or architecture decision uses the separate
+`rag.record-decision` Action. The Action resolves the actor and execution
+context on the server, requires a stable `decision_ref`, and requires a Node
+reference. It always records one `DECISION_NOTE` with `LINKED` state, so the
+decision is immediately available to bounded retrieval for that Node.
+
+The decision reference is the logical idempotency boundary. Repeating the same
+reference with the same content returns the existing Memory. Reusing it with
+different content fails with a conflict; the previous decision is never
+overwritten. The origin ref is deterministic and includes the project and
+decision reference.
+
+```json
+{
+  "action_id": "rag.record-decision",
+  "request": {
+    "project_id": "universe",
+    "decision_ref": "universe-governance-loop",
+    "title": "Universe governance loop",
+    "body": "Conductor coordinates the user-approved project loop.",
+    "node_ref": "universe",
+    "graph": "functional"
+  }
+}
+```
+
+This Action writes only canonical project Memory. It does not write Seed,
+authority, Assignment, Task Frame, repository source, or push state. The
+generic `/memories` surface remains for brainstorms, questions, and observed
+notes; `DECISION_NOTE` requests on that legacy route are rejected so confirmed
+decisions cannot bypass the Action boundary.
+
 ## Governed FAST_EXTRACT
 
 `POST /v1/projects/{project_id}/memory-batches/run` accepts a `FAST_EXTRACT`
@@ -226,13 +260,15 @@ Create body:
 {
   "title": "optional",
   "body": "note text",
-  "state": "BRAINSTORM|OBSERVED|QUESTION|DECISION_NOTE",
+  "state": "BRAINSTORM|OBSERVED|QUESTION",
   "node_ref": "optional-node-id",
   "graph": "functional|implementation"
 }
 ```
 
 If `node_ref` is omitted, `link_state` is `UNLINKED`.
+Use `POST /v1/actions` with `rag.record-decision` for a confirmed
+`DECISION_NOTE`.
 
 ## Provider activity memory
 

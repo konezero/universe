@@ -23,6 +23,9 @@ from universe_action_registry import (  # noqa: E402
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_REQUEST_SCHEMA,
     RAG_ADOPT_RESULT_SCHEMA,
+    RAG_RECORD_DECISION_ACTION_ID,
+    RAG_RECORD_DECISION_REQUEST_SCHEMA,
+    RAG_RECORD_DECISION_RESULT_SCHEMA,
     UnknownActionError,
     build_default_action_registry,
     derive_idempotency_key,
@@ -85,6 +88,9 @@ class UniverseActionRegistryTests(unittest.TestCase):
         registry.register_uncovered_surface("future.direct.surface")
         self.assertEqual(COVERED, registry.classify_surface("feature.goal.start"))
         self.assertEqual(COVERED, registry.classify_surface(RAG_ADOPT_ACTION_ID))
+        self.assertEqual(
+            COVERED, registry.classify_surface(RAG_RECORD_DECISION_ACTION_ID)
+        )
         self.assertEqual(COVERED, registry.classify_surface(MEMORY_BATCH_RUN_ACTION_ID))
         self.assertEqual(LEGACY_DIRECT, registry.classify_surface("UniverseStore.start_feature_goal"))
         self.assertEqual(
@@ -99,6 +105,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
         report = registry.coverage_report()
         self.assertIn("feature.goal.start", report["registered_action_ids"])
         self.assertIn(RAG_ADOPT_ACTION_ID, report["registered_action_ids"])
+        self.assertIn(RAG_RECORD_DECISION_ACTION_ID, report["registered_action_ids"])
         self.assertIn(MEMORY_BATCH_RUN_ACTION_ID, report["registered_action_ids"])
         self.assertEqual(coverage, registry.coverage_classification())
         self.assertEqual(
@@ -108,6 +115,17 @@ class UniverseActionRegistryTests(unittest.TestCase):
         rag_contract = build_default_action_registry().lookup(RAG_ADOPT_ACTION_ID)
         self.assertEqual(RAG_ADOPT_REQUEST_SCHEMA, rag_contract.request_schema_ref)
         self.assertEqual(RAG_ADOPT_RESULT_SCHEMA, rag_contract.result_schema_ref)
+        decision_contract = build_default_action_registry().lookup(
+            RAG_RECORD_DECISION_ACTION_ID
+        )
+        self.assertEqual(
+            RAG_RECORD_DECISION_REQUEST_SCHEMA,
+            decision_contract.request_schema_ref,
+        )
+        self.assertEqual(
+            RAG_RECORD_DECISION_RESULT_SCHEMA,
+            decision_contract.result_schema_ref,
+        )
         memory_batch_contract = build_default_action_registry().lookup(
             MEMORY_BATCH_RUN_ACTION_ID
         )

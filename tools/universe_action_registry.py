@@ -38,6 +38,13 @@ RAG_ADOPT_REQUEST_SCHEMA = "universe.rag-adopt-action-request.v1"
 RAG_ADOPT_RESULT_SCHEMA = "universe.rag-adopt-receipt.v1"
 RAG_ADOPT_ACTION_SURFACE = "rag.adopt"
 
+RAG_RECORD_DECISION_ACTION_ID = "rag.record-decision"
+RAG_RECORD_DECISION_REQUEST_SCHEMA = (
+    "universe.rag-record-decision-action-request.v1"
+)
+RAG_RECORD_DECISION_RESULT_SCHEMA = "universe.rag-record-decision-receipt.v1"
+RAG_RECORD_DECISION_ACTION_SURFACE = "rag.record-decision"
+
 MEMORY_BATCH_RUN_ACTION_ID = "memory.batch.run"
 MEMORY_BATCH_RUN_REQUEST_SCHEMA = "universe.memory-batch-run-action-request.v1"
 # The action returns the existing local-service envelope and keeps the durable
@@ -425,6 +432,7 @@ def build_default_action_registry(
     handler: ActionHandler | None = None,
     *,
     rag_adopt_handler: ActionHandler | None = None,
+    rag_record_decision_handler: ActionHandler | None = None,
     memory_batch_run_handler: ActionHandler | None = None,
 ) -> ActionRegistry:
     """Build the currently modeled mutating surface registry."""
@@ -453,6 +461,17 @@ def build_default_action_registry(
         ),
         rag_adopt_handler,
         surfaces=(RAG_ADOPT_ACTION_SURFACE,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=RAG_RECORD_DECISION_ACTION_ID,
+            request_schema_ref=RAG_RECORD_DECISION_REQUEST_SCHEMA,
+            result_schema_ref=RAG_RECORD_DECISION_RESULT_SCHEMA,
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"receipt_schema": RAG_RECORD_DECISION_RESULT_SCHEMA},
+        ),
+        rag_record_decision_handler,
+        surfaces=(RAG_RECORD_DECISION_ACTION_SURFACE,),
     )
     registry.register(
         ActionContract(
@@ -503,6 +522,10 @@ __all__ = [
     "RAG_ADOPT_ACTION_SURFACE",
     "RAG_ADOPT_REQUEST_SCHEMA",
     "RAG_ADOPT_RESULT_SCHEMA",
+    "RAG_RECORD_DECISION_ACTION_ID",
+    "RAG_RECORD_DECISION_ACTION_SURFACE",
+    "RAG_RECORD_DECISION_REQUEST_SCHEMA",
+    "RAG_RECORD_DECISION_RESULT_SCHEMA",
     "RegisteredAction",
     "SERVER_RESOLVED_CALLER_FIELDS",
     "UNCOVERED",
