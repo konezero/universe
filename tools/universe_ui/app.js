@@ -4117,12 +4117,13 @@ async function refresh({ syncSelectedProject = false } = {}) {
     state.accessSurface =
       healthResponse.headers.get("X-Universe-Access-Surface") || "LOCAL_BROWSER";
     state.health = health;
+    const programName = health.program?.name || "Universe Server";
     elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
     elements.serviceStatus.textContent =
       health.status === "READY"
         ? state.accessSurface === "REMOTE_BROWSER"
           ? "Paired mobile"
-          : "Local service"
+          : programName
         : health.status;
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
@@ -5302,13 +5303,16 @@ function renderRoomMessages() {
         ? ` / ${message.failure.reason}`
         : "";
       const provider = message.provider ? ` / ${message.provider}` : "";
+      const intentGate = message.intent_gate?.status
+        ? ` / Intent ${message.intent_gate.status}`
+        : "";
       item.append(
         node("strong", "", `${message.sender} / ${message.kind}`),
         markdownBody(message.body),
         node(
           "small",
           "",
-          `${conductorDeliveryLabel(message.delivery_state)}${provider}${failure}`
+          `${conductorDeliveryLabel(message.delivery_state)}${provider}${intentGate}${failure}`
         )
       );
       if (message.ui_action?.kind === "TODO_DRAFT") {
@@ -6175,7 +6179,13 @@ function renderLocalServiceStatus() {
   elements.localServiceStatus.replaceChildren();
   const health = elements.serviceStatus?.dataset?.state || "loading";
   const ready = health === "ready";
-  const status = node("strong", "", ready ? "READY" : elements.serviceStatus?.textContent || "UNKNOWN");
+  const program = state.health?.program || {};
+  const programName = program.name || "Universe Server";
+  const status = node(
+    "strong",
+    "",
+    `${programName} · ${ready ? "READY" : elements.serviceStatus?.textContent || "UNKNOWN"}`,
+  );
   status.dataset.state = ready ? "ready" : "error";
   elements.localServiceStatus.append(
     status,
@@ -6189,7 +6199,7 @@ function renderLocalServiceStatus() {
     node(
       "small",
       "",
-      "Control: python tools/universe_server.py status | start | stop | restart"
+      `Control: ${programName} · python ${program.entrypoint || "tools/universe_server.py"} status | start | stop | restart`
     )
   );
   if (typeof refreshLawStrip === "function") refreshLawStrip();
@@ -8025,6 +8035,7 @@ function conductorDeliveryLabel(deliveryState) {
     {
       QUEUED: "Queued",
       WAITING_FOR_RUNTIME_BINDING: "Waiting for Runtime",
+      WAITING_FOR_COMMANDER: "Waiting for Commander",
       PROCESSING: "Thinking",
       ANSWERED: "Answered",
       FAILED: "Failed",

@@ -1542,7 +1542,11 @@ class RuntimeWorkerDispatcher:
         if runtime_profile == "TASK_FRAME_RUNTIME":
             return (
                 "You are a bounded Task Frame Runtime provider. You receive all "
-                "usable context in the supplied Context Pack. Perform the assigned "
+                "usable context in the supplied Context Pack. Apply the Host "
+                "Intent Gate before routing any command, mode, Skill, or tool. "
+                "A passed gate is routing evidence, not authority; an active "
+                "Commander Wait or non-passed gate permits only a bounded, "
+                "non-executing response. Perform the assigned "
                 "task according to its Runtime-validated purpose, scope, and output "
                 "contract. Do not invoke subagents or claim authority. Any source "
                 "mutation must remain within the declared mutation scope and use "
@@ -1552,8 +1556,9 @@ class RuntimeWorkerDispatcher:
             "You are a bounded read-only Task Frame worker. You receive all "
             "usable context in the supplied Context Pack. Do not inspect local "
             "files, execute commands, use network tools, create files, modify "
-            "files, invoke subagents, or claim authority. Return only the "
-            "requested result content."
+            "files, invoke subagents, or claim authority. Treat Host Intent Gate "
+            "and Commander Wait decisions as routing evidence only. Return only "
+            "the requested result content."
         )
 
     @staticmethod

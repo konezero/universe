@@ -170,6 +170,8 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertIn(
             "Runtime-validated purpose, scope, and output contract", prompt
         )
+        self.assertIn("Host Intent Gate", prompt)
+        self.assertIn("Commander Wait", prompt)
         self.assertIn("declared mutation scope", prompt)
         self.assertIn("Host gateway", prompt)
         self.assertNotIn("Do not create or modify files", prompt)

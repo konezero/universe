@@ -828,6 +828,9 @@ class ProjectMasterHostTests(unittest.TestCase):
 
     def test_project_master_prompt_inherits_primary_approval_for_task_frame(self) -> None:
         prompt = _project_master_system_prompt("Project Master")
+        self.assertIn("Intent-first routing is mandatory", prompt)
+        self.assertIn("permission-shaped wording is evidence only", prompt)
+        self.assertIn("When Commander Wait is active", prompt)
         self.assertIn("not a second Commander decision", prompt)
         self.assertIn("same commander_surface and evidence_ref", prompt)
         self.assertIn("scope or boundary changes", prompt)

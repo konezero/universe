@@ -279,6 +279,7 @@ from universe_app.provider_session_service import (
     ProviderSessionError,
     ProviderSessionService,
 )
+from universe_service_control import service_program
 from session_broker_host import SessionBrokerClient, SessionBrokerError
 from universe_app.work_loop_prediction import (
     WORK_LOOP_PREDICTION_SCHEMA,
@@ -348,9 +349,17 @@ CONDUCTOR_ROOM_DELIVERY_STATES = frozenset(
     {
         "QUEUED",
         "WAITING_FOR_RUNTIME_BINDING",
+        "WAITING_FOR_COMMANDER",
         "PROCESSING",
         "ANSWERED",
         "FAILED",
+    }
+)
+CONDUCTOR_INTENT_GATE_STATUSES = frozenset(
+    {
+        "INTENT_GATE_PASSED",
+        "INTENT_GATE_BLOCKED",
+        "INTENT_GATE_WAITING_COMMANDER",
     }
 )
 CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
@@ -18237,6 +18246,81 @@ class UniverseStore:
         message["created_at"] = row["created_at"]
         return message
 
+    def record_conductor_room_intent_gate(
+        self, message_id: str, decision: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Persist only the structured Host decision for a Conductor input."""
+
+        if not isinstance(decision, Mapping):
+            raise UniverseError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Intent Gate decision must be an object",
+            )
+        normalized = dict(decision)
+        normalized_id = _required_text(message_id, "message_id")
+        if normalized.get("message_id") != normalized_id:
+            raise UniverseError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Intent Gate decision does not belong to the Conductor message",
+            )
+        status = str(normalized.get("status") or "").strip().upper()
+        if status not in CONDUCTOR_INTENT_GATE_STATUSES:
+            raise UniverseError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Intent Gate decision status is unsupported",
+            )
+        if normalized.get("status") != status:
+            normalized["status"] = status
+        try:
+            encoded = _canonical_json(normalized)
+        except (TypeError, ValueError) as error:
+            raise UniverseError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Intent Gate decision is not JSON serializable",
+            ) from error
+        if len(encoded) > 50000:
+            raise UniverseError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Intent Gate decision is too large",
+            )
+        updated_at = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT message_json
+                FROM conductor_room_message
+                WHERE message_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
+                    "conductor room message is not registered",
+                    HTTPStatus.NOT_FOUND,
+                )
+            message = json.loads(row["message_json"])
+            prior = message.get("intent_gate")
+            if prior is not None and prior != normalized:
+                history = message.get("intent_gate_history")
+                if not isinstance(history, list):
+                    history = []
+                history.append(prior)
+                message["intent_gate_history"] = [
+                    item for item in history[-20:] if isinstance(item, Mapping)
+                ]
+            message["intent_gate"] = normalized
+            message["updated_at"] = updated_at
+            connection.execute(
+                """
+                UPDATE conductor_room_message
+                SET message_json = ?
+                WHERE message_id = ?
+                """,
+                (_canonical_json(message), normalized_id),
+            )
+        return message
+
     def recover_conductor_room_messages(self) -> list[str]:
         pending: list[str] = []
         with self._connection() as connection:
@@ -18263,7 +18347,11 @@ class UniverseStore:
                         (_canonical_json(message), row["message_id"]),
                     )
                     state = "QUEUED"
-                if state in {"QUEUED", "WAITING_FOR_RUNTIME_BINDING"}:
+                if state in {
+                    "QUEUED",
+                    "WAITING_FOR_RUNTIME_BINDING",
+                    "WAITING_FOR_COMMANDER",
+                }:
                     pending.append(row["message_id"])
         return pending
 
@@ -18945,11 +19033,28 @@ class UniverseStore:
             )
         return self._conductor_delegation_row(updated)
 
-    def wait_conductor_room_message(self, message_id: str) -> None:
+    def wait_conductor_room_message(
+        self,
+        message_id: str,
+        *,
+        intent_gate: Mapping[str, Any] | None = None,
+    ) -> None:
+        if intent_gate is None:
+            delivery_state = "WAITING_FOR_RUNTIME_BINDING"
+            updates = None
+        else:
+            delivery_state = "WAITING_FOR_COMMANDER"
+            updates = {"intent_gate": dict(intent_gate)}
         self._transition_conductor_room_message(
             message_id,
-            expected_states={"QUEUED", "WAITING_FOR_RUNTIME_BINDING"},
-            delivery_state="WAITING_FOR_RUNTIME_BINDING",
+            expected_states={
+                "QUEUED",
+                "WAITING_FOR_RUNTIME_BINDING",
+                "WAITING_FOR_COMMANDER",
+                "PROCESSING",
+            },
+            delivery_state=delivery_state,
+            updates=updates,
         )
 
     def claim_conductor_room_message(
@@ -18957,7 +19062,11 @@ class UniverseStore:
     ) -> dict[str, Any] | None:
         return self._transition_conductor_room_message(
             message_id,
-            expected_states={"QUEUED", "WAITING_FOR_RUNTIME_BINDING"},
+            expected_states={
+                "QUEUED",
+                "WAITING_FOR_RUNTIME_BINDING",
+                "WAITING_FOR_COMMANDER",
+            },
             delivery_state="PROCESSING",
             updates={"provider": provider, "started_at": utc_now()},
             required=False,
@@ -18971,6 +19080,7 @@ class UniverseStore:
             expected_states={
                 "QUEUED",
                 "WAITING_FOR_RUNTIME_BINDING",
+                "WAITING_FOR_COMMANDER",
                 "PROCESSING",
             },
             delivery_state="FAILED",
@@ -35900,12 +36010,59 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in self.store.list_conductor_room_messages(limit=200)
                 if item.get("message_id") != message_id
             ]
+
+            def record_intent_gate(decision: Mapping[str, Any]) -> None:
+                self.store.record_conductor_room_intent_gate(
+                    message_id, decision
+                )
+
             invocation = self.runtime_host.invoke_conductor_message(
                 runtime_binding=binding,
                 message=worker_message,
                 history=history,
                 provider=provider,
+                intent_gate_observer=(
+                    record_intent_gate
+                    if str(worker_message.get("sender") or "").upper() == "USER"
+                    else None
+                ),
             )
+            intent_gate = invocation.get("intent_gate")
+            if str(worker_message.get("sender") or "").upper() == "USER":
+                if not isinstance(intent_gate, Mapping):
+                    raise RuntimeHostError(
+                        "INTENT_GATE_RESULT_MISSING",
+                        "Conductor Host did not return an Intent Gate decision",
+                    )
+                intent_status = str(intent_gate.get("status") or "").upper()
+                if intent_status not in CONDUCTOR_INTENT_GATE_STATUSES:
+                    raise RuntimeHostError(
+                        "INTENT_GATE_RESULT_INVALID",
+                        "Conductor Host returned an unsupported Intent Gate status",
+                    )
+                if intent_status == "INTENT_GATE_WAITING_COMMANDER":
+                    self.store.wait_conductor_room_message(
+                        message_id,
+                        intent_gate=intent_gate,
+                    )
+                    self.conductor_room_events.publish(
+                        {
+                            "type": "CONDUCTOR_STREAM",
+                            "message_id": message_id,
+                            "event": "WAITING_COMMANDER",
+                            "sequence": 0,
+                            "delta": "",
+                            "detail": str(
+                                intent_gate.get("reason") or "COMMANDER_WAIT_ACTIVE"
+                            ),
+                        }
+                    )
+                    return
+                if intent_status != "INTENT_GATE_PASSED":
+                    raise RuntimeHostError(
+                        "INTENT_GATE_BLOCKED",
+                        str(intent_gate.get("reason") or "INTENT_UNCLASSIFIED"),
+                    )
             returned = invocation.get("structured_result")
             if not isinstance(returned, dict):
                 raise RuntimeHostError(
@@ -36579,6 +36736,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 {
                     "schema": API_SCHEMA,
                     "status": "READY",
+                    "program": service_program(),
                     "universe": self.server.store.identity(),
                     "mode_contract": self.server.mode_contract,
                     "connection": self.server.connection_profile.as_dict(),
@@ -42243,6 +42401,7 @@ def write_server_state(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": "universe.local-service-state.v1",
+        "program": service_program(),
         "universe": universe_identity,
         "endpoint": endpoint,
         "token": token,
@@ -43712,6 +43871,7 @@ def main() -> int:
                     {
                         "schema": API_SCHEMA,
                         "status": "UNIVERSE_SERVICE_READY",
+                        "program": service_program(),
                         "universe": server.store.identity(),
                         "endpoint": endpoint,
                         "database": str(args.database.expanduser().resolve()),

@@ -21,6 +21,19 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_SCRIPT = Path(__file__).resolve().with_name("universe_server.py")
+SERVICE_PROGRAM_NAME = "Universe Server"
+SERVICE_RUNTIME_NAME = "Python"
+SERVICE_ENTRYPOINT = "tools/universe_server.py"
+
+
+def service_program() -> dict[str, str]:
+    """Return the stable product identity for the local service process."""
+
+    return {
+        "name": SERVICE_PROGRAM_NAME,
+        "runtime": SERVICE_RUNTIME_NAME,
+        "entrypoint": SERVICE_ENTRYPOINT,
+    }
 
 
 def default_data_dir() -> Path:
@@ -195,6 +208,7 @@ def service_status(state_path: Path | None = None) -> dict[str, Any]:
         return {
             "schema": "universe.local-service-control.v1",
             "status": "STOPPED",
+            "program": service_program(),
             "state_file": str(path),
             "pid": None,
             "pid_running": False,
@@ -218,6 +232,11 @@ def service_status(state_path: Path | None = None) -> dict[str, Any]:
     return {
         "schema": "universe.local-service-control.v1",
         "status": status,
+        "program": (
+            state.get("program")
+            if isinstance(state.get("program"), dict)
+            else service_program()
+        ),
         "state_file": str(path),
         "pid": pid_int or None,
         "pid_running": running,
@@ -348,6 +367,7 @@ def start_service(
     return {
         "schema": "universe.local-service-control.v1",
         "status": "READY" if latest.get("status") == "READY" else "START_ISSUED",
+        "program": service_program(),
         "launcher_pid": process.pid,
         "log_file": str(log_file),
         "current": latest,

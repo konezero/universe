@@ -32,6 +32,8 @@ class UniverseServiceControlTests(unittest.TestCase):
             report = service_status(path)
             self.assertEqual("STOPPED", report["status"])
             self.assertFalse(report["pid_running"])
+            self.assertEqual("Universe Server", report["program"]["name"])
+            self.assertEqual("Python", report["program"]["runtime"])
 
     def test_load_state_reads_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -127,6 +129,7 @@ class UniverseServiceControlTests(unittest.TestCase):
                         wait_seconds=0,
                     )
             self.assertEqual("READY", result["status"])
+            self.assertEqual("Universe Server", result["program"]["name"])
             self.assertTrue(popen.call_args.kwargs["close_fds"])
 
     def test_stop_uses_authenticated_graceful_shutdown_without_taskkill(self) -> None:

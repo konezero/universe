@@ -28,6 +28,13 @@ RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 PLANNING_PROFILE = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
 )
+CONDUCTOR_INTENT_GATE_STATUSES = frozenset(
+    {
+        "INTENT_GATE_PASSED",
+        "INTENT_GATE_BLOCKED",
+        "INTENT_GATE_WAITING_COMMANDER",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -205,6 +212,38 @@ def _conductor_chat_json_schema() -> dict[str, Any]:
                 ]
             },
         },
+    }
+
+
+def _conductor_intent_classification(message: Mapping[str, Any]) -> dict[str, Any]:
+    """Build conservative Host evidence for the read-only Conductor surface.
+
+    The Conductor chat contract only permits read-only answers and reviewable
+    drafts.  The trusted normalized message kind is therefore the only
+    classification source at this boundary; message text and client claims
+    are never treated as routing authority.
+    """
+
+    kind = str(message.get("kind") or "QUESTION").strip().upper()
+    by_kind = {
+        "QUESTION": ("QUESTION", "READ_ONLY_RESPONSE"),
+        "REVIEW": ("REVIEW", "READ_ONLY_RESPONSE"),
+        "STATUS": ("STATUS_REQUEST", "STATUS"),
+        "TASK_DRAFT": ("DESIGN_DISCUSSION", "READ_ONLY_RESPONSE"),
+        "RESULT": ("QUESTION", "READ_ONLY_RESPONSE"),
+    }
+    intent_class, route = by_kind.get(kind, ("UNKNOWN", "NO_ROUTE"))
+    return {
+        "classifier_kind": "HOST",
+        "classifier_ref": f"host://universe-conductor/message-kind/{kind}",
+        "intent_class": intent_class,
+        "route": route,
+        "effect_class": "NONE",
+        "explicit_imperative": False,
+        "target_state": "EXACT",
+        "permission_shaped": False,
+        "token_match_only": False,
+        "mentioned_runtime_tokens": [],
     }
 
 
@@ -669,6 +708,64 @@ class UniverseRuntimeHost:
                 except RuntimeHostError:
                     pass
 
+    def _evaluate_conductor_intent_gate(
+        self,
+        *,
+        runtime_binding: Mapping[str, Any],
+        message: Mapping[str, Any],
+        frame_id: str,
+        source_ref: str,
+        body: str,
+    ) -> dict[str, Any]:
+        endpoint = _loopback_endpoint(runtime_binding.get("endpoint"), "endpoint")
+        token = _required_text(runtime_binding.get("token"), "token")
+        session_id = _required_text(runtime_binding.get("session_id"), "session_id")
+        anchor_id = _required_text(
+            runtime_binding.get("origin_anchor_ref"), "origin_anchor_ref"
+        )
+        observed_at = message.get("created_at")
+        if not isinstance(observed_at, str) or not observed_at.strip():
+            observed_at = _utc_now()
+        response = self._post_runtime(
+            endpoint,
+            token,
+            "/v1/anchor-session-memory/intent-gate",
+            {
+                "session_id": session_id,
+                "frame_id": frame_id,
+                "anchor_id": anchor_id,
+                "utterance_ref": source_ref,
+                "current_message": {
+                    "message_id": _required_text(message.get("message_id"), "message_id"),
+                    "role": "USER",
+                    "digest": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "observed_at": observed_at,
+                },
+                "classification": _conductor_intent_classification(message),
+            },
+        )
+        status = _text_or(response.get("status"), "")
+        if status not in CONDUCTOR_INTENT_GATE_STATUSES:
+            raise RuntimeHostError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Runtime Host returned an unsupported Intent Gate status",
+            )
+        decision = response.get("decision")
+        if (
+            not isinstance(decision, Mapping)
+            or decision.get("schema") != "ai-career.intent-gate-decision.v1"
+            or decision.get("status") != status
+            or decision.get("session_id") != session_id
+            or decision.get("frame_id") != frame_id
+            or decision.get("anchor_id") != anchor_id
+            or decision.get("message_id") != message.get("message_id")
+        ):
+            raise RuntimeHostError(
+                "INTENT_GATE_RESULT_INVALID",
+                "Runtime Host returned no matching Intent Gate decision coordinates",
+            )
+        return dict(decision)
+
     def invoke_conductor_message(
         self,
         *,
@@ -676,14 +773,9 @@ class UniverseRuntimeHost:
         message: Mapping[str, Any],
         history: list[Mapping[str, Any]],
         provider: str,
+        intent_gate_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         normalized_provider = _required_text(provider, "provider").upper()
-        capability = self.provider_capability(normalized_provider)
-        if capability["status"] != "AVAILABLE":
-            raise RuntimeHostError(
-                "WORKER_PROVIDER_UNAVAILABLE",
-                capability.get("reason", "selected provider is unavailable"),
-            )
         message_id = _required_text(message.get("message_id"), "message_id")
         body = message.get("body")
         if not isinstance(body, str) or not body.strip() or len(body.strip()) > 12000:
@@ -697,6 +789,29 @@ class UniverseRuntimeHost:
         frame_id = f"conductor-chat:{message_id}"
         turn_id = "conductor"
         source_ref = f"universe://conductor-room/messages/{message_id}"
+        intent_gate: dict[str, Any] | None = None
+        if str(message.get("sender") or "USER").strip().upper() == "USER":
+            intent_gate = self._evaluate_conductor_intent_gate(
+                runtime_binding=runtime_binding,
+                message=message,
+                frame_id=frame_id,
+                source_ref=source_ref,
+                body=body.strip(),
+            )
+            if intent_gate_observer is not None:
+                intent_gate_observer(intent_gate)
+            if intent_gate["status"] != "INTENT_GATE_PASSED":
+                return {
+                    "status": intent_gate["status"],
+                    "provider": normalized_provider,
+                    "intent_gate": intent_gate,
+                }
+        capability = self.provider_capability(normalized_provider)
+        if capability["status"] != "AVAILABLE":
+            raise RuntimeHostError(
+                "WORKER_PROVIDER_UNAVAILABLE",
+                capability.get("reason", "selected provider is unavailable"),
+            )
         model = _capability_model(capability)
         execution_plan = {
             "profile_id": "task-frame-debate-v1",
@@ -861,6 +976,7 @@ class UniverseRuntimeHost:
                             "expected_output": output_contract,
                             "repository_write_scope": "NONE",
                             "mutation_scope": {"operations": [], "targets": []},
+                            "intent_gate": intent_gate,
                         },
                         "parent_observation": {
                             "status": "MATCHED",
@@ -942,6 +1058,7 @@ class UniverseRuntimeHost:
                             if isinstance(item, Mapping)
                             and str(item.get("project_id") or "").strip()
                         ],
+                        "intent_gate": intent_gate,
                     },
                     "output_contract": output_contract,
                     "result_mode": "STRUCTURED_JSON",
@@ -966,6 +1083,8 @@ class UniverseRuntimeHost:
                     "TASK_FRAME_RESULT_PACKET_FAILED",
                     "Conductor chat Result Packet was not built",
                 )
+            if intent_gate is not None:
+                result["intent_gate"] = intent_gate
             return result
         finally:
             if created:

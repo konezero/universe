@@ -839,6 +839,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         status, result = self.request("GET", "/health")
         self.assertEqual(200, status)
         self.assertEqual("READY", result["status"])
+        self.assertEqual("Universe Server", result["program"]["name"])
+        self.assertEqual("Python", result["program"]["runtime"])
         self.assertEqual(
             {
                 "schema": "universe.mode-contract.v1",
@@ -4694,6 +4696,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(identity, load_server_state(state_path)["universe"])
+        self.assertEqual(
+            "Universe Server",
+            load_server_state(state_path)["program"]["name"],
+        )
 
     def test_desktop_ui_is_public_static_but_api_data_is_not_embedded(self) -> None:
         with urlopen(self.endpoint + "/", timeout=5) as response:
@@ -6769,6 +6775,73 @@ class UniverseLocalServiceTests(unittest.TestCase):
             reopened.list_conductor_room_messages()[0]["message_id"],
         )
 
+    def test_conductor_intent_wait_is_durable_and_replaced_after_release(self) -> None:
+        message, _created = self.server.store.create_conductor_room_message(
+            {
+                "kind": "QUESTION",
+                "sender": "USER",
+                "body": "Inspect the current routing state.",
+                "idempotency_key": "conductor-intent-wait-001",
+            }
+        )
+        message_id = message["message_id"]
+        self.assertIsNotNone(
+            self.server.store.claim_conductor_room_message(
+                message_id,
+                provider="GROK",
+            )
+        )
+        waiting = {
+            "schema": "ai-career.intent-gate-decision.v1",
+            "session_id": "conductor-session",
+            "frame_id": "conductor-chat:" + message_id,
+            "anchor_id": "conductor-anchor",
+            "message_id": message_id,
+            "status": "INTENT_GATE_WAITING_COMMANDER",
+            "stage": "COMMANDER_WAIT",
+            "routing_allowed": False,
+            "reason": "COMMANDER_WAIT_ACTIVE",
+            "classification": None,
+            "authority": "UNASSIGNED",
+            "execution_assignment": "UNASSIGNED",
+            "mutation_permission": "NONE",
+        }
+        self.server.store.record_conductor_room_intent_gate(message_id, waiting)
+        self.server.store.wait_conductor_room_message(
+            message_id,
+            intent_gate=waiting,
+        )
+        stored = self.server.store.get_conductor_room_message(message_id)
+        self.assertEqual("WAITING_FOR_COMMANDER", stored["delivery_state"])
+        self.assertEqual(
+            "INTENT_GATE_WAITING_COMMANDER",
+            stored["intent_gate"]["status"],
+        )
+
+        self.assertIsNotNone(
+            self.server.store.claim_conductor_room_message(
+                message_id,
+                provider="GROK",
+            )
+        )
+        passed = dict(waiting)
+        passed.update(
+            {
+                "status": "INTENT_GATE_PASSED",
+                "stage": "INTENT",
+                "routing_allowed": True,
+                "reason": "NONE",
+            }
+        )
+        self.server.store.record_conductor_room_intent_gate(message_id, passed)
+        stored = self.server.store.get_conductor_room_message(message_id)
+        self.assertEqual("INTENT_GATE_PASSED", stored["intent_gate"]["status"])
+        self.assertEqual(1, len(stored["intent_gate_history"]))
+        self.assertEqual(
+            "INTENT_GATE_WAITING_COMMANDER",
+            stored["intent_gate_history"][0]["status"],
+        )
+
     def test_conductor_room_invokes_bound_runtime_asynchronously(self) -> None:
         class FakeConductorCoordinator:
             def __init__(self) -> None:
@@ -6801,6 +6874,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 message: dict[str, object],
                 history: list[dict[str, object]],
                 provider: str,
+                intent_gate_observer: Callable[[Mapping[str, Any]], None] | None = None,
             ) -> dict[str, object]:
                 self.calls.append(
                     {
@@ -6810,12 +6884,41 @@ class UniverseLocalServiceTests(unittest.TestCase):
                         "provider": provider,
                     }
                 )
+                intent_gate = {
+                    "schema": "ai-career.intent-gate-decision.v1",
+                    "session_id": runtime_binding["session_id"],
+                    "frame_id": "conductor-chat:" + str(message["message_id"]),
+                    "anchor_id": runtime_binding["origin_anchor_ref"],
+                    "message_id": message["message_id"],
+                    "status": "INTENT_GATE_PASSED",
+                    "stage": "INTENT",
+                    "routing_allowed": True,
+                    "reason": "NONE",
+                    "classification": {
+                        "classifier_kind": "HOST",
+                        "classifier_ref": "host://test/conductor",
+                        "intent_class": "QUESTION",
+                        "route": "READ_ONLY_RESPONSE",
+                        "effect_class": "NONE",
+                        "explicit_imperative": False,
+                        "target_state": "EXACT",
+                        "permission_shaped": False,
+                        "token_match_only": False,
+                        "mentioned_runtime_tokens": [],
+                    },
+                    "authority": "UNASSIGNED",
+                    "execution_assignment": "UNASSIGNED",
+                    "mutation_permission": "NONE",
+                }
+                if intent_gate_observer is not None:
+                    intent_gate_observer(intent_gate)
                 return {
                     "status": "TURN_COMPLETED",
                     "provider": provider,
                     "worker_id": "grok-cli:conductor-001",
                     "result_receipt_ref": "grok-cli:conductor-001:result-001",
                     "repository_write": False,
+                    "intent_gate": intent_gate,
                     "structured_result": {
                         "reply": "현재 프로젝트 위험을 정리했습니다.",
                         "action": {
@@ -6899,6 +7002,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("ANSWERED", original["delivery_state"])
         self.assertEqual("GROK", original["provider"])
+        self.assertEqual(
+            "INTENT_GATE_PASSED",
+            original["intent_gate"]["status"],
+        )
         self.assertEqual("UNIVERSE_CONDUCTOR", reply["sender"])
         self.assertEqual("현재 프로젝트 위험을 정리했습니다.", reply["body"])
         self.assertEqual("TODO_DRAFT", reply["ui_action"]["kind"])

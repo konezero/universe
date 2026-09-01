@@ -369,6 +369,26 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             _: str, __: str, path: str, payload: dict[str, object]
         ) -> dict[str, object]:
             operations.append({"path": path, "payload": payload})
+            if path == "/v1/anchor-session-memory/intent-gate":
+                decision = {
+                    "schema": "ai-career.intent-gate-decision.v1",
+                    "session_id": "session-001",
+                    "frame_id": "conductor-chat:conductor_001",
+                    "anchor_id": "anchor-001",
+                    "message_id": "conductor_001",
+                    "status": "INTENT_GATE_PASSED",
+                    "stage": "INTENT",
+                    "routing_allowed": True,
+                    "reason": "NONE",
+                    "classification": payload["classification"],
+                    "authority": "UNASSIGNED",
+                    "execution_assignment": "UNASSIGNED",
+                    "mutation_permission": "NONE",
+                }
+                return {
+                    "status": "INTENT_GATE_PASSED",
+                    "decision": decision,
+                }
             if path == "/v1/task-frame/create":
                 return {"status": "TASK_FRAME_HOST_ACTIVE"}
             if path == "/v1/task-frame/close":
@@ -414,6 +434,7 @@ class UniverseRuntimeHostTests(unittest.TestCase):
             {"reply": "유니버스 응답", "action": {"kind": "NONE"}},
             result["structured_result"],
         )
+        self.assertEqual("INTENT_GATE_PASSED", result["intent_gate"]["status"])
         self.assertEqual(1, len(dispatcher.dispatch_calls))
         request = dispatcher.dispatch_calls[0]
         self.assertEqual("NONE", request["repository_write_scope"])
@@ -461,11 +482,74 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         )
         self.assertEqual(
             [
+                "/v1/anchor-session-memory/intent-gate",
                 "/v1/task-frame/create",
                 "/v1/task-frame/operation",
                 "/v1/task-frame/operation",
                 "/v1/task-frame/close",
             ],
+            [operation["path"] for operation in operations],
+        )
+
+    def test_conductor_message_stops_before_task_frame_when_intent_gate_blocks(
+        self,
+    ) -> None:
+        dispatcher = FakeWorkerDispatcher()
+        host = UniverseRuntimeHost(
+            ROOT,
+            worker_dispatcher=dispatcher,
+        )
+        operations: list[dict[str, object]] = []
+
+        def post_runtime(
+            _: str, __: str, path: str, payload: dict[str, object]
+        ) -> dict[str, object]:
+            operations.append({"path": path, "payload": payload})
+            if path != "/v1/anchor-session-memory/intent-gate":
+                raise AssertionError("blocked intent must precede Task Frame calls")
+            decision = {
+                "schema": "ai-career.intent-gate-decision.v1",
+                "session_id": "session-001",
+                "frame_id": "conductor-chat:conductor_blocked",
+                "anchor_id": "anchor-001",
+                "message_id": "conductor_blocked",
+                "status": "INTENT_GATE_BLOCKED",
+                "stage": "INTENT",
+                "routing_allowed": False,
+                "reason": "INTENT_UNCLASSIFIED",
+                "classification": payload["classification"],
+                "authority": "UNASSIGNED",
+                "execution_assignment": "UNASSIGNED",
+                "mutation_permission": "NONE",
+            }
+            return {
+                "status": "INTENT_GATE_BLOCKED",
+                "decision": decision,
+            }
+
+        host._post_runtime = post_runtime  # type: ignore[method-assign]
+        result = host.invoke_conductor_message(
+            runtime_binding={
+                "endpoint": "http://127.0.0.1:17777",
+                "token": "transient-token",
+                "session_id": "session-001",
+                "origin_anchor_ref": "anchor-001",
+            },
+            message={
+                "message_id": "conductor_blocked",
+                "kind": "UNKNOWN",
+                "sender": "USER",
+                "body": "이건 분류되지 않은 요청",
+            },
+            history=[],
+            provider="GROK",
+        )
+
+        self.assertEqual("INTENT_GATE_BLOCKED", result["status"])
+        self.assertEqual("INTENT_UNCLASSIFIED", result["intent_gate"]["reason"])
+        self.assertEqual([], dispatcher.dispatch_calls)
+        self.assertEqual(
+            ["/v1/anchor-session-memory/intent-gate"],
             [operation["path"] for operation in operations],
         )
 
