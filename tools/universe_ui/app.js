@@ -557,7 +557,7 @@ function sessionCoordinateLabel(session) {
 }
 
 function sessionStateLabel(session) {
-  return session.state === "LIVE" ? "SESSION LIVE" : (session.state || "UNKNOWN");
+  return sessionHostStatusLabel(session);
 }
 
 function parseSessionDate(value) {
@@ -2078,6 +2078,9 @@ function nodeModeSessionIsCurrent(session) {
 function hostSessionRef(session) {
   return String(
     session?.host_session_ref ||
+      session?.reconnection_host_id ||
+      session?.host?.host_session_ref ||
+      session?.host?.host_id ||
       session?.pty_binding?.host_session_ref ||
       session?.pty_binding?.reconnection_host_id ||
       ""
@@ -2086,16 +2089,48 @@ function hostSessionRef(session) {
 
 function hostForSession(session) {
   const wanted = hostSessionRef(session);
-  if (!wanted) return null;
-  return (state.supervisorHosts || []).find(
-    (host) => String(host.host_session_ref || host.host_id || "").trim() === wanted
+  const anchorRef = sessionAnchorRef(session);
+  const hosts = state.supervisorHosts || [];
+  if (wanted) {
+    const exact = hosts.find(
+      (host) => String(host.host_session_ref || host.host_id || "").trim() === wanted
+    );
+    if (exact) return exact;
+  }
+  if (!anchorRef) return null;
+  return hosts.find(
+    (host) => String(host.session_anchor_ref || host.anchor_ref || "").trim() === anchorRef
   ) || null;
 }
 
-function hostReconnectEligible(session) {
+function hostRuntimeState(host) {
+  return String(host?.runtime_state || host?.state || "UNKNOWN").trim().toUpperCase();
+}
+
+function hostCompatibility(host) {
+  return String(host?.compatibility || "UNKNOWN").trim().toUpperCase();
+}
+
+function hostIsUsable(host) {
+  return Boolean(
+    host &&
+      hostRuntimeState(host) === "LIVE" &&
+      host.reconnect_eligible === true &&
+      ["CURRENT", "COMPATIBLE_OLD"].includes(hostCompatibility(host))
+  );
+}
+
+function sessionHostStatusLabel(session) {
   const host = hostForSession(session);
-  if (host) return host.reconnect_eligible === true;
-  return session?.pty_binding?.host_reconnect_eligible === true;
+  if (!host) return "HOST UNAVAILABLE";
+  const runtime = hostRuntimeState(host);
+  const compatibility = hostCompatibility(host);
+  if (compatibility === "INCOMPATIBLE") return "HOST INCOMPATIBLE";
+  return runtime === "LIVE" ? `HOST ${compatibility}` : `HOST ${runtime}`;
+}
+
+function hostReconnectEligible(session) {
+  return hostIsUsable(hostForSession(session));
 }
 
 function sessionTerminalId(session) {
@@ -2302,7 +2337,7 @@ async function attachProviderChatRoom(room, coordinate) {
   return providerSessionRoomForChatKey(key);
 }
 
-async function bindNodeModeSessionPty(coordinate, session) {
+async function openNodeModeSessionHost(coordinate, session) {
   if (focusTerminalForSession(coordinate, session)) {
     expandConversationLayer();
     return;
@@ -2333,25 +2368,26 @@ function openNodeModeSessionActions(coordinate, session) {
     elements.nodeSessionActionTitle.textContent = sessionDisplayName(session);
   }
   if (elements.nodeSessionActionSubtitle) {
-    const host = hostForSession(session);
-    const compatibility = String(
-      host?.compatibility || session?.pty_binding?.host_compatibility || "UNKNOWN"
-    ).toUpperCase();
     elements.nodeSessionActionSubtitle.textContent =
-      `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)} / Host ${compatibility.replaceAll("_", " ")}`;
+      `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)} / ${sessionHostStatusLabel(session)}`;
   }
   const terminalId = sessionTerminalId(session);
+  const host = hostForSession(session);
+  const hostReady = hostIsUsable(host);
+  const hostKnown = Boolean(host || hostSessionRef(session));
   if (elements.nodeSessionStop) {
-    elements.nodeSessionStop.disabled = !terminalId;
+    elements.nodeSessionStop.disabled = !terminalId || !hostReady;
   }
   if (elements.nodeSessionInbox) {
-    elements.nodeSessionInbox.disabled = !terminalId;
+    elements.nodeSessionInbox.disabled = !sessionAnchorRef(session);
   }
   if (elements.nodeSessionOpen) {
-    elements.nodeSessionOpen.textContent = terminalId
-      ? "Open PTY"
-      : "PTY Binding";
-    elements.nodeSessionOpen.disabled = Boolean(hostSessionRef(session)) && !hostReconnectEligible(session);
+    elements.nodeSessionOpen.textContent = hostReady
+      ? "Open Host"
+      : hostKnown
+        ? "Host unavailable"
+        : "Start Host";
+    elements.nodeSessionOpen.disabled = hostKnown && !hostReady;
   }
   if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
     elements.nodeSessionActionDialog.showModal();
@@ -2569,7 +2605,7 @@ async function sendSessionBusCompose(event) {
   await refreshSessionBusMessages();
 }
 
-function openPtySessionInspectSummary(coordinate, session) {
+function openSessionInspectSummary(coordinate, session) {
   state.sessionSummaryInspectOnly = true;
   state.selectedProviderChatKey = null;
   if (elements.sessionSummaryTitle) {
@@ -2580,13 +2616,14 @@ function openPtySessionInspectSummary(coordinate, session) {
   }
   if (elements.sessionSummaryFacts) {
     elements.sessionSummaryFacts.replaceChildren();
+    const host = hostForSession(session);
     const facts = [
       ["Project", String(session.project_id || session.node || coordinate?.project?.project_id || "")],
       ["Mode", String(session.mode || coordinate?.mode || "").toUpperCase()],
       ["Provider", String(session.provider || "UNKNOWN").toUpperCase()],
       ["Host", hostSessionRef(session) || "none"],
-      ["Host compatibility", String(hostForSession(session)?.compatibility || session?.pty_binding?.host_compatibility || "UNKNOWN")],
-      ["PTY", sessionTerminalId(session) || "none"],
+      ["Host status", sessionHostStatusLabel(session)],
+      ["Host compatibility", hostCompatibility(host)],
       ["State", String(session.state || vendorStreamStateForSession(session) || "")],
     ];
     for (const [label, value] of facts) {
@@ -2608,12 +2645,12 @@ async function inspectNodeModeSession(coordinate, session) {
     openProviderChatSummary(room, { inspectOnly: true });
     return;
   }
-  openPtySessionInspectSummary(coordinate, session);
+  openSessionInspectSummary(coordinate, session);
 }
 
-async function endNodeModePtySession(session) {
+async function endNodeModeSession(session) {
   const terminalId = sessionTerminalId(session);
-  if (!terminalId) throw new Error("No live PTY session to end");
+  if (!terminalId) throw new Error("No managed Host session to end");
   if (typeof stopTerminalSession === "function") {
     await stopTerminalSession(terminalId);
   } else {
@@ -2636,19 +2673,6 @@ async function selectNodeModeSession(coordinate, session) {
   renderSessionRail();
   renderSessionObservatory();
   openNodeModeSessionActions(coordinate, session);
-}
-
-function ptyLiveTerminalsForCoordinate(coordinate) {
-  const projectId = String(coordinate?.project?.project_id || coordinate?.nodeId || "").trim();
-  const mode = String(coordinate?.mode || "").trim().toUpperCase();
-  if (!projectId || !mode) return [];
-  return (state.supervisorTerminals || state.terminals || []).filter(
-    (item) =>
-      String(item.state || "").toUpperCase() === "LIVE" &&
-      item.host_reconnect_eligible === true &&
-      String(item.project_id || "") === projectId &&
-      String(item.mode || "").toUpperCase() === mode
-  );
 }
 
 const NODE_MODE_RECENT_SESSION_LIMIT = 5;
@@ -2676,7 +2700,7 @@ function recentAnchorSessionsForCoordinate(coordinate) {
 }
 
 function nodeModePanelSessionBuckets(coordinate) {
-  // Session and Anchor records are authoritative. PTY data can decorate an
+  // Session and Anchor records are authoritative. Host data can decorate an
   // existing record but never creates or promotes a session card.
   const sessions = recentAnchorSessionsForCoordinate(coordinate).slice(
     0,
@@ -2721,7 +2745,7 @@ function renderNodeModeSessionCards(coordinate) {
   cards.append(create);
   if (!sessions.length) {
     cards.append(
-      node("p", "node-mode-session-empty", "No live or recent sessions in this mode")
+      node("p", "node-mode-session-empty", "No current or recent sessions in this mode")
     );
     return cards;
   }
@@ -2741,12 +2765,8 @@ function renderNodeModeSessionCards(coordinate) {
     );
     const label = node("span", "node-mode-session-copy");
     const host = hostForSession(session);
-    const compatibility = String(
-      host?.compatibility || session?.pty_binding?.host_compatibility || ""
-    ).toUpperCase();
-    const hostLabel = compatibility
-      ? ` / Host ${compatibility.replaceAll("_", " ")}`
-      : "";
+    const compatibility = hostCompatibility(host);
+    const hostLabel = ` / ${sessionHostStatusLabel(session)}`;
     const detail = `${String(session.provider || "UNKNOWN").toUpperCase()} / ${currentAnchorLabel(session)}${hostLabel}`;
     label.append(
       node("strong", "", sessionDisplayName(session)),
@@ -2756,9 +2776,12 @@ function renderNodeModeSessionCards(coordinate) {
     const current = nodeModeSessionIsCurrent(session);
     let visualState = "RECENT";
     let statusLabel = "RECENT";
-    if (compatibility === "INCOMPATIBLE") {
+    if (host && compatibility === "INCOMPATIBLE") {
       visualState = "INCOMPATIBLE";
       statusLabel = "HOST INCOMPATIBLE";
+    } else if (host && hostRuntimeState(host) !== "LIVE") {
+      visualState = "HOST_UNAVAILABLE";
+      statusLabel = sessionHostStatusLabel(session);
     } else if (nodeModeSessionIsWorking(session)) {
       visualState = activityState;
       statusLabel = activityState === "ACTIVE" ? "WORKING" : activityState;
@@ -2776,6 +2799,8 @@ function renderNodeModeSessionCards(coordinate) {
     }
     card.title = compatibility === "INCOMPATIBLE"
       ? "This Host is incompatible and cannot receive new work"
+      : host && hostRuntimeState(host) !== "LIVE"
+        ? "This Host is not currently live"
       : current
         ? "Inspect the DB Current session anchor"
         : "Inspect this recent session anchor";
@@ -3198,7 +3223,7 @@ function renderSessionObservatory() {
       node("span", "session-token-pill", currentAnchorLabel(session)),
       node("span", "session-state-pill", sessionStateLabel(session))
     );
-    heading.lastElementChild.dataset.state = session.state || "UNKNOWN";
+    heading.lastElementChild.dataset.state = hostRuntimeState(hostForSession(session));
     if (isPrimary && !state.observatoryShowAll) {
       heading.append(node("span", "session-token-pill active", "ACTIVE"));
     } else if (!isPrimary && group) {
@@ -3827,7 +3852,7 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       expectedEffort: isNew ? undefined : effort,
     };
     if (isNew) {
-      // New sessions must first create the PTY-backed CLI surface.  Provider
+      // New sessions must first create the Host-backed CLI surface.  Provider
       // session identity is then observed and bound by the terminal Hook.
       await startNewNodeModeSession({
         ...(pendingCoord || {}),
@@ -6990,13 +7015,10 @@ async function advanceGoalAutomation() {
 
 function liveConductorHostSession() {
   const candidates = (state.supervisorSessions || []).filter((session) => {
-    const binding = session.pty_binding || {};
+    const host = hostForSession(session);
     return (
       String(session.mode || "").toUpperCase() === "CONDUCTOR" &&
-      String(session.state || "").toUpperCase() === "LIVE" &&
-      String(binding.pty_state || "").toUpperCase() === "LIVE" &&
-      String(binding.backend_owner || "").toUpperCase() === "RUST_RECONNECTION_HOST" &&
-      String(binding.reconnection_host_id || "").trim() &&
+      hostIsUsable(host) &&
       String(session.provider || "").trim() &&
       String(session.provider_session_ref || "").trim() &&
       String(session.session_id || "").trim() &&
@@ -11220,7 +11242,7 @@ function renderDetails() {
       node(
         "p",
         "todo-context-ownership",
-        `Work ownership / ${ownershipSummary.task_frame_count} Task Frame(s) / ${ownershipSummary.session_count} target Session Anchor(s) / ${ownershipSummary.live_pty_count} live PTY / ${ownershipSummary.unbound_in_progress_count} unbound active`
+        `Work ownership / ${ownershipSummary.task_frame_count} Task Frame(s) / ${ownershipSummary.session_count} target Session Anchor(s) / ${ownershipSummary.live_host_count} live Host(s) / ${ownershipSummary.unbound_in_progress_count} unbound active`
       )
     );
   }
@@ -12106,7 +12128,7 @@ function todoScopeLabel(todo) {
 }
 
 function semanticTaskFrameOwner(taskFrameId) {
-  if (!taskFrameId) return { anchor: null, session: null, terminal: null };
+  if (!taskFrameId) return { anchor: null, session: null, host: null };
   const frameNodeId = `task_frame:${taskFrameId}`;
   const graph = state.semanticGraph || {};
   const targetEdge = (graph.edges || []).find(
@@ -12119,12 +12141,7 @@ function semanticTaskFrameOwner(taskFrameId) {
   const session = (state.supervisorSessions || []).find(
     (item) => String(item.session_anchor_ref || "") === anchorRef
   ) || null;
-  const terminal = (state.supervisorTerminals || state.terminals || []).find(
-    (item) =>
-      String(item.active_session_anchor_ref || item.session_anchor_ref || "") ===
-      anchorRef
-  ) || null;
-  return { anchor: anchorRef || null, session, terminal };
+  return { anchor: anchorRef || null, session, host: hostForSession(session) };
 }
 
 function todoOwnershipProjection(todo) {
@@ -12141,8 +12158,10 @@ function todoOwnershipProjection(todo) {
     provider: owner.session?.provider || null,
     mode: owner.session?.mode || null,
     session_state: owner.session?.state || "UNKNOWN",
-    terminal_id: owner.terminal?.terminal_id || null,
-    pty_state: owner.terminal?.state || "DETACHED",
+    host_session_ref: hostSessionRef(owner.session) || owner.host?.host_session_ref || null,
+    host_state: hostRuntimeState(owner.host),
+    host_compatibility: hostCompatibility(owner.host),
+    host_reconnect_eligible: owner.host?.reconnect_eligible === true,
   };
 }
 
@@ -12154,7 +12173,12 @@ function todoOwnershipSummary(todos) {
     session_count: new Set(
       projections.map((item) => item.anchor_ref).filter(Boolean)
     ).size,
-    live_pty_count: projections.filter((item) => item.pty_state === "LIVE").length,
+    live_host_count: projections.filter(
+      (item) =>
+        item.host_state === "LIVE" &&
+        item.host_reconnect_eligible === true &&
+        ["CURRENT", "COMPATIBLE_OLD"].includes(item.host_compatibility)
+    ).length,
     unbound_in_progress_count: todos.filter(
       (todo) => todo.state === "IN_PROGRESS" && !todoOwnershipProjection(todo)
     ).length,
@@ -12307,12 +12331,12 @@ function renderTodoOwnership(todo) {
     row.dataset.bound = "false";
     row.append(
       node("span", "todo-ownership-chip", "No Task Frame owner"),
-      node("span", "todo-ownership-chip", "PTY unbound")
+      node("span", "todo-ownership-chip", "Host unbound")
     );
     return row;
   }
   row.dataset.bound = "true";
-  row.dataset.live = ownership.pty_state === "LIVE" ? "true" : "false";
+  row.dataset.hostState = ownership.host_state;
   row.append(
     node("span", "todo-ownership-chip", `Task Frame ${ownership.task_frame_id}`),
     node(
@@ -12324,7 +12348,11 @@ function renderTodoOwnership(todo) {
           ? "Target Session Anchor"
           : "Target owner pending"
     ),
-    node("span", "todo-ownership-chip", `PTY ${ownership.pty_state}`)
+    node(
+      "span",
+      "todo-ownership-chip",
+      `Host ${ownership.host_state}${ownership.host_compatibility !== "UNKNOWN" ? ` / ${ownership.host_compatibility}` : ""}`
+    )
   );
   return row;
 }
@@ -15150,7 +15178,7 @@ function bindEvents() {
       const pending = state.pendingNodeSessionAction;
       if (!pending) return;
       elements.nodeSessionActionDialog?.close();
-      bindNodeModeSessionPty(pending.coordinate, pending.session).catch((error) =>
+      openNodeModeSessionHost(pending.coordinate, pending.session).catch((error) =>
         toast(error.message, true)
       );
     });
@@ -15160,7 +15188,7 @@ function bindEvents() {
       const pending = state.pendingNodeSessionAction;
       if (!pending) return;
       elements.nodeSessionActionDialog?.close();
-      endNodeModePtySession(pending.session).catch((error) => toast(error.message, true));
+      endNodeModeSession(pending.session).catch((error) => toast(error.message, true));
     });
   }
   if (elements.discoverProviderActivity) {

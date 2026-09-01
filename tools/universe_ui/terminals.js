@@ -27,13 +27,35 @@ function activeTerminalSession() {
   return (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId) || null;
 }
 
+function terminalHostForSession(session) {
+  const hostRef = String(
+    session?.host_session_ref || session?.reconnection_host_id || ""
+  ).trim();
+  const anchorRef = String(
+    session?.session_anchor_ref || session?.active_session_anchor_ref || ""
+  ).trim();
+  const hosts = state.supervisorHosts || [];
+  if (hostRef) {
+    const exact = hosts.find(
+      (host) => String(host.host_session_ref || host.host_id || "").trim() === hostRef
+    );
+    if (exact) return exact;
+  }
+  return hosts.find(
+    (host) => String(host.session_anchor_ref || host.anchor_ref || "").trim() === anchorRef
+  ) || null;
+}
+
 function terminalDockVisible(session) {
-  const stateValue = String(session?.state || "").trim().toUpperCase();
-  // Failed/closed PTYs remain in the supervisor as diagnostic history.  They
-  // must not be restored into the interactive dock after a service restart:
-  // doing so makes a stale provider --resume error look like a new-session
-  // failure and blocks the user from opening a fresh tab.
-  return ["LIVE", "STARTING", "CONNECTING"].includes(stateValue);
+  const host = terminalHostForSession(session);
+  return Boolean(
+    host &&
+      String(host.runtime_state || host.state || "").trim().toUpperCase() === "LIVE" &&
+      host.reconnect_eligible === true &&
+      ["CURRENT", "COMPATIBLE_OLD"].includes(
+        String(host.compatibility || "").trim().toUpperCase()
+      )
+  );
 }
 
 function focusTerminalInput() {
@@ -603,13 +625,13 @@ async function createTerminalTab(coordinate, session) {
   const tab = created.terminal || created;
   state.dismissedTerminalIds = state.dismissedTerminalIds || {};
   delete state.dismissedTerminalIds[tab.terminal_id];
-  state.supervisorTerminals = [
-    ...(state.supervisorTerminals || []).filter((item) => item.terminal_id !== tab.terminal_id),
-    tab,
-  ];
-  state.terminals = [...(state.terminals || []).filter((item) => item.terminal_id !== tab.terminal_id), tab];
-  selectTerminalTab(tab.terminal_id);
-  return tab;
+  await loadTerminalTabs();
+  const visible = (state.terminals || []).find(
+    (item) => item.terminal_id === tab.terminal_id
+  );
+  if (!visible) throw new Error("Managed Host is not available for this session");
+  selectTerminalTab(visible.terminal_id);
+  return visible;
 }
 
 function refitActiveTerminal() {
@@ -627,7 +649,7 @@ function refitActiveTerminal() {
 
 async function stopTerminalSession(terminalId) {
   const id = String(terminalId || "").trim();
-  if (!id) throw new Error("No live PTY session");
+  if (!id) throw new Error("No managed Host session");
   await api("/v1/terminals/" + encodeURIComponent(id), { method: "DELETE" });
   if (state.dismissedTerminalIds) delete state.dismissedTerminalIds[id];
   state.supervisorTerminals = (state.supervisorTerminals || []).filter(
@@ -667,7 +689,7 @@ function focusTerminalForSession(coordinate, session) {
     : String(session?.terminal_id || session?.pty_binding?.terminal_id || "").trim();
   if (wantedId) {
     const exact = (state.terminals || []).find((item) => item.terminal_id === wantedId);
-    if (exact) {
+    if (exact && terminalDockVisible(exact)) {
       selectTerminalTab(exact.terminal_id);
       return true;
     }
@@ -734,6 +756,9 @@ async function loadTerminalTabs() {
     state.terminals = visible;
     renderTerminalDock();
     if (typeof renderNodeModes === "function") renderNodeModes();
+    if (typeof renderSessionObservatory === "function") renderSessionObservatory();
+    if (typeof renderTodos === "function") renderTodos();
+    if (typeof renderDetails === "function") renderDetails();
     if (!state.activeTerminalId && visible[0]) {
       selectTerminalTab(visible[0].terminal_id);
       return;

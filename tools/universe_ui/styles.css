@@ -2888,7 +2888,7 @@ dialog label {
   background: rgba(251, 191, 36, 0.08);
 }
 
-.todo-ownership[data-live="true"] .todo-ownership-chip:last-child {
+.todo-ownership[data-host-state="LIVE"] .todo-ownership-chip:last-child {
   border-color: rgba(74, 222, 128, 0.4);
   color: #86efac;
   background: rgba(74, 222, 128, 0.08);
@@ -6789,7 +6789,9 @@ body:not(.graph-mode) .conductor-panel {
 }
 .node-mode-session-status[data-current="true"] { color: var(--cyan); }
 .node-mode-session-status[data-state="CONNECTING"],
-.node-mode-session-status[data-state="RECONNECTING"] { color: var(--amber); }
+.node-mode-session-status[data-state="RECONNECTING"],
+.node-mode-session-status[data-state="HOST_UNAVAILABLE"],
+.node-mode-session-status[data-state="INCOMPATIBLE"] { color: var(--amber); }
 .node-mode-session-status[data-state="NO_VENDOR"],
 .node-mode-session-status[data-state="IDLE"] { color: var(--text-3); }
 .node-mode-mark {
