@@ -1081,5 +1081,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("flex-wrap: nowrap;", mobile_tabs_block)
         self.assertIn("overflow-x: auto;", mobile_tabs_block)
 
+    def test_memory_candidate_keep_has_explicit_rag_adoption_action(self) -> None:
+        self.assertIn('async function adoptMemoryCandidate(candidate)', APP)
+        self.assertIn('invokeServerAction("rag.adopt", {', APP)
+        self.assertIn("expected_candidate_digest: candidate.candidate_digest", APP)
+        review_start = APP.index("function renderMemoryCandidateReview()")
+        review_end = APP.index("function renderMemory()", review_start)
+        review = APP[review_start:review_end]
+        self.assertIn("KEEP marks a candidate only", review)
+        self.assertIn('candidate.state === "KEEP" && candidate.kind === "MEMORY"', review)
+        self.assertIn('"Adopt to RAG"', review)
+
 if __name__ == "__main__":
     unittest.main()

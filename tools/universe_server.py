@@ -181,6 +181,8 @@ from universe_conductor_runtime import (
 from universe_action_registry import (
     ACTION_CONTEXT_SCHEMA,
     FEATURE_GOAL_START_ACTION_ID,
+    RAG_ADOPT_ACTION_ID,
+    RAG_ADOPT_RESULT_SCHEMA,
     ActionRegistryError,
     UnknownActionError,
     build_default_action_registry,
@@ -16919,6 +16921,28 @@ class UniverseStore:
             )
         return material
 
+    def _find_project_memory_by_origin_ref(
+        self, project_id: str, origin_ref: str
+    ) -> dict[str, Any] | None:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT memory_json, created_at, updated_at
+                FROM project_memory
+                WHERE project_id = ? AND origin_ref = ?
+                ORDER BY memory_id
+                LIMIT 1
+                """,
+                (project["project_id"], origin_ref),
+            ).fetchone()
+        if row is None:
+            return None
+        memory = json.loads(row["memory_json"])
+        memory["created_at"] = row["created_at"]
+        memory["updated_at"] = row["updated_at"]
+        return memory
+
     def list_project_memories(
         self,
         project_id: str,
@@ -17633,6 +17657,120 @@ class UniverseStore:
                 ),
             )
         return candidate, True
+
+    def adopt_memory_candidate(
+        self, candidate_id: str, expected_candidate_digest: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Adopt one explicitly kept MEMORY candidate into canonical project RAG."""
+
+        if not isinstance(expected_candidate_digest, str):
+            raise UniverseError(
+                "RAG_ADOPT_DIGEST_INVALID",
+                "expected_candidate_digest must be a SHA-256 hex digest",
+            )
+        expected_digest = expected_candidate_digest.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+            raise UniverseError(
+                "RAG_ADOPT_DIGEST_INVALID",
+                "expected_candidate_digest must be a SHA-256 hex digest",
+            )
+
+        candidate = self.get_memory_candidate(candidate_id)
+        if candidate["candidate_digest"] != expected_digest:
+            raise UniverseError(
+                "RAG_ADOPT_CANDIDATE_DIGEST_CONFLICT",
+                "candidate digest no longer matches the requested adoption",
+                HTTPStatus.CONFLICT,
+            )
+        if candidate["kind"] != "MEMORY":
+            raise UniverseError(
+                "RAG_ADOPT_KIND_INVALID",
+                "only MEMORY candidates can be adopted into canonical RAG",
+                HTTPStatus.CONFLICT,
+            )
+        if candidate["state"] != "KEEP":
+            raise UniverseError(
+                "RAG_ADOPT_REVIEW_REQUIRED",
+                "candidate must have an explicit KEEP decision before adoption",
+                HTTPStatus.CONFLICT,
+            )
+        with self._connection() as connection:
+            review = connection.execute(
+                """
+                SELECT decision
+                FROM memory_candidate_review
+                WHERE candidate_id = ? AND project_id = ?
+                """,
+                (candidate["candidate_id"], candidate["project_id"]),
+            ).fetchone()
+        if review is None or str(review["decision"]).upper() != "KEEP":
+            raise UniverseError(
+                "RAG_ADOPT_REVIEW_REQUIRED",
+                "candidate must have an explicit KEEP review record before adoption",
+                HTTPStatus.CONFLICT,
+            )
+
+        origin_ref = (
+            "universe://memory-candidates/"
+            f"{expected_digest}/{quote(candidate['candidate_id'], safe='')}"
+        )
+        expected_title = candidate["summary"][:160]
+        expected_body = candidate["summary"]
+
+        def matches_adoption(memory: Mapping[str, Any]) -> bool:
+            return (
+                memory.get("title") == expected_title
+                and memory.get("body") == expected_body
+                and memory.get("state") == "OBSERVED"
+                and memory.get("link_state") == "UNLINKED"
+                and memory.get("node_ref") is None
+                and memory.get("graph") is None
+                and memory.get("origin_ref") == origin_ref
+            )
+
+        existing = self._find_project_memory_by_origin_ref(
+            candidate["project_id"], origin_ref
+        )
+        if existing is not None:
+            if not matches_adoption(existing):
+                raise UniverseError(
+                    "RAG_ADOPT_STORAGE_CONFLICT",
+                    "canonical Memory origin is bound to different content",
+                    HTTPStatus.CONFLICT,
+                )
+            return existing, False
+
+        try:
+            memory = self.create_project_memory(
+                candidate["project_id"],
+                {
+                    "title": expected_title,
+                    "body": expected_body,
+                    "state": "OBSERVED",
+                    "origin_ref": origin_ref,
+                },
+            )
+        except sqlite3.IntegrityError as error:
+            # The deterministic origin ref and memory digest make a concurrent
+            # retry safe. Re-read only the expected origin; unrelated integrity
+            # failures remain explicit instead of being treated as a replay.
+            existing = self._find_project_memory_by_origin_ref(
+                candidate["project_id"], origin_ref
+            )
+            if existing is None:
+                raise UniverseError(
+                    "RAG_ADOPT_STORAGE_CONFLICT",
+                    "canonical Memory could not be adopted",
+                    HTTPStatus.CONFLICT,
+                ) from error
+            if not matches_adoption(existing):
+                raise UniverseError(
+                    "RAG_ADOPT_STORAGE_CONFLICT",
+                    "canonical Memory origin is bound to different content",
+                    HTTPStatus.CONFLICT,
+                )
+            return existing, False
+        return memory, True
 
     def run_memory_batch(
         self,
@@ -24817,7 +24955,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
         self.action_registry = build_default_action_registry(
-            self._handle_feature_goal_start_action
+            self._handle_feature_goal_start_action,
+            rag_adopt_handler=self._handle_rag_adopt_action,
         )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_error: dict[str, str] | None = None
@@ -25689,7 +25828,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def action_http_status(result: Mapping[str, Any]) -> HTTPStatus:
         return (
             HTTPStatus.CREATED
-            if result.get("status") == "FEATURE_GOAL_STARTED"
+            if result.get("status") in {"FEATURE_GOAL_STARTED", "RAG_MEMORY_ADOPTED"}
             else HTTPStatus.OK
         )
 
@@ -25764,6 +25903,55 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         feature_id = _identifier(action.pop("feature_id"), "feature_id")
         action["started_by_role"] = "USER"
         return self._complete_feature_goal_start(feature_id, action)
+
+    def _handle_rag_adopt_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "rag.adopt requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request,
+            field="rag_adopt_action",
+            required=frozenset({"candidate_id", "expected_candidate_digest"}),
+        )
+        candidate_id = _identifier(action["candidate_id"], "candidate_id")
+        memory, created = self.store.adopt_memory_candidate(
+            candidate_id,
+            action["expected_candidate_digest"],
+        )
+        candidate = self.store.get_memory_candidate(candidate_id)
+        return {
+            "schema": RAG_ADOPT_RESULT_SCHEMA,
+            "status": (
+                "RAG_MEMORY_ADOPTED"
+                if created
+                else "RAG_MEMORY_ADOPTION_REPLAYED"
+            ),
+            "action_id": RAG_ADOPT_ACTION_ID,
+            "candidate": candidate,
+            "memory": memory,
+            "adopted": created,
+            "canonical_memory_created": created,
+            "authority_created": False,
+            "execution_assignment_created": False,
+            "task_frame_created": False,
+            "repository_pushed": False,
+            "effects": {
+                "candidate": "UNCHANGED",
+                "canonical_rag": "CREATED" if created else "IDEMPOTENT_REPLAY",
+                "seed_write": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+                "task_frame": "NONE",
+                "auto_linked": False,
+            },
+            "next_operation": memory["next_operation"],
+        }
 
     def _complete_feature_goal_start(
         self, feature_id: str, value: Mapping[str, Any]

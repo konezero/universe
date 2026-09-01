@@ -16,6 +16,9 @@ from universe_action_registry import (  # noqa: E402
     ActionContractError,
     ActionRegistry,
     DuplicateActionError,
+    RAG_ADOPT_ACTION_ID,
+    RAG_ADOPT_REQUEST_SCHEMA,
+    RAG_ADOPT_RESULT_SCHEMA,
     UnknownActionError,
     build_default_action_registry,
     derive_idempotency_key,
@@ -77,6 +80,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
         registry = build_default_action_registry()
         registry.register_uncovered_surface("future.direct.surface")
         self.assertEqual(COVERED, registry.classify_surface("feature.goal.start"))
+        self.assertEqual(COVERED, registry.classify_surface(RAG_ADOPT_ACTION_ID))
         self.assertEqual(LEGACY_DIRECT, registry.classify_surface("UniverseStore.start_feature_goal"))
         self.assertEqual(UNCOVERED, registry.classify_surface("future.direct.surface"))
         coverage = registry.coverage()
@@ -85,11 +89,15 @@ class UniverseActionRegistryTests(unittest.TestCase):
         self.assertEqual(UNCOVERED, coverage["future.direct.surface"])
         report = registry.coverage_report()
         self.assertIn("feature.goal.start", report["registered_action_ids"])
+        self.assertIn(RAG_ADOPT_ACTION_ID, report["registered_action_ids"])
         self.assertEqual(coverage, registry.coverage_classification())
         self.assertEqual(
             "universe.feature-goal-start-receipt.v1",
             build_default_action_registry().lookup("feature.goal.start").result_schema_ref,
         )
+        rag_contract = build_default_action_registry().lookup(RAG_ADOPT_ACTION_ID)
+        self.assertEqual(RAG_ADOPT_REQUEST_SCHEMA, rag_contract.request_schema_ref)
+        self.assertEqual(RAG_ADOPT_RESULT_SCHEMA, rag_contract.result_schema_ref)
         self.assertEqual(
             {"COVERED", "LEGACY_DIRECT", "UNCOVERED"},
             {item["classification"] for item in report["coverage"]},

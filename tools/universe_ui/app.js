@@ -14442,6 +14442,38 @@ function renderMemoryBatchStages() {
   return group;
 }
 
+async function adoptMemoryCandidate(candidate) {
+  try {
+    const result = await invokeServerAction("rag.adopt", {
+      candidate_id: candidate.candidate_id,
+      expected_candidate_digest: candidate.candidate_digest,
+    });
+    if (result.candidate) {
+      state.memoryCandidates = state.memoryCandidates.map((item) =>
+        item.candidate_id === result.candidate.candidate_id
+          ? result.candidate
+          : item
+      );
+    }
+    if (result.memory) {
+      state.memories = [
+        result.memory,
+        ...state.memories.filter(
+          (item) => item.memory_id !== result.memory.memory_id
+        ),
+      ];
+    }
+    renderMemory();
+    toast(
+      result.status === "RAG_MEMORY_ADOPTED"
+        ? "Candidate adopted to RAG"
+        : "RAG adoption already recorded"
+    );
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function renderMemoryCandidateReview() {
   const group = node("div", "detail-group memory-candidate-review");
   group.append(
@@ -14449,7 +14481,7 @@ function renderMemoryCandidateReview() {
     node(
       "p",
       "context-copy",
-      "Review-only candidates retain summaries, digests, ranges, and relations. Decisions never write Seed, facts, anchors, authority, or source."
+      "Review-only candidates retain summaries, digests, ranges, and relations. KEEP marks a candidate only; use Adopt to RAG to create canonical Memory. Decisions never write Seed, facts, anchors, authority, or source."
     )
   );
   const filters = node("div", "memory-candidate-filters");
@@ -14523,6 +14555,18 @@ function renderMemoryCandidateReview() {
         });
         actions.append(button);
       }
+      card.append(actions);
+    }
+    if (candidate.state === "KEEP" && candidate.kind === "MEMORY") {
+      const actions = node("div", "memory-candidate-actions");
+      const adopt = node(
+        "button",
+        "primary-button compact-action",
+        "Adopt to RAG"
+      );
+      adopt.type = "button";
+      adopt.addEventListener("click", () => adoptMemoryCandidate(candidate));
+      actions.append(adopt);
       card.append(actions);
     }
     list.append(card);

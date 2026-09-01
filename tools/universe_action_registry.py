@@ -33,6 +33,11 @@ LEGACY_FEATURE_GOAL_START_HTTP_SURFACE = (
 )
 LEGACY_FEATURE_GOAL_START_STORE_SURFACE = "UniverseStore.start_feature_goal"
 
+RAG_ADOPT_ACTION_ID = "rag.adopt"
+RAG_ADOPT_REQUEST_SCHEMA = "universe.rag-adopt-action-request.v1"
+RAG_ADOPT_RESULT_SCHEMA = "universe.rag-adopt-receipt.v1"
+RAG_ADOPT_ACTION_SURFACE = "rag.adopt"
+
 SERVER_RESOLVED_CALLER_FIELDS = frozenset(
     {
         "actor",
@@ -408,6 +413,8 @@ class ActionRegistry:
 
 def build_default_action_registry(
     handler: ActionHandler | None = None,
+    *,
+    rag_adopt_handler: ActionHandler | None = None,
 ) -> ActionRegistry:
     """Build the currently modeled mutating surface registry."""
 
@@ -425,6 +432,17 @@ def build_default_action_registry(
     )
     registry.register_legacy_surface(LEGACY_FEATURE_GOAL_START_HTTP_SURFACE)
     registry.register_legacy_surface(LEGACY_FEATURE_GOAL_START_STORE_SURFACE)
+    registry.register(
+        ActionContract(
+            action_id=RAG_ADOPT_ACTION_ID,
+            request_schema_ref=RAG_ADOPT_REQUEST_SCHEMA,
+            result_schema_ref=RAG_ADOPT_RESULT_SCHEMA,
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"receipt_schema": RAG_ADOPT_RESULT_SCHEMA},
+        ),
+        rag_adopt_handler,
+        surfaces=(RAG_ADOPT_ACTION_SURFACE,),
+    )
     return registry
 
 
@@ -450,6 +468,10 @@ __all__ = [
     "LEGACY_DIRECT",
     "LEGACY_FEATURE_GOAL_START_HTTP_SURFACE",
     "LEGACY_FEATURE_GOAL_START_STORE_SURFACE",
+    "RAG_ADOPT_ACTION_ID",
+    "RAG_ADOPT_ACTION_SURFACE",
+    "RAG_ADOPT_REQUEST_SCHEMA",
+    "RAG_ADOPT_RESULT_SCHEMA",
     "RegisteredAction",
     "SERVER_RESOLVED_CALLER_FIELDS",
     "UNCOVERED",

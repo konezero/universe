@@ -9001,6 +9001,142 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("USER", context["actor"]["role"])
         self.assertNotEqual("TEST_CALLER", context["source"])
 
+    def test_rag_adopt_requires_keep_review_and_is_digest_pinned(self) -> None:
+        self.server.store.register_project(self.registration())
+        candidate, created = self.server.store.create_memory_candidate(
+            "GCS",
+            {
+                "stage": "FAST_EXTRACT",
+                "kind": "MEMORY",
+                "summary": "Keep this bounded project memory.",
+                "source_session": {
+                    "provider": "CODEX",
+                    "provider_session_id": "codex-rag-adopt-test",
+                },
+                "source_range": {"start": 4, "end": 4},
+                "ref_digests": ["activity-rag-adopt-test"],
+            },
+        )
+        self.assertTrue(created)
+        action_request = {
+            "action_id": "rag.adopt",
+            "request": {
+                "candidate_id": candidate["candidate_id"],
+                "expected_candidate_digest": candidate["candidate_digest"],
+            },
+        }
+
+        status, blocked = self.request("POST", "/v1/actions", action_request, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RAG_ADOPT_REVIEW_REQUIRED", blocked["error_code"])
+        self.assertEqual([], self.server.store.list_project_memories("GCS"))
+
+        kept, changed = self.server.store.review_memory_candidate(
+            candidate["candidate_id"], {"decision": "KEEP"}
+        )
+        self.assertTrue(changed)
+        self.assertEqual("KEEP", kept["state"])
+
+        status, adopted = self.request("POST", "/v1/actions", action_request, self.token)
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("RAG_MEMORY_ADOPTED", adopted["status"])
+        self.assertEqual("universe.rag-adopt-receipt.v1", adopted["schema"])
+        self.assertTrue(adopted["adopted"])
+        self.assertTrue(adopted["canonical_memory_created"])
+        self.assertFalse(adopted["authority_created"])
+        self.assertFalse(adopted["execution_assignment_created"])
+        self.assertFalse(adopted["task_frame_created"])
+        self.assertFalse(adopted["repository_pushed"])
+        memory = adopted["memory"]
+        self.assertEqual("OBSERVED", memory["state"])
+        self.assertEqual("UNLINKED", memory["link_state"])
+        self.assertEqual(
+            f"universe://memory-candidates/{candidate['candidate_digest']}/{candidate['candidate_id']}",
+            memory["origin_ref"],
+        )
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
+
+        status, replay = self.request("POST", "/v1/actions", action_request, self.token)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RAG_MEMORY_ADOPTION_REPLAYED", replay["status"])
+        self.assertFalse(replay["adopted"])
+        self.assertEqual(memory["memory_id"], replay["memory"]["memory_id"])
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
+
+        status, digest_conflict = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "rag.adopt",
+                "request": {
+                    "candidate_id": candidate["candidate_id"],
+                    "expected_candidate_digest": "0" * 64,
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "RAG_ADOPT_CANDIDATE_DIGEST_CONFLICT",
+            digest_conflict["error_code"],
+        )
+
+        idea, _ = self.server.store.create_memory_candidate(
+            "GCS",
+            {
+                "stage": "SYNTHESIZE",
+                "kind": "IDEA",
+                "summary": "An idea remains a candidate until another product decision.",
+            },
+        )
+        self.server.store.review_memory_candidate(
+            idea["candidate_id"], {"decision": "KEEP"}
+        )
+        status, non_memory = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "rag.adopt",
+                "request": {
+                    "candidate_id": idea["candidate_id"],
+                    "expected_candidate_digest": idea["candidate_digest"],
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RAG_ADOPT_KIND_INVALID", non_memory["error_code"])
+        self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
+
+    def test_rag_adopt_does_not_trust_candidate_keep_state_without_review(self) -> None:
+        self.server.store.register_project(self.registration())
+        candidate, created = self.server.store.create_memory_candidate(
+            "GCS",
+            {
+                "stage": "FAST_EXTRACT",
+                "kind": "MEMORY",
+                "state": "KEEP",
+                "summary": "A state-only candidate is not a review.",
+            },
+        )
+        self.assertTrue(created)
+
+        status, payload = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "rag.adopt",
+                "request": {
+                    "candidate_id": candidate["candidate_id"],
+                    "expected_candidate_digest": candidate["candidate_digest"],
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RAG_ADOPT_REVIEW_REQUIRED", payload["error_code"])
+        self.assertEqual([], self.server.store.list_project_memories("GCS"))
+
     def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
         self.server.store.register_project(self.registration())
         room = self.server.multi_rooms.create_meeting_room(

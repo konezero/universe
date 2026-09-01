@@ -4,7 +4,7 @@ Status: implemented and live-probed (governed FAST_EXTRACT adapter plus determin
 Scope: project-local memory notes, configurable redacted batch stages,
 governed Codex extraction, candidate review, SkillRunObservation/Bench evidence,
 node link/unlink, search, and propose-links
-Not: Candidate auto-adoption, Seed mutation, automatic Bench/Future promotion,
+Not: automatic Candidate adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
 ## LLM retrieval context
@@ -103,6 +103,28 @@ POST /v1/memory-candidates/{candidate_id}/review
 Only `REVIEW_REQUIRED` candidates accept `IGNORE`, `KEEP`, `EXPLORE`, or
 `START_PRODUCT_DESIGN`. A second identical decision is idempotent; all other
 transitions fail closed with a conflict.
+
+`KEEP` is a review decision only. Canonical RAG adoption is a separate explicit
+Action IR operation. `rag.adopt` accepts only a `MEMORY` candidate with a
+recorded `KEEP` review and requires the caller to pin the current
+`candidate_digest`. It creates one `OBSERVED`, `UNLINKED` project Memory whose
+origin ref contains the candidate digest. Repeating the same request returns
+the existing Memory as an idempotent replay. Adoption does not link a Node,
+write Seed, create authority, create an Assignment, or start a Task Frame.
+
+```text
+POST /v1/actions
+```
+
+```json
+{
+  "action_id": "rag.adopt",
+  "request": {
+    "candidate_id": "memory_candidate_...",
+    "expected_candidate_digest": "64-character-sha256-hex"
+  }
+}
+```
 
 ## Governed FAST_EXTRACT
 
