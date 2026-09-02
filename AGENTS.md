@@ -11,6 +11,34 @@ remain source-bound. Edit project policy outside this block.
 Status: installed project runtime router
 Scope: project-local runtime entry and authority boundary
 
+## Reserved Universe Command Fast Path
+
+Before Mode Intent or the general Entry Order, inspect only the
+first non-whitespace user-input line through
+`.ai/skills/common/universe-command/SKILL.md`. Exact reserved
+commands are `#마스터모드`, `#컨덕터모드`, and `#메모싱크`.
+A resolved Mode command goes immediately to
+`.ai/skills/common/mode-change/SKILL.md`; `#메모싱크` goes only to
+`.ai/skills/common/memory-sync/SKILL.md` for passive session-memory
+candidate extraction. Do not first read repository, Boot, Core, Git,
+RAG, long-term memory, project files, or common Agent policy. An
+embedded, extended, or unmatched `#` tag is not a reserved command
+and continues through the normal route.
+
+## Mode Intent Fast Path
+
+Before the general Entry Order, handle an unambiguous request to enter
+or change to a registered Mode through
+`.ai/skills/common/mode-change/SKILL.md`. Read only the Host-observed
+Session Anchor and the Registry snapshot in
+`.ai/runtime/state/project_runtime.sqlite3` needed to resolve that
+request. Do not first read `REPOSITORY_MANIFEST.md`, `.ai/START_HERE.md`,
+Boot or Core documents, git history, project files,
+`.ai/agents/common/README.md`, RAG, or memory. The Intent Gate decides
+only whether this is `MODE_CHANGE`; the Mode Change Skill performs the
+declared Runtime-owned anchor updates. If the request is not an explicit
+registered Mode request, continue with the general Entry Order.
+
 ## Entry Order
 
 Read `REPOSITORY_MANIFEST.md`, then `.ai/START_HERE.md`, then
@@ -42,9 +70,10 @@ seed only when the snapshot is absent. The project Registry is
 
 ## Common Agent Policy
 
-The active Parent follows `.ai/agents/common/README.md` after
-repository startup policy. Project-owned Agent policy may add
-narrower constraints but must not weaken the common package.
+After the Mode Intent Fast Path or general repository startup policy,
+the active Parent follows `.ai/agents/common/README.md`. Project-owned
+Agent policy may add narrower constraints but must not weaken the common
+package.
 
 Before Worker invocation, the Task Frame Runtime validates
 `.ai/agents/common/worker-policy-pack.json` against the installed
@@ -98,21 +127,30 @@ sandbox.
 ## Execution Guard
 
 Mode and Role do not create authority. A current, scoped assignment and
-immediate pre-execution verification are required before **project-owned**
-mutation (source, product trees, Core, templates, configuration, external
-systems).
+immediate pre-execution verification are required before **guarded
+project-owned** mutation (source outside an active direct Work Receipt,
+product trees, Core, templates, configuration, external systems, or
+unclassified durable effects).
 
-Before every project-owned file create/edit/delete/move, write-capable API
-or database mutation, or other project-owned / external / unclassified
-durable side effect other than ordinary source-control operations, execute
+Before every project-owned file create/edit/delete/move outside an active
+direct Work Receipt, non-governed write-capable API or database mutation,
+or other project-owned / external / unclassified durable side effect other
+than ordinary source-control operations, execute
 `.ai/skills/common/execution-guard/SKILL.md`. Reading or summarizing that
 Skill is not sufficient. Do not call a raw mutation tool first.
 
-A project-owned mutation may proceed only when the active Session Boot
-process returns `EXECUTION_GUARD_PERMITTED`, supplies a one-time receipt,
-and the Host has a receipt-aware pre-write hook. Missing endpoint, token,
-Authority, Write Scope, Execution Assignment, approval, or Host hook
-blocks that class of mutation.
+First-class governed knowledge Actions, such as canonical RAG decision
+registration, use the named Action Gateway instead of an Execution Guard
+receipt. The Action Gateway must enforce server-resolved actor/context,
+schema and scope, provenance, deterministic replay/conflict behavior, and
+an auditable typed result. Any source, configuration, lifecycle,
+authority, assignment, or external effect remains guarded separately.
+
+A guarded project-owned mutation may proceed only when the active Session
+Boot process returns `EXECUTION_GUARD_PERMITTED`, supplies a one-time
+receipt, and the Host has a receipt-aware pre-write hook. Missing endpoint,
+token, Authority, Write Scope, Execution Assignment, approval, or Host
+hook blocks that class of mutation.
 
 **Runtime-owned state is not Guard work.** MODE_CHANGE / Mode Anchor
 store updates, `HOST_STATE_PROJECTION` into

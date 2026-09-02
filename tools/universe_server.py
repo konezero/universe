@@ -181,6 +181,10 @@ from universe_conductor_runtime import (
 from universe_action_registry import (
     ACTION_CONTEXT_SCHEMA,
     FEATURE_GOAL_START_ACTION_ID,
+    SESSION_NEW_ACTION_ID,
+    SESSION_NEW_RESULT_SCHEMA,
+    SESSION_RESUME_ACTION_ID,
+    SESSION_RESUME_RESULT_SCHEMA,
     MEMORY_BATCH_RUN_ACTION_ID,
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_RESULT_SCHEMA,
@@ -371,6 +375,16 @@ CONDUCTOR_ROOM_PROVIDERS = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCHEMA = "universe.cli-provider-setting.v1"
 PROVIDER_SETTING_CHOICES = frozenset({"AUTO", "GROK", "CODEX", "CLAUDE"})
 PROVIDER_SETTING_SCOPES = frozenset({"UNIVERSE_CONDUCTOR", "PROJECT_MASTER"})
+SESSION_ACTION_TARGET_CLI_TERMINAL = "CLI_TERMINAL"
+SESSION_ACTION_TARGET_PROJECT_MASTER = "PROJECT_MASTER"
+SESSION_ACTION_TARGET_UNIVERSE_CONDUCTOR = "UNIVERSE_CONDUCTOR"
+SESSION_ACTION_TARGETS = frozenset(
+    {
+        SESSION_ACTION_TARGET_CLI_TERMINAL,
+        SESSION_ACTION_TARGET_PROJECT_MASTER,
+        SESSION_ACTION_TARGET_UNIVERSE_CONDUCTOR,
+    }
+)
 WORKER_BINDING_SCHEMA = "universe.worker-binding-profile.v1"
 WORKER_BINDING_RESOLUTION_SCHEMA = "universe.worker-binding-resolution.v1"
 WORKER_BINDING_SCOPES = frozenset({"UNIVERSE", "PROJECT"})
@@ -25099,6 +25113,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             rag_adopt_handler=self._handle_rag_adopt_action,
             rag_record_decision_handler=self._handle_rag_record_decision_action,
             memory_batch_run_handler=self._handle_memory_batch_run_action,
+            session_new_handler=self._handle_session_new_action,
+            session_resume_handler=self._handle_session_resume_action,
         )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_error: dict[str, str] | None = None
@@ -25975,6 +25991,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "FEATURE_GOAL_STARTED",
                 "RAG_MEMORY_ADOPTED",
                 "RAG_DECISION_RECORDED",
+                "SESSION_NEW_COMPLETED",
             }
             else HTTPStatus.OK
         )
@@ -26017,6 +26034,272 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     dispatch_action = execute_action
     handle_action = execute_action
+
+    @staticmethod
+    def _require_session_action_user(
+        context: Mapping[str, Any], action_id: str
+    ) -> None:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                f"{action_id} requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+
+    @staticmethod
+    def _session_action_target(
+        request: Mapping[str, Any], *, field: str
+    ) -> str:
+        target = _required_text(request.get("target"), f"{field}.target").upper()
+        if target not in SESSION_ACTION_TARGETS:
+            raise UniverseError(
+                "SESSION_ACTION_TARGET_INVALID",
+                "session action target is not supported",
+                HTTPStatus.BAD_REQUEST,
+            )
+        return target
+
+    @staticmethod
+    def _session_action_options(request: Mapping[str, Any]) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        if "provider" in request:
+            options["provider"] = str(request.get("provider") or "AUTO").strip().upper() or "AUTO"
+        if "model_ref" in request:
+            options["model_ref"] = str(request.get("model_ref") or "").strip()
+        if "effort" in request:
+            options["effort"] = str(request.get("effort") or "AUTO").strip().upper() or "AUTO"
+        return options
+
+    def _session_action_project_root(self, project_id: str) -> str:
+        if project_id.casefold() == "universe":
+            return str(Path(__file__).resolve().parents[1])
+        project = self.store.get_project(project_id)
+        return _required_text(project.get("project_root"), "project.project_root")
+
+    def _handle_session_new_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require_session_action_user(context, SESSION_NEW_ACTION_ID)
+        action = _exact_object_fields(
+            request,
+            field="session_new_action",
+            required=frozenset({"target"}),
+            optional=frozenset({"project_id", "provider", "model_ref", "effort"}),
+        )
+        target = self._session_action_target(action, field="session_new_action")
+        if target == SESSION_ACTION_TARGET_CLI_TERMINAL:
+            raise UniverseError(
+                "SESSION_NEW_TARGET_INVALID",
+                "session.new must target a Project Master or Universe Conductor",
+                HTTPStatus.BAD_REQUEST,
+            )
+        if target == SESSION_ACTION_TARGET_PROJECT_MASTER:
+            project_id = _project_id(action.get("project_id"))
+            mode = "MASTER"
+        else:
+            project_id = "universe"
+            mode = "CONDUCTOR"
+        payload = self._session_action_options(action)
+        payload.update(
+            {
+                "project_id": project_id,
+                "mode": mode,
+                "cwd": self._session_action_project_root(project_id),
+            }
+        )
+        created = self.create_cli_terminal(payload)
+        return {
+            "schema": SESSION_NEW_RESULT_SCHEMA,
+            "status": "SESSION_NEW_COMPLETED",
+            "action_id": SESSION_NEW_ACTION_ID,
+            "target": target,
+            "terminal_status": created.get("status"),
+            "terminal": created.get("terminal"),
+        }
+
+    def _resume_cli_terminal_action(
+        self, action: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if str(action.get("project_id") or "").strip():
+            raise UniverseError(
+                "SESSION_RESUME_COORDINATE_CLIENT_SUPPLIED",
+                "CLI terminal resume resolves project and Mode from the server-owned session selector",
+                HTTPStatus.BAD_REQUEST,
+            )
+        supervisor_session_id = str(
+            action.get("supervisor_session_id") or ""
+        ).strip()
+        host_session_ref = str(action.get("host_session_ref") or "").strip()
+        requested_anchor_ref = str(
+            action.get("pty_binding_anchor_ref") or ""
+        ).strip()
+        if not supervisor_session_id and not host_session_ref:
+            raise UniverseError(
+                "SESSION_RESUME_SELECTOR_REQUIRED",
+                "CLI terminal resume requires a supervisor session or Host session reference",
+                HTTPStatus.CONFLICT,
+            )
+
+        payload = self._session_action_options(action)
+        if supervisor_session_id:
+            try:
+                supervised = self.session_supervisor.get_session(
+                    supervisor_session_id
+                )
+            except SessionSupervisorError as error:
+                raise UniverseError(
+                    error.code, error.detail, HTTPStatus.NOT_FOUND
+                ) from error
+            project_id = str(
+                supervised.get("current_project_id")
+                or supervised.get("node")
+                or supervised.get("project_id")
+                or ""
+            ).strip()
+            mode = str(supervised.get("mode") or "").strip().upper()
+            stored_anchor_ref = str(
+                supervised.get("session_anchor_ref") or ""
+            ).strip()
+            if requested_anchor_ref and stored_anchor_ref != requested_anchor_ref:
+                raise UniverseError(
+                    "SESSION_RESUME_ANCHOR_MISMATCH",
+                    "requested Session Anchor does not match the server-owned Supervisor session",
+                    HTTPStatus.CONFLICT,
+                )
+            anchor_ref = requested_anchor_ref or stored_anchor_ref
+            payload["supervisor_session_id"] = supervisor_session_id
+        else:
+            try:
+                managed_host = self._session_anchor_terminal_host().get_host(
+                    host_session_ref
+                )
+            except TerminalHostError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+            hosted = managed_host.public()
+            project_id = str(hosted.get("project_id") or "").strip()
+            mode = str(hosted.get("mode") or "").strip().upper()
+            stored_anchor_ref = str(
+                hosted.get("session_anchor_ref")
+                or hosted.get("active_session_anchor_ref")
+                or ""
+            ).strip()
+            if requested_anchor_ref and stored_anchor_ref != requested_anchor_ref:
+                raise UniverseError(
+                    "SESSION_RESUME_ANCHOR_MISMATCH",
+                    "requested Session Anchor does not match the server-owned Host session",
+                    HTTPStatus.CONFLICT,
+                )
+            anchor_ref = requested_anchor_ref or stored_anchor_ref
+            supervisor_session_id = str(
+                hosted.get("supervisor_session_id") or ""
+            ).strip()
+            if not supervisor_session_id:
+                raise UniverseError(
+                    "SESSION_RESUME_SUPERVISOR_REQUIRED",
+                    "Host session has no Supervisor session coordinate",
+                    HTTPStatus.CONFLICT,
+                )
+            payload["supervisor_session_id"] = supervisor_session_id
+
+        if not project_id or mode not in {"MASTER", "CONDUCTOR"}:
+            raise UniverseError(
+                "SESSION_RESUME_COORDINATE_UNAVAILABLE",
+                "server-owned session selector has no valid project and Mode coordinate",
+                HTTPStatus.CONFLICT,
+            )
+        payload.update(
+            {
+                "project_id": project_id,
+                "mode": mode,
+                "cwd": self._session_action_project_root(project_id),
+            }
+        )
+        if host_session_ref:
+            payload["host_session_ref"] = host_session_ref
+        if anchor_ref:
+            payload["pty_binding_anchor_ref"] = anchor_ref
+        return self.create_cli_terminal(payload)
+
+    def _handle_session_resume_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require_session_action_user(context, SESSION_RESUME_ACTION_ID)
+        action = _exact_object_fields(
+            request,
+            field="session_resume_action",
+            required=frozenset({"target"}),
+            optional=frozenset(
+                {
+                    "project_id",
+                    "provider",
+                    "model_ref",
+                    "effort",
+                    "supervisor_session_id",
+                    "host_session_ref",
+                    "pty_binding_anchor_ref",
+                }
+            ),
+        )
+        target = self._session_action_target(action, field="session_resume_action")
+        if target == SESSION_ACTION_TARGET_CLI_TERMINAL:
+            resumed = self._resume_cli_terminal_action(action)
+            return {
+                "schema": SESSION_RESUME_RESULT_SCHEMA,
+                "status": "SESSION_RESUME_COMPLETED",
+                "action_id": SESSION_RESUME_ACTION_ID,
+                "target": target,
+                "terminal_status": resumed.get("status"),
+                "terminal": resumed.get("terminal"),
+            }
+
+        if any(
+            str(action.get(field) or "").strip()
+            for field in (
+                "supervisor_session_id",
+                "host_session_ref",
+                "pty_binding_anchor_ref",
+            )
+        ):
+            raise UniverseError(
+                "SESSION_RESUME_SELECTOR_TARGET_INVALID",
+                "Supervisor and Host selectors are valid only for CLI terminal resume",
+                HTTPStatus.BAD_REQUEST,
+            )
+        options = self._session_action_options(action)
+        if target == SESSION_ACTION_TARGET_UNIVERSE_CONDUCTOR:
+            if str(action.get("project_id") or "").strip():
+                raise UniverseError(
+                    "SESSION_RESUME_PROJECT_INVALID",
+                    "Universe Conductor resume does not accept a project selector",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            prepared = self.prepare_conductor_session(options)
+            return {
+                "schema": SESSION_RESUME_RESULT_SCHEMA,
+                "status": "SESSION_RESUME_COMPLETED",
+                "action_id": SESSION_RESUME_ACTION_ID,
+                "target": target,
+                "session_connection": prepared,
+                "prepared": prepared,
+            }
+
+        project_id = _project_id(action.get("project_id"))
+        prepared = self.prepare_project_master_session(project_id, options)
+        connection = (
+            prepared.get("session_connection")
+            if isinstance(prepared, Mapping)
+            else prepared
+        )
+        return {
+            "schema": SESSION_RESUME_RESULT_SCHEMA,
+            "status": "SESSION_RESUME_COMPLETED",
+            "action_id": SESSION_RESUME_ACTION_ID,
+            "target": target,
+            "project_id": project_id,
+            "session_connection": connection,
+            "prepared": prepared,
+        }
 
     def _handle_feature_goal_start_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]

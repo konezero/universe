@@ -153,18 +153,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn(".xterm-helper-textarea", CSS)
         self.assertIn("async function stopTerminalSession(terminalId)", TERM)
         self.assertIn('method: "DELETE"', TERM)
-        self.assertIn("sessionProvider !== provider", TERM)
-        self.assertIn('stripped.startsWith("term_")', TERM)
         self.assertIn("item.provider === provider", TERM)
         self.assertIn("const tab = created.terminal || created;", TERM)
         self.assertNotIn("const session = created.terminal || created;", TERM)
-        self.assertIn("resume_session_ref", TERM)
         self.assertIn("pty_binding_anchor_ref", TERM)
         self.assertIn("supervisor_session_id", TERM)
         self.assertIn("function terminalSupervisorSessionId(session)", TERM)
         supervisor_slice = TERM[
             TERM.index("function terminalSupervisorSessionId") : TERM.index(
-                "function terminalResumeRef"
+                "async function createTerminalTab"
             )
         ]
         self.assertIn("state.supervisorSessions", supervisor_slice)
@@ -177,16 +174,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertIn(
-            "supervisor_session_id: terminalSupervisorSessionId(session)",
+            'target: "CLI_TERMINAL"',
             create_slice,
         )
-        resume_slice = TERM[
-            TERM.index("function terminalResumeRef") : TERM.index(
-                "async function createTerminalTab"
-            )
-        ]
-        self.assertNotIn("session.session_id", resume_slice)
-        self.assertNotIn("session.observer_session_ref", resume_slice)
+        self.assertIn('"session.new"', create_slice)
+        self.assertIn('"session.resume"', create_slice)
+        self.assertIn("invokeServerAction(actionId, request)", create_slice)
+        self.assertIn('target: "UNIVERSE_CONDUCTOR"', create_slice)
+        self.assertIn('target: "PROJECT_MASTER"', create_slice)
+        self.assertNotIn("resume_session_ref", create_slice)
         self.assertIn("createTerminalTab(coordinate, session)", APP)
         mobile_session_nav = APP[
             APP.index('elements.mobileWorkTabs?.addEventListener("click"') : APP.index(
@@ -570,7 +566,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('"Start new session"', connection_slice)
         self.assertIn('sessionAction = "RESUME"', APP)
         self.assertIn('connectSessionSummaryProviderModel("NEW")', APP)
-        self.assertIn("prepareBody.session_action = options.sessionAction", APP)
+        self.assertIn('invokeServerAction("session.resume"', APP)
         self.assertIn(
             'const validSelected = selected && models.includes(selected) ? selected : ""',
             APP,
@@ -578,7 +574,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
 
     def test_conductor_session_uses_the_same_lazy_prepare_attach_route(self) -> None:
         self.assertIn('async function callUniverseConductor(options = {})', APP)
-        self.assertIn('"/v1/conductor-session/prepare"', APP)
+        self.assertIn('target: "UNIVERSE_CONDUCTOR"', APP)
         self.assertIn("async function attachSelectedConductorSession(session)", APP)
         activate_slice = APP[
             APP.index("async function activateAnchorSession") : APP.index(

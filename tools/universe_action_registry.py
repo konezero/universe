@@ -55,6 +55,22 @@ LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE = (
     "/v1/projects/{project_id}/memory-batches/run"
 )
 
+SESSION_NEW_ACTION_ID = "session.new"
+SESSION_NEW_REQUEST_SCHEMA = "universe.session-new-action-request.v1"
+SESSION_NEW_RESULT_SCHEMA = "universe.session-new-receipt.v1"
+SESSION_NEW_ACTION_SURFACE = "session.new"
+
+SESSION_RESUME_ACTION_ID = "session.resume"
+SESSION_RESUME_REQUEST_SCHEMA = "universe.session-resume-action-request.v1"
+SESSION_RESUME_RESULT_SCHEMA = "universe.session-resume-receipt.v1"
+SESSION_RESUME_ACTION_SURFACE = "session.resume"
+
+LEGACY_CLI_TERMINAL_HTTP_SURFACE = "/v1/terminals"
+LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE = "/v1/conductor-session/prepare"
+LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE = (
+    "/v1/projects/{project_id}/master-session/prepare"
+)
+
 SERVER_RESOLVED_CALLER_FIELDS = frozenset(
     {
         "actor",
@@ -434,6 +450,8 @@ def build_default_action_registry(
     rag_adopt_handler: ActionHandler | None = None,
     rag_record_decision_handler: ActionHandler | None = None,
     memory_batch_run_handler: ActionHandler | None = None,
+    session_new_handler: ActionHandler | None = None,
+    session_resume_handler: ActionHandler | None = None,
 ) -> ActionRegistry:
     """Build the currently modeled mutating surface registry."""
 
@@ -488,6 +506,41 @@ def build_default_action_registry(
         surfaces=(MEMORY_BATCH_RUN_ACTION_SURFACE,),
     )
     registry.register_legacy_surface(LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE)
+    registry.register(
+        ActionContract(
+            action_id=SESSION_NEW_ACTION_ID,
+            request_schema_ref=SESSION_NEW_REQUEST_SCHEMA,
+            result_schema_ref=SESSION_NEW_RESULT_SCHEMA,
+            side_effect_class="SESSION_LIFECYCLE_MUTATION",
+            metadata={
+                "target_resolution": "SERVER_SIDE",
+                "targets": ["PROJECT_MASTER", "UNIVERSE_CONDUCTOR"],
+            },
+        ),
+        session_new_handler,
+        surfaces=(SESSION_NEW_ACTION_SURFACE,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=SESSION_RESUME_ACTION_ID,
+            request_schema_ref=SESSION_RESUME_REQUEST_SCHEMA,
+            result_schema_ref=SESSION_RESUME_RESULT_SCHEMA,
+            side_effect_class="SESSION_LIFECYCLE_MUTATION",
+            metadata={
+                "target_resolution": "SERVER_SIDE",
+                "targets": [
+                    "CLI_TERMINAL",
+                    "PROJECT_MASTER",
+                    "UNIVERSE_CONDUCTOR",
+                ],
+            },
+        ),
+        session_resume_handler,
+        surfaces=(SESSION_RESUME_ACTION_SURFACE,),
+    )
+    registry.register_legacy_surface(LEGACY_CLI_TERMINAL_HTTP_SURFACE)
+    registry.register_legacy_surface(LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE)
+    registry.register_legacy_surface(LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE)
     return registry
 
 
@@ -511,9 +564,12 @@ __all__ = [
     "FEATURE_GOAL_START_REQUEST_SCHEMA",
     "FEATURE_GOAL_START_RESULT_SCHEMA",
     "LEGACY_DIRECT",
+    "LEGACY_CLI_TERMINAL_HTTP_SURFACE",
+    "LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE",
     "LEGACY_FEATURE_GOAL_START_HTTP_SURFACE",
     "LEGACY_FEATURE_GOAL_START_STORE_SURFACE",
     "LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE",
+    "LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE",
     "MEMORY_BATCH_RUN_ACTION_ID",
     "MEMORY_BATCH_RUN_ACTION_SURFACE",
     "MEMORY_BATCH_RUN_REQUEST_SCHEMA",
@@ -526,6 +582,14 @@ __all__ = [
     "RAG_RECORD_DECISION_ACTION_SURFACE",
     "RAG_RECORD_DECISION_REQUEST_SCHEMA",
     "RAG_RECORD_DECISION_RESULT_SCHEMA",
+    "SESSION_NEW_ACTION_ID",
+    "SESSION_NEW_ACTION_SURFACE",
+    "SESSION_NEW_REQUEST_SCHEMA",
+    "SESSION_NEW_RESULT_SCHEMA",
+    "SESSION_RESUME_ACTION_ID",
+    "SESSION_RESUME_ACTION_SURFACE",
+    "SESSION_RESUME_REQUEST_SCHEMA",
+    "SESSION_RESUME_RESULT_SCHEMA",
     "RegisteredAction",
     "SERVER_RESOLVED_CALLER_FIELDS",
     "UNCOVERED",

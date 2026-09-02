@@ -4786,11 +4786,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 script,
             )
             self.assertIn("/v1/settings/provider-models", script)
-            self.assertIn("/master-session/prepare", script)
-            self.assertIn("/v1/conductor-session/prepare", script)
-            self.assertIn("prepareBody.project_id", script)
-            self.assertIn("prepareBody.cwd", script)
-            self.assertIn("prepareBody.requested_mode", script)
+            self.assertIn("/v1/actions", script)
+            self.assertIn('invokeServerAction("session.resume"', script)
+            self.assertIn('target: "PROJECT_MASTER"', script)
+            self.assertIn('target: "UNIVERSE_CONDUCTOR"', script)
+            self.assertNotIn("prepareBody.project_id", script)
+            self.assertNotIn("prepareBody.cwd", script)
+            self.assertNotIn("prepareBody.requested_mode", script)
             self.assertIn('state.modeContract?.mode === "CONDUCTOR"', script)
             self.assertIn("sessionConnectionText", script)
             self.assertIn("/v1/supervisor/sessions", script)
@@ -5348,6 +5350,147 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 },
             )
         self.assertEqual("SESSION_CWD_MISMATCH", raised.exception.code)
+
+    def test_session_new_action_resolves_project_coordinates_server_side(self) -> None:
+        self.server.store.register_project(self.registration())
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_action_new",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+
+        status, result = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "session.new",
+                "request": {
+                    "target": "PROJECT_MASTER",
+                    "project_id": "GCS",
+                    "provider": "CODEX",
+                    "model_ref": "",
+                    "effort": "AUTO",
+                },
+            },
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertEqual("SESSION_NEW_COMPLETED", result["status"])
+        self.assertEqual("session.new", result["action_id"])
+        self.assertEqual("term_action_new", result["terminal"]["terminal_id"])
+        call = terminal_host.create.call_args.kwargs
+        self.assertEqual("GCS", call["project_id"])
+        self.assertEqual("MASTER", call["mode"])
+        self.assertEqual(str(self.project_root), call["cwd"])
+        self.assertEqual("CODEX", call["provider"])
+
+    def test_session_new_action_resolves_conductor_coordinates_server_side(self) -> None:
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_action_new_conductor",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+
+        result = self.server.execute_action(
+            "session.new",
+            {"target": "UNIVERSE_CONDUCTOR", "provider": "CODEX"},
+            source="TEST",
+        )
+
+        self.assertEqual("SESSION_NEW_COMPLETED", result["status"])
+        self.assertEqual("term_action_new_conductor", result["terminal"]["terminal_id"])
+        call = terminal_host.create.call_args.kwargs
+        self.assertEqual("universe", call["project_id"])
+        self.assertEqual("CONDUCTOR", call["mode"])
+        self.assertEqual(str(ROOT), call["cwd"])
+        self.assertEqual("CODEX", call["provider"])
+
+    def test_session_resume_action_resolves_supervisor_coordinate(self) -> None:
+        self.server.store.register_project(self.registration())
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_action_resume",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:vendor-thread-action",
+                "state": "DISCONNECTED",
+                "currentness": "CURRENT",
+            }
+        )
+        terminal_host = Mock()
+        terminal_host.find_live.return_value = None
+        terminal_host.create.return_value = {
+            "terminal_id": "term_action_resume",
+            "state": "LIVE",
+        }
+        self.server.terminal_host = terminal_host
+
+        result = self.server.execute_action(
+            "session.resume",
+            {
+                "target": "CLI_TERMINAL",
+                "supervisor_session_id": supervised["session_id"],
+                "provider": "CODEX",
+            },
+            source="TEST",
+        )
+
+        self.assertEqual("SESSION_RESUME_COMPLETED", result["status"])
+        self.assertEqual("session.resume", result["action_id"])
+        self.assertEqual("term_action_resume", result["terminal"]["terminal_id"])
+        call = terminal_host.create.call_args.kwargs
+        self.assertEqual("GCS", call["project_id"])
+        self.assertEqual("MASTER", call["mode"])
+        self.assertEqual("vendor-thread-action", call["resume_session_ref"])
+
+    def test_session_resume_action_routes_project_master_prepare(self) -> None:
+        prepared = {
+            "schema": "universe.project-master-session-prepared.v1",
+            "session_connection": {"connection_state": "READY"},
+        }
+        with patch.object(
+            self.server,
+            "prepare_project_master_session",
+            return_value=prepared,
+        ) as prepare:
+            result = self.server.execute_action(
+                "session.resume",
+                {
+                    "target": "PROJECT_MASTER",
+                    "project_id": "GCS",
+                    "provider": "CODEX",
+                    "model_ref": "provider://CODEX/model/test",
+                    "effort": "MAX",
+                },
+                source="TEST",
+            )
+
+        self.assertEqual("SESSION_RESUME_COMPLETED", result["status"])
+        self.assertEqual({"connection_state": "READY"}, result["session_connection"])
+        prepare.assert_called_once_with(
+            "GCS",
+            {
+                "provider": "CODEX",
+                "model_ref": "provider://CODEX/model/test",
+                "effort": "MAX",
+            },
+        )
+
+    def test_session_resume_action_requires_a_server_owned_terminal_selector(self) -> None:
+        with self.assertRaises(UniverseError) as raised:
+            self.server.execute_action(
+                "session.resume",
+                {"target": "CLI_TERMINAL"},
+                source="TEST",
+            )
+        self.assertEqual("SESSION_RESUME_SELECTOR_REQUIRED", raised.exception.code)
 
     def test_cli_terminal_resolves_vendor_ref_from_supervisor_session(self) -> None:
         supervised, _ = self.server.session_supervisor.register_session(

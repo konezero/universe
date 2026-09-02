@@ -32,7 +32,7 @@ Distribution Manifest: `.ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json`
 Validation: `.ai/runtime/project_instance/validation/latest.md`
 
 Mutation Entry: `.ai/skills/common/execution-guard/SKILL.md`
-Mutation Rule: Guard before project-owned / source / external mutation; Runtime-owned state, HOST_STATE_PROJECTION, handoff, and continuity flush use the Guard exception list
+Mutation Rule: Execution Guard before guarded project-owned / source / external mutation; first-class governed knowledge Actions use their validated Action Gateway; Runtime-owned state, HOST_STATE_PROJECTION, handoff, and continuity flush use their declared exception routes
 Host State Projection: `.ai/skills/common/host-state-projection/SKILL.md`
 Exact Text Edit Entry: `.ai/skills/common/receipt-aware-text-edit/SKILL.md`
 

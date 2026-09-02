@@ -26,6 +26,12 @@ from universe_action_registry import (  # noqa: E402
     RAG_RECORD_DECISION_ACTION_ID,
     RAG_RECORD_DECISION_REQUEST_SCHEMA,
     RAG_RECORD_DECISION_RESULT_SCHEMA,
+    SESSION_NEW_ACTION_ID,
+    SESSION_NEW_REQUEST_SCHEMA,
+    SESSION_NEW_RESULT_SCHEMA,
+    SESSION_RESUME_ACTION_ID,
+    SESSION_RESUME_REQUEST_SCHEMA,
+    SESSION_RESUME_RESULT_SCHEMA,
     UnknownActionError,
     build_default_action_registry,
     derive_idempotency_key,
@@ -92,6 +98,8 @@ class UniverseActionRegistryTests(unittest.TestCase):
             COVERED, registry.classify_surface(RAG_RECORD_DECISION_ACTION_ID)
         )
         self.assertEqual(COVERED, registry.classify_surface(MEMORY_BATCH_RUN_ACTION_ID))
+        self.assertEqual(COVERED, registry.classify_surface(SESSION_NEW_ACTION_ID))
+        self.assertEqual(COVERED, registry.classify_surface(SESSION_RESUME_ACTION_ID))
         self.assertEqual(LEGACY_DIRECT, registry.classify_surface("UniverseStore.start_feature_goal"))
         self.assertEqual(
             LEGACY_DIRECT,
@@ -107,6 +115,8 @@ class UniverseActionRegistryTests(unittest.TestCase):
         self.assertIn(RAG_ADOPT_ACTION_ID, report["registered_action_ids"])
         self.assertIn(RAG_RECORD_DECISION_ACTION_ID, report["registered_action_ids"])
         self.assertIn(MEMORY_BATCH_RUN_ACTION_ID, report["registered_action_ids"])
+        self.assertIn(SESSION_NEW_ACTION_ID, report["registered_action_ids"])
+        self.assertIn(SESSION_RESUME_ACTION_ID, report["registered_action_ids"])
         self.assertEqual(coverage, registry.coverage_classification())
         self.assertEqual(
             "universe.feature-goal-start-receipt.v1",
@@ -136,6 +146,22 @@ class UniverseActionRegistryTests(unittest.TestCase):
         self.assertEqual(
             MEMORY_BATCH_RUN_RESULT_SCHEMA,
             memory_batch_contract.result_schema_ref,
+        )
+        session_new_contract = build_default_action_registry().lookup(
+            SESSION_NEW_ACTION_ID
+        )
+        self.assertEqual(
+            SESSION_NEW_REQUEST_SCHEMA, session_new_contract.request_schema_ref
+        )
+        self.assertEqual(SESSION_NEW_RESULT_SCHEMA, session_new_contract.result_schema_ref)
+        session_resume_contract = build_default_action_registry().lookup(
+            SESSION_RESUME_ACTION_ID
+        )
+        self.assertEqual(
+            SESSION_RESUME_REQUEST_SCHEMA, session_resume_contract.request_schema_ref
+        )
+        self.assertEqual(
+            SESSION_RESUME_RESULT_SCHEMA, session_resume_contract.result_schema_ref
         )
         self.assertEqual(
             {"COVERED", "LEGACY_DIRECT", "UNCOVERED"},

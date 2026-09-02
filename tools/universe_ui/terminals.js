@@ -575,28 +575,7 @@ function terminalSupervisorSessionId(session) {
   );
   return supervised
     ? String(supervised.universe_session_id || supervised.session_id || "").trim()
-    : "";
-}
-
-function terminalResumeRef(coordinate, session) {
-  if (!session) return "";
-  const provider = terminalProviderFor(coordinate, session);
-  const raw = String(session.provider_session_id || "").trim();
-  const sessionProvider = String(session.provider || "").toUpperCase();
-  if (sessionProvider && sessionProvider !== "AUTO" && sessionProvider !== provider) return "";
-  if (/^grok-/i.test(raw) && provider !== "GROK") return "";
-  if (/^claude-/i.test(raw) && provider !== "CLAUDE") return "";
-  if (/^codex/i.test(raw) && provider !== "CODEX") return "";
-  const stripped = raw.replace(
-    /^(grok-acp:|grok-cli:|claude-code:|codex-app-server:|codex-app:|codex:|cli-terminal:)/i,
-    ""
-  );
-  if (!stripped || /^(UNKNOWN|UNASSIGNED|NONE)$/i.test(stripped)) return "";
-  if (/^[A-Z]+-CURRENT-/i.test(stripped)) return "";
-  if (stripped.startsWith("UNIVERSE-")) return "";
-  if (stripped.startsWith("term_")) return "";
-  if (stripped.startsWith("pty:")) return "";
-  return stripped;
+    : candidates[0] || "";
 }
 
 async function createTerminalTab(coordinate, session) {
@@ -607,21 +586,41 @@ async function createTerminalTab(coordinate, session) {
   if (!projectId || !cwd) {
     throw new Error("A registered project root is required to open a CLI tab");
   }
-  const created = await api("/v1/terminals", {
-    method: "POST",
-    body: {
-      project_id: projectId,
-      mode,
-      cwd,
-      provider: terminalProviderFor(coordinate, session),
-      model_ref: String(coordinate?.modelRef || coordinate?.model_ref || "").trim(),
-      effort: String(coordinate?.effort || "AUTO").toUpperCase(),
-      supervisor_session_id: terminalSupervisorSessionId(session),
-      pty_binding_anchor_ref: String(session?.session_anchor_ref || "").trim(),
-      host_session_ref: typeof hostSessionRef === "function" ? hostSessionRef(session) : "",
-      resume_session_ref: terminalResumeRef(coordinate, session),
-    },
-  });
+  const provider = terminalProviderFor(coordinate, session);
+  const modelRef = String(
+    coordinate?.modelRef || coordinate?.model_ref || ""
+  ).trim();
+  const effort = String(coordinate?.effort || "AUTO").toUpperCase();
+  const isResume = Boolean(session);
+  const actionId = isResume ? "session.resume" : "session.new";
+  const supervisorSessionId = terminalSupervisorSessionId(session);
+  const anchorRef = typeof sessionAnchorRef === "function"
+    ? sessionAnchorRef(session)
+    : String(session?.session_anchor_ref || "").trim();
+  const hostRef = typeof hostSessionRef === "function" ? hostSessionRef(session) : "";
+  const request = isResume
+    ? {
+        target: "CLI_TERMINAL",
+        provider,
+        supervisor_session_id: supervisorSessionId,
+        pty_binding_anchor_ref: anchorRef,
+        host_session_ref: hostRef,
+      }
+    : mode === "CONDUCTOR"
+      ? {
+          target: "UNIVERSE_CONDUCTOR",
+          provider,
+          model_ref: modelRef,
+          effort,
+        }
+      : {
+          target: "PROJECT_MASTER",
+          project_id: projectId,
+          provider,
+          model_ref: modelRef,
+          effort,
+        };
+  const created = await invokeServerAction(actionId, request);
   const tab = created.terminal || created;
   state.dismissedTerminalIds = state.dismissedTerminalIds || {};
   delete state.dismissedTerminalIds[tab.terminal_id];

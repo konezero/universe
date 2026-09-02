@@ -3574,26 +3574,6 @@ function returnToUniverseConductor() {
   showSessionSelection("");
 }
 
-function applyNewSessionCoordinates(
-  prepareBody,
-  options,
-  fallbackProjectId,
-  fallbackMode
-) {
-  if (options.sessionAction !== "NEW") return;
-  const projectId = String(options.projectId || fallbackProjectId || "").trim();
-  const cwd = String(options.cwd || "").trim();
-  const requestedMode = String(
-    options.requestedMode || fallbackMode || ""
-  ).trim().toUpperCase();
-  if (!projectId || !cwd || !requestedMode) {
-    throw new Error("New sessions require project, cwd, and Mode coordinates");
-  }
-  prepareBody.project_id = projectId;
-  prepareBody.cwd = cwd;
-  prepareBody.requested_mode = requestedMode;
-}
-
 function preparedSupervisorSession({ mode, projectId = "", connection = {}, anchorKey = "" }) {
   const normalizedMode = String(mode || "").toUpperCase();
   const normalizedProject = String(projectId || "").toLowerCase();
@@ -3649,27 +3629,15 @@ async function openPreparedProviderSession({ mode, projectId = "", connection = 
 
 async function callUniverseConductor(options = {}) {
   closeComposerActionMenu();
-  const prepareBody = {};
-  if (options.provider) prepareBody.provider = options.provider;
+  const actionRequest = { target: "UNIVERSE_CONDUCTOR" };
+  if (options.provider) actionRequest.provider = options.provider;
   if (Object.prototype.hasOwnProperty.call(options, "modelRef")) {
-    prepareBody.model_ref = options.modelRef || "";
+    actionRequest.model_ref = options.modelRef || "";
   }
   if (Object.prototype.hasOwnProperty.call(options, "effort")) {
-    prepareBody.effort = options.effort || "AUTO";
+    actionRequest.effort = options.effort || "AUTO";
   }
-  if (options.sessionAction) {
-    prepareBody.session_action = options.sessionAction;
-  }
-  applyNewSessionCoordinates(
-    prepareBody,
-    options,
-    options.projectId,
-    "CONDUCTOR"
-  );
-  const prepared = await api("/v1/conductor-session/prepare", {
-    method: "POST",
-    body: prepareBody,
-  });
+  const prepared = await invokeServerAction("session.resume", actionRequest);
   const connection = prepared.session_connection || {};
   if (connection.error_code) {
     throw new Error(connection.reason || connection.error_code);
@@ -3709,30 +3677,18 @@ async function callProjectMaster(projectId, options = {}) {
   if (state.selectedProject?.project_id !== projectId) {
     await selectProject(projectId);
   }
-  const prepareBody = {};
-  if (options.provider) prepareBody.provider = options.provider;
+  const actionRequest = {
+    target: "PROJECT_MASTER",
+    project_id: projectId,
+  };
+  if (options.provider) actionRequest.provider = options.provider;
   if (Object.prototype.hasOwnProperty.call(options, "modelRef")) {
-    prepareBody.model_ref = options.modelRef || "";
+    actionRequest.model_ref = options.modelRef || "";
   }
   if (Object.prototype.hasOwnProperty.call(options, "effort")) {
-    prepareBody.effort = options.effort || "AUTO";
+    actionRequest.effort = options.effort || "AUTO";
   }
-  if (options.sessionAction) {
-    prepareBody.session_action = options.sessionAction;
-  }
-  applyNewSessionCoordinates(
-    prepareBody,
-    options,
-    projectId,
-    "MASTER"
-  );
-  const prepared = await api(
-    `/v1/projects/${encodeURIComponent(projectId)}/master-session/prepare`,
-    {
-      method: "POST",
-      body: prepareBody,
-    }
-  );
+  const prepared = await invokeServerAction("session.resume", actionRequest);
   const connection = prepared.session_connection || {};
   if (
     options.expectedProvider &&
