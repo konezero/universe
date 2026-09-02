@@ -15463,6 +15463,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual("NONE", projection["effects"]["project_source_write"])
 
+        # Unified node graph model: additive fields on the projection.
+        self.assertIsInstance(projection["unified_graph"], dict)
+        unified_ids = {
+            node["node_id"] for node in projection["unified_graph"]["nodes"]
+        }
+        self.assertIn("broker-client", unified_ids)
+        self.assertIn("strategy-viewer", unified_ids)
+        self.assertEqual(
+            {"galaxy", "functional", "structural", "flow", "knowledge", "kanban"},
+            {view["view"] for view in projection["views"]},
+        )
+
         status, fetched = self.request(
             "GET", "/v1/projects/GCS/projection", token=self.token
         )

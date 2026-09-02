@@ -78,6 +78,7 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from universe_node_graph import compute_views, unify_seed_graph
 from project_work_model import (
     WORK_SURFACE_SCHEMA,
     backfill_template_instances,
@@ -5006,6 +5007,25 @@ def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
                     "selection_state": "USER_SELECTION_REQUIRED",
                 }
             )
+    # Unified node graph model (docs/universe-unified-node-graph-model.md).
+    # Additive and best-effort: a seed shape that does not unify must not break
+    # the projection. DECISION / MEMORY knowledge nodes are grafted at read
+    # time, not here; DOCUMENT nodes are seed-derived and safe to include.
+    try:
+        unified_graph = unify_seed_graph(seed)
+        from universe_node_graph import document_graph as _document_graph
+
+        _structural_ids = {node["node_id"] for node in unified_graph["nodes"]}
+        _doc_graph = _document_graph(seed.get("documents", []), _structural_ids)
+        unified_graph["nodes"].extend(_doc_graph["nodes"])
+        unified_graph["edges"].extend(_doc_graph["edges"])
+        projection_views = compute_views(
+            unified_graph["nodes"], unified_graph["edges"]
+        )
+    except Exception:  # noqa: BLE001 - projection must not fail on graph shape
+        unified_graph = None
+        projection_views = []
+
     material = {
         "schema": PROJECT_PROJECTION_SCHEMA,
         "project_id": seed["project_id"],
@@ -5018,6 +5038,8 @@ def build_projection(seed: dict[str, Any]) -> dict[str, Any]:
         "implementation": seed.get("implementation", {"nodes": []}),
         "implementation_bindings": seed.get("implementation_bindings", []),
         "documents": seed["documents"],
+        "unified_graph": unified_graph,
+        "views": projection_views,
         "missing_connections": missing_connections,
         "predicted_paths": predicted_paths,
         "effects": {

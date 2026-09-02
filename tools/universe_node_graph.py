@@ -99,9 +99,21 @@ def _kind(value: Any) -> str:
     return _text(value).upper().replace(" ", "_")
 
 
-def _map_functional_kind(raw: Any) -> str:
+def _map_functional_kind(raw: Any) -> tuple[str, str | None]:
+    """Map a functional-graph node kind to (unified kind, optional role).
+
+    A seed may already be flat (GCS records ``SERVICE`` as a node kind rather
+    than in a separate implementation graph), so an implementation kind seen
+    here still maps to COMPONENT / STRUCTURE. An unrecognised kind passes
+    through unchanged and simply lands in no View.
+    """
+
     kind = _kind(raw)
-    return _FUNCTIONAL_KIND_MAP.get(kind, kind or "CAPABILITY")
+    if kind in _FUNCTIONAL_KIND_MAP:
+        return (_FUNCTIONAL_KIND_MAP[kind], None)
+    if kind in _IMPLEMENTATION_KIND_MAP:
+        return _IMPLEMENTATION_KIND_MAP[kind]
+    return (kind or "CAPABILITY", None)
 
 
 def _map_implementation_kind(raw: Any) -> tuple[str, str | None]:
@@ -149,13 +161,16 @@ def unify_seed_graph(seed: Mapping[str, Any]) -> dict[str, Any]:
         node_id = _text(raw.get("node_id"))
         if not node_id:
             raise NodeGraphError(f"nodes[{index}] has no node_id")
+        kind, role = _map_functional_kind(raw.get("kind"))
         node: dict[str, Any] = {
             "node_id": node_id,
-            "kind": _map_functional_kind(raw.get("kind")),
+            "kind": kind,
             "state": _node_state(raw.get("state")),
             "title": _text(raw.get("title")) or node_id,
             "refs": list(raw.get("refs") or []),
         }
+        if role:
+            node["structure_role" if kind == "STRUCTURE" else "component_role"] = role
         if _text(raw.get("summary")):
             node["summary"] = _text(raw.get("summary"))
         if isinstance(raw.get("layout"), Mapping):

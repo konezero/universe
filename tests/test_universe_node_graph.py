@@ -145,6 +145,26 @@ class UnifySeedGraphTests(unittest.TestCase):
         self.assertEqual(node["state"], "PROPOSED")
         self.assertEqual(node["expected_path_ref"], "ep_1")
 
+    def test_flat_seed_with_implementation_kind_as_node_kind(self):
+        # GCS records SERVICE directly as a node kind, no implementation graph.
+        seed = {
+            "nodes": [
+                {"node_id": "market-data", "kind": "SERVICE", "title": "Market",
+                 "refs": []},
+                {"node_id": "domain", "kind": "DOMAIN", "title": "Domain", "refs": []},
+            ],
+            "edges": [
+                {"edge_id": "x", "from_node": "market-data", "to_node": "domain",
+                 "kind": "FEEDS"},
+            ],
+        }
+        graph = unify_seed_graph(seed)
+        by_id = {n["node_id"]: n for n in graph["nodes"]}
+        self.assertEqual(by_id["market-data"]["kind"], "COMPONENT")
+        self.assertEqual(by_id["market-data"]["component_role"], "service")
+        self.assertEqual(by_id["domain"]["kind"], "DOMAIN")  # unknown passes through
+        self.assertEqual(graph["edges"][0]["relation"], "FEEDS")
+
     def test_real_universe_assets_unify(self):
         asset_root = ROOT / ".ai" / "universe"
         if not (asset_root / "functional-graph.json").is_file():
