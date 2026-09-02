@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import quote, urlsplit
 
-from universe_host_state import is_universe_managed_host
+# This module is invoked as `python -m tools.universe_session_inject_hook` from
+# the repo root, where sibling tools/ modules are not importable by default.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from universe_host_state import is_universe_managed_host  # noqa: E402
 
 HOOK_SCHEMA = "universe.session-inject-hook.v1"
 PROVIDERS = frozenset({"CLAUDE", "CODEX", "GROK"})
