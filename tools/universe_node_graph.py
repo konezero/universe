@@ -181,7 +181,7 @@ def unify_seed_graph(seed: Mapping[str, Any]) -> dict[str, Any]:
             node["expected_path_ref"] = _text(raw.get("expected_path_ref"))
         _add(node)
 
-    for index, raw in enumerate(_seq(seed.get("implementation_nodes"))):
+    for index, raw in enumerate(_implementation_nodes(seed)):
         if not isinstance(raw, Mapping):
             raise NodeGraphError(f"implementation_nodes[{index}] is not an object")
         node_id = _text(raw.get("implementation_id")) or _text(raw.get("node_id"))
@@ -266,6 +266,22 @@ def unify_seed_graph(seed: Mapping[str, Any]) -> dict[str, Any]:
 def _node_state(value: Any) -> str:
     state = _text(value).upper()
     return state if state in NODE_STATES else "ADOPTED"
+
+
+def _implementation_nodes(seed: Mapping[str, Any]) -> list[Any]:
+    """The implementation node list, however the seed carries it.
+
+    ``load_project_seed_assets`` returns ``implementation_nodes`` (a list); the
+    stored / normalized seed carries ``implementation`` (``{"nodes": [...]}``).
+    """
+
+    direct = seed.get("implementation_nodes")
+    if direct is not None:
+        return _seq(direct)
+    nested = seed.get("implementation")
+    if isinstance(nested, Mapping):
+        return _seq(nested.get("nodes"))
+    return []
 
 
 def document_graph(

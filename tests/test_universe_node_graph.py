@@ -121,6 +121,17 @@ class UnifySeedGraphTests(unittest.TestCase):
         graph = unify_seed_graph(seed)
         self.assertEqual(graph["edges"][0]["edge_id"], "structure-enables-sessions")
 
+    def test_implementation_nodes_under_nested_implementation_key(self):
+        # The stored / normalized seed carries impl nodes as
+        # implementation={"nodes": [...]}, not implementation_nodes.
+        seed = _seed()
+        seed["implementation"] = {"nodes": seed.pop("implementation_nodes")}
+        graph = unify_seed_graph(seed)
+        by_id = {n["node_id"]: n for n in graph["nodes"]}
+        self.assertEqual(by_id["server"]["kind"], "COMPONENT")
+        binding = next(e for e in graph["edges"] if e["edge_id"] == "b1")
+        self.assertEqual(binding["from_node"], "server")
+
     def test_normalized_seed_shape_upper_case_kinds(self):
         seed = _seed(
             nodes=[{"node_id": "cap", "kind": "CAPABILITY", "title": "Cap", "refs": []}],
