@@ -249,13 +249,16 @@ them from the RAG store and grafts them onto the graph by their `node_ref`.
 
 ### Code
 
-| file | change |
-|---|---|
-| `tools/project_seed_assets.py` | `load_project_seed_assets` reads `node-graph.json` → one `nodes` / `edges` list. Compat shim up-converts an old 3-file seed (GCS) in memory on read, so callers only ever see the unified shape. |
-| `tools/universe_server.py` `build_projection` (~:4958) | consume unified `nodes` / `edges`; graft RAG knowledge nodes; compute `node.rollup`; emit `views[]` including `galaxy` with ship overlay. |
-| `tools/universe_server.py` node kind constants (~:581–599) | unified `kind` enum for seed graphs (network-anchor `NODE_KINDS` stays separate). |
-| projection schema `universe.project-projection.v1` | add `views`, `node_kinds`, `rollup`, `ships`. |
-| Work Item stores | ensure `owner_node_ref` on goal / milestone / todo / task frame; default to the `universe` root node during migration. |
+| file | change | status |
+|---|---|---|
+| `tools/universe_node_graph.py` | **new, pure, no I/O.** `unify_seed_graph(seed)` merges the split functional / implementation / bindings shape into one `universe.node-graph.v1` graph; `document_graph(documents, node_ids)` turns the catalogue into DOCUMENT nodes + edges; `compute_views(nodes, edges)` projects the six Views. `tests/test_universe_node_graph.py` (21 cases, incl. the real `.ai/universe/*.json`). | **landed 2026-09-02** |
+| `tools/project_seed_assets.py` | `load_project_seed_assets` reads `node-graph.json` → one `nodes` / `edges` list. Compat shim up-converts an old 3-file seed (GCS) in memory on read, so callers only ever see the unified shape. | todo |
+| `tools/universe_server.py` `build_projection` (~:5009 `material`) | call `unify_seed_graph` + `compute_views`; add `unified_graph` + `views` to `material`. Additive; keeps `missing_connections` / `predicted_paths`. NOTE: `material` is hashed into `projection_digest`, so adding fields makes the next `sync` retire GCS's current projection and store a new one (non-destructive, versioned). | todo |
+| `tools/universe_server.py` `build_projection` (~:5018) | today reads `seed.get("implementation", {"nodes": []})` but `normalize_project_seed` / `load_project_seed_assets` emit the key `implementation_nodes` — so implementation nodes are **currently dropped from every projection**. `unify_seed_graph` reads `implementation_nodes`; fixing the old read is part of the wiring. | todo |
+| `tools/universe_server.py` `normalize_project_seed` (~:3904) | `_exact_object_fields` strictly rejects unknown keys. Node required = `{node_id, kind, title, refs}`, optional `{summary}`. To author `state` / `parent_ref` / `layout` / `expected_path_ref` in the seed, add them to the optional set; edges likewise (`relation` alongside `kind`). | todo |
+| knowledge grafting | DECISION / MEMORY nodes come from the RAG store and change over time, so they must be grafted at projection **read** time (`get_project_projection` / the route), not baked into the stored `projection_json`. | todo |
+| projection schema `universe.project-projection.v1` | add `unified_graph`, `views`, `node_rollup`, `ships`. | todo |
+| Work Item stores | ensure `owner_node_ref` on goal / milestone / todo / task frame; default to the `universe` root node during migration. | todo |
 
 ### Data
 
