@@ -275,18 +275,27 @@ them from the RAG store and grafts them onto the graph by their `node_ref`.
    projection, defensive (`null` / `[]` on a shape that will not unify). GCS
    projection keeps working; its non-standard kinds (DOMAIN / RUNTIME) land in
    no View, SERVICE maps to COMPONENT.
-3. ⏳ `tools/project_seed_assets.py` — unified `node-graph.json` loader + GCS
-   compat shim; then author `.ai/universe/node-graph.json` from current docs +
-   code. (`.ai/` is a managed overlay, not version-controlled.)
-4. ⏳ `POST /v1/projects/universe/sync` → seed + projection.
-5. ⏳ Read-time graft of DECISION / MEMORY nodes from the RAG store in
+3. ✅ Refreshed `.ai/universe/*.json` digests (kept the split format for now —
+   `unify_seed_graph` consumes it fine) and `POST /v1/projects/universe/sync`.
+   `universe` now has a live Project Seed + Projection: `unified_graph` = 25
+   nodes (2 CAPABILITY, 2 FLOW, 1 EXTERNAL_BOUNDARY, 1 STRUCTURE, 11 COMPONENT,
+   8 DOCUMENT), 27 edges, all six `views`. `missing_connections: 0`.
+   Fix `3658dd8`: `unify_seed_graph` reads impl nodes from either
+   `implementation_nodes` or the nested `implementation.nodes` shape.
+4. ⏳ Read-time graft of DECISION / MEMORY nodes from the RAG store in
    `get_project_projection`, and recompute the `knowledge` view.
+5. ⏳ Richer `.ai/universe/` seed — add PRODUCT / APP / SURFACE / FEATURE nodes
+   so the `galaxy` view (2 nodes today) is meaningful. Optionally the unified
+   on-disk `node-graph.json` loader + `project_seed_assets.py` GCS shim.
 6. ⏳ UI: Galaxy render consuming `projection.views` (planets + ships), then
    drill-in to knowledge + kanban.
-7. ⏳ Re-link the 50 memories; verify `propose-links` against real nodes.
+7. ⏳ Re-link the 51 memories (all on the synthetic root `universe`, which is
+   not a graph node) to real nodes; `propose-links` only proposes for UNLINKED.
 8. ⏳ Fresh dogfood pass: author docs → nodes → Feature Node → Goal → TODO →
    automation, watched on the Galaxy.
 
-Steps 3–5 touch `normalize_project_seed`'s strict `_exact_object_fields`
-validation, the on-disk asset format, and re-version GCS's stored projection —
-left for a supervised pass.
+Known gaps in the current Views: `galaxy` is thin (old seed has no
+PRODUCT/APP/FEATURE nodes); `structural` drops the IMPLEMENTS/SUPPORTS
+cross-edges (`compute_views` needs both endpoints selected — should pull the
+functional endpoint as an overlay). Steps 5–7 and any `normalize_project_seed`
+optional-field change are a supervised pass.
