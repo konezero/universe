@@ -1090,6 +1090,12 @@ def run_hook(
                     "provider": provider,
                     "session_id": session_ref,
                     "requested_mode": mode,
+                    "coordinates": {
+                        "session_location": str(env.get("UNIVERSE_SESSION_LOCATION") or "provider-standalone"),
+                        "commander_surface": str(env.get("UNIVERSE_COMMANDER_SURFACE") or "UNKNOWN"),
+                        "execution_surface": str(env.get("UNIVERSE_EXECUTION_SURFACE") or "UNKNOWN"),
+                        "repository_location": str(env.get("UNIVERSE_REPOSITORY_LOCATION") or repo_root),
+                    },
                 },
                 dict(env),
             )
