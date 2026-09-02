@@ -345,8 +345,8 @@ def document_graph(
 _VIEW_SPECS: dict[str, dict[str, Any]] = {
     "galaxy": {
         "zoom": "far",
-        "kinds": {"PRODUCT", "APP", "FEATURE", "CAPABILITY"},
-        "relations": {"CONTAINS", "ENABLES", "REALIZES"},
+        "kinds": {"PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY"},
+        "relations": {"CONTAINS", "ENABLES", "REALIZES", "INFORMS"},
         "include_proposed": True,
     },
     "functional": {
