@@ -268,13 +268,25 @@ them from the RAG store and grafts them onto the graph by their `node_ref`.
 
 ## 7. Sequence
 
-1. Accept this draft (adjust kinds / relations / view rules / the FEATURE↔CAPABILITY question).
-2. Land the schema + `build_projection` change with tests (behaviour-preserving
-   for GCS via the compat shim; `galaxy` / `knowledge` views new).
-3. Author `.ai/universe/node-graph.json` from current docs + code.
-4. `POST /v1/projects/universe/sync` → seed + projection.
-5. UI: Galaxy render consuming `projection.views.galaxy` (planets + ships), then
+1. ✅ Accept this draft. Open: FEATURE↔CAPABILITY merge (both kept for now).
+2. ✅ Pure logic landed — `tools/universe_node_graph.py` (`unify_seed_graph`,
+   `document_graph`, `compute_views`) + `tests/test_universe_node_graph.py`.
+2b. ✅ Wired into `build_projection` — additive `unified_graph` + `views` on the
+   projection, defensive (`null` / `[]` on a shape that will not unify). GCS
+   projection keeps working; its non-standard kinds (DOMAIN / RUNTIME) land in
+   no View, SERVICE maps to COMPONENT.
+3. ⏳ `tools/project_seed_assets.py` — unified `node-graph.json` loader + GCS
+   compat shim; then author `.ai/universe/node-graph.json` from current docs +
+   code. (`.ai/` is a managed overlay, not version-controlled.)
+4. ⏳ `POST /v1/projects/universe/sync` → seed + projection.
+5. ⏳ Read-time graft of DECISION / MEMORY nodes from the RAG store in
+   `get_project_projection`, and recompute the `knowledge` view.
+6. ⏳ UI: Galaxy render consuming `projection.views` (planets + ships), then
    drill-in to knowledge + kanban.
-6. Re-link memories; verify `propose-links` against real nodes.
-7. Fresh dogfood pass: author docs → nodes → Feature Node → Goal → TODO →
+7. ⏳ Re-link the 50 memories; verify `propose-links` against real nodes.
+8. ⏳ Fresh dogfood pass: author docs → nodes → Feature Node → Goal → TODO →
    automation, watched on the Galaxy.
+
+Steps 3–5 touch `normalize_project_seed`'s strict `_exact_object_fields`
+validation, the on-disk asset format, and re-version GCS's stored projection —
+left for a supervised pass.
