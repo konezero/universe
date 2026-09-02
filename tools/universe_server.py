@@ -23014,6 +23014,18 @@ class UniverseStore:
             )
         projection = json.loads(row["projection_json"])
         projection["built_at"] = row["built_at"]
+        # Graft DECISION / MEMORY knowledge nodes at read time (they change
+        # independently of the seed). Best-effort: a failure returns the stored
+        # projection unchanged.
+        try:
+            from universe_node_graph import graft_knowledge_nodes as _graft
+
+            memories = self.list_project_memories(
+                normalized, link_state="LINKED", limit=500
+            )
+            projection = _graft(projection, memories)
+        except Exception:  # noqa: BLE001 - projection read must not fail
+            pass
         return projection
 
     def create_document_incorporation_proposal(

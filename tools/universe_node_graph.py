@@ -401,6 +401,90 @@ _VIEW_SPECS: dict[str, dict[str, Any]] = {
 VIEW_NAMES: tuple[str, ...] = tuple(_VIEW_SPECS)
 
 
+def graft_knowledge_nodes(
+    projection: Mapping[str, Any],
+    memories: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Add DECISION / MEMORY nodes from the RAG store to a stored projection.
+
+    Knowledge memories change over time, so they are grafted at projection read
+    time, not baked into ``projection_json``. Returns a shallow copy with an
+    enriched ``unified_graph``, recomputed ``views``, and a ``knowledge_grafted``
+    summary. A memory whose ``node_ref`` names a real graph node gets an
+    ``INFORMS`` edge; the rest float (until re-linked).
+    """
+
+    result = dict(projection)
+    unified = projection.get("unified_graph")
+    if not isinstance(unified, Mapping):
+        result["knowledge_grafted"] = {"decisions": 0, "memories": 0, "linked": 0}
+        return result
+
+    base_nodes = list(unified.get("nodes") or [])
+    base_edges = list(unified.get("edges") or [])
+    node_ids = {n.get("node_id") for n in base_nodes}
+
+    add_nodes: list[dict[str, Any]] = []
+    add_edges: list[dict[str, Any]] = []
+    decisions = memory_count = linked = 0
+    for raw in memories or []:
+        memory_id = _text(raw.get("memory_id"))
+        if not memory_id:
+            continue
+        node_id = f"mem:{memory_id}"
+        if node_id in node_ids:
+            continue
+        node_ids.add(node_id)
+        is_decision = _text(raw.get("state")).upper() == "DECISION_NOTE"
+        if is_decision:
+            decisions += 1
+        else:
+            memory_count += 1
+        add_nodes.append(
+            {
+                "node_id": node_id,
+                "kind": "DECISION" if is_decision else "MEMORY",
+                "state": "ADOPTED",
+                "title": _text(raw.get("title"))
+                or _text(raw.get("body"))[:60]
+                or memory_id,
+                "refs": [
+                    {
+                        "kind": "memory",
+                        "path": _text(raw.get("origin_ref")),
+                        "sha256": "",
+                    }
+                ],
+            }
+        )
+        target = _text(raw.get("node_ref"))
+        if target and target in node_ids and target != node_id:
+            linked += 1
+            add_edges.append(
+                {
+                    "edge_id": f"{node_id}-informs-{target}",
+                    "from_node": node_id,
+                    "to_node": target,
+                    "relation": "INFORMS",
+                }
+            )
+
+    new_nodes = base_nodes + add_nodes
+    new_edges = base_edges + add_edges
+    result["unified_graph"] = {
+        "schema": NODE_GRAPH_SCHEMA,
+        "nodes": new_nodes,
+        "edges": new_edges,
+    }
+    result["views"] = compute_views(new_nodes, new_edges)
+    result["knowledge_grafted"] = {
+        "decisions": decisions,
+        "memories": memory_count,
+        "linked": linked,
+    }
+    return result
+
+
 def compute_views(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],

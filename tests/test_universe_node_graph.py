@@ -13,6 +13,7 @@ from universe_node_graph import (  # noqa: E402
     VIEW_NAMES,
     compute_views,
     document_graph,
+    graft_knowledge_nodes,
     unify_seed_graph,
 )
 
@@ -280,6 +281,54 @@ class ComputeViewsTests(unittest.TestCase):
         knowledge = set(views["knowledge"]["node_ids"])
         self.assertIn("doc:spec", knowledge)
         self.assertIn("structure", knowledge)  # endpoint pulled in
+
+
+class GraftKnowledgeTests(unittest.TestCase):
+    def _projection(self):
+        graph = unify_seed_graph(_seed())
+        return {
+            "unified_graph": graph,
+            "views": compute_views(graph["nodes"], graph["edges"]),
+        }
+
+    def test_decision_and_memory_nodes_added_and_counted(self):
+        projection = self._projection()
+        memories = [
+            {"memory_id": "m1", "state": "DECISION_NOTE", "title": "D1",
+             "node_ref": "structure"},
+            {"memory_id": "m2", "state": "OBSERVED", "title": "O1",
+             "node_ref": "unknown-root"},
+        ]
+        out = graft_knowledge_nodes(projection, memories)
+        by_id = {n["node_id"]: n for n in out["unified_graph"]["nodes"]}
+        self.assertEqual(by_id["mem:m1"]["kind"], "DECISION")
+        self.assertEqual(by_id["mem:m2"]["kind"], "MEMORY")
+        self.assertEqual(out["knowledge_grafted"],
+                         {"decisions": 1, "memories": 1, "linked": 1})
+
+    def test_edge_only_when_node_ref_is_a_real_node(self):
+        projection = self._projection()
+        out = graft_knowledge_nodes(projection, [
+            {"memory_id": "m1", "state": "DECISION_NOTE", "node_ref": "structure"},
+            {"memory_id": "m2", "state": "OBSERVED", "node_ref": "universe"},
+        ])
+        froms = {e["from_node"] for e in out["unified_graph"]["edges"]}
+        self.assertIn("mem:m1", froms)
+        self.assertNotIn("mem:m2", froms)  # node_ref "universe" is not a graph node
+
+    def test_knowledge_view_includes_grafted_nodes(self):
+        projection = self._projection()
+        out = graft_knowledge_nodes(projection, [
+            {"memory_id": "m1", "state": "OBSERVED", "node_ref": "universe"},
+        ])
+        views = {v["view"]: v for v in out["views"]}
+        self.assertIn("mem:m1", views["knowledge"]["node_ids"])
+        self.assertNotIn("mem:m1", views["kanban"]["node_ids"])
+
+    def test_no_unified_graph_is_safe(self):
+        out = graft_knowledge_nodes({"views": []}, [{"memory_id": "m1"}])
+        self.assertEqual(out["knowledge_grafted"],
+                         {"decisions": 0, "memories": 0, "linked": 0})
 
 
 if __name__ == "__main__":
