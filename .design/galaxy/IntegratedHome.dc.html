@@ -96,7 +96,7 @@
     <!-- relation: project → nodes -->
     <div class="gap">
       <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
-        <path d="M0 40 L 30 60" stroke="#7fb0a7" stroke-width="1.8"/>
+        <path d="M0 40 H 15 V 60 H 30" stroke="#7fb0a7" stroke-width="1.8"/>
       </svg>
     </div>
 
@@ -145,9 +145,9 @@
     <!-- relation: selected node → its todos (selected todo bright) -->
     <div class="gap">
       <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
-        <path d="M0 70 L 30 40" stroke="#7fb0a7" stroke-width="1.8"/>
-        <path d="M0 70 L 30 150" stroke="#31333a" stroke-width="1.2"/>
-        <path d="M0 70 L 30 244" stroke="#31333a" stroke-width="1.2"/>
+        <path d="M0 70 H 15 V 40 H 30" stroke="#7fb0a7" stroke-width="1.8"/>
+        <path d="M0 70 H 15 V 150 H 30" stroke="#31333a" stroke-width="1.2"/>
+        <path d="M0 70 H 15 V 244 H 30" stroke="#31333a" stroke-width="1.2"/>
       </svg>
     </div>
 
@@ -196,7 +196,7 @@
     <!-- relation: selected todo → detail + kanban -->
     <div class="gap">
       <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
-        <path d="M0 40 L 30 120" stroke="#7fb0a7" stroke-width="1.8"/>
+        <path d="M0 40 H 15 V 120 H 30" stroke="#7fb0a7" stroke-width="1.8"/>
       </svg>
     </div>
 
@@ -293,20 +293,15 @@
           </div>
         </div>
 
-        <!-- relation: agent → work summary -->
-        <svg style="position:absolute;right:56px;top:148px;width:120px;height:200px;overflow:visible" fill="none" stroke="#7fb0a7" stroke-width="1.6">
-          <path d="M112 0 L 34 166"/>
-          <path d="M40 150 L 32 168 L 52 166"/>
-        </svg>
-
         <div style="flex:1"></div>
 
+        <!-- click an agent on a lane → its work summary appears here -->
         <div style="border:1px solid #43454c;border-radius:9px;background:#212327;padding:12px 14px">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
             <span class="dot" style="background:#6f9b78"></span>
             <span style="font-size:11px;font-weight:650;color:#7fb0a7">CODEX &middot; codex-r17</span>
             <span style="font-size:10px;color:#8a8a86">PTY live &middot; 4m</span>
-            <span style="margin-left:auto;font-size:10px;color:#8a8a86">작업내용 보기</span>
+            <span style="margin-left:auto;font-size:10px;color:#8a8a86">Action 정의 계약 &middot; Executing</span>
           </div>
           <div class="mono" style="font-size:10px;color:#a8a8a4;line-height:1.75">
             <div style="display:flex;gap:7px"><span style="color:#6f6f6b">&gt;</span> building Action IR registry&hellip;</div>
