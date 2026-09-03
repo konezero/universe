@@ -4674,7 +4674,8 @@ function renderHomeKanban(selNode, nodeTodos, selTodo) {
       lane.states.includes(String(t.state || "").toUpperCase())
     );
     for (const todo of laneTodos) {
-      const chip = node("div", "home-lane-todo", shortLabel(todo.title || todo.todo_id, 40));
+      const chip = node("div", "home-lane-todo", todo.title || todo.todo_id);
+      chip.title = todo.title || todo.todo_id;
       if (todo.todo_id === selTodo?.todo_id) chip.classList.add("sel");
       if (homeTodoBlocked(todo)) chip.classList.add("blocked");
       chip.style.cursor = "pointer";

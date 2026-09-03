@@ -7911,7 +7911,7 @@ body.home-mode #home-view { min-height: 100%; }
 }
 .home-add:hover { border-color: #6f6f6b; color: #a8a8a4; }
 
-.home-detail-kanban { flex: 1; display: flex; min-width: 480px; }
+.home-detail-kanban { flex: 1; display: flex; min-width: 620px; }
 .home-col-detail { border-right: 1px solid #26272c; }
 .home-todo-detail-grid {
   display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 7px 10px; font-size: 11px;
@@ -7942,6 +7942,7 @@ body.home-mode #home-view { min-height: 100%; }
 .home-lane-todo {
   font-size: 10px; font-weight: 600; padding: 4px 9px; border-radius: 6px;
   border: 1px solid #34363c; background: #212327; color: #a8a8a4;
+  max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .home-lane-todo.sel { border-color: #7fb0a7; background: rgba(111,155,147,0.1); color: #e6e6e4; }
 .home-lane-todo.blocked { border-color: #c26b5e; color: #e6e6e4; }
@@ -7961,4 +7962,14 @@ body.home-mode #home-view { min-height: 100%; }
 .home-work-summary-body {
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px;
   color: #a8a8a4; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+}
+
+/* Narrow viewports: stack the Todo detail above the Kanban so the whole
+   canvas needs less horizontal scroll. */
+@media (max-width: 1560px) {
+  .home-detail-kanban { flex-direction: column; min-width: 420px; }
+  .home-col-detail {
+    width: auto; border-right: 0; border-bottom: 1px solid #26272c;
+  }
+  .home-todo-detail-grid { grid-template-columns: 66px minmax(0, 1fr) 66px minmax(0, 1fr); }
 }
