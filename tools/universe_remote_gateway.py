@@ -522,26 +522,34 @@ poll();</script>
             return
         if result["state"] == "CONSUMED":
             secure = urlsplit(self.server.public_base_url).scheme == "https"
-            # The session token is also returned in the body so a cookie-less
-            # client can replay it as X-Universe-Session on later requests.
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "status": result["status"],
-                    "state": result["state"],
-                    "session_token": result["session_token"],
-                    "device_id": result["device_id"],
-                },
-                cookies=[
+            body: dict[str, Any] = {
+                "status": result.get("status", "REMOTE_PAIRING_CONSUMED"),
+                "state": "CONSUMED",
+            }
+            cookies: list[str] = []
+            # Only the poll that actually performs the consume carries a fresh
+            # session token. A later re-poll of an already-consumed pairing is
+            # idempotent: report CONSUMED, touch no cookies (clearing the
+            # pairing cookie again would strip the token a looping client still
+            # needs and turn the next poll into a 400).
+            session_token = result.get("session_token")
+            if session_token:
+                # Returned in the body too, so a cookie-less client can replay
+                # it as X-Universe-Session on later requests. The spent pairing
+                # cookie is left to age out on its own Max-Age rather than
+                # cleared here — a client still looping on /pair/status would
+                # otherwise lose its token mid-flight and 400 on the next poll.
+                body["session_token"] = session_token
+                body["device_id"] = result.get("device_id")
+                cookies = [
                     self._cookie(
                         SESSION_COOKIE,
-                        result["session_token"],
+                        session_token,
                         max_age=30 * 24 * 60 * 60,
                         secure=secure,
                     ),
-                    self._cookie(PAIRING_COOKIE, "", max_age=0, secure=secure),
-                ],
-            )
+                ]
+            self._send_json(HTTPStatus.OK, body, cookies=cookies)
             return
         self._send_json(
             HTTPStatus.OK, {"status": "REMOTE_PAIRING_STATUS", "state": result["state"]}

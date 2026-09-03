@@ -308,6 +308,17 @@ class RemoteGatewayTests(unittest.TestCase):
                 "REMOTE_BROWSER", response.headers["X-Universe-Access-Surface"]
             )
 
+        # A client still looping on /pair/status after the consuming poll must
+        # get a stable CONSUMED, not a crash or a 400 from a re-cleared token.
+        repoll = Request(
+            self.endpoint + f"/pair/status?id={pairing_id}",
+            headers={"X-Request-Token": request_token, "User-Agent": self.user_agent},
+        )
+        with urlopen(repoll, timeout=5) as response:
+            again = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(HTTPStatus.OK, response.status)
+        self.assertEqual("CONSUMED", again["state"])
+
     def test_pairing_status_without_a_token_is_a_named_client_error(self) -> None:
         invitation = self.store.create_pairing(
             public_base_url=self.endpoint, ttl_seconds=600
