@@ -35327,9 +35327,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         if rust_host_interactive and provider in {"CODEX", "GROK"}:
             try:
+                body_text = str(delivery["body_text"])
+                instruction_ref = str(delivery.get("instruction_ref") or "").strip()
+                if instruction_ref and not body_text.startswith("instruction_ref:"):
+                    body_text = f"instruction_ref: {instruction_ref}\n{body_text}"
                 self.terminal_host.write(
                     terminal_id,
-                    (str(delivery["body_text"]) + "\r").encode("utf-8"),
+                    (body_text + "\r").encode("utf-8"),
                 )
                 completed = self.session_bus.complete_instruction_claim(
                     terminal_id=terminal_id,
