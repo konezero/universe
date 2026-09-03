@@ -483,6 +483,19 @@ function ensureTerminalSurface(session) {
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
+  // The bundled xterm ships only the DOM renderer, which repaints the whole
+  // grid on every keystroke — a full-screen TUI in a tall dock then feels
+  // laggy. Prefer the GPU renderer; fall back to DOM if WebGL is unavailable
+  // or its context is lost.
+  if (typeof window.WebglAddon?.WebglAddon === "function") {
+    try {
+      const webgl = new window.WebglAddon.WebglAddon();
+      webgl.onContextLoss(() => { try { webgl.dispose(); } catch (_error) { /* already gone */ } });
+      term.loadAddon(webgl);
+    } catch (_error) {
+      /* stay on the DOM renderer */
+    }
+  }
   // A click in the pane must land keyboard focus in xterm's hidden textarea.
   // When the running TUI turns on mouse tracking, xterm forwards the click as
   // a mouse report and does NOT move focus on its own — so pointerdown here

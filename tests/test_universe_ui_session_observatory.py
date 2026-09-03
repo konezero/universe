@@ -143,6 +143,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("fitAddon.proposeDimensions()", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)
+        # GPU renderer preferred over the slow DOM renderer, with a fallback.
+        self.assertIn("window.WebglAddon?.WebglAddon", TERM)
+        self.assertIn("webgl.onContextLoss(", TERM)
         self.assertIn("attachCustomKeyEventHandler", TERM)
         self.assertIn("event.isComposing", TERM)
         self.assertIn("function bindTerminalIme(term, socket)", TERM)
