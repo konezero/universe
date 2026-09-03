@@ -255,14 +255,12 @@
         <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Session conversation">
           <header class="conversation-layer-header">
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse session dock" aria-label="Collapse session dock" aria-expanded="true">
-              <span class="chat-dock-icon" aria-hidden="true">&#128172;</span>
-              <span class="chat-dock-label">Sessions</span>
               <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
             </button>
-            <div class="conversation-title-wrap">
-              <strong id="conversation-title">CLI</strong>
+            <button id="conversation-title-toggle" class="conversation-title-wrap" type="button" aria-label="Toggle session dock">
+              <strong id="conversation-title">Terminal</strong>
               <small id="conversation-target-label">No terminal tab</small>
-            </div>
+            </button>
             <button id="terminal-new-session" class="icon-button compact" type="button" title="New session" aria-label="New session">&#43;</button>
             <button id="terminal-dock-side" class="icon-button compact" type="button" title="Dock to bottom / right" aria-label="Dock to bottom or right">&#9660;</button>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>

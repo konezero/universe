@@ -693,25 +693,19 @@ body.inspector-open .graph-hint {
 }
 
 .chat-dock-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: inline-grid;
+  place-items: center;
   flex: 0 0 auto;
-  min-height: 30px;
-  padding: 0 10px 0 8px;
-  border: 1px solid rgba(111,155,147, 0.28);
-  border-radius: 999px;
-  background: rgba(33, 35, 39, 0.85);
-  color: var(--text-1, #e8f1ff);
-  font-size: 12px;
-  font-weight: 600;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
   cursor: pointer;
 }
-
-.chat-dock-toggle:hover {
-  border-color: rgba(111,155,147, 0.55);
-  box-shadow: 0 0 12px rgba(111,155,147, 0.18);
-}
+.chat-dock-toggle:hover { border-color: var(--line-strong); color: var(--text-2); }
 
 .chat-dock-icon {
   font-size: 14px;
@@ -755,7 +749,16 @@ body.inspector-open .graph-hint {
   min-width: 0;
   flex: 1 1 auto;
   gap: 1px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
+.conversation-title-wrap:hover { background: rgba(255, 255, 255, 0.03); }
 
 .conversation-title-wrap strong {
   line-height: 1.2;

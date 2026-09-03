@@ -14,7 +14,7 @@ function terminalLabel(session) {
 
 function applyCliDockTitle(session) {
   if (elements.conversationTitle) {
-    elements.conversationTitle.textContent = "CLI";
+    elements.conversationTitle.textContent = "Terminal";
   }
   if (elements.conversationTargetLabel) {
     elements.conversationTargetLabel.textContent = session

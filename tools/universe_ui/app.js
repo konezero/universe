@@ -3891,16 +3891,12 @@ function renderComposerState() {
   elements.dispatchForm.classList.add("hidden");
   elements.terminalTabs.classList.toggle("hidden", !showTerminal);
   elements.terminalStage.classList.toggle("hidden", !showTerminal);
-  const dockLabel = elements.conversationToggle?.querySelector(".chat-dock-label");
-  if (dockLabel) {
-    dockLabel.textContent = showTerminal ? "Terminal" : "Sessions";
-  }
   if (typeof applyCliDockTitle === "function") {
     applyCliDockTitle(showTerminal ? activeTerminal : null);
   }
   if (showTerminal) return;
   if (true) {
-    elements.conversationTitle.textContent = "Sessions";
+    elements.conversationTitle.textContent = "Terminal";
     elements.conversationTargetLabel.textContent = "No terminal tab";
     return;
   }
@@ -17197,11 +17193,13 @@ function bindEvents() {
       syncConductorSummaryToggle(collapsed);
     });
   }
-  elements.conversationToggle.addEventListener("click", () => {
+  const toggleSessionDock = () => {
     const collapsed = elements.conversationLayer.classList.toggle("collapsed");
     syncConversationToggle(collapsed);
     if (!collapsed && typeof refitActiveTerminal === "function") refitActiveTerminal();
-  });
+  };
+  elements.conversationToggle.addEventListener("click", toggleSessionDock);
+  document.querySelector("#conversation-title-toggle")?.addEventListener("click", toggleSessionDock);
   elements.conversationOpacity.addEventListener("input", () => {
     elements.conversationLayer.style.setProperty(
       "--conversation-opacity",
