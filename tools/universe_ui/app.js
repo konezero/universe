@@ -4007,6 +4007,8 @@ function showGraphView(view) {
   if (goalWorkspace) goalWorkspace.hidden = false;
   state.view = view;
   document.body.classList.add("graph-mode");
+  // The integrated home owns these; leaving it must clear them.
+  document.body.classList.remove("home-mode", "fleet-mode");
   state.selectedNode = null;
   state.focusedNodeId = null;
   elements.nodeBreadcrumb?.classList.add("hidden");
@@ -4950,6 +4952,7 @@ function showBenchScreen() {
   state.benchScreenActive = true;
   document.body.classList.remove("graph-mode");
   document.body.classList.remove("inspector-open");
+  document.body.classList.remove("home-mode", "fleet-mode");
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
   if (goalWorkspace) goalWorkspace.hidden = true;
   screenBody.append(panel);
