@@ -10423,18 +10423,18 @@ function drawGraph() {
             ? 1.8
             : 1.2;
     context.strokeStyle = isPredicted
-      ? "rgba(155, 124, 255, 0.75)"
+      ? "rgba(125, 115, 151, 0.7)"
       : isDocumentLink
-      ? "rgba(240, 184, 74, 0.7)"
+      ? "rgba(166, 141, 91, 0.7)"
       : isImplementationLink
-        ? "rgba(122, 106, 212, 0.7)"
+        ? "rgba(125, 115, 151, 0.65)"
         : isProjectLink
           ? emphasized
-            ? "rgba(90, 220, 255, 0.9)"
-            : "rgba(90, 200, 255, 0.45)"
+            ? "rgba(111, 155, 147, 0.8)"
+            : "rgba(111, 155, 147, 0.4)"
           : edge.kind === "contains" && emphasized
-            ? "rgba(100, 190, 255, 0.7)"
-          : "rgba(120, 180, 230, 0.4)";
+            ? "rgba(120, 130, 124, 0.6)"
+          : "rgba(110, 112, 108, 0.35)";
     context.setLineDash(
       isPredicted
         ? [7, 6]
@@ -10600,12 +10600,12 @@ function graphNodeMetrics(item) {
 
 function todoStateColor(todoState) {
   return {
-    BLOCKED: "#fb7185",
-    IN_PROGRESS: "#22d3ee",
-    READY: "#a3e635",
-    BACKLOG: "#94a3b8",
-    DONE: "#4ade80",
-  }[todoState] || "#f6c76a";
+    BLOCKED: "#a86f66",
+    IN_PROGRESS: "#6f9b93",
+    READY: "#8a9b6f",
+    BACKLOG: "#8b8d96",
+    DONE: "#6f9b78",
+  }[todoState] || "#a68d5b";
 }
 
 function featureWorkProjection(value) {
@@ -10661,8 +10661,8 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   const accent = graphAccentColor(item);
   const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
   const todoProjection = todoProjectionForGraphNode(item);
-  const focusRing = item.unifiedKind ? accent.stroke : "#3de0ff";
-  const glow = item.unifiedKind ? accent.soft : "rgba(61, 224, 255, 0.8)";
+  const focusRing = item.unifiedKind ? accent.stroke : "#6f9b93";
+  const glow = item.unifiedKind ? accent.soft : "rgba(111, 155, 147, 0.7)";
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
     context.shadowColor = glow;
@@ -10671,7 +10671,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.shadowColor = accent.soft;
     context.shadowBlur = item.unifiedKind ? 4 : 10;
   } else {
-    context.shadowColor = item.unifiedKind ? "rgba(0,0,0,0)" : "rgba(61, 224, 255, 0.06)";
+    context.shadowColor = item.unifiedKind ? "rgba(0,0,0,0)" : "rgba(111, 155, 147, 0.06)";
     context.shadowBlur = item.unifiedKind ? 0 : 4;
   }
 
@@ -10679,23 +10679,23 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     // Universe hub: ringed disc with monogram.
     context.beginPath();
     context.arc(item.x, item.y, r + 6, 0, Math.PI * 2);
-    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "rgba(90, 208, 255, 0.55)");
+    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "rgba(111, 155, 147, 0.45)");
     context.lineWidth = selected ? 2 : 1.2;
     context.stroke();
     context.beginPath();
     context.arc(item.x, item.y, r, 0, Math.PI * 2);
     context.fillStyle = item.unifiedKind
       ? accent.fill
-      : (selected ? "rgba(12, 32, 56, 0.98)" : "rgba(10, 24, 44, 0.94)");
+      : (selected ? "rgba(33, 35, 39, 0.98)" : "rgba(25, 26, 29, 0.94)");
     context.fill();
-    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "#5ad0ff");
+    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "#6f9b93");
     context.lineWidth = selected ? 2 : 1.4;
     context.stroke();
   } else if (metrics.shape === "project") {
     // Project: filled circle, color-coded by project id.
     context.beginPath();
     context.arc(item.x, item.y, r, 0, Math.PI * 2);
-    context.fillStyle = selected ? "rgba(12, 28, 52, 0.98)" : accent.fill;
+    context.fillStyle = selected ? "rgba(33, 35, 39, 0.98)" : accent.fill;
     context.fill();
     context.strokeStyle = selected ? focusRing : accent.stroke;
     context.lineWidth = selected ? 2.6 : emphasized ? 2 : 1.5;
@@ -10707,14 +10707,14 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.fillStyle = item.unifiedKind
       ? accent.fill
       : selected
-        ? "rgba(12, 28, 48, 0.96)"
-        : "rgba(10, 22, 40, 0.92)";
+        ? "rgba(33, 35, 39, 0.96)"
+        : "rgba(25, 26, 29, 0.92)";
     context.fill();
     context.strokeStyle = selected
       ? focusRing
       : emphasized || item.unifiedKind
         ? accent.stroke
-        : "rgba(120, 170, 210, 0.55)";
+        : "rgba(130, 130, 124, 0.5)";
     context.lineWidth = selected ? 2.2 : 1.4;
     context.stroke();
   }
@@ -10740,7 +10740,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
           -Math.PI / 2,
           -Math.PI / 2 + Math.PI * 2 * Math.min(100, todoProjection.progress) / 100
         );
-        context.strokeStyle = "#4ade80";
+        context.strokeStyle = "#6f9b78";
         context.lineWidth = 2.5;
         context.stroke();
       }
@@ -10748,7 +10748,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   }
 
   context.shadowBlur = 0;
-  context.fillStyle = selected || hovered ? "#f2fbff" : "#e6f2ff";
+  context.fillStyle = selected || hovered ? "#e8e8ea" : "#d0d1d6";
   context.font = `${metrics.shape === "system" ? "600 10px" : "700 12px"} Segoe UI`;
   context.textAlign = "center";
   context.textBaseline = "middle";
