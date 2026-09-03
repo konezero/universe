@@ -7607,3 +7607,21 @@ body.fleet-mode .fleet-board {
   display: none;
 }
 .topbar .brand-copy strong { font-size: 14px; }
+
+/* Conductor panel: it's the terminal dock now, not a dashboard. Drop the
+   redundant ghost-actions (Multiverse Map = Galaxy, Future = inspector,
+   Dispatch Board = Fleet) and the greeting; keep a compact metric strip. */
+.app-shell.mockup-shell .conductor-panel .conductor-actions,
+.app-shell.mockup-shell .conductor-panel .conductor-header {
+  display: none;
+}
+.app-shell.mockup-shell .conductor-panel .metric-row {
+  padding: 6px 10px;
+  gap: 6px;
+}
+.app-shell.mockup-shell .conductor-panel .metric-card {
+  padding: 4px 6px;
+}
+.app-shell.mockup-shell .conductor-panel .metric-card small {
+  display: none;
+}
