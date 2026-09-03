@@ -8969,6 +8969,7 @@ function renderGalaxyViewSwitch(active, available) {
     chip.addEventListener("click", () => {
       if (galaxyUnifiedView() === name) return;
       state.galaxyView = name;
+      state.galaxyFocus = null;
       buildGraph();
     });
     el.append(chip);
@@ -8986,7 +8987,38 @@ function buildUnifiedGalaxyGraph() {
   const edgeAllow = view ? new Set(view.edge_ids) : null;
   renderGalaxyViewSwitch(viewName, true);
 
-  const nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+  let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+
+  // Focus: n-hop neighbourhood around a clicked planet.
+  const focusId = state.galaxyFocus;
+  const focusHops = 2;
+  let focused = false;
+  if (focusId && nodes.some((n) => n.node_id === focusId)) {
+    focused = true;
+    const inView = new Set(nodes.map((n) => n.node_id));
+    const adj = new Map();
+    for (const e of unified.edges || []) {
+      if (!inView.has(e.from_node) || !inView.has(e.to_node)) continue;
+      (adj.get(e.from_node) || adj.set(e.from_node, []).get(e.from_node)).push(e.to_node);
+      (adj.get(e.to_node) || adj.set(e.to_node, []).get(e.to_node)).push(e.from_node);
+    }
+    const keep = new Set([focusId]);
+    let frontier = [focusId];
+    for (let hop = 0; hop < focusHops; hop += 1) {
+      const next = [];
+      for (const id of frontier) {
+        for (const nb of adj.get(id) || []) {
+          if (!keep.has(nb)) {
+            keep.add(nb);
+            next.push(nb);
+          }
+        }
+      }
+      frontier = next;
+    }
+    nodes = nodes.filter((n) => keep.has(n.node_id));
+  }
+
   const kindsPresent = new Set();
   const graphNodes = nodes.map((n) => {
     const style = UNIFIED_KIND_STYLE[n.kind] || { kind: "related", depth: 4 };
@@ -9037,9 +9069,12 @@ function buildUnifiedGalaxyGraph() {
     const graftText = graftInfo
       ? ` · ${graftInfo.decisions} decisions · ${graftInfo.memories} memories`
       : "";
+    const focusText = focused
+      ? ` · focus: ${truncate(state.selectedNode?.label || focusId, 24)} (${focusHops}-hop, click again to clear)`
+      : "";
     elements.graphHint.textContent =
       `Galaxy · ${state.selectedProject?.project_id || "universe"} · ${viewName} view · ` +
-      `${graphNodes.length}/${unified.nodes.length} nodes${graftText} · projection only`;
+      `${graphNodes.length}/${unified.nodes.length} nodes${graftText}${focusText} · projection only`;
   }
   fitGraphView();
   return true;
@@ -10249,7 +10284,27 @@ function drawGraph() {
 }
 
 /** Colors express node meaning. Do not derive semantic UI state from an ID hash. */
+// Unified Galaxy: muted, kind-keyed planet colours (no glow) so the map reads
+// as a calm dark-grey surface, not a toy.
+const UNIFIED_ACCENT = {
+  PRODUCT: { fill: "rgba(38,54,50,0.95)", stroke: "#7fb0a7", soft: "rgba(111,155,147,0.18)" },
+  APP: { fill: "rgba(34,44,54,0.95)", stroke: "#6a8fb2", soft: "rgba(106,127,155,0.18)" },
+  SURFACE: { fill: "rgba(32,40,48,0.95)", stroke: "#5f7f9b", soft: "rgba(95,127,155,0.16)" },
+  FEATURE: { fill: "rgba(42,38,52,0.95)", stroke: "#9a8fb6", soft: "rgba(125,115,151,0.18)" },
+  CAPABILITY: { fill: "rgba(36,48,46,0.95)", stroke: "#6f9b93", soft: "rgba(111,155,147,0.16)" },
+  FLOW: { fill: "rgba(40,38,50,0.95)", stroke: "#8f84a8", soft: "rgba(125,115,151,0.16)" },
+  EXTERNAL_BOUNDARY: { fill: "rgba(48,44,36,0.95)", stroke: "#a68d5b", soft: "rgba(166,141,91,0.16)" },
+  STRUCTURE: { fill: "rgba(38,40,44,0.95)", stroke: "#8a8a86", soft: "rgba(138,138,134,0.14)" },
+  COMPONENT: { fill: "rgba(34,36,40,0.95)", stroke: "#8a8a86", soft: "rgba(138,138,134,0.14)" },
+  DOCUMENT: { fill: "rgba(32,38,48,0.95)", stroke: "#6a7f9b", soft: "rgba(106,127,155,0.14)" },
+  DECISION: { fill: "rgba(34,44,44,0.95)", stroke: "#6f9b93", soft: "rgba(111,155,147,0.14)" },
+  MEMORY: { fill: "rgba(34,34,38,0.95)", stroke: "#7d7f7a", soft: "rgba(125,127,122,0.12)" },
+};
+
 function graphAccentColor(item) {
+  if (item.unifiedKind) {
+    return UNIFIED_ACCENT[item.unifiedKind] || UNIFIED_ACCENT.COMPONENT;
+  }
   const networkRole = String(item?.data?.network_role || "");
   if (item.kind === "feature") {
     return { fill: "rgba(76, 45, 112, 0.94)", stroke: "#c084fc", soft: "rgba(192, 132, 252, 0.24)" };
@@ -10311,6 +10366,12 @@ function nodeMonogram(item) {
 
 /** Visual + hit metrics for multiverse icon nodes. */
 function graphNodeMetrics(item) {
+  if (item.unifiedKind) {
+    const big = ["PRODUCT"].includes(item.unifiedKind);
+    const mid = ["APP", "FEATURE", "CAPABILITY", "FLOW"].includes(item.unifiedKind);
+    const radius = big ? 24 : mid ? 18 : 14;
+    return { shape: big ? "hub" : "project", radius, hitR: radius + 12 };
+  }
   if (item.kind === "universe") {
     return { shape: "hub", radius: 28, hitR: 34 };
   }
@@ -10389,30 +10450,32 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   const accent = graphAccentColor(item);
   const r = metrics.radius * (selected ? 1.08 : hovered ? 1.05 : 1);
   const todoProjection = todoProjectionForGraphNode(item);
+  const focusRing = item.unifiedKind ? accent.stroke : "#3de0ff";
+  const glow = item.unifiedKind ? accent.soft : "rgba(61, 224, 255, 0.8)";
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
-    context.shadowColor = "rgba(61, 224, 255, 0.8)";
-    context.shadowBlur = selected ? 20 : 14;
+    context.shadowColor = glow;
+    context.shadowBlur = item.unifiedKind ? (selected ? 12 : 8) : selected ? 20 : 14;
   } else if (emphasized) {
     context.shadowColor = accent.soft;
-    context.shadowBlur = 10;
+    context.shadowBlur = item.unifiedKind ? 4 : 10;
   } else {
-    context.shadowColor = "rgba(61, 224, 255, 0.06)";
-    context.shadowBlur = 4;
+    context.shadowColor = item.unifiedKind ? "rgba(0,0,0,0)" : "rgba(61, 224, 255, 0.06)";
+    context.shadowBlur = item.unifiedKind ? 0 : 4;
   }
 
   if (metrics.shape === "hub") {
     // Universe hub: ringed disc with monogram.
     context.beginPath();
     context.arc(item.x, item.y, r + 6, 0, Math.PI * 2);
-    context.strokeStyle = selected ? "#3de0ff" : "rgba(90, 208, 255, 0.55)";
+    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "rgba(90, 208, 255, 0.55)");
     context.lineWidth = selected ? 2.4 : 1.5;
     context.stroke();
     context.beginPath();
     context.arc(item.x, item.y, r, 0, Math.PI * 2);
     context.fillStyle = selected ? "rgba(12, 32, 56, 0.98)" : "rgba(10, 24, 44, 0.94)";
     context.fill();
-    context.strokeStyle = selected ? "#3de0ff" : "#5ad0ff";
+    context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "#5ad0ff");
     context.lineWidth = selected ? 2.4 : 1.8;
     context.stroke();
   } else if (metrics.shape === "project") {
@@ -10421,18 +10484,22 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.arc(item.x, item.y, r, 0, Math.PI * 2);
     context.fillStyle = selected ? "rgba(12, 28, 52, 0.98)" : accent.fill;
     context.fill();
-    context.strokeStyle = selected ? "#3de0ff" : accent.stroke;
+    context.strokeStyle = selected ? focusRing : accent.stroke;
     context.lineWidth = selected ? 2.6 : emphasized ? 2 : 1.5;
     context.stroke();
   } else {
     // System / leaf: smaller rounded square, accent ring from parent project.
     const half = r;
     roundedRect(context, item.x - half, item.y - half, half * 2, half * 2, 6);
-    context.fillStyle = selected ? "rgba(12, 28, 48, 0.96)" : "rgba(10, 22, 40, 0.92)";
+    context.fillStyle = item.unifiedKind
+      ? accent.fill
+      : selected
+        ? "rgba(12, 28, 48, 0.96)"
+        : "rgba(10, 22, 40, 0.92)";
     context.fill();
     context.strokeStyle = selected
-      ? "#3de0ff"
-      : emphasized
+      ? focusRing
+      : emphasized || item.unifiedKind
         ? accent.stroke
         : "rgba(120, 170, 210, 0.55)";
     context.lineWidth = selected ? 2.2 : 1.4;
@@ -10642,6 +10709,19 @@ function selectGraphNode(event) {
         toast(error.message, true)
       );
     }
+    return;
+  }
+  if (selected.unifiedKind) {
+    // Galaxy: click a planet to focus its neighbourhood; click it again to
+    // zoom back out. The inspector shows the node's evidence + linked work.
+    state.selectedNode = selected;
+    state.galaxyFocus = state.galaxyFocus === selected.id ? null : selected.id;
+    buildGraph();
+    state.selectedNode =
+      state.graph.nodes.find((item) => item.id === selected.id) || selected;
+    drawGraph();
+    renderDetails();
+    showInspectorTab("details");
     return;
   }
   if (selected.kind === "universe") {
