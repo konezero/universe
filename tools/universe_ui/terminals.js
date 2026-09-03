@@ -352,18 +352,15 @@ function sendPtyText(socket, data) {
   socket.send(new TextEncoder().encode(text));
 }
 
-// A CLI wraps badly below 80 columns, so that is the hard floor: once the pane
-// is too narrow to show 80 columns at a readable font, the font shrinks instead
-// of the column count. 120x40 is the comfortable target and the fallback when
-// the pane cannot be measured yet.
+// The grid width is fixed at 120 columns; the font is scaled so those columns
+// fill the pane, and the row count is whatever fits vertically at that font.
+// 120x40 is the fallback when the pane cannot be measured yet.
 const TERMINAL_COLS = 120;
 const TERMINAL_ROWS = 40;
-const TERMINAL_MIN_COLS = 80;
-const TERMINAL_MIN_ROWS = 24;
+const TERMINAL_MIN_ROWS = 20;
 const TERMINAL_MAX_ROWS = 60;
-const TERMINAL_BASE_FONT = 13;
 const TERMINAL_MIN_FONT = 6;
-const TERMINAL_MAX_FONT = 15;
+const TERMINAL_MAX_FONT = 16;
 
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
@@ -427,17 +424,13 @@ function bindTerminalIme(term, socket) {
 
 function scaleFontToContainer(term, element) {
   const width = element.clientWidth;
-  const height = element.clientHeight;
-  if (!width || !height) return false;
-  const fontFromWidth = width / (TERMINAL_COLS * 0.62);
-  const fontFromHeight = height / (TERMINAL_ROWS * 1.3);
+  if (!width) return false;
+  // Char cell width ~= 0.6 * fontSize; size the font so 120 columns span the pane.
   const size = Math.max(
     TERMINAL_MIN_FONT,
-    Math.min(TERMINAL_MAX_FONT, Math.floor(Math.min(fontFromWidth, fontFromHeight)))
+    Math.min(TERMINAL_MAX_FONT, Math.floor(width / (TERMINAL_COLS * 0.6)))
   );
-  if (term.options.fontSize !== size) {
-    term.options.fontSize = size;
-  }
+  if (term.options.fontSize !== size) term.options.fontSize = size;
   return true;
 }
 
@@ -447,31 +440,26 @@ function fitTerminalToContainer(term, element, fitAddon) {
   if (!width || !height) return false;
   if (fitAddon && typeof fitAddon.proposeDimensions === "function") {
     try {
-      // Fit at a readable font first; only if that cannot show 80 columns do we
-      // trade font size for columns (char metrics scale ~linearly with font).
-      const base = Math.min(
-        TERMINAL_MAX_FONT,
-        Math.max(TERMINAL_MIN_FONT, TERMINAL_BASE_FONT)
-      );
-      if (term.options.fontSize !== base) term.options.fontSize = base;
-      const atBase = fitAddon.proposeDimensions();
-      let font = base;
-      if (atBase && atBase.cols && atBase.cols < TERMINAL_MIN_COLS) {
-        font = Math.max(
-          TERMINAL_MIN_FONT,
-          Math.floor((base * atBase.cols) / TERMINAL_MIN_COLS)
-        );
-        term.options.fontSize = font;
+      // The grid is a fixed 120 columns. Measure how many columns a reference
+      // font yields, then (char width scales ~linearly with font size) pick the
+      // font that makes exactly 120 columns fill the pane width.
+      const ref = TERMINAL_MAX_FONT;
+      if (term.options.fontSize !== ref) term.options.fontSize = ref;
+      const at = fitAddon.proposeDimensions();
+      let font = ref;
+      if (at && at.cols) {
+        font = Math.round((ref * at.cols) / TERMINAL_COLS);
+        font = Math.max(TERMINAL_MIN_FONT, Math.min(TERMINAL_MAX_FONT, font));
       }
-      const proposed =
-        font === base ? atBase : fitAddon.proposeDimensions();
-      const cols = Math.max(TERMINAL_MIN_COLS, (proposed && proposed.cols) || TERMINAL_COLS);
-      let rows = Math.max(TERMINAL_MIN_ROWS, (proposed && proposed.rows) || TERMINAL_ROWS);
-      // When the font was shrunk to hold 80 columns in a narrow pane, the row
-      // count would otherwise balloon into a tall unusable sliver — cap it and
-      // leave the surplus as background.
-      if (font < base) rows = Math.min(rows, TERMINAL_MAX_ROWS);
-      if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+      if (term.options.fontSize !== font) term.options.fontSize = font;
+      const after = fitAddon.proposeDimensions();
+      const rows = Math.max(
+        TERMINAL_MIN_ROWS,
+        Math.min(TERMINAL_MAX_ROWS, (after && after.rows) || TERMINAL_ROWS)
+      );
+      if (term.cols !== TERMINAL_COLS || term.rows !== rows) {
+        term.resize(TERMINAL_COLS, rows);
+      }
       return Boolean(term.cols && term.rows);
     } catch (_error) {
       // A just-mounted pane may not be measurable yet; use the fallback below.
@@ -513,19 +501,6 @@ function ensureTerminalSurface(session) {
   term.open(element);
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
-  }
-  // The bundled xterm ships only the DOM renderer, which repaints the whole
-  // grid on every keystroke — a full-screen TUI in a tall dock then feels
-  // laggy. Prefer the GPU renderer; fall back to DOM if WebGL is unavailable
-  // or its context is lost.
-  if (typeof window.WebglAddon?.WebglAddon === "function") {
-    try {
-      const webgl = new window.WebglAddon.WebglAddon();
-      webgl.onContextLoss(() => { try { webgl.dispose(); } catch (_error) { /* already gone */ } });
-      term.loadAddon(webgl);
-    } catch (_error) {
-      /* stay on the DOM renderer */
-    }
   }
   // A click in the pane must land keyboard focus in xterm's hidden textarea.
   // When the running TUI turns on mouse tracking, xterm forwards the click as
@@ -582,7 +557,7 @@ function ensureTerminalSurface(session) {
   let resizeTimer = 0;
   const sendCurrentSize = () => {
     if (socket.readyState !== WebSocket.OPEN) return false;
-    const cols = Math.max(TERMINAL_MIN_COLS, Number(term.cols) || TERMINAL_COLS);
+    const cols = Number(term.cols) || TERMINAL_COLS;
     const rows = Math.max(TERMINAL_MIN_ROWS, Number(term.rows) || TERMINAL_ROWS);
     const sizeKey = `${cols}x${rows}`;
     if (surface?.lastSentSizeKey === sizeKey) return false;

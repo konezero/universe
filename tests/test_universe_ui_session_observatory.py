@@ -141,15 +141,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("surface.retainedLiveChunks.push({", TERM)
         self.assertIn("await writeUndisplayedLiveTail(surface)", TERM)
         self.assertIn("fitAddon.proposeDimensions()", TERM)
-        # 80 columns is the CLI floor — shrink the font, not the column count.
-        self.assertIn("const TERMINAL_MIN_COLS = 80;", TERM)
-        self.assertIn("atBase.cols < TERMINAL_MIN_COLS", TERM)
-        self.assertIn("Math.max(TERMINAL_MIN_COLS,", TERM)
+        # Fixed 120-column grid; the font scales, the column count does not.
+        self.assertIn("const TERMINAL_COLS = 120;", TERM)
+        self.assertIn("(ref * at.cols) / TERMINAL_COLS", TERM)
+        self.assertIn("term.resize(TERMINAL_COLS, rows)", TERM)
+        self.assertNotIn("WebglAddon", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)
-        # GPU renderer preferred over the slow DOM renderer, with a fallback.
-        self.assertIn("window.WebglAddon?.WebglAddon", TERM)
-        self.assertIn("webgl.onContextLoss(", TERM)
         self.assertIn("attachCustomKeyEventHandler", TERM)
         self.assertIn("event.isComposing", TERM)
         self.assertIn("function bindTerminalIme(term, socket)", TERM)
