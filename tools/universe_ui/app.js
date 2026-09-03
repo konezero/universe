@@ -4095,27 +4095,63 @@ function roomsForSelectedNode(selected) {
   );
 }
 
-// + 노드 등록 — a feature node is created inside a project Meeting Room
-// (intent → explore → adopt). Spin one up and drop the user into it.
-async function openHomeAddNode() {
-  const projectId = state.selectedProject?.project_id;
-  if (!projectId) {
+// + 노드 등록 — a feature node is a project sub-goal that Todos hang off.
+// Lightweight create (title + intent); Expected-Path exploration in a
+// meeting room stays optional and later.
+function openHomeAddNode() {
+  const dialog = document.querySelector("#home-node-dialog");
+  if (!dialog) return;
+  if (!state.selectedProject?.project_id) {
     toast("먼저 프로젝트를 선택하세요", true);
     return;
   }
-  await api("/v1/rooms", {
-    method: "POST",
-    body: {
-      room_type: "MEETING",
-      title: `${projectId} · new node`,
-      topic: "Feature node specification",
-      project_id: projectId,
-      models: [],
-    },
-  });
-  toast("미팅룸을 만들었어요 — 여기서 feature 노드를 정의하세요");
-  if (typeof refreshProjectRooms === "function") await refreshProjectRooms().catch(() => {});
-  openRoomIndex().catch((error) => toast(error.message, true));
+  const form = document.querySelector("#home-node-form");
+  form.reset();
+  document.querySelector("#home-node-error").textContent = "";
+  dialog.showModal();
+  form.elements.intent_text.focus();
+}
+
+async function submitHomeNode(event) {
+  event.preventDefault();
+  const projectId = state.selectedProject?.project_id;
+  const form = event.target;
+  const errEl = document.querySelector("#home-node-error");
+  const intent = String(form.elements.intent_text.value || "").trim();
+  if (!projectId || !intent) {
+    errEl.textContent = "노드 설명을 입력하세요";
+    return;
+  }
+  // The API needs a title; the projection labels the node by intent anyway.
+  const title = intent.length > 80 ? `${intent.slice(0, 79)}…` : intent;
+  const submit = document.querySelector("#home-node-submit");
+  submit.disabled = true;
+  try {
+    const result = await api(
+      `/v1/projects/${encodeURIComponent(projectId)}/feature-nodes`,
+      {
+        method: "POST",
+        body: {
+          idempotency_key: crypto.randomUUID(),
+          title,
+          intent_text: intent,
+          created_by_role: "USER",
+        },
+      }
+    );
+    document.querySelector("#home-node-dialog").close();
+    toast("노드를 만들었어요");
+    state.homeNodeId = `feat:${result.feature?.feature_id || ""}`;
+    state.homeTodoId = null;
+    // Drop the cached projection so the re-select grafts in the new node.
+    if (state.projectionsByProject) delete state.projectionsByProject[projectId];
+    await selectProject(projectId).catch(() => {});
+    renderIntegratedHome();
+  } catch (error) {
+    errEl.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
 }
 
 // + Todo 등록 — open the todo work map, create tab, scoped to the selected node.
@@ -17473,9 +17509,8 @@ refreshLawStrip = function () {
   document.querySelector("#home-add-project")?.addEventListener("click", () => {
     if (typeof openFreshProjectWizard === "function") openFreshProjectWizard();
   });
-  document.querySelector("#home-add-node")?.addEventListener("click", () => {
-    openHomeAddNode().catch((error) => toast(error.message, true));
-  });
+  document.querySelector("#home-add-node")?.addEventListener("click", openHomeAddNode);
+  document.querySelector("#home-node-form")?.addEventListener("submit", submitHomeNode);
   document.querySelector("#home-add-todo")?.addEventListener("click", () => {
     openHomeAddTodo();
   });

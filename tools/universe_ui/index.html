@@ -1396,6 +1396,22 @@
     <div id="room-dialog-body" class="room-dialog-body"></div>
   </dialog>
 
+  <dialog id="home-node-dialog" class="goal-dialog">
+    <form id="home-node-form" method="dialog">
+      <div class="dialog-heading">
+        <div><span class="goal-plan-kicker">New node</span><h2>Feature node</h2></div>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label>이 노드가 뭘 하나<textarea name="intent_text" rows="4" maxlength="4000" required placeholder="예: 세션이 supervisor 밖에서도 재접속되도록 PTY 핸들 유지"></textarea></label>
+      <p class="boundary-copy">노드는 프로젝트의 세부 목표 — 그 아래로 Todo가 모입니다. 필요하면 나중에 미팅룸에서 Expected Path를 탐색하세요.</p>
+      <div class="dialog-actions">
+        <button type="button" data-close-dialog class="secondary-button">취소</button>
+        <button id="home-node-submit" type="submit" class="primary-button">노드 생성</button>
+      </div>
+      <p id="home-node-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
+
 
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/xterm.min.js"></script>
