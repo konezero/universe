@@ -181,6 +181,7 @@ const elements = {
   graphLegend: document.querySelector("#graph-legend"),
   graphHint: document.querySelector("#graph-hint"),
   galaxyViewSwitch: document.querySelector("#galaxy-view-switch"),
+  galaxyFullscreenToggle: document.querySelector("#galaxy-fullscreen-toggle"),
   graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
   graphZoomOut: document.querySelector("#graph-zoom-out"),
@@ -8884,9 +8885,24 @@ function startGalaxyShipLoop() {
   }, 120);
 }
 
+function setGalaxyFullscreen(on) {
+  document.body.classList.toggle("galaxy-fullscreen", on);
+  if (elements.galaxyFullscreenToggle) {
+    elements.galaxyFullscreenToggle.innerHTML = on
+      ? "&#9634; Exit full screen"
+      : "&#9635; Full screen";
+  }
+  // The map's viewport just changed size — refit.
+  if (state.view === "semantic") setTimeout(() => fitGraphView(), 240);
+}
+
 function buildGraph() {
   elements.nodeBreadcrumb.classList.add("hidden");
   if (elements.galaxyViewSwitch) elements.galaxyViewSwitch.hidden = true;
+  if (elements.galaxyFullscreenToggle) elements.galaxyFullscreenToggle.hidden = true;
+  if (state.view !== "semantic" && document.body.classList.contains("galaxy-fullscreen")) {
+    setGalaxyFullscreen(false);
+  }
   stopGalaxyShipLoop();
   // Universe map: always full tree (hub → projects → systems). Depth = dim only.
   // Timeline/Documents still use project-interior graphs. focusedNodeId dig-in
@@ -9008,6 +9024,7 @@ function buildUnifiedGalaxyGraph() {
   const nodeAllow = view ? new Set(view.node_ids) : null;
   const edgeAllow = view ? new Set(view.edge_ids) : null;
   renderGalaxyViewSwitch(viewName, true);
+  if (elements.galaxyFullscreenToggle) elements.galaxyFullscreenToggle.hidden = false;
 
   let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
 
@@ -16358,8 +16375,17 @@ refreshLawStrip = function () {
   if (elements.graphFit) {
     elements.graphFit.addEventListener("click", fitGraphView);
   }
+  if (elements.galaxyFullscreenToggle) {
+    elements.galaxyFullscreenToggle.addEventListener("click", () =>
+      setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))
+    );
+  }
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (document.body.classList.contains("galaxy-fullscreen")) {
+      setGalaxyFullscreen(false);
+      return;
+    }
     if (elements.composerActionMenu && !elements.composerActionMenu.classList.contains("hidden")) {
       closeComposerActionMenu();
       return;
