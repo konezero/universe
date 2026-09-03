@@ -8863,9 +8863,31 @@ function openProjectRoomStream(projectId) {
   });
 }
 
+let galaxyShipTimer = null;
+
+function stopGalaxyShipLoop() {
+  if (galaxyShipTimer) {
+    clearInterval(galaxyShipTimer);
+    galaxyShipTimer = null;
+  }
+}
+
+function startGalaxyShipLoop() {
+  stopGalaxyShipLoop();
+  if (!state.projection?.ships?.length) return;
+  galaxyShipTimer = setInterval(() => {
+    if (state.view !== "semantic" || !state.projection?.ships?.length) {
+      stopGalaxyShipLoop();
+      return;
+    }
+    drawGraph();
+  }, 120);
+}
+
 function buildGraph() {
   elements.nodeBreadcrumb.classList.add("hidden");
   if (elements.galaxyViewSwitch) elements.galaxyViewSwitch.hidden = true;
+  stopGalaxyShipLoop();
   // Universe map: always full tree (hub → projects → systems). Depth = dim only.
   // Timeline/Documents still use project-interior graphs. focusedNodeId dig-in
   // is for non-universe views only (not multiverse).
@@ -9077,6 +9099,7 @@ function buildUnifiedGalaxyGraph() {
       `${graphNodes.length}/${unified.nodes.length} nodes${graftText}${focusText} · projection only`;
   }
   fitGraphView();
+  startGalaxyShipLoop();
   return true;
 }
 
@@ -10280,7 +10303,44 @@ function drawGraph() {
   for (const item of state.graph.nodes) {
     drawGraphNodeIcon(context, item, depthStyle);
   }
+  drawGalaxyShips(context, byId);
   context.restore();
+}
+
+// Ships = executing / verifying Task Frames, drawn as small markers in orbit
+// around their target planet (projection.ships from graft_work_rollup).
+function drawGalaxyShips(context, byId) {
+  const ships = state.projection?.ships;
+  if (!Array.isArray(ships) || !ships.length) return;
+  const byTarget = new Map();
+  for (const ship of ships) {
+    const list = byTarget.get(ship.target_node) || [];
+    list.push(ship);
+    byTarget.set(ship.target_node, list);
+  }
+  const t = (Date.now() / 1000) % (Math.PI * 2);
+  for (const [target, list] of byTarget) {
+    const node = byId.get(target);
+    if (!node) continue;
+    const metrics = graphNodeMetrics(node);
+    const orbit = metrics.radius + 16;
+    list.forEach((ship, index) => {
+      const angle = t + (index * Math.PI * 2) / list.length;
+      const x = node.x + Math.cos(angle) * orbit;
+      const y = node.y + Math.sin(angle) * orbit;
+      context.save();
+      context.translate(x, y);
+      context.rotate(angle + Math.PI / 2);
+      context.beginPath();
+      context.moveTo(0, -5);
+      context.lineTo(4, 4);
+      context.lineTo(-4, 4);
+      context.closePath();
+      context.fillStyle = ship.state === "VERIFYING" ? "#a68d5b" : "#9a8f74";
+      context.fill();
+      context.restore();
+    });
+  }
 }
 
 /** Colors express node meaning. Do not derive semantic UI state from an ID hash. */
@@ -10556,6 +10616,33 @@ function drawGraphNodeIcon(context, item, depthStyle) {
       context.fillStyle = "rgba(140,140,132,0.55)";
       context.fillText(truncate(item.data.node_id, 30), item.x, item.y + r + 24);
     }
+  }
+
+  // Work rollup ring: done fraction + blocked / executing hints.
+  const work = item.data?.work;
+  if (work && work.total) {
+    const ringR = r + 5;
+    context.lineWidth = 2.5;
+    context.strokeStyle = "rgba(90,90,86,0.5)";
+    context.beginPath();
+    context.arc(item.x, item.y, ringR, 0, Math.PI * 2);
+    context.stroke();
+    const doneFrac = work.done / work.total;
+    if (doneFrac > 0) {
+      context.strokeStyle = "#6f9b78";
+      context.beginPath();
+      context.arc(item.x, item.y, ringR, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * doneFrac);
+      context.stroke();
+    }
+    if (work.blocked) {
+      context.fillStyle = "#a86f66";
+      context.beginPath();
+      context.arc(item.x + ringR * 0.7, item.y - ringR * 0.7, 3, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.font = "600 8px ui-monospace, Menlo, Consolas, monospace";
+    context.fillStyle = "rgba(200,200,196,0.7)";
+    context.fillText(`${work.done}/${work.total}`, item.x, item.y - r - 10);
   }
 
   if (todoProjection) {
