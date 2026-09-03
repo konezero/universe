@@ -3886,13 +3886,9 @@ function renderComposerState() {
   elements.terminalStage.classList.toggle("hidden", !showTerminal);
   const dockLabel = elements.conversationToggle?.querySelector(".chat-dock-label");
   if (dockLabel) {
-    dockLabel.textContent = showTerminal
-      ? "CLI"
-      : state.conversationTarget.kind === "PROVIDER_SESSION"
-        ? "Chat"
-        : state.conversationTarget.kind === "NONE"
-          ? "Chat"
-          : "Project Room";
+    // The dock is the session terminal — the old "chat to Conductor" surface
+    // is superseded by working directly in the session window.
+    dockLabel.textContent = showTerminal ? "Terminal" : "Sessions";
   }
   if (typeof applyCliDockTitle === "function") {
     applyCliDockTitle(showTerminal ? activeTerminal : null);
@@ -4068,6 +4064,30 @@ function fleetNodeLabel(nodeRef) {
   return raw;
 }
 
+// Rooms attached to a graph node: MEETING room whose feature this node is
+// (node id "feat:feature_x" or data.feature_id), or a BOSS room for a Task
+// Frame whose owner node this is.
+function roomsForSelectedNode(selected) {
+  if (!selected) return [];
+  const rooms = projectRoomsList();
+  if (!rooms.length) return [];
+  const nodeId = String(selected.id || "");
+  const featureId =
+    String(selected.data?.feature_id || "") ||
+    (nodeId.startsWith("feat:") ? nodeId.slice(5) : "");
+  const ownedTaskFrames = new Set(
+    (state.projection?.ships || [])
+      .filter((ship) => String(ship.target_node || "") === nodeId)
+      .map((ship) => ship.task_frame_id)
+      .filter(Boolean)
+  );
+  return rooms.filter(
+    (room) =>
+      (featureId && room.feature_id === featureId) ||
+      (room.task_frame_id && ownedTaskFrames.has(room.task_frame_id))
+  );
+}
+
 // A live terminal working the selected project (its Master/Conductor session).
 function fleetCardSession() {
   const pid = String(state.selectedProject?.project_id || "").toLowerCase();
@@ -4188,20 +4208,14 @@ function renderFleetBoard() {
       const nodeName = fleetNodeLabel(todo.node_ref);
       if (nodeName) meta.append(node("span", "fleet-card-node", nodeName));
       if (todo.priority) meta.append(node("span", "fleet-card-pri", String(todo.priority)));
-      // Session control: on the working lanes, the card is a way in and out of
-      // the terminal dock. Live session → jump to its tab; none → open a new
-      // session for this project.
-      if (["ready", "executing", "verifying"].includes(lane.id)) {
-        const term = fleetCardSession();
-        const sessBadge = node(
-          "button",
-          `fleet-card-sess ${term ? "live" : "idle"}`,
-          term ? "▶ session" : "+ session"
-        );
+      // The board only surfaces sessions that are actually running — a live
+      // terminal for this work opens in the dock on click. New sessions are
+      // started from the terminal dock's + , not from here.
+      const term = fleetCardSession();
+      if (term && ["ready", "executing", "verifying"].includes(lane.id)) {
+        const sessBadge = node("button", "fleet-card-sess live", "▶ session");
         sessBadge.type = "button";
-        sessBadge.title = term
-          ? "Open this session in the dock"
-          : "Start a session for this project";
+        sessBadge.title = "Open this session in the dock";
         sessBadge.addEventListener("click", (event) => {
           event.stopPropagation();
           openFleetCardSession(todo);
@@ -10849,7 +10863,37 @@ function drawGraph() {
     drawGraphNodeIcon(context, item, depthStyle);
   }
   drawGalaxyShips(context, byId);
+  drawGalaxyRooms(context);
   context.restore();
+}
+
+// Rooms projected onto Galaxy planets: a small ◈ over a feature planet that
+// has a meeting room. The node inspector carries the click target.
+function drawGalaxyRooms(context) {
+  const rooms = projectRoomsList();
+  if (!rooms.length) return;
+  const featured = new Set(rooms.map((room) => room.feature_id).filter(Boolean));
+  if (!featured.size) return;
+  for (const item of state.graph.nodes) {
+    if (!item.unifiedKind) continue;
+    const featureId = item.id.startsWith("feat:") ? item.id.slice(5) : "";
+    if (!featureId || !featured.has(featureId)) continue;
+    const metrics = graphNodeMetrics(item);
+    const bx = item.x + metrics.radius * 0.72;
+    const by = item.y + metrics.radius * 0.72;
+    context.beginPath();
+    context.arc(bx, by, 6, 0, Math.PI * 2);
+    context.fillStyle = "#1c1d20";
+    context.fill();
+    context.strokeStyle = "#6f9b93";
+    context.lineWidth = 1;
+    context.stroke();
+    context.fillStyle = "#6f9b93";
+    context.font = "8px Segoe UI";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText("◈", bx, by + 0.5);
+  }
 }
 
 // Ships = executing / verifying Task Frames, drawn as small markers in orbit
@@ -12035,6 +12079,28 @@ function renderDetails() {
   }
   heading.append(grid);
   elements.details.append(heading);
+
+  // Rooms projected onto this node: a MEETING room whose feature this node is,
+  // or a BOSS room for a Task Frame owned here. Galaxy + inspector share this.
+  const nodeRooms = roomsForSelectedNode(selected);
+  if (nodeRooms.length) {
+    const roomGroup = node("div", "detail-group");
+    roomGroup.append(node("h3", "", `Rooms (${nodeRooms.length})`));
+    for (const room of nodeRooms) {
+      const row = node(
+        "button",
+        "todo-context-open",
+        `${ROOM_TYPE_LABEL[room.room_type] || room.room_type} · ${room.title || room.room_id}`
+      );
+      row.type = "button";
+      row.title = "Open room (observation)";
+      row.addEventListener("click", () =>
+        openRoomObservation(room.room_id).catch((error) => toast(error.message, true))
+      );
+      roomGroup.append(row);
+    }
+    elements.details.append(roomGroup);
+  }
 
   const matchingTodos = todosForSelectedContext().filter(
     (todo) => todo.state !== "DONE"

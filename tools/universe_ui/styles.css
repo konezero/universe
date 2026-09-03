@@ -7697,6 +7697,14 @@ body.fleet-mode .fleet-board {
 }
 .fleet-card-sess:hover { border-color: var(--line-strong); }
 
+/* The bottom dock is the session terminal only — the "message the Conductor"
+   composer is superseded by working in the session window. */
+body.terminal-bottom #dispatch-form,
+body.terminal-bottom #room-message-list {
+  display: none !important;
+}
+.chat-dock-icon { display: none; }
+
 .room-dialog { width: min(720px, calc(100vw - 28px)); }
 .room-dialog-body {
   max-height: min(70vh, 720px);
