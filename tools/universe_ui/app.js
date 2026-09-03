@@ -4396,7 +4396,18 @@ function renderIntegratedHome() {
   renderHomeDetail(selNode, selTodo);
   renderHomeKanban(selNode, nodeTodos, selTodo);
   renderHomeWorkSummary(nodeTodos);
-  requestAnimationFrame(drawHomeRelations);
+  // Draw after layout settles; the retry budget resets each render.
+  // (setTimeout, not rAF — rAF is paused when the tab is not foregrounded.)
+  homeRelRetry = 0;
+  setTimeout(drawHomeRelations, 0);
+  setTimeout(drawHomeRelations, 180);
+  const ws = document.querySelector("#goal-plan-workspace");
+  if (ws && !ws.dataset.homeScrollBound) {
+    ws.dataset.homeScrollBound = "1";
+    ws.addEventListener("scroll", () => {
+      if (document.body.classList.contains("home-mode")) drawHomeRelations();
+    });
+  }
 }
 
 function renderHomeProjects() {
@@ -4707,13 +4718,31 @@ function homeRelPath(svg, fromY, toY, strong) {
   svg.append(p);
 }
 
+let homeRelRetry = 0;
 function drawHomeRelations() {
   const root = document.querySelector("#home-view");
   if (!root || root.hidden) return;
+  const rootBox = root.getBoundingClientRect();
+  const relBox = document.querySelector("#home-rel-1")?.getBoundingClientRect();
+  const selCard = document.querySelector("#home-node-list .home-card.sel");
+  const notReady =
+    rootBox.height < 40 ||
+    !relBox ||
+    relBox.height < 20 ||
+    !selCard ||
+    selCard.getBoundingClientRect().height < 5;
+  if (notReady) {
+    if (homeRelRetry < 20) {
+      homeRelRetry += 1;
+      setTimeout(drawHomeRelations, 100);
+    }
+    return;
+  }
+  homeRelRetry = 0;
   const relYOf = (relSel, cardEl) => {
     const rel = document.querySelector(relSel)?.getBoundingClientRect();
     const box = cardEl?.getBoundingClientRect();
-    if (!rel || !box) return null;
+    if (!rel || !box || rel.height < 1) return null;
     const title = cardEl.querySelector(".home-card-title, .home-nav") || cardEl;
     const t = title.getBoundingClientRect();
     return ((t.top + t.height / 2 - rel.top) / rel.height) * 900;

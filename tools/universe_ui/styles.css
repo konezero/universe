@@ -7836,34 +7836,31 @@ body.home-mode .app-shell.mockup-shell > .graph-workspace {
 }
 body.home-mode .goal-plan-workspace {
   padding: 0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
+  overflow: auto;            /* one scroll for the whole canvas */
+  display: block;
+  scrollbar-gutter: auto;
 }
-body.home-mode #home-view { flex: 1; }
+body.home-mode #home-view { min-height: 100%; }
 .home-view {
   display: flex;
-  min-height: 0;
-  height: 100%;
+  align-items: stretch;
+  min-width: max-content;
+  min-height: 100%;
   background: #191a1d;
-  overflow-x: auto;
-  overflow-y: hidden;
 }
-.home-view::-webkit-scrollbar { height: 8px; }
 .home-view[hidden] { display: none; }
 .home-col {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 14px 12px;
-  min-height: 0;
   flex: none;
 }
 .home-col-projects { width: 156px; background: #17181b; }
 .home-col-nodes { width: 220px; }
 .home-col-todos { width: 264px; }
 .home-col-detail { width: 300px; }
-.home-col-body { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; }
+.home-col-body { display: flex; flex-direction: column; gap: 8px; }
 .home-col-head {
   font-size: 10px; letter-spacing: .09em; color: #6f6f6b; text-transform: uppercase;
   padding: 0 3px 2px;
