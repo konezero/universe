@@ -1277,6 +1277,49 @@ class SessionBus:
             self._persist_message(persist_tid, message)
             return self._public_message(message, headers_only=False)
 
+    def _originator_mailbox(
+        self,
+        original: Mapping[str, Any],
+        host: Any | None,
+        stored_tid: str,
+        stored_anchor: str,
+    ) -> tuple[str, str]:
+        source = original.get("from") if isinstance(original.get("from"), Mapping) else {}
+        recipient_tid = str(source.get("terminal_id") or stored_tid).strip()
+        recipient_anchor = str(
+            original.get("source_anchor_ref")
+            or source.get("session_anchor_ref")
+            or ""
+        ).strip()
+        from_provider = str(source.get("provider") or "").upper()
+        # UI-originated work stays on the addressed Session Anchor. A Conductor
+        # or other provider originator must receive the RESULT on their live
+        # Session Anchor even when the inbound `from` omitted it.
+        if (
+            host is not None
+            and from_provider not in {"", "UI"}
+            and (not recipient_anchor or recipient_anchor == stored_anchor)
+        ):
+            matches = match_live_terminals(
+                host,
+                project_id=str(source.get("project_id") or ""),
+                mode=str(source.get("mode") or ""),
+                provider=from_provider,
+            )
+            if matches:
+                live = matches[0]
+                live_anchor = _terminal_anchor(live)
+                live_tid = str(live.get("terminal_id") or "").strip()
+                if live_anchor:
+                    recipient_anchor = live_anchor
+                if live_tid:
+                    recipient_tid = live_tid
+        if not recipient_anchor:
+            recipient_anchor = stored_anchor
+        if not recipient_tid:
+            recipient_tid = stored_tid
+        return recipient_tid, recipient_anchor
+
     def reply(
         self,
         message_id: str,
@@ -1286,6 +1329,7 @@ class SessionBus:
         body_text: str,
         result_ref: str = "",
         outcome: str = "COMPLETED",
+        host: Any | None = None,
     ) -> dict[str, Any]:
         mid = _text(message_id, "message_id", required=True, limit=80)
         body = str(body_text or "").strip()
@@ -1332,7 +1376,7 @@ class SessionBus:
                     409,
                 )
             current = _message_lifecycle(original)
-            if current not in {"STARTED", "COMPLETED", "FAILED"}:
+            if current not in {"STARTED", "COMPLETED", "FAILED", "REPLIED"}:
                 raise SessionBusError(
                     "BUS_LIFECYCLE_TRANSITION_INVALID",
                     f"cannot reply while message is {current}",
@@ -1353,16 +1397,10 @@ class SessionBus:
                 )
             self._persist_message(stored_tid, original)
 
-            source = original.get("from") if isinstance(original.get("from"), Mapping) else {}
             result_id = "msg_" + secrets.token_hex(8)
-            # A UI-originated instruction has no provider terminal of its own.
-            # Keep its result on the addressed Session Anchor so the operator
-            # can see it in the same durable thread. Provider-originated work
-            # still routes back to the explicit source coordinate.
-            recipient_tid = str(source.get("terminal_id") or stored_tid).strip()
-            recipient_anchor = str(
-                original.get("source_anchor_ref") or stored_anchor
-            ).strip()
+            recipient_tid, recipient_anchor = self._originator_mailbox(
+                original, host, stored_tid, stored_anchor
+            )
             thread_id = str(original.get("thread_id") or mid)
             result = {
                 "message_id": result_id,
@@ -1372,7 +1410,11 @@ class SessionBus:
                 "kind": "RESULT",
                 "from": dict(original.get("to") or {}),
                 "to": {
-                    **dict(source),
+                    **dict(
+                        original.get("from")
+                        if isinstance(original.get("from"), Mapping)
+                        else {}
+                    ),
                     "terminal_id": recipient_tid,
                     "session_anchor_ref": recipient_anchor,
                 },

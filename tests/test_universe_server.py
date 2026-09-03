@@ -3817,6 +3817,88 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual([reply["result"]["message_id"]], [item["message_id"] for item in filtered["messages"]])
 
+    def test_grok_session_bus_reply_lands_on_conductor_inbox(self) -> None:
+        master_tid = "term-grok-master-result-001"
+        conductor_tid = "term-claude-conductor-result-001"
+        master_anchor = "session_anchor_grok_master_result_001"
+        conductor_anchor = "session_anchor_claude_conductor_result_001"
+        master = {
+            "terminal_id": master_tid,
+            "project_id": "universe",
+            "mode": "MASTER",
+            "provider": "GROK",
+            "state": "LIVE",
+            "session_anchor_ref": master_anchor,
+            "active_session_anchor_ref": master_anchor,
+        }
+        conductor = {
+            "terminal_id": conductor_tid,
+            "project_id": "universe",
+            "mode": "CONDUCTOR",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "session_anchor_ref": conductor_anchor,
+            "active_session_anchor_ref": conductor_anchor,
+        }
+        host = Mock()
+        host.list_sessions.return_value = [master, conductor]
+        host.list_hosts.return_value = []
+        host.get.side_effect = lambda terminal_id: (
+            master if terminal_id == master_tid else conductor
+        )
+        self.server.terminal_host = host
+        posted = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=master,
+            to={
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "GROK",
+                "terminal_id": master_tid,
+                "session_anchor_ref": master_anchor,
+            },
+            source={
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CLAUDE",
+            },
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="report A/B on the Conductor thread",
+        )
+        self.server.session_bus.claim_instruction(
+            host,
+            terminal_id=master_tid,
+            session_anchor_ref=master_anchor,
+        )
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=master_tid,
+            message_id=posted["message_id"],
+            session_anchor_ref=master_anchor,
+        )
+        status, reply = self.request(
+            "POST",
+            f"/v1/session-bus/messages/{posted['message_id']}/reply",
+            {
+                "session_anchor_ref": master_anchor,
+                "body_text": "A/B roundtrip RESULT",
+                "outcome": "COMPLETED",
+            },
+            self.token,
+        )
+        self.assertEqual(201, status, reply)
+        self.assertEqual("REPLIED", reply["status"])
+        self.assertEqual("RESULT", reply["result"]["kind"])
+        self.assertEqual(conductor_anchor, reply["result"]["recipient_anchor_ref"])
+        status, inbox = self.request(
+            "GET",
+            "/v1/session-bus/inbox?session_anchor_ref=" + conductor_anchor,
+            token=self.token,
+        )
+        self.assertEqual(200, status)
+        result_ids = [item["message_id"] for item in inbox["messages"] if item.get("kind") == "RESULT"]
+        self.assertIn(reply["result"]["message_id"], result_ids)
+
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         delegation, created = self.server.store.create_conductor_delegation(

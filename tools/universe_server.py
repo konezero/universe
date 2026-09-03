@@ -31279,6 +31279,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 body_text=str(payload.get("body_text") or payload.get("text") or ""),
                 result_ref=str(payload.get("result_ref") or ""),
                 outcome=str(payload.get("outcome") or "COMPLETED"),
+                host=self._session_anchor_terminal_host(),
             )
         except SessionBusError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
@@ -35286,6 +35287,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         result_ref=str(result.get("result_ref") or "")
                         or f"claude-channel://{terminal_id}/{message_id}",
                         outcome=str(result.get("outcome") or "COMPLETED"),
+                        host=self._session_anchor_terminal_host(),
                     )
                 try:
                     channel_result = self.terminal_host.push_channel(
@@ -35398,6 +35400,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         body_text=body,
                         result_ref=result_ref,
                         outcome=outcome,
+                        host=self._session_anchor_terminal_host(),
                     )
                 except SessionBusError as error:
                     # Result delivery failures must remain observable on the
