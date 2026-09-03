@@ -4094,6 +4094,23 @@ function renderFleetBoard() {
   const shipsByTodo = new Map(
     (state.projection?.ships || []).map((s) => [s.todo_id, s])
   );
+  // Rooms projected onto the board: a BOSS room follows its Task Frame, a
+  // MEETING room follows the feature node it explored.
+  const roomByTaskFrame = new Map();
+  const roomByFeature = new Map();
+  for (const room of projectRoomsList()) {
+    if (room.task_frame_id) roomByTaskFrame.set(room.task_frame_id, room);
+    if (room.feature_id) roomByFeature.set(room.feature_id, room);
+  }
+  const fleetCardRoom = (todo) => {
+    const shipTaskFrame = shipsByTodo.get(todo.todo_id)?.task_frame_id;
+    return (
+      (todo.task_frame_id && roomByTaskFrame.get(todo.task_frame_id)) ||
+      (shipTaskFrame && roomByTaskFrame.get(shipTaskFrame)) ||
+      roomByFeature.get(String(todo.node_ref || "")) ||
+      null
+    );
+  };
   for (const lane of FLEET_LANES) {
     const laneEl = node("div", `fleet-lane fleet-lane-${lane.id}`);
     const items = todos.filter((t) => lane.states.includes(String(t.state || "").toUpperCase()));
@@ -4110,6 +4127,17 @@ function renderFleetBoard() {
       if (todo.priority) meta.append(node("span", "fleet-card-pri", String(todo.priority)));
       if (shipsByTodo.has(todo.todo_id)) {
         meta.append(node("span", "fleet-card-ship", "▶ session"));
+      }
+      const room = fleetCardRoom(todo);
+      if (room) {
+        const roomBadge = node("button", "fleet-card-room", "◈ room");
+        roomBadge.type = "button";
+        roomBadge.title = room.title || "Open room";
+        roomBadge.addEventListener("click", (event) => {
+          event.stopPropagation();
+          openRoomObservation(room.room_id).catch((error) => toast(error.message, true));
+        });
+        meta.append(roomBadge);
       }
       card.append(meta);
       list.append(card);
@@ -4836,6 +4864,14 @@ async function selectProject(
   state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
   );
+  // Rooms are projected onto the Fleet board; load them so renderFleetBoard can
+  // badge cards. Non-blocking — a slow/failed room list must not stall project
+  // selection.
+  refreshProjectRooms()
+    .then(() => {
+      if (state.goalPlanLayout === "board") renderFleetBoard();
+    })
+    .catch(() => { /* board just renders without room badges */ });
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -7412,6 +7448,284 @@ async function openMultiRoom(roomId) {
   await refreshActiveRoomFeatures({ render: false });
   renderActiveMultiRoom();
   openMultiRoomStream(roomId);
+}
+
+// ---------------------------------------------------------------------------
+// Room observation popup.
+//
+// Rooms are the agent communication space (Conductor / Master / Boss / Workers
+// talking); the user drives agents from the session window, not from here. So
+// this popup is an *observation* surface — the transcript, decisions, artifacts
+// and findings of one room — reachable from a badge on the Fleet board or from
+// the rail's room index. It is deliberately read-only.
+// ---------------------------------------------------------------------------
+const ROOM_TYPE_LABEL = { PROJECT: "Project room", BOSS: "Boss room", MEETING: "Meeting room" };
+
+function closeRoomObsStream() {
+  if (state.roomObsStream) {
+    try { state.roomObsStream.close(); } catch (_) { /* already closed */ }
+  }
+  state.roomObsStream = null;
+}
+
+function roomObsMessageArticle(message) {
+  const role = String(message.author_role || message.role || "SYSTEM").toUpperCase();
+  const item = node("article", `room-message room-obs-message ${role.toLowerCase()}`);
+  const meta = node("div", "room-obs-message-meta");
+  meta.append(node("span", "room-obs-role", role));
+  const kind = String(message.kind || "").toUpperCase();
+  if (kind && kind !== "MESSAGE") meta.append(node("span", "room-obs-kind", kind));
+  if (message.created_at) {
+    meta.append(node("time", "", formatSessionTime(message.created_at, { withSeconds: false })));
+  }
+  item.append(meta);
+  const body = String(message.body_text || message.text || "").trim();
+  if (body) item.append(node("pre", "room-obs-body", body));
+  return item;
+}
+
+function renderRoomObservation(snap) {
+  const body = document.querySelector("#room-dialog-body");
+  if (!body || !snap) return;
+  const room = snap.room || {};
+  const roomType = String(room.room_type || "").toUpperCase();
+  document.querySelector("#room-dialog-kicker").textContent =
+    ROOM_TYPE_LABEL[roomType] || "Room";
+  document.querySelector("#room-dialog-title").textContent =
+    room.title || room.room_id || "Room";
+  const parts = [];
+  if (room.state) parts.push(room.state);
+  if (Number.isFinite(Number(room.participant_count))) parts.push(`${room.participant_count} participants`);
+  const writeRoles = snap.write_roles || [];
+  if (writeRoles.length) parts.push(`writes: ${writeRoles.join(" · ")}`);
+  document.querySelector("#room-dialog-subtitle").textContent = parts.join("  ·  ");
+
+  body.replaceChildren();
+
+  const toolbar = node("div", "room-obs-toolbar");
+  const back = node("button", "secondary-button", "← All rooms");
+  back.type = "button";
+  back.addEventListener("click", () => openRoomIndex());
+  const refresh = node("button", "secondary-button", "Refresh");
+  refresh.type = "button";
+  refresh.addEventListener("click", () => {
+    api(`/v1/rooms/${encodeURIComponent(room.room_id)}`)
+      .then((next) => renderRoomObservation(next))
+      .catch((error) => toast(error.message, true));
+  });
+  toolbar.append(back, refresh);
+  body.append(toolbar);
+
+  body.append(
+    node(
+      "p",
+      "room-obs-hint",
+      "Observation only — reply to these agents from the session window."
+    )
+  );
+
+  // BOSS rooms carry their transcript as the Task Frame timeline; the rest use
+  // chat messages.
+  const timeline = snap.task_frame_timeline;
+  if (roomType === "BOSS" && timeline && (timeline.entries || []).length) {
+    body.append(renderTaskFrameTimeline(timeline));
+  }
+
+  const messages = snap.messages || [];
+  if (messages.length) {
+    const transcript = node("section", "room-obs-transcript");
+    transcript.append(node("h3", "", `Messages (${messages.length})`));
+    for (const message of messages) transcript.append(roomObsMessageArticle(message));
+    body.append(transcript);
+  }
+
+  const artifacts = snap.artifacts || [];
+  if (artifacts.length) {
+    const section = node("section", "room-obs-artifacts");
+    section.append(node("h3", "", `Artifacts (${artifacts.length})`));
+    for (const artifact of artifacts) {
+      const row = node("article", "room-obs-artifact");
+      row.append(
+        node("strong", "", artifact.title || artifact.artifact_id),
+        node(
+          "small",
+          "",
+          [artifact.artifact_type, artifact.state].filter(Boolean).join(" · ")
+        )
+      );
+      if (artifact.summary) row.append(node("p", "", artifact.summary));
+      section.append(row);
+    }
+    body.append(section);
+  }
+
+  const findings = snap.findings || [];
+  if (findings.length) {
+    const section = node("section", "room-obs-findings");
+    section.append(node("h3", "", `Findings (${findings.length})`));
+    for (const finding of findings) {
+      const row = node("article", `room-obs-finding ${String(finding.state || "").toLowerCase()}`);
+      row.append(
+        node("strong", "", finding.summary || finding.finding_id),
+        node("small", "", [finding.finding_type, finding.state].filter(Boolean).join(" · "))
+      );
+      section.append(row);
+    }
+    body.append(section);
+  }
+
+  if (
+    !messages.length &&
+    !artifacts.length &&
+    !findings.length &&
+    !(roomType === "BOSS" && timeline && (timeline.entries || []).length)
+  ) {
+    body.append(node("p", "empty-copy", "This room has no activity yet."));
+  }
+}
+
+async function openRoomObservation(roomId) {
+  const dialog = document.querySelector("#room-dialog");
+  if (!dialog) return;
+  state.roomObsId = roomId;
+  closeRoomObsStream();
+  if (!dialog.open) dialog.showModal();
+  const body = document.querySelector("#room-dialog-body");
+  body.replaceChildren(node("p", "empty-copy", "Loading room…"));
+  try {
+    const snap = await api(`/v1/rooms/${encodeURIComponent(roomId)}`);
+    if (state.roomObsId !== roomId) return;
+    renderRoomObservation(snap);
+  } catch (error) {
+    body.replaceChildren(node("p", "form-error", error.message));
+    return;
+  }
+  // Live updates: the room stream re-emits a full snapshot on every change.
+  try {
+    const source = new EventSource(`/v1/rooms/${encodeURIComponent(roomId)}/stream`);
+    state.roomObsStream = source;
+    source.addEventListener("snapshot", (event) => {
+      if (state.roomObsId !== roomId) return;
+      try {
+        const payload = JSON.parse(event.data);
+        renderRoomObservation({
+          room: payload.room,
+          messages: payload.messages || [],
+          artifacts: payload.artifacts || [],
+          findings: payload.findings || [],
+          task_frame_timeline: payload.task_frame_timeline,
+          write_roles: payload.write_roles || [],
+        });
+      } catch (_) { /* ignore malformed frame */ }
+    });
+    source.onerror = () => closeRoomObsStream();
+  } catch (_) { /* EventSource unavailable — refresh button still works */ }
+}
+
+function projectRoomsList() {
+  return Array.isArray(state.projectRooms) ? state.projectRooms : [];
+}
+
+async function refreshProjectRooms() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) {
+    state.projectRooms = [];
+    return [];
+  }
+  const project = encodeURIComponent(projectId);
+  const [roomResult, featureResult] = await Promise.all([
+    api(`/v1/rooms?project_id=${project}&state=ALL`).catch(() => ({ rooms: [] })),
+    api(`/v1/projects/${project}/feature-nodes`).catch(() => ({ features: [] })),
+  ]);
+  const rooms = roomResult.rooms || [];
+  // Annotate MEETING rooms with the feature node they explore, so the Fleet
+  // board can badge a card whose owner node is that feature.
+  const featureByRoom = new Map(
+    (featureResult.features || [])
+      .filter((feature) => feature.meeting_room_id)
+      .map((feature) => [feature.meeting_room_id, feature.feature_id])
+  );
+  for (const room of rooms) {
+    const featureId = featureByRoom.get(room.room_id);
+    if (featureId) room.feature_id = featureId;
+  }
+  state.projectRooms = rooms;
+  return state.projectRooms;
+}
+
+async function openRoomIndex() {
+  const dialog = document.querySelector("#room-dialog");
+  if (!dialog) return;
+  state.roomObsId = null;
+  closeRoomObsStream();
+  if (!dialog.open) dialog.showModal();
+  document.querySelector("#room-dialog-kicker").textContent = "Communication";
+  document.querySelector("#room-dialog-title").textContent = "Rooms";
+  const projectId = state.selectedProject?.project_id;
+  document.querySelector("#room-dialog-subtitle").textContent = projectId
+    ? `${projectId} — agent conversation spaces`
+    : "agent conversation spaces";
+  const body = document.querySelector("#room-dialog-body");
+  body.replaceChildren(node("p", "empty-copy", "Loading rooms…"));
+  const rooms = await refreshProjectRooms();
+  body.replaceChildren();
+  if (!rooms.length) {
+    body.append(node("p", "empty-copy", "No rooms for this project yet."));
+    return;
+  }
+  body.append(
+    node(
+      "p",
+      "room-obs-hint",
+      "Rooms are where agents coordinate. Open one to watch; talk to agents from the session window."
+    )
+  );
+  const order = ["PROJECT", "MEETING", "BOSS"];
+  const grouped = new Map(order.map((type) => [type, []]));
+  for (const room of rooms) {
+    const type = String(room.room_type || "").toUpperCase();
+    if (!grouped.has(type)) grouped.set(type, []);
+    grouped.get(type).push(room);
+  }
+  for (const type of order) {
+    const full = (grouped.get(type) || []).sort((a, b) =>
+      String(b.updated_at || "").localeCompare(String(a.updated_at || ""))
+    );
+    if (!full.length) continue;
+    // BOSS rooms are one-per-Task-Frame-run and pile up; show the recent ones.
+    const cap = type === "BOSS" ? 12 : full.length;
+    const list = full.slice(0, cap);
+    const section = node("section", "room-index-group");
+    const countLabel = full.length > list.length
+      ? `${list.length} of ${full.length}`
+      : `${full.length}`;
+    section.append(node("h3", "", `${ROOM_TYPE_LABEL[type] || type} (${countLabel})`));
+    for (const room of list) {
+      const row = node("button", `room-index-row state-${String(room.state || "").toLowerCase()}`);
+      row.type = "button";
+      row.append(
+        node("span", "room-index-title", room.title || room.room_id),
+        node(
+          "span",
+          "room-index-meta",
+          [
+            room.state,
+            Number.isFinite(Number(room.participant_count))
+              ? `${room.participant_count}p`
+              : null,
+            room.updated_at
+              ? formatSessionTime(room.updated_at, { relative: true, withSeconds: false })
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")
+        )
+      );
+      row.addEventListener("click", () => openRoomObservation(room.room_id));
+      section.append(row);
+    }
+    body.append(section);
+  }
 }
 
 function renderTaskFrameTimeline(timeline) {
@@ -16192,8 +16506,8 @@ function bindGoalPlanEvents() {
     const button = event.target.closest("[data-primary-view]");
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
-    if (view === "work") showGoalPlanView();
-    else if (view === "fleet") {
+    // Fleet is home: "work" and "fleet" both land on the kanban board.
+    if (view === "work" || view === "fleet") {
       setGoalPlanLayout("board");
       showGoalPlanView();
       syncPrimaryNavSelection("fleet");
@@ -16202,11 +16516,13 @@ function bindGoalPlanEvents() {
     else if (view === "documents") showGraphView("documents");
     else if (view === "sessions") showGraphView("sessions");
     else if (view === "meeting") {
-      state.settingsTab = "rooms";
-      openProviderSettings().catch((error) => toast(error.message, true));
+      openRoomIndex().catch((error) => toast(error.message, true));
     }
     else if (view === "bench") showBenchScreen();
-    else if (["memory", "activity", "details"].includes(view)) openInspectorSurface(view);
+    // Memory / Activity live in the Galaxy knowledge graph now, not a rail view.
+    else if (["memory", "activity", "details", "future"].includes(view)) {
+      openInspectorSurface(view === "future" ? "details" : view);
+    }
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
   elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);
@@ -16432,6 +16748,10 @@ refreshLawStrip = function () {
   for (const button of document.querySelectorAll("[data-close-dialog]")) {
     button.addEventListener("click", () => button.closest("dialog").close());
   }
+  document.querySelector("#room-dialog")?.addEventListener("close", () => {
+    state.roomObsId = null;
+    closeRoomObsStream();
+  });
 
   // Graph mode lives on top primary nav (showGraphView). Legacy [data-view]
   // controls were removed to stop Map/Timeline/Memory duplicates.

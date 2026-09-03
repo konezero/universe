@@ -7625,6 +7625,13 @@ body.fleet-mode .fleet-board {
 }
 .topbar .brand-copy strong { font-size: 14px; }
 
+/* Session Observatory is an operator surface, not a user view — hide every
+   entry point (the dialog code stays wired, just unreachable). */
+#session-observatory-button,
+#session-summary-manage {
+  display: none;
+}
+
 /* Conductor panel: it's the terminal dock now, not a dashboard. Drop the
    redundant ghost-actions (Multiverse Map = Galaxy, Future = inspector,
    Dispatch Board = Fleet) and the greeting; keep a compact metric strip. */
@@ -7642,3 +7649,119 @@ body.fleet-mode .fleet-board {
 .app-shell.mockup-shell .conductor-panel .metric-card small {
   display: none;
 }
+
+/* ============================================================
+   Rooms: projected onto the Fleet board + observation popup.
+   Rooms are the agent communication space; the user drives agents
+   from the session window, so the popup is read-only.
+   ============================================================ */
+.fleet-card-room {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(111, 155, 147, 0.12);
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.fleet-card-room:hover {
+  background: rgba(111, 155, 147, 0.22);
+}
+
+.room-dialog { width: min(720px, calc(100vw - 28px)); }
+.room-dialog-body {
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+  padding: 0 16px 16px;
+  display: grid;
+  gap: 14px;
+}
+.room-obs-toolbar { display: flex; gap: 8px; }
+.room-obs-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+.room-obs-transcript,
+.room-obs-artifacts,
+.room-obs-findings,
+.room-index-group { display: grid; gap: 8px; }
+.room-obs-transcript h3,
+.room-obs-artifacts h3,
+.room-obs-findings h3,
+.room-index-group h3 {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.room-obs-message {
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.room-obs-message.user { border-left-color: var(--teal); }
+.room-obs-message.model,
+.room-obs-message.conductor { border-left-color: var(--violet); }
+.room-obs-message.master { border-left-color: var(--blue); }
+.room-obs-message-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.room-obs-role { font-size: 10px; font-weight: 750; color: var(--text-2); letter-spacing: 0.03em; }
+.room-obs-kind {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(166, 141, 91, 0.16);
+  color: var(--amber);
+  font-size: 9px;
+  font-weight: 700;
+}
+.room-obs-message-meta time { color: var(--text-3); font-size: 10px; }
+.room-obs-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  color: var(--text-1);
+}
+.room-obs-artifact,
+.room-obs-finding {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+}
+.room-obs-artifact small,
+.room-obs-finding small { color: var(--muted); font-size: 10px; }
+.room-obs-artifact p { margin: 2px 0 0; color: var(--text-2); font-size: 12px; }
+.room-obs-finding.open { border-left: 3px solid var(--amber); }
+.room-obs-finding.resolved { border-left: 3px solid var(--green); }
+
+.room-index-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-1);
+  text-align: left;
+  cursor: pointer;
+}
+.room-index-row:hover { border-color: var(--line-strong); background: rgba(111, 155, 147, 0.08); }
+.room-index-title { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-index-meta { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+.room-index-row.state-closed { opacity: 0.55; }

@@ -43,10 +43,8 @@
     </header>
 
     <nav class="utility-rail" aria-label="Universe tools">
-      <button class="selected" type="button" data-primary-view="work" title="Home"><span aria-hidden="true">&#8962;</span><small>Home</small></button>
+      <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
       <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true">&#9675;</span><small>Galaxy</small></button>
-      <button type="button" data-primary-view="fleet" title="Kanban execution board"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
-      <button type="button" data-primary-view="memory" title="Memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
       <button type="button" data-primary-view="meeting" title="Collaboration Rooms"><span aria-hidden="true">&#9672;</span><small>Rooms</small></button>
@@ -1355,6 +1353,18 @@
       </div>
       <section id="release-proposal-output" class="proposal-output hidden"></section>
     </form>
+  </dialog>
+
+  <dialog id="room-dialog" class="wide-dialog room-dialog" aria-labelledby="room-dialog-title">
+    <div class="dialog-heading">
+      <div>
+        <span class="inspector-kicker" id="room-dialog-kicker">Room</span>
+        <h2 id="room-dialog-title">Rooms</h2>
+        <p id="room-dialog-subtitle"></p>
+      </div>
+      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div id="room-dialog-body" class="room-dialog-body"></div>
   </dialog>
 
 
