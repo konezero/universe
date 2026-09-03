@@ -14,24 +14,28 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .kicker { font-size: 10px; letter-spacing: .09em; color: #6f6f6b; text-transform: uppercase; }
     .card { border: 1px solid #31333a; border-radius: 8px; background: #212327; }
-    .card.sel { border-color: #6f9b93; }
+    .card.sel { border-color: #7fb0a7; box-shadow: 0 0 0 1px rgba(127,176,167,0.25); }
+    .card.blocked { border-color: #c26b5e; }
     .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
     .chip { font-size: 9px; font-weight: 650; padding: 1px 6px; border-radius: 999px;
       border: 1px solid #34363c; color: #a8a8a4; }
     .navrow { display: flex; align-items: center; gap: 7px; padding: 7px 9px; border-radius: 6px;
       background: transparent; border: 1px solid transparent; color: #a8a8a4; font: inherit;
       font-size: 11px; text-align: left; cursor: pointer; }
-    .navrow.sel { background: #212327; border-color: #6f9b93; color: #e6e6e4; }
+    .navrow.sel { background: #212327; border-color: #7fb0a7; color: #e6e6e4; }
     .addbtn { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px;
       border: 1px dashed #43454c; border-radius: 8px; background: transparent; color: #8a8a86;
       font: inherit; font-size: 11px; cursor: pointer; }
+    .col { padding: 14px 12px; display: flex; flex-direction: column; gap: 9px; }
+    .gap { width: 30px; flex: none; position: relative; }
+    .gap svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   </style>
 </helmet>
 
 <div style="width:1600px;height:1000px;display:flex;flex-direction:column;overflow:hidden;background:#191a1d">
 
   <!-- top bar -->
-  <div style="height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid #31333a;background:#17181b">
+  <div style="height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid #26272c;background:#17181b">
     <div style="width:18px;height:18px;border-radius:50%;background:#6f9b93"></div>
     <div style="font-size:13px;font-weight:600">Universe</div>
     <div style="flex:1;max-width:420px;height:30px;border:1px solid #31333a;border-radius:8px;display:flex;align-items:center;padding:0 12px;font-size:12px;color:#6f6f6b">Search projects, nodes, todos, sessions&hellip;</div>
@@ -40,10 +44,10 @@
     <div style="width:26px;height:26px;border-radius:50%;border:1px solid #43454c"></div>
   </div>
 
-  <div style="flex:1;display:flex;min-height:0">
+  <div style="flex:1;display:flex;min-height:0;background:#191a1d">
 
     <!-- utility rail -->
-    <div style="width:54px;border-right:1px solid #31333a;background:#17181b;display:flex;flex-direction:column;align-items:center;padding-top:12px;gap:12px;color:#8a8a86;font-size:8px">
+    <div style="width:54px;flex:none;background:#17181b;display:flex;flex-direction:column;align-items:center;padding-top:12px;gap:12px;color:#8a8a86;font-size:8px">
       <div style="display:flex;flex-direction:column;align-items:center;gap:3px;color:#6f9b93">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
         Home</div>
@@ -61,8 +65,8 @@
         Rooms</div>
     </div>
 
-    <!-- COLUMN 0 — PROJECTS (product / 최종골) -->
-    <div style="width:152px;border-right:1px solid #31333a;background:#17181b;padding:14px 9px;display:flex;flex-direction:column;gap:5px">
+    <!-- PROJECTS -->
+    <div class="col" style="width:150px;flex:none;background:#17181b">
       <div class="kicker" style="padding:0 4px 3px">Projects</div>
       <button class="navrow sel">
         <span class="dot" style="background:#6f9b78"></span>
@@ -89,8 +93,15 @@
       </button>
     </div>
 
-    <!-- COLUMN 1 — NODES (sub-goals of the selected project) -->
-    <div style="width:224px;border-right:1px solid #31333a;background:#191a1d;padding:14px 12px;display:flex;flex-direction:column;gap:9px">
+    <!-- relation: project → nodes -->
+    <div class="gap">
+      <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
+        <path d="M0 40 L 30 60" stroke="#7fb0a7" stroke-width="1.8"/>
+      </svg>
+    </div>
+
+    <!-- NODES -->
+    <div class="col" style="width:210px;flex:none">
       <div class="kicker">universe &middot; nodes</div>
 
       <div class="card sel" style="overflow:hidden">
@@ -107,12 +118,15 @@
         <div style="padding:7px 11px;border-top:1px solid #31333a;font-size:10px;color:#8a8a86;line-height:1.45">세션·룸·실행에서 지식과 lineage 누적</div>
       </div>
 
-      <div class="card" style="overflow:hidden">
-        <div style="padding:9px 11px;font-size:12px;font-weight:600;color:#d0d1d6">Session Continuity</div>
+      <div class="card blocked" style="overflow:hidden">
+        <div style="padding:9px 11px;font-size:12px;font-weight:600;color:#d0d1d6;display:flex;align-items:center;gap:6px">
+          Session Continuity
+          <span class="dot" style="background:#c26b5e;margin-left:auto"></span>
+        </div>
         <div style="padding:7px 11px;border-top:1px solid #31333a;font-size:10px;color:#8a8a86;line-height:1.45">재접속 가능한 PTY 핸들 유지</div>
         <div style="padding:7px 11px;border-top:1px solid #31333a;display:flex;align-items:center;gap:6px">
-          <span class="dot" style="background:#6f9b78"></span>
-          <span style="font-size:10px;color:#7fb0a7">GROK &middot; r14</span>
+          <span class="dot" style="background:#c26b5e"></span>
+          <span style="font-size:10px;color:#c99187">GROK &middot; blocked</span>
         </div>
       </div>
 
@@ -128,15 +142,17 @@
       </button>
     </div>
 
-    <!-- COLUMN 2 — TODOs of the selected node -->
-    <div style="width:270px;border-right:1px solid #31333a;background:#191a1d;padding:14px 15px 14px 21px;display:flex;flex-direction:column;gap:8px;position:relative">
-      <svg style="position:absolute;left:6px;top:34px;width:15px;height:250px;overflow:visible" fill="none" stroke="#43454c" stroke-width="1.2">
-        <path d="M0 0 V 240"/>
-        <path d="M0 26 H 15"/>
-        <path d="M0 116 H 15"/>
-        <path d="M0 190 H 15"/>
+    <!-- relation: selected node → its todos (selected todo bright) -->
+    <div class="gap">
+      <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
+        <path d="M0 70 L 30 40" stroke="#7fb0a7" stroke-width="1.8"/>
+        <path d="M0 70 L 30 150" stroke="#31333a" stroke-width="1.2"/>
+        <path d="M0 70 L 30 244" stroke="#31333a" stroke-width="1.2"/>
       </svg>
+    </div>
 
+    <!-- TODOS of the selected node -->
+    <div class="col" style="width:256px;flex:none">
       <div class="kicker">Action Runtime &middot; todos</div>
 
       <div class="card sel" style="padding:9px 10px;display:flex;flex-direction:column;gap:5px">
@@ -158,11 +174,13 @@
         </div>
       </div>
 
-      <div class="card" style="padding:9px 10px;display:flex;flex-direction:column;gap:5px">
-        <div style="font-size:11px;font-weight:600;line-height:1.35;color:#d0d1d6">UI와 Conductor의 공용 호출 경로 연결</div>
+      <div class="card blocked" style="padding:9px 10px;display:flex;flex-direction:column;gap:5px">
+        <div style="font-size:11px;font-weight:600;line-height:1.35;color:#d0d1d6">ConPTY 핸들이 supervisor 재시작 후에도 유지</div>
         <div style="display:flex;align-items:center;gap:6px">
-          <span style="font-size:9px;color:#8a8a86">Planned</span>
-          <span class="chip" style="margin-left:auto">P1</span>
+          <span class="dot" style="background:#c26b5e"></span>
+          <span style="font-size:9px;color:#c99187;font-weight:650">Blocked</span>
+          <span style="font-size:9px;color:#8a8a86">&middot; 승인 패킷 대기</span>
+          <span class="chip" style="margin-left:auto">P0</span>
         </div>
       </div>
 
@@ -175,15 +193,22 @@
       </div>
     </div>
 
-    <!-- COLUMN 3 — Todo detail + Kanban -->
+    <!-- relation: selected todo → detail + kanban -->
+    <div class="gap">
+      <svg viewBox="0 0 30 860" preserveAspectRatio="none" fill="none">
+        <path d="M0 40 L 30 120" stroke="#7fb0a7" stroke-width="1.8"/>
+      </svg>
+    </div>
+
+    <!-- DETAIL + KANBAN -->
     <div style="flex:1;display:flex;min-width:0">
 
-      <!-- 3a: Todo detail -->
-      <div style="width:300px;border-right:1px solid #31333a;background:#191a1d;padding:14px 15px;display:flex;flex-direction:column;gap:11px">
+      <!-- Todo detail -->
+      <div class="col" style="width:288px;flex:none;gap:11px">
         <div class="kicker">Todo 상세</div>
         <div style="font-size:13px;font-weight:650;line-height:1.35">Action 정의 계약과 최소 Registry 구축</div>
 
-        <div style="display:grid;grid-template-columns:70px minmax(0,1fr);gap:7px 10px;font-size:11px">
+        <div style="display:grid;grid-template-columns:66px minmax(0,1fr);gap:7px 10px;font-size:11px">
           <span style="color:#8a8a86">Lane</span><span style="color:#6f9b78;font-weight:650">Executing</span>
           <span style="color:#8a8a86">Node</span><span>Action Runtime</span>
           <span style="color:#8a8a86">Lineage</span><span style="color:#a8a8a4">Goal / Milestone</span>
@@ -213,59 +238,65 @@
         <button style="padding:8px;border:1px solid #43454c;border-radius:7px;background:#212327;color:#a8a8a4;font:inherit;font-size:11px;cursor:pointer">세션 창 열기</button>
       </div>
 
-      <!-- 3b: Kanban board -->
-      <div style="flex:1;display:flex;flex-direction:column;background:#191a1d;padding:14px 16px;min-width:0;position:relative">
+      <!-- Kanban -->
+      <div style="flex:1;display:flex;flex-direction:column;padding:14px 16px;min-width:0;position:relative">
         <div class="kicker" style="margin-bottom:10px">Kanban &mdash; Action Runtime</div>
 
-        <div style="display:flex;flex-direction:column;gap:1px;background:#31333a;border:1px solid #31333a;border-radius:9px;overflow:hidden">
+        <div style="display:flex;flex-direction:column;gap:1px;background:#26272c;border:1px solid #26272c;border-radius:9px;overflow:hidden">
 
-          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:46px">
-            <span style="width:78px;font-size:10px;color:#8a8a86;letter-spacing:.04em">PLANNED</span>
-            <div style="flex:1;display:flex;gap:7px;flex-wrap:wrap">
-              <span class="chip" style="background:#212327">UI+Conductor 공용 호출 경로</span>
-            </div>
+          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:44px">
+            <span style="width:76px;font-size:10px;color:#8a8a86;letter-spacing:.04em">PLANNED</span>
+            <div style="flex:1"></div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:46px">
-            <span style="width:78px;font-size:10px;color:#8a8a86;letter-spacing:.04em">READY</span>
+          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:44px">
+            <span style="width:76px;font-size:10px;color:#8a8a86;letter-spacing:.04em">READY</span>
             <div style="flex:1;display:flex;gap:7px;flex-wrap:wrap">
               <span class="chip" style="background:#212327">feature.goal.start Adapter</span>
             </div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;background:#1c1d20;padding:10px 14px;min-height:56px">
-            <span style="width:78px;font-size:10px;color:#6f9b78;font-weight:650;letter-spacing:.04em">EXECUTING</span>
-            <div style="flex:1;display:flex;gap:7px;align-items:center;flex-wrap:wrap">
-              <span style="font-size:10px;font-weight:600;padding:4px 9px;border-radius:6px;border:1px solid #6f9b93;background:rgba(111,155,147,0.1);color:#e6e6e4">Action 정의 계약과 최소 Registry</span>
+          <div style="display:flex;align-items:center;gap:12px;background:#1c1d20;padding:10px 14px;min-height:54px">
+            <span style="width:76px;font-size:10px;color:#6f9b78;font-weight:650;letter-spacing:.04em">EXECUTING</span>
+            <div style="flex:1;display:flex;gap:7px;align-items:center;flex-wrap:wrap;min-width:0">
+              <span style="font-size:10px;font-weight:600;padding:4px 9px;border-radius:6px;border:1px solid #7fb0a7;background:rgba(111,155,147,0.1);color:#e6e6e4">Action 정의 계약과 최소 Registry</span>
             </div>
-            <div style="display:flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid #43454c;border-radius:999px;background:#212327">
+            <div style="display:flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid #43454c;border-radius:999px;background:#212327;flex:none">
               <span class="dot" style="background:#6f9b78"></span>
               <span style="font-size:10px;font-weight:650;color:#7fb0a7">CODEX</span>
             </div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:46px">
-            <span style="width:78px;font-size:10px;color:#a68d5b;letter-spacing:.04em">VERIFYING</span>
+          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:44px">
+            <span style="width:76px;font-size:10px;color:#a68d5b;letter-spacing:.04em">VERIFYING</span>
             <div style="flex:1"></div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:46px">
-            <span style="width:78px;font-size:10px;color:#a86f66;letter-spacing:.04em">BLOCKED</span>
-            <div style="flex:1"></div>
+          <div style="display:flex;align-items:center;gap:12px;background:#1c1d20;padding:10px 14px;min-height:54px">
+            <span style="width:76px;font-size:10px;color:#c26b5e;font-weight:650;letter-spacing:.04em">BLOCKED</span>
+            <div style="flex:1;display:flex;gap:7px;align-items:center;flex-wrap:wrap;min-width:0">
+              <span style="font-size:10px;font-weight:600;padding:4px 9px;border-radius:6px;border:1px solid #c26b5e;background:#212327;color:#e6e6e4">ConPTY 핸들 유지</span>
+              <span style="font-size:9px;color:#c99187">승인 패킷 대기</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid #c26b5e;border-radius:999px;background:#212327;flex:none">
+              <span class="dot" style="background:#c26b5e"></span>
+              <span style="font-size:10px;font-weight:650;color:#c99187">GROK</span>
+            </div>
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:46px">
-            <span style="width:78px;font-size:10px;color:#6f9b78;letter-spacing:.04em">DONE</span>
-            <div style="flex:1;display:flex;gap:7px;flex-wrap:wrap;opacity:.6">
+          <div style="display:flex;align-items:center;gap:12px;background:#191a1d;padding:10px 14px;min-height:44px">
+            <span style="width:76px;font-size:10px;color:#6f9b78;letter-spacing:.04em">DONE</span>
+            <div style="flex:1;display:flex;gap:7px;flex-wrap:wrap;opacity:.55">
               <span class="chip" style="background:#212327">Registry seed 스키마</span>
               <span class="chip" style="background:#212327">Action IR 타입 정의</span>
             </div>
           </div>
         </div>
 
-        <svg style="position:absolute;right:58px;top:150px;width:120px;height:210px;overflow:visible" fill="none" stroke="#43454c" stroke-width="1.2">
-          <path d="M112 0 V 150 Q 112 168 94 168 L 30 168"/>
-          <path d="M38 162 L 28 168 L 38 174"/>
+        <!-- relation: agent → work summary -->
+        <svg style="position:absolute;right:56px;top:148px;width:120px;height:200px;overflow:visible" fill="none" stroke="#7fb0a7" stroke-width="1.6">
+          <path d="M112 0 L 34 166"/>
+          <path d="M40 150 L 32 168 L 52 166"/>
         </svg>
 
         <div style="flex:1"></div>
@@ -277,11 +308,17 @@
             <span style="font-size:10px;color:#8a8a86">PTY live &middot; 4m</span>
             <span style="margin-left:auto;font-size:10px;color:#8a8a86">작업내용 보기</span>
           </div>
-          <div class="mono" style="font-size:10px;color:#a8a8a4;line-height:1.7">
-            <div>&rsaquo; building Action IR registry&hellip;</div>
-            <div>&rsaquo; 15 tests &middot; test_action_ir_cli test_execution_guard_policy</div>
-            <div style="color:#6f9b78">&check; all passed</div>
-            <div style="color:#a68d5b">&bull; waiting for approval packet</div>
+          <div class="mono" style="font-size:10px;color:#a8a8a4;line-height:1.75">
+            <div style="display:flex;gap:7px"><span style="color:#6f6f6b">&gt;</span> building Action IR registry&hellip;</div>
+            <div style="display:flex;gap:7px"><span style="color:#6f6f6b">&gt;</span> 15 tests &middot; test_action_ir_cli test_execution_guard_policy</div>
+            <div style="display:flex;gap:7px;color:#6f9b78">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6L9 17l-5-5"/></svg>
+              all passed
+            </div>
+            <div style="display:flex;gap:7px;color:#a68d5b">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+              waiting for approval packet
+            </div>
           </div>
         </div>
       </div>
@@ -289,7 +326,7 @@
   </div>
 
   <!-- bottom session dock -->
-  <div style="height:40px;border-top:1px solid #31333a;background:#17181b;display:flex;align-items:center;gap:10px;padding:0 14px;font-size:11px;color:#8a8a86">
+  <div style="height:40px;flex:none;border-top:1px solid #26272c;background:#17181b;display:flex;align-items:center;gap:10px;padding:0 14px;font-size:11px;color:#8a8a86">
     <span style="color:#e6e6e4;font-weight:600">Sessions</span>
     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
     <span>No terminal tab</span>
