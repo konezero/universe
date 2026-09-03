@@ -4009,6 +4009,16 @@ function showGraphView(view) {
   document.body.classList.add("graph-mode");
   // The integrated home owns these; leaving it must clear them.
   document.body.classList.remove("home-mode", "fleet-mode");
+  // Galaxy is a full-bleed view: no project rail, no shell inspector.
+  document.body.classList.toggle(
+    "galaxy-view",
+    ["semantic", "universe"].includes(view)
+  );
+  const galaxyCard = document.querySelector("#galaxy-node-card");
+  if (galaxyCard) {
+    galaxyCard.hidden = true;
+    galaxyCard.replaceChildren();
+  }
   state.selectedNode = null;
   state.focusedNodeId = null;
   elements.nodeBreadcrumb?.classList.add("hidden");
@@ -4031,6 +4041,7 @@ function showGraphView(view) {
 function showGoalPlanView() {
   state.view = "work";
   document.body.classList.remove("graph-mode");
+  document.body.classList.remove("galaxy-view");
   restoreBenchPanel();
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
   if (goalWorkspace) goalWorkspace.hidden = false;
@@ -4952,7 +4963,7 @@ function showBenchScreen() {
   state.benchScreenActive = true;
   document.body.classList.remove("graph-mode");
   document.body.classList.remove("inspector-open");
-  document.body.classList.remove("home-mode", "fleet-mode");
+  document.body.classList.remove("home-mode", "fleet-mode", "galaxy-view");
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
   if (goalWorkspace) goalWorkspace.hidden = true;
   screenBody.append(panel);
@@ -11544,6 +11555,73 @@ function drawGraph() {
 
 // Rooms projected onto Galaxy planets: a small ◈ over a feature planet that
 // has a meeting room. The node inspector carries the click target.
+// Galaxy node rollup — a card floating over the canvas (no shell inspector).
+function renderGalaxyNodeCard(graphNode) {
+  const card = document.querySelector("#galaxy-node-card");
+  if (!card) return;
+  if (!graphNode || !graphNode.unifiedKind) {
+    card.hidden = true;
+    card.replaceChildren();
+    return;
+  }
+  card.hidden = false;
+  card.replaceChildren();
+
+  const head = node("div", "galaxy-node-card-head");
+  head.append(
+    node("span", "galaxy-node-card-kind", String(graphNode.unifiedKind || "node")),
+    node("h3", "", graphNode.label || graphNode.id)
+  );
+  const close = node("button", "icon-button compact", "×");
+  close.type = "button";
+  close.title = "Close";
+  close.addEventListener("click", () => renderGalaxyNodeCard(null));
+  head.append(close);
+  card.append(head);
+
+  const work = featureWorkProjection(graphNode);
+  const bareRef = graphNode.id?.startsWith("feat:") ? graphNode.id.slice(5) : graphNode.id;
+  const todos = homeAllTodos().filter(
+    (t) => String(t.node_ref || "") === bareRef
+  );
+  const rooms = projectRoomsList().filter(
+    (r) => r.feature_id && r.feature_id === bareRef
+  );
+
+  const grid = node("dl", "galaxy-node-card-facts");
+  const fact = (k, v) => {
+    grid.append(node("dt", "", k), node("dd", "", v));
+  };
+  if (work) {
+    fact("Execution", work.execution_state || "—");
+    fact("Progress", `${work.todo_done}/${work.todo_total} · ${work.progress_percent}%`);
+  }
+  fact("Todos", String(todos.length));
+  if (rooms.length) fact("Rooms", String(rooms.length));
+  card.append(grid);
+
+  const actions = node("div", "galaxy-node-card-actions");
+  const openHome = node("button", "primary-button", "홈에서 보기");
+  openHome.type = "button";
+  openHome.addEventListener("click", () => {
+    state.homeNodeId = graphNode.id;
+    state.homeTodoId = null;
+    state.homeAgentTodoId = null;
+    setGoalPlanLayout();
+    showGoalPlanView();
+  });
+  actions.append(openHome);
+  if (rooms.length) {
+    const openRoom = node("button", "secondary-button", "룸 열기");
+    openRoom.type = "button";
+    openRoom.addEventListener("click", () =>
+      openRoomObservation(rooms[0].room_id).catch((error) => toast(error.message, true))
+    );
+    actions.append(openRoom);
+  }
+  card.append(actions);
+}
+
 function drawGalaxyRooms(context) {
   const rooms = projectRoomsList();
   if (!rooms.length) return;
@@ -12066,15 +12144,14 @@ function selectGraphNode(event) {
   }
   if (selected.unifiedKind) {
     // Galaxy: click a planet to focus its neighbourhood; click it again to
-    // zoom back out. The inspector shows the node's evidence + linked work.
+    // zoom back out. A rollup card floats over the canvas — no shell inspector.
     state.selectedNode = selected;
     state.galaxyFocus = state.galaxyFocus === selected.id ? null : selected.id;
     buildGraph();
     state.selectedNode =
       state.graph.nodes.find((item) => item.id === selected.id) || selected;
     drawGraph();
-    renderDetails();
-    showInspectorTab("details");
+    renderGalaxyNodeCard(state.selectedNode);
     return;
   }
   if (selected.kind === "universe") {
