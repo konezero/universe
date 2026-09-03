@@ -8915,7 +8915,97 @@ function setGraphLegend(items) {
   }
 }
 
+// Unified node graph model (docs/universe-unified-node-graph-model.md).
+// Kind -> (legend/CSS class, radial depth). Knowledge kinds render at the
+// "near" zoom, not on the far Galaxy map.
+const UNIFIED_KIND_STYLE = {
+  PRODUCT: { kind: "project", depth: 0 },
+  APP: { kind: "project", depth: 1 },
+  SURFACE: { kind: "route-step", depth: 2 },
+  FEATURE: { kind: "feature", depth: 2 },
+  CAPABILITY: { kind: "feature", depth: 2 },
+  FLOW: { kind: "expected-path", depth: 3 },
+  EXTERNAL_BOUNDARY: { kind: "predicted", depth: 3 },
+  STRUCTURE: { kind: "milestone", depth: 4 },
+  COMPONENT: { kind: "todo", depth: 4 },
+  DOCUMENT: { kind: "goal", depth: 5 },
+  DECISION: { kind: "goal", depth: 5 },
+  MEMORY: { kind: "related", depth: 6 },
+};
+
+// Which unified view drives the Galaxy render. Default = functional (the
+// product map); knowledge/structural reachable once the switcher lands.
+function galaxyUnifiedView() {
+  return String(state.galaxyView || "functional");
+}
+
+function buildUnifiedGalaxyGraph() {
+  const unified = state.projection?.unified_graph;
+  if (!unified || !Array.isArray(unified.nodes) || !unified.nodes.length) {
+    return false;
+  }
+  const viewName = galaxyUnifiedView();
+  const view = (state.projection.views || []).find((v) => v.view === viewName);
+  const nodeAllow = view ? new Set(view.node_ids) : null;
+  const edgeAllow = view ? new Set(view.edge_ids) : null;
+
+  const nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+  const kindsPresent = new Set();
+  const graphNodes = nodes.map((n) => {
+    const style = UNIFIED_KIND_STYLE[n.kind] || { kind: "related", depth: 4 };
+    kindsPresent.add(n.kind);
+    return {
+      id: n.node_id,
+      label: n.title || n.node_id,
+      kind: style.kind,
+      depth: style.depth,
+      proposed: n.state === "PROPOSED",
+      unifiedKind: n.kind,
+      data: n,
+      x: 0,
+      y: 0,
+    };
+  });
+  const layers = [...new Set(graphNodes.map((i) => i.depth))].sort((a, b) => a - b);
+  for (const depth of layers) {
+    const layer = graphNodes.filter((i) => i.depth === depth);
+    layer.forEach((item, index) => {
+      item.x = (index - (layer.length - 1) / 2) * 160;
+      item.y = (depth - 2) * 140;
+    });
+  }
+  const visible = new Set(graphNodes.map((i) => i.id));
+  state.graph.nodes = graphNodes;
+  state.graph.edges = (unified.edges || [])
+    .filter((e) => (!edgeAllow || edgeAllow.has(e.edge_id)) && visible.has(e.from_node) && visible.has(e.to_node))
+    .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e }));
+  state.graph.scale = 1;
+  state.graph.x = 0;
+  state.graph.y = 0;
+
+  const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
+  setGraphLegend(
+    legendOrder
+      .filter((k) => kindsPresent.has(k))
+      .map((k) => ({ kind: (UNIFIED_KIND_STYLE[k] || {}).kind || "related", label: k }))
+  );
+  elements.graphEmpty.classList.toggle("hidden", graphNodes.length > 0);
+  if (elements.graphHint) {
+    elements.graphHint.classList.toggle("hidden", !graphNodes.length);
+    const graftInfo = state.projection.knowledge_grafted;
+    const graftText = graftInfo
+      ? ` · ${graftInfo.decisions} decisions · ${graftInfo.memories} memories`
+      : "";
+    elements.graphHint.textContent =
+      `Galaxy · ${state.selectedProject?.project_id || "universe"} · ${viewName} view · ` +
+      `${graphNodes.length}/${unified.nodes.length} nodes${graftText} · projection only`;
+  }
+  drawGraph();
+  return true;
+}
+
 function buildSemanticProjectGraph() {
+  if (buildUnifiedGalaxyGraph()) return;
   const projection = state.semanticGraph || {};
   const galaxyEntityTypes = new Set([
     "PROJECT",
