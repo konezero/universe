@@ -97,6 +97,10 @@ const state = {
   observatoryTab: "sessions",
   todoTab: "board",
   goalPlanLayout: "board",
+  homeNodeId: null,
+  homeTodoId: null,
+  homeAgentTodoId: null,
+  homeCollapsed: new Set(),
   supervisorEvents: [],
   providerActivitySources: [],
   providerActivityDiscoveries: [],
@@ -4246,6 +4250,506 @@ function renderFleetBoard() {
   }
 }
 
+// ===========================================================================
+// Integrated home — Project → Node → Todo → (detail | Kanban).
+//
+// Three connected axes: a Todo is the work item, its lifecycle_state is a
+// Kanban lane, and the session executing it (via its Goal's automation Task
+// Frame — todoOwnershipProjection) is the agent shown on that lane. Selecting
+// a project fills the nodes, a node fills its todos, a todo drives the detail
+// + node-scoped kanban. Relation lines connect the selected item to its
+// expansion. Blocked state shows as a red border only.
+// ===========================================================================
+// Nodes for the home column: every FEATURE node (proposed or adopted) plus any
+// other graph node a todo actually points at. Todos attach via node_ref, and
+// features carry the bare id while the graph node is "feat:<id>".
+function homeNodeRefKey(nodeId) {
+  const id = String(nodeId || "");
+  return id.startsWith("feat:") ? id.slice(5) : id;
+}
+
+function homeAllTodos() {
+  const seen = new Set();
+  const out = [];
+  const push = (todo) => {
+    if (!todo?.todo_id || seen.has(todo.todo_id)) return;
+    seen.add(todo.todo_id);
+    out.push(todo);
+  };
+  for (const goal of [...(state.goals || []), ...(state.universeGoals || [])]) {
+    for (const t of goal.todos || []) push(t);
+    for (const m of goal.milestones || []) for (const t of m.todos || []) push(t);
+  }
+  for (const t of state.unassignedTodos || []) push(t);
+  return out;
+}
+
+function homeNodes() {
+  const graph = state.projection?.unified_graph?.nodes || [];
+  const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
+  const seen = new Set();
+  const out = [];
+  for (const n of graph) {
+    const id = String(n.node_id || "");
+    const kind = String(n.kind || "").toUpperCase();
+    const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
+    if ((kind === "FEATURE" || ownsTodos) && !seen.has(id)) {
+      seen.add(id);
+      out.push(n);
+    }
+  }
+  // Surface nodes that carry work first (running > any todos > none).
+  const rank = (graphNode) => {
+    const todos = homeNodeTodos(graphNode);
+    if (!todos.length) return 0;
+    const hot = todos.some((t) =>
+      ["IN_PROGRESS", "BLOCKED", "VERIFYING"].includes(String(t.state || "").toUpperCase())
+    );
+    return hot ? 3 : todos.length ? 2 : 1;
+  };
+  return out.sort((a, b) => {
+    const d = rank(b) - rank(a);
+    if (d) return d;
+    return String(a.title || a.node_id).localeCompare(String(b.title || b.node_id));
+  });
+}
+
+// A todo belongs to a node when its node_ref names that node (features carry
+// the bare id; the graph node is "feat:<id>").
+function homeNodeOwnsTodo(node, todo) {
+  const ref = String(todo.node_ref || "");
+  if (!ref) return false;
+  const id = String(node.node_id || "");
+  return id === ref || id === `feat:${ref}` || (id.startsWith("feat:") && id.slice(5) === ref);
+}
+
+function homeSelectedNode() {
+  const nodes = homeNodes();
+  return nodes.find((n) => n.node_id === state.homeNodeId) || nodes[0] || null;
+}
+
+function homeNodeTodos(node) {
+  if (!node) return [];
+  return homeAllTodos().filter((t) => homeNodeOwnsTodo(node, t));
+}
+
+function homeSelectedTodo(nodeTodos) {
+  return nodeTodos.find((t) => t.todo_id === state.homeTodoId) || nodeTodos[0] || null;
+}
+
+function homeTodoBlocked(todo) {
+  return String(todo?.state || "").toUpperCase() === "BLOCKED";
+}
+
+// The session executing this todo, if any (its Goal's automation Task Frame).
+function homeTodoExecutor(todo) {
+  const own = typeof todoOwnershipProjection === "function" ? todoOwnershipProjection(todo) : null;
+  if (!own) return null;
+  return {
+    label: own.provider ? `${own.provider}${own.mode ? ` · ${own.mode}` : ""}` : "Session",
+    provider: own.provider || null,
+    state: own.session_state || "UNKNOWN",
+    task_frame_id: own.task_frame_id || null,
+    blocked: homeTodoBlocked(todo) || String(own.session_state || "").toUpperCase() === "BLOCKED",
+    session_id: own.session_id || null,
+  };
+}
+
+function homeChev() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "chev");
+  svg.setAttribute("width", "12");
+  svg.setAttribute("height", "12");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  p.setAttribute("d", "M6 9l6 6 6-6");
+  svg.append(p);
+  return svg;
+}
+
+function renderIntegratedHome() {
+  const root = document.querySelector("#home-view");
+  if (!root) return;
+  const project = state.selectedProject;
+  renderHomeProjects();
+  if (!project) {
+    document.querySelector("#home-node-list").replaceChildren(
+      node("div", "goal-plan-empty", "Choose a project.")
+    );
+    document.querySelector("#home-todo-list").replaceChildren();
+    document.querySelector("#home-todo-detail").replaceChildren();
+    document.querySelector("#home-kanban-lanes").replaceChildren();
+    clearHomeRelations();
+    return;
+  }
+  const selNode = homeSelectedNode();
+  state.homeNodeId = selNode?.node_id || null;
+  const nodeTodos = homeNodeTodos(selNode);
+  const selTodo = homeSelectedTodo(nodeTodos);
+  state.homeTodoId = selTodo?.todo_id || null;
+
+  renderHomeNodes(selNode);
+  renderHomeTodos(selNode, nodeTodos, selTodo);
+  renderHomeDetail(selNode, selTodo);
+  renderHomeKanban(selNode, nodeTodos, selTodo);
+  renderHomeWorkSummary(nodeTodos);
+  requestAnimationFrame(drawHomeRelations);
+}
+
+function renderHomeProjects() {
+  const listEl = document.querySelector("#home-project-list");
+  if (!listEl) return;
+  listEl.replaceChildren();
+  const selectedId = state.selectedProject?.project_id;
+  for (const project of operableProjects()) {
+    const row = node("button", "home-nav", "");
+    row.type = "button";
+    if (project.project_id === selectedId) row.classList.add("sel");
+    const live = (state.terminals || []).some(
+      (t) => String(t.project_id || "").toLowerCase() === String(project.project_id || "").toLowerCase()
+    );
+    const dot = node("span", "home-dot");
+    dot.style.background = live ? "#6f9b78" : "#6f6f6b";
+    row.append(dot, node("span", "", project.project_id));
+    row.style.flex = "0 0 auto";
+    row.querySelector("span:last-child").style.flex = "1";
+    row.addEventListener("click", () => {
+      if (project.project_id === selectedId) return;
+      state.homeNodeId = null;
+      state.homeTodoId = null;
+      state.homeAgentTodoId = null;
+      selectProject(project.project_id).catch((error) => toast(error.message, true));
+    });
+    listEl.append(row);
+  }
+}
+
+function homeCard(id, titleText, { selected, blocked, unsel, bodyRows }) {
+  const card = node("div", "home-card");
+  if (selected) card.classList.add("sel");
+  if (blocked) card.classList.add("blocked");
+  if (unsel && !selected) card.classList.add("unsel");
+  const collapsed = state.homeCollapsed.has(id);
+  if (collapsed && !selected) card.classList.add("collapsed");
+  const titleBtn = node("button", "home-card-title", "");
+  titleBtn.type = "button";
+  titleBtn.append(document.createTextNode(titleText), homeChev());
+  titleBtn.addEventListener("click", (event) => {
+    // A plain title click selects; the chevron toggles collapse.
+    if (event.target.closest(".chev")) {
+      if (state.homeCollapsed.has(id)) state.homeCollapsed.delete(id);
+      else state.homeCollapsed.add(id);
+      renderIntegratedHome();
+      return;
+    }
+    card.dispatchEvent(new CustomEvent("home-select", { bubbles: true }));
+  });
+  card.append(titleBtn);
+  if (bodyRows?.length) {
+    const body = node("div", "home-card-body");
+    for (const row of bodyRows) body.append(row);
+    card.append(body);
+  }
+  return card;
+}
+
+function renderHomeNodes(selNode) {
+  const listEl = document.querySelector("#home-node-list");
+  const head = document.querySelector("#home-nodes-head");
+  if (!listEl) return;
+  head.textContent = `${state.selectedProject?.project_id || ""} · nodes`;
+  listEl.replaceChildren();
+  const nodes = homeNodes();
+  if (!nodes.length) {
+    listEl.append(node("div", "goal-plan-empty", "No nodes in this project's projection yet."));
+    return;
+  }
+  for (const graphNode of nodes) {
+    const selected = graphNode.node_id === selNode?.node_id;
+    const todos = homeNodeTodos(graphNode);
+    const executors = todos.map(homeTodoExecutor).filter(Boolean);
+    const blockedHere = executors.some((e) => e.blocked) || todos.some(homeTodoBlocked);
+    const rows = [];
+    const desc = graphNode.data?.summary || graphNode.data?.note;
+    if (desc) rows.push(node("div", "", desc));
+    const doneCount = todos.filter((t) => String(t.state || "").toUpperCase() === "DONE").length;
+    if (todos.length) {
+      rows.push(
+        node(
+          "div",
+          "",
+          `${doneCount}/${todos.length} done · ${todos.length - doneCount} open`
+        )
+      );
+    }
+    const liveExec = executors.find((e) => !e.blocked) || executors[0];
+    if (liveExec) {
+      const meta = node("div", "home-card-meta");
+      const dot = node("span", "home-dot");
+      dot.style.background = liveExec.blocked ? "#c26b5e" : "#6f9b78";
+      meta.append(dot, node("span", `home-agent ${liveExec.blocked ? "blocked" : ""}`, liveExec.label));
+      rows.push(meta);
+    }
+    const card = homeCard(`node:${graphNode.node_id}`, graphNode.title || graphNode.node_id, {
+      selected,
+      blocked: blockedHere,
+      unsel: true,
+      bodyRows: rows,
+    });
+    card.addEventListener("home-select", () => {
+      state.homeNodeId = graphNode.node_id;
+      state.homeTodoId = null;
+      state.homeAgentTodoId = null;
+      renderIntegratedHome();
+    });
+    listEl.append(card);
+  }
+}
+
+function nodeKindLabel(graphNode) {
+  return String(graphNode.unifiedKind || graphNode.kind || "node").toLowerCase();
+}
+
+function renderHomeTodos(selNode, nodeTodos, selTodo) {
+  const listEl = document.querySelector("#home-todo-list");
+  const head = document.querySelector("#home-todos-head");
+  if (!listEl) return;
+  head.textContent = `${selNode?.title ? shortLabel(selNode.title, 26) : "node"} · todos`;
+  listEl.replaceChildren();
+  if (!nodeTodos.length) {
+    listEl.append(node("div", "goal-plan-empty", "No todos attached to this node."));
+    return;
+  }
+  for (const todo of nodeTodos) {
+    const selected = todo.todo_id === selTodo?.todo_id;
+    const executor = homeTodoExecutor(todo);
+    const blocked = homeTodoBlocked(todo);
+    const meta = node("div", "home-card-meta");
+    if (executor) {
+      const dot = node("span", "home-dot");
+      dot.style.background = executor.blocked ? "#c26b5e" : "#6f9b78";
+      meta.append(
+        dot,
+        node("span", `home-agent ${executor.blocked ? "blocked" : ""}`, executor.provider || "session")
+      );
+    }
+    const stateSpan = node("span", "", planStateLabel(todo.state));
+    stateSpan.style.cssText = `font-size:9px;color:${blocked ? "#c99187" : "#8a8a86"}`;
+    meta.append(stateSpan);
+    const pri = node("span", "home-chip", String(todo.priority || "P3"));
+    pri.style.marginLeft = "auto";
+    meta.append(pri);
+    const card = homeCard(`todo:${todo.todo_id}`, todo.title || todo.todo_id, {
+      selected,
+      blocked,
+      unsel: true,
+      bodyRows: [meta],
+    });
+    card.addEventListener("home-select", () => {
+      state.homeTodoId = todo.todo_id;
+      renderIntegratedHome();
+    });
+    listEl.append(card);
+  }
+}
+
+function shortLabel(value, max) {
+  const text = String(value || "");
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function renderHomeDetail(selNode, selTodo) {
+  const el = document.querySelector("#home-todo-detail");
+  if (!el) return;
+  el.replaceChildren();
+  if (!selTodo) {
+    el.append(node("div", "goal-plan-empty", "Select a todo."));
+    return;
+  }
+  el.append(node("div", "", selTodo.title || selTodo.todo_id));
+  el.lastChild.style.cssText = "font-size:13px;font-weight:650;line-height:1.35;color:#e6e6e4";
+
+  const executor = homeTodoExecutor(selTodo);
+  const grid = node("div", "home-todo-detail-grid");
+  const add = (k, v, tone) => {
+    grid.append(node("span", "k", k));
+    const val = node("span", "", v);
+    if (tone) val.style.color = tone;
+    grid.append(val);
+  };
+  add("Lane", planStateLabel(selTodo.state), homeTodoBlocked(selTodo) ? "#c99187" : "#6f9b78");
+  add("Node", selNode?.title ? shortLabel(selNode.title, 30) : "—");
+  add("Lineage", todoLineageLabel(selTodo));
+  if (executor?.task_frame_id) add("Task Frame", executor.task_frame_id, "#a8a8a4");
+  add("Executor", executor ? executor.label : "unassigned", executor ? "#7fb0a7" : "#8a8a86");
+  el.append(grid);
+
+  const rooms = typeof roomsForSelectedNode === "function"
+    ? roomsForSelectedNode({ id: selNode?.node_id, data: selNode?.data })
+    : [];
+  if (rooms.length) {
+    const sec = node("section", "home-detail-section");
+    sec.append(node("h4", "", "Room"));
+    for (const room of rooms.slice(0, 2)) {
+      const btn = node("button", "home-nav", `${ROOM_TYPE_LABEL[room.room_type] || room.room_type} · ${room.title || room.room_id}`);
+      btn.type = "button";
+      btn.addEventListener("click", () =>
+        openRoomObservation(room.room_id).catch((error) => toast(error.message, true))
+      );
+      sec.append(btn);
+    }
+    el.append(sec);
+  }
+
+  const openSess = node("button", "home-nav", "세션 창 열기");
+  openSess.type = "button";
+  openSess.style.borderColor = "#43454c";
+  openSess.addEventListener("click", () => openFleetCardSession(selTodo));
+  el.append(openSess);
+}
+
+function renderHomeKanban(selNode, nodeTodos, selTodo) {
+  const lanesEl = document.querySelector("#home-kanban-lanes");
+  const head = document.querySelector("#home-kanban-head");
+  if (!lanesEl) return;
+  head.textContent = `Kanban — ${selNode?.title ? shortLabel(selNode.title, 28) : "node"}`;
+  lanesEl.replaceChildren();
+  for (const lane of FLEET_LANES) {
+    const laneEl = node("div", "home-lane");
+    laneEl.dataset.lane = lane.id;
+    laneEl.append(node("span", "home-lane-label", lane.label.toUpperCase()));
+    const items = node("div", "home-lane-items");
+    const laneTodos = nodeTodos.filter((t) =>
+      lane.states.includes(String(t.state || "").toUpperCase())
+    );
+    for (const todo of laneTodos) {
+      const chip = node("div", "home-lane-todo", shortLabel(todo.title || todo.todo_id, 40));
+      if (todo.todo_id === selTodo?.todo_id) chip.classList.add("sel");
+      if (homeTodoBlocked(todo)) chip.classList.add("blocked");
+      chip.style.cursor = "pointer";
+      chip.addEventListener("click", () => {
+        state.homeTodoId = todo.todo_id;
+        renderIntegratedHome();
+      });
+      items.append(chip);
+      const executor = homeTodoExecutor(todo);
+      if (executor && ["executing", "verifying", "blocked"].includes(lane.id)) {
+        const agent = node(
+          "div",
+          `home-lane-agent ${executor.blocked ? "blocked" : ""}`,
+          executor.provider || "session"
+        );
+        if (state.homeAgentTodoId === todo.todo_id) agent.classList.add("sel");
+        agent.addEventListener("click", (event) => {
+          event.stopPropagation();
+          state.homeAgentTodoId =
+            state.homeAgentTodoId === todo.todo_id ? null : todo.todo_id;
+          renderIntegratedHome();
+        });
+        items.append(agent);
+      }
+    }
+    laneEl.append(items);
+    lanesEl.append(laneEl);
+  }
+}
+
+function renderHomeWorkSummary(nodeTodos) {
+  const el = document.querySelector("#home-work-summary");
+  if (!el) return;
+  const todo = nodeTodos.find((t) => t.todo_id === state.homeAgentTodoId);
+  const executor = todo ? homeTodoExecutor(todo) : null;
+  if (!todo || !executor) {
+    el.hidden = true;
+    el.replaceChildren();
+    return;
+  }
+  el.hidden = false;
+  el.replaceChildren();
+  const headRow = node("div", "home-work-summary-head");
+  const dot = node("span", "home-dot");
+  dot.style.background = executor.blocked ? "#c26b5e" : "#6f9b78";
+  headRow.append(
+    dot,
+    node("span", `home-agent ${executor.blocked ? "blocked" : ""}`, executor.label),
+    node("span", "", `${executor.state} · ${shortLabel(todo.title, 30)}`)
+  );
+  headRow.lastChild.style.cssText = "margin-left:auto;font-size:10px;color:#8a8a86";
+  el.append(headRow);
+  el.append(
+    node(
+      "div",
+      "home-work-summary-body",
+      todo.detail || "No work detail recorded for this todo yet."
+    )
+  );
+}
+
+// Relation lines: connect the selected card's title row in a column to the
+// selected item in the next column. Orthogonal (H → V → H); selected path
+// brighter/thicker.
+function clearHomeRelations() {
+  for (const id of ["home-rel-1", "home-rel-2", "home-rel-3"]) {
+    const svg = document.querySelector(`#${id}`);
+    if (svg) svg.replaceChildren();
+  }
+}
+
+function homeRelPath(svg, fromY, toY, strong) {
+  const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  p.setAttribute("d", `M0 ${fromY} H 15 V ${toY} H 30`);
+  p.setAttribute("stroke", strong ? "#7fb0a7" : "#31333a");
+  p.setAttribute("stroke-width", strong ? "1.8" : "1.2");
+  p.setAttribute("fill", "none");
+  svg.append(p);
+}
+
+function drawHomeRelations() {
+  const root = document.querySelector("#home-view");
+  if (!root || root.hidden) return;
+  const relYOf = (relSel, cardEl) => {
+    const rel = document.querySelector(relSel)?.getBoundingClientRect();
+    const box = cardEl?.getBoundingClientRect();
+    if (!rel || !box) return null;
+    const title = cardEl.querySelector(".home-card-title, .home-nav") || cardEl;
+    const t = title.getBoundingClientRect();
+    return ((t.top + t.height / 2 - rel.top) / rel.height) * 900;
+  };
+  // project → selected node
+  const svg1 = document.querySelector("#home-rel-1");
+  const selProjRow = document.querySelector("#home-project-list .home-nav.sel");
+  const selNodeCard = document.querySelector("#home-node-list .home-card.sel");
+  if (svg1) {
+    svg1.replaceChildren();
+    const y0 = relYOf("#home-rel-1", selProjRow);
+    const y1 = relYOf("#home-rel-1", selNodeCard);
+    if (y0 != null && y1 != null) homeRelPath(svg1, y0, y1, true);
+  }
+  // selected node → its todos (selected one strong)
+  const svg2 = document.querySelector("#home-rel-2");
+  if (svg2) {
+    svg2.replaceChildren();
+    const y0 = relYOf("#home-rel-2", selNodeCard);
+    for (const card of document.querySelectorAll("#home-todo-list .home-card")) {
+      const y1 = relYOf("#home-rel-2", card);
+      if (y0 != null && y1 != null) homeRelPath(svg2, y0, y1, card.classList.contains("sel"));
+    }
+  }
+  // selected todo → detail/kanban
+  const svg3 = document.querySelector("#home-rel-3");
+  const selTodoCard = document.querySelector("#home-todo-list .home-card.sel");
+  const detailEl = document.querySelector("#home-todo-detail");
+  if (svg3) {
+    svg3.replaceChildren();
+    const y0 = relYOf("#home-rel-3", selTodoCard);
+    const y1 = relYOf("#home-rel-3", detailEl);
+    if (y0 != null && y1 != null) homeRelPath(svg3, y0, y1, true);
+  }
+}
+
 /** Highlight top nav without toast placeholders. */
 function syncPrimaryNavSelection(primaryView) {
   for (const root of [elements.primaryNav, elements.utilityRail]) {
@@ -4963,14 +5467,14 @@ async function selectProject(
   state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
     (todo) => todo.state !== "DONE"
   );
-  // Rooms are projected onto the Fleet board; load them so renderFleetBoard can
-  // badge cards. Non-blocking — a slow/failed room list must not stall project
-  // selection.
+  // Rooms surface in the home detail panel; load them non-blocking.
   refreshProjectRooms()
     .then(() => {
-      if (state.goalPlanLayout === "board") renderFleetBoard();
+      if (state.goalPlanLayout === "board" && !document.querySelector("#home-view")?.hidden) {
+        renderIntegratedHome();
+      }
     })
-    .catch(() => { /* board just renders without room badges */ });
+    .catch(() => { /* home just renders without room links */ });
   elements.workspaceTitle.textContent = project.project_id;
   elements.workspaceSubtitle.textContent =
     state.projection?.project?.goal || project.project_root;
@@ -5158,6 +5662,7 @@ function initChatPanelResize() {
   });
   window.addEventListener("resize", () => {
     setChatPanelWidth(state.chatPanelWidth);
+    if (document.body.classList.contains("home-mode")) drawHomeRelations();
   });
 }
 
@@ -13551,13 +14056,19 @@ function renderGoalPlan() {
   }
   const boardMode = state.goalPlanLayout === "board";
   const boardEl = document.querySelector("#fleet-board");
-  if (boardEl) boardEl.hidden = !boardMode;
+  const homeEl = document.querySelector("#home-view");
+  if (boardEl) boardEl.hidden = true;
+  if (homeEl) homeEl.hidden = !boardMode;
   elements.goalPlanList.hidden = boardMode;
   document.querySelector("#goal-plan-layout-plan")?.classList.toggle("selected", !boardMode);
   document.querySelector("#goal-plan-layout-board")?.classList.toggle("selected", boardMode);
-  // Fleet mode: strip the Goal-Plan chrome (summary cards, inbox, plan
-  // controls) so the board reads like the design mockup.
+  document.body.classList.toggle("home-mode", boardMode);
   document.body.classList.toggle("fleet-mode", boardMode);
+  // Board mode is the integrated home: Project → Node → Todo → (detail | Kanban).
+  if (boardMode) {
+    renderIntegratedHome();
+    return;
+  }
   const project = state.selectedProject;
   const projectGoals = goalsForSelectedContext();
   elements.goalPlanTitle.textContent = boardMode ? "Fleet" : "Goal Plan";
@@ -13593,10 +14104,6 @@ function renderGoalPlan() {
     const metric = node("article", "goal-summary-item");
     metric.append(node("span", "", label), node("strong", "", String(value)));
     elements.goalPlanSummary.append(metric);
-  }
-  if (boardMode) {
-    renderFleetBoard();
-    return;
   }
   elements.goalPlanList.replaceChildren();
   if (!project) {

@@ -125,6 +125,37 @@
           <div class="goal-plan-empty">Choose a project to begin planning.</div>
         </div>
         <div id="fleet-board" class="fleet-board" aria-label="Fleet execution board" hidden></div>
+        <div id="home-view" class="home-view" hidden aria-label="Project → node → todo → kanban">
+          <div class="home-col home-col-projects">
+            <div class="home-col-head">Projects</div>
+            <div id="home-project-list" class="home-col-body"></div>
+            <button id="home-add-project" class="home-add" type="button">+ 프로젝트</button>
+          </div>
+          <div class="home-rel"><svg id="home-rel-1" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
+          <div class="home-col home-col-nodes">
+            <div class="home-col-head" id="home-nodes-head">Nodes</div>
+            <div id="home-node-list" class="home-col-body"></div>
+            <button id="home-add-node" class="home-add" type="button">+ 노드 등록</button>
+          </div>
+          <div class="home-rel"><svg id="home-rel-2" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
+          <div class="home-col home-col-todos">
+            <div class="home-col-head" id="home-todos-head">Todos</div>
+            <div id="home-todo-list" class="home-col-body"></div>
+            <button id="home-add-todo" class="home-add" type="button">+ Todo 등록</button>
+          </div>
+          <div class="home-rel"><svg id="home-rel-3" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
+          <div class="home-detail-kanban">
+            <div class="home-col home-col-detail">
+              <div class="home-col-head">Todo 상세</div>
+              <div id="home-todo-detail" class="home-col-body"></div>
+            </div>
+            <div class="home-kanban">
+              <div class="home-col-head" id="home-kanban-head">Kanban</div>
+              <div id="home-kanban-lanes" class="home-kanban-lanes"></div>
+              <div id="home-work-summary" class="home-work-summary" hidden></div>
+            </div>
+          </div>
+        </div>
         <section class="unassigned-work" aria-label="Unassigned project work">
           <header>
             <div>
