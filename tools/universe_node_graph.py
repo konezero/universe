@@ -485,6 +485,92 @@ def graft_knowledge_nodes(
     return result
 
 
+def graft_feature_nodes(
+    projection: Mapping[str, Any],
+    features: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Add FEATURE nodes from the feature-node store to a stored projection.
+
+    Feature Nodes live in their own store and change independently of the seed,
+    so they graft at read time. ``state`` ADOPTED -> ``ADOPTED``, everything
+    else (DRAFT / EXPLORING) -> ``PROPOSED``. A feature whose ``evidence_refs``
+    names a grafted memory gets a ``DERIVED_FROM`` edge to it; every feature
+    gets a ``CONTAINS`` edge from a PRODUCT node when one exists.
+    """
+
+    result = dict(projection)
+    unified = projection.get("unified_graph")
+    if not isinstance(unified, Mapping):
+        result["feature_grafted"] = {"adopted": 0, "proposed": 0}
+        return result
+
+    base_nodes = list(unified.get("nodes") or [])
+    base_edges = list(unified.get("edges") or [])
+    node_ids = {n.get("node_id") for n in base_nodes}
+    product_id = next(
+        (n["node_id"] for n in base_nodes if n.get("kind") == "PRODUCT"), None
+    )
+
+    add_nodes: list[dict[str, Any]] = []
+    add_edges: list[dict[str, Any]] = []
+    adopted = proposed = 0
+    for raw in features or []:
+        feature_id = _text(raw.get("feature_id"))
+        if not feature_id:
+            continue
+        node_id = f"feat:{feature_id}"
+        if node_id in node_ids:
+            continue
+        node_ids.add(node_id)
+        is_adopted = _text(raw.get("state")).upper() == "ADOPTED"
+        if is_adopted:
+            adopted += 1
+        else:
+            proposed += 1
+        add_nodes.append(
+            {
+                "node_id": node_id,
+                "kind": "FEATURE",
+                "state": "ADOPTED" if is_adopted else "PROPOSED",
+                "title": _text(raw.get("intent_text"))[:80] or feature_id,
+                "refs": [{"kind": "feature", "path": f"universe://feature-nodes/{feature_id}", "sha256": ""}],
+            }
+        )
+        if product_id:
+            add_edges.append(
+                {
+                    "edge_id": f"{product_id}-contains-{node_id}",
+                    "from_node": product_id,
+                    "to_node": node_id,
+                    "relation": "CONTAINS",
+                }
+            )
+        for ref in raw.get("evidence_refs") or []:
+            ref = _text(ref)
+            if ref.startswith("universe://memories/"):
+                mem_node = "mem:" + ref.rsplit("/", 1)[-1]
+                if mem_node in node_ids:
+                    add_edges.append(
+                        {
+                            "edge_id": f"{node_id}-derived_from-{mem_node}",
+                            "from_node": node_id,
+                            "to_node": mem_node,
+                            "relation": "DERIVED_FROM",
+                        }
+                    )
+
+    new_nodes = base_nodes + add_nodes
+    new_edges = base_edges + add_edges
+    result["unified_graph"] = {
+        "schema": NODE_GRAPH_SCHEMA,
+        "nodes": new_nodes,
+        "edges": new_edges,
+    }
+    result["views"] = compute_views(new_nodes, new_edges)
+    result["feature_grafted"] = {"adopted": adopted, "proposed": proposed}
+    return result
+
+
 def compute_views(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],

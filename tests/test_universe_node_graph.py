@@ -13,6 +13,7 @@ from universe_node_graph import (  # noqa: E402
     VIEW_NAMES,
     compute_views,
     document_graph,
+    graft_feature_nodes,
     graft_knowledge_nodes,
     unify_seed_graph,
 )
@@ -329,6 +330,42 @@ class GraftKnowledgeTests(unittest.TestCase):
         out = graft_knowledge_nodes({"views": []}, [{"memory_id": "m1"}])
         self.assertEqual(out["knowledge_grafted"],
                          {"decisions": 0, "memories": 0, "linked": 0})
+
+
+class GraftFeatureTests(unittest.TestCase):
+    def _projection_with_product_and_memory(self):
+        graph = unify_seed_graph(_seed())
+        graph["nodes"].append(
+            {"node_id": "universe", "kind": "PRODUCT", "state": "ADOPTED",
+             "title": "Universe", "refs": []}
+        )
+        proj = {"unified_graph": graph,
+                "views": compute_views(graph["nodes"], graph["edges"])}
+        return graft_knowledge_nodes(proj, [
+            {"memory_id": "m9", "state": "OBSERVED", "node_ref": "structure"},
+        ])
+
+    def test_features_added_with_state_and_product_edge(self):
+        proj = self._projection_with_product_and_memory()
+        out = graft_feature_nodes(proj, [
+            {"feature_id": "f1", "intent_text": "Adopted thing", "state": "ADOPTED",
+             "evidence_refs": []},
+            {"feature_id": "f2", "intent_text": "Exploring thing", "state": "EXPLORING",
+             "evidence_refs": ["universe://memories/m9"]},
+        ])
+        by_id = {n["node_id"]: n for n in out["unified_graph"]["nodes"]}
+        self.assertEqual(by_id["feat:f1"]["kind"], "FEATURE")
+        self.assertEqual(by_id["feat:f1"]["state"], "ADOPTED")
+        self.assertEqual(by_id["feat:f2"]["state"], "PROPOSED")
+        self.assertEqual(out["feature_grafted"], {"adopted": 1, "proposed": 1})
+        rels = {(e["from_node"], e["to_node"], e["relation"])
+                for e in out["unified_graph"]["edges"]}
+        self.assertIn(("universe", "feat:f1", "CONTAINS"), rels)
+        self.assertIn(("feat:f2", "mem:m9", "DERIVED_FROM"), rels)
+
+    def test_no_unified_graph_is_safe(self):
+        out = graft_feature_nodes({"views": []}, [{"feature_id": "f1"}])
+        self.assertEqual(out["feature_grafted"], {"adopted": 0, "proposed": 0})
 
 
 if __name__ == "__main__":
