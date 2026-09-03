@@ -108,3 +108,20 @@ console window. `Stop` ends the SSH child first, then the local Gateway.
 `READY` proves that the local SSH process accepted the forward. The first
 dogfood pass must still verify the public HTTPS route end to end because DNS,
 certificate, reverse-proxy, and server firewall state remain outside Universe.
+
+## Cookie-less clients (automation-driven browsers, bare HTTP)
+
+A client that cannot persist `Set-Cookie` across the pairing redirect uses the
+header path instead:
+
+1. `POST /pair/request` with `Accept: application/json` (JSON or form body:
+   `code`, `device_name`) -> `200 {pairing_id, request_token, expires_at}`.
+2. Poll `GET /pair/status?id=<pairing_id>` with header
+   `X-Request-Token: <request_token>` until `state` is `CONSUMED`; that
+   response body carries `session_token`.
+3. Send every later request with `X-Universe-Session: <session_token>` (same
+   value the cookie would hold). The pairing token is single-use, short-lived,
+   and grants UI access only — no execution authority.
+
+If a request carries both a pairing cookie and `X-Request-Token` and they
+disagree, `/pair/status` returns `400 REMOTE_PAIRING_TOKEN_CONFLICT`.

@@ -305,7 +305,11 @@ class RemoteGatewayHandler(BaseHTTPRequestHandler):
         if path == "/pair/status":
             self._pairing_status()
             return
-        if path == "/" and SESSION_COOKIE not in self._cookies():
+        has_session = (
+            SESSION_COOKIE in self._cookies()
+            or bool((self.headers.get("X-Universe-Session") or "").strip())
+        )
+        if path == "/" and not has_session:
             # Unpaired browsers land on the public universe list (rendezvous
             # broker at /join), not device-pair. Device pair is still /pair.
             self.send_response(HTTPStatus.SEE_OTHER)
@@ -406,25 +410,53 @@ universes</strong>, use the public list.</p>
         if not self.server.pairing_limiter.allow(self.client_address[0]):
             self._send_error_payload(429, "REMOTE_PAIRING_RATE_LIMITED", "try later")
             return
+        body_type = (self.headers.get("Content-Type") or "").lower()
+        wants_json = "application/json" in (self.headers.get("Accept") or "").lower()
         try:
             body = self._read_body()
-            form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+            if "application/json" in body_type:
+                payload = json.loads(body.decode("utf-8"))
+                code = str(payload.get("code") or "")
+                device_name = str(payload.get("device_name") or "")
+            else:
+                form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+                code = form.get("code", [""])[0]
+                device_name = form.get("device_name", [""])[0]
             result = self.server.remote_access.request_pairing(
-                code=form.get("code", [""])[0],
-                device_name=form.get("device_name", [""])[0],
+                code=code,
+                device_name=device_name,
                 user_agent=self.headers.get("User-Agent") or "UNKNOWN_BROWSER",
             )
-        except (UnicodeError, RemoteAccessError) as error:
+        except (UnicodeError, ValueError, RemoteAccessError) as error:
             if isinstance(error, RemoteAccessError):
                 self._send_error_payload(error.status, error.code, error.detail)
             else:
                 self._send_error_payload(400, "REMOTE_PAIRING_REQUEST_INVALID", str(error))
             return
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header(
-            "Set-Cookie",
-            self._cookie(PAIRING_COOKIE, result["request_token"], max_age=600),
+        # A cookie-less client (an automation-driven browser or a bare HTTP
+        # client) cannot carry the pairing cookie through the redirect, so the
+        # JSON variant hands back the request token to send as X-Request-Token.
+        cookie = self._cookie(
+            PAIRING_COOKIE,
+            result["request_token"],
+            max_age=self._seconds_until(str(result.get("expires_at") or "")),
         )
+        if wants_json:
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "schema": result["schema"],
+                    "status": result["status"],
+                    "pairing_id": result["pairing_id"],
+                    "request_token": result["request_token"],
+                    "expires_at": result["expires_at"],
+                    "status_path": "/pair/status?" + urlencode({"id": result["pairing_id"]}),
+                },
+                cookies=[cookie],
+            )
+            return
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Set-Cookie", cookie)
         self.send_header(
             "Location", "/pair/wait?" + urlencode({"id": result["pairing_id"]})
         )
@@ -440,14 +472,45 @@ universes</strong>, use the public list.</p>
 <title>Approve Universe device</title><style>{PAIRING_STYLE}</style></head>
 <body><main><span class="kicker">APPROVAL REQUIRED</span><h1>Check your desktop</h1>
 <p id="state">Waiting for the Universe desktop to approve this browser.</p>
+<p id="hint" hidden><a class="link" href="/pair">← 다시 페어링하기 / pair again</a></p>
 <small>You may close this page if you did not request access.</small></main>
-<script>const id={json.dumps(safe_id)};async function poll(){{const r=await fetch('/pair/status?id='+encodeURIComponent(id),{{cache:'no-store',credentials:'same-origin'}});const p=await r.json();if(p.state==='CONSUMED'){{location.replace('/?paired=1');return}}if(p.state==='DENIED'||p.state==='EXPIRED'){{document.querySelector('#state').textContent=p.state;return}}setTimeout(poll,1200)}}poll();</script>
+<script>const id={json.dumps(safe_id)};
+async function poll(){{
+  let r,p={{}};
+  try{{
+    r=await fetch('/pair/status?id='+encodeURIComponent(id),{{cache:'no-store',credentials:'include'}});
+    p=await r.json();
+  }}catch(_e){{setTimeout(poll,1500);return;}}
+  if(r.ok&&p.state==='CONSUMED'){{location.replace('/?paired=1');return;}}
+  if(p.state==='DENIED'||p.state==='EXPIRED'){{document.querySelector('#state').textContent=p.state;return;}}
+  if(r.status>=400&&r.status<500){{
+    document.querySelector('#state').textContent=
+      'This browser has no live pairing session ('+(p.error_code||r.status)+'). Pair again.';
+    document.querySelector('#hint').hidden=false;
+    return;
+  }}
+  setTimeout(poll,1200);
+}}
+poll();</script>
 </body></html>""",
         )
 
     def _pairing_status(self) -> None:
         pairing_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
-        request_token = self._cookies().get(PAIRING_COOKIE, "")
+        cookie_token = self._cookies().get(PAIRING_COOKIE, "")
+        header_token = (self.headers.get("X-Request-Token") or "").strip()
+        if (
+            cookie_token
+            and header_token
+            and not secrets.compare_digest(cookie_token, header_token)
+        ):
+            self._send_error_payload(
+                400,
+                "REMOTE_PAIRING_TOKEN_CONFLICT",
+                "cookie and X-Request-Token pairing tokens disagree",
+            )
+            return
+        request_token = cookie_token or header_token
         try:
             result = self.server.remote_access.pairing_status(
                 pairing_id,
@@ -459,9 +522,16 @@ universes</strong>, use the public list.</p>
             return
         if result["state"] == "CONSUMED":
             secure = urlsplit(self.server.public_base_url).scheme == "https"
+            # The session token is also returned in the body so a cookie-less
+            # client can replay it as X-Universe-Session on later requests.
             self._send_json(
                 HTTPStatus.OK,
-                {"status": result["status"], "state": result["state"]},
+                {
+                    "status": result["status"],
+                    "state": result["state"],
+                    "session_token": result["session_token"],
+                    "device_id": result["device_id"],
+                },
                 cookies=[
                     self._cookie(
                         SESSION_COOKIE,
@@ -486,7 +556,12 @@ universes</strong>, use the public list.</p>
         self, *, path: str | None = None
     ) -> dict[str, Any] | None:
         ws_key = self._ws_upgrade_key()
-        token = self._cookies().get(SESSION_COOKIE, "")
+        # Cookie is primary; a cookie-less client may present the same session
+        # token as an explicit header instead.
+        token = (
+            self._cookies().get(SESSION_COOKIE, "")
+            or (self.headers.get("X-Universe-Session") or "").strip()
+        )
         if not token:
             # Browser navigations should re-enter pairing, not a raw JSON error.
             if not ws_key and self._wants_html_navigation():
@@ -784,6 +859,17 @@ universes</strong>, use the public list.</p>
         except Exception:
             return {}
         return {name: morsel.value for name, morsel in parsed.items()}
+
+    @staticmethod
+    def _seconds_until(iso_timestamp: str, *, floor: int = 60, cap: int = 3600) -> int:
+        try:
+            parsed = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return floor
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = int((parsed - datetime.now(timezone.utc)).total_seconds())
+        return max(floor, min(cap, delta))
 
     @staticmethod
     def _cookie(name: str, value: str, *, max_age: int, secure: bool = False) -> str:

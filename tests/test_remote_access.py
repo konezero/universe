@@ -252,6 +252,112 @@ class RemoteGatewayTests(unittest.TestCase):
         )
         self.assertEqual("0", _UpstreamHandler.observed_headers["Last-Event-ID"])
 
+    def test_cookieless_client_pairs_and_authorizes_with_header_tokens(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        # A bare client with no cookie jar: it cannot persist Set-Cookie, so it
+        # must get the request token in the body and replay it as a header.
+        request = Request(
+            self.endpoint + "/pair/request",
+            data=json.dumps(
+                {"code": invitation["code"], "device_name": "grok vm chrome"}
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": self.user_agent,
+            },
+        )
+        with urlopen(request, timeout=5) as response:
+            issued = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(HTTPStatus.OK, response.status)
+        request_token = issued["request_token"]
+        pairing_id = issued["pairing_id"]
+        self.assertTrue(request_token)
+
+        def _status() -> dict:
+            poll = Request(
+                self.endpoint + f"/pair/status?id={pairing_id}",
+                headers={
+                    "X-Request-Token": request_token,
+                    "User-Agent": self.user_agent,
+                },
+            )
+            with urlopen(poll, timeout=5) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual("AWAITING_APPROVAL", _status()["state"])
+        self.store.decide_pairing(pairing_id, approve=True)
+        consumed = _status()
+        self.assertEqual("CONSUMED", consumed["state"])
+        session_token = consumed["session_token"]
+        self.assertTrue(session_token)
+
+        proxied = Request(
+            self.endpoint + "/",
+            headers={
+                "X-Universe-Session": session_token,
+                "User-Agent": self.user_agent,
+            },
+        )
+        with urlopen(proxied, timeout=5) as response:
+            self.assertIn(b"Universe upstream", response.read())
+            self.assertEqual(
+                "REMOTE_BROWSER", response.headers["X-Universe-Access-Surface"]
+            )
+
+    def test_pairing_status_without_a_token_is_a_named_client_error(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        request = self.store.request_pairing(
+            code=invitation["code"],
+            device_name="d",
+            user_agent=self.user_agent,
+        )
+        self.store.decide_pairing(request["pairing_id"], approve=True)
+        poll = Request(
+            self.endpoint + f"/pair/status?id={request['pairing_id']}",
+            headers={"User-Agent": self.user_agent},
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(poll, timeout=5)
+        self.assertEqual(400, raised.exception.code)
+        body = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual("REMOTE_ACCESS_REQUEST_INVALID", body["error_code"])
+
+    def test_pairing_status_rejects_conflicting_cookie_and_header_tokens(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        form = urlencode(
+            {"code": invitation["code"], "device_name": "d"}
+        ).encode("utf-8")
+        with self._open(
+            Request(
+                self.endpoint + "/pair/request",
+                data=form,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        ):
+            pass
+        pending = self.store.snapshot()["pairings"][0]
+        poll = Request(
+            self.endpoint + f"/pair/status?id={pending['pairing_id']}",
+            headers={
+                "X-Request-Token": "a-different-token",
+                "User-Agent": self.user_agent,
+            },
+        )
+        with self.assertRaises(HTTPError) as raised:
+            self.opener.open(poll, timeout=5)
+        self.assertEqual(400, raised.exception.code)
+        body = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual("REMOTE_PAIRING_TOKEN_CONFLICT", body["error_code"])
+
     def test_gateway_flushes_sse_event_before_upstream_stream_finishes(self) -> None:
         invitation = self.store.create_pairing(
             public_base_url=self.endpoint, ttl_seconds=600
