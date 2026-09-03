@@ -1048,7 +1048,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         open_block = CSS[open_start : CSS.index("}", open_start)]
         self.assertIn("display: flex;", open_block)
         self.assertIn("overflow: hidden;", open_block)
-        self.assertIn("background: #071413;", CSS)
+        self.assertIn("background: #17181b;", CSS)
 
         panels_selector = ".session-observatory-dialog > .observatory-tab-panels {"
         panels_start = CSS.index(panels_selector)

@@ -16906,10 +16906,13 @@ refreshLawStrip = function () {
     }, 260);
   });
   try {
-    if (localStorage.getItem("universe.terminalDock") === "bottom") {
+    // Bottom dock is the default (design mockup); only "right" opts out.
+    if (localStorage.getItem("universe.terminalDock") !== "right") {
       document.querySelector("#terminal-dock-side")?.click();
     }
-  } catch (_e) { /* private mode */ }
+  } catch (_e) {
+    document.querySelector("#terminal-dock-side")?.click();
+  }
   document.querySelector("#goal-plan-layout-plan")?.addEventListener("click", () =>
     setGoalPlanLayout("plan")
   );
