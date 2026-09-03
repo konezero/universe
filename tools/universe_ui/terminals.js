@@ -441,18 +441,29 @@ function fitTerminalToContainer(term, element, fitAddon) {
   if (fitAddon && typeof fitAddon.proposeDimensions === "function") {
     try {
       // The grid is a fixed 120 columns. Measure how many columns a reference
-      // font yields, then (char width scales ~linearly with font size) pick the
-      // font that makes exactly 120 columns fill the pane width.
+      // font yields, then (char width scales ~linearly with font size) estimate
+      // the font that fits 120 columns — floor, never round up, or the last
+      // column spills past the pane edge and the TUI looks clipped.
       const ref = TERMINAL_MAX_FONT;
       if (term.options.fontSize !== ref) term.options.fontSize = ref;
       const at = fitAddon.proposeDimensions();
       let font = ref;
       if (at && at.cols) {
-        font = Math.round((ref * at.cols) / TERMINAL_COLS);
+        font = Math.floor((ref * at.cols) / TERMINAL_COLS);
         font = Math.max(TERMINAL_MIN_FONT, Math.min(TERMINAL_MAX_FONT, font));
       }
       if (term.options.fontSize !== font) term.options.fontSize = font;
-      const after = fitAddon.proposeDimensions();
+      let after = fitAddon.proposeDimensions();
+      // Char metrics are not perfectly linear (sub-pixel rounding); step the
+      // font down until 120 columns actually fit.
+      while (
+        after && after.cols && after.cols < TERMINAL_COLS &&
+        font > TERMINAL_MIN_FONT
+      ) {
+        font -= 1;
+        term.options.fontSize = font;
+        after = fitAddon.proposeDimensions();
+      }
       const rows = Math.max(
         TERMINAL_MIN_ROWS,
         Math.min(TERMINAL_MAX_ROWS, (after && after.rows) || TERMINAL_ROWS)
