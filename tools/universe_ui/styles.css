@@ -5553,13 +5553,36 @@ body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-pan
   display: none;
 }
 body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle {
-  top: 0;
+  top: -3px;
   left: 0;
   right: 0;
   bottom: auto;
   width: auto;
-  height: 10px;
+  height: 14px;
   cursor: ns-resize;
+}
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle::after {
+  top: 6px;
+  right: 50%;
+  bottom: auto;
+  left: 50%;
+  width: 36px;
+  height: 3px;
+  margin-left: -18px;
+  border-radius: 2px;
+  background: #4a4c53;
+}
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle:hover::after,
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle:focus-visible::after,
+body.chat-resizing.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle::after {
+  width: 52px;
+  height: 3px;
+  margin-left: -26px;
+  background: var(--ws-teal);
+}
+body.chat-resizing.terminal-bottom,
+body.chat-resizing.terminal-bottom * {
+  cursor: ns-resize !important;
 }
 .goal-card {
   padding: 0;

@@ -171,6 +171,7 @@ const state = {
   hoveredNodeId: null,
   inspectorDismissed: false,
   chatPanelWidth: 380,
+  terminalDockHeight: 300,
   selectedGoalId: null,
 };
 
@@ -5837,6 +5838,32 @@ function setChatPanelWidth(width, { persist = false } = {}) {
   }
 }
 
+const TERMINAL_DOCK_MIN_HEIGHT = 140;
+
+function clampTerminalDockHeight(height) {
+  const requested = Number(height);
+  const safe = Number.isFinite(requested) ? requested : state.terminalDockHeight;
+  const viewportMax = Math.max(TERMINAL_DOCK_MIN_HEIGHT, window.innerHeight - 160);
+  return Math.round(
+    Math.min(viewportMax, Math.max(TERMINAL_DOCK_MIN_HEIGHT, safe))
+  );
+}
+
+function setTerminalDockHeight(height, { persist = false } = {}) {
+  const shell = document.querySelector(".app-shell.mockup-shell");
+  if (!shell || window.innerWidth <= 720) return;
+  const next = clampTerminalDockHeight(height);
+  state.terminalDockHeight = next;
+  shell.style.setProperty("--terminal-dock-height", String(next) + "px");
+  if (persist) {
+    try {
+      window.localStorage.setItem("universe.terminalDockHeight", String(next));
+    } catch (_error) {
+      // Local preference storage is optional.
+    }
+  }
+}
+
 async function applyProjectRelease(proposal, button) {
   const projectId = String(proposal.project_id || "");
   if (!projectId) {
@@ -5901,16 +5928,47 @@ function initChatPanelResize() {
       : state.chatPanelWidth
   );
 
+  let storedHeight = null;
+  try {
+    storedHeight = Number(window.localStorage.getItem("universe.terminalDockHeight"));
+  } catch (_error) {
+    storedHeight = null;
+  }
+  setTerminalDockHeight(
+    Number.isFinite(storedHeight) && storedHeight > 0
+      ? storedHeight
+      : state.terminalDockHeight
+  );
+
+  // The one handle serves both docks: it resizes width on the right dock and
+  // height on the bottom dock (where CSS rotates it to an ns-resize top edge).
+  const isBottomDock = () => document.body.classList.contains("terminal-bottom");
+  const refitDock = () => {
+    if (typeof refitActiveTerminal === "function") refitActiveTerminal();
+    if (state.terminalGrid && typeof refitAllTerminals === "function") {
+      refitAllTerminals();
+    }
+  };
+
   let dragging = false;
   const move = (event) => {
     if (!dragging) return;
-    setChatPanelWidth(window.innerWidth - event.clientX);
+    if (isBottomDock()) {
+      setTerminalDockHeight(window.innerHeight - event.clientY);
+    } else {
+      setChatPanelWidth(window.innerWidth - event.clientX);
+    }
   };
   const finish = () => {
     if (!dragging) return;
     dragging = false;
     document.body.classList.remove("chat-resizing");
-    setChatPanelWidth(state.chatPanelWidth, { persist: true });
+    if (isBottomDock()) {
+      setTerminalDockHeight(state.terminalDockHeight, { persist: true });
+    } else {
+      setChatPanelWidth(state.chatPanelWidth, { persist: true });
+    }
+    refitDock();
   };
 
   handle.addEventListener("pointerdown", (event) => {
@@ -5924,6 +5982,18 @@ function initChatPanelResize() {
   window.addEventListener("pointerup", finish);
   window.addEventListener("pointercancel", finish);
   handle.addEventListener("keydown", (event) => {
+    if (isBottomDock()) {
+      let next = null;
+      if (event.key === "ArrowUp") next = state.terminalDockHeight + 24;
+      if (event.key === "ArrowDown") next = state.terminalDockHeight - 24;
+      if (event.key === "Home") next = window.innerHeight - 160;
+      if (event.key === "End") next = TERMINAL_DOCK_MIN_HEIGHT;
+      if (next === null) return;
+      event.preventDefault();
+      setTerminalDockHeight(next, { persist: true });
+      refitDock();
+      return;
+    }
     let next = null;
     if (event.key === "ArrowLeft") next = state.chatPanelWidth + 20;
     if (event.key === "ArrowRight") next = state.chatPanelWidth - 20;
@@ -5935,6 +6005,7 @@ function initChatPanelResize() {
   });
   window.addEventListener("resize", () => {
     setChatPanelWidth(state.chatPanelWidth);
+    setTerminalDockHeight(state.terminalDockHeight);
     if (document.body.classList.contains("home-mode")) drawHomeRelations();
   });
 }
@@ -17352,6 +17423,13 @@ function bindGoalPlanEvents() {
         parent.insertBefore(elements.conversationLayer, nextSibling);
       }
       renderRoomMessages();
+      // The container just jumped size — let xterm catch up once it settles.
+      setTimeout(() => {
+        if (typeof refitActiveTerminal === "function") refitActiveTerminal();
+        if (state.terminalGrid && typeof refitAllTerminals === "function") {
+          refitAllTerminals();
+        }
+      }, 240);
     });
   }
   elements.goalPlanMap?.addEventListener("click", () => showGraphView("semantic"));
@@ -17738,6 +17816,16 @@ refreshLawStrip = function () {
     if (btn) {
       btn.textContent = bottom ? "▶" : "▼";
       btn.title = bottom ? "Dock to right" : "Dock to bottom";
+    }
+    if (elements.chatResizeHandle) {
+      elements.chatResizeHandle.setAttribute(
+        "aria-orientation",
+        bottom ? "horizontal" : "vertical"
+      );
+      elements.chatResizeHandle.setAttribute(
+        "aria-label",
+        bottom ? "Resize terminal dock height" : "Resize chat panel width"
+      );
     }
     try {
       localStorage.setItem("universe.terminalDock", bottom ? "bottom" : "right");
