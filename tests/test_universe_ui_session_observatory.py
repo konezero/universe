@@ -160,7 +160,11 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('data.normalize("NFC")', TERM)
         self.assertIn("compositionend", TERM)
         self.assertNotIn("function HangulBuffer()", TERM)
-        self.assertNotIn("keyCode === 229", TERM)
+        # IME composition must not swallow line-editing keys.
+        self.assertIn("IME_PASSTHROUGH_KEYS", TERM)
+        self.assertIn('"Enter", "Backspace"', TERM)
+        self.assertIn('textarea.addEventListener("blur", () => { composing = false; }', TERM)
+        self.assertIn("composing && !isControlData", TERM)
         self.assertIn(".xterm-helper-textarea", CSS)
         self.assertIn("async function stopTerminalSession(terminalId)", TERM)
         self.assertIn('method: "DELETE"', TERM)

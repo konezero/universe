@@ -359,9 +359,25 @@ function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
   let lastComposed = null;
+  // During IME composition the compositionend path owns *text* input, so xterm
+  // must not also emit the printable keydowns. But it must still forward the
+  // keys that edit or submit the line — Enter, Backspace, arrows, Ctrl chords —
+  // which a blanket `isComposing` block was swallowing (Korean IME reports
+  // isComposing / keyCode 229 for those too).
+  const IME_PASSTHROUGH_KEYS = new Set([
+    "Enter", "Backspace", "Delete", "Tab", "Escape",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "Home", "End", "PageUp", "PageDown",
+  ]);
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
-      if (event.isComposing) return false;
+      if (event.type !== "keydown") return true;
+      if (event.isComposing || event.keyCode === 229) {
+        return (
+          IME_PASSTHROUGH_KEYS.has(event.key) ||
+          event.ctrlKey || event.altKey || event.metaKey
+        );
+      }
       return true;
     });
   }
@@ -383,9 +399,16 @@ function bindTerminalIme(term, socket) {
         try { textarea.value = ""; } catch (_error) { /* ignore */ }
       }, 0);
     }, true);
+    // A composition abandoned by a blur/refit would otherwise wedge `composing`
+    // true forever and silently drop every later keystroke.
+    textarea.addEventListener("blur", () => { composing = false; }, true);
   }
   term.onData((data) => {
-    if (composing) return;
+    // Control / navigation bytes (Enter \r, Backspace \x7f, arrows \x1b[…,
+    // Ctrl chords) are never composed text — forward them even mid-composition.
+    const isControlData =
+      !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
+    if (composing && !isControlData) return;
     // Skip only if xterm echoes the exact composed char we already sent
     if (lastComposed !== null && data === lastComposed) return;
     sendPtyText(socket, data);
