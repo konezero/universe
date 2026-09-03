@@ -7765,3 +7765,14 @@ body.fleet-mode .fleet-board {
 .room-index-title { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-index-meta { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
 .room-index-row.state-closed { opacity: 0.55; }
+
+.fleet-card { cursor: pointer; }
+.fleet-card:hover { border-color: var(--line-strong); }
+.fleet-card:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
+.todo-item-flash {
+  animation: todo-item-flash 1.6s ease-out;
+}
+@keyframes todo-item-flash {
+  0%, 30% { box-shadow: 0 0 0 2px var(--teal); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}

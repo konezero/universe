@@ -4068,6 +4068,24 @@ function fleetNodeLabel(nodeRef) {
   return raw;
 }
 
+// Open the Todo work map focused on one Todo (Fleet card → its Todo).
+function openFleetCardTodo(todoId) {
+  openTodoDialog(false);
+  const focusRow = (attempt = 0) => {
+    const row = elements.todoList?.querySelector(
+      `[data-todo-id="${CSS.escape(todoId)}"]`
+    );
+    if (!row) {
+      if (attempt < 10) setTimeout(() => focusRow(attempt + 1), 60);
+      return;
+    }
+    row.scrollIntoView({ block: "center" });
+    row.classList.add("todo-item-flash");
+    setTimeout(() => row.classList.remove("todo-item-flash"), 1600);
+  };
+  focusRow();
+}
+
 function renderFleetBoard() {
   const board = document.querySelector("#fleet-board");
   if (!board) return;
@@ -4120,6 +4138,18 @@ function renderFleetBoard() {
     const list = node("div", "fleet-lane-list");
     for (const todo of items) {
       const card = node("article", "fleet-card");
+      card.dataset.todoId = todo.todo_id;
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      // Fleet cards connect to their Todo: open the work map focused on it.
+      const openTodo = () => openFleetCardTodo(todo.todo_id);
+      card.addEventListener("click", openTodo);
+      card.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openTodo();
+        }
+      });
       card.append(node("div", "fleet-card-title", todo.title || todo.todo_id));
       const meta = node("div", "fleet-card-meta");
       const nodeName = fleetNodeLabel(todo.node_ref);
