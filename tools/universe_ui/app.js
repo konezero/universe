@@ -17329,6 +17329,23 @@ function bindGoalPlanEvents() {
     else if (["details", "future"].includes(view)) openInspectorSurface("details");
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
+  // Mobile: ☰ opens the rail as a left drawer; the scrim / any nav closes it.
+  const closeMobileNav = () => {
+    document.body.classList.remove("mobile-nav-open");
+    document.querySelector("#mobile-menu-btn")?.setAttribute("aria-expanded", "false");
+    const scrim = document.querySelector("#mobile-scrim");
+    if (scrim) scrim.hidden = true;
+  };
+  document.querySelector("#mobile-menu-btn")?.addEventListener("click", () => {
+    const open = document.body.classList.toggle("mobile-nav-open");
+    document.querySelector("#mobile-menu-btn")?.setAttribute("aria-expanded", String(open));
+    const scrim = document.querySelector("#mobile-scrim");
+    if (scrim) scrim.hidden = !open;
+  });
+  document.querySelector("#mobile-scrim")?.addEventListener("click", closeMobileNav);
+  elements.utilityRail?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-primary-view], #add-project-rail-button")) closeMobileNav();
+  });
   elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);
   elements.newSessionForm?.addEventListener("submit", submitNewSession);
   elements.quickConductorButton?.addEventListener("click", () => elements.dispatchInstruction?.focus());

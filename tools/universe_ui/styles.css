@@ -8054,3 +8054,149 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 
 /* Galaxy is full-bleed by default now — the fullscreen toggle is redundant. */
 #galaxy-fullscreen-toggle { display: none !important; }
+
+/* ============================================================
+   Mobile (≤720px) — simple console: header (☰ / title / ⚙),
+   a left nav drawer, one main view, a collapsible bottom xterm
+   sheet that overlays the main area when expanded. No Galaxy.
+   ============================================================ */
+.mobile-icon-btn { display: none; }
+.mobile-scrim { display: none; }
+
+@media (max-width: 720px) {
+  .app-shell.mockup-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: 52px minmax(0, 1fr);
+  }
+  .app-shell.mockup-shell > .topbar { grid-column: 1; grid-row: 1; }
+  .app-shell.mockup-shell > .graph-workspace { grid-column: 1; grid-row: 2; }
+  .app-shell.mockup-shell > .project-rail,
+  .app-shell.mockup-shell > .inspector,
+  .app-shell.mockup-shell > .status-bar { display: none !important; }
+
+  /* header */
+  .topbar {
+    padding: 0 8px;
+    gap: 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .mobile-icon-btn {
+    display: inline-grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-2);
+    font-size: 20px;
+    cursor: pointer;
+  }
+  .topbar > .primary-nav,
+  .topbar > .top-search,
+  .topbar #universe-list-link,
+  .topbar #service-status,
+  .topbar #mode-status,
+  .topbar #todo-button,
+  .topbar #session-observatory-topbar-button,
+  .topbar #start-project-topbar-button,
+  .topbar #release-button,
+  .topbar #refresh-button,
+  .topbar .user-chip { display: none !important; }
+  .topbar .brand-copy small { display: none; }
+  .topbar .brand-copy strong { font-size: 15px; }
+  .topbar .topbar-actions { margin-left: auto; gap: 4px; }
+  .topbar #settings-button { display: inline-grid; }
+
+  /* left nav drawer (the utility rail, slid in) */
+  .app-shell.mockup-shell > .utility-rail {
+    display: flex;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 76vw;
+    max-width: 300px;
+    z-index: 90;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 60px 10px 20px;
+    background: #17181b;
+    border-right: 1px solid var(--line);
+    transform: translateX(-104%);
+    transition: transform 0.22s ease;
+    overflow-y: auto;
+  }
+  body.mobile-nav-open .app-shell.mockup-shell > .utility-rail { transform: none; }
+  .utility-rail button {
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 14px;
+    width: 100%;
+    height: auto;
+    padding: 13px 12px;
+    border-radius: 8px;
+    color: var(--text-2);
+  }
+  .utility-rail button small { font-size: 14px; }
+  .utility-rail button > span[aria-hidden] { font-size: 18px; width: 20px; text-align: center; }
+  .utility-rail button.selected { background: #212327; color: var(--text-1); }
+  .utility-rail button[data-primary-view="map"] { display: none; }
+
+  .mobile-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    background: rgba(0, 0, 0, 0.5);
+  }
+  .mobile-scrim[hidden] { display: none; }
+
+  /* main content — one column, own scroll, no relation lines */
+  .goal-plan-workspace { padding: 12px 12px 52px; }
+  body.home-mode .goal-plan-workspace { padding: 0 0 52px; }
+  #home-view { flex-direction: column; min-width: 0; }
+  #home-view .home-rel { display: none; }
+  #home-view .home-col,
+  #home-view .home-col-projects,
+  #home-view .home-col-nodes,
+  #home-view .home-col-todos,
+  #home-view .home-col-detail {
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  #home-view .home-detail-kanban { flex-direction: column; min-width: 0; }
+
+  /* bottom xterm sheet — collapsed bar, expands over the main area */
+  body.terminal-bottom .app-shell.mockup-shell > .graph-workspace { padding-bottom: 44px; }
+  body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    height: 44px;
+    width: auto;
+    z-index: 70;
+    border-top: 1px solid var(--line);
+    box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.4);
+    transition: height 0.2s ease;
+  }
+  body.terminal-bottom
+    .app-shell.mockup-shell
+    > .graph-workspace
+    > .conductor-panel:has(.conversation-layer:not(.collapsed)) {
+    height: 72dvh;
+  }
+  .conversation-layer:not(.expanded) {
+    position: static !important;
+    width: auto !important;
+    max-height: none !important;
+    min-height: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+  }
+  .conversation-layer .conversation-layer-header { min-height: 44px; }
+}
