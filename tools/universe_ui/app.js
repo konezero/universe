@@ -4559,6 +4559,37 @@ function renderHomeNodes(selNode) {
     const rows = [];
     const desc = graphNode.data?.summary || graphNode.data?.note;
     if (desc) rows.push(node("div", "", desc));
+
+    const statusRow = node("div", "home-card-meta");
+    const kind = String(graphNode.kind || "").toUpperCase();
+    if (kind === "FEATURE") {
+      const stateChip = node(
+        "span",
+        "home-chip",
+        graphNode.proposed ? "제안됨" : "채택됨"
+      );
+      if (!graphNode.proposed) {
+        stateChip.style.borderColor = "#5c6b3f";
+        stateChip.style.color = "#8a9b6f";
+      }
+      statusRow.append(stateChip);
+    } else if (kind) {
+      statusRow.append(node("span", "home-chip", kind.toLowerCase()));
+    }
+    const room = projectRoomsList().find(
+      (r) => r.feature_id && homeNodeRefKey(graphNode.node_id) === r.feature_id
+    );
+    if (room) {
+      const roomChip = node("span", "home-chip", "◈ room");
+      roomChip.style.cssText = "border-color:#4a4655;color:#8f84a8;cursor:pointer";
+      roomChip.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openRoomObservation(room.room_id).catch((error) => toast(error.message, true));
+      });
+      statusRow.append(roomChip);
+    }
+    if (statusRow.childElementCount) rows.push(statusRow);
+
     const doneCount = todos.filter((t) => String(t.state || "").toUpperCase() === "DONE").length;
     if (todos.length) {
       rows.push(
