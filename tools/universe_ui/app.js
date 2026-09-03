@@ -10383,7 +10383,7 @@ function drawGraph() {
     const x = (index * 149 + 41) % viewportWidth;
     const y = (index * 83 + 67) % viewportHeight;
     const radius = index % 11 === 0 ? 1.4 : 0.65;
-    context.fillStyle = index % 11 === 0 ? "rgba(114, 189, 255, 0.58)" : "rgba(178, 205, 244, 0.24)";
+    context.fillStyle = index % 11 === 0 ? "rgba(150, 152, 148, 0.4)" : "rgba(130, 132, 128, 0.18)";
     context.beginPath();
     context.arc(x, y, radius, 0, Math.PI * 2);
     context.fill();
@@ -10492,11 +10492,11 @@ function drawGalaxyShips(context, byId) {
 // Unified Galaxy: muted, kind-keyed planet colours (no glow) so the map reads
 // as a calm dark-grey surface, not a toy.
 const UNIFIED_ACCENT = {
-  PRODUCT: { fill: "rgba(38,54,50,0.95)", stroke: "#7fb0a7", soft: "rgba(111,155,147,0.18)" },
-  APP: { fill: "rgba(34,44,54,0.95)", stroke: "#6a8fb2", soft: "rgba(106,127,155,0.18)" },
-  SURFACE: { fill: "rgba(32,40,48,0.95)", stroke: "#5f7f9b", soft: "rgba(95,127,155,0.16)" },
-  FEATURE: { fill: "rgba(42,38,52,0.95)", stroke: "#9a8fb6", soft: "rgba(125,115,151,0.18)" },
-  CAPABILITY: { fill: "rgba(36,48,46,0.95)", stroke: "#6f9b93", soft: "rgba(111,155,147,0.16)" },
+  PRODUCT: { fill: "rgba(40,44,42,0.96)", stroke: "#6f9b93", soft: "rgba(111,155,147,0.12)" },
+  APP: { fill: "rgba(36,40,44,0.96)", stroke: "#6a8093", soft: "rgba(106,128,147,0.12)" },
+  SURFACE: { fill: "rgba(34,38,42,0.96)", stroke: "#5f7382", soft: "rgba(95,115,130,0.1)" },
+  FEATURE: { fill: "rgba(40,38,44,0.96)", stroke: "#8a8098", soft: "rgba(125,115,151,0.12)" },
+  CAPABILITY: { fill: "rgba(36,42,40,0.96)", stroke: "#6f9b93", soft: "rgba(111,155,147,0.1)" },
   FLOW: { fill: "rgba(40,38,50,0.95)", stroke: "#8f84a8", soft: "rgba(125,115,151,0.16)" },
   EXTERNAL_BOUNDARY: { fill: "rgba(48,44,36,0.95)", stroke: "#a68d5b", soft: "rgba(166,141,91,0.16)" },
   STRUCTURE: { fill: "rgba(38,40,44,0.95)", stroke: "#8a8a86", soft: "rgba(138,138,134,0.14)" },
@@ -10660,7 +10660,7 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   context.globalAlpha = style.alpha;
   if (selected || hovered) {
     context.shadowColor = glow;
-    context.shadowBlur = item.unifiedKind ? (selected ? 12 : 8) : selected ? 20 : 14;
+    context.shadowBlur = item.unifiedKind ? (selected ? 6 : 3) : selected ? 20 : 14;
   } else if (emphasized) {
     context.shadowColor = accent.soft;
     context.shadowBlur = item.unifiedKind ? 4 : 10;
@@ -10674,14 +10674,16 @@ function drawGraphNodeIcon(context, item, depthStyle) {
     context.beginPath();
     context.arc(item.x, item.y, r + 6, 0, Math.PI * 2);
     context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "rgba(90, 208, 255, 0.55)");
-    context.lineWidth = selected ? 2.4 : 1.5;
+    context.lineWidth = selected ? 2 : 1.2;
     context.stroke();
     context.beginPath();
     context.arc(item.x, item.y, r, 0, Math.PI * 2);
-    context.fillStyle = selected ? "rgba(12, 32, 56, 0.98)" : "rgba(10, 24, 44, 0.94)";
+    context.fillStyle = item.unifiedKind
+      ? accent.fill
+      : (selected ? "rgba(12, 32, 56, 0.98)" : "rgba(10, 24, 44, 0.94)");
     context.fill();
     context.strokeStyle = selected ? focusRing : (item.unifiedKind ? accent.stroke : "#5ad0ff");
-    context.lineWidth = selected ? 2.4 : 1.8;
+    context.lineWidth = selected ? 2 : 1.4;
     context.stroke();
   } else if (metrics.shape === "project") {
     // Project: filled circle, color-coded by project id.

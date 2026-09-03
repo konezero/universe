@@ -7495,3 +7495,81 @@ body.chat-resizing * {
     border-radius: 0 0 8px 8px;
   }
 }
+
+/* ============================================================
+   Muted dark-grey theme (rag/universe-shell-ia-and-galaxy-view).
+   Last block wins: redefines every palette token family to the
+   design canvas palette. Individual hardcoded hexes are chased
+   separately where they still read as the old blue/cyan.
+   ============================================================ */
+:root {
+  /* general theme */
+  --bg-0: #17181b;
+  --bg-1: #191a1d;
+  --bg-2: #1f2024;
+  --bg: #191a1d;
+  --panel: rgba(33, 35, 39, 0.92);
+  --panel-strong: rgba(40, 42, 47, 0.96);
+  --surface: rgba(33, 35, 39, 0.9);
+  --surface-quiet: rgba(28, 29, 33, 0.85);
+  --line: #31333a;
+  --line-default: #31333a;
+  --line-soft: #26272c;
+  --line-strong: #43454c;
+  --focus-ring: rgba(111, 155, 147, 0.45);
+  --text: #e6e6e4;
+  --text-1: #e6e6e4;
+  --text-2: #a8a8a4;
+  --text-3: #6f6f6b;
+  --muted: #8a8a86;
+  --cyan: #6f9b93;
+  --teal: #6f9b93;
+  --blue: #6a7f9b;
+  --violet: #7d7397;
+  --amber: #a68d5b;
+  --green: #6f9b78;
+  --red: #a86f66;
+  --glow-cyan: none;
+  --glow-violet: none;
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+
+  /* goal-plan / Fleet workspace */
+  --work-bg: #191a1d;
+  --work-panel: #212327;
+  --work-panel-raised: #282a2f;
+  --work-line: #31333a;
+  --work-text: #e6e6e4;
+  --work-muted: #8a8a86;
+  --work-teal: #6f9b93;
+  --work-coral: #a86f66;
+  --work-yellow: #a68d5b;
+
+  /* shell (rails / panels) */
+  --ws-ink: #191a1d;
+  --ws-panel: #212327;
+  --ws-panel-2: #282a2f;
+  --ws-line: #31333a;
+  --ws-teal: #6f9b93;
+  --ws-teal-soft: rgba(111, 155, 147, 0.16);
+  --ws-coral: #a86f66;
+  --ws-text: #e6e6e4;
+  --ws-muted: #8a8a86;
+}
+
+html,
+body {
+  background: #191a1d !important;
+  color: var(--text-1);
+}
+
+/* Canvas / graph surface — flat dark grey, no blue glow. */
+.canvas-wrap,
+.canvas-wrap.starfield {
+  background:
+    radial-gradient(1px 1px at 14% 24%, rgba(200, 200, 196, 0.28), transparent),
+    radial-gradient(1px 1px at 30% 68%, rgba(190, 190, 186, 0.2), transparent),
+    radial-gradient(1px 1px at 64% 20%, rgba(200, 200, 196, 0.22), transparent),
+    radial-gradient(1px 1px at 80% 56%, rgba(180, 180, 176, 0.18), transparent),
+    radial-gradient(1px 1px at 88% 82%, rgba(180, 180, 176, 0.16), transparent),
+    #16171a;
+}
