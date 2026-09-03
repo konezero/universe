@@ -4003,6 +4003,7 @@ function showGraphView(view) {
   const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
   restoreBenchPanel();
+  restoreProjectPanels();
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
   if (goalWorkspace) goalWorkspace.hidden = false;
   state.view = view;
@@ -4043,6 +4044,7 @@ function showGoalPlanView() {
   document.body.classList.remove("graph-mode");
   document.body.classList.remove("galaxy-view");
   restoreBenchPanel();
+  restoreProjectPanels();
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
   if (goalWorkspace) goalWorkspace.hidden = false;
   syncPrimaryNavSelection("work");
@@ -4954,11 +4956,60 @@ function restoreBenchPanel() {
   state.benchScreenActive = false;
 }
 
+// Project-scoped screens (Activity / Memory) — the inspector's tabs promoted
+// to full centre screens. The panel <section>s live in the (hidden) inspector
+// as the source of truth; they get moved into #project-screen-body while
+// active and parked back after.
+const PROJECT_SCREENS = {
+  activity: { panelId: "activity-panel", title: "Activity", kicker: "Timeline", render: () => renderActivity() },
+  memory: { panelId: "memory-panel", title: "Memory", kicker: "Project RAG", render: () => renderMemory() },
+};
+
+function restoreProjectPanels() {
+  const body = document.querySelector("#project-screen-body");
+  const inspector = document.querySelector(".inspector");
+  if (body && inspector) {
+    for (const key of Object.keys(PROJECT_SCREENS)) {
+      const panel = document.querySelector(`#${PROJECT_SCREENS[key].panelId}`);
+      if (panel && panel.parentElement === body) {
+        inspector.append(panel);
+        panel.classList.add("hidden");
+      }
+    }
+  }
+  const screen = document.querySelector("#project-screen");
+  if (screen) screen.hidden = true;
+}
+
+function showProjectScreen(which) {
+  const spec = PROJECT_SCREENS[which];
+  const screen = document.querySelector("#project-screen");
+  const body = document.querySelector("#project-screen-body");
+  const panel = spec && document.querySelector(`#${spec.panelId}`);
+  if (!spec || !screen || !body || !panel) return;
+  restoreBenchPanel();
+  state.view = which;
+  document.body.classList.remove("graph-mode", "home-mode", "fleet-mode", "galaxy-view", "inspector-open");
+  const goalWorkspace = document.querySelector("#goal-plan-workspace");
+  if (goalWorkspace) goalWorkspace.hidden = true;
+  document.querySelector("#project-screen-title").textContent = spec.title;
+  document.querySelector("#project-screen-kicker").textContent = spec.kicker;
+  document.querySelector("#project-screen-subtitle").textContent = state.selectedProject
+    ? projectDisplayName(state.selectedProject)
+    : "Select a project";
+  body.append(panel);
+  panel.classList.remove("hidden");
+  screen.hidden = false;
+  syncPrimaryNavSelection(which);
+  spec.render();
+}
+
 function showBenchScreen() {
   const panel = elements.benchPanel;
   const screen = document.querySelector("#bench-screen");
   const screenBody = document.querySelector("#bench-screen-body");
   if (!panel || !screen || !screenBody) return openInspectorSurface("bench");
+  restoreProjectPanels();
   state.view = "bench";
   state.benchScreenActive = true;
   document.body.classList.remove("graph-mode");
@@ -17114,9 +17165,9 @@ function bindEvents() {
       const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
       if (nav) nav.click();
       else if (view === "bench") showBenchScreen();
-      else if (["memory", "future", "activity", "details"].includes(view)) {
-        openInspectorSurface(view);
-      } else if (view === "map" || view === "universe") {
+      else if (view === "activity" || view === "memory") showProjectScreen(view);
+      else if (["future", "details"].includes(view)) openInspectorSurface("details");
+      else if (view === "map" || view === "universe") {
         showGraphView(state.selectedProject ? "semantic" : "universe");
       }
     });
@@ -17266,10 +17317,8 @@ function bindGoalPlanEvents() {
       openRoomIndex().catch((error) => toast(error.message, true));
     }
     else if (view === "bench") showBenchScreen();
-    // Memory / Activity live in the Galaxy knowledge graph now, not a rail view.
-    else if (["memory", "activity", "details", "future"].includes(view)) {
-      openInspectorSurface(view === "future" ? "details" : view);
-    }
+    else if (view === "activity" || view === "memory") showProjectScreen(view);
+    else if (["details", "future"].includes(view)) openInspectorSurface("details");
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
   elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);

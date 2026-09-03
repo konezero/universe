@@ -8038,3 +8038,8 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .galaxy-node-card-facts dd { margin: 0; color: #d0d1d6; }
 .galaxy-node-card-actions { display: flex; gap: 8px; }
 .galaxy-node-card-actions button { flex: 1; padding: 7px; font-size: 11px; }
+
+/* NODE MODES panel retired — sessions surface on Todos / in the dock, not a
+   standalone tree. MAIN spans where the rail used to be, in every view. */
+.app-shell.mockup-shell > .project-rail { display: none; }
+.app-shell.mockup-shell > .graph-workspace { grid-column: 2 / -1; }

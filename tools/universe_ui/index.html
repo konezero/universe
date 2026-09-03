@@ -45,6 +45,8 @@
     <nav class="utility-rail" aria-label="Universe tools">
       <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
       <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true">&#9675;</span><small>Galaxy</small></button>
+      <button type="button" data-primary-view="activity" title="Project activity"><span aria-hidden="true">&#8801;</span><small>Activity</small></button>
+      <button type="button" data-primary-view="memory" title="Project memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
       <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
       <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
       <button type="button" data-primary-view="meeting" title="Collaboration Rooms"><span aria-hidden="true">&#9672;</span><small>Rooms</small></button>
@@ -173,6 +175,16 @@
           </div>
         </header>
         <div id="bench-screen-body"></div>
+      </section>
+      <section id="project-screen" class="bench-screen" aria-label="Project view" hidden>
+        <header class="goal-plan-header">
+          <div>
+            <span class="goal-plan-kicker" id="project-screen-kicker">Project</span>
+            <h1 id="project-screen-title">Activity</h1>
+            <p id="project-screen-subtitle">Select a project</p>
+          </div>
+        </header>
+        <div id="project-screen-body"></div>
       </section>
       <div class="graph-toolbar glass-bar">
         <div class="toolbar-filters">
