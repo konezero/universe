@@ -101,6 +101,7 @@ const state = {
   homeTodoId: null,
   homeAgentTodoId: null,
   homeCollapsed: new Set(),
+  homeMobileLevel: "projects",
   supervisorEvents: [],
   providerActivitySources: [],
   providerActivityDiscoveries: [],
@@ -4497,6 +4498,7 @@ function renderIntegratedHome() {
   renderHomeDetail(selNode, selTodo);
   renderHomeKanban(selNode, nodeTodos, selTodo);
   renderHomeWorkSummary(nodeTodos);
+  renderHomeMobileBar(project, selNode, selTodo);
   // Draw after layout settles; the retry budget resets each render.
   // (setTimeout, not rAF — rAF is paused when the tab is not foregrounded.)
   homeRelRetry = 0;
@@ -4509,6 +4511,50 @@ function renderIntegratedHome() {
       if (document.body.classList.contains("home-mode")) drawHomeRelations();
     });
   }
+}
+
+function isMobileView() {
+  return window.matchMedia("(max-width: 720px)").matches;
+}
+
+// Mobile: the home shows one level at a time (projects → nodes → todos →
+// detail). Selecting an item on mobile advances; the bar's ← goes back.
+const HOME_LEVELS = ["projects", "nodes", "todos", "detail"];
+function homeMobileGo(level) {
+  state.homeMobileLevel = HOME_LEVELS.includes(level) ? level : "projects";
+  document.body.dataset.homeLevel = state.homeMobileLevel;
+  renderIntegratedHome();
+}
+function homeMobileBack() {
+  const i = HOME_LEVELS.indexOf(state.homeMobileLevel);
+  homeMobileGo(HOME_LEVELS[Math.max(0, i - 1)]);
+}
+function homeMobileAdvance(from) {
+  if (!isMobileView()) return;
+  const i = HOME_LEVELS.indexOf(from);
+  if (i >= 0 && i < HOME_LEVELS.length - 1) homeMobileGo(HOME_LEVELS[i + 1]);
+}
+
+function renderHomeMobileBar(project, selNode, selTodo) {
+  const bar = document.querySelector("#home-mobile-bar");
+  const crumb = document.querySelector("#home-mobile-crumb");
+  if (!bar || !crumb) return;
+  if (!isMobileView()) {
+    bar.hidden = true;
+    delete document.body.dataset.homeLevel;
+    return;
+  }
+  bar.hidden = false;
+  if (!HOME_LEVELS.includes(state.homeMobileLevel)) state.homeMobileLevel = "projects";
+  document.body.dataset.homeLevel = state.homeMobileLevel;
+  const labels = {
+    projects: "Projects",
+    nodes: `${project?.project_id || ""} · nodes`,
+    todos: selNode?.title ? `${shortLabel(selNode.title, 24)} · todos` : "Todos",
+    detail: selTodo?.title ? shortLabel(selTodo.title, 30) : "Todo",
+  };
+  crumb.textContent = labels[state.homeMobileLevel] || "";
+  document.querySelector("#home-mobile-back").hidden = state.homeMobileLevel === "projects";
 }
 
 function renderHomeProjects() {
@@ -4529,11 +4575,16 @@ function renderHomeProjects() {
     row.style.flex = "0 0 auto";
     row.querySelector("span:last-child").style.flex = "1";
     row.addEventListener("click", () => {
-      if (project.project_id === selectedId) return;
       state.homeNodeId = null;
       state.homeTodoId = null;
       state.homeAgentTodoId = null;
-      selectProject(project.project_id).catch((error) => toast(error.message, true));
+      if (project.project_id === selectedId) {
+        homeMobileAdvance("projects");
+        return;
+      }
+      selectProject(project.project_id)
+        .then(() => homeMobileAdvance("projects"))
+        .catch((error) => toast(error.message, true));
     });
     listEl.append(row);
   }
@@ -4658,7 +4709,8 @@ function renderHomeNodes(selNode) {
       state.homeNodeId = graphNode.node_id;
       state.homeTodoId = null;
       state.homeAgentTodoId = null;
-      renderIntegratedHome();
+      if (isMobileView()) homeMobileGo("todos");
+      else renderIntegratedHome();
     });
     listEl.append(card);
   }
@@ -4705,7 +4757,8 @@ function renderHomeTodos(selNode, nodeTodos, selTodo) {
     });
     card.addEventListener("home-select", () => {
       state.homeTodoId = todo.todo_id;
-      renderIntegratedHome();
+      if (isMobileView()) homeMobileGo("detail");
+      else renderIntegratedHome();
     });
     listEl.append(card);
   }
@@ -17343,6 +17396,7 @@ function bindGoalPlanEvents() {
     if (scrim) scrim.hidden = !open;
   });
   document.querySelector("#mobile-scrim")?.addEventListener("click", closeMobileNav);
+  document.querySelector("#home-mobile-back")?.addEventListener("click", homeMobileBack);
   elements.utilityRail?.addEventListener("click", (event) => {
     if (event.target.closest("[data-primary-view], #add-project-rail-button")) closeMobileNav();
   });

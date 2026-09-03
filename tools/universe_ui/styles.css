@@ -8169,6 +8169,49 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
   }
   #home-view .home-detail-kanban { flex-direction: column; min-width: 0; }
 
+  /* one level at a time (body[data-home-level] set by the JS wizard) */
+  .home-mobile-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    background: #17181b;
+    position: sticky;
+    top: 0;
+    z-index: 3;
+  }
+  .home-mobile-bar[hidden] { display: none; }
+  .home-mobile-back {
+    width: 30px;
+    height: 30px;
+    flex: none;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-2);
+    font-size: 16px;
+    cursor: pointer;
+  }
+  .home-mobile-back[hidden] { display: none; }
+  .home-mobile-crumb {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-1);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body[data-home-level] #home-view .home-col-projects,
+  body[data-home-level] #home-view .home-col-nodes,
+  body[data-home-level] #home-view .home-col-todos,
+  body[data-home-level] #home-view .home-detail-kanban { display: none; }
+  body[data-home-level="projects"] #home-view .home-col-projects,
+  body[data-home-level="nodes"] #home-view .home-col-nodes,
+  body[data-home-level="todos"] #home-view .home-col-todos,
+  body[data-home-level="detail"] #home-view .home-detail-kanban { display: flex; }
+  body[data-home-level="detail"] #home-view .home-col-detail { display: flex; }
+
   /* bottom xterm sheet — collapsed bar, expands over the main area */
   body.terminal-bottom .app-shell.mockup-shell > .graph-workspace { padding-bottom: 44px; }
   body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
