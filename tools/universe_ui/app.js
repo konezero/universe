@@ -142,7 +142,7 @@ const state = {
   providerSessionPermissions: [],
   providerSessionConnection: null,
   providerSessionStreamState: "IDLE",
-  conversationSurface: "CHAT",
+  conversationSurface: "CLI",
   conversationTarget: {
     kind: "NONE",
     projectId: null,
@@ -3876,24 +3876,29 @@ function renderComposerState() {
   const activeTerminal = typeof activeTerminalSession === "function"
     ? activeTerminalSession()
     : (state.terminals || []).find((item) => item.terminal_id === state.activeTerminalId);
+  // The dock is the session terminal only. The "message the Conductor" chat
+  // surface has been removed — the user works agents in the session window,
+  // so the conversation surface is always CLI.
   const showTerminal =
     state.conversationSurface === "CLI" && Boolean(activeTerminal);
-  const showConversation =
-    !showTerminal && state.conversationTarget.kind !== "NONE";
-  elements.roomMessageList.classList.toggle("hidden", !showConversation);
-  elements.dispatchForm.classList.toggle("hidden", !showConversation);
+  const showConversation = false;
+  elements.roomMessageList.classList.add("hidden");
+  elements.dispatchForm.classList.add("hidden");
   elements.terminalTabs.classList.toggle("hidden", !showTerminal);
   elements.terminalStage.classList.toggle("hidden", !showTerminal);
   const dockLabel = elements.conversationToggle?.querySelector(".chat-dock-label");
   if (dockLabel) {
-    // The dock is the session terminal — the old "chat to Conductor" surface
-    // is superseded by working directly in the session window.
     dockLabel.textContent = showTerminal ? "Terminal" : "Sessions";
   }
   if (typeof applyCliDockTitle === "function") {
     applyCliDockTitle(showTerminal ? activeTerminal : null);
   }
   if (showTerminal) return;
+  if (true) {
+    elements.conversationTitle.textContent = "Sessions";
+    elements.conversationTargetLabel.textContent = "No terminal tab";
+    return;
+  }
   if (!showConversation) {
     elements.conversationTitle.textContent = "Chat";
     elements.conversationTargetLabel.textContent = "Select a session";
@@ -5003,7 +5008,7 @@ function mergeGovernanceProposalInbox(projectId, proposals) {
 
 function syncConversationToggle(collapsed) {
   if (!elements.conversationToggle) return;
-  const title = collapsed ? "Expand conversation" : "Collapse conversation";
+  const title = collapsed ? "Expand session dock" : "Collapse session dock";
   elements.conversationToggle.title = title;
   elements.conversationToggle.setAttribute("aria-label", title);
   elements.conversationToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
