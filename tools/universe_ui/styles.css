@@ -5496,6 +5496,21 @@ body {
   padding: 0 5px;
 }
 .fleet-card-ship { color: #a68d5b; }
+
+.bench-screen {
+  padding: 18px 22px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.bench-screen[hidden] { display: none; }
+.bench-screen #bench-panel,
+.bench-screen #bench-panel.hidden {
+  display: block;
+  position: static;
+  width: 100%;
+  max-width: 1100px;
+}
+#goal-plan-workspace[hidden] { display: none; }
 .goal-card {
   padding: 0;
   overflow: hidden;

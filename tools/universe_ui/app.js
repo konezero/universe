@@ -3997,6 +3997,9 @@ function setGraphScale(nextScale) {
 function showGraphView(view) {
   const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
+  restoreBenchPanel();
+  const goalWorkspace = document.querySelector("#goal-plan-workspace");
+  if (goalWorkspace) goalWorkspace.hidden = false;
   state.view = view;
   document.body.classList.add("graph-mode");
   state.selectedNode = null;
@@ -4021,6 +4024,9 @@ function showGraphView(view) {
 function showGoalPlanView() {
   state.view = "work";
   document.body.classList.remove("graph-mode");
+  restoreBenchPanel();
+  const goalWorkspace = document.querySelector("#goal-plan-workspace");
+  if (goalWorkspace) goalWorkspace.hidden = false;
   syncPrimaryNavSelection("work");
   renderGoalPlan();
 }
@@ -4120,8 +4126,43 @@ function syncPrimaryNavSelection(primaryView) {
   }
 }
 
+// Bench as a dedicated centre screen: physically move #bench-panel into
+// #bench-screen-body (keeps its listeners), render, and hide the plan/graph.
+// Leaving any other view moves it back to the inspector.
+function restoreBenchPanel() {
+  const panel = elements.benchPanel;
+  const home = document.querySelector("#memory-panel");
+  const screenBody = document.querySelector("#bench-screen-body");
+  if (panel && home && panel.parentElement === screenBody) {
+    home.parentElement.insertBefore(panel, home);
+    panel.classList.add("hidden");
+  }
+  const screen = document.querySelector("#bench-screen");
+  if (screen) screen.hidden = true;
+  state.benchScreenActive = false;
+}
+
+function showBenchScreen() {
+  const panel = elements.benchPanel;
+  const screen = document.querySelector("#bench-screen");
+  const screenBody = document.querySelector("#bench-screen-body");
+  if (!panel || !screen || !screenBody) return openInspectorSurface("bench");
+  state.view = "bench";
+  state.benchScreenActive = true;
+  document.body.classList.remove("graph-mode");
+  document.body.classList.remove("inspector-open");
+  const goalWorkspace = document.querySelector("#goal-plan-workspace");
+  if (goalWorkspace) goalWorkspace.hidden = true;
+  screenBody.append(panel);
+  panel.classList.remove("hidden");
+  screen.hidden = false;
+  syncPrimaryNavSelection("bench");
+  renderBench();
+}
+
 /** Open inspector tab (Memory / Future / Bench / Activity / Details). */
 function openInspectorSurface(tab) {
+  restoreBenchPanel();
   const allowed = new Set(["details", "activity", "bench", "memory", "future"]);
   if (!allowed.has(tab)) tab = "details";
   state.inspectorDismissed = false;
@@ -15998,7 +16039,8 @@ function bindEvents() {
       }
       const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
       if (nav) nav.click();
-      else if (["memory", "future", "bench", "activity", "details"].includes(view)) {
+      else if (view === "bench") showBenchScreen();
+      else if (["memory", "future", "activity", "details"].includes(view)) {
         openInspectorSurface(view);
       } else if (view === "map" || view === "universe") {
         showGraphView(state.selectedProject ? "semantic" : "universe");
@@ -16051,8 +16093,12 @@ function bindEvents() {
         showGraphView(view);
         return;
       }
+      if (view === "bench") {
+        showBenchScreen();
+        return;
+      }
       // Project-context panels live only in the inspector.
-      if (["memory", "future", "bench", "activity", "details"].includes(view)) {
+      if (["memory", "future", "activity", "details"].includes(view)) {
         openInspectorSurface(view);
         return;
       }
@@ -16146,7 +16192,8 @@ function bindGoalPlanEvents() {
       state.settingsTab = "rooms";
       openProviderSettings().catch((error) => toast(error.message, true));
     }
-    else if (["memory", "bench", "activity", "details"].includes(view)) openInspectorSurface(view);
+    else if (view === "bench") showBenchScreen();
+    else if (["memory", "activity", "details"].includes(view)) openInspectorSurface(view);
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
   elements.quickNewSessionButton?.addEventListener("click", openNewSessionDialog);
