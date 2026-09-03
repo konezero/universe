@@ -4224,14 +4224,11 @@ function openFleetCardSession(todo) {
     if (typeof selectTerminalTab === "function") selectTerminalTab(term.terminal_id);
     return;
   }
-  openNewSessionDialog();
-  if (elements.newSessionMode) {
-    elements.newSessionMode.value = "MASTER";
-    elements.newSessionMode.onchange?.();
-  }
-  if (elements.newSessionProject && state.selectedProject) {
-    elements.newSessionProject.value = state.selectedProject.project_id;
-  }
+  openNewSessionDialog({
+    projectId: state.selectedProject?.project_id,
+    mode: "MASTER",
+    nodeHint: fleetNodeLabel(todo.node_ref),
+  });
 }
 
 // Open the Todo work map focused on one Todo (Fleet card → its Todo).
@@ -6553,7 +6550,7 @@ function providerCatalogModels(provider) {
   return Array.isArray(entry?.models) ? entry.models : [];
 }
 
-function openNewSessionDialog() {
+function openNewSessionDialog(options = {}) {
   if (!elements.newSessionDialog) return;
   const providers = state.providerSettings?.available_providers || [];
   elements.newSessionProvider.replaceChildren();
@@ -6606,19 +6603,30 @@ function openNewSessionDialog() {
     option.value = project.project_id;
     elements.newSessionProject.append(option);
   }
-  const currentProjectId = state.selectedProject?.project_id || projects[0]?.project_id || "";
-  elements.newSessionProject.value = currentProjectId;
+  // Default to the project in view — a session almost always works on the
+  // project you were just looking at, as its Master.
+  const contextProjectId =
+    options.projectId ||
+    state.selectedProject?.project_id ||
+    projects[0]?.project_id ||
+    "";
+  elements.newSessionProject.value = contextProjectId;
+  const contextMode =
+    options.mode ||
+    (contextProjectId && contextProjectId.toLowerCase() !== "universe" ? "MASTER" : "CONDUCTOR");
 
   const updateProjectRowVisibility = () => {
     if (elements.newSessionProjectRow) {
       elements.newSessionProjectRow.hidden = elements.newSessionMode.value === "CONDUCTOR";
     }
   };
-  elements.newSessionMode.value = "CONDUCTOR";
+  elements.newSessionMode.value = contextMode;
   updateProjectRowVisibility();
   elements.newSessionMode.onchange = updateProjectRowVisibility;
 
-  if (elements.newSessionStatus) elements.newSessionStatus.textContent = "";
+  if (elements.newSessionStatus) {
+    elements.newSessionStatus.textContent = options.nodeHint ? `for ${options.nodeHint}` : "";
+  }
   if (elements.newSessionError) elements.newSessionError.textContent = "";
   if (elements.newSessionSubmit) elements.newSessionSubmit.disabled = false;
   elements.newSessionDialog.showModal();
@@ -17656,7 +17664,12 @@ refreshLawStrip = function () {
     );
   }
   document.querySelector("#terminal-new-session")?.addEventListener("click", () => {
-    openNewSessionDialog();
+    // Prefill from what's in view: the home's selected node's project + label.
+    const homeNode = typeof homeSelectedNode === "function" ? homeSelectedNode() : null;
+    openNewSessionDialog({
+      projectId: state.selectedProject?.project_id,
+      nodeHint: homeNode?.label,
+    });
   });
   document.querySelector("#terminal-dock-side")?.addEventListener("click", () => {
     const bottom = !document.body.classList.contains("terminal-bottom");
