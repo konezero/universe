@@ -874,6 +874,24 @@ body.inspector-open .graph-hint {
   overflow: hidden;
   position: relative;
 }
+.terminal-pane .xterm-viewport {
+  overscroll-behavior: contain;
+}
+.terminal-status-chip,
+.terminal-delivery-chip {
+  font-size: 10px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.terminal-status-chip.is-live { color: #7fb0a7; }
+.terminal-status-chip.is-dead { color: #a86f66; }
+.terminal-delivery-chip.is-delivered { color: #7fb0a7; }
+.terminal-delivery-chip.is-pending { color: #91a0af; }
+.terminal-delivery-chip.is-stalled,
+.terminal-delivery-chip.is-blocked { color: #a68d5b; }
 
 /* Grid mode: every open session visible at once. */
 .terminal-stage.terminal-grid {

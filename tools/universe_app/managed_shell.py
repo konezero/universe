@@ -635,6 +635,8 @@ def _native_host_probes() -> dict[str, Any] | None:
         "is_alive": probes["is_alive"],
         "children_of": children_of,
         "start_time_of": probes["start_time_of"],
+        "process_name": probes["process_name"],
+        "process_image_path": probes["process_image_path"],
         "source": "WINDOWS_NATIVE",
     }
 

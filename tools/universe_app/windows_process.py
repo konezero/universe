@@ -106,6 +106,14 @@ def _kernel32() -> Any:
         ctypes.POINTER(_ProcessEntry32W),
     ]
 
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+
     _KERNEL32 = kernel32
     return _KERNEL32
 
@@ -279,6 +287,28 @@ def process_name(pid: int) -> str:
         kernel32.CloseHandle(wintypes.HANDLE(snapshot))
 
 
+def process_image_path(pid: int) -> str:
+    """Return the full image path of one process, or an empty string."""
+
+    if not native_inspection_available() or not (isinstance(pid, int) and pid > 0):
+        return ""
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid)
+    )
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        ok = kernel32.QueryFullProcessImageNameW(
+            wintypes.HANDLE(handle), 0, buf, ctypes.byref(size)
+        )
+        return buf.value if ok else ""
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
 def native_probes() -> dict[str, Callable[..., Any]] | None:
     """Build native process probes, or None when this Host cannot inspect."""
 
@@ -290,4 +320,5 @@ def native_probes() -> dict[str, Callable[..., Any]] | None:
         "child_pids": child_pids,
         "parent_pid": parent_pid,
         "process_name": process_name,
+        "process_image_path": process_image_path,
     }

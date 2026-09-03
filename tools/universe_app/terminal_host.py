@@ -44,6 +44,14 @@ from universe_app.managed_shell import (
     observe_process_tree,
     plan_hook_timeout_recovery,
 )
+from universe_app.prompt_submission_verification import (
+    AGENT_PROMPT_EFFECT_POLL_MS,
+    AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+    AGENT_PROMPT_PENDING,
+    prompt_activity,
+    verify_agent_prompt_submission,
+)
+from universe_app.provider_process_recognition import recognize_provider_process_tree
 from universe_app.reconnection_host import (
     ReconnectionHostError,
     ReconnectionHostRegistry,
@@ -487,6 +495,16 @@ class TerminalSession:
     protocol_state: str = "UNKNOWN"
     bootstrap_input: bytes = b""
     bootstrap_delivered: bool = False
+    prompt_generation: int = 0
+    working_sequence: int = 0
+    permission_sequence: int = 0
+    explicit_working_started_at: float | None = None
+    hook_status: str | None = None
+    prompt_delivery: str = ""
+    provider_cli: str = ""
+    provider_cli_process: str = ""
+    provider_cli_alive: bool = False
+    prompt_verify_stop: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -540,6 +558,18 @@ class TerminalSession:
                 else "NOT_APPLICABLE"
             ),
             "channel_registered": self.channel_is_registered(),
+            "output_sequence": self.output_cursor,
+            "prompt_delivery": self.prompt_delivery,
+            "prompt_activity": {
+                "generation": self.prompt_generation,
+                "working_sequence": self.working_sequence,
+                "permission_sequence": self.permission_sequence,
+                "output_sequence": self.output_cursor,
+                "status": self.hook_status,
+            },
+            "provider_cli": self.provider_cli,
+            "provider_cli_process": self.provider_cli_process,
+            "provider_cli_alive": self.provider_cli_alive,
         }
 
     def channel_is_registered(self) -> bool:
@@ -1729,6 +1759,7 @@ class TerminalHost:
             start_time_of=resolved["start_time_of"],
             pty_responsive=self._pty_responsive(session),
         )
+        self._refresh_provider_cli(session, observation, resolved)
         previous_state = shell.last_state
         state = shell.evaluate(observation, now=time.time() if now is None else now)
         if not observation.cli_children and shell.grace_deadline is not None:
@@ -1962,6 +1993,110 @@ class TerminalHost:
             terminal_id, audit_context=audit_context, terminate_host=True
         )
 
+
+    def _session_prompt_activity(self, session: TerminalSession) -> dict[str, Any]:
+        status = session.hook_status
+        if not status:
+            status = "working" if session.provider_cli_alive else "idle"
+        return prompt_activity(
+            generation=session.prompt_generation,
+            permission_sequence=session.permission_sequence,
+            working_sequence=session.working_sequence,
+            explicit_working_started_at=session.explicit_working_started_at,
+            output_sequence=session.output_cursor,
+            status=status,
+        )
+
+    def record_hook_activity(
+        self,
+        terminal_id: str,
+        *,
+        status: str | None = None,
+        working: bool = False,
+        permission: bool = False,
+    ) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        if working:
+            session.working_sequence += 1
+            session.explicit_working_started_at = time.time()
+            session.hook_status = "working"
+        if permission:
+            session.permission_sequence += 1
+            session.hook_status = "permission"
+        if status:
+            session.hook_status = status
+        return self._session_prompt_activity(session)
+
+    def _arm_prompt_verification(
+        self, session: TerminalSession, baseline: Mapping[str, Any]
+    ) -> None:
+        session.prompt_delivery = AGENT_PROMPT_PENDING
+        session.prompt_verify_stop.set()
+        stop = threading.Event()
+        session.prompt_verify_stop = stop
+
+        def run() -> None:
+            result = verify_agent_prompt_submission(
+                baseline=baseline,
+                read_activity=lambda: self._session_prompt_activity(session),
+                timeout_ms=AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                poll_ms=AGENT_PROMPT_EFFECT_POLL_MS,
+            )
+            if stop.is_set():
+                return
+            session.prompt_delivery = result
+
+        threading.Thread(
+            target=run,
+            name="prompt-verify-" + session.terminal_id[:8],
+            daemon=True,
+        ).start()
+
+    def _refresh_provider_cli(
+        self,
+        session: TerminalSession,
+        observation: ShellObservation,
+        probes: Mapping[str, Any] | None,
+    ) -> None:
+        nodes: list[dict[str, Any]] = []
+        name_fn = probes.get("process_name") if isinstance(probes, Mapping) else None
+        image_fn = probes.get("process_image_path") if isinstance(probes, Mapping) else None
+        children_fn = probes.get("children_of") if isinstance(probes, Mapping) else None
+        identities = []
+        if observation.shell is not None:
+            identities.append(observation.shell)
+        identities.extend(observation.cli_children)
+        for child in identities:
+            name = str(name_fn(child.pid) or "") if callable(name_fn) else ""
+            image = str(image_fn(child.pid) or "") if callable(image_fn) else ""
+            grandchildren: list[dict[str, Any]] = []
+            if callable(children_fn):
+                for grand in children_fn(child.pid):
+                    gname = str(name_fn(grand.pid) or "") if callable(name_fn) else ""
+                    gimage = str(image_fn(grand.pid) or "") if callable(image_fn) else ""
+                    grandchildren.append(
+                        {
+                            "name": gname,
+                            "image": gimage,
+                            "command_line": "",
+                            "children": [],
+                        }
+                    )
+            nodes.append(
+                {
+                    "name": name,
+                    "image": image,
+                    "command_line": "",
+                    "children": grandchildren,
+                }
+            )
+        recognized = recognize_provider_process_tree(nodes)
+        session.provider_cli = str(recognized.get("provider") or "")
+        session.provider_cli_process = str(recognized.get("process_name") or "")
+        session.provider_cli_alive = bool(recognized.get("alive"))
+        if session.provider_cli_alive and not session.hook_status:
+            session.hook_status = "working"
+
     def write(
         self,
         terminal_id: str,
@@ -1973,7 +2108,11 @@ class TerminalHost:
         backend = session.backend
         if backend is None or session.state != "LIVE":
             raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
+        submit = b"\r" in data or b"\n" in data
+        baseline = self._session_prompt_activity(session) if submit else None
         backend.write(data)
+        if submit and baseline is not None:
+            self._arm_prompt_verification(session, baseline)
         controls = _input_control_metadata(data)
         if controls:
             self.record_audit_event(
@@ -2304,6 +2443,25 @@ class TerminalHost:
         if session.state != "LIVE":
             return
         self._refresh_host_projection(session)
+        probes = host_process_probes()
+        if probes is not None:
+            shell_id = None
+            managed = getattr(session, "managed_shell", None)
+            if managed is not None:
+                shell_id = getattr(managed, "shell", None)
+            if shell_id is None:
+                pid = session.live_pid()
+                started = probes["start_time_of"](pid) if pid else None
+                if isinstance(pid, int) and pid > 0 and started is not None:
+                    shell_id = ProcessIdentity(pid=int(pid), started_at=float(started))
+            if shell_id is not None:
+                observation = observe_process_tree(
+                    shell_id,
+                    is_alive=probes["is_alive"],
+                    children_of=probes["children_of"],
+                    start_time_of=probes["start_time_of"],
+                )
+                self._refresh_provider_cli(session, observation, probes)
         backend = session.backend
         if backend is None or self._backend_is_alive(backend) is not False:
             return

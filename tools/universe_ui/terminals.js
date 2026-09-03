@@ -104,6 +104,143 @@ function cloneTerminalChunk(data) {
   return new TextEncoder().encode(String(data || ""));
 }
 
+
+const LIGHT_BG_MIN_CONTRAST = 4.5;
+const DARK_BG_MIN_CONTRAST = 3;
+const TERMINAL_SCROLLBAR_GUTTER_PX = 7;
+const IME_STALE_COMPOSITION_MS = 10000;
+const RETAINED_LIVE_MAX_BYTES = 2 * 1024 * 1024;
+const HANGUL_PREEDIT_PATTERN = /[ᄀ-ᇿ㄰-㆏ꥠ-꥿가-힣]/;
+
+function channelLuminance(value) {
+  const channel = value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  return channel;
+}
+
+function hexBackgroundLuminance(hex) {
+  const raw = String(hex || "").trim().replace(/^#/, "");
+  if (raw.length !== 6 || /[^0-9a-fA-F]/.test(raw)) return 0;
+  const r = parseInt(raw.slice(0, 2), 16) / 255;
+  const g = parseInt(raw.slice(2, 4), 16) / 255;
+  const b = parseInt(raw.slice(4, 6), 16) / 255;
+  return 0.2126 * channelLuminance(r) + 0.7152 * channelLuminance(g) + 0.0722 * channelLuminance(b);
+}
+
+function terminalMinimumContrastRatio(background) {
+  return hexBackgroundLuminance(background) >= 0.5
+    ? LIGHT_BG_MIN_CONTRAST
+    : DARK_BG_MIN_CONTRAST;
+}
+
+function releaseTerminalReplayGuard(surface) {
+  const finish = () => {
+    if (!surface.replayDepth) surface.replaying = false;
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(finish);
+  else finish();
+}
+
+async function withTerminalReplayGuard(surface, writer) {
+  surface.replayDepth = (surface.replayDepth || 0) + 1;
+  surface.replaying = true;
+  try {
+    return await writer();
+  } finally {
+    surface.replayDepth = Math.max(0, (surface.replayDepth || 1) - 1);
+    if (!surface.replayDepth) releaseTerminalReplayGuard(surface);
+  }
+}
+
+function installGuardedLinkProviderRegistration(term) {
+  if (!term || typeof term.registerLinkProvider !== "function") return;
+  const register = term.registerLinkProvider.bind(term);
+  let providerCount = 0;
+  term.registerLinkProvider = (provider) => {
+    providerCount += 1;
+    const label = "provider-" + providerCount;
+    return register({
+      provideLinks(bufferLineNumber, callback) {
+        let invoked = false;
+        const tracked = (links) => {
+          invoked = true;
+          callback(links);
+        };
+        try {
+          provider.provideLinks(bufferLineNumber, tracked);
+        } catch (_error) {
+          if (!invoked) callback(undefined);
+        }
+      },
+    });
+  };
+}
+
+function attachTerminalMouseWheelHandler(term) {
+  if (!term || typeof term.attachCustomWheelEventHandler !== "function") return;
+  term.attachCustomWheelEventHandler(() => {
+    const mode = term.modes && term.modes.mouseTrackingMode;
+    if (mode && mode !== "none") return false;
+    return true;
+  });
+}
+
+function disposeTerminalWebgl(surface) {
+  const addon = surface?.webglAddon;
+  if (!addon) return;
+  try { addon.dispose(); } catch (_error) { /* already gone */ }
+  surface.webglAddon = null;
+}
+
+function attachTerminalWebgl(surface) {
+  if (!surface?.term || surface.webglAddon) return Boolean(surface?.webglAddon);
+  if (surface.webglFailedSinceRecovery) return false;
+  if (typeof window.WebglAddon?.WebglAddon !== "function") return false;
+  let webgl = null;
+  try {
+    webgl = new window.WebglAddon.WebglAddon();
+    webgl.onContextLoss(() => {
+      disposeTerminalWebgl(surface);
+      surface.webglFailedSinceRecovery = false;
+      try { surface.notifySize?.(0); } catch (_error) { /* pane may be gone */ }
+    });
+    surface.term.loadAddon(webgl);
+    if (!surface.element?.querySelector("canvas")) {
+      try { webgl.dispose(); } catch (_error) { /* nothing to undo */ }
+      surface.webglFailedSinceRecovery = true;
+      surface.webglAddon = null;
+      return false;
+    }
+    surface.webglAddon = webgl;
+    surface.webglFailedSinceRecovery = false;
+    return true;
+  } catch (_error) {
+    try { webgl?.dispose(); } catch (_disposeError) { /* stay on DOM */ }
+    surface.webglAddon = null;
+    surface.webglFailedSinceRecovery = true;
+    return false;
+  }
+}
+
+function retryTerminalWebglAfterFit(surface, fitted) {
+  if (!fitted || !surface) return;
+  if (surface.webglAddon) return;
+  surface.webglFailedSinceRecovery = false;
+  attachTerminalWebgl(surface);
+}
+
+
+function retainLiveChunk(surface, live, displayed) {
+  surface.retainedLiveChunks.push({ data: live, displayed });
+  let total = 0;
+  for (const entry of surface.retainedLiveChunks) total += entry.data.length;
+  if (total <= RETAINED_LIVE_MAX_BYTES) return;
+  const snapshot = concatTerminalChunks(surface.retainedLiveChunks.map((entry) => entry.data));
+  const kept = snapshot.length > RETAINED_LIVE_MAX_BYTES
+    ? snapshot.slice(snapshot.length - RETAINED_LIVE_MAX_BYTES)
+    : snapshot;
+  surface.retainedLiveChunks = [{ data: kept, displayed: false, overflowSnapshot: true }];
+}
+
 function concatTerminalChunks(chunks) {
   const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
   const joined = new Uint8Array(total);
@@ -198,15 +335,17 @@ async function loadOlderTerminalHistory(surface, session) {
     trimHistoryCoveredLiveTail(ordered, surface.retainedLiveChunks);
     for (const entry of surface.retainedLiveChunks) entry.displayed = false;
     const snapshot = decodeTerminalHistoryChunk(payload.screen_snapshot_base64);
-    try { surface.term.reset(); } catch (_error) { /* xterm not ready */ }
-    for (const chunk of ordered) await writeTerminalChunk(surface.term, chunk);
-    // A WebSocket attachment already paints the current screen snapshot. Use the
-    // API snapshot only when no immutable history chunk is available; appending it
-    // after the same latest chunks would duplicate the visible tail.
-    if (!ordered.length && snapshot.length) {
-      await writeTerminalChunk(surface.term, snapshot);
-    }
-    await writeUndisplayedLiveTail(surface);
+    await withTerminalReplayGuard(surface, async () => {
+      try { surface.term.reset(); } catch (_error) { /* xterm not ready */ }
+      for (const chunk of ordered) await writeTerminalChunk(surface.term, chunk);
+      // A WebSocket attachment already paints the current screen snapshot. Use the
+      // API snapshot only when no immutable history chunk is available; appending it
+      // after the same latest chunks would duplicate the visible tail.
+      if (!ordered.length && snapshot.length) {
+        await writeTerminalChunk(surface.term, snapshot);
+      }
+      await writeUndisplayedLiveTail(surface);
+    });
     surface.historyInitialized = true;
     const rebuilt = surface.term?.buffer?.active;
     if (rebuilt) {
@@ -215,7 +354,9 @@ async function loadOlderTerminalHistory(surface, session) {
       );
     }
   } finally {
-    await writeUndisplayedLiveTail(surface);
+    await withTerminalReplayGuard(surface, async () => {
+      await writeUndisplayedLiveTail(surface);
+    });
     surface.rebuildingHistory = false;
     surface.historyLoading = false;
   }
@@ -241,6 +382,17 @@ function renderTerminalDock() {
     tab.ariaSelected = String(active);
     tab.dataset.terminalId = session.terminal_id;
     tab.append(node("span", "", terminalLabel(session)));
+    const cliName = String(session.provider_cli || "").toUpperCase();
+    if (cliName) {
+      const chip = node("span", "terminal-status-chip", cliName);
+      chip.classList.add(session.provider_cli_alive === false ? "is-dead" : "is-live");
+      chip.title = String(session.provider_cli_process || cliName);
+      tab.append(chip);
+    }
+    const delivery = String(session.prompt_delivery || "").toLowerCase();
+    if (["delivered", "stalled", "pending", "blocked"].includes(delivery)) {
+      tab.append(node("span", "terminal-delivery-chip is-" + delivery, delivery));
+    }
     const close = node("span", "terminal-tab-close", "×");
     close.title = "Close tab";
     close.addEventListener("click", (event) => {
@@ -350,6 +502,33 @@ function sendPtyText(socket, data) {
   const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
   if (!text) return;
   socket.send(new TextEncoder().encode(text));
+  if (/\r|\n/.test(text)) watchPromptDelivery(state.activeTerminalId);
+}
+
+function watchPromptDelivery(terminalId) {
+  const id = String(terminalId || "").trim();
+  if (!id) return;
+  const started = Date.now();
+  const tick = () => {
+    api("/v1/terminals").then((payload) => {
+      const row = (payload.terminals || []).find((item) => item.terminal_id === id);
+      if (!row) return;
+      const current = (state.terminals || []).find((item) => item.terminal_id === id);
+      if (current) {
+        current.prompt_delivery = row.prompt_delivery;
+        current.provider_cli = row.provider_cli;
+        current.provider_cli_alive = row.provider_cli_alive;
+        current.provider_cli_process = row.provider_cli_process;
+      }
+      renderTerminalDock();
+      const delivery = String(row.prompt_delivery || "");
+      if (["delivered", "stalled", "blocked", "stale"].includes(delivery)) return;
+      if (Date.now() - started < 30000) window.setTimeout(tick, 50);
+    }).catch(() => {
+      if (Date.now() - started < 30000) window.setTimeout(tick, 50);
+    });
+  };
+  window.setTimeout(tick, 50);
 }
 
 // The grid width is fixed at 120 columns; the font is scaled so those columns
@@ -362,10 +541,12 @@ const TERMINAL_MAX_ROWS = 60;
 const TERMINAL_MIN_FONT = 6;
 const TERMINAL_MAX_FONT = 16;
 
-function bindTerminalIme(term, socket) {
+function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
   let lastComposed = null;
+  let lastComposeAt = 0;
+  let hangulPreedit = false;
   // During IME composition the compositionend path owns *text* input, so xterm
   // must not also emit the printable keydowns. But it must still forward the
   // keys that edit or submit the line — Enter, Backspace, arrows, Ctrl chords —
@@ -379,7 +560,21 @@ function bindTerminalIme(term, socket) {
   let composeWatchdog = 0;
   const endCompose = () => {
     composing = false;
+    hangulPreedit = false;
     window.clearTimeout(composeWatchdog);
+  };
+  const markComposeActivity = (event) => {
+    lastComposeAt = Date.now();
+    const data = event && typeof event.data === "string" ? event.data : "";
+    if (data) hangulPreedit = HANGUL_PREEDIT_PATTERN.test(data);
+  };
+  const isComposingNow = () => {
+    if (!composing) return false;
+    if (Date.now() - lastComposeAt > IME_STALE_COMPOSITION_MS) {
+      endCompose();
+      return false;
+    }
+    return true;
   };
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
@@ -387,10 +582,13 @@ function bindTerminalIme(term, socket) {
       // Self-heal: the browser is the source of truth for composition. If it
       // says this keydown is not composing, any stale `composing` is wrong —
       // clear it so input never wedges after one character.
-      if (composing && !event.isComposing && event.keyCode !== 229) {
+      if (isComposingNow() && !event.isComposing && event.keyCode !== 229) {
         endCompose();
       }
       if (event.isComposing || event.keyCode === 229) {
+        if (hangulPreedit && /^[0-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey) {
+          return true;
+        }
         return (
           IME_PASSTHROUGH_KEYS.has(event.key) ||
           event.ctrlKey || event.altKey || event.metaKey
@@ -403,13 +601,19 @@ function bindTerminalIme(term, socket) {
     textarea.setAttribute("autocapitalize", "off");
     textarea.setAttribute("autocomplete", "off");
     textarea.setAttribute("spellcheck", "false");
-    textarea.addEventListener("compositionstart", () => {
+    textarea.addEventListener("compositionstart", (event) => {
       composing = true;
       lastComposed = null;
+      hangulPreedit = false;
+      markComposeActivity(event);
       // No real composition outlives this; if compositionend is ever missed
       // (IME quirks, focus races) the flag still clears on its own.
       window.clearTimeout(composeWatchdog);
-      composeWatchdog = window.setTimeout(() => { composing = false; }, 3000);
+      composeWatchdog = window.setTimeout(endCompose, IME_STALE_COMPOSITION_MS);
+    }, true);
+    textarea.addEventListener("compositionupdate", (event) => {
+      composing = true;
+      markComposeActivity(event);
     }, true);
     textarea.addEventListener("compositionend", (event) => {
       endCompose();
@@ -422,11 +626,14 @@ function bindTerminalIme(term, socket) {
     textarea.addEventListener("blur", endCompose, true);
   }
   term.onData((data) => {
+    // xterm auto-answers DA1/CPR/OSC during a replay; those bytes
+    // must not reach the PTY as stray input.
+    if (getSurface?.()?.replaying) return;
     // Control / navigation bytes (Enter \r, Backspace \x7f, arrows \x1b[…,
     // Ctrl chords) are never composed text — forward them even mid-composition.
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    if (composing && !isControlData) return;
+    if (isComposingNow() && !isControlData) return;
     // Skip only if xterm echoes the exact composed char we already sent
     if (lastComposed !== null && data === lastComposed) return;
     sendPtyText(socket, data);
@@ -505,44 +712,34 @@ function ensureTerminalSurface(session) {
       ? new window.FitAddon.FitAddon()
       : null
   );
+  const termTheme = {
+    background: "#07101d",
+    foreground: "#d7e6ff",
+  };
   const term = new Terminal({
     cols: TERMINAL_COLS,
     rows: TERMINAL_ROWS,
+    allowProposedApi: true,
     cursorBlink: true,
     fontSize: 13,
     fontFamily: 'Consolas, "Cascadia Code", D2Coding, "Nanum Gothic Coding", monospace',
     unicodeVersion: "11",
     convertEol: true,
     scrollback: 5000,
-    smoothScrollDuration: 100,
-    theme: {
-      background: "#07101d",
-      foreground: "#d7e6ff",
-    },
+    smoothScrollDuration: 0,
+    scrollSensitivity: 1.15,
+    fastScrollSensitivity: 5,
+    macOptionIsMeta: false,
+    minimumContrastRatio: terminalMinimumContrastRatio(termTheme.background),
+    scrollbar: { width: TERMINAL_SCROLLBAR_GUTTER_PX },
+    vtExtensions: { kittyKeyboard: true },
+    theme: termTheme,
   });
   term.open(element);
+  installGuardedLinkProviderRegistration(term);
+  attachTerminalMouseWheelHandler(term);
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
-  }
-  // The DOM renderer repaints the whole grid on every keystroke; a full-screen
-  // TUI in a tall dock then lags. Load the GPU renderer (addon version is
-  // lock-stepped with the bundled xterm) and only keep it if it actually took
-  // over — a version-mismatched addon that half-activates would break echo.
-  if (typeof window.WebglAddon?.WebglAddon === "function") {
-    try {
-      const webgl = new window.WebglAddon.WebglAddon();
-      webgl.onContextLoss(() => {
-        try { webgl.dispose(); } catch (_error) { /* already gone */ }
-      });
-      term.loadAddon(webgl);
-      // The DOM renderer paints <div> rows; the GPU renderer paints <canvas>.
-      // No canvas means activate() bailed — drop back to the DOM renderer.
-      if (!element.querySelector("canvas")) {
-        try { webgl.dispose(); } catch (_error) { /* nothing to undo */ }
-      }
-    } catch (_error) {
-      /* stay on the DOM renderer */
-    }
   }
   // A click in the pane must land keyboard focus in xterm's hidden textarea.
   // When the running TUI turns on mouse tracking, xterm forwards the click as
@@ -567,10 +764,12 @@ function ensureTerminalSurface(session) {
     window.clearTimeout(initialLayoutTimer);
     initialLayoutTimer = window.setTimeout(() => {
       if (!initialLayoutPending || element.hidden) return;
-      if (!refreshAfterLayout()) {
+      const fitted = refreshAfterLayout();
+      if (!fitted) {
         scheduleInitialLayout(200);
         return;
       }
+      retryTerminalWebglAfterFit(surface, fitted);
       initialLayoutPending = false;
       if (surface) surface.initialLayoutPending = false;
       sendCurrentSize();
@@ -587,15 +786,12 @@ function ensureTerminalSurface(session) {
   socket.addEventListener("message", (event) => {
     const live = cloneTerminalChunk(event.data);
     if (surface && (surface.rebuildingHistory || surface.historyInitialized)) {
-      surface.retainedLiveChunks.push({
-        data: live,
-        displayed: !surface.rebuildingHistory,
-      });
+      retainLiveChunk(surface, live, !surface.rebuildingHistory);
     }
     if (!surface?.rebuildingHistory) writeTerminalBytes(term, live);
     scheduleInitialLayout(240);
   });
-  bindTerminalIme(term, socket);
+  bindTerminalIme(term, socket, () => surface);
   let resizeTimer = 0;
   const sendCurrentSize = () => {
     if (socket.readyState !== WebSocket.OPEN) return false;
@@ -623,8 +819,13 @@ function ensureTerminalSurface(session) {
       if (!restoringTab) captureTerminalViewport(surface);
       const previousCols = term.cols;
       const previousRows = term.rows;
-      fitTerminalToContainer(term, element, fitAddon);
+      const fitted = fitTerminalToContainer(term, element, fitAddon);
+      retryTerminalWebglAfterFit(surface, fitted);
       const geometryChanged = term.cols !== previousCols || term.rows !== previousRows;
+      if (!geometryChanged && !restoringTab) {
+        if (surface) surface.savedViewport = null;
+        return;
+      }
       sendCurrentSize();
       if (restoringTab || geometryChanged) restoreTerminalViewport(surface);
       else if (surface) surface.savedViewport = null;
@@ -663,7 +864,12 @@ function ensureTerminalSurface(session) {
     rebuildingHistory: false,
     historyInitialized: false,
     retainedLiveChunks: [],
+    replaying: false,
+    replayDepth: 0,
+    webglAddon: null,
+    webglFailedSinceRecovery: false,
   };
+  attachTerminalWebgl(surface);
   term.onScroll((viewportY) => {
     if (viewportY > 2 || surface.rebuildingHistory) return;
     loadOlderTerminalHistory(surface, session).catch((error) =>
