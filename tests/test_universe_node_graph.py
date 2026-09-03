@@ -15,6 +15,7 @@ from universe_node_graph import (  # noqa: E402
     document_graph,
     graft_feature_nodes,
     graft_knowledge_nodes,
+    graft_work_rollup,
     unify_seed_graph,
 )
 
@@ -366,6 +367,45 @@ class GraftFeatureTests(unittest.TestCase):
     def test_no_unified_graph_is_safe(self):
         out = graft_feature_nodes({"views": []}, [{"feature_id": "f1"}])
         self.assertEqual(out["feature_grafted"], {"adopted": 0, "proposed": 0})
+
+
+class GraftWorkRollupTests(unittest.TestCase):
+    def _projection_with_feature(self):
+        graph = unify_seed_graph(_seed())
+        graph["nodes"].append(
+            {"node_id": "universe", "kind": "PRODUCT", "state": "ADOPTED",
+             "title": "Universe", "refs": []}
+        )
+        proj = {"unified_graph": graph, "views": []}
+        return graft_feature_nodes(proj, [
+            {"feature_id": "feature_abc", "intent_text": "A feature",
+             "state": "EXPLORING", "evidence_refs": []},
+        ])
+
+    def test_rollup_by_lane_and_ships(self):
+        proj = self._projection_with_feature()
+        goals = [{
+            "goal_id": "g1", "node_ref": "feature_abc", "todos": [
+                {"todo_id": "t1", "state": "IN_PROGRESS", "node_ref": "feature_abc",
+                 "task_frame_id": "tf1", "title": "wip"},
+                {"todo_id": "t2", "state": "DONE", "node_ref": "feature_abc"},
+                {"todo_id": "t3", "state": "BACKLOG", "node_ref": "structure"},
+            ],
+            "milestones": [],
+        }]
+        out = graft_work_rollup(proj, goals)
+        by_id = {n["node_id"]: n for n in out["unified_graph"]["nodes"]}
+        self.assertEqual(by_id["feat:feature_abc"]["work"]["executing"], 1)
+        self.assertEqual(by_id["feat:feature_abc"]["work"]["done"], 1)
+        self.assertEqual(by_id["feat:feature_abc"]["work"]["total"], 2)
+        self.assertEqual(by_id["structure"]["work"]["planned"], 1)
+        self.assertEqual(len(out["ships"]), 1)
+        self.assertEqual(out["ships"][0]["target_node"], "feat:feature_abc")
+        self.assertEqual(out["ships"][0]["state"], "EXECUTING")
+
+    def test_no_unified_graph_is_safe(self):
+        out = graft_work_rollup({"views": []}, [{"goal_id": "g"}])
+        self.assertEqual(out["ships"], [])
 
 
 if __name__ == "__main__":

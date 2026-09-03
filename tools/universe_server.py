@@ -23032,6 +23032,13 @@ class UniverseStore:
             except Exception:  # noqa: BLE001
                 features = []
             projection = _graft_features(projection, features)
+            try:
+                from universe_node_graph import graft_work_rollup as _graft_work
+
+                goals = self.list_project_goals(normalized)
+                projection = _graft_work(projection, goals)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001 - projection read must not fail
             pass
         return projection

@@ -571,6 +571,97 @@ def graft_feature_nodes(
     return result
 
 
+# Todo lifecycle_state -> kanban lane.
+_TODO_LANE = {
+    "BACKLOG": "planned",
+    "PLANNED": "planned",
+    "READY": "ready",
+    "IN_PROGRESS": "executing",
+    "VERIFYING": "verifying",
+    "BLOCKED": "blocked",
+    "DONE": "done",
+}
+_LANES = ("planned", "ready", "executing", "verifying", "blocked", "done")
+
+
+def graft_work_rollup(
+    projection: Mapping[str, Any],
+    goals: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Roll Work Items up per node and derive the ship list.
+
+    A goal / todo carries ``node_ref`` (a node id, or a ``feature_<id>`` that
+    maps to the grafted ``feat:<id>`` node). For each node we attach
+    ``work`` = counts by lane; ``projection["ships"]`` lists each executing
+    todo as a ship heading to its node.
+    """
+
+    result = dict(projection)
+    unified = projection.get("unified_graph")
+    if not isinstance(unified, Mapping):
+        result["ships"] = []
+        return result
+
+    nodes = list(unified.get("nodes") or [])
+    node_ids = {n.get("node_id") for n in nodes}
+
+    def resolve(node_ref: Any) -> str | None:
+        ref = _text(node_ref)
+        if not ref:
+            return None
+        if ref in node_ids:
+            return ref
+        if ref.startswith("feature_") and f"feat:{ref}" in node_ids:
+            return f"feat:{ref}"
+        return None
+
+    todos: list[Mapping[str, Any]] = []
+    for goal in goals or []:
+        for todo in goal.get("todos") or []:
+            todos.append(todo)
+        for milestone in goal.get("milestones") or []:
+            for todo in milestone.get("todos") or []:
+                todos.append(todo)
+
+    rollup: dict[str, dict[str, int]] = {}
+    ships: list[dict[str, Any]] = []
+    for todo in todos:
+        target = resolve(todo.get("node_ref"))
+        if not target:
+            continue
+        lane = _TODO_LANE.get(_text(todo.get("state")).upper())
+        if not lane:
+            continue
+        bucket = rollup.setdefault(target, {k: 0 for k in _LANES})
+        bucket[lane] += 1
+        if lane in ("executing", "verifying"):
+            ships.append(
+                {
+                    "todo_id": _text(todo.get("todo_id")),
+                    "task_frame_id": _text(todo.get("task_frame_id")) or None,
+                    "target_node": target,
+                    "state": "VERIFYING" if lane == "verifying" else "EXECUTING",
+                    "title": _text(todo.get("title"))[:80],
+                }
+            )
+
+    new_nodes = []
+    for n in nodes:
+        work = rollup.get(n.get("node_id"))
+        if work:
+            n = dict(n)
+            n["work"] = {**work, "total": sum(work.values())}
+        new_nodes.append(n)
+
+    result["unified_graph"] = {
+        "schema": NODE_GRAPH_SCHEMA,
+        "nodes": new_nodes,
+        "edges": list(unified.get("edges") or []),
+    }
+    result["ships"] = ships
+    return result
+
+
 def compute_views(
     nodes: Sequence[Mapping[str, Any]],
     edges: Sequence[Mapping[str, Any]],
