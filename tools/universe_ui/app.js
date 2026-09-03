@@ -4036,12 +4036,10 @@ function showGoalPlanView() {
   renderGoalPlan();
 }
 
-function setGoalPlanLayout(layout) {
-  state.goalPlanLayout = layout === "board" ? "board" : "plan";
-  const planBtn = document.querySelector("#goal-plan-layout-plan");
-  const boardBtn = document.querySelector("#goal-plan-layout-board");
-  planBtn?.classList.toggle("selected", state.goalPlanLayout === "plan");
-  boardBtn?.classList.toggle("selected", state.goalPlanLayout === "board");
+// The Plan/Board toggle is gone — the home (Project → Node → Todo → Kanban)
+// is the only layout. Kept as a no-op shim for old call sites.
+function setGoalPlanLayout() {
+  state.goalPlanLayout = "board";
   renderGoalPlan();
 }
 
@@ -4095,6 +4093,45 @@ function roomsForSelectedNode(selected) {
       (featureId && room.feature_id === featureId) ||
       (room.task_frame_id && ownedTaskFrames.has(room.task_frame_id))
   );
+}
+
+// + 노드 등록 — a feature node is created inside a project Meeting Room
+// (intent → explore → adopt). Spin one up and drop the user into it.
+async function openHomeAddNode() {
+  const projectId = state.selectedProject?.project_id;
+  if (!projectId) {
+    toast("먼저 프로젝트를 선택하세요", true);
+    return;
+  }
+  await api("/v1/rooms", {
+    method: "POST",
+    body: {
+      room_type: "MEETING",
+      title: `${projectId} · new node`,
+      topic: "Feature node specification",
+      project_id: projectId,
+      models: [],
+    },
+  });
+  toast("미팅룸을 만들었어요 — 여기서 feature 노드를 정의하세요");
+  if (typeof refreshProjectRooms === "function") await refreshProjectRooms().catch(() => {});
+  openRoomIndex().catch((error) => toast(error.message, true));
+}
+
+// + Todo 등록 — open the todo work map, create tab, scoped to the selected node.
+function openHomeAddTodo() {
+  openTodoDialog(true);
+  const nodeRef = homeNodeRefKey(state.homeNodeId || "");
+  if (nodeRef && elements.todoScope && elements.todoNode) {
+    elements.todoScope.value = "NODE";
+    if (typeof renderTodoScopeControls === "function") renderTodoScopeControls();
+    const hasOption = [...elements.todoNode.options].some((o) => o.value === nodeRef);
+    if (!hasOption) {
+      elements.todoNode.append(new Option(homeSelectedNode()?.title || nodeRef, nodeRef));
+    }
+    elements.todoNode.value = nodeRef;
+    elements.todoNode.disabled = false;
+  }
 }
 
 // A live terminal working the selected project (its Master/Conductor session).
@@ -14083,168 +14120,15 @@ function renderGoalPlan() {
   if (!document.body.classList.contains("graph-mode")) {
     syncPrimaryNavSelection("work");
   }
-  const boardMode = state.goalPlanLayout === "board";
+  // The home (Project → Node → Todo → Kanban) is the only layout.
   const boardEl = document.querySelector("#fleet-board");
   const homeEl = document.querySelector("#home-view");
   if (boardEl) boardEl.hidden = true;
-  if (homeEl) homeEl.hidden = !boardMode;
-  elements.goalPlanList.hidden = boardMode;
-  document.querySelector("#goal-plan-layout-plan")?.classList.toggle("selected", !boardMode);
-  document.querySelector("#goal-plan-layout-board")?.classList.toggle("selected", boardMode);
-  document.body.classList.toggle("home-mode", boardMode);
-  document.body.classList.toggle("fleet-mode", boardMode);
-  // Board mode is the integrated home: Project → Node → Todo → (detail | Kanban).
-  if (boardMode) {
-    renderIntegratedHome();
-    return;
-  }
-  const project = state.selectedProject;
-  const projectGoals = goalsForSelectedContext();
-  elements.goalPlanTitle.textContent = boardMode ? "Fleet" : "Goal Plan";
-  if (elements.goalPlanBreadcrumb) {
-    elements.goalPlanBreadcrumb.textContent = project
-      ? `${projectDisplayName(project)} > ${boardMode ? "Fleet" : "Goal Plan"}`
-      : `Project > ${boardMode ? "Fleet" : "Goal Plan"}`;
-  }
-  elements.goalPlanSubtitle.textContent = !project
-    ? "Select a project to shape its delivery plan."
-    : boardMode
-      ? `${projectDisplayName(project)} · Feature Node → Expected Path → Goal → Milestone → Todo → Task Frame`
-      : "Universe Goal -> Project Goal -> Milestone / Phase -> Todo";
-  elements.addGoalButton.disabled = !project;
-  const todos = projectGoals.flatMap((goal) => [
-    ...(goal.todos || []),
-    ...(goal.milestones || []).flatMap((milestone) => milestone.todos || []),
-  ]);
-  const done = todos.filter((todo) => todo.state === "DONE").length;
-  const progress = todos.length ? Math.round((done / todos.length) * 100) : 0;
-  const readyGoals = projectGoals.filter((goal) => ["READY", "ACTIVE", "DONE"].includes(goal.state)).length;
-  const readiness = projectGoals.length ? Math.round((readyGoals / projectGoals.length) * 100) : 0;
-  const milestoneCount = projectGoals.reduce((count, goal) => count + (goal.milestones || []).length, 0);
-  const owner = projectGoals[0]?.owner || "Project Master";
-  elements.goalPlanSummary.replaceChildren();
-  const needsYou = state.unassignedTodos.length + todos.filter((todo) => todo.state === "BLOCKED").length;
-  for (const [label, value] of [
-    ["Design readiness", `${readiness}%`],
-    ["Progress", `${progress}%`],
-    ["Needs you", needsYou],
-    ["Milestones", milestoneCount],
-  ]) {
-    const metric = node("article", "goal-summary-item");
-    metric.append(node("span", "", label), node("strong", "", String(value)));
-    elements.goalPlanSummary.append(metric);
-  }
-  elements.goalPlanList.replaceChildren();
-  if (!project) {
-    elements.goalPlanList.append(node("div", "goal-plan-empty", "Choose a project to begin planning."));
-  } else {
-    for (const universeGoal of state.universeGoals || []) {
-      elements.goalPlanList.append(renderUniverseGoalCard(universeGoal));
-    }
-  }
-  if (project && !projectGoals.length) {
-    const empty = node("div", "goal-plan-empty");
-    empty.append(
-      node("strong", "", "No goals yet"),
-      node("p", "", "Start with the outcome you want, then break it into milestones and Todo."),
-    );
-    const add = node("button", "primary-button", "Create first goal");
-    add.type = "button";
-    add.addEventListener("click", () => elements.goalDialog.showModal());
-    empty.append(add);
-    elements.goalPlanList.append(empty);
-  }
-  projectGoals.forEach((goal, goalIndex) => {
-    const card = node("article", "goal-card");
-    card.tabIndex = 0;
-    card.classList.toggle("selected", state.selectedGoalId === goal.goal_id);
-    card.addEventListener("click", () => {
-      state.selectedGoalId = goal.goal_id;
-      renderGoalPlan();
-    });
-    const header = node("header", "goal-card-header");
-    const titleWrap = node("div", "goal-card-title");
-    titleWrap.append(
-      node("span", "goal-index", String(goalIndex + 1).padStart(2, "0")),
-      node("h2", "", goal.title),
-      node("p", "", goal.description || "No outcome description yet.")
-    );
-    const progress = goalProgress(goal);
-    const actions = node("div", "goal-card-actions");
-    const delegate = node("button", "secondary-button", "Delegate Goal");
-    delegate.type = "button";
-    delegate.addEventListener("click", () => {
-      elements.dispatchInstruction.value = `Delegate goal \"${goal.title}\" to the Project Master. Use this goal plan as the planning reference and do not start execution until the plan is confirmed.`;
-      elements.dispatchInstruction.focus();
-      toast("Delegation draft is ready. Review it before sending.");
-    });
-    const addMilestone = node("button", "icon-button compact", "+");
-    addMilestone.type = "button";
-    addMilestone.title = "Add milestone";
-    addMilestone.addEventListener("click", () => {
-      elements.milestoneForm.elements.goal_id.value = goal.goal_id;
-      elements.milestoneDialog.showModal();
-    });
-    const collapse = node("button", "icon-button compact goal-collapse", state.expandedGoals[goal.goal_id] === false ? "+" : "−");
-    collapse.type = "button";
-    collapse.title = "Expand or collapse goal";
-    collapse.addEventListener("click", (event) => {
-      event.stopPropagation();
-      state.expandedGoals[goal.goal_id] = state.expandedGoals[goal.goal_id] === false;
-      renderGoalPlan();
-    });
-    actions.append(node("span", `plan-state ${goal.state.toLowerCase()}`, planStateLabel(goal.state)), delegate, addMilestone, collapse);
-    header.append(titleWrap, actions);
-    const progressBar = node("div", "goal-progress");
-    const fill = node("span", "goal-progress-fill");
-    fill.style.width = `${progress}%`;
-    progressBar.append(fill);
-    const progressLabel = node("small", "goal-progress-label", `${progress}% complete`);
-    const milestones = node("div", "milestone-list");
-    for (const milestone of goal.milestones || []) {
-      const item = node("section", "milestone-block");
-      const itemHeader = node("header", "milestone-header");
-      itemHeader.append(
-        node("span", "milestone-marker", ""),
-        node("strong", "", milestone.title),
-        node("span", `plan-state ${milestone.state.toLowerCase()}`, planStateLabel(milestone.state))
-      );
-      item.append(itemHeader);
-      if (milestone.description) item.append(node("p", "milestone-description", milestone.description));
-      const list = node("div", "milestone-todos");
-      for (const todo of openPlanTodos(milestone.todos)) list.append(planTodoRow(todo));
-      if (!list.childElementCount) list.append(node("small", "empty-copy", "No work assigned to this milestone."));
-      item.append(list);
-      milestones.append(item);
-    }
-    for (const todo of openPlanTodos(goal.todos)) milestones.append(planTodoRow(todo));
-    if (!milestones.childElementCount) milestones.append(node("div", "milestone-empty", "Add a milestone to shape the delivery path."));
-    milestones.hidden = state.expandedGoals[goal.goal_id] === false;
-    card.append(header, progressBar, progressLabel, milestones);
-    elements.goalPlanList.append(card);
-    if (state.selectedGoalId === goal.goal_id) renderGoalInspector(goal, goalIndex);
-  });
-
-  elements.unassignedWorkCount.textContent = String(state.unassignedTodos.length);
-  elements.unassignedWorkList.replaceChildren();
-  if (!state.unassignedTodos.length) {
-    elements.unassignedWorkList.append(node("div", "goal-plan-empty compact", "Everything is connected to a goal."));
-  }
-  for (const todo of state.unassignedTodos) {
-    const row = planTodoRow(todo);
-    const select = node("select", "goal-assign-select");
-    select.append(new Option("Add to goal...", ""));
-    for (const goal of projectGoals) select.append(new Option(goal.title, goal.goal_id));
-    select.disabled = !projectGoals.length;
-    select.addEventListener("change", async () => {
-      const goalId = select.value;
-      if (!goalId) return;
-      await updateTodo(todo, { ...todo, goal_id: goalId, milestone_id: null });
-      await refreshGoalPlan();
-    });
-    row.append(select);
-    elements.unassignedWorkList.append(row);
-  }
+  if (homeEl) homeEl.hidden = false;
+  elements.goalPlanList.hidden = true;
+  document.body.classList.add("home-mode");
+  document.body.classList.add("fleet-mode");
+  renderIntegratedHome();
 }
 
 function renderFleetFeatureSummaries(todos) {
@@ -17584,12 +17468,16 @@ refreshLawStrip = function () {
     elements.conversationLayer.classList.add("collapsed");
     if (typeof syncConversationToggle === "function") syncConversationToggle(true);
   }
-  document.querySelector("#goal-plan-layout-plan")?.addEventListener("click", () =>
-    setGoalPlanLayout("plan")
-  );
-  document.querySelector("#goal-plan-layout-board")?.addEventListener("click", () =>
-    setGoalPlanLayout("board")
-  );
+  // + buttons in the integrated home.
+  document.querySelector("#home-add-project")?.addEventListener("click", () => {
+    if (typeof openFreshProjectWizard === "function") openFreshProjectWizard();
+  });
+  document.querySelector("#home-add-node")?.addEventListener("click", () => {
+    openHomeAddNode().catch((error) => toast(error.message, true));
+  });
+  document.querySelector("#home-add-todo")?.addEventListener("click", () => {
+    openHomeAddTodo();
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if (document.body.classList.contains("galaxy-fullscreen")) {

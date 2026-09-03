@@ -284,11 +284,13 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("Delegate here", card_slice)
 
     def test_goal_plan_hides_done_todos_but_keeps_completion_metrics(self) -> None:
+        # The Plan/Board toggle is gone; the integrated home is the only layout.
         plan_slice = APP[APP.index("function openPlanTodos") : APP.index("function renderTodos")]
         self.assertIn('todo.state !== "DONE"', plan_slice)
-        self.assertIn("openPlanTodos(milestone.todos)", plan_slice)
         self.assertIn("openPlanTodos(goal.todos)", plan_slice)
-        self.assertIn('todos.filter((todo) => todo.state === "DONE")', plan_slice)
+        home_slice = APP[APP.index("function renderIntegratedHome") : APP.index("function renderHomeProjects")]
+        self.assertIn("homeSelectedNode()", home_slice)
+        self.assertIn("renderHomeKanban(selNode, nodeTodos, selTodo)", home_slice)
 
     def test_sessions_are_diagnostics_not_primary_navigation(self) -> None:
         self.assertNotIn('data-primary-view="sessions"', HTML)

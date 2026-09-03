@@ -7904,9 +7904,10 @@ body.home-mode #home-view { min-height: 100%; }
 .home-agent.blocked { color: #c99187; }
 
 .home-add {
-  display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px; margin-bottom: 6px;
   border: 1px dashed #43454c; border-radius: 8px; background: transparent; color: #8a8a86;
-  font: inherit; font-size: 11px; cursor: pointer; flex: none; margin-top: auto;
+  font: inherit; font-size: 11px; cursor: pointer; flex: none;
 }
 .home-add:hover { border-color: #6f6f6b; color: #a8a8a4; }
 

@@ -114,10 +114,7 @@
             <button id="add-goal-button" class="primary-button" type="button">Add goal</button>
           </div>
         </header>
-        <div class="goal-plan-toolbar" aria-label="Goal plan controls">
-          <div class="goal-plan-view-toggle"><button id="goal-plan-layout-plan" class="selected" type="button">Plan</button><button id="goal-plan-layout-board" type="button">Board</button></div>
-          <span>Group by <strong>Goal</strong></span>
-          <span>Sort <strong>Priority</strong></span>
+        <div class="goal-plan-toolbar" aria-label="Goal plan controls" hidden>
           <button id="edit-selected-goal" class="secondary-button" type="button">Edit plan</button>
         </div>
         <div id="goal-plan-summary" class="goal-plan-summary" aria-label="Goal plan summary"></div>
@@ -128,20 +125,20 @@
         <div id="home-view" class="home-view" hidden aria-label="Project → node → todo → kanban">
           <div class="home-col home-col-projects">
             <div class="home-col-head">Projects</div>
-            <div id="home-project-list" class="home-col-body"></div>
             <button id="home-add-project" class="home-add" type="button">+ 프로젝트</button>
+          <div id="home-project-list" class="home-col-body"></div>
           </div>
           <div class="home-rel"><svg id="home-rel-1" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
           <div class="home-col home-col-nodes">
             <div class="home-col-head" id="home-nodes-head">Nodes</div>
-            <div id="home-node-list" class="home-col-body"></div>
             <button id="home-add-node" class="home-add" type="button">+ 노드 등록</button>
+          <div id="home-node-list" class="home-col-body"></div>
           </div>
           <div class="home-rel"><svg id="home-rel-2" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
           <div class="home-col home-col-todos">
             <div class="home-col-head" id="home-todos-head">Todos</div>
-            <div id="home-todo-list" class="home-col-body"></div>
             <button id="home-add-todo" class="home-add" type="button">+ Todo 등록</button>
+          <div id="home-todo-list" class="home-col-body"></div>
           </div>
           <div class="home-rel"><svg id="home-rel-3" viewBox="0 0 30 900" preserveAspectRatio="none" fill="none"></svg></div>
           <div class="home-detail-kanban">
