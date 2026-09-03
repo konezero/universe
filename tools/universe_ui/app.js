@@ -16526,6 +16526,27 @@ refreshLawStrip = function () {
       setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))
     );
   }
+  document.querySelector("#terminal-dock-side")?.addEventListener("click", () => {
+    const bottom = !document.body.classList.contains("terminal-bottom");
+    document.body.classList.toggle("terminal-bottom", bottom);
+    const btn = document.querySelector("#terminal-dock-side");
+    if (btn) {
+      btn.textContent = bottom ? "▶" : "▼";
+      btn.title = bottom ? "Dock to right" : "Dock to bottom";
+    }
+    try {
+      localStorage.setItem("universe.terminalDock", bottom ? "bottom" : "right");
+    } catch (_e) { /* private mode */ }
+    setTimeout(() => {
+      if (typeof refitActiveTerminal === "function") refitActiveTerminal();
+      if (state.terminalGrid && typeof refitAllTerminals === "function") refitAllTerminals();
+    }, 260);
+  });
+  try {
+    if (localStorage.getItem("universe.terminalDock") === "bottom") {
+      document.querySelector("#terminal-dock-side")?.click();
+    }
+  } catch (_e) { /* private mode */ }
   document.querySelector("#goal-plan-layout-plan")?.addEventListener("click", () =>
     setGoalPlanLayout("plan")
   );

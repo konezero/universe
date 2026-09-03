@@ -5511,6 +5511,36 @@ body {
   max-width: 1100px;
 }
 #goal-plan-workspace[hidden] { display: none; }
+
+/* Terminal dock at the bottom instead of the right column. Additive
+   override of the mockup-shell rules — base layout untouched. */
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace {
+  padding-right: 0;
+  padding-bottom: var(--terminal-dock-height, 300px);
+}
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+  top: auto;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: auto;
+  height: var(--terminal-dock-height, 300px);
+  border-left: 0;
+  border-top: 1px solid var(--ws-line);
+  box-shadow: 0 -14px 32px rgba(0, 0, 0, 0.24);
+}
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conductor-summary {
+  display: none;
+}
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .chat-resize-handle {
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: auto;
+  width: auto;
+  height: 10px;
+  cursor: ns-resize;
+}
 .goal-card {
   padding: 0;
   overflow: hidden;
