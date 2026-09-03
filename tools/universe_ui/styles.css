@@ -7973,3 +7973,9 @@ body.home-mode #home-view { min-height: 100%; }
   }
   .home-todo-detail-grid { grid-template-columns: 66px minmax(0, 1fr) 66px minmax(0, 1fr); }
 }
+
+.home-node-archive {
+  padding: 3px 8px; border: 1px solid #43454c; border-radius: 5px;
+  background: transparent; color: #8a8a86; font: inherit; font-size: 9px; cursor: pointer;
+}
+.home-node-archive:hover { border-color: #c26b5e; color: #c99187; }

@@ -11890,6 +11890,36 @@ class UniverseStore:
             )
         return result
 
+    def archive_feature_node(self, feature_id: str) -> dict[str, Any]:
+        """Retire a Feature Node (폐기). ARCHIVED nodes drop out of the
+        projection graft; their Todos and rooms are untouched."""
+        fid = _identifier(feature_id, "feature_id")
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_node WHERE feature_id = ?", (fid,)
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "FEATURE_NODE_NOT_FOUND",
+                    "Feature Node does not exist",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if str(row["state"]) == "ADOPTED":
+                raise UniverseError(
+                    "FEATURE_NODE_ADOPTED",
+                    "an adopted Feature Node cannot be archived",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                "UPDATE feature_node SET state = 'ARCHIVED', revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (now, fid),
+            )
+            updated = connection.execute(
+                "SELECT * FROM feature_node WHERE feature_id = ?", (fid,)
+            ).fetchone()
+        return self._feature_row(updated)
+
     def create_feature_expected_path(self, feature_id: str, value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         feature = self.get_feature_node(feature_id)
         if feature["state"] == "ADOPTED":
@@ -40443,6 +40473,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {"schema": API_SCHEMA, "status": "FEATURE_NODE_RECORDED" if created else "FEATURE_NODE_REPLAYED", "feature": feature},
+                )
+                return
+            feature_archive = re.fullmatch(r"/v1/feature-nodes/([^/]+)/archive", path)
+            if feature_archive is not None:
+                feature = self.server.store.archive_feature_node(
+                    unquote(feature_archive.group(1))
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {"schema": API_SCHEMA, "status": "FEATURE_NODE_ARCHIVED", "feature": feature},
                 )
                 return
             expected_paths = re.fullmatch(r"/v1/feature-nodes/([^/]+)/expected-paths", path)

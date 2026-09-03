@@ -4112,6 +4112,22 @@ function openHomeAddNode() {
   form.elements.intent_text.focus();
 }
 
+async function archiveHomeNode(featureId) {
+  if (!featureId) return;
+  const projectId = state.selectedProject?.project_id;
+  await api(`/v1/feature-nodes/${encodeURIComponent(featureId)}/archive`, {
+    method: "POST",
+    body: {},
+  });
+  toast("노드를 폐기했어요");
+  if (state.homeNodeId === `feat:${featureId}`) state.homeNodeId = null;
+  if (state.projectionsByProject && projectId) {
+    delete state.projectionsByProject[projectId];
+  }
+  if (projectId) await selectProject(projectId).catch(() => {});
+  renderIntegratedHome();
+}
+
 async function submitHomeNode(event) {
   event.preventDefault();
   const projectId = state.selectedProject?.project_id;
@@ -4562,13 +4578,10 @@ function renderHomeNodes(selNode) {
 
     const statusRow = node("div", "home-card-meta");
     const kind = String(graphNode.kind || "").toUpperCase();
+    const adopted = String(graphNode.state || "").toUpperCase() === "ADOPTED";
     if (kind === "FEATURE") {
-      const stateChip = node(
-        "span",
-        "home-chip",
-        graphNode.proposed ? "제안됨" : "채택됨"
-      );
-      if (!graphNode.proposed) {
+      const stateChip = node("span", "home-chip", adopted ? "채택됨" : "제안됨");
+      if (adopted) {
         stateChip.style.borderColor = "#5c6b3f";
         stateChip.style.color = "#8a9b6f";
       }
@@ -4608,6 +4621,21 @@ function renderHomeNodes(selNode) {
       meta.append(dot, node("span", `home-agent ${liveExec.blocked ? "blocked" : ""}`, liveExec.label));
       rows.push(meta);
     }
+    // 폐기 — proposed feature nodes can be archived (drops out of the graft).
+    if (kind === "FEATURE" && !adopted && !todos.length) {
+      const archiveRow = node("div", "");
+      const archiveBtn = node("button", "home-node-archive", "폐기");
+      archiveBtn.type = "button";
+      archiveBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        archiveHomeNode(homeNodeRefKey(graphNode.node_id)).catch((error) =>
+          toast(error.message, true)
+        );
+      });
+      archiveRow.append(archiveBtn);
+      rows.push(archiveRow);
+    }
+
     const card = homeCard(`node:${graphNode.node_id}`, graphNode.title || graphNode.node_id, {
       selected,
       blocked: blockedHere,

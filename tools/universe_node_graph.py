@@ -518,6 +518,8 @@ def graft_feature_nodes(
         feature_id = _text(raw.get("feature_id"))
         if not feature_id:
             continue
+        if _text(raw.get("state")).upper() == "ARCHIVED":
+            continue
         node_id = f"feat:{feature_id}"
         if node_id in node_ids:
             continue
