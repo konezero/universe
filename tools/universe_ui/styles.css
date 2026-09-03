@@ -7678,6 +7678,24 @@ body.fleet-mode .fleet-board {
 .fleet-card-room:hover {
   background: rgba(111, 155, 147, 0.22);
 }
+.fleet-card-sess {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.fleet-card-sess.live {
+  background: rgba(111, 155, 120, 0.16);
+  border-color: rgba(111, 155, 120, 0.4);
+  color: var(--green);
+}
+.fleet-card-sess.idle {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+}
+.fleet-card-sess:hover { border-color: var(--line-strong); }
 
 .room-dialog { width: min(720px, calc(100vw - 28px)); }
 .room-dialog-body {

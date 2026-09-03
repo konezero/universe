@@ -4068,6 +4068,39 @@ function fleetNodeLabel(nodeRef) {
   return raw;
 }
 
+// A live terminal working the selected project (its Master/Conductor session).
+function fleetCardSession() {
+  const pid = String(state.selectedProject?.project_id || "").toLowerCase();
+  if (!pid) return null;
+  return (
+    (state.terminals || []).find(
+      (term) => String(term.project_id || "").toLowerCase() === pid
+    ) || null
+  );
+}
+
+// Fleet card session badge: jump to the live session in the dock, or open a
+// new session for this project when there is none.
+function openFleetCardSession(todo) {
+  const term = fleetCardSession();
+  if (term) {
+    if (typeof expandConversationLayer === "function") expandConversationLayer();
+    if (!document.body.classList.contains("terminal-bottom")) {
+      document.querySelector("#terminal-dock-side")?.click();
+    }
+    if (typeof selectTerminalTab === "function") selectTerminalTab(term.terminal_id);
+    return;
+  }
+  openNewSessionDialog();
+  if (elements.newSessionMode) {
+    elements.newSessionMode.value = "MASTER";
+    elements.newSessionMode.onchange?.();
+  }
+  if (elements.newSessionProject && state.selectedProject) {
+    elements.newSessionProject.value = state.selectedProject.project_id;
+  }
+}
+
 // Open the Todo work map focused on one Todo (Fleet card → its Todo).
 function openFleetCardTodo(todoId) {
   openTodoDialog(false);
@@ -4155,8 +4188,25 @@ function renderFleetBoard() {
       const nodeName = fleetNodeLabel(todo.node_ref);
       if (nodeName) meta.append(node("span", "fleet-card-node", nodeName));
       if (todo.priority) meta.append(node("span", "fleet-card-pri", String(todo.priority)));
-      if (shipsByTodo.has(todo.todo_id)) {
-        meta.append(node("span", "fleet-card-ship", "▶ session"));
+      // Session control: on the working lanes, the card is a way in and out of
+      // the terminal dock. Live session → jump to its tab; none → open a new
+      // session for this project.
+      if (["ready", "executing", "verifying"].includes(lane.id)) {
+        const term = fleetCardSession();
+        const sessBadge = node(
+          "button",
+          `fleet-card-sess ${term ? "live" : "idle"}`,
+          term ? "▶ session" : "+ session"
+        );
+        sessBadge.type = "button";
+        sessBadge.title = term
+          ? "Open this session in the dock"
+          : "Start a session for this project";
+        sessBadge.addEventListener("click", (event) => {
+          event.stopPropagation();
+          openFleetCardSession(todo);
+        });
+        meta.append(sessBadge);
       }
       const room = fleetCardRoom(todo);
       if (room) {
@@ -16889,6 +16939,9 @@ refreshLawStrip = function () {
       setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))
     );
   }
+  document.querySelector("#terminal-new-session")?.addEventListener("click", () => {
+    openNewSessionDialog();
+  });
   document.querySelector("#terminal-dock-side")?.addEventListener("click", () => {
     const bottom = !document.body.classList.contains("terminal-bottom");
     document.body.classList.toggle("terminal-bottom", bottom);
