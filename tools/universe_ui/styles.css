@@ -5420,6 +5420,50 @@ body {
 .goal-summary-item strong { color: var(--ws-text); font-size: 17px; }
 
 .goal-plan-list { display: grid; gap: 10px; }
+.goal-plan-list[hidden] { display: none; }
+
+.fleet-board {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+  min-height: 0;
+}
+.fleet-board[hidden] { display: none; }
+
+.fleet-lane { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.fleet-lane-head {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ws-muted, #91aaa4);
+  padding: 0 2px 2px;
+}
+.fleet-lane-executing .fleet-lane-head { color: #6f9b93; }
+.fleet-lane-verifying .fleet-lane-head { color: #a68d5b; }
+.fleet-lane-blocked .fleet-lane-head { color: #a86f66; }
+.fleet-lane-done .fleet-lane-head { color: #6f9b78; }
+.fleet-lane-list { display: flex; flex-direction: column; gap: 8px; }
+
+.fleet-card {
+  background: #212327;
+  border: 1px solid #31333a;
+  border-radius: 8px;
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fleet-lane-executing .fleet-card { border-color: rgba(111, 155, 147, 0.5); }
+.fleet-lane-blocked .fleet-card { border-color: rgba(168, 111, 102, 0.5); }
+.fleet-card-title { font-size: 12px; font-weight: 600; line-height: 1.3; color: var(--ws-text, #edf6f3); }
+.fleet-card-meta { display: flex; flex-wrap: wrap; gap: 6px; font-size: 10px; color: var(--ws-muted, #91aaa4); }
+.fleet-card-node { color: #7fb0a7; }
+.fleet-card-pri {
+  border: 1px solid #34363c;
+  border-radius: 4px;
+  padding: 0 5px;
+}
+.fleet-card-ship { color: #a68d5b; }
 .goal-card {
   padding: 0;
   overflow: hidden;

@@ -117,7 +117,7 @@
           </div>
         </header>
         <div class="goal-plan-toolbar" aria-label="Goal plan controls">
-          <div class="goal-plan-view-toggle"><button class="selected" type="button">Plan</button><button type="button" disabled>Board</button></div>
+          <div class="goal-plan-view-toggle"><button id="goal-plan-layout-plan" class="selected" type="button">Plan</button><button id="goal-plan-layout-board" type="button">Board</button></div>
           <span>Group by <strong>Goal</strong></span>
           <span>Sort <strong>Priority</strong></span>
           <button id="edit-selected-goal" class="secondary-button" type="button">Edit plan</button>
@@ -126,6 +126,7 @@
         <div id="goal-plan-list" class="goal-plan-list">
           <div class="goal-plan-empty">Choose a project to begin planning.</div>
         </div>
+        <div id="fleet-board" class="fleet-board" aria-label="Fleet execution board" hidden></div>
         <section class="unassigned-work" aria-label="Unassigned project work">
           <header>
             <div>

@@ -96,6 +96,7 @@ const state = {
   settingsTab: "service",
   observatoryTab: "sessions",
   todoTab: "board",
+  goalPlanLayout: "board",
   supervisorEvents: [],
   providerActivitySources: [],
   providerActivityDiscoveries: [],
@@ -4022,6 +4023,88 @@ function showGoalPlanView() {
   document.body.classList.remove("graph-mode");
   syncPrimaryNavSelection("work");
   renderGoalPlan();
+}
+
+function setGoalPlanLayout(layout) {
+  state.goalPlanLayout = layout === "board" ? "board" : "plan";
+  const planBtn = document.querySelector("#goal-plan-layout-plan");
+  const boardBtn = document.querySelector("#goal-plan-layout-board");
+  planBtn?.classList.toggle("selected", state.goalPlanLayout === "plan");
+  boardBtn?.classList.toggle("selected", state.goalPlanLayout === "board");
+  renderGoalPlan();
+}
+
+// Fleet: an execution board — every project todo placed in a lane by its
+// lifecycle_state, with its owner node and (where the projection knows) its
+// ship. Data from state.goals + state.projection (ships / node.work).
+const FLEET_LANES = [
+  { id: "planned", label: "Planned", states: ["BACKLOG", "PLANNED"] },
+  { id: "ready", label: "Ready", states: ["READY"] },
+  { id: "executing", label: "Executing", states: ["IN_PROGRESS"] },
+  { id: "verifying", label: "Verifying", states: ["VERIFYING"] },
+  { id: "blocked", label: "Blocked", states: ["BLOCKED"] },
+  { id: "done", label: "Done", states: ["DONE"] },
+];
+
+function fleetNodeLabel(nodeRef) {
+  const ref = String(nodeRef || "");
+  if (!ref) return "";
+  const nodes = state.projection?.unified_graph?.nodes || [];
+  const hit =
+    nodes.find((n) => n.node_id === ref) ||
+    (ref.startsWith("feature_") && nodes.find((n) => n.node_id === `feat:${ref}`));
+  return hit?.title || ref;
+}
+
+function renderFleetBoard() {
+  const board = document.querySelector("#fleet-board");
+  if (!board) return;
+  board.replaceChildren();
+  if (!state.selectedProject) {
+    board.append(node("div", "goal-plan-empty", "Choose a project to see its Fleet."));
+    return;
+  }
+  // Fleet is a whole-project board: every goal's todos (any scope) plus the
+  // unassigned inbox, deduped.
+  const seen = new Set();
+  const todos = [];
+  const push = (todo) => {
+    const id = todo?.todo_id;
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    todos.push(todo);
+  };
+  for (const goal of [...(state.goals || []), ...(state.universeGoals || [])]) {
+    for (const t of goal.todos || []) push(t);
+    for (const m of goal.milestones || []) for (const t of m.todos || []) push(t);
+  }
+  for (const t of state.unassignedTodos || []) push(t);
+  const shipsByTodo = new Map(
+    (state.projection?.ships || []).map((s) => [s.todo_id, s])
+  );
+  for (const lane of FLEET_LANES) {
+    const laneEl = node("div", `fleet-lane fleet-lane-${lane.id}`);
+    const items = todos.filter((t) => lane.states.includes(String(t.state || "").toUpperCase()));
+    laneEl.append(
+      node("div", "fleet-lane-head", `${lane.label} · ${items.length}`)
+    );
+    const list = node("div", "fleet-lane-list");
+    for (const todo of items) {
+      const card = node("article", "fleet-card");
+      card.append(node("div", "fleet-card-title", todo.title || todo.todo_id));
+      const meta = node("div", "fleet-card-meta");
+      const nodeName = fleetNodeLabel(todo.node_ref);
+      if (nodeName) meta.append(node("span", "fleet-card-node", nodeName));
+      if (todo.priority) meta.append(node("span", "fleet-card-pri", String(todo.priority)));
+      if (shipsByTodo.has(todo.todo_id)) {
+        meta.append(node("span", "fleet-card-ship", "▶ session"));
+      }
+      card.append(meta);
+      list.append(card);
+    }
+    laneEl.append(list);
+    board.append(laneEl);
+  }
 }
 
 /** Highlight top nav without toast placeholders. */
@@ -12952,6 +13035,12 @@ function renderGoalPlan() {
   if (!document.body.classList.contains("graph-mode")) {
     syncPrimaryNavSelection("work");
   }
+  const boardMode = state.goalPlanLayout === "board";
+  const boardEl = document.querySelector("#fleet-board");
+  if (boardEl) boardEl.hidden = !boardMode;
+  elements.goalPlanList.hidden = boardMode;
+  document.querySelector("#goal-plan-layout-plan")?.classList.toggle("selected", !boardMode);
+  document.querySelector("#goal-plan-layout-board")?.classList.toggle("selected", boardMode);
   const project = state.selectedProject;
   const projectGoals = goalsForSelectedContext();
   elements.goalPlanTitle.textContent = "Goal Plan";
@@ -12985,6 +13074,10 @@ function renderGoalPlan() {
     const metric = node("article", "goal-summary-item");
     metric.append(node("span", "", label), node("strong", "", String(value)));
     elements.goalPlanSummary.append(metric);
+  }
+  if (boardMode) {
+    renderFleetBoard();
+    return;
   }
   elements.goalPlanList.replaceChildren();
   if (!project) {
@@ -15941,7 +16034,8 @@ function bindEvents() {
         return;
       }
       if (view === "fleet") {
-        openTodoDialog(false);
+        setGoalPlanLayout("board");
+        showGoalPlanView();
         syncPrimaryNavSelection("fleet");
         return;
       }
@@ -16041,7 +16135,8 @@ function bindGoalPlanEvents() {
     const view = button.getAttribute("data-primary-view");
     if (view === "work") showGoalPlanView();
     else if (view === "fleet") {
-      openTodoDialog(false);
+      setGoalPlanLayout("board");
+      showGoalPlanView();
       syncPrimaryNavSelection("fleet");
     }
     else if (view === "map") showGraphView(state.selectedProject ? "semantic" : "universe");
@@ -16384,6 +16479,12 @@ refreshLawStrip = function () {
       setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))
     );
   }
+  document.querySelector("#goal-plan-layout-plan")?.addEventListener("click", () =>
+    setGoalPlanLayout("plan")
+  );
+  document.querySelector("#goal-plan-layout-board")?.addEventListener("click", () =>
+    setGoalPlanLayout("board")
+  );
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if (document.body.classList.contains("galaxy-fullscreen")) {
