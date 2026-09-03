@@ -13519,7 +13519,7 @@ async function prepareProjectSeed() {
     );
     toast("Project seed preparation queued");
     await selectProject(state.selectedProject.project_id);
-    showInspectorTab("activity");
+    showProjectScreen("activity");
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -17645,19 +17645,10 @@ refreshLawStrip = function () {
     },
     { passive: false }
   );
-  if (elements.graphZoomIn) {
-    elements.graphZoomIn.addEventListener("click", () =>
-      setGraphScale(state.graph.scale * 1.12)
-    );
-  }
-  if (elements.graphZoomOut) {
-    elements.graphZoomOut.addEventListener("click", () =>
-      setGraphScale(state.graph.scale * 0.9)
-    );
-  }
-  if (elements.graphFit) {
-    elements.graphFit.addEventListener("click", fitGraphView);
-  }
+  // No zoom chrome: wheel/pinch zooms, double-click empty space fits.
+  elements.canvas.addEventListener("dblclick", (event) => {
+    if (!hitTestGraphNode(graphPoint(event))) fitGraphView();
+  });
   if (elements.galaxyFullscreenToggle) {
     elements.galaxyFullscreenToggle.addEventListener("click", () =>
       setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))

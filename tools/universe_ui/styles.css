@@ -1068,14 +1068,13 @@ body.inspector-open .graph-hint {
 }
 
 .graph-legend {
-  display: none;
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.94);
+  background: rgba(28, 29, 33, 0.82);
   color: var(--muted);
   font-size: 10px;
 }
@@ -8043,3 +8042,15 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
    standalone tree. MAIN spans where the rail used to be, in every view. */
 .app-shell.mockup-shell > .project-rail { display: none; }
 .app-shell.mockup-shell > .graph-workspace { grid-column: 2 / -1; }
+
+.galaxy-map-refresh {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: rgba(28, 29, 33, 0.6); color: var(--muted);
+  font: inherit; font-size: 11px; cursor: pointer;
+}
+.galaxy-map-refresh:hover { border-color: var(--line-strong); color: var(--text-2); }
+.galaxy-map-refresh:disabled { opacity: 0.5; cursor: default; }
+
+/* Galaxy is full-bleed by default now — the fullscreen toggle is redundant. */
+#galaxy-fullscreen-toggle { display: none !important; }
