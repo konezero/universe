@@ -376,9 +376,20 @@ function bindTerminalIme(term, socket) {
     "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
     "Home", "End", "PageUp", "PageDown",
   ]);
+  let composeWatchdog = 0;
+  const endCompose = () => {
+    composing = false;
+    window.clearTimeout(composeWatchdog);
+  };
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+      // Self-heal: the browser is the source of truth for composition. If it
+      // says this keydown is not composing, any stale `composing` is wrong —
+      // clear it so input never wedges after one character.
+      if (composing && !event.isComposing && event.keyCode !== 229) {
+        endCompose();
+      }
       if (event.isComposing || event.keyCode === 229) {
         return (
           IME_PASSTHROUGH_KEYS.has(event.key) ||
@@ -395,20 +406,20 @@ function bindTerminalIme(term, socket) {
     textarea.addEventListener("compositionstart", () => {
       composing = true;
       lastComposed = null;
+      // No real composition outlives this; if compositionend is ever missed
+      // (IME quirks, focus races) the flag still clears on its own.
+      window.clearTimeout(composeWatchdog);
+      composeWatchdog = window.setTimeout(() => { composing = false; }, 3000);
     }, true);
     textarea.addEventListener("compositionend", (event) => {
-      composing = false;
+      endCompose();
       const composed = event.data || "";
       lastComposed = composed || null;
       if (composed) sendPtyText(socket, composed);
-      window.setTimeout(() => {
-        lastComposed = null;
-        try { textarea.value = ""; } catch (_error) { /* ignore */ }
-      }, 0);
+      window.setTimeout(() => { lastComposed = null; }, 0);
     }, true);
-    // A composition abandoned by a blur/refit would otherwise wedge `composing`
-    // true forever and silently drop every later keystroke.
-    textarea.addEventListener("blur", () => { composing = false; }, true);
+    // A composition abandoned by a blur/refit would otherwise wedge `composing`.
+    textarea.addEventListener("blur", endCompose, true);
   }
   term.onData((data) => {
     // Control / navigation bytes (Enter \r, Backspace \x7f, arrows \x1b[…,
