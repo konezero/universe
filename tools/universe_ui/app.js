@@ -16913,6 +16913,17 @@ refreshLawStrip = function () {
   } catch (_e) {
     document.querySelector("#terminal-dock-side")?.click();
   }
+  // Bottom dock starts collapsed to its bar when nothing is running — it grows
+  // when a terminal opens or the user expands it.
+  if (
+    document.body.classList.contains("terminal-bottom") &&
+    !(state.terminals || []).length &&
+    elements.conversationLayer &&
+    !elements.conversationLayer.classList.contains("collapsed")
+  ) {
+    elements.conversationLayer.classList.add("collapsed");
+    if (typeof syncConversationToggle === "function") syncConversationToggle(true);
+  }
   document.querySelector("#goal-plan-layout-plan")?.addEventListener("click", () =>
     setGoalPlanLayout("plan")
   );

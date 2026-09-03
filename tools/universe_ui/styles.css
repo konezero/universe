@@ -5537,6 +5537,16 @@ body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-pan
   border-top: 1px solid var(--ws-line);
   box-shadow: 0 -14px 32px rgba(0, 0, 0, 0.24);
 }
+/* Collapsed bottom dock is just its bar — no reserved dead space. */
+body.terminal-bottom .app-shell.mockup-shell > .graph-workspace:has(.conversation-layer.collapsed) {
+  padding-bottom: 40px;
+}
+body.terminal-bottom
+  .app-shell.mockup-shell
+  > .graph-workspace
+  > .conductor-panel:has(.conversation-layer.collapsed) {
+  height: 40px;
+}
 body.terminal-bottom .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conductor-summary {
   display: none;
 }
