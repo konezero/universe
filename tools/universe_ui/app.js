@@ -180,6 +180,7 @@ const elements = {
   graphEmpty: document.querySelector("#graph-empty"),
   graphLegend: document.querySelector("#graph-legend"),
   graphHint: document.querySelector("#graph-hint"),
+  galaxyViewSwitch: document.querySelector("#galaxy-view-switch"),
   graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
   graphZoomOut: document.querySelector("#graph-zoom-out"),
@@ -8864,6 +8865,7 @@ function openProjectRoomStream(projectId) {
 
 function buildGraph() {
   elements.nodeBreadcrumb.classList.add("hidden");
+  if (elements.galaxyViewSwitch) elements.galaxyViewSwitch.hidden = true;
   // Universe map: always full tree (hub → projects → systems). Depth = dim only.
   // Timeline/Documents still use project-interior graphs. focusedNodeId dig-in
   // is for non-universe views only (not multiverse).
@@ -8933,10 +8935,44 @@ const UNIFIED_KIND_STYLE = {
   MEMORY: { kind: "related", depth: 6 },
 };
 
-// Which unified view drives the Galaxy render. Default = functional (the
-// product map); knowledge/structural reachable once the switcher lands.
+// Which unified view drives the Galaxy render.
+const GALAXY_VIEWS = ["functional", "structural", "flow", "knowledge", "galaxy"];
+const GALAXY_VIEW_LABEL = {
+  functional: "Functional",
+  structural: "Structural",
+  flow: "Flow",
+  knowledge: "Knowledge",
+  galaxy: "Galaxy",
+};
+
 function galaxyUnifiedView() {
-  return String(state.galaxyView || "functional");
+  const v = String(state.galaxyView || "functional");
+  return GALAXY_VIEWS.includes(v) ? v : "functional";
+}
+
+function renderGalaxyViewSwitch(active, available) {
+  const el = elements.galaxyViewSwitch;
+  if (!el) return;
+  if (!available) {
+    el.hidden = true;
+    el.replaceChildren();
+    return;
+  }
+  el.hidden = false;
+  el.replaceChildren();
+  for (const name of GALAXY_VIEWS) {
+    const chip = node("button", "galaxy-view-chip");
+    chip.type = "button";
+    chip.textContent = GALAXY_VIEW_LABEL[name] || name;
+    chip.setAttribute("role", "tab");
+    if (name === active) chip.classList.add("is-active");
+    chip.addEventListener("click", () => {
+      if (galaxyUnifiedView() === name) return;
+      state.galaxyView = name;
+      buildGraph();
+    });
+    el.append(chip);
+  }
 }
 
 function buildUnifiedGalaxyGraph() {
@@ -8948,6 +8984,7 @@ function buildUnifiedGalaxyGraph() {
   const view = (state.projection.views || []).find((v) => v.view === viewName);
   const nodeAllow = view ? new Set(view.node_ids) : null;
   const edgeAllow = view ? new Set(view.edge_ids) : null;
+  renderGalaxyViewSwitch(viewName, true);
 
   const nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
   const kindsPresent = new Set();
@@ -8967,21 +9004,25 @@ function buildUnifiedGalaxyGraph() {
     };
   });
   const layers = [...new Set(graphNodes.map((i) => i.depth))].sort((a, b) => a - b);
+  const perRow = 8;
+  let rowCursor = 0;
   for (const depth of layers) {
     const layer = graphNodes.filter((i) => i.depth === depth);
+    const rows = Math.max(1, Math.ceil(layer.length / perRow));
     layer.forEach((item, index) => {
-      item.x = (index - (layer.length - 1) / 2) * 160;
-      item.y = (depth - 2) * 140;
+      const row = Math.floor(index / perRow);
+      const col = index % perRow;
+      const cols = Math.min(perRow, layer.length - row * perRow);
+      item.x = (col - (cols - 1) / 2) * 200;
+      item.y = (rowCursor + row) * 150;
     });
+    rowCursor += rows;
   }
   const visible = new Set(graphNodes.map((i) => i.id));
   state.graph.nodes = graphNodes;
   state.graph.edges = (unified.edges || [])
     .filter((e) => (!edgeAllow || edgeAllow.has(e.edge_id)) && visible.has(e.from_node) && visible.has(e.to_node))
     .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e }));
-  state.graph.scale = 1;
-  state.graph.x = 0;
-  state.graph.y = 0;
 
   const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
   setGraphLegend(
@@ -9000,7 +9041,7 @@ function buildUnifiedGalaxyGraph() {
       `Galaxy · ${state.selectedProject?.project_id || "universe"} · ${viewName} view · ` +
       `${graphNodes.length}/${unified.nodes.length} nodes${graftText} · projection only`;
   }
-  drawGraph();
+  fitGraphView();
   return true;
 }
 
@@ -10432,6 +10473,23 @@ function drawGraphNodeIcon(context, item, depthStyle) {
   context.textAlign = "center";
   context.textBaseline = "middle";
   context.fillText(nodeMonogram(item), item.x, item.y + 0.5);
+
+  // Unified Galaxy: full node name under the glyph so the map is readable
+  // without hovering every planet.
+  if (item.unifiedKind && item.label) {
+    context.font = "500 10px Segoe UI";
+    context.fillStyle = selected || hovered
+      ? "rgba(240,242,244,0.95)"
+      : item.proposed
+        ? "rgba(160,160,156,0.6)"
+        : "rgba(214,214,210,0.78)";
+    context.fillText(truncate(item.label, 28), item.x, item.y + r + 12);
+    if (item.data?.node_id && item.data.node_id !== item.label) {
+      context.font = "400 9px ui-monospace, Menlo, Consolas, monospace";
+      context.fillStyle = "rgba(140,140,132,0.55)";
+      context.fillText(truncate(item.data.node_id, 30), item.x, item.y + r + 24);
+    }
+  }
 
   if (todoProjection) {
     const badgeX = item.x + r * 0.72;
