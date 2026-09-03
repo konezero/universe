@@ -199,6 +199,7 @@ function attachTerminalWebgl(surface) {
   try {
     webgl = new window.WebglAddon.WebglAddon();
     webgl.onContextLoss(() => {
+      console.warn("[terminal] WebGL context lost — falling back to DOM renderer");
       disposeTerminalWebgl(surface);
       surface.webglFailedSinceRecovery = false;
       try { surface.notifySize?.(0); } catch (_error) { /* pane may be gone */ }
@@ -208,6 +209,7 @@ function attachTerminalWebgl(surface) {
       try { webgl.dispose(); } catch (_error) { /* nothing to undo */ }
       surface.webglFailedSinceRecovery = true;
       surface.webglAddon = null;
+      console.warn("[terminal] WebGL attach produced no canvas — latching DOM renderer until next successful refit");
       return false;
     }
     surface.webglAddon = webgl;
@@ -217,6 +219,7 @@ function attachTerminalWebgl(surface) {
     try { webgl?.dispose(); } catch (_disposeError) { /* stay on DOM */ }
     surface.webglAddon = null;
     surface.webglFailedSinceRecovery = true;
+    console.warn("[terminal] WebGL unavailable — latching DOM renderer until next successful refit:", _error);
     return false;
   }
 }

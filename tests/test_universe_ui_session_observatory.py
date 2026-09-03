@@ -147,19 +147,23 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("term.resize(TERMINAL_COLS, rows)", TERM)
         # GPU renderer, kept only if activate() actually installed a canvas.
         self.assertIn("window.WebglAddon?.WebglAddon", TERM)
-        self.assertIn('!element.querySelector("canvas")', TERM)
+        self.assertIn('!surface.element?.querySelector("canvas")', TERM)
+        self.assertIn("webglFailedSinceRecovery", TERM)
+        self.assertIn("function attachTerminalWebgl(surface)", TERM)
         self.assertIn("webgl.onContextLoss(", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)
         self.assertIn("attachCustomKeyEventHandler", TERM)
         self.assertIn("event.isComposing", TERM)
-        self.assertIn("function bindTerminalIme(term, socket)", TERM)
+        self.assertIn("function bindTerminalIme(term, socket, getSurface)", TERM)
+        self.assertIn("IME_STALE_COMPOSITION_MS", TERM)
+        self.assertIn("HANGUL_PREEDIT_PATTERN", TERM)
         # A click anywhere in the pane must land keyboard focus in xterm, even
         # when the running TUI has grabbed the mouse (mouse-tracking mode) and
         # so does not move focus on its own.
         surface_slice = TERM[
             TERM.index("function ensureTerminalSurface") : TERM.rindex(
-                "bindTerminalIme(term, socket)"
+                "bindTerminalIme(term, socket, () => surface)"
             )
         ]
         self.assertIn('element.addEventListener(', surface_slice)
@@ -172,10 +176,12 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         # compositionend must never wedge input.
         self.assertIn("IME_PASSTHROUGH_KEYS", TERM)
         self.assertIn('"Enter", "Backspace"', TERM)
-        self.assertIn("composing && !event.isComposing && event.keyCode !== 229", TERM)
+        self.assertIn("isComposingNow() && !event.isComposing && event.keyCode !== 229", TERM)
         self.assertIn("composeWatchdog = window.setTimeout", TERM)
         self.assertIn('textarea.addEventListener("blur", endCompose', TERM)
-        self.assertIn("composing && !isControlData", TERM)
+        self.assertIn("isComposingNow() && !isControlData", TERM)
+        self.assertIn("withTerminalReplayGuard", TERM)
+        self.assertIn("attachTerminalMouseWheelHandler", TERM)
         self.assertIn(".xterm-helper-textarea", CSS)
         self.assertIn("async function stopTerminalSession(terminalId)", TERM)
         self.assertIn('method: "DELETE"', TERM)
