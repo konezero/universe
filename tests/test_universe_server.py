@@ -5888,6 +5888,71 @@ class UniverseLocalServiceTests(unittest.TestCase):
             terminal["terminal_id"], posted["messages"][0]["to"]["terminal_id"]
         )
 
+    def test_list_cli_terminals_keeps_public_activity_fields(self) -> None:
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "todo-activity-fields-session",
+                "project_id": "universe",
+                "node": "universe",
+                "mode": "MASTER",
+                "provider": "GROK",
+                "provider_session_ref": "grok-activity-fields",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        populated = {
+            "terminal_id": "term_activity_fields_001",
+            "project_id": "universe",
+            "mode": "MASTER",
+            "provider": "GROK",
+            "state": "LIVE",
+            "created_at": "2026-09-04T00:00:00Z",
+            "supervisor_session_id": session["session_id"],
+            "prompt_delivery": "delivered",
+            "provider_cli": "GROK",
+            "provider_cli_process": "grok.exe",
+            "provider_cli_alive": True,
+            "output_sequence": 12,
+            "prompt_activity": {
+                "generation": 1,
+                "working_sequence": 2,
+                "permission_sequence": 0,
+                "output_sequence": 12,
+                "status": "idle",
+            },
+        }
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = [populated]
+        terminal_host.list_hosts.return_value = []
+        terminal_host.get.return_value = populated
+        self.server.terminal_host = terminal_host
+
+        listed = self.server.list_cli_terminals()["terminals"][0]
+        self.assertEqual("delivered", listed["prompt_delivery"])
+        self.assertEqual("GROK", listed["provider_cli"])
+        self.assertEqual("grok.exe", listed["provider_cli_process"])
+        self.assertTrue(listed["provider_cli_alive"])
+        self.assertEqual(12, listed["output_sequence"])
+        self.assertEqual("idle", listed["prompt_activity"]["status"])
+
+        missing = {
+            "terminal_id": "term_activity_fields_002",
+            "project_id": "universe",
+            "mode": "MASTER",
+            "provider": "GROK",
+            "state": "LIVE",
+            "created_at": "2026-09-04T00:00:01Z",
+            "supervisor_session_id": session["session_id"],
+        }
+        terminal_host.list_sessions.return_value = [missing]
+        filled = self.server.list_cli_terminals()["terminals"][0]
+        self.assertEqual("", filled["prompt_delivery"])
+        self.assertEqual("GROK", filled["provider_cli"])
+        self.assertEqual("", filled["provider_cli_process"])
+        self.assertTrue(filled["provider_cli_alive"])
+        self.assertIn("prompt_activity", filled)
+
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None

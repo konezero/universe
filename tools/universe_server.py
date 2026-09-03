@@ -30608,12 +30608,47 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._project_terminal_session_location,
         )
 
+    def _with_terminal_public_activity(
+        self, terminal: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Keep TerminalSession.public() activity fields on every list projection."""
+
+        projected = dict(terminal)
+        if "prompt_delivery" not in projected:
+            projected["prompt_delivery"] = ""
+        if "provider_cli" not in projected:
+            projected["provider_cli"] = ""
+        if "provider_cli_process" not in projected:
+            projected["provider_cli_process"] = ""
+        if "provider_cli_alive" not in projected:
+            projected["provider_cli_alive"] = False
+        declared = str(projected.get("provider") or "").upper()
+        if not str(projected.get("provider_cli") or "").strip() and declared in {
+            "GROK",
+            "CLAUDE",
+            "CODEX",
+        }:
+            projected["provider_cli"] = declared
+            if str(projected.get("state") or "").upper() == "LIVE":
+                projected["provider_cli_alive"] = True
+        if "output_sequence" not in projected:
+            projected["output_sequence"] = 0
+        if "prompt_activity" not in projected:
+            projected["prompt_activity"] = {
+                "generation": 0,
+                "working_sequence": 0,
+                "permission_sequence": 0,
+                "output_sequence": projected.get("output_sequence") or 0,
+                "status": None,
+            }
+        return projected
+
     def _project_terminal_session_location(
         self, terminal: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Keep PTY birth coordinates as history and project its active location."""
 
-        projected = dict(terminal)
+        projected = self._with_terminal_public_activity(dict(terminal))
         created_project_id = str(terminal.get("project_id") or "").strip()
         created_mode = str(terminal.get("mode") or "").strip().upper()
         projected["created_project_id"] = created_project_id
