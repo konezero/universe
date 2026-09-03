@@ -352,8 +352,18 @@ function sendPtyText(socket, data) {
   socket.send(new TextEncoder().encode(text));
 }
 
+// A CLI wraps badly below 80 columns, so that is the hard floor: once the pane
+// is too narrow to show 80 columns at a readable font, the font shrinks instead
+// of the column count. 120x40 is the comfortable target and the fallback when
+// the pane cannot be measured yet.
 const TERMINAL_COLS = 120;
 const TERMINAL_ROWS = 40;
+const TERMINAL_MIN_COLS = 80;
+const TERMINAL_MIN_ROWS = 24;
+const TERMINAL_MAX_ROWS = 60;
+const TERMINAL_BASE_FONT = 13;
+const TERMINAL_MIN_FONT = 6;
+const TERMINAL_MAX_FONT = 15;
 
 function bindTerminalIme(term, socket) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
@@ -419,9 +429,12 @@ function scaleFontToContainer(term, element) {
   const width = element.clientWidth;
   const height = element.clientHeight;
   if (!width || !height) return false;
-  const fontFromWidth = width / (TERMINAL_COLS * 0.65);
-  const fontFromHeight = height / (TERMINAL_ROWS * 1.35);
-  const size = Math.max(8, Math.min(20, Math.floor(Math.min(fontFromWidth, fontFromHeight))));
+  const fontFromWidth = width / (TERMINAL_COLS * 0.62);
+  const fontFromHeight = height / (TERMINAL_ROWS * 1.3);
+  const size = Math.max(
+    TERMINAL_MIN_FONT,
+    Math.min(TERMINAL_MAX_FONT, Math.floor(Math.min(fontFromWidth, fontFromHeight)))
+  );
   if (term.options.fontSize !== size) {
     term.options.fontSize = size;
   }
@@ -432,15 +445,33 @@ function fitTerminalToContainer(term, element, fitAddon) {
   const width = element.clientWidth;
   const height = element.clientHeight;
   if (!width || !height) return false;
-  if (fitAddon && typeof fitAddon.fit === "function") {
+  if (fitAddon && typeof fitAddon.proposeDimensions === "function") {
     try {
-      const proposed = typeof fitAddon.proposeDimensions === "function"
-        ? fitAddon.proposeDimensions()
-        : null;
-      if (proposed && proposed.cols === term.cols && proposed.rows === term.rows) {
-        return true;
+      // Fit at a readable font first; only if that cannot show 80 columns do we
+      // trade font size for columns (char metrics scale ~linearly with font).
+      const base = Math.min(
+        TERMINAL_MAX_FONT,
+        Math.max(TERMINAL_MIN_FONT, TERMINAL_BASE_FONT)
+      );
+      if (term.options.fontSize !== base) term.options.fontSize = base;
+      const atBase = fitAddon.proposeDimensions();
+      let font = base;
+      if (atBase && atBase.cols && atBase.cols < TERMINAL_MIN_COLS) {
+        font = Math.max(
+          TERMINAL_MIN_FONT,
+          Math.floor((base * atBase.cols) / TERMINAL_MIN_COLS)
+        );
+        term.options.fontSize = font;
       }
-      fitAddon.fit();
+      const proposed =
+        font === base ? atBase : fitAddon.proposeDimensions();
+      const cols = Math.max(TERMINAL_MIN_COLS, (proposed && proposed.cols) || TERMINAL_COLS);
+      let rows = Math.max(TERMINAL_MIN_ROWS, (proposed && proposed.rows) || TERMINAL_ROWS);
+      // When the font was shrunk to hold 80 columns in a narrow pane, the row
+      // count would otherwise balloon into a tall unusable sliver — cap it and
+      // leave the surplus as background.
+      if (font < base) rows = Math.min(rows, TERMINAL_MAX_ROWS);
+      if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
       return Boolean(term.cols && term.rows);
     } catch (_error) {
       // A just-mounted pane may not be measurable yet; use the fallback below.
@@ -551,8 +582,8 @@ function ensureTerminalSurface(session) {
   let resizeTimer = 0;
   const sendCurrentSize = () => {
     if (socket.readyState !== WebSocket.OPEN) return false;
-    const cols = Math.max(40, Number(term.cols) || TERMINAL_COLS);
-    const rows = Math.max(20, Number(term.rows) || TERMINAL_ROWS);
+    const cols = Math.max(TERMINAL_MIN_COLS, Number(term.cols) || TERMINAL_COLS);
+    const rows = Math.max(TERMINAL_MIN_ROWS, Number(term.rows) || TERMINAL_ROWS);
     const sizeKey = `${cols}x${rows}`;
     if (surface?.lastSentSizeKey === sizeKey) return false;
     socket.send(JSON.stringify({

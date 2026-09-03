@@ -141,6 +141,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("surface.retainedLiveChunks.push({", TERM)
         self.assertIn("await writeUndisplayedLiveTail(surface)", TERM)
         self.assertIn("fitAddon.proposeDimensions()", TERM)
+        # 80 columns is the CLI floor — shrink the font, not the column count.
+        self.assertIn("const TERMINAL_MIN_COLS = 80;", TERM)
+        self.assertIn("atBase.cols < TERMINAL_MIN_COLS", TERM)
+        self.assertIn("Math.max(TERMINAL_MIN_COLS,", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)
         # GPU renderer preferred over the slow DOM renderer, with a fallback.
