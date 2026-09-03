@@ -252,6 +252,50 @@ function renderTerminalDock() {
     tab.addEventListener("click", () => selectTerminalTab(session.terminal_id));
     tabs.append(tab);
   }
+  if (sessions.length > 1) {
+    const gridBtn = node("button", "terminal-grid-toggle");
+    gridBtn.type = "button";
+    gridBtn.title = "Show all sessions in a grid";
+    gridBtn.textContent = state.terminalGrid ? "▦ grid" : "▤ single";
+    gridBtn.classList.toggle("is-active", Boolean(state.terminalGrid));
+    gridBtn.addEventListener("click", () => setTerminalGrid(!state.terminalGrid));
+    tabs.append(gridBtn);
+  }
+  applyTerminalGridLayout();
+}
+
+function setTerminalGrid(on) {
+  state.terminalGrid = Boolean(on);
+  renderTerminalDock();
+}
+
+function applyTerminalGridLayout() {
+  const stage = elements.terminalStage;
+  if (!stage) return;
+  const grid = Boolean(state.terminalGrid) && (state.terminals || []).length > 1;
+  stage.classList.toggle("terminal-grid", grid);
+  for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
+    if (!surface?.element) continue;
+    surface.element.hidden = grid ? false : id !== state.activeTerminalId;
+  }
+  if (grid && typeof refitAllTerminals === "function") {
+    setTimeout(() => refitAllTerminals(), 60);
+  } else {
+    setTimeout(() => refitActiveTerminal(), 60);
+  }
+}
+
+function refitAllTerminals() {
+  for (const surface of Object.values(state.terminalSurfaces || {})) {
+    if (!surface?.element || surface.element.hidden) continue;
+    const box = surface.element.getBoundingClientRect();
+    if (box.width < 40 || box.height < 60) continue;
+    try {
+      surface.notifySize?.(0);
+    } catch (_error) {
+      /* surface may still be measuring */
+    }
+  }
 }
 
 function captureTerminalViewport(surface) {
@@ -288,9 +332,10 @@ function selectTerminalTab(terminalId) {
   renderTerminalDock();
   if (typeof renderComposerState === "function") renderComposerState();
   ensureTerminalSurface(session);
+  const grid = Boolean(state.terminalGrid) && (state.terminals || []).length > 1;
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
-    surface.element.hidden = id !== terminalId;
+    surface.element.hidden = grid ? false : id !== terminalId;
     if (id === terminalId) {
       surface.restoreSavedViewport = switchingTabs;
       refitActiveTerminal();
