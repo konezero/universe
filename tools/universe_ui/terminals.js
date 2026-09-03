@@ -460,6 +460,15 @@ function ensureTerminalSurface(session) {
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
+  // A click in the pane must land keyboard focus in xterm's hidden textarea.
+  // When the running TUI turns on mouse tracking, xterm forwards the click as
+  // a mouse report and does NOT move focus on its own — so pointerdown here
+  // (capture, before xterm consumes it) keeps typing working after any click.
+  element.addEventListener(
+    "pointerdown",
+    () => { try { term.focus(); } catch (_error) { /* pane not ready */ } },
+    true
+  );
   const refreshAfterLayout = () => {
     return fitTerminalToContainer(term, element, fitAddon);
   };

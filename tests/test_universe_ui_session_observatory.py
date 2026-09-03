@@ -146,6 +146,17 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("attachCustomKeyEventHandler", TERM)
         self.assertIn("event.isComposing", TERM)
         self.assertIn("function bindTerminalIme(term, socket)", TERM)
+        # A click anywhere in the pane must land keyboard focus in xterm, even
+        # when the running TUI has grabbed the mouse (mouse-tracking mode) and
+        # so does not move focus on its own.
+        surface_slice = TERM[
+            TERM.index("function ensureTerminalSurface") : TERM.rindex(
+                "bindTerminalIme(term, socket)"
+            )
+        ]
+        self.assertIn('element.addEventListener(', surface_slice)
+        self.assertIn('"pointerdown",', surface_slice)
+        self.assertIn("try { term.focus(); }", surface_slice)
         self.assertIn('data.normalize("NFC")', TERM)
         self.assertIn("compositionend", TERM)
         self.assertNotIn("function HangulBuffer()", TERM)
