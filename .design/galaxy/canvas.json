@@ -1,0 +1,22 @@
+{
+  "pages": [
+    { "id": "shell", "name": "Shell IA" },
+    { "id": "galaxy", "name": "Galaxy view" }
+  ],
+  "artboards": [
+    { "file": "FleetHome.dc.html", "x": 0, "y": 0, "w": 1600, "h": 1000, "title": "Shell — Fleet home", "page": "shell" },
+    { "file": "BenchScreen.dc.html", "x": 1720, "y": 0, "w": 1440, "h": 900, "title": "Bench — dedicated screen", "page": "shell" },
+
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 1440, "h": 900, "title": "Galaxy — far", "page": "galaxy" },
+    { "file": "System.dc.html", "x": 1560, "y": 0, "w": 1440, "h": 900, "title": "System — mid", "page": "galaxy" },
+    { "file": "Knowledge.dc.html", "x": 0, "y": 1020, "w": 1440, "h": 900, "title": "Knowledge — near", "page": "galaxy" },
+    { "file": "Taxonomy.dc.html", "x": 1560, "y": 1020, "w": 1000, "h": 1480, "title": "Reference", "print": "flow", "page": "galaxy" }
+  ],
+  "annotations": [
+    { "id": "note-shell", "x": 0, "y": -170, "w": 700, "page": "shell",
+      "text": "Shell IA direction. Default view = Fleet (work-centric kanban). Left utility rail = view switcher only; the old left-panel dump (project tree + mode switcher + dozens of session cards) is gone. Session badges live on Fleet cards: hover = peek popover, click = bottom Terminal dock (single / tabs / GRID). Galaxy + Bench are full-screen / dedicated views; Activity/Docs/Memory/Rooms are center content in this chrome. Low-fi sketch." },
+    { "id": "note-galaxy", "x": 0, "y": -170, "w": 640, "page": "galaxy",
+      "text": "Galaxy = full-screen view mode (Esc → Fleet). far → system → near zoom. Inspector lives inside Galaxy, not the shell. Matches Universe app tokens. Static mockup; backend already serves projection.views (galaxy 9 · functional 12 · structural 12 · flow 26 · knowledge 74 · kanban 24)." }
+  ],
+  "launch": { "view": "canvas", "page": "shell" }
+}

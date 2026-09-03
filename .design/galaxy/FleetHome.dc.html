@@ -1,0 +1,215 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin:0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif;
+      background:#191a1d; color:#e6e6e4; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .lane-h { font-size:11px; letter-spacing:.06em; color:#8a8a86; padding:0 4px 8px; }
+    .card { background:#212327; border:1px solid #31333a; border-radius:8px; padding:10px 11px;
+      display:flex; flex-direction:column; gap:6px; }
+    .card .t { font-size:12px; font-weight:600; line-height:1.3; }
+    .meta { font-size:10px; color:#8a8a86; display:flex; gap:8px; flex-wrap:wrap; }
+    .badge { font-size:10px; padding:1px 6px; border-radius:5px; border:1px solid #383a41; color:#a8a8a4; }
+    .sess { font-size:10px; padding:2px 6px; border-radius:5px; background:#22242a;
+      border:1px solid #34363c; color:#7fb0a7; cursor:pointer; display:inline-flex; gap:5px; align-items:center; }
+    .dot { width:6px;height:6px;border-radius:50%; }
+  </style>
+</helmet>
+<div style="width:1600px;height:1000px;display:flex;flex-direction:column;overflow:hidden">
+
+  <!-- top bar: search / server / account only -->
+  <div style="height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;
+       border-bottom:1px solid #31333a;background:#161719">
+    <div style="width:20px;height:20px;border-radius:50%;background:#6f9b93"></div>
+    <div style="font-size:13px;font-weight:600">Universe</div>
+    <div style="flex:1;max-width:420px;height:30px;border:1px solid #31333a;border-radius:8px;
+         display:flex;align-items:center;padding:0 12px;font-size:12px;color:#5c5c58">
+      Search nodes, work, sessions…</div>
+    <div style="flex:1"></div>
+    <div style="font-size:11px;color:#6f9b78;display:flex;align-items:center;gap:6px">
+      <span class="dot" style="background:#6f9b78"></span>Server READY · :57608</div>
+    <div style="width:26px;height:26px;border-radius:50%;border:1px solid #383a41"></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <!-- utility rail = view switcher only -->
+    <div style="width:64px;border-right:1px solid #31333a;background:#161719;display:flex;
+         flex-direction:column;align-items:center;padding-top:12px;gap:4px;font-size:9px;color:#8a8a86">
+      <div style="width:44px;height:44px;border-radius:10px;background:#282a2f;border:1px solid #6f9b93;
+           color:#6f9b93;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">⇄</div>Fleet</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">○</div>Galaxy</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">≡</div>Activity</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">◈</div>Rooms</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">□</div>Docs</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">◉</div>Memory</div>
+      <div style="width:44px;height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px">
+        <div style="font-size:15px">◇</div>Bench</div>
+    </div>
+
+    <!-- context panel = scope for the current view -->
+    <div style="width:210px;border-right:1px solid #31333a;background:#161719;padding:14px 12px;font-size:12px">
+      <div style="font-size:10px;color:#8a8a86;letter-spacing:.08em;margin-bottom:8px">FLEET SCOPE</div>
+      <div style="background:#282a2f;border:1px solid #6f9b93;border-radius:8px;padding:8px 10px;color:#6f9b93">
+        universe</div>
+      <div style="padding:8px 10px;color:#a8a8a4">Career</div>
+      <div style="padding:8px 10px;color:#a8a8a4">GCS</div>
+      <div style="margin-top:16px;font-size:10px;color:#8a8a86;letter-spacing:.08em;margin-bottom:6px">FILTER</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px">
+        <span class="badge" style="border-color:#6f9b93;color:#6f9b93">mine</span>
+        <span class="badge">blocked</span>
+        <span class="badge">active agent</span>
+        <span class="badge">needs me</span>
+      </div>
+      <div style="margin-top:16px;font-size:10px;color:#8a8a86;letter-spacing:.08em;margin-bottom:6px">SESSIONS</div>
+      <div style="font-size:11px;color:#7fb0a7">3 live · 2 recent</div>
+      <div style="font-size:10px;color:#5c5c58;margin-top:2px">manage in session dock ↓</div>
+    </div>
+
+    <!-- main = Fleet kanban -->
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+      <div style="padding:14px 18px 6px;display:flex;align-items:baseline;gap:12px">
+        <div style="font-size:16px;font-weight:700">Fleet</div>
+        <div style="font-size:12px;color:#8a8a86">universe · Feature Node → Expected Path → Goal → Milestone → Todo → Task Frame</div>
+      </div>
+      <div style="flex:1;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;
+           padding:8px 18px 14px;overflow:hidden">
+        <div>
+          <div class="lane-h">PLANNED · 5</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card"><div class="t">Rehydrate mid-turn master stream</div>
+              <div class="meta"><span>session-continuity</span><span>P4</span></div></div>
+            <div class="card"><div class="t">Provider usage telemetry HUD</div>
+              <div class="meta"><span>intent-to-work</span><span>P1</span></div></div>
+            <div class="card" style="opacity:.6"><div class="t">Grok compat session mapping</div></div>
+          </div>
+        </div>
+        <div>
+          <div class="lane-h">READY · 1</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card" style="border-color:#6f9b93"><div class="t">Digest-pinned RAG adoption</div>
+              <div class="meta"><span>context-and-learning</span></div>
+              <div><span class="sess"><span class="dot" style="background:#5c5c58"></span>no session</span></div></div>
+          </div>
+        </div>
+        <div>
+          <div class="lane-h" style="color:#6f9b93">EXECUTING · 2</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card" style="border-color:#6f9b93">
+              <div class="t">Rust reconnection host</div>
+              <div class="meta"><span>session-continuity</span><span>tf-reconnect</span></div>
+              <div><span class="sess"><span class="dot" style="background:#6f9b78"></span>GROK · PTY live</span></div>
+              <div style="font-size:10px;color:#8a8a86" class="mono">…replace_terminal_id atomic terminate</div>
+            </div>
+            <div class="card" style="border-color:#6f9b93">
+              <div class="t">Action IR CLI</div>
+              <div><span class="sess"><span class="dot" style="background:#6f9b78"></span>CODEX · PTY live</span></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div class="lane-h" style="color:#a68d5b">VERIFYING · 1</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card" style="border-color:#a68d5b"><div class="t">Reattach lease evidence check</div>
+              <div class="meta"><span>validation running</span></div></div>
+          </div>
+        </div>
+        <div>
+          <div class="lane-h" style="color:#a86f66">BLOCKED · 1</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card" style="border-color:#a86f66"><div class="t">ConPTY handle survives supervisor restart</div>
+              <div style="font-size:10px;color:#b58279">needs approval packet</div></div>
+          </div>
+        </div>
+        <div>
+          <div class="lane-h" style="color:#6f9b78">DONE · 9</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div class="card" style="opacity:.65"><div class="t">Anchor-scoped reattach lookup</div>
+              <div class="meta"><span class="mono">6a2a6b7</span></div></div>
+            <div class="card" style="opacity:.45;font-size:10px">+8 more</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== bottom terminal dock — GRID mode ===== -->
+      <div style="height:300px;border-top:1px solid #31333a;background:#161719;display:flex;flex-direction:column">
+        <div style="height:34px;display:flex;align-items:center;gap:10px;padding:0 14px;
+             border-bottom:1px solid #31333a;font-size:11px;color:#8a8a86">
+          <span style="color:#e6e6e4;font-weight:600">Terminal dock</span>
+          <span class="badge" style="border-color:#6f9b93;color:#6f9b93">grid ▦</span>
+          <span class="badge">tabs</span>
+          <span class="badge">single</span>
+          <div style="flex:1"></div>
+          <span>2 sessions · click a card's session to add</span>
+          <span class="badge">⤢ pop out</span>
+          <span class="badge">▾ collapse</span>
+        </div>
+        <div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#31333a">
+          <div style="background:#121316;padding:10px 12px;font-size:11px;color:#7fb0a7" class="mono">
+            <div style="color:#5c5c58">tf-reconnect · GROK · anchor D82E0E7B</div>
+            <div>$ python tools/run_test_tier.py changed --path tools/terminal_host.py</div>
+            <div style="color:#6f9b78">.... 12 passed in 8.4s</div>
+            <div>$ git add -A &amp;&amp; git commit -m "fix: atomic replace_terminal_id"</div>
+            <div style="color:#e6e6e4">[main 6a2a6b7] fix: atomic replace_terminal_id</div>
+            <div style="color:#6f9b93">▊</div>
+          </div>
+          <div style="background:#121316;padding:10px 12px;font-size:11px;color:#7fb0a7" class="mono">
+            <div style="color:#5c5c58">action-ir · CODEX · anchor 0376513</div>
+            <div>› building Action IR registry…</div>
+            <div>› 15 tests · test_action_ir_cli test_execution_guard_policy</div>
+            <div style="color:#6f9b78">✓ all passed</div>
+            <div style="color:#a68d5b">⏳ waiting for approval packet</div>
+            <div style="color:#6f9b93">▊</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Fleet-native detail rail (card select) -->
+    <div style="width:280px;border-left:1px solid #31333a;background:#161719;padding:14px 14px;font-size:12px">
+      <div style="font-size:10px;color:#8a8a86;letter-spacing:.08em">TASK FRAME · EXECUTING</div>
+      <div style="font-size:14px;font-weight:600;margin:3px 0 8px">Rust reconnection host</div>
+      <div style="color:#8a8a86;line-height:1.6">
+        <div>Milestone <span style="color:#a8a8a4">114569b2</span></div>
+        <div>Owner node <span style="color:#7fb0a7" class="mono">session-continuity</span></div>
+        <div>Assignment <span style="color:#a8a8a4">bind_acc352…</span></div>
+        <div>Boss <span style="color:#a8a8a4">GROK grok-4.6</span></div>
+      </div>
+      <div style="margin-top:12px;font-size:10px;color:#8a8a86;letter-spacing:.08em">EVIDENCE</div>
+      <div style="color:#a8a8a4;line-height:1.6" class="mono" style="font-size:11px">
+        <div>~891 insertions · 12 files</div>
+        <div style="color:#6f9b78">tests: 312 passed</div>
+        <div>commit 6a2a6b7</div>
+      </div>
+      <div style="margin-top:12px;font-size:10px;color:#8a8a86;letter-spacing:.08em">SESSION</div>
+      <div><span class="sess"><span class="dot" style="background:#6f9b78"></span>GROK · PTY live · open in dock</span></div>
+    </div>
+  </div>
+
+  <!-- hover popover callout (peek) -->
+  <div style="position:absolute;left:640px;top:470px;width:220px;background:#212327;
+       border:1px solid #383a41;border-radius:8px;padding:8px 10px;font-size:10px;color:#a8a8a4;
+       box-shadow:0 10px 26px rgba(0,0,0,.6)" class="mono">
+    <div style="color:#6f9b78">● PTY live · GROK · 4m</div>
+    <div style="color:#5c5c58;margin-top:4px">…[main 6a2a6b7] fix: atomic replace</div>
+    <div style="color:#5c5c58">…$ git push</div>
+    <div style="color:#7fb0a7;margin-top:4px">click → open in terminal dock</div>
+  </div>
+  <div style="position:absolute;left:700px;top:454px;font-size:10px;color:#5c5c58">↑ hover a session badge = peek</div>
+
+</div>
+</x-dc>
+</body>
+</html>

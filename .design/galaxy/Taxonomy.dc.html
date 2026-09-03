@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif;
+      background:#22242a; color:#e6e6e4; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    h2 { font-size:13px; letter-spacing:.1em; text-transform:uppercase; color:#8a8a86;
+      margin:26px 0 10px; font-weight:600; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    td, th { text-align:left; padding:7px 12px; border-bottom:1px solid rgba(140,140,132,.14); vertical-align:top; }
+    th { color:#8a8a86; font-weight:600; font-size:11px; }
+    .k { color:#6f9b93; } .r { color:#7d7397; }
+  </style>
+</helmet>
+<div style="width:1000px;padding:40px 44px 56px">
+  <div style="font-size:22px;font-weight:700">Galaxy — unified node graph reference</div>
+  <div style="font-size:13px;color:#8a8a86;margin-top:4px">
+    One typed graph. Every screen is a View over <span class="mono">(node.kind, edge.relation)</span> plus a zoom level.
+    Ships and Work Items attach — they are never graph nodes.
+  </div>
+
+  <h2>Node kinds — structural (planets)</h2>
+  <table>
+    <tr><th>kind</th><th>meaning</th><th>galaxy glyph</th></tr>
+    <tr><td class="k">PRODUCT</td><td>the product root</td><td>bright central star</td></tr>
+    <tr><td class="k">APP</td><td>web / rust-desktop / cli / mobile</td><td>ringed planet w/ surface moons</td></tr>
+    <tr><td class="k">SURFACE</td><td>a screen / panel (Galaxy, Fleet, Activity…)</td><td>small moon</td></tr>
+    <tr><td class="k">FEATURE</td><td>Feature Node — spec, scope, Expected Paths; may be PROPOSED</td><td>planet (dashed if PROPOSED)</td></tr>
+    <tr><td class="k">CAPABILITY</td><td>a settled functional capability</td><td>planet w/ progress ring</td></tr>
+    <tr><td class="r">FLOW</td><td>end-to-end flow across capabilities</td><td>rounded-rect planet</td></tr>
+    <tr><td style="color:#a68d5b">EXTERNAL_BOUNDARY</td><td>external system / trust boundary</td><td>hexagon</td></tr>
+    <tr><td>STRUCTURE</td><td>code grouping — <span class="mono">structure_role: package | layer | module</span></td><td>square (structural view only)</td></tr>
+    <tr><td>COMPONENT</td><td>impl unit — <span class="mono">component_role: service | adapter | endpoint | class</span></td><td>square (structural view only)</td></tr>
+  </table>
+
+  <h2>Node kinds — knowledge (Obsidian layer)</h2>
+  <table>
+    <tr><th>kind</th><th>source</th><th>glyph</th></tr>
+    <tr><td style="color:#6a7f9b">DOCUMENT</td><td>seed document catalogue · role SPECIFICATION / ARCHITECTURE / DESIGN / CONTRACT / …</td><td>▭ blue</td></tr>
+    <tr><td class="k">DECISION</td><td>RAG DECISION_NOTE — grafted at read time</td><td>◇ cyan</td></tr>
+    <tr><td>MEMORY</td><td>RAG OBSERVED / BRAINSTORM / QUESTION — grafted at read time</td><td>○ muted</td></tr>
+  </table>
+  <div style="font-size:11px;color:#5c5c58;margin-top:6px">
+    node.state: <b>ADOPTED</b> (accepts Work Items) · <b>PROPOSED</b> (from an Expected Path; never deleted when a
+    sibling is adopted; carries <span class="mono">expected_path_ref</span>).
+  </div>
+
+  <h2>Edge relations</h2>
+  <table>
+    <tr><td class="mono r">CONTAINS</td><td>PRODUCT→APP→SURFACE, STRUCTURE→COMPONENT</td></tr>
+    <tr><td class="mono r">ENABLES / INFORMS</td><td>CAPABILITY→CAPABILITY, CAPABILITY→FLOW</td></tr>
+    <tr><td class="mono r">REQUESTS / DELIVERS</td><td>FLOW↔EXTERNAL_BOUNDARY</td></tr>
+    <tr><td class="mono r">DEPENDS_ON</td><td>COMPONENT→COMPONENT, STRUCTURE→STRUCTURE</td></tr>
+    <tr><td class="mono r">IMPLEMENTS / SUPPORTS / ADAPTS / EXPOSES</td><td>COMPONENT/STRUCTURE → CAPABILITY/FEATURE (the old bindings)</td></tr>
+    <tr><td class="mono r">REALIZES</td><td>FEATURE → CAPABILITY (adopted path built)</td></tr>
+    <tr><td class="mono r">SPECIFIES / INFORMS / EVIDENCES</td><td>DOCUMENT/DECISION/MEMORY → structural node</td></tr>
+    <tr><td class="mono r">DERIVED_FROM / DUPLICATE_OF / CONFLICTS_WITH / SUPERSEDES</td><td>knowledge → knowledge</td></tr>
+  </table>
+
+  <h2>Views = zoom hierarchy</h2>
+  <table>
+    <tr><th>view</th><th>zoom</th><th>shows</th></tr>
+    <tr><td class="k">galaxy</td><td>far</td><td>PRODUCT · APP · SURFACE · FEATURE · CAPABILITY + ships (live Task Frames)</td></tr>
+    <tr><td class="k">functional</td><td>mid</td><td>+ FLOW · EXTERNAL_BOUNDARY; CONTAINS/ENABLES/INFORMS/REQUESTS/DELIVERS</td></tr>
+    <tr><td class="k">structural</td><td>mid</td><td>STRUCTURE · COMPONENT; DEPENDS_ON + IMPLEMENTS/SUPPORTS cross-edges</td></tr>
+    <tr><td class="k">flow</td><td>mid</td><td>FLOW nodes + edge endpoints, ordered</td></tr>
+    <tr><td class="k">knowledge</td><td>near</td><td>DOCUMENT · DECISION · MEMORY — Obsidian local graph, n-hop from the selected node</td></tr>
+    <tr><td class="k">kanban</td><td>board</td><td>every ADOPTED node + its Work Item rollup by lane</td></tr>
+  </table>
+
+  <h2>Ships — live execution, attached not nodes</h2>
+  <table>
+    <tr><th>Task Frame state</th><th>ship</th></tr>
+    <tr><td>READY / dispatched</td><td>departing the source node</td></tr>
+    <tr><td>ACTIVE / Executing</td><td>in transit to target node</td></tr>
+    <tr><td>Verifying</td><td>entering orbit</td></tr>
+    <tr><td>DONE</td><td>landed</td></tr>
+    <tr><td style="color:#a86f66">BLOCKED</td><td>stopped in space</td></tr>
+  </table>
+  <div style="font-size:11px;color:#5c5c58;margin-top:8px">
+    Lineage: Feature Node → Expected Path → Goal → Milestone → Todo → Task Frame → Session Anchor → PTY → Activity.
+    The Task Frame + session is the ship.
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

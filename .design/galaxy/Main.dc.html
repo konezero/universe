@@ -1,0 +1,229 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif; }
+    a { color: #6f9b93; } a:hover { color: #7fb0a7; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</helmet>
+<div style="width:1440px;height:900px;position:relative;overflow:hidden;background:
+     radial-gradient(1100px 700px at 52% 44%, #1b1c1f 0%, #22242a 55%, #121316 100%);
+     color:#e6e6e4;">
+
+  <!-- starfield -->
+  <svg width="1440" height="900" style="position:absolute;inset:0;opacity:.5">
+    <g fill="#4a4a46">
+      <circle cx="120" cy="90" r="1"/><circle cx="340" cy="160" r="1.4"/><circle cx="900" cy="70" r="1"/>
+      <circle cx="1230" cy="140" r="1.2"/><circle cx="1360" cy="360" r="1"/><circle cx="80" cy="500" r="1.3"/>
+      <circle cx="1180" cy="640" r="1"/><circle cx="520" cy="820" r="1.2"/><circle cx="960" cy="800" r="1"/>
+      <circle cx="240" cy="700" r="1"/><circle cx="700" cy="120" r="0.8"/><circle cx="1080" cy="300" r="0.8"/>
+      <circle cx="440" cy="420" r="0.8"/><circle cx="1320" cy="760" r="0.9"/><circle cx="180" cy="270" r="0.9"/>
+    </g>
+  </svg>
+
+  <!-- ===== spatial layer ===== -->
+  <svg width="1440" height="900" viewBox="0 0 1440 900" style="position:absolute;inset:0">
+    <defs>
+      <radialGradient id="core" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#c9d6d3"/><stop offset="35%" stop-color="#5f857e"/>
+        <stop offset="100%" stop-color="#2a2c30"/>
+      </radialGradient>
+      <radialGradient id="planet" cx="38%" cy="35%" r="70%">
+        <stop offset="0%" stop-color="#34363c"/><stop offset="100%" stop-color="#22242a"/>
+      </radialGradient>
+      <marker id="ship" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0 0 L10 5 L0 10 L3 5 Z" fill="#a68d5b"/>
+      </marker>
+    </defs>
+
+    <!-- orbit rings -->
+    <g fill="none" stroke="#2f3136" stroke-width="1" opacity=".55">
+      <ellipse cx="720" cy="430" rx="210" ry="120"/>
+      <ellipse cx="720" cy="430" rx="380" ry="215"/>
+      <ellipse cx="720" cy="430" rx="560" ry="315"/>
+    </g>
+
+    <!-- ship trajectories (dashed) -->
+    <g fill="none" stroke="#a68d5b" stroke-width="1.3" stroke-dasharray="5 6" opacity=".8">
+      <path d="M980 250 Q 860 340 792 388" marker-end="url(#ship)"/>
+      <path d="M520 610 Q 640 520 690 470" marker-end="url(#ship)"/>
+      <path d="M1120 560 Q 980 520 916 486" marker-end="url(#ship)"/>
+    </g>
+
+    <!-- capability / feature planets -->
+    <!-- session-continuity -->
+    <g transform="translate(792,388)">
+      <circle r="34" fill="url(#planet)" stroke="#6f9b93" stroke-width="1.5"/>
+      <circle r="41" fill="none" stroke="#6f9b78" stroke-width="3" stroke-dasharray="180 77"
+              transform="rotate(-90)" opacity=".9"/>
+      <text y="60" text-anchor="middle" font-size="12" fill="#a8a8a4">session-continuity</text>
+      <text y="4" text-anchor="middle" font-size="10" fill="#8a8a86" class="mono">CAPABILITY</text>
+    </g>
+    <!-- context-and-learning -->
+    <g transform="translate(690,470)">
+      <circle r="30" fill="url(#planet)" stroke="#6f9b93" stroke-width="1.5"/>
+      <circle r="37" fill="none" stroke="#6f9b78" stroke-width="3" stroke-dasharray="90 142"
+              transform="rotate(-90)" opacity=".9"/>
+      <text y="54" text-anchor="middle" font-size="12" fill="#a8a8a4">context-and-learning</text>
+    </g>
+    <!-- intent-to-work (FLOW) -->
+    <g transform="translate(916,486)">
+      <rect x="-30" y="-24" width="60" height="48" rx="10" fill="url(#planet)" stroke="#7d7397" stroke-width="1.5"/>
+      <rect x="-36" y="-30" width="72" height="60" rx="13" fill="none" stroke="#a68d5b" stroke-width="3"
+            stroke-dasharray="120 96" opacity=".9"/>
+      <text y="50" text-anchor="middle" font-size="12" fill="#a8a8a4">intent-to-work</text>
+      <text y="4" text-anchor="middle" font-size="10" fill="#8a8a86" class="mono">FLOW</text>
+    </g>
+    <!-- safe-delivery (EXTERNAL_BOUNDARY) -->
+    <g transform="translate(1090,360)">
+      <path d="M0 -26 L23 -13 L23 13 L0 26 L-23 13 L-23 -13 Z" fill="url(#planet)" stroke="#a68d5b" stroke-width="1.5"/>
+      <text y="46" text-anchor="middle" font-size="12" fill="#a8a8a4">safe-delivery</text>
+      <text y="3" text-anchor="middle" font-size="9" fill="#8a8a86" class="mono">EXTERNAL</text>
+    </g>
+    <!-- project-structure -->
+    <g transform="translate(520,300)">
+      <circle r="26" fill="url(#planet)" stroke="#6f9b93" stroke-width="1.5"/>
+      <circle r="33" fill="none" stroke="#6f9b78" stroke-width="3" stroke-dasharray="30 178" transform="rotate(-90)"/>
+      <text y="48" text-anchor="middle" font-size="12" fill="#a8a8a4">project-structure</text>
+    </g>
+
+    <!-- proposed feature planet (un-taken Expected Path) -->
+    <g transform="translate(300,640)" opacity=".62">
+      <circle r="26" fill="#22242a" stroke="#7d7397" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text y="46" text-anchor="middle" font-size="12" fill="#8a8a86">remote-federation</text>
+      <text y="3" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">FEATURE · PROPOSED</text>
+    </g>
+    <g transform="translate(410,720)" opacity=".62">
+      <circle r="20" fill="#22242a" stroke="#7d7397" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text y="40" text-anchor="middle" font-size="11" fill="#8a8a86">rust-desktop</text>
+    </g>
+    <path d="M300 640 L410 720" stroke="#7d7397" stroke-width="1" stroke-dasharray="3 5" opacity=".5"/>
+    <text x="250" y="770" font-size="10" fill="#8a8a86" font-style="italic">Expected Path · not adopted</text>
+
+    <!-- app + surfaces cluster -->
+    <g transform="translate(1180,660)">
+      <circle r="24" fill="url(#planet)" stroke="#6a7f9b" stroke-width="1.5"/>
+      <text y="0" text-anchor="middle" font-size="10" fill="#a8a8a4" class="mono">APP</text>
+      <text y="44" text-anchor="middle" font-size="12" fill="#a8a8a4">universe-web</text>
+      <g stroke="#2f3136" stroke-width="1">
+        <line x1="0" y1="0" x2="-70" y2="-46"/><line x1="0" y1="0" x2="-64" y2="40"/>
+        <line x1="0" y1="0" x2="66" y2="-30"/><line x1="0" y1="0" x2="60" y2="52"/>
+      </g>
+      <g font-size="9" fill="#8a8a86" class="mono">
+        <circle cx="-70" cy="-46" r="8" fill="#22242a" stroke="#6a7f9b"/><text x="-70" y="-60" text-anchor="middle">galaxy</text>
+        <circle cx="-64" cy="40" r="8" fill="#22242a" stroke="#6a7f9b"/><text x="-64" y="60" text-anchor="middle">fleet</text>
+        <circle cx="66" cy="-30" r="8" fill="#22242a" stroke="#6a7f9b"/><text x="66" y="-44" text-anchor="middle">activity</text>
+        <circle cx="60" cy="52" r="8" fill="#22242a" stroke="#6a7f9b"/><text x="60" y="72" text-anchor="middle">terminal</text>
+      </g>
+    </g>
+
+    <!-- central PRODUCT star -->
+    <g transform="translate(720,430)">
+      <circle r="70" fill="none" stroke="#6f9b93" stroke-width="1" opacity=".25"/>
+      <circle r="46" fill="url(#core)"/>
+      <circle r="46" fill="none" stroke="#7fb0a7" stroke-width="2" opacity=".7"/>
+      <text y="5" text-anchor="middle" font-size="15" font-weight="700" fill="#161719">universe</text>
+      <text y="86" text-anchor="middle" font-size="11" fill="#8a8a86" class="mono">PRODUCT · 87 nodes</text>
+    </g>
+
+    <!-- CONTAINS spokes from product -->
+    <g stroke="#2f3136" stroke-width="1" opacity=".7">
+      <line x1="720" y1="430" x2="792" y2="388"/><line x1="720" y1="430" x2="690" y2="470"/>
+      <line x1="720" y1="430" x2="520" y2="300"/><line x1="720" y1="430" x2="916" y2="486"/>
+      <line x1="720" y1="430" x2="1090" y2="360"/><line x1="720" y1="430" x2="1180" y2="660"/>
+    </g>
+  </svg>
+
+  <!-- ===== top-left controls ===== -->
+  <div style="position:absolute;left:24px;top:20px;display:flex;flex-direction:column;gap:12px">
+    <div style="display:flex;gap:8px;align-items:center">
+      <div style="display:flex;background:rgba(26,27,31,.82);border:1px solid rgba(140,140,132,.16);
+           border-radius:9px;overflow:hidden">
+        <button style="all:unset;padding:7px 12px;color:#8a8a86;cursor:pointer">−</button>
+        <button style="all:unset;padding:7px 12px;color:#e6e6e4;border-left:1px solid rgba(140,140,132,.16);
+             border-right:1px solid rgba(140,140,132,.16)">▦</button>
+        <button style="all:unset;padding:7px 12px;color:#8a8a86;cursor:pointer">+</button>
+      </div>
+      <span style="font-size:13px;color:#8a8a86">Galaxy</span>
+      <span style="font-size:13px;color:#6f9b93" class="mono">universe</span>
+      <span style="font-size:12px;color:#5c5c58">/ far</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;max-width:520px;background:rgba(26,27,31,.72);
+         border:1px solid rgba(140,140,132,.14);border-radius:9px;padding:8px 10px">
+      <span style="font-size:11px;color:#a8a8a4">● PRODUCT</span>
+      <span style="font-size:11px;color:#a8a8a4">● APP</span>
+      <span style="font-size:11px;color:#a8a8a4">● SURFACE</span>
+      <span style="font-size:11px;color:#a8a8a4">● FEATURE</span>
+      <span style="font-size:11px;color:#a8a8a4">● CAPABILITY</span>
+      <span style="font-size:11px;color:#7d7397">● FLOW</span>
+      <span style="font-size:11px;color:#a68d5b">◆ EXTERNAL</span>
+      <span style="font-size:11px;color:#5c5c58">◌ PROPOSED</span>
+      <span style="font-size:11px;color:#a68d5b">▶ ship = live Task Frame</span>
+    </div>
+  </div>
+
+  <!-- ===== selected planet rollup card ===== -->
+  <div style="position:absolute;right:24px;top:20px;width:300px;background:rgba(30,31,36,.92);
+       border:1px solid rgba(111,155,147,.3);border-radius:16px;box-shadow:0 16px 40px rgba(0,0,0,.55);
+       padding:16px 18px">
+    <div style="font-size:10px;color:#8a8a86;letter-spacing:.08em" class="mono">CAPABILITY · ADOPTED</div>
+    <div style="font-size:16px;font-weight:600;margin:3px 0 2px">Keep AI sessions connected</div>
+    <div style="font-size:12px;color:#8a8a86">session-continuity</div>
+
+    <div style="margin:14px 0 6px;font-size:11px;color:#a8a8a4">Work status</div>
+    <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#22242a">
+      <div style="width:44%;background:#6f9b78"></div>
+      <div style="width:14%;background:#6f9b93"></div>
+      <div style="width:12%;background:#a68d5b"></div>
+      <div style="width:8%;background:#a86f66"></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:#8a8a86;margin-top:4px">
+      <span>Done 44%</span><span>Executing</span><span>Verifying</span><span>Blocked</span>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:14px">
+      <div style="background:#22242a;border-radius:9px;padding:8px 10px">
+        <div style="font-size:18px;font-weight:600">2</div>
+        <div style="font-size:10px;color:#8a8a86">ships in flight</div>
+      </div>
+      <div style="background:#22242a;border-radius:9px;padding:8px 10px">
+        <div style="font-size:18px;font-weight:600">11</div>
+        <div style="font-size:10px;color:#8a8a86">knowledge nodes</div>
+      </div>
+      <div style="background:#22242a;border-radius:9px;padding:8px 10px">
+        <div style="font-size:13px;font-weight:600;color:#a68d5b">partial</div>
+        <div style="font-size:10px;color:#8a8a86">evidence freshness</div>
+      </div>
+      <div style="background:#22242a;border-radius:9px;padding:8px 10px">
+        <div style="font-size:13px;font-weight:600;color:#a86f66">1 blocked</div>
+        <div style="font-size:10px;color:#8a8a86">Work Item</div>
+      </div>
+    </div>
+    <button style="all:unset;display:block;text-align:center;margin-top:14px;width:100%;padding:9px 0;
+         background:rgba(111,155,147,.12);border:1px solid rgba(111,155,147,.3);border-radius:9px;
+         color:#6f9b93;font-size:12px;cursor:pointer">Enter system →</button>
+  </div>
+
+  <!-- full-screen view-mode affordance -->
+  <div style="position:absolute;right:24px;bottom:52px;display:flex;gap:8px;font-size:11px;color:#8a8a86">
+    <span style="background:rgba(26,27,31,.72);border:1px solid rgba(140,140,132,.16);border-radius:6px;padding:5px 9px">
+      full-screen view mode</span>
+    <span style="background:rgba(26,27,31,.72);border:1px solid rgba(140,140,132,.16);border-radius:6px;padding:5px 9px">
+      Esc → back to Fleet</span>
+  </div>
+
+  <!-- ===== bottom status ===== -->
+  <div style="position:absolute;left:0;right:0;bottom:16px;text-align:center;font-size:12px;color:#8a8a86">
+    Galaxy · universe · 87 typed nodes · 3 ships in flight · click a planet to enter its system
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

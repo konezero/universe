@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif; }
+    a { color: #6f9b93; } a:hover { color: #7fb0a7; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</helmet>
+<div style="width:1440px;height:900px;position:relative;overflow:hidden;
+     background:radial-gradient(1000px 700px at 50% 45%, #1b1c1f 0%, #22242a 60%, #121316 100%);color:#e6e6e4;">
+
+  <div style="position:absolute;left:24px;top:20px;display:flex;gap:8px;align-items:center;font-size:13px">
+    <div style="display:flex;background:rgba(26,27,31,.82);border:1px solid rgba(140,140,132,.16);
+         border-radius:9px;overflow:hidden">
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;cursor:pointer">−</button>
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;border-left:1px solid rgba(140,140,132,.16)">▦</button>
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;border-left:1px solid rgba(140,140,132,.16)">+</button>
+    </div>
+    <span style="color:#6f9b93" class="mono">universe</span><span style="color:#5c5c58">›</span>
+    <span style="color:#6f9b93" class="mono">context-and-learning</span>
+    <span style="color:#5c5c58">/ knowledge · 2 hops</span>
+  </div>
+
+  <!-- toggle chips -->
+  <div style="position:absolute;right:24px;top:18px;display:flex;gap:6px;font-size:11px">
+    <span style="background:rgba(111,155,147,.14);border:1px solid rgba(111,155,147,.3);border-radius:6px;padding:5px 9px;color:#6f9b93">local</span>
+    <span style="background:rgba(26,27,31,.72);border:1px solid rgba(140,140,132,.16);border-radius:6px;padding:5px 9px;color:#8a8a86">global</span>
+    <span style="background:rgba(26,27,31,.72);border:1px solid rgba(140,140,132,.16);border-radius:6px;padding:5px 9px;color:#8a8a86">hops: 1 · <b style="color:#e6e6e4">2</b> · 3</span>
+  </div>
+
+  <svg width="1440" height="820" viewBox="0 0 1440 820" style="position:absolute;left:0;top:64px">
+    <defs>
+      <radialGradient id="cap" cx="40%" cy="35%" r="70%">
+        <stop offset="0%" stop-color="#5f857e"/><stop offset="100%" stop-color="#2a2c30"/>
+      </radialGradient>
+    </defs>
+
+    <!-- edges -->
+    <g stroke="#34363c" stroke-width="1.3" fill="none">
+      <line x1="720" y1="400" x2="470" y2="250"/><line x1="720" y1="400" x2="990" y2="240"/>
+      <line x1="720" y1="400" x2="410" y2="520"/><line x1="720" y1="400" x2="1010" y2="540"/>
+      <line x1="720" y1="400" x2="720" y2="180"/><line x1="720" y1="400" x2="720" y2="640"/>
+      <line x1="470" y1="250" x2="290" y2="360" stroke-dasharray="4 5"/>
+      <line x1="990" y1="240" x2="1180" y2="330" stroke-dasharray="4 5"/>
+      <line x1="720" y1="640" x2="560" y2="720" stroke-dasharray="4 5"/>
+      <line x1="720" y1="640" x2="900" y2="720" stroke-dasharray="4 5"/>
+    </g>
+    <text x="560" y="315" font-size="10" fill="#5c5c58" transform="rotate(-31 560 315)">SPECIFIES</text>
+    <text x="855" y="305" font-size="10" fill="#5c5c58" transform="rotate(28 855 305)">INFORMS</text>
+    <text x="360" y="450" font-size="10" fill="#5c5c58" transform="rotate(38 360 450)">DERIVED_FROM</text>
+
+    <!-- focus capability -->
+    <circle cx="720" cy="400" r="38" fill="url(#cap)"/>
+    <circle cx="720" cy="400" r="45" fill="none" stroke="#6f9b78" stroke-width="3"
+            stroke-dasharray="90 145" transform="rotate(-90 720 400)"/>
+    <text x="720" y="396" text-anchor="middle" font-size="11" font-weight="700" fill="#161719">context</text>
+    <text x="720" y="410" text-anchor="middle" font-size="11" font-weight="700" fill="#161719">and-learning</text>
+
+    <!-- knowledge nodes -->
+    <g font-size="10">
+      <!-- DOCUMENT (square, blue) -->
+      <g>
+        <rect x="694" y="152" width="52" height="30" rx="4" fill="#22242a" stroke="#6a7f9b" stroke-width="1.4"/>
+        <text x="720" y="142" text-anchor="middle" fill="#a8a8a4">Universe Memory RAG</text>
+        <text x="720" y="171" text-anchor="middle" fill="#5c5c58" class="mono">DOC · architecture</text>
+      </g>
+      <g>
+        <rect x="964" y="222" width="52" height="30" rx="4" fill="#22242a" stroke="#6a7f9b" stroke-width="1.4"/>
+        <text x="990" y="212" text-anchor="middle" fill="#a8a8a4">Node graph model</text>
+      </g>
+      <!-- DECISION (diamond, cyan) -->
+      <g transform="translate(470,250)">
+        <path d="M0 -18 L18 0 L0 18 L-18 0 Z" fill="#22242a" stroke="#6f9b93" stroke-width="1.5"/>
+        <text y="-26" text-anchor="middle" fill="#a8a8a4">unified node graph + RAG model</text>
+        <text y="34" text-anchor="middle" fill="#5c5c58" class="mono">DECISION</text>
+      </g>
+      <g transform="translate(1010,540)">
+        <path d="M0 -18 L18 0 L0 18 L-18 0 Z" fill="#22242a" stroke="#6f9b93" stroke-width="1.5"/>
+        <text y="-26" text-anchor="middle" fill="#a8a8a4">seed/projection → unified graph</text>
+        <text y="34" text-anchor="middle" fill="#5c5c58" class="mono">DECISION</text>
+      </g>
+      <!-- MEMORY (circle, muted) -->
+      <g>
+        <circle cx="410" cy="520" r="14" fill="#22242a" stroke="#8a8a86" stroke-width="1.3"/>
+        <text x="410" y="548" text-anchor="middle" fill="#8a8a86">Project Room result · council</text>
+        <text x="410" y="560" text-anchor="middle" fill="#5c5c58" class="mono">MEMORY</text>
+      </g>
+      <g><circle cx="290" cy="360" r="12" fill="#22242a" stroke="#8a8a86" stroke-width="1.3"/>
+        <text x="290" y="386" text-anchor="middle" fill="#8a8a86">Fleet Kanban projection</text></g>
+      <g><circle cx="1180" cy="330" r="12" fill="#22242a" stroke="#8a8a86" stroke-width="1.3"/>
+        <text x="1180" y="356" text-anchor="middle" fill="#8a8a86">MEMORY_SYNC candidate</text></g>
+      <g><circle cx="720" cy="640" r="13" fill="#22242a" stroke="#8a8a86" stroke-width="1.3"/>
+        <text x="720" y="668" text-anchor="middle" fill="#8a8a86">Functional node ownership</text>
+        <text x="720" y="680" text-anchor="middle" fill="#5c5c58" class="mono">DECISION</text></g>
+      <g><circle cx="560" cy="720" r="10" fill="#22242a" stroke="#8a8a86" stroke-width="1.2"/></g>
+      <g><circle cx="900" cy="720" r="10" fill="#22242a" stroke="#8a8a86" stroke-width="1.2"/></g>
+    </g>
+  </svg>
+
+  <!-- legend -->
+  <div style="position:absolute;left:24px;bottom:60px;display:flex;gap:14px;font-size:11px;color:#a8a8a4;
+       background:rgba(26,27,31,.72);border:1px solid rgba(140,140,132,.14);border-radius:9px;padding:8px 12px">
+    <span><span style="color:#6a7f9b">▭</span> DOCUMENT</span>
+    <span><span style="color:#6f9b93">◇</span> DECISION</span>
+    <span><span style="color:#8a8a86">○</span> MEMORY</span>
+    <span style="color:#5c5c58">dashed = knowledge↔knowledge (DERIVED_FROM / SUPERSEDES / CONFLICTS_WITH)</span>
+  </div>
+  <div style="position:absolute;left:0;right:0;bottom:20px;text-align:center;font-size:12px;color:#8a8a86">
+    knowledge view · context-and-learning · 8 documents · 8 decisions · 43 memories in graph · showing 2-hop neighbourhood
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

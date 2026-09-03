@@ -1,0 +1,173 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin: 0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif; }
+    a { color: #6f9b93; } a:hover { color: #7fb0a7; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .lane-card { background:#212327; border:1px solid #31333a; border-radius:8px; padding:8px 10px;
+      font-size:11px; color:#e6e6e4; }
+  </style>
+</helmet>
+<div style="width:1440px;height:900px;position:relative;overflow:hidden;
+     background:radial-gradient(900px 600px at 30% 40%, #1b1c1f 0%, #22242a 60%, #121316 100%);color:#e6e6e4;">
+
+  <!-- breadcrumb / zoom -->
+  <div style="position:absolute;left:24px;top:20px;display:flex;gap:8px;align-items:center;font-size:13px">
+    <div style="display:flex;background:rgba(26,27,31,.82);border:1px solid rgba(140,140,132,.16);
+         border-radius:9px;overflow:hidden">
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;cursor:pointer">−</button>
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;border-left:1px solid rgba(140,140,132,.16)">▦</button>
+      <button style="all:unset;padding:7px 12px;color:#8a8a86;border-left:1px solid rgba(140,140,132,.16);cursor:pointer">+</button>
+    </div>
+    <span style="color:#6f9b93" class="mono">universe</span>
+    <span style="color:#5c5c58">›</span>
+    <span style="color:#6f9b93" class="mono">session-continuity</span>
+    <span style="color:#5c5c58">/ system</span>
+  </div>
+
+  <!-- ===== left: local graph ===== -->
+  <svg width="760" height="820" viewBox="0 0 760 820" style="position:absolute;left:20px;top:64px">
+    <defs>
+      <radialGradient id="focus" cx="40%" cy="35%" r="70%">
+        <stop offset="0%" stop-color="#5f857e"/><stop offset="100%" stop-color="#2a2c30"/>
+      </radialGradient>
+      <radialGradient id="nb" cx="40%" cy="35%" r="70%">
+        <stop offset="0%" stop-color="#2f3136"/><stop offset="100%" stop-color="#22242a"/>
+      </radialGradient>
+      <marker id="s2" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+        <path d="M0 0 L10 5 L0 10 L3 5 Z" fill="#a68d5b"/>
+      </marker>
+    </defs>
+
+    <!-- edges to neighbours -->
+    <g stroke="#34363c" stroke-width="1.4">
+      <line x1="380" y1="360" x2="180" y2="170"/>
+      <line x1="380" y1="360" x2="600" y2="180"/>
+      <line x1="380" y1="360" x2="150" y2="560"/>
+      <line x1="380" y1="360" x2="600" y2="560"/>
+      <line x1="380" y1="360" x2="380" y2="150"/>
+    </g>
+    <text x="270" y="255" font-size="10" fill="#5c5c58" transform="rotate(-42 270 255)">ENABLES</text>
+    <text x="470" y="255" font-size="10" fill="#5c5c58" transform="rotate(38 470 255)">CONTAINS</text>
+    <text x="245" y="470" font-size="10" fill="#5c5c58" transform="rotate(40 245 470)">IMPLEMENTS</text>
+
+    <!-- neighbours -->
+    <g>
+      <circle cx="180" cy="170" r="26" fill="url(#nb)" stroke="#7d7397" stroke-width="1.4"/>
+      <text x="180" y="215" text-anchor="middle" font-size="11" fill="#a8a8a4">intent-to-work</text>
+      <text x="180" y="228" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">FLOW</text>
+    </g>
+    <g>
+      <circle cx="600" cy="180" r="24" fill="url(#nb)" stroke="#6f9b93" stroke-width="1.4"/>
+      <text x="600" y="222" text-anchor="middle" font-size="11" fill="#a8a8a4">universe</text>
+      <text x="600" y="235" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">PRODUCT</text>
+    </g>
+    <g>
+      <rect x="126" y="536" width="48" height="48" rx="8" fill="url(#nb)" stroke="#8a8a86" stroke-width="1.4"/>
+      <text x="150" y="600" text-anchor="middle" font-size="11" fill="#a8a8a4">session-supervisor</text>
+      <text x="150" y="613" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">COMPONENT · service</text>
+    </g>
+    <g>
+      <rect x="576" y="536" width="48" height="48" rx="8" fill="url(#nb)" stroke="#8a8a86" stroke-width="1.4"/>
+      <text x="600" y="600" text-anchor="middle" font-size="11" fill="#a8a8a4">terminal-host</text>
+      <text x="600" y="613" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">COMPONENT · service</text>
+    </g>
+    <g>
+      <circle cx="380" cy="150" r="20" fill="#22242a" stroke="#6a7f9b" stroke-width="1.4"/>
+      <text x="380" y="120" text-anchor="middle" font-size="11" fill="#a8a8a4">Activity</text>
+      <text x="380" y="108" text-anchor="middle" font-size="9" fill="#5c5c58" class="mono">SURFACE</text>
+    </g>
+
+    <!-- ship arriving -->
+    <path d="M120 720 Q 280 520 366 392" fill="none" stroke="#a68d5b" stroke-width="1.4"
+          stroke-dasharray="5 6" marker-end="url(#s2)"/>
+    <text x="150" y="740" font-size="10" fill="#a68d5b">tf-reconnect-host · Executing</text>
+
+    <!-- focus node -->
+    <circle cx="380" cy="360" r="52" fill="none" stroke="#6f9b93" stroke-width="1" opacity=".3"/>
+    <circle cx="380" cy="360" r="40" fill="url(#focus)"/>
+    <circle cx="380" cy="360" r="47" fill="none" stroke="#6f9b78" stroke-width="4"
+            stroke-dasharray="140 90" transform="rotate(-90 380 360)"/>
+    <text x="380" y="356" text-anchor="middle" font-size="12" font-weight="700" fill="#161719">session</text>
+    <text x="380" y="370" text-anchor="middle" font-size="12" font-weight="700" fill="#161719">continuity</text>
+  </svg>
+
+  <!-- ===== right: kanban rollup ===== -->
+  <div style="position:absolute;right:24px;top:64px;width:600px">
+    <div style="font-size:13px;color:#a8a8a4;margin-bottom:10px">
+      Work Items on <span class="mono" style="color:#6f9b93">session-continuity</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px">
+      <div>
+        <div style="font-size:11px;color:#8a8a86;margin-bottom:6px">PLANNED · 3</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="lane-card">Rehydrate mid-turn master stream</div>
+          <div class="lane-card">Full host session_ref invalidate</div>
+          <div class="lane-card">Grok compat session mapping</div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#6f9b93;margin-bottom:6px">EXECUTING · 1</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="lane-card" style="border-color:#6f9b93">
+            <div style="font-weight:600">Rust reconnection host</div>
+            <div style="color:#8a8a86;margin-top:2px" class="mono">tf-reconnect-host · GROK</div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#a68d5b;margin-bottom:6px">VERIFYING · 1</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="lane-card" style="border-color:#a68d5b">Reattach lease evidence check</div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#a86f66;margin-bottom:6px">BLOCKED · 1</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="lane-card" style="border-color:#a86f66">
+            ConPTY handle survives supervisor restart
+            <div style="color:#b58279;margin-top:2px">needs approval packet</div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#6f9b78;margin-bottom:6px">DONE · 6</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="lane-card" style="opacity:.7">Anchor-scoped reattach lookup</div>
+          <div class="lane-card" style="opacity:.7">replace_terminal_id atomic</div>
+          <div class="lane-card" style="opacity:.55;font-size:10px">+4 more</div>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:#8a8a86;margin-bottom:6px">READY · 0</div>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;font-size:13px;color:#a8a8a4;margin-bottom:8px">Linked knowledge · 11</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">
+      <span style="font-size:11px;background:#22242a;border:1px solid #34363c;border-radius:6px;padding:4px 8px;color:#a8a8a4">
+        <span style="color:#6a7f9b">◆</span> DECISION · file-touch provenance</span>
+      <span style="font-size:11px;background:#22242a;border:1px solid #34363c;border-radius:6px;padding:4px 8px;color:#a8a8a4">
+        DECISION · rust action-ir session objects</span>
+      <span style="font-size:11px;background:#22242a;border:1px solid #34363c;border-radius:6px;padding:4px 8px;color:#a8a8a4">
+        DOC · Live Session and Room Routing</span>
+      <span style="font-size:11px;background:#22242a;border:1px solid #34363c;border-radius:6px;padding:4px 8px;color:#a8a8a4">
+        DOC · Supervisor Session Topology Audit</span>
+      <span style="font-size:11px;background:#22242a;border:1px solid #34363c;border-radius:6px;padding:4px 8px;color:#8a8a86">
+        + 7 memories</span>
+    </div>
+    <button style="all:unset;display:inline-block;margin-top:14px;padding:9px 16px;
+         background:rgba(111,155,147,.12);border:1px solid rgba(111,155,147,.3);border-radius:9px;
+         color:#6f9b93;font-size:12px;cursor:pointer">Open knowledge graph →</button>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

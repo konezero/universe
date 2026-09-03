@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    body { margin:0; font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif;
+      background:#191a1d; color:#e6e6e4; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    th, td { text-align:left; padding:9px 14px; font-size:12px; border-bottom:1px solid #2c2e34; }
+    th { font-size:10px; letter-spacing:.06em; color:#8a8a86; }
+  </style>
+</helmet>
+<div style="width:1440px;height:900px;display:flex;flex-direction:column;overflow:hidden">
+
+  <!-- same top bar + rail so it reads as a dedicated screen, not an overlay -->
+  <div style="height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;
+       border-bottom:1px solid #31333a;background:#161719">
+    <div style="width:20px;height:20px;border-radius:50%;background:#6f9b93"></div>
+    <div style="font-size:13px;font-weight:600">Universe</div>
+    <div style="flex:1"></div>
+    <div style="font-size:11px;color:#6f9b78">● Server READY</div>
+    <div style="width:26px;height:26px;border-radius:50%;border:1px solid #383a41"></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0">
+    <div style="width:64px;border-right:1px solid #31333a;background:#161719;display:flex;
+         flex-direction:column;align-items:center;padding-top:12px;gap:10px;font-size:9px;color:#8a8a86">
+      <div style="opacity:.5">⇄<br>Fleet</div>
+      <div style="opacity:.5">○<br>Galaxy</div>
+      <div style="opacity:.5">≡<br>Activity</div>
+      <div style="width:44px;height:44px;border-radius:10px;background:#282a2f;border:1px solid #6f9b93;
+           color:#6f9b93;display:flex;flex-direction:column;align-items:center;justify-content:center">◇<br>Bench</div>
+    </div>
+
+    <div style="flex:1;min-width:0;padding:20px 28px;overflow:hidden">
+      <div style="display:flex;align-items:baseline;gap:14px">
+        <div style="font-size:18px;font-weight:700">Bench</div>
+        <div style="font-size:12px;color:#8a8a86">Skill / model / provider comparison over redacted run observations · review-only, promotes nothing</div>
+      </div>
+
+      <div style="display:flex;gap:8px;margin:16px 0 18px;font-size:11px">
+        <span style="padding:5px 11px;border-radius:7px;background:#282a2f;border:1px solid #6f9b93;color:#6f9b93">group: skill</span>
+        <span style="padding:5px 11px;border-radius:7px;border:1px solid #383a41;color:#a8a8a4">model</span>
+        <span style="padding:5px 11px;border-radius:7px;border:1px solid #383a41;color:#a8a8a4">provider</span>
+        <span style="padding:5px 11px;border-radius:7px;border:1px solid #383a41;color:#a8a8a4">project</span>
+        <div style="flex:1"></div>
+        <span style="padding:5px 11px;border-radius:7px;border:1px solid #383a41;color:#a8a8a4">last 50 runs</span>
+        <span style="padding:5px 11px;border-radius:7px;border:1px solid #383a41;color:#a8a8a4">↻</span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:24px;height:calc(100% - 120px)">
+        <!-- table -->
+        <div style="border:1px solid #2c2e34;border-radius:12px;overflow:hidden;align-self:start">
+          <table style="width:100%;border-collapse:collapse">
+            <tr><th>SKILL</th><th>RUNS</th><th>SUCCESS</th><th>AVG DURATION</th><th></th></tr>
+            <tr><td>universe.memory.fast-extract</td><td>14</td><td style="color:#6f9b78">86%</td><td class="mono">42s</td>
+              <td><div style="height:6px;width:86px;background:#6f9b78;border-radius:3px"></div></td></tr>
+            <tr><td>task-frame-debate</td><td>9</td><td style="color:#6f9b78">78%</td><td class="mono">3m10s</td>
+              <td><div style="height:6px;width:78px;background:#6f9b78;border-radius:3px"></div></td></tr>
+            <tr><td>source-review</td><td>21</td><td style="color:#a68d5b">62%</td><td class="mono">1m54s</td>
+              <td><div style="height:6px;width:62px;background:#a68d5b;border-radius:3px"></div></td></tr>
+            <tr><td>meeting-room-create</td><td>6</td><td style="color:#6f9b78">83%</td><td class="mono">28s</td>
+              <td><div style="height:6px;width:83px;background:#6f9b78;border-radius:3px"></div></td></tr>
+            <tr><td>standalone-bootstrap</td><td>31</td><td style="color:#a86f66">48%</td><td class="mono">6s</td>
+              <td><div style="height:6px;width:48px;background:#a86f66;border-radius:3px"></div></td></tr>
+          </table>
+          <div style="padding:8px 14px;font-size:10px;color:#5c5c58">illustrative — real rows from GET /v1/bench/compare</div>
+        </div>
+
+        <!-- detail: one skill across models -->
+        <div style="border:1px solid #2c2e34;border-radius:12px;padding:16px 18px">
+          <div style="font-size:10px;color:#8a8a86;letter-spacing:.06em">SELECTED</div>
+          <div style="font-size:14px;font-weight:600;margin:2px 0 14px">source-review · by model</div>
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:#a8a8a4">
+                <span>claude-sonnet-5</span><span class="mono">71% · n=9</span></div>
+              <div style="height:8px;background:#282a2f;border-radius:4px;margin-top:4px">
+                <div style="height:8px;width:71%;background:#6f9b78;border-radius:4px"></div></div>
+            </div>
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:#a8a8a4">
+                <span>gpt-5.6-luna</span><span class="mono">58% · n=7</span></div>
+              <div style="height:8px;background:#282a2f;border-radius:4px;margin-top:4px">
+                <div style="height:8px;width:58%;background:#a68d5b;border-radius:4px"></div></div>
+            </div>
+            <div>
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:#a8a8a4">
+                <span>grok-4.6</span><span class="mono">40% · n=5</span></div>
+              <div style="height:8px;background:#282a2f;border-radius:4px;margin-top:4px">
+                <div style="height:8px;width:40%;background:#a86f66;border-radius:4px"></div></div>
+            </div>
+          </div>
+          <div style="margin-top:16px;font-size:10px;color:#8a8a86;letter-spacing:.06em">OUTCOMES</div>
+          <div style="display:flex;gap:6px;margin-top:6px;font-size:11px;color:#a8a8a4">
+            <span>✓ 13</span><span style="color:#a68d5b">~ 4</span><span style="color:#a86f66">✗ 4</span>
+          </div>
+          <div style="margin-top:18px;font-size:11px;color:#7fb0a7;cursor:pointer">
+            Recommend for a Task Frame → <span style="color:#5c5c58">CANDIDATE_ONLY · selection still required</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
