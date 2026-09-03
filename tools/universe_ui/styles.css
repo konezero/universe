@@ -8243,3 +8243,40 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
   }
   .conversation-layer .conversation-layer-header { min-height: 44px; }
 }
+
+@media (max-width: 720px) {
+  /* Settings opens as a right-side drawer, not a centred modal. */
+  .settings-dialog {
+    width: min(88vw, 380px);
+    max-width: 380px;
+    max-height: none;
+    height: 100dvh;
+    margin: 0 0 0 auto;
+    border-radius: 0;
+    border-right: 0;
+    border-top: 0;
+    border-bottom: 0;
+  }
+  .settings-dialog::backdrop { background: rgba(10, 11, 13, 0.55); }
+  .settings-dialog > .dialog-heading { position: sticky; top: 0; background: #202226; z-index: 2; }
+  .settings-dialog .dialog-tabs,
+  .settings-dialog [role="tablist"] { flex-wrap: wrap; }
+
+  /* the other wide dialogs: full-bleed sheets on phones */
+  .wide-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    border-radius: 0;
+  }
+  .room-dialog, .todo-dialog, .fresh-project-dialog, .session-observatory-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    border-radius: 0;
+  }
+}
