@@ -239,8 +239,9 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("selectedModeCoordinateKey: null", APP)
         self.assertIn("function renderNodeModeSessionCards(coordinate)", APP)
         self.assertIn("node-mode-session-card", APP)
-        self.assertIn("if (modeSelected || sessionCount)", APP)
-        self.assertIn("renderNodeModeSessionCards(coordinate)", APP)
+        # Session cards render only for the selected mode — the mode tree is a
+        # navigator, not a session dump (rag/universe-shell-ia-and-galaxy-view).
+        self.assertIn("if (modeSelected) {\n        list.append(renderNodeModeSessionCards(coordinate));", APP)
         self.assertIn("function nodeModePanelSessionBuckets", APP)
         self.assertIn("working: sessions.filter(nodeModeSessionIsWorking)", APP)
         self.assertIn("Session and Anchor records are authoritative", APP)

@@ -2875,16 +2875,20 @@ function renderNodeModeGroup(group, { nested = false } = {}) {
       item.ariaSelected = String(modeSelected);
       item.title = `${projectDisplayName(group.project)} / ${coordinate.mode} · ${nodeModeStatusLabel(coordinate)}`;
       const copy = node("span", "node-mode-copy");
+      const sessionCount = nodeModePanelSessions(coordinate).length;
+      const statusLine = sessionCount
+        ? `${nodeModeStatusLabel(coordinate)} · ${sessionCount} session${sessionCount === 1 ? "" : "s"}`
+        : nodeModeStatusLabel(coordinate);
       copy.append(
         node("strong", "", coordinate.mode),
-        node("small", "", nodeModeStatusLabel(coordinate))
+        node("small", "", statusLine)
       );
       item.append(node("span", "node-mode-mark", coordinate.mode.slice(0, 1)), copy);
       item.addEventListener("click", () => openNodeModeCoordinate(coordinate));
       list.append(item);
-      const sessionCount = nodeModePanelSessions(coordinate).length;
-      // Collapsed modes keep LIVE and bounded recent sessions discoverable.
-      if (modeSelected || sessionCount) {
+      // Session cards only for the selected mode — the tree stays a navigator,
+      // not a session dump. Pick a mode to see (and manage) its sessions.
+      if (modeSelected) {
         list.append(renderNodeModeSessionCards(coordinate));
       }
     }
