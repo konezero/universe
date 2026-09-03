@@ -7573,3 +7573,24 @@ body {
     radial-gradient(1px 1px at 88% 82%, rgba(180, 180, 176, 0.16), transparent),
     #16171a;
 }
+
+/* Fleet board mode: match the design mockup — drop the Goal-Plan chrome. */
+body.fleet-mode #goal-plan-summary,
+body.fleet-mode .goal-plan-workspace > .unassigned-work,
+body.fleet-mode .goal-plan-toolbar > span,
+body.fleet-mode #edit-selected-goal,
+body.fleet-mode #plan-project-button,
+body.fleet-mode #goal-plan-map {
+  display: none;
+}
+body.fleet-mode .goal-plan-workspace {
+  padding-bottom: 24px;
+}
+body.fleet-mode .goal-plan-toolbar {
+  border: 0;
+  padding: 0 clamp(20px, 3vw, 44px) 8px;
+  margin: 0;
+}
+body.fleet-mode .fleet-board {
+  padding: 0 clamp(20px, 3vw, 44px) 24px;
+}

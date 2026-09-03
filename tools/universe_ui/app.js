@@ -4059,7 +4059,13 @@ function fleetNodeLabel(nodeRef) {
   const hit =
     nodes.find((n) => n.node_id === ref) ||
     (ref.startsWith("feature_") && nodes.find((n) => n.node_id === `feat:${ref}`));
-  return hit?.title || ref;
+  const raw = hit?.title || ref;
+  // FEATURE titles are the (long) intent_text — keep the card readable.
+  if (hit?.kind === "FEATURE" && raw.length > 34) {
+    const firstClause = raw.split(/[,.:;]/)[0].trim();
+    return (firstClause.length > 6 && firstClause.length <= 40 ? firstClause : raw.slice(0, 32)) + "…";
+  }
+  return raw;
 }
 
 function renderFleetBoard() {
@@ -13084,17 +13090,22 @@ function renderGoalPlan() {
   elements.goalPlanList.hidden = boardMode;
   document.querySelector("#goal-plan-layout-plan")?.classList.toggle("selected", !boardMode);
   document.querySelector("#goal-plan-layout-board")?.classList.toggle("selected", boardMode);
+  // Fleet mode: strip the Goal-Plan chrome (summary cards, inbox, plan
+  // controls) so the board reads like the design mockup.
+  document.body.classList.toggle("fleet-mode", boardMode);
   const project = state.selectedProject;
   const projectGoals = goalsForSelectedContext();
-  elements.goalPlanTitle.textContent = "Goal Plan";
+  elements.goalPlanTitle.textContent = boardMode ? "Fleet" : "Goal Plan";
   if (elements.goalPlanBreadcrumb) {
     elements.goalPlanBreadcrumb.textContent = project
-      ? `${projectDisplayName(project)} > Goal Plan`
-      : "Project > Goal Plan";
+      ? `${projectDisplayName(project)} > ${boardMode ? "Fleet" : "Goal Plan"}`
+      : `Project > ${boardMode ? "Fleet" : "Goal Plan"}`;
   }
-  elements.goalPlanSubtitle.textContent = project
-    ? "Universe Goal -> Project Goal -> Milestone / Phase -> Todo"
-    : "Select a project to shape its delivery plan.";
+  elements.goalPlanSubtitle.textContent = !project
+    ? "Select a project to shape its delivery plan."
+    : boardMode
+      ? `${projectDisplayName(project)} · Feature Node → Expected Path → Goal → Milestone → Todo → Task Frame`
+      : "Universe Goal -> Project Goal -> Milestone / Phase -> Todo";
   elements.addGoalButton.disabled = !project;
   const todos = projectGoals.flatMap((goal) => [
     ...(goal.todos || []),
