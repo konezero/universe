@@ -502,6 +502,26 @@ function ensureTerminalSurface(session) {
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
+  // The DOM renderer repaints the whole grid on every keystroke; a full-screen
+  // TUI in a tall dock then lags. Load the GPU renderer (addon version is
+  // lock-stepped with the bundled xterm) and only keep it if it actually took
+  // over — a version-mismatched addon that half-activates would break echo.
+  if (typeof window.WebglAddon?.WebglAddon === "function") {
+    try {
+      const webgl = new window.WebglAddon.WebglAddon();
+      webgl.onContextLoss(() => {
+        try { webgl.dispose(); } catch (_error) { /* already gone */ }
+      });
+      term.loadAddon(webgl);
+      // The DOM renderer paints <div> rows; the GPU renderer paints <canvas>.
+      // No canvas means activate() bailed — drop back to the DOM renderer.
+      if (!element.querySelector("canvas")) {
+        try { webgl.dispose(); } catch (_error) { /* nothing to undo */ }
+      }
+    } catch (_error) {
+      /* stay on the DOM renderer */
+    }
+  }
   // A click in the pane must land keyboard focus in xterm's hidden textarea.
   // When the running TUI turns on mouse tracking, xterm forwards the click as
   // a mouse report and does NOT move focus on its own — so pointerdown here

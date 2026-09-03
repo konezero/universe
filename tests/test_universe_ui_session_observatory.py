@@ -145,7 +145,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const TERMINAL_COLS = 120;", TERM)
         self.assertIn("(ref * at.cols) / TERMINAL_COLS", TERM)
         self.assertIn("term.resize(TERMINAL_COLS, rows)", TERM)
-        self.assertNotIn("WebglAddon", TERM)
+        # GPU renderer, kept only if activate() actually installed a canvas.
+        self.assertIn("window.WebglAddon?.WebglAddon", TERM)
+        self.assertIn('!element.querySelector("canvas")', TERM)
+        self.assertIn("webgl.onContextLoss(", TERM)
         self.assertIn("surface?.lastSentSizeKey === sizeKey", TERM)
         self.assertIn("surface.notifySize?.(0)", TERM)
         self.assertIn("attachCustomKeyEventHandler", TERM)
