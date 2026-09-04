@@ -733,23 +733,47 @@ const IME_DEBUG = (() => {
   }
 })();
 const imeTrace = [];
+let imeTraceSink = null; // set by bindTerminalIme: pushes the trace into the PTY
 function imeLog(tag, detail) {
   if (!IME_DEBUG) return;
   imeTrace.push(
     `${new Date().toISOString().slice(17, 23)} ${tag} ${detail || ""}`.trim()
   );
-  if (imeTrace.length > 16) imeTrace.shift();
+  if (imeTrace.length > 40) imeTrace.shift();
   let box = document.getElementById("ime-debug-box");
   if (!box) {
     box = document.createElement("div");
     box.id = "ime-debug-box";
     box.style.cssText =
-      "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;" +
-      "overflow:auto;background:rgba(0,0,0,.86);color:#7fffd4;font:10px/1.35 " +
-      "ui-monospace,monospace;padding:6px 8px;white-space:pre-wrap;pointer-events:none";
+      "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:46vh;" +
+      "overflow:auto;background:rgba(0,0,0,.9);color:#7fffd4;font:10px/1.35 " +
+      "ui-monospace,monospace;padding:6px 8px;white-space:pre-wrap";
+    const bar = document.createElement("div");
+    bar.style.cssText = "display:flex;gap:8px;margin-bottom:4px";
+    const mk = (label, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.style.cssText =
+        "font:11px ui-monospace,monospace;padding:3px 8px;background:#123;" +
+        "color:#7fffd4;border:1px solid #7fffd4;border-radius:4px";
+      b.addEventListener("click", fn);
+      return b;
+    };
+    bar.append(
+      mk("⇧ dump to terminal", () => imeTraceSink && imeTraceSink()),
+      mk("clear", () => {
+        imeTrace.length = 0;
+        box.querySelector(".ime-debug-body").textContent = "";
+      })
+    );
+    const body = document.createElement("div");
+    body.className = "ime-debug-body";
+    body.style.whiteSpace = "pre-wrap";
+    box.append(bar, body);
     document.body.appendChild(box);
   }
-  box.textContent = `IS_IOS=${IS_IOS}\n` + imeTrace.join("\n");
+  box.querySelector(".ime-debug-body").textContent =
+    `IS_IOS=${IS_IOS}\n` + imeTrace.join("\n");
 }
 
 function bindTerminalIme(term, socket, getSurface) {
@@ -764,6 +788,14 @@ function bindTerminalIme(term, socket, getSurface) {
   // ("ㅇㅏㅇㅣㅍㅗㄴ"). On iOS we trust compositionend.data and drop everything
   // else for a short window so nothing double-sends.
   let iosComposeEndAt = 0;
+  if (IME_DEBUG) {
+    imeTraceSink = () => {
+      const dump = "IMETRACE " + imeTrace.join("  |  ");
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(new TextEncoder().encode(dump));
+      }
+    };
+  }
   // Keys that end a marked IME syllable (and, on Windows, must reach xterm
   // even while an IME reports keyCode 229 for them).
   const IME_BOUNDARY_KEYS = new Set([
