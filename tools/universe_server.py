@@ -25377,6 +25377,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             else None
         )
         self.provider_quota_registry = ProviderQuotaRegistry()
+        self.ui_debug_trace: dict[str, Any] | None = None
         self._conductor_worker = threading.Thread(
             target=self._conductor_worker_loop,
             name="universe-conductor-room-worker",
@@ -37827,6 +37828,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, self.server.provider_quota_view())
             return
+        if path == "/v1/ui-debug-trace":
+            if not self._authorize():
+                return
+            self._send(
+                HTTPStatus.OK,
+                getattr(self.server, "ui_debug_trace", None)
+                or {"received_at": None, "trace": None},
+            )
+            return
         if path == "/v1/sessions/resumable":
             if not self._authorize():
                 return
@@ -39415,6 +39425,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not self._authorize():
             return
         path = urlsplit(self.path).path
+        if path == "/v1/ui-debug-trace":
+            try:
+                payload = self._read_json()
+            except UniverseError:
+                payload = {}
+            self.server.ui_debug_trace = {
+                "received_at": utc_now(),
+                "trace": payload if isinstance(payload, (list, dict)) else str(payload),
+            }
+            self._send(HTTPStatus.OK, {"status": "UI_DEBUG_TRACE_RECORDED"})
+            return
         if path == "/v1/terminals":
             try:
                 self._send(

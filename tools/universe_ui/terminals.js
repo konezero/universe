@@ -193,12 +193,14 @@ function attachTerminalMouseWheelHandler(term, element, getSurface) {
       repaintTimers.forEach(window.clearTimeout);
       const paint = () => {
         try {
+          const before = performance.now();
           // xterm 6.1's WebGL renderer leaves a stale band where a
           // mouse-tracking TUI redraws over scrolled rows. Reset its glyph
           // atlas and mark every visible row dirty.
           getSurface?.()?.webglAddon?.clearTextureAtlas?.();
           term.clearTextureAtlas?.();
           term.refresh(0, Math.max(0, term.rows - 1));
+          imeLog("wheel:repaint", `${(performance.now() - before).toFixed(1)}ms`);
         } catch (_error) { /* pane disposed */ }
       };
       // Two shots: one when the wheel burst settles, one after the TUI's
@@ -209,6 +211,7 @@ function attachTerminalMouseWheelHandler(term, element, getSurface) {
       "wheel",
       (event) => {
         if (!event.defaultPrevented) event.preventDefault();
+        imeLog("wheel", `deltaY=${event.deltaY}`);
         // The WebGL renderer leaves stale glyphs where a mouse-tracking TUI
         // redraws shorter lines on scroll (leftover text in the left column
         // and indentation).
@@ -713,6 +716,25 @@ function imeFlushTraceDom() {
     .join("");
   imeTraceBody.parentElement.scrollTop = imeTraceBody.parentElement.scrollHeight;
 }
+// Auto-ship the trace to the server so it can be read back with a plain
+// GET — no screenshot / phone photo / devtools copy-paste needed for a
+// same-machine session. Debounced so a burst of events posts once.
+let imeTracePostTimer = 0;
+function postImeTrace() {
+  try {
+    fetch("/v1/ui-debug-trace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ua: navigator.userAgent,
+        trace: imeTraceLines.map(([, text]) => text),
+      }),
+      cache: "no-store",
+    }).catch(() => {});
+  } catch (_e) {
+    /* best effort */
+  }
+}
 function imeLog(tag, detail) {
   if (!IME_DEBUG) return;
   const now = performance.now();
@@ -722,6 +744,8 @@ function imeLog(tag, detail) {
     .replace(/</g, "&lt;");
   imeTraceLines.push([delta, text]);
   if (imeTraceLines.length > 80) imeTraceLines.shift();
+  window.clearTimeout(imeTracePostTimer);
+  imeTracePostTimer = window.setTimeout(postImeTrace, 900);
   if (!imeTraceFlushQueued) {
     imeTraceFlushQueued = true;
     requestAnimationFrame(imeFlushTraceDom);
