@@ -177,7 +177,19 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("event.keyCode !== 229", TERM)
         self.assertIn("if (event.keyCode === 229) lastKey229At", TERM)
         self.assertIn("composeWatchdog = window.setTimeout", TERM)
-        self.assertIn("isComposingNow() && !isControlData", TERM)
+        self.assertIn("isComposingNow()", TERM)
+        # A just-committed syllable's onData can arrive after the IME has
+        # already started the next composition (fast typing) — composing is
+        # true again by the time it fires, so a bare isComposingNow() check
+        # drops the previous syllable outright. A short post-compositionend
+        # grace window lets that onData through while still suppressing
+        # genuine mid-composition leakage.
+        self.assertIn("IME_POST_COMPOSITION_GRACE_MS", TERM)
+        self.assertIn("lastCompositionEndAt = Date.now()", TERM)
+        self.assertIn(
+            "Date.now() - lastCompositionEndAt > IME_POST_COMPOSITION_GRACE_MS",
+            TERM,
+        )
         # compositionend must NOT re-send the composed text — xterm's own
         # composition handler emits it through onData (double = 한한글글).
         self.assertNotIn("commitComposedText", TERM)

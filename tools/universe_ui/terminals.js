@@ -825,6 +825,17 @@ function bindTerminalIme(term, socket, getSurface) {
   let lastKey229At = 0;
   let imeInputAt = 0;
   let imeFlushTimer = 0;
+  // xterm emits the just-committed syllable's onData asynchronously relative
+  // to our own compositionend listener. If the IME starts the NEXT syllable
+  // before that onData arrives (fast typing), `composing` is already true
+  // again by the time it fires, and "isComposingNow() -> suppress" swallows
+  // the previous syllable outright — confirmed via ?imedebug=1: comp:end
+  // "니" -> comp:start "" (next syllable) -> onData "니" arrives with no
+  // matching send, dropped. Grace window: an onData within this many ms of
+  // a compositionend belongs to the syllable that just ended, not the one
+  // that raced in after it.
+  const IME_POST_COMPOSITION_GRACE_MS = 150;
+  let lastCompositionEndAt = 0;
   const flushImeMarked = () => {
     window.clearTimeout(imeFlushTimer);
     const text = imeMarked;
@@ -916,6 +927,7 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("compositionend", (event) => {
       imeLog("comp:end", JSON.stringify(event.data || ""));
       lastCompositionAt = Date.now();
+      lastCompositionEndAt = Date.now();
       // Do NOT send here. xterm's own composition handler emits the committed
       // text through onData right after this; sending it again produced
       // 한한글글 (and NFC/NFD-sensitive dedup could not catch it).
@@ -1017,7 +1029,12 @@ function bindTerminalIme(term, socket, getSurface) {
     ) {
       return;
     }
-    if (isComposingNow() && !isControlData) {
+    if (
+      isComposingNow()
+      && !isControlData
+      && Date.now() - lastCompositionEndAt > IME_POST_COMPOSITION_GRACE_MS
+    ) {
+      imeLog("onData:drop(composing)", "");
       return;
     }
     sendPtyText(socket, data);
