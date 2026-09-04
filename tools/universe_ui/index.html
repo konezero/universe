@@ -7,8 +7,46 @@
   <title>Universe</title>
   <link rel="stylesheet" href="/styles.css?v=work-spine-15-reattach">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
+  <style>
+    /* Boot splash — painted before app.js so a reconnecting browser never
+       shows the previous frame behind the shell. Removed on first render. */
+    #app-boot-splash {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      background: #161719;
+      color: #cfd8e3;
+      font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      transition: opacity 260ms ease;
+    }
+    #app-boot-splash.is-hidden { opacity: 0; pointer-events: none; }
+    #app-boot-splash .boot-mark {
+      width: 46px;
+      height: 46px;
+      border-radius: 50%;
+      border: 2px solid rgba(120, 170, 220, 0.22);
+      border-top-color: #6fb0dc;
+      animation: app-boot-spin 900ms linear infinite;
+    }
+    #app-boot-splash .boot-word { opacity: 0.7; }
+    @keyframes app-boot-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      #app-boot-splash .boot-mark { animation-duration: 2400ms; }
+    }
+  </style>
 </head>
 <body>
+  <div id="app-boot-splash" role="status" aria-label="Loading Universe">
+    <span class="boot-mark" aria-hidden="true"></span>
+    <span class="boot-word">Universe</span>
+  </div>
   <div class="app-shell mockup-shell">
     <header class="topbar">
       <button id="mobile-menu-btn" class="mobile-icon-btn" type="button" aria-label="Menu" aria-expanded="false">&#9776;</button>
@@ -1445,6 +1483,6 @@
   <script src="/xterm-addon-web-links.min.js?v=0.13.0-beta.300"></script>
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
   <script src="/terminals.js?v=term-34-atlas" defer></script>
-  <script src="/app.js?v=work-spine-19-reattach" defer></script>
+  <script src="/app.js?v=work-spine-20-boot-splash" defer></script>
 </body>
 </html>

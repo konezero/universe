@@ -18029,7 +18029,21 @@ refreshLawStrip = function () {
 
 bindEvents();
 window.addEventListener("beforeunload", closeAllProviderSessionStreams);
+
+let bootSplashCleared = false;
+function clearBootSplash() {
+  if (bootSplashCleared) return;
+  bootSplashCleared = true;
+  const splash = document.getElementById("app-boot-splash");
+  if (!splash) return;
+  splash.classList.add("is-hidden");
+  window.setTimeout(() => splash.remove(), 400);
+}
+// Safety net: never let the splash outlast a slow or failed first refresh.
+window.setTimeout(clearBootSplash, 8000);
+
 refresh().finally(() => {
+  clearBootSplash();
   openConductorRoomStream();
   void tailProviderSessions();
 });
