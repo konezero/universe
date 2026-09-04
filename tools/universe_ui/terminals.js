@@ -582,10 +582,18 @@ function bindTerminalIme(term, socket, getSurface) {
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
-      // Self-heal: the browser is the source of truth for composition. If it
-      // says this keydown is not composing, any stale `composing` is wrong —
-      // clear it so input never wedges after one character.
-      if (isComposingNow() && !event.isComposing && event.keyCode !== 229) {
+      // Self-heal a genuinely wedged composition — but only after a quiet gap.
+      // macOS Chrome/Safari report `isComposing: false` on keydowns that are
+      // still mid-Hangul-composition; clearing the flag there lets every jamo
+      // leak to the PTY as its own keystroke ("한글" arrives as ㅎㅏㄴㄱㅡㄹ).
+      // A live compositionupdate fires per keystroke, so a fresh lastComposeAt
+      // means the composition is real regardless of this event's flag.
+      if (
+        isComposingNow()
+        && !event.isComposing
+        && event.keyCode !== 229
+        && Date.now() - lastComposeAt > 400
+      ) {
         endCompose();
       }
       if (event.isComposing || event.keyCode === 229) {
@@ -618,12 +626,35 @@ function bindTerminalIme(term, socket, getSurface) {
       composing = true;
       markComposeActivity(event);
     }, true);
+    const commitComposedText = (composed) => {
+      if (!composed) return;
+      lastComposed = composed;
+      sendPtyText(socket, composed);
+      window.setTimeout(() => {
+        if (lastComposed === composed) lastComposed = null;
+      }, 0);
+    };
     textarea.addEventListener("compositionend", (event) => {
       endCompose();
-      const composed = event.data || "";
-      lastComposed = composed || null;
-      if (composed) sendPtyText(socket, composed);
-      window.setTimeout(() => { lastComposed = null; }, 0);
+      // macOS can fire compositionend with empty data and deliver the
+      // committed syllable only on the following `input` event; the handler
+      // below covers that. When data is present (Windows, most Linux) this is
+      // the authoritative commit.
+      commitComposedText(event.data || "");
+    }, true);
+    // The text system's commit callback. On macOS the composed Hangul often
+    // arrives here rather than on compositionend; the lastComposed guard in
+    // onData keeps this from double-sending where compositionend already did.
+    textarea.addEventListener("input", (event) => {
+      if (!(event instanceof InputEvent)) return;
+      if (event.inputType === "insertCompositionText") return;
+      if (event.inputType === "insertText" && event.data) {
+        if (composing || Date.now() - lastComposeAt < 400) {
+          commitComposedText(event.data);
+        }
+        // A real insertText means ordinary typing resumed.
+        endCompose();
+      }
     }, true);
     // A composition abandoned by a blur/refit would otherwise wedge `composing`.
     textarea.addEventListener("blur", endCompose, true);

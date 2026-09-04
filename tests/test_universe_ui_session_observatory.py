@@ -176,10 +176,17 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         # compositionend must never wedge input.
         self.assertIn("IME_PASSTHROUGH_KEYS", TERM)
         self.assertIn('"Enter", "Backspace"', TERM)
-        self.assertIn("isComposingNow() && !event.isComposing && event.keyCode !== 229", TERM)
+        self.assertIn("!event.isComposing", TERM)
+        self.assertIn("event.keyCode !== 229", TERM)
+        # The self-heal only fires after a quiet gap so macOS mid-composition
+        # keydowns (which report isComposing:false) cannot leak jamo.
+        self.assertIn("Date.now() - lastComposeAt > 400", TERM)
         self.assertIn("composeWatchdog = window.setTimeout", TERM)
         self.assertIn('textarea.addEventListener("blur", endCompose', TERM)
         self.assertIn("isComposingNow() && !isControlData", TERM)
+        # macOS delivers the committed syllable on `input`, not compositionend.
+        self.assertIn("const commitComposedText", TERM)
+        self.assertIn('event.inputType === "insertText"', TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         self.assertIn(".xterm-helper-textarea", CSS)
