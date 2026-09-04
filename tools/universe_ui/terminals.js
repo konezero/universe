@@ -674,6 +674,7 @@ function sendPtyText(socket, data) {
   if (socket.readyState !== WebSocket.OPEN) return;
   const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
   if (!text) return;
+  imeLog("SEND", JSON.stringify(text));
   socket.send(new TextEncoder().encode(text));
   if (/\r|\n/.test(text)) watchPromptDelivery(state.activeTerminalId);
 }
@@ -714,12 +715,55 @@ const TERMINAL_MAX_ROWS = 60;
 const TERMINAL_MIN_FONT = 6;
 const TERMINAL_MAX_FONT = 16;
 
+const IS_IOS =
+  typeof navigator !== "undefined" &&
+  (/\b(iPad|iPhone|iPod)\b/.test(navigator.userAgent) ||
+    // iPadOS 13+ reports as desktop Safari but is still touch-first.
+    (navigator.platform === "MacIntel" &&
+      typeof document !== "undefined" &&
+      "ontouchend" in document));
+
+// Opt-in on-screen IME trace for devices with no reachable dev console
+// (?imedebug=1). Compact ring buffer rendered into a fixed overlay.
+const IME_DEBUG = (() => {
+  try {
+    return new URLSearchParams(location.search).get("imedebug") === "1";
+  } catch (_e) {
+    return false;
+  }
+})();
+const imeTrace = [];
+function imeLog(tag, detail) {
+  if (!IME_DEBUG) return;
+  imeTrace.push(
+    `${new Date().toISOString().slice(17, 23)} ${tag} ${detail || ""}`.trim()
+  );
+  if (imeTrace.length > 16) imeTrace.shift();
+  let box = document.getElementById("ime-debug-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "ime-debug-box";
+    box.style.cssText =
+      "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;" +
+      "overflow:auto;background:rgba(0,0,0,.86);color:#7fffd4;font:10px/1.35 " +
+      "ui-monospace,monospace;padding:6px 8px;white-space:pre-wrap;pointer-events:none";
+    document.body.appendChild(box);
+  }
+  box.textContent = `IS_IOS=${IS_IOS}\n` + imeTrace.join("\n");
+}
+
 function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
   let lastComposeAt = 0;
   let lastCompositionAt = 0;
   let hangulPreedit = false;
+  // iOS Safari fires composition events for the Hangul keyboard, but xterm's
+  // own composition integration does not emit the composed syllable through
+  // onData there — each jamo leaks out as a separate insertText instead
+  // ("ㅇㅏㅇㅣㅍㅗㄴ"). On iOS we trust compositionend.data and drop everything
+  // else for a short window so nothing double-sends.
+  let iosComposeEndAt = 0;
   // Keys that end a marked IME syllable (and, on Windows, must reach xterm
   // even while an IME reports keyCode 229 for them).
   const IME_BOUNDARY_KEYS = new Set([
@@ -767,6 +811,10 @@ function bindTerminalIme(term, socket, getSurface) {
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+      imeLog(
+        "keydown",
+        `k=${event.key} c=${event.keyCode} comp=${event.isComposing}`
+      );
       if (event.keyCode === 229) lastKey229At = Date.now();
 
       // A line-edit / submit key ends any macOS marked syllable first.
@@ -802,6 +850,7 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.setAttribute("autocomplete", "off");
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", (event) => {
+      imeLog("comp:start", JSON.stringify(event.data || ""));
       composing = true;
       hangulPreedit = false;
       lastCompositionAt = Date.now();
@@ -812,15 +861,27 @@ function bindTerminalIme(term, socket, getSurface) {
       composeWatchdog = window.setTimeout(endCompose, IME_STALE_COMPOSITION_MS);
     }, true);
     textarea.addEventListener("compositionupdate", (event) => {
+      imeLog("comp:update", JSON.stringify(event.data || ""));
       composing = true;
       lastCompositionAt = Date.now();
       markComposeActivity(event);
     }, true);
     textarea.addEventListener("compositionend", (event) => {
+      imeLog("comp:end", JSON.stringify(event.data || ""));
       lastCompositionAt = Date.now();
-      // Do NOT send here. xterm's own composition handler emits the committed
-      // text through onData right after this; sending it again produced
-      // 한한글글 (and the NFC/NFD-sensitive dedup could not catch it).
+      if (IS_IOS) {
+        // iOS: xterm won't emit this syllable itself — send it, and swallow
+        // the trailing onData / input echoes for a short window.
+        iosComposeEndAt = Date.now();
+        const composed = typeof event.data === "string" ? event.data : "";
+        endCompose();
+        if (composed) sendPtyText(socket, composed);
+        try { textarea.value = ""; } catch (_e) { /* readonly race */ }
+        return;
+      }
+      // Desktop: Do NOT send here. xterm's own composition handler emits the
+      // committed text through onData right after this; sending it again
+      // produced 한한글글 (and NFC/NFD-sensitive dedup could not catch it).
       endCompose();
     }, true);
     // Fallback for the degraded macOS path where the IME fires NO composition
@@ -829,6 +890,11 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("input", (event) => {
       if (!(event instanceof InputEvent)) return;
       const it = event.inputType;
+      imeLog("input", `${it} ${JSON.stringify(event.data || "")} comp=${composing}`);
+      // iOS drives everything through composition events + the compositionend
+      // send above; the degraded-macOS marked-text path must not run here or
+      // it re-sends jamo.
+      if (IS_IOS) return;
       if (composing || Date.now() - lastCompositionAt < 1500) return;
 
       if (it === "insertReplacementText") {
@@ -864,6 +930,17 @@ function bindTerminalIme(term, socket, getSurface) {
     if (getSurface?.()?.replaying) return;
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
+    // iOS: the compositionend handler owns Hangul. Drop xterm's per-jamo
+    // leakage while composing and the echo right after a syllable commits;
+    // control keys (Enter/Backspace/arrows) still pass.
+    if (IS_IOS && !isControlData) {
+      if (isComposingNow()) { imeLog("onData:drop", "ios-composing"); return; }
+      if (Date.now() - iosComposeEndAt < 400) {
+        imeLog("onData:drop", "ios-post-commit");
+        return;
+      }
+    }
+    imeLog("onData", `${JSON.stringify(data)} ctrl=${isControlData}`);
     // Degraded macOS path only: the input listener owns the send while a
     // syllable is marked or a jamo key just fired.
     if (

@@ -193,9 +193,17 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("IME_BOUNDARY_KEYS", TERM)
         self.assertIn('textarea.addEventListener("blur"', TERM)
         self.assertIn("flushImeMarked()", TERM)
-        # The temporary macOS IME trace instrumentation is gone.
+        # The always-on macOS IME trace global is gone; the trace is now
+        # strictly opt-in behind ?imedebug=1 and a no-op otherwise.
         self.assertNotIn("__imeTrace", TERM)
-        self.assertNotIn("imedebug", TERM)
+        self.assertIn('.get("imedebug") === "1"', TERM)
+        self.assertIn("if (!IME_DEBUG) return;", TERM)
+        # iOS Safari: xterm does not emit the composed Hangul syllable, so the
+        # compositionend handler sends it and onData is suppressed there.
+        self.assertIn("const IS_IOS", TERM)
+        self.assertIn("if (IS_IOS) {", TERM)
+        self.assertIn("if (composed) sendPtyText(socket, composed)", TERM)
+        self.assertIn("ios-post-commit", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         # The wheel handler must let xterm process every event (scrollback +
