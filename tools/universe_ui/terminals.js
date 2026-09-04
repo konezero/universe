@@ -680,15 +680,17 @@ const IME_DEBUG = (() => {
     return false;
   }
 })();
+// Recording is near-free (one timestamp + one array push); every DOM write
+// is deferred and coalesced into a single rAF so the trace itself can never
+// be the thing that delays the next real keystroke.
 let imeLastTraceAt = 0;
-function imeLog(tag, detail) {
-  if (!IME_DEBUG) return;
-  const now = performance.now();
-  const delta = imeLastTraceAt ? now - imeLastTraceAt : 0;
-  imeLastTraceAt = now;
-  let box = document.getElementById("ime-debug-box");
-  if (!box) {
-    box = document.createElement("div");
+let imeTraceBody = null;
+let imeTraceFlushQueued = false;
+const imeTraceLines = [];
+function imeFlushTraceDom() {
+  imeTraceFlushQueued = false;
+  if (!imeTraceBody) {
+    const box = document.createElement("div");
     box.id = "ime-debug-box";
     box.style.cssText =
       "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;" +
@@ -697,19 +699,33 @@ function imeLog(tag, detail) {
     const bar = document.createElement("div");
     bar.textContent = "?imedebug=1 — timing trace (gap > 80ms highlighted)";
     bar.style.cssText = "color:#fff;margin-bottom:4px;font-weight:600";
-    const body = document.createElement("div");
-    body.className = "ime-debug-body";
-    box.append(bar, body);
+    imeTraceBody = document.createElement("div");
+    box.append(bar, imeTraceBody);
     document.body.appendChild(box);
   }
-  const line = document.createElement("div");
-  const slow = delta > 80;
-  line.style.color = slow ? "#ff6b5e" : "#7fffd4";
-  line.textContent = `+${delta.toFixed(0).padStart(4)}ms  ${tag}  ${detail || ""}`;
-  const body = box.querySelector(".ime-debug-body");
-  body.appendChild(line);
-  while (body.childNodes.length > 80) body.removeChild(body.firstChild);
-  box.scrollTop = box.scrollHeight;
+  // One textContent write for the whole buffer — no per-line elements, no
+  // scrollHeight read (that forces layout) on the hot path.
+  imeTraceBody.innerHTML = imeTraceLines
+    .map(
+      ([delta, text]) =>
+        `<div style="color:${delta > 80 ? "#ff6b5e" : "#7fffd4"}">${text}</div>`
+    )
+    .join("");
+  imeTraceBody.parentElement.scrollTop = imeTraceBody.parentElement.scrollHeight;
+}
+function imeLog(tag, detail) {
+  if (!IME_DEBUG) return;
+  const now = performance.now();
+  const delta = imeLastTraceAt ? now - imeLastTraceAt : 0;
+  imeLastTraceAt = now;
+  const text = `+${delta.toFixed(0).padStart(4)}ms  ${tag}  ${detail || ""}`
+    .replace(/</g, "&lt;");
+  imeTraceLines.push([delta, text]);
+  if (imeTraceLines.length > 80) imeTraceLines.shift();
+  if (!imeTraceFlushQueued) {
+    imeTraceFlushQueued = true;
+    requestAnimationFrame(imeFlushTraceDom);
+  }
 }
 
 function sendPtyText(socket, data) {
