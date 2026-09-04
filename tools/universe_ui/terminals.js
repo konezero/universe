@@ -188,10 +188,25 @@ function attachTerminalMouseWheelHandler(term, element) {
   // Belt: an alt-screen TUI with mouse tracking off has nothing for xterm to
   // scroll, so the event would bubble to the page. Contain it on the pane.
   if (element) {
+    let repaintTimers = [];
+    const repaintSoon = () => {
+      repaintTimers.forEach(window.clearTimeout);
+      const paint = () => {
+        try { term.refresh(0, Math.max(0, term.rows - 1)); }
+        catch (_error) { /* pane disposed */ }
+      };
+      // Two shots: one when the wheel burst settles, one after the TUI's
+      // scroll redraw output lands.
+      repaintTimers = [window.setTimeout(paint, 140), window.setTimeout(paint, 520)];
+    };
     element.addEventListener(
       "wheel",
       (event) => {
         if (!event.defaultPrevented) event.preventDefault();
+        // The WebGL renderer leaves stale glyphs where a mouse-tracking TUI
+        // redraws shorter lines on scroll (leftover text in the left column
+        // and indentation).
+        repaintSoon();
       },
       { passive: false }
     );
