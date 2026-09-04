@@ -5947,12 +5947,17 @@ function setChatPanelWidth(width, { persist = false } = {}) {
   }
 }
 
-const TERMINAL_DOCK_MIN_HEIGHT = 140;
+const TERMINAL_DOCK_MIN_HEIGHT = 96;
 
 function clampTerminalDockHeight(height) {
   const requested = Number(height);
   const safe = Number.isFinite(requested) ? requested : state.terminalDockHeight;
-  const viewportMax = Math.max(TERMINAL_DOCK_MIN_HEIGHT, window.innerHeight - 160);
+  // Leave the main view at least ~40% of a short screen; on a tall screen the
+  // fixed 96px margin keeps the header/composer reachable.
+  const viewportMax = Math.max(
+    TERMINAL_DOCK_MIN_HEIGHT,
+    Math.min(window.innerHeight - 96, Math.round(window.innerHeight * 0.6))
+  );
   return Math.round(
     Math.min(viewportMax, Math.max(TERMINAL_DOCK_MIN_HEIGHT, safe))
   );

@@ -600,6 +600,7 @@ function applyTerminalGridLayout() {
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = grid ? false : id !== state.activeTerminalId;
+    surface.element.classList.toggle("is-active", id === state.activeTerminalId);
   }
   if (grid && typeof refitAllTerminals === "function") {
     setTimeout(() => refitAllTerminals(), 60);
@@ -659,6 +660,7 @@ function selectTerminalTab(terminalId) {
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = grid ? false : id !== terminalId;
+    surface.element.classList.toggle("is-active", id === terminalId);
     if (id === terminalId) {
       surface.restoreSavedViewport = switchingTabs;
       refitActiveTerminal();
