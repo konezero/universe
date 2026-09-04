@@ -897,6 +897,7 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.setAttribute("autocomplete", "off");
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", (event) => {
+      imeLog("comp:start", JSON.stringify(event.data || ""));
       composing = true;
       hangulPreedit = false;
       lastCompositionAt = Date.now();
@@ -907,11 +908,13 @@ function bindTerminalIme(term, socket, getSurface) {
       composeWatchdog = window.setTimeout(endCompose, IME_STALE_COMPOSITION_MS);
     }, true);
     textarea.addEventListener("compositionupdate", (event) => {
+      imeLog("comp:update", JSON.stringify(event.data || ""));
       composing = true;
       lastCompositionAt = Date.now();
       markComposeActivity(event);
     }, true);
     textarea.addEventListener("compositionend", (event) => {
+      imeLog("comp:end", JSON.stringify(event.data || ""));
       lastCompositionAt = Date.now();
       // Do NOT send here. xterm's own composition handler emits the committed
       // text through onData right after this; sending it again produced
@@ -924,6 +927,7 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("input", (event) => {
       if (!(event instanceof InputEvent)) return;
       const it = event.inputType;
+      imeLog("input", `type=${it} data=${JSON.stringify(event.data || "")} composing=${composing}`);
       if (IS_IOS) {
         // Leave textarea.value alone — iOS tracks its own composition state and
         // clearing it mid-syllable desyncs the next deleteContentBackward.
