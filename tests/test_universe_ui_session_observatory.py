@@ -172,21 +172,21 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('data.normalize("NFC")', TERM)
         self.assertIn("compositionend", TERM)
         self.assertNotIn("function HangulBuffer()", TERM)
-        # IME composition must not swallow line-editing keys, and a missed
-        # compositionend must never wedge input.
-        self.assertIn("IME_PASSTHROUGH_KEYS", TERM)
-        self.assertIn('"Enter", "Backspace"', TERM)
-        self.assertIn("!event.isComposing", TERM)
+        # An IME keydown must never be preventDefault-ed (returning false) —
+        # that cancels macOS marked-text composition. keyCode 229 returns true.
         self.assertIn("event.keyCode !== 229", TERM)
-        # The self-heal only fires after a quiet gap so macOS mid-composition
-        # keydowns (which report isComposing:false) cannot leak jamo.
-        self.assertIn("Date.now() - lastComposeAt > 400", TERM)
+        self.assertIn("if (event.keyCode === 229) lastKey229At", TERM)
         self.assertIn("composeWatchdog = window.setTimeout", TERM)
-        self.assertIn('textarea.addEventListener("blur", endCompose', TERM)
         self.assertIn("isComposingNow() && !isControlData", TERM)
-        # macOS delivers the committed syllable on `input`, not compositionend.
-        self.assertIn("const commitComposedText", TERM)
-        self.assertIn('event.inputType === "insertText"', TERM)
+        # macOS has no composition events: the marked syllable is tracked from
+        # input/insertReplacementText and flushed on a boundary.
+        self.assertIn("insertReplacementText", TERM)
+        self.assertIn("const flushImeMarked", TERM)
+        self.assertIn("imeFlushTimer = window.setTimeout(flushImeMarked", TERM)
+        self.assertIn("onData suppressed(ime)", TERM)
+        self.assertIn("IME_BOUNDARY_KEYS", TERM)
+        self.assertIn('textarea.addEventListener("blur"', TERM)
+        self.assertIn("flushImeMarked()", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         self.assertIn(".xterm-helper-textarea", CSS)

@@ -632,17 +632,32 @@ function bindTerminalIme(term, socket, getSurface) {
     if (imeTrace.length > 200) imeTrace.shift();
     renderImeDebugBox();
   };
-  // During IME composition the compositionend path owns *text* input, so xterm
-  // must not also emit the printable keydowns. But it must still forward the
-  // keys that edit or submit the line — Enter, Backspace, arrows, Ctrl chords —
-  // which a blanket `isComposing` block was swallowing (Korean IME reports
-  // isComposing / keyCode 229 for those too).
-  const IME_PASSTHROUGH_KEYS = new Set([
-    "Enter", "Backspace", "Delete", "Tab", "Escape",
+  // Keys that end a marked IME syllable (and, on Windows, must reach xterm
+  // even while an IME reports keyCode 229 for them).
+  const IME_BOUNDARY_KEYS = new Set([
+    "Enter", "Tab", "Escape",
     "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
     "Home", "End", "PageUp", "PageDown",
   ]);
   let composeWatchdog = 0;
+  // macOS remote-browser Hangul does NOT fire composition events: it delivers
+  // the first jamo as `input/insertText` then refines the syllable through
+  // `input/insertReplacementText` in the helper textarea, and starts the next
+  // syllable with a fresh `insertText`. We track that marked syllable and
+  // commit it on a boundary (next syllable, Enter, blur, quiet timeout).
+  let imeMarked = "";
+  let lastKey229At = 0;
+  let imeInputAt = 0;
+  let imeFlushTimer = 0;
+  const flushImeMarked = () => {
+    window.clearTimeout(imeFlushTimer);
+    const text = imeMarked;
+    imeMarked = "";
+    if (text) {
+      imeLog("ime-flush->pty", { text });
+      sendPtyText(socket, text);
+    }
+  };
   const endCompose = () => {
     composing = false;
     hangulPreedit = false;
@@ -665,12 +680,19 @@ function bindTerminalIme(term, socket, getSurface) {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       imeLog("keydown", { key: event.key, code: event.keyCode, isComposing: event.isComposing });
+      if (event.keyCode === 229) lastKey229At = Date.now();
+
+      // A line-edit / submit key ends any macOS marked syllable first.
+      if (imeMarked && IME_BOUNDARY_KEYS.has(event.key)) {
+        flushImeMarked();
+      }
+      // Backspace while a syllable is marked edits the marked text in the
+      // browser — it must not reach the PTY as a destructive \x7f.
+      if (imeMarked && event.key === "Backspace") {
+        return false;
+      }
+
       // Self-heal a genuinely wedged composition — but only after a quiet gap.
-      // macOS Chrome/Safari report `isComposing: false` on keydowns that are
-      // still mid-Hangul-composition; clearing the flag there lets every jamo
-      // leak to the PTY as its own keystroke ("한글" arrives as ㅎㅏㄴㄱㅡㄹ).
-      // A live compositionupdate fires per keystroke, so a fresh lastComposeAt
-      // means the composition is real regardless of this event's flag.
       if (
         isComposingNow()
         && !event.isComposing
@@ -680,13 +702,10 @@ function bindTerminalIme(term, socket, getSurface) {
         endCompose();
       }
       if (event.isComposing || event.keyCode === 229) {
-        if (hangulPreedit && /^[0-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey) {
-          return true;
-        }
-        return (
-          IME_PASSTHROUGH_KEYS.has(event.key) ||
-          event.ctrlKey || event.altKey || event.metaKey
-        );
+        // Never preventDefault an IME keydown: on macOS that cancels
+        // marked-text composition and degrades it to per-jamo insertText.
+        // xterm skips keyCode 229 on its own, so `true` is safe.
+        return true;
       }
       return true;
     });
@@ -729,25 +748,55 @@ function bindTerminalIme(term, socket, getSurface) {
       // the authoritative commit.
       commitComposedText(event.data || "");
     }, true);
-    // The text system's commit callback. On macOS the composed Hangul often
-    // arrives here rather than on compositionend; the lastComposed guard in
-    // onData keeps this from double-sending where compositionend already did.
+    // The text system's commit callback. On Windows the composed syllable can
+    // arrive here rather than on compositionend. On macOS (no composition
+    // events) this is the *only* signal, and it drives the marked-syllable
+    // tracker below.
     textarea.addEventListener("input", (event) => {
-      if (event instanceof InputEvent) {
-        imeLog("input", { inputType: event.inputType, data: event.data });
-      }
       if (!(event instanceof InputEvent)) return;
-      if (event.inputType === "insertCompositionText") return;
-      if (event.inputType === "insertText" && event.data) {
-        if (composing || Date.now() - lastComposeAt < 400) {
+      const it = event.inputType;
+      imeLog("input", { inputType: it, data: event.data });
+
+      // Windows / standard path: real composition events are in charge.
+      if (composing) {
+        if (it === "insertText" && event.data && Date.now() - lastComposeAt < 400) {
           commitComposedText(event.data);
+          endCompose();
         }
-        // A real insertText means ordinary typing resumed.
-        endCompose();
+        return;
       }
+
+      const imeOrigin =
+        it === "insertReplacementText"
+        || it === "insertCompositionText"
+        || (it === "insertText" && Date.now() - lastKey229At < 600);
+      if (!imeOrigin) {
+        // Ordinary typing / paste — xterm's onData owns it.
+        if (imeMarked) flushImeMarked();
+        return;
+      }
+
+      imeInputAt = Date.now();
+      if (it === "insertReplacementText" || it === "insertCompositionText") {
+        // Same syllable, refined in place.
+        imeMarked = event.data || imeMarked;
+        try { textarea.value = imeMarked; } catch (_e) { /* readonly race */ }
+      } else {
+        // Fresh insertText after an IME key: the previous syllable is final.
+        if (imeMarked) {
+          imeLog("ime-commit->pty", { text: imeMarked });
+          sendPtyText(socket, imeMarked);
+        }
+        // A Windows compositionend may have already sent this exact text.
+        imeMarked =
+          event.data && event.data !== lastComposed ? event.data : "";
+        try { textarea.value = imeMarked; } catch (_e) { /* readonly race */ }
+      }
+      window.clearTimeout(imeFlushTimer);
+      imeFlushTimer = window.setTimeout(flushImeMarked, 700);
     }, true);
     // A composition abandoned by a blur/refit would otherwise wedge `composing`.
-    textarea.addEventListener("blur", endCompose, true);
+    textarea.addEventListener("blur", () => { endCompose(); flushImeMarked(); }, true);
   }
   term.onData((data) => {
     // xterm auto-answers DA1/CPR/OSC during a replay; those bytes
@@ -757,6 +806,17 @@ function bindTerminalIme(term, socket, getSurface) {
     // Ctrl chords) are never composed text — forward them even mid-composition.
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
+    // macOS marked-syllable path: the input listener owns every printable send
+    // while a syllable is being built or a jamo key just fired.
+    if (
+      !isControlData
+      && (imeMarked
+        || Date.now() - imeInputAt < 150
+        || Date.now() - lastKey229At < 150)
+    ) {
+      imeLog("onData suppressed(ime)", { data });
+      return;
+    }
     if (isComposingNow() && !isControlData) {
       imeLog("onData BLOCKED", { data });
       return;
