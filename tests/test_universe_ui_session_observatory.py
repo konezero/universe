@@ -141,10 +141,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("surface.retainedLiveChunks.push({", TERM)
         self.assertIn("await writeUndisplayedLiveTail(surface)", TERM)
         self.assertIn("fitAddon.proposeDimensions()", TERM)
-        # Fixed 120-column grid; the font scales, the column count does not.
+        # Fixed 120x40 grid; the font scales to whichever axis is tighter
+        # (letterbox fit), the column/row counts never do.
         self.assertIn("const TERMINAL_COLS = 120;", TERM)
-        self.assertIn("(ref * at.cols) / TERMINAL_COLS", TERM)
-        self.assertIn("term.resize(TERMINAL_COLS, rows)", TERM)
+        self.assertIn("const TERMINAL_ROWS = 40;", TERM)
+        self.assertIn("const fontForWidth = (ref * at.cols) / TERMINAL_COLS;", TERM)
+        self.assertIn("const fontForHeight = (ref * at.rows) / TERMINAL_ROWS;", TERM)
+        self.assertIn("Math.min(fontForWidth, fontForHeight)", TERM)
+        self.assertIn("term.resize(TERMINAL_COLS, TERMINAL_ROWS)", TERM)
         # GPU renderer, kept only if activate() actually installed a canvas.
         self.assertIn("window.WebglAddon?.WebglAddon", TERM)
         self.assertIn('!surface.element?.querySelector("canvas")', TERM)

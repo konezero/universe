@@ -1106,36 +1106,36 @@ function fitTerminalToContainer(term, element, fitAddon) {
   if (!width || !height) return false;
   if (fitAddon && typeof fitAddon.proposeDimensions === "function") {
     try {
-      // The grid is a fixed 120 columns. Measure how many columns a reference
-      // font yields, then (char width scales ~linearly with font size) estimate
-      // the font that fits 120 columns — floor, never round up, or the last
-      // column spills past the pane edge and the TUI looks clipped.
+      // The grid is fixed at 120x40 — like object-fit: contain, whichever
+      // axis is tighter (a wide-short pane vs. a narrow-tall one) decides the
+      // font size, so the full grid always fits without clipping on either
+      // axis instead of only ever fitting the width and letting rows spill.
       const ref = TERMINAL_MAX_FONT;
       if (term.options.fontSize !== ref) term.options.fontSize = ref;
       const at = fitAddon.proposeDimensions();
       let font = ref;
-      if (at && at.cols) {
-        font = Math.floor((ref * at.cols) / TERMINAL_COLS);
+      if (at && at.cols && at.rows) {
+        const fontForWidth = (ref * at.cols) / TERMINAL_COLS;
+        const fontForHeight = (ref * at.rows) / TERMINAL_ROWS;
+        font = Math.floor(Math.min(fontForWidth, fontForHeight));
         font = Math.max(TERMINAL_MIN_FONT, Math.min(TERMINAL_MAX_FONT, font));
       }
       if (term.options.fontSize !== font) term.options.fontSize = font;
       let after = fitAddon.proposeDimensions();
       // Char metrics are not perfectly linear (sub-pixel rounding); step the
-      // font down until 120 columns actually fit.
+      // font down until the full 120x40 grid actually fits both ways.
       while (
-        after && after.cols && after.cols < TERMINAL_COLS &&
-        font > TERMINAL_MIN_FONT
+        after
+        && ((after.cols && after.cols < TERMINAL_COLS)
+          || (after.rows && after.rows < TERMINAL_ROWS))
+        && font > TERMINAL_MIN_FONT
       ) {
         font -= 1;
         term.options.fontSize = font;
         after = fitAddon.proposeDimensions();
       }
-      const rows = Math.max(
-        TERMINAL_MIN_ROWS,
-        Math.min(TERMINAL_MAX_ROWS, (after && after.rows) || TERMINAL_ROWS)
-      );
-      if (term.cols !== TERMINAL_COLS || term.rows !== rows) {
-        term.resize(TERMINAL_COLS, rows);
+      if (term.cols !== TERMINAL_COLS || term.rows !== TERMINAL_ROWS) {
+        term.resize(TERMINAL_COLS, TERMINAL_ROWS);
       }
       return Boolean(term.cols && term.rows);
     } catch (_error) {
