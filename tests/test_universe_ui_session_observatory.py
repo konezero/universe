@@ -193,11 +193,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("IME_BOUNDARY_KEYS", TERM)
         self.assertIn('textarea.addEventListener("blur"', TERM)
         self.assertIn("flushImeMarked()", TERM)
-        # The always-on macOS IME trace global is gone; the trace is now
-        # strictly opt-in behind ?imedebug=1 and a no-op otherwise.
+        # No IME trace instrumentation ships in production.
         self.assertNotIn("__imeTrace", TERM)
-        self.assertIn('.get("imedebug") === "1"', TERM)
-        self.assertIn("if (!IME_DEBUG) return;", TERM)
+        self.assertNotIn("imedebug", TERM)
+        self.assertNotIn("imeLog(", TERM)
         # iOS Safari fires no composition events; the `input` stream is mirrored
         # directly (deleteContentBackward -> \x7f, insertText -> text) and
         # xterm's own printable/DEL onData is dropped.

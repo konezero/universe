@@ -674,7 +674,6 @@ function sendPtyText(socket, data) {
   if (socket.readyState !== WebSocket.OPEN) return;
   const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
   if (!text) return;
-  imeLog("SEND", JSON.stringify(text));
   socket.send(new TextEncoder().encode(text));
   if (/\r|\n/.test(text)) watchPromptDelivery(state.activeTerminalId);
 }
@@ -723,74 +722,6 @@ const IS_IOS =
       typeof document !== "undefined" &&
       "ontouchend" in document));
 
-// Opt-in on-screen IME trace for devices with no reachable dev console
-// (?imedebug=1). Compact ring buffer rendered into a fixed overlay.
-const IME_DEBUG = (() => {
-  try {
-    return new URLSearchParams(location.search).get("imedebug") === "1";
-  } catch (_e) {
-    return false;
-  }
-})();
-const imeTrace = [];
-let imeTraceSink = null; // set by bindTerminalIme: pushes the trace into the PTY
-let imeTracePostTimer = 0;
-function postImeTrace() {
-  try {
-    fetch("/v1/ui-debug-trace", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ is_ios: IS_IOS, ua: navigator.userAgent, trace: imeTrace }),
-      cache: "no-store",
-    }).catch(() => {});
-  } catch (_e) {
-    /* best effort */
-  }
-}
-function imeLog(tag, detail) {
-  if (!IME_DEBUG) return;
-  imeTrace.push(
-    `${new Date().toISOString().slice(17, 23)} ${tag} ${detail || ""}`.trim()
-  );
-  if (imeTrace.length > 60) imeTrace.shift();
-  window.clearTimeout(imeTracePostTimer);
-  imeTracePostTimer = window.setTimeout(postImeTrace, 600);
-  let box = document.getElementById("ime-debug-box");
-  if (!box) {
-    box = document.createElement("div");
-    box.id = "ime-debug-box";
-    box.style.cssText =
-      "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:46vh;" +
-      "overflow:auto;background:rgba(0,0,0,.9);color:#7fffd4;font:10px/1.35 " +
-      "ui-monospace,monospace;padding:6px 8px;white-space:pre-wrap";
-    const bar = document.createElement("div");
-    bar.style.cssText = "display:flex;gap:8px;margin-bottom:4px";
-    const mk = (label, fn) => {
-      const b = document.createElement("button");
-      b.textContent = label;
-      b.style.cssText =
-        "font:11px ui-monospace,monospace;padding:3px 8px;background:#123;" +
-        "color:#7fffd4;border:1px solid #7fffd4;border-radius:4px";
-      b.addEventListener("click", fn);
-      return b;
-    };
-    bar.append(
-      mk("⇧ dump to terminal", () => imeTraceSink && imeTraceSink()),
-      mk("clear", () => {
-        imeTrace.length = 0;
-        box.querySelector(".ime-debug-body").textContent = "";
-      })
-    );
-    const body = document.createElement("div");
-    body.className = "ime-debug-body";
-    body.style.whiteSpace = "pre-wrap";
-    box.append(bar, body);
-    document.body.appendChild(box);
-  }
-  box.querySelector(".ime-debug-body").textContent =
-    `IS_IOS=${IS_IOS}\n` + imeTrace.join("\n");
-}
-
 function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
@@ -805,14 +736,7 @@ function bindTerminalIme(term, socket, getSurface) {
   // xterm's own onData meanwhile leaks the raw jamo. So on iOS we ignore
   // xterm's printable/DEL onData entirely and mirror the `input` stream:
   // deleteContentBackward -> \x7f, insertText -> the text.
-  if (IME_DEBUG) {
-    imeTraceSink = () => {
-      const dump = "IMETRACE " + imeTrace.join("  |  ");
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(new TextEncoder().encode(dump));
-      }
-    };
-  }
+
   // Keys that end a marked IME syllable (and, on Windows, must reach xterm
   // even while an IME reports keyCode 229 for them).
   const IME_BOUNDARY_KEYS = new Set([
@@ -860,10 +784,6 @@ function bindTerminalIme(term, socket, getSurface) {
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
-      imeLog(
-        "keydown",
-        `k=${event.key} c=${event.keyCode} comp=${event.isComposing}`
-      );
       if (event.keyCode === 229) lastKey229At = Date.now();
       if (IS_IOS) {
         // Never preventDefault on iOS — the soft keyboard needs the keydown to
@@ -905,7 +825,6 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.setAttribute("autocomplete", "off");
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", (event) => {
-      imeLog("comp:start", JSON.stringify(event.data || ""));
       composing = true;
       hangulPreedit = false;
       lastCompositionAt = Date.now();
@@ -916,13 +835,11 @@ function bindTerminalIme(term, socket, getSurface) {
       composeWatchdog = window.setTimeout(endCompose, IME_STALE_COMPOSITION_MS);
     }, true);
     textarea.addEventListener("compositionupdate", (event) => {
-      imeLog("comp:update", JSON.stringify(event.data || ""));
       composing = true;
       lastCompositionAt = Date.now();
       markComposeActivity(event);
     }, true);
     textarea.addEventListener("compositionend", (event) => {
-      imeLog("comp:end", JSON.stringify(event.data || ""));
       lastCompositionAt = Date.now();
       // Do NOT send here. xterm's own composition handler emits the committed
       // text through onData right after this; sending it again produced
@@ -935,7 +852,6 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("input", (event) => {
       if (!(event instanceof InputEvent)) return;
       const it = event.inputType;
-      imeLog("input", `${it} ${JSON.stringify(event.data || "")} comp=${composing}`);
       if (IS_IOS) {
         // Leave textarea.value alone — iOS tracks its own composition state and
         // clearing it mid-syllable desyncs the next deleteContentBackward.
@@ -1000,10 +916,8 @@ function bindTerminalIme(term, socket, getSurface) {
     // a duplicate DEL, so drop printable + \x7f here; Enter / arrows / Esc
     // (other control bytes) still pass through.
     if (IS_IOS && (!isControlData || data === "\x7f")) {
-      imeLog("onData:drop", "ios");
       return;
     }
-    imeLog("onData", `${JSON.stringify(data)} ctrl=${isControlData}`);
     // Degraded macOS path only: the input listener owns the send while a
     // syllable is marked or a jamo key just fired.
     if (
