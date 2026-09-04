@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta
 from http import HTTPStatus
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from unittest.mock import ANY, Mock, patch
@@ -6257,6 +6259,30 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("EXHAUSTED", codex["state"])
         self.assertEqual("codex-rollout-transcript", codex["source"])
         self.assertEqual("2026-09-04T07:00:00Z", codex["observed_at"])
+
+    def test_server_disables_nagle_on_every_accepted_connection(self) -> None:
+        # A terminal WebSocket sends the smallest possible frame as fast as a
+        # user can type or a PTY can echo — exactly the pattern Nagle plus
+        # delayed-ACK interacts badly with. The remote gateway's own proxy
+        # legs already disable it (universe_remote_gateway.py); a direct
+        # local connection to this server had no equivalent, so a local
+        # browser could see worse per-keystroke latency than one going
+        # through the gateway.
+        request = Mock()
+        client_address = ("127.0.0.1", 51234)
+        with patch.object(ThreadingHTTPServer, "finish_request") as base_finish:
+            self.server.finish_request(request, client_address)
+        request.setsockopt.assert_called_once_with(
+            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+        )
+        base_finish.assert_called_once_with(request, client_address)
+
+    def test_server_nagle_disable_tolerates_a_closed_socket(self) -> None:
+        request = Mock()
+        request.setsockopt.side_effect = OSError("socket already closed")
+        with patch.object(ThreadingHTTPServer, "finish_request") as base_finish:
+            self.server.finish_request(request, ("127.0.0.1", 51234))
+        base_finish.assert_called_once()
 
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()

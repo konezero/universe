@@ -25085,6 +25085,22 @@ class _SessionAnchorTerminalHost:
 class UniverseHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def finish_request(self, request, client_address):
+        # Nagle's algorithm batches small TCP writes to wait for an ACK or a
+        # fuller buffer. A terminal WebSocket sends the smallest possible
+        # frames as fast as a user can type / a PTY can echo, which is
+        # exactly the pattern Nagle + delayed-ACK interact badly on (the
+        # remote gateway's own proxy legs already disable this — see
+        # universe_remote_gateway.py's _proxy_websocket). A direct local
+        # connection to this server had no equivalent, so a local browser
+        # could see WORSE per-keystroke latency than one going through the
+        # gateway. Disable it for every connection this server accepts.
+        try:
+            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        super().finish_request(request, client_address)
+
     def __init__(
         self,
         address: tuple[str, int],
