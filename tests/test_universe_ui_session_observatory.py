@@ -198,6 +198,11 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("imedebug", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
+        # The wheel handler must let xterm process every event (scrollback +
+        # SGR mouse-wheel reports) and contain any leftover on the pane, not
+        # cancel xterm processing under mouse tracking.
+        self.assertIn("attachCustomWheelEventHandler(() => true)", TERM)
+        self.assertIn('if (!event.defaultPrevented) event.preventDefault();', TERM)
         self.assertIn(".xterm-helper-textarea", CSS)
         self.assertIn("async function stopTerminalSession(terminalId)", TERM)
         self.assertIn('method: "DELETE"', TERM)

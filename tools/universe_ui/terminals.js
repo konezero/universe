@@ -175,13 +175,27 @@ function installGuardedLinkProviderRegistration(term) {
   };
 }
 
-function attachTerminalMouseWheelHandler(term) {
-  if (!term || typeof term.attachCustomWheelEventHandler !== "function") return;
-  term.attachCustomWheelEventHandler(() => {
-    const mode = term.modes && term.modes.mouseTrackingMode;
-    if (mode && mode !== "none") return false;
-    return true;
-  });
+function attachTerminalMouseWheelHandler(term, element) {
+  // Let xterm process every wheel event: it scrolls the scrollback in the
+  // normal buffer and emits SGR mouse-wheel reports to a mouse-tracking TUI,
+  // and preventDefault()s in both cases so the page never moves. (The earlier
+  // handler returned false under mouse tracking, which cancelled BOTH the
+  // TUI scroll and xterm's preventDefault — the wheel did nothing and the
+  // page scrolled instead.)
+  if (term && typeof term.attachCustomWheelEventHandler === "function") {
+    term.attachCustomWheelEventHandler(() => true);
+  }
+  // Belt: an alt-screen TUI with mouse tracking off has nothing for xterm to
+  // scroll, so the event would bubble to the page. Contain it on the pane.
+  if (element) {
+    element.addEventListener(
+      "wheel",
+      (event) => {
+        if (!event.defaultPrevented) event.preventDefault();
+      },
+      { passive: false }
+    );
+  }
 }
 
 function disposeTerminalWebgl(surface) {
@@ -809,7 +823,7 @@ function ensureTerminalSurface(session) {
   });
   term.open(element);
   installGuardedLinkProviderRegistration(term);
-  attachTerminalMouseWheelHandler(term);
+  attachTerminalMouseWheelHandler(term, element);
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
