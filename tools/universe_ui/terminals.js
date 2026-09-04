@@ -544,6 +544,72 @@ const TERMINAL_MAX_ROWS = 60;
 const TERMINAL_MIN_FONT = 6;
 const TERMINAL_MAX_FONT = 16;
 
+const IME_DEBUG = (() => {
+  try { return new URLSearchParams(window.location.search).has("imedebug"); }
+  catch (_e) { return false; }
+})();
+
+function renderImeDebugBox() {
+  if (!IME_DEBUG) return;
+  const trace = window.__imeTrace || [];
+  let box = document.getElementById("ime-debug-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "ime-debug-box";
+    box.style.cssText =
+      "position:fixed;right:8px;bottom:8px;width:min(360px,92vw);max-height:46vh;" +
+      "z-index:99999;background:#0b1416ee;color:#d7e6ff;border:1px solid #2a4a52;" +
+      "border-radius:8px;font:11px/1.45 ui-monospace,Menlo,monospace;display:flex;" +
+      "flex-direction:column;box-shadow:0 8px 30px rgba(0,0,0,.5)";
+    const bar = document.createElement("div");
+    bar.style.cssText =
+      "display:flex;gap:6px;align-items:center;padding:6px 8px;border-bottom:1px solid #2a4a52";
+    bar.innerHTML = "<b style='flex:1'>IME trace</b>";
+    const mk = (label, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.style.cssText =
+        "font:11px ui-monospace,monospace;background:#17323a;color:#d7e6ff;" +
+        "border:1px solid #2a4a52;border-radius:5px;padding:2px 7px;cursor:pointer";
+      b.addEventListener("click", (e) => { e.preventDefault(); fn(); });
+      return b;
+    };
+    bar.append(
+      mk("copy", () => {
+        const text = JSON.stringify(window.__imeTrace || []);
+        (navigator.clipboard?.writeText(text) || Promise.reject()).then(
+          () => { bar.querySelector("b").textContent = "IME trace — copied ✓"; },
+          () => {
+            const ta = document.createElement("textarea");
+            ta.value = text; document.body.append(ta); ta.select();
+            try { document.execCommand("copy"); } catch (_e) {}
+            ta.remove();
+            bar.querySelector("b").textContent = "IME trace — copied ✓";
+          }
+        );
+      }),
+      mk("clear", () => { (window.__imeTrace || []).length = 0; renderImeDebugBox(); }),
+      mk("×", () => box.remove()),
+    );
+    const body = document.createElement("pre");
+    body.id = "ime-debug-body";
+    body.style.cssText = "margin:0;padding:8px;overflow:auto;white-space:pre-wrap;word-break:break-all";
+    box.append(bar, body);
+    document.body.append(box);
+  }
+  const body = box.querySelector("#ime-debug-body");
+  if (body) {
+    body.textContent = trace
+      .slice(-40)
+      .map((e) => {
+        const { t, tag, ...rest } = e;
+        return `${String(t).padStart(6)} ${tag}  ${JSON.stringify(rest)}`;
+      })
+      .join("\n");
+    body.scrollTop = body.scrollHeight;
+  }
+}
+
 function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
@@ -552,6 +618,7 @@ function bindTerminalIme(term, socket, getSurface) {
   let hangulPreedit = false;
   // IME diagnostic ring buffer. Read after reproducing:
   //   copy(JSON.stringify(window.__imeTrace))
+  // or open the on-screen box with ?imedebug=1 in the URL.
   // Zero cost when nobody looks; safe to leave in.
   const imeTrace = (window.__imeTrace = window.__imeTrace || []);
   const imeLog = (tag, extra) => {
@@ -562,7 +629,8 @@ function bindTerminalIme(term, socket, getSurface) {
       isComposingNow: (() => { try { return isComposingNow(); } catch (_e) { return "?"; } })(),
       ...extra,
     });
-    if (imeTrace.length > 120) imeTrace.shift();
+    if (imeTrace.length > 200) imeTrace.shift();
+    renderImeDebugBox();
   };
   // During IME composition the compositionend path owns *text* input, so xterm
   // must not also emit the printable keydowns. But it must still forward the
