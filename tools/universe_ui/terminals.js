@@ -668,11 +668,58 @@ function selectTerminalTab(terminalId) {
   focusTerminalInput();
 }
 
+// Opt-in on-screen input-timing trace (?imedebug=1) — no console needed.
+// Every line is "+<ms since previous event> <tag> <detail>"; a gap over
+// 80ms is highlighted so a slow stretch is visible without measuring by
+// hand. Session-only: nothing is persisted, nothing ships unless the query
+// param is present.
+const IME_DEBUG = (() => {
+  try {
+    return new URLSearchParams(location.search).get("imedebug") === "1";
+  } catch (_e) {
+    return false;
+  }
+})();
+let imeLastTraceAt = 0;
+function imeLog(tag, detail) {
+  if (!IME_DEBUG) return;
+  const now = performance.now();
+  const delta = imeLastTraceAt ? now - imeLastTraceAt : 0;
+  imeLastTraceAt = now;
+  let box = document.getElementById("ime-debug-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "ime-debug-box";
+    box.style.cssText =
+      "position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;" +
+      "overflow:auto;background:rgba(0,0,0,.9);color:#7fffd4;font:11px/1.4 " +
+      "ui-monospace,monospace;padding:6px 8px;white-space:pre";
+    const bar = document.createElement("div");
+    bar.textContent = "?imedebug=1 — timing trace (gap > 80ms highlighted)";
+    bar.style.cssText = "color:#fff;margin-bottom:4px;font-weight:600";
+    const body = document.createElement("div");
+    body.className = "ime-debug-body";
+    box.append(bar, body);
+    document.body.appendChild(box);
+  }
+  const line = document.createElement("div");
+  const slow = delta > 80;
+  line.style.color = slow ? "#ff6b5e" : "#7fffd4";
+  line.textContent = `+${delta.toFixed(0).padStart(4)}ms  ${tag}  ${detail || ""}`;
+  const body = box.querySelector(".ime-debug-body");
+  body.appendChild(line);
+  while (body.childNodes.length > 80) body.removeChild(body.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
 function sendPtyText(socket, data) {
   if (socket.readyState !== WebSocket.OPEN) return;
   const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
   if (!text) return;
+  imeLog("send", JSON.stringify(text));
+  const before = performance.now();
   socket.send(new TextEncoder().encode(text));
+  imeLog("ws.send done", `+${(performance.now() - before).toFixed(1)}ms`);
   if (/\r|\n/.test(text)) watchPromptDelivery(state.activeTerminalId);
 }
 
@@ -782,6 +829,7 @@ function bindTerminalIme(term, socket, getSurface) {
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+      imeLog("keydown", `key=${event.key} code=${event.keyCode} isComposing=${event.isComposing} IS_IOS=${IS_IOS}`);
       if (event.keyCode === 229) lastKey229At = Date.now();
       if (IS_IOS) {
         // Never preventDefault on iOS — the soft keyboard needs the keydown to
@@ -904,6 +952,7 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("blur", () => { endCompose(); flushImeMarked(); }, true);
   }
   term.onData((data) => {
+    imeLog("onData", `${JSON.stringify(data)} replaying=${Boolean(getSurface?.()?.replaying)}`);
     // xterm auto-answers DA1/CPR/OSC during a replay; those bytes
     // must not reach the PTY as stray input.
     if (getSurface?.()?.replaying) return;
@@ -914,6 +963,7 @@ function bindTerminalIme(term, socket, getSurface) {
     // a duplicate DEL, so drop printable + \x7f here; Enter / arrows / Esc
     // (other control bytes) still pass through.
     if (IS_IOS && (!isControlData || data === "\x7f")) {
+      imeLog("onData:drop(ios)", "");
       return;
     }
     // Degraded macOS path only: the input listener owns the send while a
