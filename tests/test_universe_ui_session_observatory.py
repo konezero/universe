@@ -198,12 +198,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertNotIn("__imeTrace", TERM)
         self.assertIn('.get("imedebug") === "1"', TERM)
         self.assertIn("if (!IME_DEBUG) return;", TERM)
-        # iOS Safari: xterm does not emit the composed Hangul syllable, so the
-        # compositionend handler sends it and onData is suppressed there.
+        # iOS Safari fires no composition events; the `input` stream is mirrored
+        # directly (deleteContentBackward -> \x7f, insertText -> text) and
+        # xterm's own printable/DEL onData is dropped.
         self.assertIn("const IS_IOS", TERM)
         self.assertIn("if (IS_IOS) {", TERM)
-        self.assertIn("if (composed) sendPtyText(socket, composed)", TERM)
-        self.assertIn("ios-post-commit", TERM)
+        self.assertIn('it === "deleteContentBackward"', TERM)
+        self.assertIn('sendPtyText(socket, "\\x7f")', TERM)
+        self.assertIn('if (IS_IOS && (!isControlData || data === "\\x7f"))', TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         # The wheel handler must let xterm process every event (scrollback +

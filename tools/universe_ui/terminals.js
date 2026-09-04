@@ -797,12 +797,14 @@ function bindTerminalIme(term, socket, getSurface) {
   let lastComposeAt = 0;
   let lastCompositionAt = 0;
   let hangulPreedit = false;
-  // iOS Safari fires composition events for the Hangul keyboard, but xterm's
-  // own composition integration does not emit the composed syllable through
-  // onData there — each jamo leaks out as a separate insertText instead
-  // ("ㅇㅏㅇㅣㅍㅗㄴ"). On iOS we trust compositionend.data and drop everything
-  // else for a short window so nothing double-sends.
-  let iosComposeEndAt = 0;
+  // iOS Safari fires NO composition events for the Hangul keyboard. Instead it
+  // composes the syllable inside the helper textarea and reports it through
+  // `input` events: each jamo keydown yields `deleteContentBackward` (drop the
+  // in-progress syllable) then `insertText` with the refined syllable ("하" ->
+  // "한"); a new syllable is a bare `insertText` with no preceding delete.
+  // xterm's own onData meanwhile leaks the raw jamo. So on iOS we ignore
+  // xterm's printable/DEL onData entirely and mirror the `input` stream:
+  // deleteContentBackward -> \x7f, insertText -> the text.
   if (IME_DEBUG) {
     imeTraceSink = () => {
       const dump = "IMETRACE " + imeTrace.join("  |  ");
@@ -863,6 +865,12 @@ function bindTerminalIme(term, socket, getSurface) {
         `k=${event.key} c=${event.keyCode} comp=${event.isComposing}`
       );
       if (event.keyCode === 229) lastKey229At = Date.now();
+      if (IS_IOS) {
+        // Never preventDefault on iOS — the soft keyboard needs the keydown to
+        // reach the textarea so it emits the `input` events we mirror. xterm's
+        // resulting printable/DEL onData is dropped in the onData handler.
+        return true;
+      }
 
       // A line-edit / submit key ends any macOS marked syllable first.
       if (imeMarked && IME_BOUNDARY_KEYS.has(event.key)) {
@@ -916,32 +924,42 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("compositionend", (event) => {
       imeLog("comp:end", JSON.stringify(event.data || ""));
       lastCompositionAt = Date.now();
-      if (IS_IOS) {
-        // iOS: xterm won't emit this syllable itself — send it, and swallow
-        // the trailing onData / input echoes for a short window.
-        iosComposeEndAt = Date.now();
-        const composed = typeof event.data === "string" ? event.data : "";
-        endCompose();
-        if (composed) sendPtyText(socket, composed);
-        try { textarea.value = ""; } catch (_e) { /* readonly race */ }
-        return;
-      }
-      // Desktop: Do NOT send here. xterm's own composition handler emits the
-      // committed text through onData right after this; sending it again
-      // produced 한한글글 (and NFC/NFD-sensitive dedup could not catch it).
+      // Do NOT send here. xterm's own composition handler emits the committed
+      // text through onData right after this; sending it again produced
+      // 한한글글 (and NFC/NFD-sensitive dedup could not catch it).
       endCompose();
     }, true);
-    // Fallback for the degraded macOS path where the IME fires NO composition
-    // events and refines the syllable through input/insertReplacementText.
-    // Only engages when composition events are demonstrably absent.
+    // iOS Safari: no composition events. Mirror the `input` stream directly —
+    // deleteContentBackward erases a cell, insertText writes the (possibly
+    // re-composed) syllable. xterm's own printable/DEL onData is dropped.
     textarea.addEventListener("input", (event) => {
       if (!(event instanceof InputEvent)) return;
       const it = event.inputType;
       imeLog("input", `${it} ${JSON.stringify(event.data || "")} comp=${composing}`);
-      // iOS drives everything through composition events + the compositionend
-      // send above; the degraded-macOS marked-text path must not run here or
-      // it re-sends jamo.
-      if (IS_IOS) return;
+      if (IS_IOS) {
+        // Leave textarea.value alone — iOS tracks its own composition state and
+        // clearing it mid-syllable desyncs the next deleteContentBackward.
+        if (it === "deleteContentBackward" || it === "deleteWordBackward") {
+          // The only DEL sender on iOS — xterm's own \x7f onData is dropped.
+          // Covers both a real Backspace and IME syllable-refinement.
+          sendPtyText(socket, "\x7f");
+          return;
+        }
+        if (
+          (it === "insertText" ||
+            it === "insertReplacementText" ||
+            it === "insertFromComposition" ||
+            it === "insertCompositionText") &&
+          event.data
+        ) {
+          sendPtyText(socket, event.data);
+          return;
+        }
+        if (it === "insertLineBreak") {
+          sendPtyText(socket, "\r");
+        }
+        return;
+      }
       if (composing || Date.now() - lastCompositionAt < 1500) return;
 
       if (it === "insertReplacementText") {
@@ -977,15 +995,13 @@ function bindTerminalIme(term, socket, getSurface) {
     if (getSurface?.()?.replaying) return;
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    // iOS: the compositionend handler owns Hangul. Drop xterm's per-jamo
-    // leakage while composing and the echo right after a syllable commits;
-    // control keys (Enter/Backspace/arrows) still pass.
-    if (IS_IOS && !isControlData) {
-      if (isComposingNow()) { imeLog("onData:drop", "ios-composing"); return; }
-      if (Date.now() - iosComposeEndAt < 400) {
-        imeLog("onData:drop", "ios-post-commit");
-        return;
-      }
+    // iOS: the `input` listener mirrors every printable key and every
+    // syllable-refinement delete. xterm's own onData only leaks raw jamo and
+    // a duplicate DEL, so drop printable + \x7f here; Enter / arrows / Esc
+    // (other control bytes) still pass through.
+    if (IS_IOS && (!isControlData || data === "\x7f")) {
+      imeLog("onData:drop", "ios");
+      return;
     }
     imeLog("onData", `${JSON.stringify(data)} ctrl=${isControlData}`);
     // Degraded macOS path only: the input listener owns the send while a
