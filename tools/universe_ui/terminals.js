@@ -1123,7 +1123,15 @@ function ensureTerminalSurface(session) {
     allowProposedApi: true,
     cursorBlink: true,
     fontSize: 13,
-    fontFamily: 'Consolas, "Cascadia Code", D2Coding, "Nanum Gothic Coding", monospace',
+    // D2Coding first, not last: it is the only font here with a matched
+    // fixed-width Latin/Hangul metric (1 Latin cell : 1 Hangul cell at 2x
+    // width). Consolas/Cascadia Code have no Hangul glyphs at all, so a
+    // Latin-first stack falls through to the OS's default CJK font for every
+    // Hangul character — which is proportional, not width-matched to the
+    // Latin font's cell — and xterm's fixed column grid then misaligns
+    // wherever Hangul appears. Bundled locally (tools/universe_ui/fonts/),
+    // not relying on the host having D2Coding installed.
+    fontFamily: '"D2Coding", Consolas, "Cascadia Code", "Nanum Gothic Coding", monospace',
     unicodeVersion: "11",
     convertEol: true,
     scrollback: 5000,

@@ -1,3 +1,23 @@
+/* Bundled locally so the terminal's Latin/Hangul column alignment does not
+   depend on the host having D2Coding installed (it usually isn't — see
+   terminals.js's fontFamily comment for why a Latin-only monospace font
+   first in the stack misaligns Hangul). font-display: swap so a slow local
+   read never blocks the terminal's own first paint. */
+@font-face {
+  font-family: "D2Coding";
+  src: url("/fonts/D2Coding.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "D2Coding";
+  src: url("/fonts/D2Coding-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   color-scheme: dark;
   font-family: Inter, "Segoe UI", Pretendard, system-ui, sans-serif;

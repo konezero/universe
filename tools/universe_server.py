@@ -37779,7 +37779,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path in {"/", "/app.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js", "/xterm-addon-webgl.min.js", "/xterm-addon-search.min.js", "/xterm-addon-unicode11.min.js", "/xterm-addon-web-links.min.js", "/xterm-addon-serialize.min.js"}:
+        if path in {"/", "/app.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js", "/xterm-addon-webgl.min.js", "/xterm-addon-search.min.js", "/xterm-addon-unicode11.min.js", "/xterm-addon-web-links.min.js", "/xterm-addon-serialize.min.js", "/fonts/D2Coding.woff2", "/fonts/D2Coding-Bold.woff2"}:
             self._send_static(path)
             return
         terminal_history = re.fullmatch(r"/v1/terminals/([^/]+)/history", path)
@@ -43482,6 +43482,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/xterm-addon-unicode11.min.js": "xterm-addon-unicode11.min.js",
             "/xterm-addon-web-links.min.js": "xterm-addon-web-links.min.js",
             "/xterm-addon-serialize.min.js": "xterm-addon-serialize.min.js",
+            "/fonts/D2Coding.woff2": "fonts/D2Coding.woff2",
+            "/fonts/D2Coding-Bold.woff2": "fonts/D2Coding-Bold.woff2",
         }[path]
         target = UI_ROOT / filename
         if not target.is_file() or target.is_symlink():
