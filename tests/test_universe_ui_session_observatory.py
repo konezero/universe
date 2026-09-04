@@ -186,13 +186,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         # tracked from input/insertReplacementText and flushed on a boundary,
         # and only while composition events are demonstrably absent.
         self.assertIn("Date.now() - lastCompositionAt < 1500", TERM)
+        self.assertIn("Date.now() - lastCompositionAt > 1500", TERM)
         self.assertIn("insertReplacementText", TERM)
         self.assertIn("const flushImeMarked", TERM)
         self.assertIn("imeFlushTimer = window.setTimeout(flushImeMarked", TERM)
-        self.assertIn("onData suppressed(ime)", TERM)
         self.assertIn("IME_BOUNDARY_KEYS", TERM)
         self.assertIn('textarea.addEventListener("blur"', TERM)
         self.assertIn("flushImeMarked()", TERM)
+        # The temporary macOS IME trace instrumentation is gone.
+        self.assertNotIn("__imeTrace", TERM)
+        self.assertNotIn("imedebug", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         self.assertIn(".xterm-helper-textarea", CSS)
