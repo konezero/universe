@@ -818,6 +818,16 @@ poll();</script>
         client_sock = self.connection
         client_sock.settimeout(0.5)
         upstream_sock.settimeout(0.5)
+        # A terminal keystroke is one tiny WebSocket frame. With Nagle on, the
+        # proxy holds it up to a delayed-ACK interval (~40ms, worse under
+        # loss), so the first character of every burst feels laggy over a
+        # remote link. The stream is interactive, not bulk — disable Nagle on
+        # both legs.
+        for _sock in (client_sock, upstream_sock):
+            try:
+                _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
         stop = threading.Event()
 
         def relay(src: socket.socket, dst: socket.socket) -> None:
