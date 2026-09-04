@@ -8514,3 +8514,175 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
     border-radius: 0;
   }
 }
+
+/* ============================================================
+   MOBILE — single authoritative layout (chat-first).
+   Supersedes every earlier @media(max-width:720px) rule that
+   positioned .conductor-panel / .conversation-layer / the shell
+   grid. The conductor conversation IS the page body; Fleet /
+   Galaxy / Work Spine / Bench / Memory open full-screen over it,
+   driven by body[data-mobile-surface] ("chat" is the rest state).
+   z-index scale: content 1 · topbar/composer 30 · surface 40 ·
+   inspector 45 · drawer scrim 85 · drawer 90 · <dialog> top-layer.
+   ============================================================ */
+@media (max-width: 720px) {
+  :root { --topbar-h: 48px; }
+
+  .app-shell.mockup-shell {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: var(--topbar-h) minmax(0, 1fr) !important;
+  }
+  .app-shell.mockup-shell > .utility-rail,
+  .app-shell.mockup-shell > .project-rail,
+  .app-shell.mockup-shell > .inspector,
+  .app-shell.mockup-shell > .status-bar { display: none; }
+  .mobile-work-tabs,
+  .mobile-goal-actions { display: none !important; }
+
+  .app-shell.mockup-shell > .topbar {
+    grid-column: 1; grid-row: 1;
+    position: sticky; top: 0; z-index: 30;
+    gap: 6px; padding: 0 8px;
+  }
+  #mobile-menu-btn { display: inline-grid; }
+  body[data-mobile-surface="chat"] #mobile-back-chat { display: none !important; }
+
+  .app-shell.mockup-shell > .graph-workspace {
+    grid-column: 1; grid-row: 2;
+    position: relative;
+    min-width: 0;
+    padding: 0 !important;
+    overflow: hidden;
+  }
+
+  /* ---- the conductor conversation = the mobile page body ---- */
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+    position: absolute !important;
+    inset: 0 !important;
+    width: auto !important; height: auto !important;
+    max-height: none !important; min-height: 0 !important;
+    margin: 0 !important;
+    display: flex !important; flex-direction: column;
+    border: 0 !important; border-radius: 0 !important;
+    box-shadow: none !important;
+    background: var(--bg-1, #191a1d);
+    overflow: hidden;
+    z-index: 1;
+    -webkit-backdrop-filter: none; backdrop-filter: none;
+  }
+  .conductor-panel > .conductor-summary,
+  .conductor-panel > .chat-resize-handle { display: none !important; }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .conversation-layer {
+    position: static !important;
+    flex: 1 1 auto !important;
+    display: flex !important; flex-direction: column;
+    width: auto !important; min-width: 0 !important; max-width: none !important;
+    min-height: 0 !important; max-height: none !important;
+    inset: auto !important; margin: 0 !important;
+    border: 0 !important; border-radius: 0 !important;
+    background: transparent !important;
+    overflow: hidden;
+  }
+  .conductor-panel > .conversation-layer.collapsed,
+  .conductor-panel > .conversation-layer.expanded {
+    flex: 1 1 auto !important; max-height: none !important; height: auto !important;
+    inset: auto !important; z-index: auto !important;
+  }
+
+  .conversation-layer > .conversation-layer-header {
+    flex: 0 0 auto;
+    display: flex !important;
+    grid-template-areas: none !important;
+    align-items: center; gap: 8px;
+    min-height: 44px; padding: 0 8px;
+  }
+  .conversation-layer-header .layer-opacity { display: none !important; }
+  .conversation-layer > #terminal-tabs,
+  .conversation-layer > #provider-quota-strip { flex: 0 0 auto; }
+  .conversation-layer > #room-message-list {
+    flex: 1 1 auto !important;
+    min-height: 0; height: auto !important; max-height: none !important;
+    overflow-y: auto;
+  }
+  .conversation-layer > #terminal-stage {
+    flex: 1 1 auto !important; min-height: 0 !important;
+  }
+
+  .app-shell.mockup-shell > .graph-workspace > .conductor-panel > .command-composer.conductor-composer {
+    flex: 0 0 auto !important;
+    position: static !important;
+    display: grid !important;
+    width: auto !important; margin: 0 !important;
+    padding: 8px !important;
+    border: 0 !important;
+    border-top: 1px solid var(--line, #31333a) !important;
+    border-radius: 0 !important;
+    background: var(--bg-1, #191a1d);
+    z-index: 2;
+  }
+  .command-composer.conductor-composer .room-actions {
+    grid-column: 1 / -1; gap: 8px; padding-inline: 4px;
+  }
+
+  /* ---- secondary surfaces: full-screen over the chat ---- */
+  .app-shell.mockup-shell > .graph-workspace > .canvas-wrap,
+  .app-shell.mockup-shell > .graph-workspace > #goal-plan-workspace,
+  .app-shell.mockup-shell > .graph-workspace > #bench-screen,
+  .app-shell.mockup-shell > .graph-workspace > #project-screen {
+    position: absolute !important;
+    inset: 0 !important;
+    margin: 0 !important;
+    z-index: 40;
+    overflow: auto;
+    background: var(--bg-0, #17181b);
+  }
+  .app-shell.mockup-shell > .graph-workspace > .graph-toolbar {
+    position: absolute !important; inset: 0 auto auto 0; right: 0;
+    z-index: 41;
+  }
+
+  /* chat rest state: hide every surface, show the conversation */
+  body:is([data-mobile-surface="chat"], :not([data-mobile-surface])) .app-shell.mockup-shell > .graph-workspace > .canvas-wrap,
+  body:is([data-mobile-surface="chat"], :not([data-mobile-surface])) .app-shell.mockup-shell > .graph-workspace > #goal-plan-workspace,
+  body:is([data-mobile-surface="chat"], :not([data-mobile-surface])) .app-shell.mockup-shell > .graph-workspace > #bench-screen,
+  body:is([data-mobile-surface="chat"], :not([data-mobile-surface])) .app-shell.mockup-shell > .graph-workspace > #project-screen,
+  body:is([data-mobile-surface="chat"], :not([data-mobile-surface])) .app-shell.mockup-shell > .graph-workspace > .graph-toolbar {
+    display: none !important;
+  }
+  /* a surface is open: keep the chat mounted (live WS) but out of the way */
+  body[data-mobile-surface]:not([data-mobile-surface="chat"]) .app-shell.mockup-shell > .graph-workspace > .conductor-panel {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  /* ---- left nav drawer ---- */
+  #mobile-scrim {
+    position: fixed; inset: 0; z-index: 85;
+    background: rgba(0, 0, 0, 0.5);
+  }
+  #mobile-scrim[hidden] { display: none; }
+  body.mobile-nav-open .app-shell.mockup-shell > .utility-rail {
+    display: flex !important;
+    position: fixed; top: var(--topbar-h); bottom: 0; left: 0;
+    width: 76vw; max-width: 300px;
+    z-index: 90;
+    flex-direction: column; align-items: stretch; gap: 2px;
+    padding: 12px 10px 20px;
+    background: #17181b;
+    border-right: 1px solid var(--line, #31333a);
+    overflow-y: auto;
+  }
+  .app-shell.mockup-shell > .utility-rail > button {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 11px 10px;
+    border: 0; border-radius: 7px;
+    background: transparent; color: var(--text-2, #a8a8a4);
+    font: inherit; text-align: left;
+  }
+  .app-shell.mockup-shell > .utility-rail > button small { font-size: 13px; }
+  .app-shell.mockup-shell > .utility-rail > button.selected {
+    background: rgba(111, 155, 147, 0.14); color: var(--text, #e6e6e4);
+  }
+  .drawer-chat-item { border-bottom: 1px solid var(--line, #31333a) !important; border-radius: 0 !important; }
+}

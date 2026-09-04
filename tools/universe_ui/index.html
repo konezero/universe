@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-18-dock-height">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-19-mobile-chatfirst">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
   <style>
     /* Boot splash — painted before app.js so a reconnecting browser never
@@ -50,6 +50,7 @@
   <div class="app-shell mockup-shell">
     <header class="topbar">
       <button id="mobile-menu-btn" class="mobile-icon-btn" type="button" aria-label="Menu" aria-expanded="false">&#9776;</button>
+      <button id="mobile-back-chat" class="mobile-icon-btn" type="button" aria-label="Back to chat" hidden>&#8592;</button>
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <span class="brand-copy"><strong>Universe</strong><small>Work Spine Command Center</small></span>
@@ -90,6 +91,7 @@
     </div>
 
     <nav class="utility-rail" aria-label="Universe tools">
+      <button class="drawer-chat-item" type="button" data-mobile-surface="chat" title="Conductor conversation"><span aria-hidden="true">&#128172;</span><small>Chat</small></button>
       <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
       <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true">&#9675;</span><small>Galaxy</small></button>
       <button type="button" data-primary-view="activity" title="Project activity"><span aria-hidden="true">&#8801;</span><small>Activity</small></button>
@@ -1484,6 +1486,6 @@
   <script src="/xterm-addon-web-links.min.js?v=0.13.0-beta.300"></script>
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
   <script src="/terminals.js?v=term-42-ios-clean" defer></script>
-  <script src="/app.js?v=work-spine-22-dock-height" defer></script>
+  <script src="/app.js?v=work-spine-23-mobile-chatfirst" defer></script>
 </body>
 </html>

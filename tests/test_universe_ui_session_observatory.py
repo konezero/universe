@@ -1080,20 +1080,30 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('todo.state !== "DONE"', select_slice)
         self.assertIn('todo.state !== "DONE"', refresh_goal_slice)
 
-    def test_mobile_conversation_launcher_stays_inside_the_composer_dock(
+    def test_mobile_conversation_layer_is_the_page_body_not_a_floating_dock(
         self,
     ) -> None:
+        # The authoritative mobile block makes the conversation layer fill the
+        # conductor panel (which fills the workspace) — never a fixed/floating
+        # pill. This is the last matching rule so it wins the cascade.
         selector = (
             "  .app-shell.mockup-shell > .graph-workspace > .conductor-panel "
             "> .conversation-layer {"
         )
         start = CSS.rindex(selector)
         block = CSS[start : CSS.index("  }", start)]
-        self.assertIn("position: relative;", block)
-        self.assertIn("inset: auto;", block)
-        self.assertIn("width: 100%;", block)
-        self.assertIn("min-width: 0;", block)
-        self.assertIn("max-width: 100%;", block)
+        self.assertIn("position: static !important;", block)
+        self.assertIn("flex: 1 1 auto !important;", block)
+        self.assertIn("inset: auto !important;", block)
+        # the conductor panel itself must absolutely fill the workspace
+        panel = CSS[
+            CSS.rindex(
+                "  .app-shell.mockup-shell > .graph-workspace > .conductor-panel {"
+            ) :
+        ]
+        panel = panel[: panel.index("  }")]
+        self.assertIn("position: absolute !important;", panel)
+        self.assertIn("inset: 0 !important;", panel)
 
     def test_terminal_selection_preserves_the_explicit_chat_panel_width(self) -> None:
         self.assertNotIn("autoWidenForTerminal", TERM)
