@@ -734,12 +734,27 @@ const IME_DEBUG = (() => {
 })();
 const imeTrace = [];
 let imeTraceSink = null; // set by bindTerminalIme: pushes the trace into the PTY
+let imeTracePostTimer = 0;
+function postImeTrace() {
+  try {
+    fetch("/v1/ui-debug-trace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_ios: IS_IOS, ua: navigator.userAgent, trace: imeTrace }),
+      cache: "no-store",
+    }).catch(() => {});
+  } catch (_e) {
+    /* best effort */
+  }
+}
 function imeLog(tag, detail) {
   if (!IME_DEBUG) return;
   imeTrace.push(
     `${new Date().toISOString().slice(17, 23)} ${tag} ${detail || ""}`.trim()
   );
-  if (imeTrace.length > 40) imeTrace.shift();
+  if (imeTrace.length > 60) imeTrace.shift();
+  window.clearTimeout(imeTracePostTimer);
+  imeTracePostTimer = window.setTimeout(postImeTrace, 600);
   let box = document.getElementById("ime-debug-box");
   if (!box) {
     box = document.createElement("div");
