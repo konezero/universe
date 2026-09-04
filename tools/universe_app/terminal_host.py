@@ -411,6 +411,47 @@ def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
     )
 
 
+def scan_managed_shell_identities(root: Path) -> dict[str, dict[str, str]]:
+    """Map ``session_anchor_ref`` -> persisted managed-shell identity.
+
+    The identity file is written by ``write_managed_shell_identity`` and survives
+    a ``universe_server`` restart. It is the reliable provider/mode/project source
+    for a reconnection host whose live terminal has not been re-registered yet,
+    which is exactly the re-attach picker's state after a restart.
+    """
+
+    identities: dict[str, dict[str, str]] = {}
+    shell_dir = root.resolve() / ".ai" / "runtime" / "tmp" / "managed-shells"
+    try:
+        entries = sorted(shell_dir.glob("*.json"))
+    except OSError:
+        return identities
+    for path in entries:
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("schema") != MANAGED_SHELL_IDENTITY_SCHEMA:
+            continue
+        anchor = str(payload.get("session_anchor_ref") or "").strip()
+        if not anchor:
+            continue
+        identities[anchor] = {
+            "provider": str(payload.get("provider") or "").upper(),
+            "mode": str(payload.get("mode") or "").upper(),
+            "project_id": str(payload.get("project_id") or "").strip(),
+            "supervisor_session_id": str(
+                payload.get("supervisor_session_id") or ""
+            ).strip(),
+            "terminal_id": str(payload.get("terminal_id") or "").strip(),
+        }
+    return identities
+
+
 def write_managed_shell_identity(path: Path, session: Any) -> None:
     managed = getattr(session, "managed_shell", None)
     shell = getattr(managed, "shell", None)

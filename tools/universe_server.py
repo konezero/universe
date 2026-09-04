@@ -281,7 +281,11 @@ from universe_app.pty_supervisor import (
     restart_supervisor,
 )
 from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting_bus
-from universe_app.terminal_host import TerminalHost, TerminalHostError
+from universe_app.terminal_host import (
+    TerminalHost,
+    TerminalHostError,
+    scan_managed_shell_identities,
+)
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
 from universe_app.provider_session_service import (
     HOST_MESSAGE_CHANNEL_SCHEMA,
@@ -30585,6 +30589,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "hosts": terminal_host.list_hosts(),
         }
 
+    def _managed_shell_identities(self) -> dict[str, dict[str, str]]:
+        """Persisted ``session_anchor_ref`` -> provider/mode/project map.
+
+        Split out so tests can stub the on-disk scan.
+        """
+
+        return scan_managed_shell_identities(Path(__file__).resolve().parents[1])
+
     def list_resumable_sessions(
         self, query: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -30629,6 +30641,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             for session in sessions
             if str(session.get("session_anchor_ref") or "").strip()
         }
+        # The anchor-session projection can come back without a provider after a
+        # server restart (the live terminal is not re-registered yet). The
+        # managed-shell identity file persists provider/mode/project on disk,
+        # keyed by anchor, so a re-attach row never renders "session MASTER".
+        shell_identities = self._managed_shell_identities()
+
+        def _anchor_view(anchor_ref: str) -> dict[str, Any]:
+            view = dict(by_anchor.get(anchor_ref) or {})
+            shell = shell_identities.get(anchor_ref) or {}
+            for field in ("provider", "mode", "project_id", "supervisor_session_id"):
+                if not str(view.get(field) or "").strip() and shell.get(field):
+                    view[field] = shell[field]
+            return view
 
         def _resumable_label(
             session: Mapping[str, Any], host: Mapping[str, Any] | None = None
@@ -30657,7 +30682,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             anchor = str(
                 host.get("session_anchor_ref") or host.get("anchor_ref") or ""
             ).strip()
-            session = by_anchor.get(anchor) or {}
+            session = _anchor_view(anchor)
             if compatibility == "INCOMPATIBLE":
                 if runtime == "LIVE":
                     if anchor:
@@ -30731,6 +30756,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             reverse=True,
         )
         for session in pool:
+            anchor_hint = str(session.get("session_anchor_ref") or "").strip()
+            if anchor_hint and anchor_hint in shell_identities:
+                session = _anchor_view(anchor_hint)
             project_id = str(
                 session.get("project_id") or session.get("node") or ""
             ).strip()

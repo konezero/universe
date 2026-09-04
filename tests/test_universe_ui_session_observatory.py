@@ -1018,7 +1018,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
             )
         ]
         self.assertNotIn('api("/v1/terminals")', supervisor_slice)
-        startup_slice = APP[APP.index("refresh().finally(() => {") :]
+        # Only the initial refresh().finally() block is the startup path. The
+        # service-health poll that follows may call loadTerminalTabs() on a
+        # proven error->ready recovery, which is a distinct, non-startup trigger.
+        startup_slice = APP[
+            APP.index("refresh().finally(() => {") : APP.index(
+                "window.setInterval(refreshConductorRoom"
+            )
+        ]
         self.assertNotIn("loadTerminalTabs()", startup_slice)
 
     def test_selected_projection_is_reused_and_completed_todos_leave_planning_inbox(

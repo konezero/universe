@@ -6040,6 +6040,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("prompt_activity", filled)
 
     def test_list_resumable_sessions_splits_reattach_and_resume(self) -> None:
+        self.server._managed_shell_identities = lambda: {}  # type: ignore[method-assign]
         live_host = {
             "host_session_ref": "host-live-current",
             "session_anchor_ref": "anchor-live",
@@ -6147,6 +6148,50 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
         self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
+
+    def test_reattach_row_provider_falls_back_to_managed_shell_identity(self) -> None:
+        # After a server restart the anchor-session projection can lose provider
+        # before the live terminal re-registers; the persisted managed-shell
+        # identity file still carries it, so the re-attach label stays specific.
+        live_host = {
+            "host_session_ref": "host-live",
+            "session_anchor_ref": "anchor-live",
+            "runtime_state": "LIVE",
+            "reconnect_eligible": True,
+            "compatibility": "CURRENT",
+        }
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = []
+        terminal_host.list_hosts.return_value = [live_host]
+        self.server.terminal_host = terminal_host
+        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+            {
+                "session_anchor_ref": "anchor-live",
+                "universe_session_id": "sess-live",
+                "project_id": "",
+                "mode": "",
+                "provider": "",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-04T03:00:00Z",
+            }
+        ]
+        self.server._managed_shell_identities = lambda: {  # type: ignore[method-assign]
+            "anchor-live": {
+                "provider": "CODEX",
+                "mode": "MASTER",
+                "project_id": "universe",
+                "supervisor_session_id": "sess-live",
+            }
+        }
+
+        listed = self.server.list_resumable_sessions({"limit": 7})
+        self.assertEqual(1, len(listed["reattach"]))
+        row = listed["reattach"][0]
+        self.assertEqual("CODEX", row["provider"])
+        self.assertEqual("MASTER", row["mode"])
+        self.assertEqual("universe", row["project_id"])
+        self.assertEqual("universe MASTER CODEX", row["label"])
+        self.assertNotIn("UNKNOWN", row["label"])
 
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()
