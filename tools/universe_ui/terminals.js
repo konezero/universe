@@ -550,6 +550,20 @@ function bindTerminalIme(term, socket, getSurface) {
   let lastComposed = null;
   let lastComposeAt = 0;
   let hangulPreedit = false;
+  // IME diagnostic ring buffer. Read after reproducing:
+  //   copy(JSON.stringify(window.__imeTrace))
+  // Zero cost when nobody looks; safe to leave in.
+  const imeTrace = (window.__imeTrace = window.__imeTrace || []);
+  const imeLog = (tag, extra) => {
+    imeTrace.push({
+      t: Math.round(performance.now()),
+      tag,
+      composing,
+      isComposingNow: (() => { try { return isComposingNow(); } catch (_e) { return "?"; } })(),
+      ...extra,
+    });
+    if (imeTrace.length > 120) imeTrace.shift();
+  };
   // During IME composition the compositionend path owns *text* input, so xterm
   // must not also emit the printable keydowns. But it must still forward the
   // keys that edit or submit the line — Enter, Backspace, arrows, Ctrl chords —
@@ -582,6 +596,7 @@ function bindTerminalIme(term, socket, getSurface) {
   if (typeof term.attachCustomKeyEventHandler === "function") {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
+      imeLog("keydown", { key: event.key, code: event.keyCode, isComposing: event.isComposing });
       // Self-heal a genuinely wedged composition — but only after a quiet gap.
       // macOS Chrome/Safari report `isComposing: false` on keydowns that are
       // still mid-Hangul-composition; clearing the flag there lets every jamo
@@ -617,6 +632,7 @@ function bindTerminalIme(term, socket, getSurface) {
       lastComposed = null;
       hangulPreedit = false;
       markComposeActivity(event);
+      imeLog("compositionstart", { data: event.data });
       // No real composition outlives this; if compositionend is ever missed
       // (IME quirks, focus races) the flag still clears on its own.
       window.clearTimeout(composeWatchdog);
@@ -625,16 +641,19 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.addEventListener("compositionupdate", (event) => {
       composing = true;
       markComposeActivity(event);
+      imeLog("compositionupdate", { data: event.data });
     }, true);
     const commitComposedText = (composed) => {
       if (!composed) return;
       lastComposed = composed;
+      imeLog("commit->pty", { text: composed });
       sendPtyText(socket, composed);
       window.setTimeout(() => {
         if (lastComposed === composed) lastComposed = null;
       }, 0);
     };
     textarea.addEventListener("compositionend", (event) => {
+      imeLog("compositionend", { data: event.data });
       endCompose();
       // macOS can fire compositionend with empty data and deliver the
       // committed syllable only on the following `input` event; the handler
@@ -646,6 +665,9 @@ function bindTerminalIme(term, socket, getSurface) {
     // arrives here rather than on compositionend; the lastComposed guard in
     // onData keeps this from double-sending where compositionend already did.
     textarea.addEventListener("input", (event) => {
+      if (event instanceof InputEvent) {
+        imeLog("input", { inputType: event.inputType, data: event.data });
+      }
       if (!(event instanceof InputEvent)) return;
       if (event.inputType === "insertCompositionText") return;
       if (event.inputType === "insertText" && event.data) {
@@ -667,9 +689,15 @@ function bindTerminalIme(term, socket, getSurface) {
     // Ctrl chords) are never composed text — forward them even mid-composition.
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    if (isComposingNow() && !isControlData) return;
-    // Skip only if xterm echoes the exact composed char we already sent
-    if (lastComposed !== null && data === lastComposed) return;
+    if (isComposingNow() && !isControlData) {
+      imeLog("onData BLOCKED", { data });
+      return;
+    }
+    if (lastComposed !== null && data === lastComposed) {
+      imeLog("onData dedup", { data });
+      return;
+    }
+    imeLog("onData->pty", { data });
     sendPtyText(socket, data);
   });
 }
