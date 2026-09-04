@@ -178,8 +178,14 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("if (event.keyCode === 229) lastKey229At", TERM)
         self.assertIn("composeWatchdog = window.setTimeout", TERM)
         self.assertIn("isComposingNow() && !isControlData", TERM)
-        # macOS has no composition events: the marked syllable is tracked from
-        # input/insertReplacementText and flushed on a boundary.
+        # compositionend must NOT re-send the composed text — xterm's own
+        # composition handler emits it through onData (double = 한한글글).
+        self.assertNotIn("commitComposedText", TERM)
+        self.assertIn("Do NOT send here", TERM)
+        # Degraded macOS path (no composition events): the marked syllable is
+        # tracked from input/insertReplacementText and flushed on a boundary,
+        # and only while composition events are demonstrably absent.
+        self.assertIn("Date.now() - lastCompositionAt < 1500", TERM)
         self.assertIn("insertReplacementText", TERM)
         self.assertIn("const flushImeMarked", TERM)
         self.assertIn("imeFlushTimer = window.setTimeout(flushImeMarked", TERM)

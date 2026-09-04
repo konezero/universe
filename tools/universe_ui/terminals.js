@@ -613,8 +613,8 @@ function renderImeDebugBox() {
 function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
-  let lastComposed = null;
   let lastComposeAt = 0;
+  let lastCompositionAt = 0;
   let hangulPreedit = false;
   // IME diagnostic ring buffer. Read after reproducing:
   //   copy(JSON.stringify(window.__imeTrace))
@@ -717,8 +717,8 @@ function bindTerminalIme(term, socket, getSurface) {
     textarea.setAttribute("spellcheck", "false");
     textarea.addEventListener("compositionstart", (event) => {
       composing = true;
-      lastComposed = null;
       hangulPreedit = false;
+      lastCompositionAt = Date.now();
       markComposeActivity(event);
       imeLog("compositionstart", { data: event.data });
       // No real composition outlives this; if compositionend is ever missed
@@ -728,82 +728,51 @@ function bindTerminalIme(term, socket, getSurface) {
     }, true);
     textarea.addEventListener("compositionupdate", (event) => {
       composing = true;
+      lastCompositionAt = Date.now();
       markComposeActivity(event);
       imeLog("compositionupdate", { data: event.data });
     }, true);
-    const commitComposedText = (composed) => {
-      if (!composed) return;
-      lastComposed = composed;
-      imeLog("commit->pty", { text: composed });
-      sendPtyText(socket, composed);
-      window.setTimeout(() => {
-        if (lastComposed === composed) lastComposed = null;
-      }, 0);
-    };
     textarea.addEventListener("compositionend", (event) => {
       imeLog("compositionend", { data: event.data });
+      lastCompositionAt = Date.now();
+      // Do NOT send here. xterm's own composition handler emits the committed
+      // text through onData right after this; sending it again produced
+      // 한한글글 (and the NFC/NFD-sensitive dedup could not catch it).
       endCompose();
-      // macOS can fire compositionend with empty data and deliver the
-      // committed syllable only on the following `input` event; the handler
-      // below covers that. When data is present (Windows, most Linux) this is
-      // the authoritative commit.
-      commitComposedText(event.data || "");
     }, true);
-    // The text system's commit callback. On Windows the composed syllable can
-    // arrive here rather than on compositionend. On macOS (no composition
-    // events) this is the *only* signal, and it drives the marked-syllable
-    // tracker below.
+    // Fallback for the degraded macOS path where the IME fires NO composition
+    // events and refines the syllable through input/insertReplacementText.
+    // Only engages when composition events are demonstrably absent.
     textarea.addEventListener("input", (event) => {
       if (!(event instanceof InputEvent)) return;
       const it = event.inputType;
       imeLog("input", { inputType: it, data: event.data });
+      if (composing || Date.now() - lastCompositionAt < 1500) return;
 
-      // Windows / standard path: real composition events are in charge.
-      if (composing) {
-        if (it === "insertText" && event.data && Date.now() - lastComposeAt < 400) {
-          commitComposedText(event.data);
-          endCompose();
-        }
-        return;
-      }
-
-      const imeOrigin =
-        it === "insertReplacementText"
-        || it === "insertCompositionText"
-        || (it === "insertText" && Date.now() - lastKey229At < 600);
-      if (!imeOrigin) {
-        // Ordinary typing / paste — xterm's onData owns it.
-        if (imeMarked) flushImeMarked();
-        return;
-      }
-
-      imeInputAt = Date.now();
-      if (it === "insertReplacementText" || it === "insertCompositionText") {
-        // Same syllable, refined in place.
+      if (it === "insertReplacementText") {
         imeMarked = event.data || imeMarked;
+        imeInputAt = Date.now();
         try { textarea.value = imeMarked; } catch (_e) { /* readonly race */ }
-      } else if (imeMarked && event.data === imeMarked) {
-        // insertText echoing the syllable we already have = the IME's commit
-        // signal for it. Send once and stop; do NOT treat it as a new one.
         window.clearTimeout(imeFlushTimer);
-        imeLog("ime-commit->pty", { text: imeMarked });
-        sendPtyText(socket, imeMarked);
-        imeMarked = "";
-        try { textarea.value = ""; } catch (_e) { /* readonly race */ }
+        imeFlushTimer = window.setTimeout(flushImeMarked, 700);
         return;
-      } else {
-        // Fresh insertText after an IME key: the previous syllable is final.
-        if (imeMarked) {
+      }
+      if (it === "insertText" && event.data && Date.now() - lastKey229At < 600) {
+        // A fresh jamo after a 229 key: the previous marked syllable is final.
+        if (imeMarked && event.data !== imeMarked) {
           imeLog("ime-commit->pty", { text: imeMarked });
           sendPtyText(socket, imeMarked);
         }
-        // A Windows compositionend may have already sent this exact text.
-        imeMarked =
-          event.data && event.data !== lastComposed ? event.data : "";
+        imeMarked = event.data === imeMarked ? "" : event.data;
+        imeInputAt = Date.now();
         try { textarea.value = imeMarked; } catch (_e) { /* readonly race */ }
+        if (imeMarked) {
+          window.clearTimeout(imeFlushTimer);
+          imeFlushTimer = window.setTimeout(flushImeMarked, 700);
+        }
+        return;
       }
-      window.clearTimeout(imeFlushTimer);
-      imeFlushTimer = window.setTimeout(flushImeMarked, 700);
+      if (imeMarked) flushImeMarked();
     }, true);
     // A composition abandoned by a blur/refit would otherwise wedge `composing`.
     textarea.addEventListener("blur", () => { endCompose(); flushImeMarked(); }, true);
@@ -812,14 +781,13 @@ function bindTerminalIme(term, socket, getSurface) {
     // xterm auto-answers DA1/CPR/OSC during a replay; those bytes
     // must not reach the PTY as stray input.
     if (getSurface?.()?.replaying) return;
-    // Control / navigation bytes (Enter \r, Backspace \x7f, arrows \x1b[…,
-    // Ctrl chords) are never composed text — forward them even mid-composition.
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    // macOS marked-syllable path: the input listener owns every printable send
-    // while a syllable is being built or a jamo key just fired.
+    // Degraded macOS path only: the input listener owns the send while a
+    // syllable is marked or a jamo key just fired.
     if (
       !isControlData
+      && Date.now() - lastCompositionAt > 1500
       && (imeMarked
         || Date.now() - imeInputAt < 400
         || Date.now() - lastKey229At < 400)
@@ -829,10 +797,6 @@ function bindTerminalIme(term, socket, getSurface) {
     }
     if (isComposingNow() && !isControlData) {
       imeLog("onData BLOCKED", { data });
-      return;
-    }
-    if (lastComposed !== null && data === lastComposed) {
-      imeLog("onData dedup", { data });
       return;
     }
     imeLog("onData->pty", { data });
