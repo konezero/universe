@@ -425,6 +425,13 @@ function renderTerminalDock() {
       const chip = node("span", "terminal-status-chip", cliName);
       chip.classList.add(session.provider_cli_alive === false ? "is-dead" : "is-live");
       chip.title = String(session.provider_cli_process || cliName);
+      const quotaState = providerQuotaStateFor(session.provider);
+      if (quotaState && quotaState !== "UNKNOWN") {
+        const pip = node("span", "terminal-quota-pip");
+        pip.dataset.state = quotaState;
+        pip.title = `${String(session.provider || "").toUpperCase()} quota: ${quotaState}`;
+        chip.append(pip);
+      }
       tab.append(chip);
     }
     const delivery = String(session.prompt_delivery || "").toLowerCase();
@@ -457,6 +464,127 @@ function renderTerminalDock() {
 function setTerminalGrid(on) {
   state.terminalGrid = Boolean(on);
   renderTerminalDock();
+}
+
+// --- Provider quota strip -------------------------------------------------
+// Account-level, not per-session: every live session of a provider draws on
+// the same bucket, so the strip shows all three providers regardless of which
+// pane is focused. The server sweep is event-cheap; this just polls it.
+const PROVIDER_QUOTA_STALE_MS = 6 * 60 * 1000;
+
+function quotaResetLabel(resetsAt) {
+  if (resetsAt === null || resetsAt === undefined || resetsAt === "") return "";
+  let target = null;
+  if (typeof resetsAt === "number") {
+    target = resetsAt > 1e12 ? resetsAt : resetsAt * 1000;
+  } else {
+    const parsed = Date.parse(String(resetsAt));
+    if (!Number.isNaN(parsed)) target = parsed;
+  }
+  if (target === null) return "";
+  const deltaMs = target - Date.now();
+  if (deltaMs <= 0) return "resetting";
+  const mins = Math.round(deltaMs / 60000);
+  if (mins < 60) return `resets ${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem ? `resets ${hrs}h${rem}m` : `resets ${hrs}h`;
+}
+
+function tightestQuotaWindow(windows) {
+  if (!Array.isArray(windows) || !windows.length) return null;
+  return windows.reduce((worst, window) => {
+    const pct = Number(window?.used_percent);
+    if (!Number.isFinite(pct)) return worst;
+    if (!worst || pct > Number(worst.used_percent)) return window;
+    return worst;
+  }, null);
+}
+
+function renderProviderQuotaStrip() {
+  const strip = elements.providerQuotaStrip;
+  if (!strip) return;
+  const view = state.providerQuota;
+  const rows = Array.isArray(view?.providers) ? view.providers : [];
+  const known = rows.filter(
+    (row) => row && (row.state !== "UNKNOWN" || (row.windows || []).length)
+  );
+  if (!known.length) {
+    strip.hidden = true;
+    strip.replaceChildren();
+    return;
+  }
+  strip.hidden = false;
+  strip.replaceChildren();
+  for (const row of rows) {
+    const provider = String(row.provider || "").toUpperCase();
+    const state_ = String(row.state || "UNKNOWN").toUpperCase();
+    const line = node("div", "provider-quota-line");
+    line.dataset.state = state_;
+    const observedAt = row.observed_at ? Date.parse(row.observed_at) : NaN;
+    if (!Number.isNaN(observedAt) && Date.now() - observedAt > PROVIDER_QUOTA_STALE_MS) {
+      line.classList.add("is-stale");
+      line.title = "quota reading is stale";
+    }
+    line.append(node("span", "provider-quota-name", provider));
+
+    const window = tightestQuotaWindow(row.windows);
+    const pct = window ? Number(window.used_percent) : NaN;
+    const bar = node("span", "provider-quota-bar");
+    const fill = node("span", "provider-quota-bar-fill");
+    if (Number.isFinite(pct)) {
+      fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    }
+    bar.append(fill);
+    line.append(bar);
+
+    let valueText;
+    if (state_ === "EXHAUSTED") valueText = "EXHAUSTED";
+    else if (Number.isFinite(pct)) valueText = `${Math.round(pct)}%`;
+    else if (state_ === "UNKNOWN") valueText = "—";
+    else valueText = state_;
+    line.append(node("span", "provider-quota-value", valueText));
+
+    const resetText = quotaResetLabel(window?.resets_at);
+    if (resetText) line.append(node("span", "provider-quota-reset", resetText));
+    strip.append(line);
+  }
+}
+
+function providerQuotaStateFor(provider) {
+  const target = String(provider || "").toUpperCase();
+  if (!target) return "";
+  const row = (state.providerQuota?.providers || []).find(
+    (item) => String(item.provider || "").toUpperCase() === target
+  );
+  return row ? String(row.state || "UNKNOWN").toUpperCase() : "";
+}
+
+async function refreshProviderQuota() {
+  try {
+    state.providerQuota = await api("/v1/provider-quota");
+  } catch (_error) {
+    // Endpoint missing or offline — leave the last view in place.
+    return;
+  }
+  renderProviderQuotaStrip();
+  // Only disturb the dock (which refits the active terminal) when a provider's
+  // quota *state* actually changed — not on every 15s poll.
+  const signature = (state.providerQuota?.providers || [])
+    .map((row) => `${row.provider}:${row.state}`)
+    .join("|");
+  if (signature !== state.providerQuotaPipSignature) {
+    state.providerQuotaPipSignature = signature;
+    if (typeof renderTerminalDock === "function") renderTerminalDock();
+  }
+}
+
+function startProviderQuotaPolling() {
+  if (state.providerQuotaTimer) return;
+  void refreshProviderQuota();
+  state.providerQuotaTimer = window.setInterval(refreshProviderQuota, 15000);
+  // Re-read the strip's reset countdowns each minute without a network call.
+  window.setInterval(renderProviderQuotaStrip, 60000);
 }
 
 function applyTerminalGridLayout() {
@@ -1182,6 +1310,7 @@ function focusTerminalForSession(coordinate, session) {
 }
 
 async function loadTerminalTabs() {
+  startProviderQuotaPolling();
   try {
     const payload = await api("/v1/terminals");
     const incoming = payload.terminals || [];

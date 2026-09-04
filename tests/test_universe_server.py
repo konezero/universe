@@ -6193,6 +6193,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("universe MASTER CODEX", row["label"])
         self.assertNotIn("UNKNOWN", row["label"])
 
+    def test_provider_quota_endpoint_returns_three_rows_and_absorbs_a_sweep(
+        self,
+    ) -> None:
+        # Nothing observed yet: three stable rows, all UNKNOWN.
+        status, payload = self.request(
+            "GET", "/v1/provider-quota", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["CLAUDE", "GROK", "CODEX"],
+            [row["provider"] for row in payload["providers"]],
+        )
+        self.assertTrue(all(row["state"] == "UNKNOWN" for row in payload["providers"]))
+
+        # A live conductor connection carrying a quota reading is picked up by
+        # the endpoint's own sweep.
+        self.server.conductor_session_status = lambda: {  # type: ignore[method-assign]
+            "schema": "universe.provider-session-connection.v1",
+            "connection_state": "OPEN",
+            "session_ref": "session_anchor_conductor",
+            "runtime_observation": {
+                "schema": "universe.provider-runtime-observation.v1",
+                "provider": "CLAUDE",
+                "quota": {
+                    "schema": "universe.provider-quota-snapshot.v1",
+                    "provider": "CLAUDE",
+                    "source": "rate_limit_event",
+                    "state": "WARNING",
+                    "windows": [
+                        {"name": "FIVE_HOUR", "used_percent": 83.0},
+                    ],
+                },
+            },
+        }
+        status, payload = self.request(
+            "GET", "/v1/provider-quota", token=self.token
+        )
+        self.assertEqual(200, status)
+        claude = payload["providers"][0]
+        self.assertEqual("WARNING", claude["state"])
+        self.assertEqual(83.0, claude["windows"][0]["used_percent"])
+        self.assertEqual("session_anchor_conductor", claude["session_ref"])
+
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None

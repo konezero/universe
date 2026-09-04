@@ -473,6 +473,7 @@ const elements = {
   conversationOpacity: document.querySelector("#conversation-opacity"),
   roomMessageList: document.querySelector("#room-message-list"),
   terminalTabs: document.querySelector("#terminal-tabs"),
+  providerQuotaStrip: document.querySelector("#provider-quota-strip"),
   terminalStage: document.querySelector("#terminal-stage"),
   conversationTitle: document.querySelector("#conversation-title"),
   conversationTargetLabel: document.querySelector("#conversation-target-label"),

@@ -835,6 +835,62 @@ body.inspector-open .graph-hint {
   gap: 6px;
   padding: 8px 10px 0;
 }
+.provider-quota-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 6px 12px 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2, #9fb2c4);
+  border-bottom: 1px solid var(--line-soft);
+}
+.provider-quota-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.provider-quota-line.is-stale { opacity: 0.45; }
+.provider-quota-name {
+  min-width: 46px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.provider-quota-bar {
+  position: relative;
+  width: 72px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(126, 180, 220, 0.16);
+  overflow: hidden;
+}
+.provider-quota-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: 2px;
+  background: var(--green);
+  transition: width 400ms ease;
+}
+.provider-quota-line[data-state="WARNING"] .provider-quota-bar-fill { background: var(--amber); }
+.provider-quota-line[data-state="EXHAUSTED"] .provider-quota-bar-fill { background: var(--red); width: 100%; }
+.provider-quota-line[data-state="UNKNOWN"] .provider-quota-bar { opacity: 0.4; }
+.provider-quota-value { font-variant-numeric: tabular-nums; }
+.provider-quota-line[data-state="EXHAUSTED"] .provider-quota-value { color: var(--red); font-weight: 600; }
+.provider-quota-line[data-state="WARNING"] .provider-quota-value { color: var(--amber); }
+.provider-quota-reset { opacity: 0.7; }
+.terminal-quota-pip {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  vertical-align: middle;
+  background: var(--green);
+}
+.terminal-quota-pip[data-state="WARNING"] { background: var(--amber); }
+.terminal-quota-pip[data-state="EXHAUSTED"] { background: var(--red); }
 .terminal-new-wrap {
   position: relative;
   flex: 0 0 auto;

@@ -293,6 +293,7 @@ from universe_app.provider_session_service import (
     ProviderSessionError,
     ProviderSessionService,
 )
+from universe_app.provider_quota_registry import ProviderQuotaRegistry
 from universe_service_control import service_program
 from session_broker_host import SessionBrokerClient, SessionBrokerError
 from universe_app.work_loop_prediction import (
@@ -25358,6 +25359,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if auto_start_project_masters
             else None
         )
+        self.provider_quota_registry = ProviderQuotaRegistry()
         self._conductor_worker = threading.Thread(
             target=self._conductor_worker_loop,
             name="universe-conductor-room-worker",
@@ -29141,6 +29143,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         settings["universe_conductor"]["session_connection"] = (
             self.conductor_session_status()
         )
+        self._record_connection_quota(
+            settings["universe_conductor"]["session_connection"]
+        )
         for project in settings["project_masters"]:
             project["resolved_provider"] = self._resolve_configured_provider(
                 project["provider"],
@@ -29172,6 +29177,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "resident": False,
                 }
             )
+            self._record_connection_quota(project["session_connection"])
         settings["status"] = "CLI_PROVIDER_SETTINGS_COLLECTED"
         return settings
 
@@ -29384,6 +29390,48 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             status["error_code"] = self._conductor_session_error["error_code"]
             status["reason"] = self._conductor_session_error["reason"]
         return status
+
+    def _record_connection_quota(self, connection: Any) -> None:
+        """Feed a session connection's quota reading into the account-level registry."""
+
+        if not isinstance(connection, Mapping):
+            return
+        observation = connection.get("runtime_observation")
+        if not isinstance(observation, Mapping):
+            return
+        quota = observation.get("quota")
+        session_ref = str(
+            connection.get("session_ref")
+            or connection.get("last_session_ref")
+            or observation.get("session_ref")
+            or ""
+        )
+        self.provider_quota_registry.record(quota, session_ref=session_ref)
+
+    def provider_quota_view(self) -> dict[str, Any]:
+        """Sweep the live conductor + master connections, then return the 3-row view.
+
+        The sweep is cheap: each ``status()`` is an in-memory read, and Claude
+        sessions carry a fresh ``rate_limit_event`` reading on every turn, so a
+        poll right after a turn settles picks the new number up without a probe.
+        """
+
+        try:
+            self._record_connection_quota(self.conductor_session_status())
+        except Exception:  # noqa: BLE001 - a quota sweep must never break the read
+            pass
+        if self.project_master_hosts is not None:
+            for project in self.store.list_projects():
+                project_id = str(project.get("project_id") or "").strip()
+                if not project_id:
+                    continue
+                try:
+                    self._record_connection_quota(
+                        self.project_master_hosts.connection_status(project_id)
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+        return self.provider_quota_registry.view()
 
     def prepare_conductor_session(
         self,
@@ -37744,6 +37792,11 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if not self._authorize():
                 return
             self._send(HTTPStatus.OK, self.server.list_cli_terminals())
+            return
+        if path == "/v1/provider-quota":
+            if not self._authorize():
+                return
+            self._send(HTTPStatus.OK, self.server.provider_quota_view())
             return
         if path == "/v1/sessions/resumable":
             if not self._authorize():
