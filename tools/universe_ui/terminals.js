@@ -789,6 +789,13 @@ function watchPromptDelivery(terminalId) {
   window.setTimeout(tick, 50);
 }
 
+// SGR mouse report: \x1b[<Cb;Cx;CyM (press/motion) or ...m (release). Bit
+// 0x20 on Cb marks a motion report (mouse moved, with or without a button
+// held) as opposed to a plain press/release — see the onData throttle below.
+const MOUSE_SGR_PATTERN = /^\x1b\[<(\d+);\d+;\d+[Mm]$/;
+const MOUSE_MOTION_MIN_INTERVAL_MS = 32; // ~30/s — plenty for a hover cursor
+let lastMouseMotionSentAt = 0;
+
 // The grid width is fixed at 120 columns; the font is scaled so those columns
 // fill the pane, and the row count is whatever fits vertically at that font.
 // 120x40 is the fallback when the pane cannot be measured yet.
@@ -1028,6 +1035,22 @@ function bindTerminalIme(term, socket, getSurface) {
     // xterm auto-answers DA1/CPR/OSC during a replay; those bytes
     // must not reach the PTY as stray input.
     if (getSurface?.()?.replaying) return;
+    // A mouse-tracking TUI in "any motion" mode (\e[?1003h) makes xterm
+    // report every pixel the mouse crosses, not just clicks/drags/wheel —
+    // a live capture showed 15+ SGR motion reports firing back-to-back while
+    // the mouse simply moved over the pane, each a full onData->send->PTY
+    // round trip. Cap those specifically (bit 0x20 on the SGR button code =
+    // motion) to ~30/s; clicks and wheel reports (no motion bit) are
+    // untouched. Losing an intermediate hover position is imperceptible.
+    const mouseSgr = MOUSE_SGR_PATTERN.exec(data);
+    if (mouseSgr && (Number(mouseSgr[1]) & 0x20) !== 0) {
+      const now = performance.now();
+      if (now - lastMouseMotionSentAt < MOUSE_MOTION_MIN_INTERVAL_MS) {
+        imeLog("onData:drop(mouse-motion)", "");
+        return;
+      }
+      lastMouseMotionSentAt = now;
+    }
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
     // iOS: the `input` listener mirrors every printable key and every
