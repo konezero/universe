@@ -487,8 +487,13 @@ function quotaResetLabel(resetsAt) {
   const mins = Math.round(deltaMs / 60000);
   if (mins < 60) return `resets ${mins}m`;
   const hrs = Math.floor(mins / 60);
-  const rem = mins % 60;
-  return rem ? `resets ${hrs}h${rem}m` : `resets ${hrs}h`;
+  if (hrs < 24) {
+    const rem = mins % 60;
+    return rem ? `resets ${hrs}h${rem}m` : `resets ${hrs}h`;
+  }
+  const days = Math.floor(hrs / 24);
+  const remHrs = hrs % 24;
+  return remHrs ? `resets ${days}d${remHrs}h` : `resets ${days}d`;
 }
 
 function tightestQuotaWindow(windows) {

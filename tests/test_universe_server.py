@@ -6196,6 +6196,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_provider_quota_endpoint_returns_three_rows_and_absorbs_a_sweep(
         self,
     ) -> None:
+        # Isolate from the developer's real ~/.codex transcript.
+        self.server._sweep_transcript_quota = lambda: []  # type: ignore[method-assign]
         # Nothing observed yet: three stable rows, all UNKNOWN.
         status, payload = self.request(
             "GET", "/v1/provider-quota", token=self.token
@@ -6235,6 +6237,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("WARNING", claude["state"])
         self.assertEqual(83.0, claude["windows"][0]["used_percent"])
         self.assertEqual("session_anchor_conductor", claude["session_ref"])
+
+        # A transcript-sourced Codex reading flows through the same endpoint.
+        self.server._sweep_transcript_quota = lambda: [  # type: ignore[method-assign]
+            {
+                "schema": "universe.provider-quota-snapshot.v1",
+                "provider": "CODEX",
+                "source": "codex-rollout-transcript",
+                "state": "EXHAUSTED",
+                "windows": [{"name": "PRIMARY", "used_percent": 100.0}],
+                "rate_limit_reached_type": "primary",
+                "observed_at": "2026-09-04T07:00:00Z",
+            }
+        ]
+        status, payload = self.request(
+            "GET", "/v1/provider-quota", token=self.token
+        )
+        codex = payload["providers"][2]
+        self.assertEqual("EXHAUSTED", codex["state"])
+        self.assertEqual("codex-rollout-transcript", codex["source"])
+        self.assertEqual("2026-09-04T07:00:00Z", codex["observed_at"])
 
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()

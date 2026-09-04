@@ -294,6 +294,7 @@ from universe_app.provider_session_service import (
     ProviderSessionService,
 )
 from universe_app.provider_quota_registry import ProviderQuotaRegistry
+from universe_app.provider_quota_transcript import sweep_transcript_quota
 from universe_service_control import service_program
 from session_broker_host import SessionBrokerClient, SessionBrokerError
 from universe_app.work_loop_prediction import (
@@ -29431,7 +29432,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 except Exception:  # noqa: BLE001
                     continue
+        # ConPTY / terminal sessions never emit an SDK rate_limit_event, so read
+        # the provider CLI's own transcript. Codex records full rate_limits;
+        # Claude only a coarse "approaching limit" notice; Grok nothing.
+        try:
+            for snapshot in self._sweep_transcript_quota():
+                self.provider_quota_registry.record(snapshot)
+        except Exception:  # noqa: BLE001 - transcript sweep is best-effort
+            pass
         return self.provider_quota_registry.view()
+
+    @staticmethod
+    def _sweep_transcript_quota() -> list[dict[str, Any]]:
+        return sweep_transcript_quota(max_age_seconds=24 * 3600)
 
     def prepare_conductor_session(
         self,

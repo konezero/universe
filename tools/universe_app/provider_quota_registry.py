@@ -74,6 +74,9 @@ class ProviderQuotaRegistry:
         windows = _clean_windows(snapshot.get("windows"))
         if state == "UNKNOWN" and not windows:
             return
+        observed_at = snapshot.get("observed_at")
+        if not isinstance(observed_at, str) or not observed_at.strip():
+            observed_at = _utc_now()
         entry = {
             "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
             "provider": provider,
@@ -81,12 +84,21 @@ class ProviderQuotaRegistry:
             "state": state,
             "windows": windows,
             "session_ref": session_ref or "",
-            "observed_at": _utc_now(),
+            "observed_at": observed_at,
+            "recorded_at": _utc_now(),
         }
         reached = snapshot.get("rate_limit_reached_type")
         if isinstance(reached, str) and reached:
             entry["rate_limit_reached_type"] = reached
         with self._lock:
+            current = self._by_provider.get(provider)
+            # Keep the freshest reading — a stale transcript sweep must not
+            # overwrite a live SDK reading that landed in the same pass.
+            if (
+                current is not None
+                and str(current.get("observed_at") or "") > observed_at
+            ):
+                return
             self._by_provider[provider] = entry
 
     def view(self) -> dict[str, Any]:
