@@ -1027,6 +1027,8 @@ async function closeTerminalTab(terminalId) {
   }
   if (typeof renderComposerState === "function") renderComposerState();
   if (typeof renderRoomMessages === "function") renderRoomMessages();
+  renderReattachBanner();
+  renderTerminalNewMenu();
 }
 
 function focusTerminalForSession(coordinate, session) {
@@ -1115,7 +1117,243 @@ async function loadTerminalTabs() {
     }
     if (state.activeTerminalId) applyCliDockTitle(activeTerminalSession());
     else applyCliDockTitle(null);
+    await loadResumableSessions();
+    renderReattachBanner();
+    renderTerminalNewMenu();
   } catch (_error) {
     state.terminals = state.terminals || [];
   }
+}
+
+function hostSessionRefOf(item) {
+  return String(
+    item?.host_session_ref || item?.host_id || item?.reconnection_host_id || ""
+  ).trim();
+}
+
+function hostRuntimeLive(host) {
+  return String(host?.runtime_state || host?.state || "").trim().toUpperCase() === "LIVE";
+}
+
+function hostCompatibilityOk(host) {
+  return ["CURRENT", "COMPATIBLE_OLD"].includes(
+    String(host?.compatibility || host?.host_compatibility || "").trim().toUpperCase()
+  );
+}
+
+function eligibleReattachHosts() {
+  const openHosts = new Set((state.terminals || []).map(hostSessionRefOf).filter(Boolean));
+  const openAnchors = new Set(
+    (state.terminals || [])
+      .map((item) => String(item.session_anchor_ref || item.active_session_anchor_ref || "").trim())
+      .filter(Boolean)
+  );
+  return (state.supervisorHosts || []).filter((host) => {
+    const href = hostSessionRefOf(host);
+    const anchor = String(host.session_anchor_ref || host.anchor_ref || "").trim();
+    return hostRuntimeLive(host)
+      && host.reconnect_eligible === true
+      && hostCompatibilityOk(host)
+      && href
+      && !openHosts.has(href)
+      && !(anchor && openAnchors.has(anchor));
+  });
+}
+
+function reattachHostLabel(host) {
+  const project = String(host.project_id || host.node || "session").trim();
+  const mode = String(host.mode || "").trim().toUpperCase();
+  const provider = String(host.provider || "").trim().toUpperCase();
+  const parts = [project, mode, provider].filter(Boolean);
+  return parts.length ? parts.join(" ") : hostSessionRefOf(host);
+}
+
+function joinReattachHost(host, catalog) {
+  const row = { ...host };
+  const href = hostSessionRefOf(host);
+  const anchor = String(host.session_anchor_ref || host.anchor_ref || "").trim();
+  const match = (catalog || []).find((item) => {
+    if (item.kind === "REATTACH" && hostSessionRefOf(item) === href) return true;
+    return String(item.session_anchor_ref || "").trim() === anchor && Boolean(anchor);
+  });
+  if (match) {
+    row.project_id = row.project_id || match.project_id;
+    row.mode = row.mode || match.mode;
+    row.provider = row.provider || match.provider;
+    row.supervisor_session_id = row.supervisor_session_id || match.supervisor_session_id;
+    row.label = match.label || row.label;
+    row.last_seen_at = row.last_seen_at || match.last_seen_at;
+  }
+  const session = (state.projectAnchorSessions || []).find(
+    (item) => String(item.session_anchor_ref || "").trim() === anchor && Boolean(anchor)
+  );
+  if (session) {
+    row.project_id = row.project_id || session.project_id || session.node;
+    row.mode = row.mode || session.mode;
+    row.provider = row.provider || session.provider;
+    row.supervisor_session_id =
+      row.supervisor_session_id || session.universe_session_id || session.session_id;
+    row.last_seen_at = row.last_seen_at || session.last_seen_at;
+  }
+  const live = (state.supervisorTerminals || []).find(
+    (item) => hostSessionRefOf(item) === href && Boolean(href)
+  );
+  if (live) {
+    row.project_id = row.project_id || live.project_id;
+    row.mode = row.mode || live.mode;
+    row.provider = row.provider || live.provider;
+    row.supervisor_session_id =
+      row.supervisor_session_id || live.supervisor_session_id || live.session_id;
+    row.session_anchor_ref =
+      row.session_anchor_ref || live.session_anchor_ref || live.active_session_anchor_ref;
+  }
+  if (!row.label) row.label = reattachHostLabel(row);
+  return row;
+}
+
+function currentReattachHosts() {
+  const catalog = state.resumableSessions?.reattach || [];
+  const hosts = eligibleReattachHosts().map((host) => joinReattachHost(host, catalog));
+  const seen = new Set(hosts.map(hostSessionRefOf).filter(Boolean));
+  for (const item of catalog) {
+    const href = hostSessionRefOf(item);
+    if (href && seen.has(href)) continue;
+    hosts.push(item);
+    if (href) seen.add(href);
+  }
+  return hosts;
+}
+
+async function loadResumableSessions() {
+  try {
+    const payload = await api("/v1/sessions/resumable?limit=7");
+    state.resumableSessions = payload;
+    return payload;
+  } catch (_error) {
+    state.resumableSessions = { reattach: [], resume: [], incompatible: [] };
+    return state.resumableSessions;
+  }
+}
+
+function renderReattachBanner() {
+  const banner = document.querySelector("#terminal-reattach-banner");
+  const text = document.querySelector("#terminal-reattach-banner-text");
+  if (!banner || !text) return;
+  const hosts = currentReattachHosts();
+  if (!hosts.length) {
+    state.reattachBannerDismissed = false;
+    banner.hidden = true;
+    banner.classList.add("hidden");
+    return;
+  }
+  const show = state.reattachBannerDismissed !== true;
+  banner.hidden = !show;
+  banner.classList.toggle("hidden", !show);
+  text.textContent = `재기동됨 — 재접속 가능한 세션 ${hosts.length}개`;
+}
+
+function hideReattachBanner() {
+  state.reattachBannerDismissed = true;
+  renderReattachBanner();
+}
+
+function renderTerminalNewMenu() {
+  const menu = document.querySelector("#terminal-new-menu");
+  if (!menu) return;
+  const hosts = currentReattachHosts();
+  menu.replaceChildren();
+  const neu = document.createElement("button");
+  neu.type = "button";
+  neu.className = "terminal-new-menu-item";
+  neu.setAttribute("role", "menuitem");
+  neu.textContent = "New session";
+  neu.addEventListener("click", () => {
+    closeTerminalNewMenu();
+    const homeNode = typeof homeSelectedNode === "function" ? homeSelectedNode() : null;
+    openNewSessionDialog({
+      projectId: state.selectedProject?.project_id,
+      nodeHint: homeNode?.label,
+    });
+  });
+  menu.append(neu);
+  for (const host of hosts) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "terminal-new-menu-item";
+    item.setAttribute("role", "menuitem");
+    const label = host.label || reattachHostLabel(host);
+    item.textContent = `Re-attach ${label}`;
+    item.title = "Live PTY — re-attach immediately";
+    item.addEventListener("click", () => {
+      closeTerminalNewMenu();
+      reattachLiveHost(host).catch((error) => toast(error.message, true));
+    });
+    menu.append(item);
+  }
+}
+
+function closeTerminalNewMenu() {
+  const menu = document.querySelector("#terminal-new-menu");
+  const button = document.querySelector("#terminal-new-session");
+  if (!menu) return;
+  menu.hidden = true;
+  menu.classList.add("hidden");
+  if (button) button.setAttribute("aria-expanded", "false");
+}
+
+function toggleTerminalNewMenu() {
+  const menu = document.querySelector("#terminal-new-menu");
+  const button = document.querySelector("#terminal-new-session");
+  if (!menu) return;
+  renderTerminalNewMenu();
+  const open = menu.hidden;
+  menu.hidden = !open;
+  menu.classList.toggle("hidden", !open);
+  if (button) button.setAttribute("aria-expanded", String(open));
+}
+
+async function reattachLiveHost(host) {
+  const projectId = String(host.project_id || host.node || "universe").trim() || "universe";
+  const project = (state.projects || []).find(
+    (item) => String(item.project_id || "").trim() === projectId
+  ) || { project_id: projectId, project_root: "" };
+  if (!project.project_root) {
+    const universe = (state.projects || []).find(
+      (item) => String(item.project_id || "").trim() === "universe"
+    );
+    if (universe) {
+      project.project_id = project.project_id || universe.project_id;
+      project.project_root = universe.project_root;
+    }
+  }
+  const session = {
+    host_session_ref: hostSessionRefOf(host),
+    session_anchor_ref: String(host.session_anchor_ref || host.anchor_ref || "").trim(),
+    project_id: project.project_id || projectId,
+    mode: String(host.mode || "MASTER").toUpperCase(),
+    provider: String(host.provider || "AUTO").toUpperCase(),
+    session_id: host.supervisor_session_id || host.session_id,
+    universe_session_id: host.supervisor_session_id || host.session_id,
+  };
+  await createTerminalTab(
+    { project, nodeId: project.project_id || projectId, mode: session.mode, modelRef: "", effort: "AUTO" },
+    session
+  );
+  await loadResumableSessions();
+  renderReattachBanner();
+  renderTerminalNewMenu();
+}
+
+async function reattachAllLiveHosts() {
+  const hosts = currentReattachHosts();
+  for (const host of hosts) {
+    await reattachLiveHost(host);
+  }
+}
+
+async function noteServiceReconnect() {
+  state.reattachBannerDismissed = false;
+  await loadTerminalTabs();
+  await loadResumableSessions();
+  renderReattachBanner();
 }

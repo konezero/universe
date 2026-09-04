@@ -6039,6 +6039,115 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(filled["provider_cli_alive"])
         self.assertIn("prompt_activity", filled)
 
+    def test_list_resumable_sessions_splits_reattach_and_resume(self) -> None:
+        live_host = {
+            "host_session_ref": "host-live-current",
+            "session_anchor_ref": "anchor-live",
+            "runtime_state": "LIVE",
+            "reconnect_eligible": True,
+            "compatibility": "CURRENT",
+            "provider": "GROK",
+        }
+        incompatible_host = {
+            "host_session_ref": "host-incompatible",
+            "session_anchor_ref": "anchor-incompatible",
+            "runtime_state": "LIVE",
+            "reconnect_eligible": True,
+            "compatibility": "INCOMPATIBLE",
+            "provider": "CLAUDE",
+        }
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = []
+        terminal_host.list_hosts.return_value = [live_host, incompatible_host]
+        self.server.terminal_host = terminal_host
+        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+            {
+                "session_anchor_ref": "anchor-live",
+                "universe_session_id": "sess-live",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "GROK",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-04T03:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-incompatible",
+                "universe_session_id": "sess-incompatible",
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CLAUDE",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-04T02:30:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-dead-new",
+                "universe_session_id": "sess-dead-new",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-04T02:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-dead-old",
+                "universe_session_id": "sess-dead-old",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-04T01:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-stale",
+                "universe_session_id": "sess-stale",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "STALE",
+                "last_seen_at": "2026-09-03T00:00:00Z",
+            },
+        ]
+
+        listed = self.server.list_resumable_sessions({"limit": 7})
+        self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", listed["status"])
+        self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in listed["reattach"]])
+        self.assertEqual(["REATTACH"], [row["kind"] for row in listed["reattach"]])
+        self.assertEqual(["sess-dead-new"], [row["session_id"] for row in listed["resume"]])
+        self.assertEqual(["RESUME"], [row["kind"] for row in listed["resume"]])
+        self.assertEqual(
+            ["anchor-incompatible"],
+            [row["session_anchor_ref"] for row in listed["incompatible"]],
+        )
+        self.assertIn("런타임 바뀜", listed["incompatible"][0]["reason"])
+        self.assertFalse(listed["resume_truncated"])
+
+        expanded = self.server.list_resumable_sessions(
+            {"project_id": "GCS", "mode": "MASTER", "limit": 7}
+        )
+        self.assertEqual(
+            ["anchor-dead-new", "anchor-dead-old", "anchor-stale"],
+            [row["session_anchor_ref"] for row in expanded["resume"]],
+        )
+        paged = self.server.list_resumable_sessions(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "before": "2026-09-04T02:00:00Z",
+                "limit": 7,
+            }
+        )
+        self.assertEqual(
+            ["anchor-dead-old", "anchor-stale"],
+            [row["session_anchor_ref"] for row in paged["resume"]],
+        )
+
+        status, payload = self.request(
+            "GET", "/v1/sessions/resumable?limit=7", token=self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
+        self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
+
     def test_new_cli_terminal_waits_for_provider_hook_not_runtime_boot(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None

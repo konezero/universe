@@ -278,9 +278,10 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("working: sessions.filter(nodeModeSessionIsWorking)", APP)
         self.assertIn("Session and Anchor records are authoritative", APP)
         self.assertIn("No current or recent sessions in this mode", APP)
-        self.assertIn("const NODE_MODE_RECENT_SESSION_LIMIT = 5", APP)
+        self.assertIn("const NODE_MODE_DEFAULT_SESSION_LIMIT = 1", APP)
+        self.assertIn("const NODE_MODE_EXPANDED_SESSION_LIMIT = 7", APP)
         self.assertIn("function recentAnchorSessionsForCoordinate", APP)
-        self.assertIn("recentAnchorSessionsForCoordinate(coordinate).slice", APP)
+        self.assertIn("all.slice(", APP)
         self.assertIn("hostReconnectEligible(session)", APP)
         self.assertIn('statusLabel = "HOST INCOMPATIBLE"', APP)
         self.assertIn('statusLabel = "CURRENT"', APP)
@@ -314,6 +315,39 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("New session", APP)
         card_slice = APP[APP.index("function renderNodeModeSessionCards") : APP.index("function selectNodeModeNode")]
         self.assertNotIn("Delegate here", card_slice)
+        self.assertIn("Re-attach", card_slice)
+        self.assertIn("Resume", card_slice)
+        self.assertIn("런타임 바뀜 — 종료 후 재생성", card_slice)
+        self.assertIn("더 보기", card_slice)
+
+    def test_dock_reattach_menu_and_reconnect_banner(self) -> None:
+        self.assertIn('id="terminal-reattach-banner"', HTML)
+        self.assertIn('id="terminal-reattach-all"', HTML)
+        self.assertIn(">모두 re-attach<", HTML)
+        self.assertIn(">선택<", HTML)
+        self.assertIn('id="terminal-new-menu"', HTML)
+        self.assertIn("function eligibleReattachHosts()", TERM)
+        self.assertIn("function renderReattachBanner()", TERM)
+        self.assertIn("function toggleTerminalNewMenu()", TERM)
+        self.assertIn("function reattachLiveHost(host)", TERM)
+        self.assertIn("function reattachAllLiveHosts()", TERM)
+        self.assertIn("async function noteServiceReconnect()", TERM)
+        close_slice = TERM[
+            TERM.index("async function closeTerminalTab") : TERM.index(
+                "function focusTerminalForSession"
+            )
+        ]
+        self.assertIn("renderReattachBanner()", close_slice)
+        self.assertIn('api("/v1/sessions/resumable?limit=7")', TERM)
+        self.assertIn('"session.resume"', TERM)
+        self.assertIn("hostRuntimeLive(host)", TERM)
+        self.assertIn('host.reconnect_eligible === true', TERM)
+        self.assertIn('"CURRENT", "COMPATIBLE_OLD"', TERM)
+        self.assertIn("toggleTerminalNewMenu()", APP)
+        self.assertIn("noteServiceReconnect", APP)
+        self.assertIn("state.lastServiceReady === false && ready", APP)
+        self.assertIn(".terminal-reattach-banner", CSS)
+        self.assertIn(".terminal-new-menu", CSS)
 
     def test_goal_plan_hides_done_todos_but_keeps_completion_metrics(self) -> None:
         # The Plan/Board toggle is gone; the integrated home is the only layout.

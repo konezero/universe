@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-14">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-15-reattach">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
 </head>
 <body>
@@ -42,6 +42,14 @@
         <span class="user-chip" title="Session">UC</span>
       </div>
     </header>
+    <div id="terminal-reattach-banner" class="terminal-reattach-banner hidden" hidden>
+      <span id="terminal-reattach-banner-text">재기동됨 — 재접속 가능한 세션 0개</span>
+      <div class="terminal-reattach-banner-actions">
+        <button id="terminal-reattach-all" type="button">모두 re-attach</button>
+        <button id="terminal-reattach-pick" type="button">선택</button>
+        <button id="terminal-reattach-dismiss" type="button" title="Dismiss" aria-label="Dismiss">&times;</button>
+      </div>
+    </div>
 
     <nav class="utility-rail" aria-label="Universe tools">
       <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
@@ -261,7 +269,10 @@
               <strong id="conversation-title">Terminal</strong>
               <small id="conversation-target-label">No terminal tab</small>
             </button>
-            <button id="terminal-new-session" class="icon-button compact" type="button" title="New session" aria-label="New session">&#43;</button>
+            <div class="terminal-new-wrap">
+              <button id="terminal-new-session" class="icon-button compact" type="button" title="New session" aria-label="New session" aria-haspopup="menu" aria-expanded="false">&#43;</button>
+              <div id="terminal-new-menu" class="terminal-new-menu hidden" hidden role="menu" aria-label="New or re-attach session"></div>
+            </div>
             <button id="terminal-dock-side" class="icon-button compact" type="button" title="Dock to bottom / right" aria-label="Dock to bottom or right">&#9660;</button>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
             <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
@@ -1433,7 +1444,7 @@
   <script src="/xterm-addon-unicode11.min.js?v=0.10.0-beta.300"></script>
   <script src="/xterm-addon-web-links.min.js?v=0.13.0-beta.300"></script>
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
-  <script src="/terminals.js?v=term-21-xterm-6.1" defer></script>
-  <script src="/app.js?v=work-spine-18-xterm-6.1" defer></script>
+  <script src="/terminals.js?v=term-24-reattach" defer></script>
+  <script src="/app.js?v=work-spine-19-reattach" defer></script>
 </body>
 </html>

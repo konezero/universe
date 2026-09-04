@@ -108,6 +108,10 @@ const state = {
   providerChatRooms: [],
   projectAnchorSessions: [],
   terminals: [],
+  lastServiceReady: null,
+  reattachBannerDismissed: false,
+  resumableSessions: { reattach: [], resume: [], incompatible: [] },
+  nodeModeExpandedCoords: {},
   activeTerminalId: null,
   terminalSurfaces: {},
   providerChatSearch: "",
@@ -2384,6 +2388,7 @@ function openNodeModeSessionActions(coordinate, session) {
   const host = hostForSession(session);
   const hostReady = hostIsUsable(host);
   const hostKnown = Boolean(host || hostSessionRef(session));
+  const incompatible = hostCompatibility(host) === "INCOMPATIBLE";
   if (elements.nodeSessionStop) {
     elements.nodeSessionStop.disabled = !terminalId || !hostReady;
   }
@@ -2391,12 +2396,16 @@ function openNodeModeSessionActions(coordinate, session) {
     elements.nodeSessionInbox.disabled = !sessionAnchorRef(session);
   }
   if (elements.nodeSessionOpen) {
-    elements.nodeSessionOpen.textContent = hostReady
-      ? "Open Host"
-      : hostKnown
-        ? "Host unavailable"
-        : "Start Host";
-    elements.nodeSessionOpen.disabled = hostKnown && !hostReady;
+    if (incompatible) {
+      elements.nodeSessionOpen.textContent = "런타임 바뀜 — 종료 후 재생성";
+      elements.nodeSessionOpen.disabled = true;
+    } else if (hostReady) {
+      elements.nodeSessionOpen.textContent = "Re-attach";
+      elements.nodeSessionOpen.disabled = false;
+    } else {
+      elements.nodeSessionOpen.textContent = "Resume";
+      elements.nodeSessionOpen.disabled = false;
+    }
   }
   if (elements.nodeSessionActionDialog && !elements.nodeSessionActionDialog.open) {
     elements.nodeSessionActionDialog.showModal();
@@ -2684,7 +2693,8 @@ async function selectNodeModeSession(coordinate, session) {
   openNodeModeSessionActions(coordinate, session);
 }
 
-const NODE_MODE_RECENT_SESSION_LIMIT = 5;
+const NODE_MODE_DEFAULT_SESSION_LIMIT = 1;
+const NODE_MODE_EXPANDED_SESSION_LIMIT = 7;
 
 function recentAnchorSessionsForCoordinate(coordinate) {
   const projectId = String(
@@ -2711,9 +2721,11 @@ function recentAnchorSessionsForCoordinate(coordinate) {
 function nodeModePanelSessionBuckets(coordinate) {
   // Session and Anchor records are authoritative. Host data can decorate an
   // existing record but never creates or promotes a session card.
-  const sessions = recentAnchorSessionsForCoordinate(coordinate).slice(
+  const expanded = Boolean(state.nodeModeExpandedCoords?.[coordinate.key]);
+  const all = recentAnchorSessionsForCoordinate(coordinate);
+  const sessions = all.slice(
     0,
-    NODE_MODE_RECENT_SESSION_LIMIT
+    expanded ? NODE_MODE_EXPANDED_SESSION_LIMIT : NODE_MODE_DEFAULT_SESSION_LIMIT
   );
   return {
     working: sessions.filter(nodeModeSessionIsWorking),
@@ -2722,7 +2734,41 @@ function nodeModePanelSessionBuckets(coordinate) {
     ),
     recent: sessions.filter((session) => !nodeModeSessionIsCurrent(session)),
     sessions,
+    truncated: all.length > sessions.length,
   };
+}
+
+async function expandNodeModeSessions(coordinate) {
+  state.nodeModeExpandedCoords = {
+    ...(state.nodeModeExpandedCoords || {}),
+    [coordinate.key]: true,
+  };
+  const projectId = String(coordinate?.project?.project_id || coordinate?.nodeId || "").trim();
+  const mode = String(coordinate?.mode || "").trim().toUpperCase();
+  try {
+    const query =
+      "/v1/sessions/resumable?limit=7" +
+      (projectId ? "&project_id=" + encodeURIComponent(projectId) : "") +
+      (mode ? "&mode=" + encodeURIComponent(mode) : "");
+    const payload = await api(query);
+    const extra = payload.resume || [];
+    if (extra.length) {
+      const known = new Set(
+        (state.projectAnchorSessions || []).map((item) =>
+          String(item.session_anchor_ref || "").trim()
+        )
+      );
+      for (const item of extra) {
+        const anchor = String(item.session_anchor_ref || "").trim();
+        if (!anchor || known.has(anchor)) continue;
+        known.add(anchor);
+        state.projectAnchorSessions = [...(state.projectAnchorSessions || []), item];
+      }
+    }
+  } catch (_error) {
+    /* local expand still applies */
+  }
+  renderNodeModes();
 }
 
 function nodeModePanelSessions(coordinate) {
@@ -2807,9 +2853,9 @@ function renderNodeModeSessionCards(coordinate) {
       card.append(node("span", "node-mode-session-bus-unread", String(Math.min(unread, 99))));
     }
     card.title = compatibility === "INCOMPATIBLE"
-      ? "This Host is incompatible and cannot receive new work"
+      ? "런타임 바뀜 — 종료 후 재생성"
       : host && hostRuntimeState(host) !== "LIVE"
-        ? "This Host is not currently live"
+        ? "Resume restarts the CLI for this session"
       : current
         ? "Inspect the DB Current session anchor"
         : "Inspect this recent session anchor";
@@ -2820,7 +2866,62 @@ function renderNodeModeSessionCards(coordinate) {
       );
     });
     row.append(card);
+    if (compatibility === "INCOMPATIBLE") {
+      row.append(node("small", "node-mode-session-incompatible", "런타임 바뀜 — 종료 후 재생성"));
+    } else {
+      const liveReattach = Boolean(host && hostIsUsable(host));
+      const href = hostSessionRef(session);
+      const alreadyOpen = Boolean(
+        href &&
+          (state.terminals || []).some(
+            (item) =>
+              String(item.host_session_ref || item.reconnection_host_id || "").trim() === href
+          )
+      );
+      if (!(liveReattach && alreadyOpen)) {
+        const action = node("button", "node-mode-session-resume");
+        action.type = "button";
+        if (liveReattach) {
+          action.textContent = "Re-attach";
+          action.title = "Live PTY — re-attach immediately";
+          action.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const target = host || session;
+            if (typeof reattachLiveHost === "function") {
+              reattachLiveHost(target).catch((error) => toast(error.message, true));
+            } else {
+              openNodeModeSessionHost(coordinate, session).catch((error) =>
+                toast(error.message, true)
+              );
+            }
+          });
+        } else {
+          action.textContent = "Resume";
+          action.title = "Restart the CLI for this session";
+          action.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openNodeModeSessionHost(coordinate, session).catch((error) =>
+              toast(error.message, true)
+            );
+          });
+        }
+        row.append(action);
+      }
+    }
     cards.append(row);
+  }
+  if (buckets.truncated) {
+    const more = node("button", "node-mode-session-expand", "더 보기");
+    more.type = "button";
+    more.title = "Load older sessions for this Current Anchor";
+    more.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      expandNodeModeSessions(coordinate).catch((error) => toast(error.message, true));
+    });
+    cards.append(more);
   }
   return cards;
 }
@@ -5140,13 +5241,16 @@ async function refresh({ syncSelectedProject = false } = {}) {
       healthResponse.headers.get("X-Universe-Access-Surface") || "LOCAL_BROWSER";
     state.health = health;
     const programName = health.program?.name || "Universe Server";
-    elements.serviceStatus.dataset.state = health.status === "READY" ? "ready" : "error";
+    const ready = health.status === "READY";
+    const recovered = state.lastServiceReady === false && ready;
+    elements.serviceStatus.dataset.state = ready ? "ready" : "error";
     elements.serviceStatus.textContent =
-      health.status === "READY"
+      ready
         ? state.accessSurface === "REMOTE_BROWSER"
           ? "Paired mobile"
           : programName
         : health.status;
+    state.lastServiceReady = ready;
     state.modeContract = health.mode_contract || null;
     renderModeStatus();
     const listLink = document.querySelector("#universe-list-link");
@@ -5250,7 +5354,11 @@ async function refresh({ syncSelectedProject = false } = {}) {
     if (typeof loadTerminalTabs === "function") {
       void loadTerminalTabs();
     }
+    if (recovered && typeof noteServiceReconnect === "function") {
+      void noteServiceReconnect();
+    }
   } catch (error) {
+    state.lastServiceReady = false;
     elements.serviceStatus.dataset.state = "error";
     elements.serviceStatus.textContent = "Unavailable";
     toast(error.message, true);
@@ -17801,13 +17909,34 @@ refreshLawStrip = function () {
       setGalaxyFullscreen(!document.body.classList.contains("galaxy-fullscreen"))
     );
   }
-  document.querySelector("#terminal-new-session")?.addEventListener("click", () => {
-    // Prefill from what's in view: the home's selected node's project + label.
+  document.querySelector("#terminal-new-session")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof toggleTerminalNewMenu === "function") {
+      toggleTerminalNewMenu();
+      return;
+    }
     const homeNode = typeof homeSelectedNode === "function" ? homeSelectedNode() : null;
     openNewSessionDialog({
       projectId: state.selectedProject?.project_id,
       nodeHint: homeNode?.label,
     });
+  });
+  document.querySelector("#terminal-reattach-all")?.addEventListener("click", () => {
+    if (typeof reattachAllLiveHosts === "function") {
+      reattachAllLiveHosts().catch((error) => toast(error.message, true));
+    }
+  });
+  document.querySelector("#terminal-reattach-pick")?.addEventListener("click", () => {
+    if (typeof hideReattachBanner === "function") hideReattachBanner();
+    if (typeof toggleTerminalNewMenu === "function") toggleTerminalNewMenu();
+  });
+  document.querySelector("#terminal-reattach-dismiss")?.addEventListener("click", () => {
+    if (typeof hideReattachBanner === "function") hideReattachBanner();
+  });
+  document.addEventListener("click", (event) => {
+    const wrap = event.target?.closest?.(".terminal-new-wrap");
+    if (!wrap && typeof closeTerminalNewMenu === "function") closeTerminalNewMenu();
   });
   document.querySelector("#terminal-dock-side")?.addEventListener("click", () => {
     const bottom = !document.body.classList.contains("terminal-bottom");
@@ -17906,3 +18035,26 @@ refresh().finally(() => {
 });
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);
+window.setInterval(async () => {
+  try {
+    const healthResponse = await fetch("/health", { cache: "no-store" });
+    if (!healthResponse.ok) throw new Error("health");
+    const health = await healthResponse.json();
+    const ready = health.status === "READY";
+    const recovered = state.lastServiceReady === false && ready;
+    if (elements.serviceStatus) {
+      elements.serviceStatus.dataset.state = ready ? "ready" : "error";
+    }
+    state.lastServiceReady = ready;
+    if (recovered) {
+      if (typeof noteServiceReconnect === "function") void noteServiceReconnect();
+      else if (typeof loadTerminalTabs === "function") void loadTerminalTabs();
+    }
+  } catch (_error) {
+    state.lastServiceReady = false;
+    if (elements.serviceStatus) {
+      elements.serviceStatus.dataset.state = "error";
+      elements.serviceStatus.textContent = "Unavailable";
+    }
+  }
+}, 5000);

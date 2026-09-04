@@ -30585,6 +30585,207 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "hosts": terminal_host.list_hosts(),
         }
 
+    def list_resumable_sessions(
+        self, query: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        raw = query if isinstance(query, Mapping) else {}
+        try:
+            limit = max(1, min(50, int(raw.get("limit") or 7)))
+        except (TypeError, ValueError):
+            limit = 7
+        before = str(raw.get("before") or "").strip()
+        project_filter = str(raw.get("project_id") or "").strip()
+        mode_filter = str(raw.get("mode") or "").strip().upper()
+        provider_filter = str(raw.get("provider") or "").strip().upper()
+        expand = bool(project_filter or mode_filter or provider_filter)
+        listed = self.list_cli_terminals()
+        terminals = listed.get("terminals") or []
+        hosts = listed.get("hosts") or []
+        open_host_refs = {
+            str(
+                item.get("host_session_ref") or item.get("reconnection_host_id") or ""
+            ).strip()
+            for item in terminals
+            if str(
+                item.get("host_session_ref") or item.get("reconnection_host_id") or ""
+            ).strip()
+        }
+        open_anchors = {
+            str(
+                item.get("session_anchor_ref")
+                or item.get("active_session_anchor_ref")
+                or ""
+            ).strip()
+            for item in terminals
+            if str(
+                item.get("session_anchor_ref")
+                or item.get("active_session_anchor_ref")
+                or ""
+            ).strip()
+        }
+        sessions = self.list_all_project_anchor_sessions()
+        by_anchor = {
+            str(session.get("session_anchor_ref") or "").strip(): session
+            for session in sessions
+            if str(session.get("session_anchor_ref") or "").strip()
+        }
+
+        def _resumable_label(
+            session: Mapping[str, Any], host: Mapping[str, Any] | None = None
+        ) -> str:
+            project_id = str(
+                session.get("project_id") or session.get("node") or ""
+            ).strip()
+            mode = str(session.get("mode") or "").upper()
+            provider = str(
+                session.get("provider") or (host or {}).get("provider") or ""
+            ).upper()
+            return " ".join(
+                part for part in (project_id or "session", mode, provider) if part
+            )
+
+        reattach: list[dict[str, Any]] = []
+        reattach_anchors: set[str] = set()
+        incompatible: list[dict[str, Any]] = []
+        incompatible_anchors: set[str] = set()
+        for host in hosts:
+            runtime = str(host.get("runtime_state") or "").upper()
+            compatibility = str(
+                host.get("compatibility") or host.get("host_compatibility") or ""
+            ).upper()
+            href = str(host.get("host_session_ref") or host.get("host_id") or "").strip()
+            anchor = str(
+                host.get("session_anchor_ref") or host.get("anchor_ref") or ""
+            ).strip()
+            session = by_anchor.get(anchor) or {}
+            if compatibility == "INCOMPATIBLE":
+                if runtime == "LIVE":
+                    if anchor:
+                        incompatible_anchors.add(anchor)
+                    incompatible.append(
+                        {
+                            "kind": "INCOMPATIBLE",
+                            "host_session_ref": href,
+                            "session_anchor_ref": anchor,
+                            "project_id": str(
+                                session.get("project_id") or session.get("node") or ""
+                            ).strip(),
+                            "mode": str(session.get("mode") or "").upper(),
+                            "provider": str(
+                                session.get("provider") or host.get("provider") or ""
+                            ).upper(),
+                            "compatibility": compatibility,
+                            "runtime_state": runtime,
+                            "reason": "런타임 바뀜 — 종료 후 재생성",
+                            "label": _resumable_label(session, host),
+                        }
+                    )
+                continue
+            if runtime != "LIVE" or host.get("reconnect_eligible") is not True:
+                continue
+            if compatibility not in {"CURRENT", "COMPATIBLE_OLD"}:
+                continue
+            if not href or href in open_host_refs:
+                continue
+            if anchor:
+                reattach_anchors.add(anchor)
+            project_id = str(
+                session.get("project_id") or session.get("node") or ""
+            ).strip()
+            mode = str(session.get("mode") or "").upper()
+            provider = str(
+                session.get("provider") or host.get("provider") or ""
+            ).upper()
+            reattach.append(
+                {
+                    "kind": "REATTACH",
+                    "host_session_ref": href,
+                    "session_anchor_ref": anchor,
+                    "supervisor_session_id": str(
+                        session.get("universe_session_id")
+                        or session.get("session_id")
+                        or ""
+                    ),
+                    "project_id": project_id,
+                    "mode": mode,
+                    "provider": provider,
+                    "last_seen_at": str(session.get("last_seen_at") or ""),
+                    "compatibility": compatibility,
+                    "runtime_state": runtime,
+                    "reconnect_eligible": True,
+                    "label": _resumable_label(session, host),
+                }
+            )
+        resume_candidates: list[dict[str, Any]] = []
+        seen_coord: set[tuple[str, str]] = set()
+        if expand:
+            pool = list(sessions)
+        else:
+            pool = [
+                session
+                for session in sessions
+                if str(session.get("currentness") or "").upper() == "CURRENT"
+            ]
+        pool.sort(
+            key=lambda session: str(session.get("last_seen_at") or ""),
+            reverse=True,
+        )
+        for session in pool:
+            project_id = str(
+                session.get("project_id") or session.get("node") or ""
+            ).strip()
+            mode = str(session.get("mode") or "").upper()
+            provider = str(session.get("provider") or "").upper()
+            if project_filter and project_id != project_filter:
+                continue
+            if mode_filter and mode != mode_filter:
+                continue
+            if provider_filter and provider != provider_filter:
+                continue
+            coord = (project_id.casefold(), mode)
+            if not expand:
+                if coord in seen_coord:
+                    continue
+                seen_coord.add(coord)
+            anchor = str(session.get("session_anchor_ref") or "").strip()
+            if (
+                anchor in reattach_anchors
+                or anchor in open_anchors
+                or anchor in incompatible_anchors
+            ):
+                continue
+            resume_candidates.append(
+                {
+                    "kind": "RESUME",
+                    "session_id": str(
+                        session.get("universe_session_id")
+                        or session.get("session_id")
+                        or ""
+                    ),
+                    "session_anchor_ref": anchor,
+                    "project_id": project_id,
+                    "mode": mode,
+                    "provider": provider,
+                    "last_seen_at": str(session.get("last_seen_at") or ""),
+                    "label": _resumable_label(session),
+                }
+            )
+        if before:
+            resume_candidates = [
+                item
+                for item in resume_candidates
+                if str(item.get("last_seen_at") or "") < before
+            ]
+        truncated = len(resume_candidates) > limit
+        return {
+            "schema": API_SCHEMA,
+            "status": "SESSIONS_RESUMABLE_COLLECTED",
+            "reattach": reattach,
+            "resume": resume_candidates[:limit],
+            "incompatible": incompatible,
+            "resume_truncated": truncated,
+        }
+
     def list_cli_terminal_audit_events(
         self, query: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -37515,6 +37716,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if not self._authorize():
                 return
             self._send(HTTPStatus.OK, self.server.list_cli_terminals())
+            return
+        if path == "/v1/sessions/resumable":
+            if not self._authorize():
+                return
+            query = parse_qs(urlsplit(self.path).query)
+            self._send(
+                HTTPStatus.OK,
+                self.server.list_resumable_sessions(
+                    {key: values[0] for key, values in query.items() if values}
+                ),
+            )
             return
         if path == "/v1/terminal-audit-events":
             if not self._authorize():
