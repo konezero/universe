@@ -30756,9 +30756,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             reverse=True,
         )
         for session in pool:
-            anchor_hint = str(session.get("session_anchor_ref") or "").strip()
-            if anchor_hint and anchor_hint in shell_identities:
-                session = _anchor_view(anchor_hint)
+            # The managed-shell identity fallback is only trusted for a live
+            # reconnection host (re-attach). A dead session's stale identity
+            # file must not stamp a provider the anchor-session record lacks.
             project_id = str(
                 session.get("project_id") or session.get("node") or ""
             ).strip()
