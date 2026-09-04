@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from universe_app.provider_quota_transcript import (  # noqa: E402
     claude_quota_from_transcript,
     codex_quota_from_transcript,
+    grok_quota_from_billing_log,
     sweep_transcript_quota,
 )
 
@@ -195,6 +196,63 @@ class ClaudeTranscriptQuotaTests(unittest.TestCase):
             self.assertIsNone(claude_quota_from_transcript(transcript))
 
 
+class GrokBillingLogQuotaTests(unittest.TestCase):
+    def test_reads_credit_usage_and_weekly_period(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log = Path(tmp) / "unified.jsonl"
+            _write(
+                log,
+                [
+                    {"msg": "something else"},
+                    {
+                        "ts": "2026-09-04T09:32:16.330Z",
+                        "msg": "billing: fetched credits config",
+                        "ctx": {
+                            "config": {
+                                "creditUsagePercent": 100.0,
+                                "currentPeriod": {
+                                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                                    "end": "2026-09-08T14:47:02.288989+00:00",
+                                },
+                            }
+                        },
+                    },
+                ],
+            )
+            snapshot = grok_quota_from_billing_log(log)
+            assert snapshot is not None
+            self.assertEqual(snapshot["provider"], "GROK")
+            self.assertEqual(snapshot["state"], "EXHAUSTED")
+            self.assertEqual(snapshot["windows"][0]["name"], "WEEKLY")
+            self.assertEqual(snapshot["windows"][0]["used_percent"], 100.0)
+            self.assertEqual(
+                snapshot["windows"][0]["resets_at"],
+                "2026-09-08T14:47:02.288989+00:00",
+            )
+
+    def test_available_below_threshold(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log = Path(tmp) / "unified.jsonl"
+            _write(
+                log,
+                [
+                    {
+                        "msg": "billing: fetched credits config",
+                        "ctx": {"config": {"creditUsagePercent": 12.0}},
+                    }
+                ],
+            )
+            snapshot = grok_quota_from_billing_log(log)
+            assert snapshot is not None
+            self.assertEqual(snapshot["state"], "AVAILABLE")
+
+    def test_no_billing_line_returns_none(self) -> None:
+        with TemporaryDirectory() as tmp:
+            log = Path(tmp) / "unified.jsonl"
+            _write(log, [{"msg": "session: started"}, {"msg": "turn: completed"}])
+            self.assertIsNone(grok_quota_from_billing_log(log))
+
+
 class SweepTests(unittest.TestCase):
     def test_sweep_picks_the_newest_transcript_per_provider(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -233,7 +291,11 @@ class SweepTests(unittest.TestCase):
             os.utime(old, (now - 5000, now - 5000))
             os.utime(new, (now - 10, now - 10))
             snapshots = sweep_transcript_quota(
-                home_by_provider={"CODEX": codex_home, "CLAUDE": Path(tmp) / "nope"}
+                home_by_provider={
+                    "CODEX": codex_home,
+                    "CLAUDE": Path(tmp) / "nope",
+                    "GROK": Path(tmp) / "nope",
+                }
             )
             self.assertEqual(len(snapshots), 1)
             self.assertEqual(snapshots[0]["windows"][0]["used_percent"], 77.0)

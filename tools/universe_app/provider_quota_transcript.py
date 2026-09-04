@@ -9,8 +9,9 @@ CLI writes a transcript, and some of them record their rate-limit state there:
   ``window_minutes`` and an epoch ``resets_at``.  Full data.
 * Claude ``~/.claude/projects/**/*.jsonl`` -- only a coarse ``system`` notice
   ("Approaching your 5-hour usage limit"): a WARNING flag, no percentage.
-* Grok ``~/.grok/sessions/**/updates.jsonl`` -- per-turn token usage only, no
-  account quota; nothing to read.
+* Grok ``~/.grok/logs/unified.jsonl`` -- the CLI logs a "billing: fetched
+  credits config" line every ~30 s with ``creditUsagePercent`` and the weekly
+  ``currentPeriod``. The freshest of the three.
 
 Quota is account-level, so the *newest* transcript for a provider is as good a
 source as any specific session's -- we never need to map a terminal to its
@@ -61,6 +62,9 @@ def _newest_transcript(provider: str, home: Path | None = None) -> Path | None:
             for path in (root / "projects").glob("**/*.jsonl")
             if "subagents" not in path.parts
         )
+    elif provider == "GROK":
+        billing_log = root / "logs" / "unified.jsonl"
+        return billing_log if billing_log.is_file() else None
     else:
         return None
     newest: Path | None = None
@@ -227,15 +231,64 @@ def claude_quota_from_transcript(
     return None
 
 
+def grok_quota_from_billing_log(
+    path: Path, *, max_age_seconds: float = 3600.0
+) -> dict[str, Any] | None:
+    """Grok CLI logs its weekly credit usage to ``~/.grok/logs/unified.jsonl``."""
+
+    if _stale(path, max_age_seconds=max_age_seconds):
+        return None
+    for line in reversed(_tail_lines(path)):
+        if "billing: fetched credits config" not in line:
+            continue
+        try:
+            config = json.loads(line).get("ctx", {}).get("config", {})
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        used = config.get("creditUsagePercent")
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        window: dict[str, Any] = {"name": "CREDITS", "used_percent": float(used)}
+        period = config.get("currentPeriod")
+        if isinstance(period, dict):
+            period_type = period.get("type")
+            if isinstance(period_type, str) and period_type:
+                window["name"] = (
+                    period_type.replace("USAGE_PERIOD_TYPE_", "").upper() or "CREDITS"
+                )
+            end = period.get("end")
+            if isinstance(end, str) and end:
+                window["resets_at"] = end
+        if "resets_at" not in window:
+            end = config.get("billingPeriodEnd")
+            if isinstance(end, str) and end:
+                window["resets_at"] = end
+        state = "AVAILABLE"
+        if used >= 100:
+            state = "EXHAUSTED"
+        elif used >= 80:
+            state = "WARNING"
+        return {
+            "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
+            "provider": "GROK",
+            "source": "grok-cli-billing-log",
+            "state": state,
+            "windows": [window],
+            "observed_at": _observed_at(path),
+        }
+    return None
+
+
 def sweep_transcript_quota(
     *, home_by_provider: dict[str, Path] | None = None, max_age_seconds: float = 3600.0
 ) -> list[dict[str, Any]]:
-    """Best-effort quota snapshots from the newest Codex / Claude transcript."""
+    """Best-effort quota snapshots from each provider CLI's own local files."""
 
     homes = home_by_provider or {}
     readers = {
         "CODEX": codex_quota_from_transcript,
         "CLAUDE": claude_quota_from_transcript,
+        "GROK": grok_quota_from_billing_log,
     }
     snapshots: list[dict[str, Any]] = []
     for provider, reader in readers.items():
@@ -254,5 +307,6 @@ def sweep_transcript_quota(
 __all__ = [
     "codex_quota_from_transcript",
     "claude_quota_from_transcript",
+    "grok_quota_from_billing_log",
     "sweep_transcript_quota",
 ]
