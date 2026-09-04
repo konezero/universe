@@ -654,6 +654,7 @@ function bindTerminalIme(term, socket, getSurface) {
     const text = imeMarked;
     imeMarked = "";
     if (text) {
+      imeInputAt = Date.now();
       imeLog("ime-flush->pty", { text });
       sendPtyText(socket, text);
     }
@@ -781,6 +782,15 @@ function bindTerminalIme(term, socket, getSurface) {
         // Same syllable, refined in place.
         imeMarked = event.data || imeMarked;
         try { textarea.value = imeMarked; } catch (_e) { /* readonly race */ }
+      } else if (imeMarked && event.data === imeMarked) {
+        // insertText echoing the syllable we already have = the IME's commit
+        // signal for it. Send once and stop; do NOT treat it as a new one.
+        window.clearTimeout(imeFlushTimer);
+        imeLog("ime-commit->pty", { text: imeMarked });
+        sendPtyText(socket, imeMarked);
+        imeMarked = "";
+        try { textarea.value = ""; } catch (_e) { /* readonly race */ }
+        return;
       } else {
         // Fresh insertText after an IME key: the previous syllable is final.
         if (imeMarked) {
@@ -811,8 +821,8 @@ function bindTerminalIme(term, socket, getSurface) {
     if (
       !isControlData
       && (imeMarked
-        || Date.now() - imeInputAt < 150
-        || Date.now() - lastKey229At < 150)
+        || Date.now() - imeInputAt < 400
+        || Date.now() - lastKey229At < 400)
     ) {
       imeLog("onData suppressed(ime)", { data });
       return;
