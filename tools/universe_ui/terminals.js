@@ -766,6 +766,16 @@ const IS_IOS =
     (navigator.platform === "MacIntel" &&
       typeof document !== "undefined" &&
       "ontouchend" in document));
+// Real macOS desktop (not iPadOS pretending to be one — that's IS_IOS).
+const IS_MAC =
+  typeof navigator !== "undefined" &&
+  navigator.platform === "MacIntel" &&
+  !IS_IOS;
+// The degraded marked-text fallback below exists ONLY for a macOS Hangul
+// quirk (no composition events over a remote browser). It must never engage
+// on Windows/Linux even if composition events look momentarily absent there
+// for an unrelated reason — gate it on platform, not just on behavior.
+const IME_DEGRADED_FALLBACK_PLATFORM = IS_MAC || IS_IOS;
 
 function bindTerminalIme(term, socket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
@@ -922,6 +932,12 @@ function bindTerminalIme(term, socket, getSurface) {
         }
         return;
       }
+      // Marked-text fallback below is a macOS-only Hangul quirk (remote
+      // browser fires no composition events). Windows/Linux fire real
+      // composition events reliably, so this must stay off there even if the
+      // "no recent composition" behavior check would otherwise let it run —
+      // never mix Windows input handling with the macOS fallback.
+      if (!IME_DEGRADED_FALLBACK_PLATFORM) return;
       if (composing || Date.now() - lastCompositionAt < 1500) return;
 
       if (it === "insertReplacementText") {
@@ -967,9 +983,13 @@ function bindTerminalIme(term, socket, getSurface) {
       return;
     }
     // Degraded macOS path only: the input listener owns the send while a
-    // syllable is marked or a jamo key just fired.
+    // syllable is marked or a jamo key just fired. Platform-gated so this
+    // can never suppress a byte on Windows/Linux even on a timing
+    // coincidence — Windows/Linux composition is handled entirely by
+    // xterm's own composition integration above, not this fallback.
     if (
-      !isControlData
+      IME_DEGRADED_FALLBACK_PLATFORM
+      && !isControlData
       && Date.now() - lastCompositionAt > 1500
       && (imeMarked
         || Date.now() - imeInputAt < 400
