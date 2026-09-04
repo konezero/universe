@@ -175,7 +175,7 @@ function installGuardedLinkProviderRegistration(term) {
   };
 }
 
-function attachTerminalMouseWheelHandler(term, element) {
+function attachTerminalMouseWheelHandler(term, element, getSurface) {
   // Let xterm process every wheel event: it scrolls the scrollback in the
   // normal buffer and emits SGR mouse-wheel reports to a mouse-tracking TUI,
   // and preventDefault()s in both cases so the page never moves. (The earlier
@@ -192,8 +192,14 @@ function attachTerminalMouseWheelHandler(term, element) {
     const repaintSoon = () => {
       repaintTimers.forEach(window.clearTimeout);
       const paint = () => {
-        try { term.refresh(0, Math.max(0, term.rows - 1)); }
-        catch (_error) { /* pane disposed */ }
+        try {
+          // xterm 6.1's WebGL renderer leaves a stale band where a
+          // mouse-tracking TUI redraws over scrolled rows. Reset its glyph
+          // atlas and mark every visible row dirty.
+          getSurface?.()?.webglAddon?.clearTextureAtlas?.();
+          term.clearTextureAtlas?.();
+          term.refresh(0, Math.max(0, term.rows - 1));
+        } catch (_error) { /* pane disposed */ }
       };
       // Two shots: one when the wheel burst settles, one after the TUI's
       // scroll redraw output lands.
@@ -838,7 +844,6 @@ function ensureTerminalSurface(session) {
   });
   term.open(element);
   installGuardedLinkProviderRegistration(term);
-  attachTerminalMouseWheelHandler(term, element);
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
   }
@@ -971,6 +976,7 @@ function ensureTerminalSurface(session) {
     webglFailedSinceRecovery: false,
   };
   attachTerminalWebgl(surface);
+  attachTerminalMouseWheelHandler(term, element, () => surface);
   term.onScroll((viewportY) => {
     if (viewportY > 2 || surface.rebuildingHistory) return;
     loadOlderTerminalHistory(surface, session).catch((error) =>
