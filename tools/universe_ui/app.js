@@ -4108,7 +4108,6 @@ function showGraphView(view) {
   if (goalWorkspace) goalWorkspace.hidden = false;
   state.view = view;
   document.body.classList.add("graph-mode");
-  setMobileSurface(MOBILE_SURFACE_BY_VIEW[view] || "surface");
   // The integrated home owns these; leaving it must clear them.
   document.body.classList.remove("home-mode", "fleet-mode");
   // Galaxy is a full-bleed view: no project rail, no shell inspector.
@@ -4615,23 +4614,6 @@ function renderIntegratedHome() {
 
 function isMobileView() {
   return window.matchMedia("(max-width: 720px)").matches;
-}
-
-// Mobile is chat-first: the conductor conversation is the page body, and
-// every other surface (Fleet / Galaxy / Work Spine / Bench / Memory) opens
-// full-screen over it. body[data-mobile-surface] drives the CSS; "chat" is
-// the resting state. No-op visually above 720px (the attribute is harmless).
-const MOBILE_SURFACE_BY_VIEW = {
-  work: "board", fleet: "board", map: "galaxy", network: "galaxy",
-  project: "galaxy", ecosystem: "galaxy", semantic: "galaxy", universe: "galaxy",
-  documents: "graph", sessions: "graph", timeline: "graph", implementation: "graph",
-  bench: "bench", activity: "surface", memory: "surface",
-};
-function setMobileSurface(name) {
-  const surface = name || "chat";
-  document.body.dataset.mobileSurface = surface;
-  const back = document.querySelector("#mobile-back-chat");
-  if (back) back.hidden = !(isMobileView() && surface !== "chat");
 }
 
 // Mobile: the home shows one level at a time (projects → nodes → todos →
@@ -5965,17 +5947,12 @@ function setChatPanelWidth(width, { persist = false } = {}) {
   }
 }
 
-const TERMINAL_DOCK_MIN_HEIGHT = 96;
+const TERMINAL_DOCK_MIN_HEIGHT = 140;
 
 function clampTerminalDockHeight(height) {
   const requested = Number(height);
   const safe = Number.isFinite(requested) ? requested : state.terminalDockHeight;
-  // Leave the main view at least ~40% of a short screen; on a tall screen the
-  // fixed 96px margin keeps the header/composer reachable.
-  const viewportMax = Math.max(
-    TERMINAL_DOCK_MIN_HEIGHT,
-    Math.min(window.innerHeight - 96, Math.round(window.innerHeight * 0.6))
-  );
+  const viewportMax = Math.max(TERMINAL_DOCK_MIN_HEIGHT, window.innerHeight - 160);
   return Math.round(
     Math.min(viewportMax, Math.max(TERMINAL_DOCK_MIN_HEIGHT, safe))
   );
@@ -17570,11 +17547,6 @@ function bindGoalPlanEvents() {
     if (goal) openGoalEditor(goal);
   });
   const handleWorkspaceNav = (event) => {
-    const surfaceButton = event.target.closest("[data-mobile-surface]");
-    if (surfaceButton) {
-      setMobileSurface(surfaceButton.getAttribute("data-mobile-surface") || "chat");
-      return;
-    }
     const button = event.target.closest("[data-primary-view]");
     if (!button) return;
     const view = button.getAttribute("data-primary-view");
@@ -17582,7 +17554,6 @@ function bindGoalPlanEvents() {
     if (view === "work" || view === "fleet") {
       setGoalPlanLayout("board");
       showGoalPlanView();
-      setMobileSurface("board");
       syncPrimaryNavSelection("fleet");
     }
     else if (view === "map") showGraphView(state.selectedProject ? "semantic" : "universe");
@@ -17611,15 +17582,6 @@ function bindGoalPlanEvents() {
   });
   document.querySelector("#mobile-scrim")?.addEventListener("click", closeMobileNav);
   document.querySelector("#home-mobile-back")?.addEventListener("click", homeMobileBack);
-  // Mobile chat-first: land on the conversation; the topbar ← returns to it.
-  setMobileSurface("chat");
-  document.querySelector("#mobile-back-chat")?.addEventListener("click", () => {
-    setMobileSurface("chat");
-    closeMobileNav();
-  });
-  window.matchMedia("(max-width: 720px)").addEventListener?.("change", () => {
-    setMobileSurface(document.body.dataset.mobileSurface || "chat");
-  });
   elements.utilityRail?.addEventListener("click", (event) => {
     if (event.target.closest("[data-primary-view], #add-project-rail-button")) closeMobileNav();
   });
