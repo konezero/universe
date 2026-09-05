@@ -221,6 +221,30 @@ class SessionAnchorTransportTests(unittest.TestCase):
         )
         self.assertEqual([], frame["results"])
 
+    def test_live_sibling_target_is_routable_even_when_currentness_is_stale(
+        self,
+    ) -> None:
+        """review step 3: an exact target anchor resolves to one specific
+        session, so a live sibling that the Supervisor's mode-wide
+        most-recently-active projection has marked STALE must still receive
+        the delegation. Two live MASTER siblings both need exact-anchor
+        transport at the same time.
+        """
+
+        self.transport.session_supervisor = FakeSupervisor(
+            [
+                session("anchor-origin"),
+                session("anchor-target", state="LIVE", currentness="STALE"),
+            ]
+        )
+        progress = self.transport.deliver(self.request())
+        self.assertEqual(
+            "WAITING_FOR_TARGET_SESSION_RESULT", progress["progress"]["step"]
+        )
+        self.assertEqual(
+            ["chat-target"], [key for key, _ in self.providers.calls]
+        )
+
     def test_claimed_origin_chat_must_match_exact_anchor_transport(self) -> None:
         request = self.request()
         request["request"] = {
@@ -238,7 +262,7 @@ class SessionAnchorTransportTests(unittest.TestCase):
         self.assertEqual("TARGET_SESSION_ANCHOR_NOT_FOUND", missing.exception.code)
 
         self.transport.session_supervisor = FakeSupervisor(
-            [session("anchor-origin"), session("anchor-target", currentness="STALE")]
+            [session("anchor-origin"), session("anchor-target", state="DISCONNECTED")]
         )
         with self.assertRaises(SessionAnchorTransportError) as stale:
             self.transport.deliver(self.request())
