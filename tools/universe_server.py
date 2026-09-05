@@ -362,6 +362,11 @@ PROJECT_MASTER_MESSAGE_SCHEMA = "universe.project-master-message.v1"
 PROJECT_MASTER_MESSAGE_STATES = frozenset(
     {"QUEUED", "PROCESSING", "DONE", "FAILED"}
 )
+# A claimed-but-abandoned item (the claiming session crashed or disconnected
+# before calling complete/fail) must not block that item forever - it is
+# reclaimed back to QUEUED once its lease expires. 5 minutes is generous for
+# a live session to renew (renew_master_message_lease) well before it lapses.
+MASTER_MESSAGE_LEASE_TTL_SECONDS = 300
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
 CONDUCTOR_ROOM_UI_ACTION_SCHEMA = "universe.conductor-room-ui-action.v1"
 CONDUCTOR_ROOM_STREAM_SCHEMA = "universe.conductor-room-stream.v1"
@@ -643,6 +648,14 @@ UI_ROOT = Path(__file__).resolve().with_name("universe_ui")
 def utc_now() -> str:
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
+
+
+def utc_after(seconds: int) -> str:
+    return (
+        (datetime.now(timezone.utc) + timedelta(seconds=seconds))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -19784,7 +19797,11 @@ class UniverseStore:
         return message
 
     def claim_master_message(
-        self, project_id: str, *, provider: str
+        self,
+        project_id: str,
+        *,
+        provider: str,
+        lease_ttl_seconds: int = MASTER_MESSAGE_LEASE_TTL_SECONDS,
     ) -> dict[str, Any] | None:
         """Claim the oldest QUEUED item for this project, safe under any
         number of concurrent Master instances racing on the same project's
@@ -19795,9 +19812,16 @@ class UniverseStore:
         only has second-level precision, so a burst of items queued within
         the same second all share one created_at value, and message_id (a
         random UUID) is not a valid tie-break for "oldest first".
+
+        Reclaims any of this project's PROCESSING items whose lease has
+        expired (the claiming session died mid-task) before looking for a
+        fresh QUEUED one - there is no separate background sweep yet (that's
+        the autonomous worker-loop todo), so claim time is where staleness
+        actually gets noticed and freed back up.
         """
 
         project = self.get_project(project_id)
+        self.reclaim_expired_master_messages(project["project_id"])
         with self._connection() as connection:
             candidates = connection.execute(
                 """
@@ -19815,12 +19839,88 @@ class UniverseStore:
                 row["message_id"],
                 expected_states={"QUEUED"},
                 delivery_state="PROCESSING",
-                updates={"provider": provider, "started_at": utc_now()},
+                updates={
+                    "provider": provider,
+                    "started_at": utc_now(),
+                    "lease_expires_at": utc_after(lease_ttl_seconds),
+                },
                 required=False,
             )
             if claimed is not None:
                 return claimed
         return None
+
+    def renew_master_message_lease(
+        self,
+        message_id: str,
+        *,
+        lease_ttl_seconds: int = MASTER_MESSAGE_LEASE_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        """A still-live session extends its own claim before the lease would
+        otherwise expire and let another instance reclaim the item out from
+        under it. Only valid while PROCESSING (a renewed lease on a QUEUED,
+        DONE, or FAILED item makes no sense - there is no live claim to
+        extend)."""
+
+        renewed = self._transition_master_message(
+            message_id,
+            expected_states={"PROCESSING"},
+            delivery_state="PROCESSING",
+            updates={"lease_expires_at": utc_after(lease_ttl_seconds)},
+            required=True,
+        )
+        assert renewed is not None  # required=True never returns None
+        return renewed
+
+    def reclaim_expired_master_messages(
+        self, project_id: str | None = None
+    ) -> list[str]:
+        """Move any PROCESSING item whose lease has lapsed back to QUEUED so
+        another instance can claim it - the claiming session presumably
+        crashed or disconnected without calling complete/fail. Scoped to one
+        project when called from claim_master_message; project_id=None
+        sweeps every project (for a future periodic background job)."""
+
+        now = utc_now()
+        with self._connection() as connection:
+            if project_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT message_id
+                    FROM project_master_message
+                    WHERE json_extract(message_json, '$.delivery_state') = 'PROCESSING'
+                      AND json_extract(message_json, '$.lease_expires_at') < ?
+                    """,
+                    (now,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT message_id
+                    FROM project_master_message
+                    WHERE project_id = ?
+                      AND json_extract(message_json, '$.delivery_state') = 'PROCESSING'
+                      AND json_extract(message_json, '$.lease_expires_at') < ?
+                    """,
+                    (project_id, now),
+                ).fetchall()
+        reclaimed: list[str] = []
+        for row in rows:
+            transitioned = self._transition_master_message(
+                row["message_id"],
+                expected_states={"PROCESSING"},
+                delivery_state="QUEUED",
+                updates={
+                    "provider": None,
+                    "started_at": None,
+                    "lease_expires_at": None,
+                    "reclaimed_at": now,
+                },
+                required=False,
+            )
+            if transitioned is not None:
+                reclaimed.append(row["message_id"])
+        return reclaimed
 
     def fail_master_message(self, message_id: str, *, code: str, reason: str) -> None:
         self._transition_master_message(
@@ -42977,6 +43077,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+                if operation == "/renew-lease":
+                    renewed = self.server.store.renew_master_message_lease(message_id)
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "MASTER_MESSAGE_LEASE_RENEWED",
+                            "message": renewed,
+                        },
+                    )
+                    return
             self._not_found()
         except ProviderSessionError as error:
             self._send_provider_session_error(error)
@@ -43531,7 +43642,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         if not path.startswith(prefix):
             return None
         remainder = path[len(prefix) :]
-        for suffix in ("/complete", "/fail"):
+        for suffix in ("/complete", "/fail", "/renew-lease"):
             if remainder.endswith(suffix):
                 return unquote(remainder[: -len(suffix)]), suffix
         return None

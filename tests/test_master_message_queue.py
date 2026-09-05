@@ -219,6 +219,118 @@ class MasterMessageQueueTests(unittest.TestCase):
             )
         self.assertEqual("MASTER_MESSAGE_STATE_CONFLICT", ctx.exception.code)
 
+    # -- lease timeout / reclaim ------------------------------------------
+
+    def test_claim_sets_a_lease_expiry_in_the_future(self) -> None:
+        project = self.register_project("ALPHA")
+        self.store.create_master_message(project["project_id"], self.message_request())
+        claimed = self.store.claim_master_message(
+            project["project_id"], provider="CLAUDE"
+        )
+        self.assertIn("lease_expires_at", claimed)
+        self.assertGreater(claimed["lease_expires_at"], claimed["started_at"])
+
+    def test_expired_lease_is_reclaimed_and_becomes_claimable_again(self) -> None:
+        """The claiming session crashed mid-task (never called complete/fail).
+        Once its lease lapses, a DIFFERENT instance's claim attempt must be
+        able to pick the same item back up - this is the whole point of a
+        lease: an abandoned claim cannot block an item forever.
+        """
+
+        project = self.register_project("ALPHA")
+        created, _ = self.store.create_master_message(
+            project["project_id"], self.message_request()
+        )
+        first_claim = self.store.claim_master_message(
+            project["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        self.assertEqual(created["message_id"], first_claim["message_id"])
+
+        second_claim = self.store.claim_master_message(
+            project["project_id"], provider="CODEX"
+        )
+        self.assertIsNotNone(second_claim)
+        self.assertEqual(created["message_id"], second_claim["message_id"])
+        self.assertEqual("CODEX", second_claim["provider"])
+        self.assertEqual("PROCESSING", second_claim["delivery_state"])
+
+    def test_reclaim_expired_master_messages_resets_state_and_ownership(self) -> None:
+        project = self.register_project("ALPHA")
+        created, _ = self.store.create_master_message(
+            project["project_id"], self.message_request()
+        )
+        self.store.claim_master_message(
+            project["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        reclaimed_ids = self.store.reclaim_expired_master_messages(
+            project["project_id"]
+        )
+        self.assertEqual([created["message_id"]], reclaimed_ids)
+        reset = self.store.get_master_message(created["message_id"])
+        self.assertEqual("QUEUED", reset["delivery_state"])
+        self.assertIsNone(reset["provider"])
+        self.assertIsNone(reset["lease_expires_at"])
+        self.assertIn("reclaimed_at", reset)
+
+    def test_reclaim_scoped_to_one_project_leaves_others_alone(self) -> None:
+        alpha = self.register_project("ALPHA")
+        beta = self.register_project("BETA")
+        self.store.create_master_message(alpha["project_id"], self.message_request())
+        self.store.create_master_message(beta["project_id"], self.message_request())
+        self.store.claim_master_message(
+            alpha["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        self.store.claim_master_message(
+            beta["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+
+        reclaimed_in_alpha = self.store.reclaim_expired_master_messages(
+            alpha["project_id"]
+        )
+        self.assertEqual(1, len(reclaimed_in_alpha))
+        beta_messages = self.store.list_master_messages(beta["project_id"])
+        self.assertEqual("PROCESSING", beta_messages[0]["delivery_state"])
+
+    def test_reclaim_with_no_project_id_sweeps_every_project(self) -> None:
+        alpha = self.register_project("ALPHA")
+        beta = self.register_project("BETA")
+        self.store.create_master_message(alpha["project_id"], self.message_request())
+        self.store.create_master_message(beta["project_id"], self.message_request())
+        self.store.claim_master_message(
+            alpha["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        self.store.claim_master_message(
+            beta["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+
+        reclaimed = self.store.reclaim_expired_master_messages()
+        self.assertEqual(2, len(reclaimed))
+
+    def test_renew_lease_extends_expiry_and_survives_a_reclaim_sweep(self) -> None:
+        project = self.register_project("ALPHA")
+        self.store.create_master_message(project["project_id"], self.message_request())
+        claimed = self.store.claim_master_message(
+            project["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        renewed = self.store.renew_master_message_lease(
+            claimed["message_id"], lease_ttl_seconds=300
+        )
+        self.assertGreater(renewed["lease_expires_at"], claimed["lease_expires_at"])
+
+        reclaimed = self.store.reclaim_expired_master_messages(project["project_id"])
+        self.assertEqual([], reclaimed)
+        still_processing = self.store.get_master_message(claimed["message_id"])
+        self.assertEqual("PROCESSING", still_processing["delivery_state"])
+
+    def test_renew_lease_rejects_a_message_that_is_not_processing(self) -> None:
+        project = self.register_project("ALPHA")
+        created, _ = self.store.create_master_message(
+            project["project_id"], self.message_request()
+        )
+        with self.assertRaises(UniverseError) as ctx:
+            self.store.renew_master_message_lease(created["message_id"])
+        self.assertEqual("MASTER_MESSAGE_STATE_CONFLICT", ctx.exception.code)
+
     # -- listing ----------------------------------------------------------
 
     def test_list_is_scoped_per_project_and_ordered_by_creation(self) -> None:

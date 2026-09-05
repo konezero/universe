@@ -16345,6 +16345,35 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, conflict_status)
         self.assertEqual("MASTER_MESSAGE_STATE_CONFLICT", conflict["error_code"])
 
+    def test_master_message_renew_lease_route(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages",
+            {
+                "idempotency_key": "seed-v2",
+                "title": "Prepare Universe project seed",
+                "instruction": "Read the project and publish Seed assets.",
+            },
+            self.token,
+        )
+        _, claimed = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages/claim",
+            {"provider": "CLAUDE"},
+            self.token,
+        )
+        message_id = claimed["message"]["message_id"]
+        renew_status, renewed = self.request(
+            "POST", f"/v1/master-messages/{message_id}/renew-lease", {}, self.token
+        )
+        self.assertEqual(200, renew_status)
+        self.assertEqual("MASTER_MESSAGE_LEASE_RENEWED", renewed["status"])
+        self.assertGreaterEqual(
+            renewed["message"]["lease_expires_at"],
+            claimed["message"]["lease_expires_at"],
+        )
+
     def test_project_seed_rejects_digest_mismatch_and_root_escape(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         invalid_digest = self.project_seed()
