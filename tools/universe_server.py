@@ -24470,9 +24470,22 @@ class UniverseStore:
     def create_project_seed_discovery_dispatch(
         self, project_id: str
     ) -> tuple[dict[str, Any], bool]:
+        """Queue a "prepare Seed" work item on the project's Master queue.
+
+        Migrated (2026-09-05) off the old project_dispatch/deliver_dispatch
+        file-drop path onto create_master_message: the file-drop had no
+        automatic consumer at all (confirmed live - two 'universe' project
+        dispatches sat QUEUED and unconsumed for weeks) and required a
+        manual "Deliver" click even to reach the inbox file. The Master
+        claim queue is claimable, lease-guarded, and wakes any live Master
+        session for this project automatically. Function name kept for the
+        existing route/callers; the delivery mechanism underneath is now
+        entirely different - see project_dispatch/deliver_dispatch for the
+        now-legacy path (still used by nothing new).
+        """
         project = self.get_project(project_id)
         template = project_seed_template()
-        return self.create_dispatch(
+        return self.create_master_message(
             project["project_id"],
             {
                 "idempotency_key": (
@@ -24486,21 +24499,19 @@ class UniverseStore:
                     "implementation nodes, and their bindings separate. Return the published "
                     "Seed revision; do not mutate application source as part of this request."
                 ),
-                "constraints": [
-                    "STATIC_DISCOVERY_ONLY",
-                    "PROJECT_MASTER_OWNS_PROJECT_WRITES",
-                    "FUNCTIONAL_AND_IMPLEMENTATION_GRAPHS_MUST_REMAIN_SEPARATE",
-                    "DO_NOT_EXECUTE_PROJECT_CODE",
-                ],
-                "expected_output": {
-                    "schema": PROJECT_DISCOVERY_DISPATCH_SCHEMA,
-                    "template": template,
-                    "result": "PUBLISHED_PROJECT_SEED_ASSETS_OR_BLOCKED_RESULT_PACKET",
+                "metadata": {
+                    "constraints": [
+                        "STATIC_DISCOVERY_ONLY",
+                        "PROJECT_MASTER_OWNS_PROJECT_WRITES",
+                        "FUNCTIONAL_AND_IMPLEMENTATION_GRAPHS_MUST_REMAIN_SEPARATE",
+                        "DO_NOT_EXECUTE_PROJECT_CODE",
+                    ],
+                    "expected_output": {
+                        "schema": PROJECT_DISCOVERY_DISPATCH_SCHEMA,
+                        "template": template,
+                        "result": "PUBLISHED_PROJECT_SEED_ASSETS_OR_BLOCKED_RESULT_PACKET",
+                    },
                 },
-                "requested_mode": MASTER_MODE,
-                # Deliver uses the registered project ref; keep the envelope
-                # aligned so discovery dispatches match Project Master inbox layout.
-                "inbox_ref": project["refs"]["master_inbox"],
             },
         )
 
@@ -42370,9 +42381,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/discovery-dispatch":
-                dispatch, created = (
+                message, created = (
                     self.server.store.create_project_seed_discovery_dispatch(parts[0])
                 )
+                if created:
+                    self.server._wake_live_master_sessions(
+                        parts[0], reason="project seed discovery queued"
+                    )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
@@ -42382,7 +42397,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             if created
                             else "PROJECT_DISCOVERY_DISPATCH_ALREADY_QUEUED"
                         ),
-                        **dispatch,
+                        "message": message,
                     },
                 )
                 return

@@ -201,30 +201,29 @@ def check_live(state_path: Path, project_id: str) -> SmokeReport:
     else:
         report.add("project_connected", "FAIL", f"http={status}")
 
-    status, dispatches = _http(
-        endpoint, "GET", f"/v1/projects/{project_id}/dispatches", token=token
+    # Migrated (2026-09-05) off /dispatches onto /master-messages - discovery
+    # dispatch now queues through the Master claim queue, not the old
+    # project_dispatch file-drop.
+    status, master_messages = _http(
+        endpoint, "GET", f"/v1/projects/{project_id}/master-messages", token=token
     )
-    items = dispatches.get("dispatches") or []
+    items = master_messages.get("messages") or []
     discovery = [
         item
         for item in items
-        if (item.get("dispatch") or {}).get("title") == "Prepare Universe project seed"
-        or (
-            (item.get("dispatch") or {})
-            .get("expected_output", {})
-            .get("schema")
-            == "universe.project-discovery-dispatch.v1"
-        )
+        if item.get("title") == "Prepare Universe project seed"
+        or (item.get("metadata") or {}).get("expected_output", {}).get("schema")
+        == "universe.project-discovery-dispatch.v1"
     ]
     if not discovery and items:
         discovery = items
     if status == 200 and discovery:
-        top = discovery[0].get("dispatch") or {}
-        d_status = top.get("status")
+        top = discovery[0]
+        d_status = top.get("delivery_state")
         report.add(
             "seed_dispatch",
-            "PASS" if d_status == "COMPLETED" else "FAIL",
-            f"{top.get('dispatch_id')} status={d_status}",
+            "PASS" if d_status == "DONE" else "FAIL",
+            f"{top.get('message_id')} status={d_status}",
         )
     else:
         report.add("seed_dispatch", "FAIL", f"http={status} count={len(items)}")
@@ -524,59 +523,41 @@ def run_isolated() -> SmokeReport:
             f"master_inbox={project['refs']['master_inbox']}",
         )
 
-        dispatch_view, created = store.create_project_seed_discovery_dispatch("GCS")
-        envelope = dispatch_view["dispatch"]
+        # Migrated (2026-09-05) off project_dispatch's file-drop lifecycle
+        # (queue -> deliver -> acknowledge -> start -> record_result_packet)
+        # onto the Master claim queue's (queue -> claim -> complete). Step
+        # names kept as-is even though "discovery_deliver" now means "claim"
+        # - they're just report labels, and this is exactly the migration
+        # the queue was built for: no more one-shot file drop into
+        # .ai/inbox/MASTER with nothing to automatically consume it.
+        envelope, created = store.create_project_seed_discovery_dispatch("GCS")
         report.add(
             "discovery_queue",
-            "PASS" if envelope["status"] == "QUEUED" else "FAIL",
-            f"created={created} id={envelope['dispatch_id']}",
+            "PASS" if envelope["delivery_state"] == "QUEUED" else "FAIL",
+            f"created={created} id={envelope['message_id']}",
         )
 
-        delivered_view, _ = store.deliver_dispatch(
-            envelope["dispatch_id"], {"approval": "APPROVED"}
-        )
-        inbox_file = (
-            project_root
-            / ".ai"
-            / "inbox"
-            / "MASTER"
-            / f"{envelope['dispatch_id']}.json"
-        )
+        claimed = store.claim_master_message("GCS", provider="CLAUDE")
         report.add(
             "discovery_deliver",
             "PASS"
-            if delivered_view["dispatch"]["status"] == "DELIVERED"
-            and inbox_file.is_file()
+            if claimed is not None
+            and claimed["message_id"] == envelope["message_id"]
+            and claimed["delivery_state"] == "PROCESSING"
             else "FAIL",
-            f"status={delivered_view['dispatch']['status']} inbox={inbox_file.is_file()}",
+            f"claimed={claimed is not None} "
+            f"status={claimed.get('delivery_state') if claimed else None}",
         )
 
-        store.acknowledge_dispatch(
-            envelope["dispatch_id"],
-            {"evidence_ref": f"local-inbox:{inbox_file.as_posix()}"},
-        )
-        store.start_dispatch(
-            envelope["dispatch_id"],
-            {"evidence_ref": "e2e-smoke:start"},
-        )
-        completed_view = store.record_result_packet(
-            envelope["dispatch_id"],
-            {
-                "status": "COMPLETED",
-                "summary": "E2E smoke closed seed discovery dispatch.",
-                "evidence_refs": [
-                    f"local-inbox:.ai/inbox/MASTER/{envelope['dispatch_id']}.json",
-                    "e2e-smoke:result",
-                ],
-                "outputs": {"harness": SCENARIO_ID},
-            },
+        completed = store.complete_master_message(
+            envelope["message_id"],
+            provider="CLAUDE",
+            result_ref="e2e-smoke:result",
         )
         report.add(
             "discovery_complete",
-            "PASS"
-            if completed_view["dispatch"]["status"] == "COMPLETED"
-            else "FAIL",
-            f"status={completed_view['dispatch']['status']}",
+            "PASS" if completed["delivery_state"] == "DONE" else "FAIL",
+            f"status={completed['delivery_state']}",
         )
 
         # Seed + projection via store API surface when available through HTTP helpers

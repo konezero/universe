@@ -16231,19 +16231,43 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_gcs_project_seed_discovery_dispatch_is_queued_before_project_write(
         self,
     ) -> None:
+        # Migrated (2026-09-05) off project_dispatch onto the Master claim
+        # queue - the response now carries a claimable "message", not a
+        # one-shot "dispatch" needing a manual Deliver click.
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         status, result = self.request(
             "POST", "/v1/projects/GCS/discovery-dispatch", {}, self.token
         )
         self.assertEqual(201, status)
         self.assertEqual("PROJECT_DISCOVERY_DISPATCH_QUEUED", result["status"])
-        dispatch = result["dispatch"]
-        self.assertEqual("QUEUED", dispatch["status"])
+        message = result["message"]
+        self.assertEqual("QUEUED", message["delivery_state"])
         self.assertEqual(
             "universe.project-discovery-dispatch.v1",
-            dispatch["expected_output"]["schema"],
+            message["metadata"]["expected_output"]["schema"],
         )
         self.assertFalse((self.project_root / ".ai" / "universe").exists())
+
+        # Same idempotency_key + content on retry returns the same item
+        # rather than creating a second one.
+        retry_status, retried = self.request(
+            "POST", "/v1/projects/GCS/discovery-dispatch", {}, self.token
+        )
+        self.assertEqual(200, retry_status)
+        self.assertEqual("PROJECT_DISCOVERY_DISPATCH_ALREADY_QUEUED", retried["status"])
+        self.assertEqual(message["message_id"], retried["message"]["message_id"])
+
+        # It is claimable through the same route every other Master message
+        # uses - this is the entire point of the migration.
+        claim_status, claimed = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages/claim",
+            {"provider": "CLAUDE"},
+            self.token,
+        )
+        self.assertEqual(200, claim_status)
+        self.assertEqual(message["message_id"], claimed["message"]["message_id"])
+        self.assertEqual("PROCESSING", claimed["message"]["delivery_state"])
 
     def test_master_message_queue_http_lifecycle(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
