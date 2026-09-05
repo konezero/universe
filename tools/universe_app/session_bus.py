@@ -24,7 +24,7 @@ from universe_app.terminal_host import TerminalHostError
 
 BUS_SCHEMA = "universe.session-bus.v1"
 MAX_BODY_BYTES = 32 * 1024
-KINDS = frozenset({"NOTE", "INSTRUCTION", "RESULT"})
+KINDS = frozenset({"NOTE", "INSTRUCTION", "RESULT", "COORDINATION"})
 NOTIFY_MODES = frozenset({"NONE", "HEADER"})
 INSTRUCTION_DELIVERY_STATES = frozenset({"PENDING", "CLAIMED", "DISPATCHED"})
 LIFECYCLE_STATES = frozenset(

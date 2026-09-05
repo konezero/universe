@@ -102,6 +102,39 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual([], empty["messages"])
 
+    def test_coordination_kind_carries_resource_overlap_negotiation(self) -> None:
+        """Backs the Execution Guard Skill's Resource Presence / Peer
+        Negotiation section (.ai/skills/common/execution-guard/SKILL.md):
+        an overlap is posted as kind=COORDINATION, subtype/overlap detail
+        carried in body_text (no first-class subtype field yet - only one
+        subtype exists today, so a dedicated field would be premature).
+        """
+
+        posted = self.host.bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.universe["terminal_id"]},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "kind": "COORDINATION",
+                "body_text": json.dumps(
+                    {
+                        "subtype": "RESOURCE_OVERLAP",
+                        "overlap": "src/broker.py",
+                        "peer_summary": "editing BrokerClient.connect",
+                    }
+                ),
+            },
+        )
+        self.assertEqual("CREATED", posted["status"])
+        self.assertEqual("COORDINATION", posted["messages"][0]["kind"])
+        inbox = self.host.bus.inbox(
+            self.host, terminal_id=self.universe["terminal_id"]
+        )
+        self.assertEqual(1, len(inbox["messages"]))
+        self.assertEqual("COORDINATION", inbox["messages"][0]["kind"])
+        overlap_detail = json.loads(inbox["messages"][0]["body_text"])
+        self.assertEqual("RESOURCE_OVERLAP", overlap_detail["subtype"])
+
     def test_notify_none_does_not_write_stdin(self) -> None:
         self.host.bus.post(
             self.host,
