@@ -39,6 +39,8 @@ from project_master_host import (  # noqa: E402
     ProjectTaskProposalAdapter,
 )
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
+from universe_app.terminal_host import TerminalHostError  # noqa: E402
+from universe_app.session_bus import SessionBusError  # noqa: E402
 from universe_server import (  # noqa: E402
     ConductorPermissionBridge,
     ConnectionCapabilities,
@@ -16373,6 +16375,85 @@ class UniverseLocalServiceTests(unittest.TestCase):
             renewed["message"]["lease_expires_at"],
             claimed["message"]["lease_expires_at"],
         )
+
+    def test_wake_live_master_sessions_notifies_every_live_master_terminal(
+        self,
+    ) -> None:
+        """The reason session_bus.post() can't be reused directly for this:
+        with 2+ live terminals matching (project_id + mode, no specific
+        anchor), resolve_direct_targets treats that as BUS_TARGET_AMBIGUOUS
+        and refuses to send anything at all - exactly the case that matters
+        once more than one live Master instance exists for a project, which
+        is the entire point of this feature. _wake_live_master_sessions
+        must reach every one of them instead of erroring out.
+        """
+
+        emitted: list[tuple[str, bytes]] = []
+
+        class FakeMasterHost:
+            def __init__(self, terminals: list[dict[str, Any]]) -> None:
+                self._terminals = terminals
+
+            def list_sessions(self) -> list[dict[str, Any]]:
+                return self._terminals
+
+            def get(self, terminal_id: str) -> dict[str, Any]:
+                for terminal in self._terminals:
+                    if terminal.get("terminal_id") == terminal_id:
+                        return terminal
+                raise TerminalHostError("TERMINAL_NOT_FOUND", "not found", 404)
+
+            def emit_output(self, terminal_id: str, data: bytes) -> None:
+                emitted.append((terminal_id, data))
+
+        live_master_terminals = [
+            {
+                "terminal_id": "term-a",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "state": "LIVE",
+                "active_session_anchor_ref": "session_anchor_a",
+            },
+            {
+                "terminal_id": "term-b",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "state": "LIVE",
+                "active_session_anchor_ref": "session_anchor_b",
+            },
+        ]
+        fake_host = FakeMasterHost(live_master_terminals)
+
+        with patch.object(
+            self.server, "_session_anchor_terminal_host", return_value=fake_host
+        ):
+            # Demonstrate the ambiguity session_bus.post() hits directly with
+            # 2+ live matches and no pinned anchor/terminal_id.
+            with self.assertRaises(SessionBusError) as ctx:
+                self.server.session_bus.post(
+                    fake_host,
+                    {
+                        "to": {"project_id": "GCS", "mode": "MASTER"},
+                        "kind": "NOTE",
+                        "body_text": "would be ambiguous",
+                    },
+                )
+            self.assertEqual("BUS_TARGET_AMBIGUOUS", ctx.exception.code)
+
+            woken = self.server._wake_live_master_sessions(
+                "GCS", reason="new work queued"
+            )
+
+        self.assertEqual(2, woken)
+        self.assertEqual({"term-a", "term-b"}, {tid for tid, _ in emitted})
+        for terminal_id in ("term-a", "term-b"):
+            inbox = self.server.session_bus.inbox(fake_host, terminal_id=terminal_id)
+            messages = inbox.get("messages") or inbox.get("inbox") or []
+            self.assertTrue(messages, f"expected an inbox message for {terminal_id}")
+            self.assertEqual("INSTRUCTION", messages[-1]["kind"])
+            self.assertIn("Master queue has work waiting", messages[-1]["body_text"])
 
     def test_project_seed_rejects_digest_mismatch_and_root_escape(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

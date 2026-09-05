@@ -280,7 +280,12 @@ from universe_app.pty_supervisor import (
     default_state_path as default_pty_supervisor_state_path,
     restart_supervisor,
 )
-from universe_app.session_bus import SessionBus, SessionBusError, fanout_meeting_bus
+from universe_app.session_bus import (
+    SessionBus,
+    SessionBusError,
+    fanout_meeting_bus,
+    match_live_terminals,
+)
 from universe_app.terminal_host import (
     TerminalHost,
     TerminalHostError,
@@ -31899,6 +31904,67 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             except (SessionSupervisorError, TerminalHostError, UniverseError):
                 continue
 
+    def _wake_live_master_sessions(self, project_id: str, *, reason: str) -> int:
+        """Best-effort nudge: tell every live Master session for this
+        project that work is waiting, so an idle one notices instead of
+        depending only on its own next poll.
+
+        session_bus.post()/resolve_direct_targets treats 2+ matching live
+        terminals (no specific anchor given) as BUS_TARGET_AMBIGUOUS and
+        refuses to send at all - exactly the case that matters once more
+        than one live Master instance exists for a project, which is the
+        entire point of this initiative. Deliver directly to each matched
+        terminal via deliver_to_terminal instead, bypassing that
+        single-target assumption, then run the same live-dispatch step
+        post_session_bus_message uses so the instruction actually reaches
+        the PTY rather than sitting PENDING in the inbox.
+
+        Never raises: waking sessions is an optimization (the item stays
+        QUEUED and independently claimable by anyone regardless), not a
+        correctness requirement.
+        """
+        try:
+            host = self._session_anchor_terminal_host()
+            terminals = match_live_terminals(host, project_id=project_id, mode="MASTER")
+        except (SessionBusError, TerminalHostError, UniverseError):
+            return 0
+        coordinate_defaults = {
+            "terminal_id": "",
+            "session_anchor_ref": "",
+            "node_ref": "",
+            "task_frame_ref": "",
+        }
+        woken = 0
+        for terminal in terminals:
+            try:
+                delivered = self.session_bus.deliver_to_terminal(
+                    host,
+                    terminal=terminal,
+                    source={
+                        "project_id": project_id,
+                        "mode": "SYSTEM",
+                        "provider": "",
+                        **coordinate_defaults,
+                    },
+                    to={
+                        "project_id": project_id,
+                        "mode": "MASTER",
+                        "provider": "",
+                        **coordinate_defaults,
+                    },
+                    kind="INSTRUCTION",
+                    notify="HEADER",
+                    body=(
+                        f"Master queue has work waiting ({reason}). Claim it: "
+                        f"POST /v1/projects/{project_id}/master-messages/claim."
+                    ),
+                )
+            except SessionBusError:
+                continue
+            self._dispatch_live_posted_session_instructions({"messages": [delivered]})
+            woken += 1
+        return woken
+
     def _observe_session_bus_result(self, packet: Mapping[str, Any]) -> None:
         original = packet.get("message")
         result = packet.get("result")
@@ -42324,6 +42390,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 message, created = self.server.store.create_master_message(
                     parts[0], body
                 )
+                if created:
+                    self.server._wake_live_master_sessions(
+                        parts[0], reason="new work queued"
+                    )
                 self._send(
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {
