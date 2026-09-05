@@ -900,6 +900,19 @@ function bindTerminalIme(term, socket, getSurface) {
       imeLog("keydown", `key=${event.key} code=${event.keyCode} isComposing=${event.isComposing} IS_IOS=${IS_IOS}`);
       if (event.keyCode === 229) lastKey229At = Date.now();
       if (IS_IOS) {
+        // Backspace is the one key iOS never mirrors through `input`: xterm's
+        // own keydown handling preventDefaults it (emitting onData("\x7f")
+        // itself, which the onData filter below drops for iOS), so the
+        // browser's native textarea delete — and the `input` event that would
+        // carry it — never fires. Confirmed via ?imedebug=1: 7 consecutive
+        // Backspace presses after finishing a word produced 7x
+        // keydown+onData/drop and zero `input` lines. Send the DEL byte here
+        // instead; jamo-refinement deletes (a jamo key producing
+        // deleteContentBackward+insertText to refine the syllable) are a
+        // different path and never hit this branch.
+        if (event.key === "Backspace") {
+          sendPtyText(socket, "\x7f");
+        }
         // Never preventDefault on iOS — the soft keyboard needs the keydown to
         // reach the textarea so it emits the `input` events we mirror. xterm's
         // resulting printable/DEL onData is dropped in the onData handler.
