@@ -221,7 +221,11 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("if (IS_IOS) {", TERM)
         self.assertIn('it === "deleteContentBackward"', TERM)
         self.assertIn('sendPtyText(socket, "\\x7f")', TERM)
-        self.assertIn('if (IS_IOS && (!isControlData || data === "\\x7f"))', TERM)
+        self.assertIn('if (IS_IOS && data === "\\x7f")', TERM)
+        self.assertIn(
+            'if (IS_IOS && lastIosKeydownKeyCode === 0 && !isControlData)', TERM
+        )
+        self.assertIn("lastIosKeydownKeyCode = event.keyCode;", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         # The wheel handler must let xterm process every event (scrollback +

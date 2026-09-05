@@ -854,6 +854,18 @@ function bindTerminalIme(term, socket, getSurface) {
   // commit it on a boundary (next syllable, Enter, blur, quiet timeout).
   let imeMarked = "";
   let lastKey229At = 0;
+  // iOS only: keyCode of the most recent keydown. xterm's core recognizes
+  // any key with a real (non-zero) legacy keyCode — digits, # % ^ * _ + | =
+  // ~ > < , ' . and friends — and preventDefaults it to emit onData itself,
+  // which blocks the browser's native textarea edit and, with it, the
+  // `input` event the mirror below depends on: that data would otherwise be
+  // silently lost (confirmed via ?imedebug=1 — every real-keyCode key
+  // produced onData+drop and zero `input` lines). A key with NO legacy
+  // mapping (keyCode 0 — Hangul jamo, £/¥/•, anything exotic) is left alone
+  // by xterm, so the native edit and `input` mirror fire normally and must
+  // stay the single source of truth for those (needed for the jamo
+  // delete+reinsert refinement dance). onData below drops only the latter.
+  let lastIosKeydownKeyCode = -1;
   let imeInputAt = 0;
   let imeFlushTimer = 0;
   // xterm emits the just-committed syllable's onData asynchronously relative
@@ -900,6 +912,7 @@ function bindTerminalIme(term, socket, getSurface) {
       imeLog("keydown", `key=${event.key} code=${event.keyCode} isComposing=${event.isComposing} IS_IOS=${IS_IOS}`);
       if (event.keyCode === 229) lastKey229At = Date.now();
       if (IS_IOS) {
+        lastIosKeydownKeyCode = event.keyCode;
         // Backspace is the one key iOS never mirrors through `input`: xterm's
         // own keydown handling preventDefaults it (emitting onData("\x7f")
         // itself, which the onData filter below drops for iOS), so the
@@ -1075,11 +1088,18 @@ function bindTerminalIme(term, socket, getSurface) {
     }
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    // iOS: the `input` listener mirrors every printable key and every
-    // syllable-refinement delete. xterm's own onData only leaks raw jamo and
-    // a duplicate DEL, so drop printable + \x7f here; Enter / arrows / Esc
-    // (other control bytes) still pass through.
-    if (IS_IOS && (!isControlData || data === "\x7f")) {
+    // iOS: \x7f is always a duplicate — the Backspace keydown handler above
+    // already sent it directly. A printable char is a duplicate only when
+    // its keydown had no legacy keyCode (jamo/£/¥/•/...), meaning the
+    // `input` mirror owns it; a real-keyCode key (digits, # % ^ * _ + | =
+    // ~ > < , ' ., ...) never reaches the mirror at all and must go through
+    // here or it's lost outright. Enter / arrows / Esc (other control
+    // bytes) always pass through either way.
+    if (IS_IOS && data === "\x7f") {
+      imeLog("onData:drop(ios-backspace)", "");
+      return;
+    }
+    if (IS_IOS && lastIosKeydownKeyCode === 0 && !isControlData) {
       imeLog("onData:drop(ios)", "");
       return;
     }
