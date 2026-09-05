@@ -19633,6 +19633,7 @@ class UniverseStore:
         not_found_error: tuple[str, str],
         conflict_error: tuple[str, str],
         required: bool,
+        field_equals: tuple[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Optimistic-concurrency transition of a JSON-blob-backed queue row.
 
@@ -19652,6 +19653,15 @@ class UniverseStore:
         exactly one caller (_conductor_worker_loop); unsafe the moment a
         second concurrent claimer exists, which is exactly what the parallel
         Conductor/Master session work introduces.
+
+        `field_equals` is an optional second CAS predicate `(json_key,
+        expected_value)`: the transition proceeds only while
+        `message_json.$<json_key>` still equals `expected_value`. The
+        delivery_state guard alone cannot catch a same-state mutation - a
+        PROCESSING->PROCESSING lease renewal is invisible to a reclaimer
+        that only checks `state == 'PROCESSING'`, so it would revert a
+        freshly renewed lease to QUEUED. Pinning the reclaim to the exact
+        `lease_expires_at` value it observed as expired closes that window.
         """
         with self._connection() as connection:
             row = connection.execute(
@@ -19670,18 +19680,31 @@ class UniverseStore:
                     return None
                 code, detail = conflict_error
                 raise UniverseError(code, detail, HTTPStatus.CONFLICT)
+            if field_equals is not None:
+                guard_key, guard_expected = field_equals
+                if message.get(guard_key) != guard_expected:
+                    if not required:
+                        return None
+                    code, detail = conflict_error
+                    raise UniverseError(code, detail, HTTPStatus.CONFLICT)
             message["delivery_state"] = next_state
             message["updated_at"] = utc_now()
             if updates:
                 message.update(updates)
+            guard_sql = ""
+            guard_params: list[Any] = []
+            if field_equals is not None:
+                guard_sql = " AND json_extract(message_json, ?) IS ?"
+                guard_params = [f"$.{field_equals[0]}", field_equals[1]]
             cursor = connection.execute(
                 f"""
                 UPDATE {table}
                 SET message_json = ?
                 WHERE message_id = ?
                   AND json_extract(message_json, '$.delivery_state') = ?
+                {guard_sql}
                 """,
-                (_canonical_json(message), message_id, current_state),
+                (_canonical_json(message), message_id, current_state, *guard_params),
             )
             if cursor.rowcount != 1:
                 if not required:
@@ -19899,7 +19922,8 @@ class UniverseStore:
             if project_id is None:
                 rows = connection.execute(
                     """
-                    SELECT message_id
+                    SELECT message_id,
+                           json_extract(message_json, '$.lease_expires_at') AS lease
                     FROM project_master_message
                     WHERE json_extract(message_json, '$.delivery_state') = 'PROCESSING'
                       AND json_extract(message_json, '$.lease_expires_at') < ?
@@ -19909,7 +19933,8 @@ class UniverseStore:
             else:
                 rows = connection.execute(
                     """
-                    SELECT message_id
+                    SELECT message_id,
+                           json_extract(message_json, '$.lease_expires_at') AS lease
                     FROM project_master_message
                     WHERE project_id = ?
                       AND json_extract(message_json, '$.delivery_state') = 'PROCESSING'
@@ -19930,6 +19955,11 @@ class UniverseStore:
                     "reclaimed_at": now,
                 },
                 required=False,
+                # Skip any item whose lease was renewed between the SELECT
+                # above and this transition: the observed-expired value no
+                # longer matches, so the guarded UPDATE hits zero rows and
+                # the still-live claim keeps the item (review F2).
+                field_equals=("lease_expires_at", row["lease"]),
             )
             if transitioned is not None:
                 reclaimed.append(row["message_id"])
@@ -19971,6 +20001,7 @@ class UniverseStore:
         delivery_state: str,
         updates: dict[str, Any] | None = None,
         required: bool = True,
+        field_equals: tuple[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if delivery_state not in PROJECT_MASTER_MESSAGE_STATES:
             raise UniverseError(
@@ -19992,6 +20023,7 @@ class UniverseStore:
                 "Master message state transition is not allowed",
             ),
             required=required,
+            field_equals=field_equals,
         )
 
     def send_room_message(

@@ -5,6 +5,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -321,6 +322,51 @@ class MasterMessageQueueTests(unittest.TestCase):
         self.assertEqual([], reclaimed)
         still_processing = self.store.get_master_message(claimed["message_id"])
         self.assertEqual("PROCESSING", still_processing["delivery_state"])
+
+    def test_reclaim_does_not_revert_a_lease_renewed_after_the_expiry_scan(
+        self,
+    ) -> None:
+        """review F2: the reclaimer SELECTs an item as expired, then a still
+        -live claimant renews the lease before the reclaimer's per-row
+        transition runs. The item must stay PROCESSING with the fresh lease,
+        not silently drop back to QUEUED (which would let a second instance
+        claim work that is still in progress).
+        """
+
+        project = self.register_project("ALPHA")
+        self.store.create_master_message(
+            project["project_id"], self.message_request()
+        )
+        claimed = self.store.claim_master_message(
+            project["project_id"], provider="CLAUDE", lease_ttl_seconds=-1
+        )
+        message_id = claimed["message_id"]
+
+        original = self.store._transition_master_message
+        renewed: dict[str, Any] = {}
+
+        def racing_transition(mid: str, **kwargs: Any) -> Any:
+            if "lease" not in renewed:
+                renewed["lease"] = None  # guard against renew's own re-entry
+                renewed["lease"] = self.store.renew_master_message_lease(
+                    mid, lease_ttl_seconds=300
+                )["lease_expires_at"]
+            return original(mid, **kwargs)
+
+        with mock.patch.object(
+            self.store,
+            "_transition_master_message",
+            side_effect=racing_transition,
+        ):
+            reclaimed = self.store.reclaim_expired_master_messages(
+                project["project_id"]
+            )
+
+        self.assertEqual([], reclaimed)
+        current = self.store.get_master_message(message_id)
+        self.assertEqual("PROCESSING", current["delivery_state"])
+        self.assertEqual(renewed["lease"], current["lease_expires_at"])
+        self.assertNotIn("reclaimed_at", current)
 
     def test_renew_lease_rejects_a_message_that_is_not_processing(self) -> None:
         project = self.register_project("ALPHA")

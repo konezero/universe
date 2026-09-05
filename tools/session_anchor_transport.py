@@ -282,15 +282,24 @@ class SessionAnchorTransport:
                 f"{side}_SESSION_PROJECT_MISMATCH",
                 f"{side.lower()} Session Anchor belongs to another Project",
             )
-        if (
-            str(session.get("currentness") or "UNKNOWN").upper() != "CURRENT"
-            or str(session.get("state") or "UNKNOWN").upper()
-            not in {"LIVE", "STARTING", "REGISTERED"}
-        ):
+        if str(session.get("state") or "UNKNOWN").upper() not in {
+            "LIVE",
+            "STARTING",
+            "REGISTERED",
+        }:
             raise SessionAnchorTransportError(
                 f"{side}_SESSION_ANCHOR_STALE",
-                f"{side.lower()} Session Anchor is not current and available",
+                f"{side.lower()} Session Anchor is not live and available",
             )
+        # Deliberately NOT gated on `currentness`. This ref was resolved to
+        # exactly one session (an ambiguous match already failed above), so
+        # the route is to a specific session, not "the mode's current one".
+        # `currentness` is the Supervisor's mode-wide most-recently-active
+        # projection - observe_session_activity() forces every sibling in a
+        # node/mode to STALE whenever any one reports activity - and using it
+        # here made two genuinely live sibling MASTER sessions unable to
+        # both receive exact-anchor delegations. Routability is the target
+        # session's own `state`; currentness stays an observation hint.
         provider = str(session.get("provider") or "").upper()
         if provider not in {"CODEX", "CLAUDE", "GROK"} or not str(
             session.get("provider_session_ref") or ""
