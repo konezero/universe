@@ -40,7 +40,7 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("async function openProviderChatSession(room, options = {})", APP)
         submit_slice = APP[
             APP.index("async function submitDispatch") : APP.index(
-                "async function prepareProjectSeed"
+                "function graphNodeRef"
             )
         ]
         self.assertIn("/v1/provider-sessions/", submit_slice)
@@ -98,7 +98,7 @@ class ProviderSessionUiContractTests(unittest.TestCase):
         self.assertIn("async function rejoinDelegationOrigin(delegation)", APP)
         delegation_slice = APP[
             APP.index("async function submitDispatch") : APP.index(
-                "async function prepareProjectSeed"
+                "function graphNodeRef"
             )
         ]
         branch = delegation_slice[

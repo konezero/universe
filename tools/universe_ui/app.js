@@ -211,7 +211,6 @@ const elements = {
   composerActionMenu: document.querySelector("#composer-action-menu"),
   projectMasterActions: document.querySelector("#project-master-actions"),
   returnToConductor: document.querySelector("#return-to-conductor"),
-  prepareProject: document.querySelector("#prepare-project-button"),
   projectDialog: document.querySelector("#project-dialog"),
   projectForm: document.querySelector("#project-form"),
   projectFormError: document.querySelector("#project-form-error"),
@@ -13363,6 +13362,45 @@ function renderSemanticNodeActivity(graphNode) {
   elements.activity.append(timeline);
 }
 
+function renderHandoffTimelineRow(handoff) {
+  const row = node("div", "timeline-item handoff-item");
+  const copy = node("div", "timeline-copy");
+  const sourceKind = handoff.source?.kind || "UNKNOWN";
+  copy.append(
+    node("strong", "", `MASTER_HANDOFF / ${sourceKind}`),
+    node("small", "", `${handoff.delivery_state} · ${handoff.handoff_id}`),
+    node(
+      "small",
+      "",
+      handoff.purpose || handoff.next_operation || "Project Master handoff"
+    )
+  );
+  if (handoff.delivery_state === "PROPOSAL_ONLY") {
+    const action = node("button", "timeline-action", "Deliver");
+    action.type = "button";
+    action.addEventListener("click", () =>
+      deliverMasterHandoff(state.selectedProject.project_id, handoff)
+    );
+    copy.append(action);
+  }
+  // Marker is CSS ::before — do not prepend an extra empty span
+  // (it steals the content column and collapses copy into a 10px vertical strip).
+  row.append(copy);
+  return row;
+}
+
+function renderRoomMessageTimelineRow(message) {
+  const row = node("div", "timeline-item room-message");
+  const copy = node("div", "timeline-copy");
+  copy.append(
+    node("strong", "", `${message.kind} / ${message.sender}`),
+    node("small", "", message.body),
+    node("small", "", `${message.delivery_state} / ${message.created_at}`)
+  );
+  row.append(copy);
+  return row;
+}
+
 function renderActivity() {
   elements.activity.replaceChildren();
   if (!state.selectedProject) {
@@ -13377,116 +13415,29 @@ function renderActivity() {
     renderSemanticNodeActivity(state.selectedNode);
     return;
   }
-  if (
-    !state.dispatches.length &&
-    !state.roomMessages.length &&
-    !state.masterHandoffs.length
-  ) {
+  if (!state.roomMessages.length && !state.masterHandoffs.length) {
     elements.activity.append(node("p", "empty-copy", "No activity yet"));
     return;
   }
+  // Newest first. Merge both sources by their own created_at instead of two
+  // fixed handoffs-then-messages blocks (each internally oldest-first,
+  // scrollable only) — that buried today's activity under both older
+  // handoffs above it and an ever-growing message history below it.
+  const entries = [
+    ...state.masterHandoffs.map((handoff) => ({
+      sortKey: handoff.created_at || "",
+      render: () => renderHandoffTimelineRow(handoff),
+    })),
+    ...state.roomMessages.map((message) => ({
+      sortKey: message.created_at || "",
+      render: () => renderRoomMessageTimelineRow(message),
+    })),
+  ].sort((left, right) => right.sortKey.localeCompare(left.sortKey));
   const timeline = node("div", "timeline");
-  for (const handoff of state.masterHandoffs) {
-    const row = node("div", "timeline-item handoff-item");
-    const copy = node("div", "timeline-copy");
-    const sourceKind = handoff.source?.kind || "UNKNOWN";
-    copy.append(
-      node("strong", "", `MASTER_HANDOFF / ${sourceKind}`),
-      node(
-        "small",
-        "",
-        `${handoff.delivery_state} · ${handoff.handoff_id}`
-      ),
-      node(
-        "small",
-        "",
-        handoff.purpose || handoff.next_operation || "Project Master handoff"
-      )
-    );
-    if (handoff.delivery_state === "PROPOSAL_ONLY") {
-      const action = node("button", "timeline-action", "Deliver");
-      action.type = "button";
-      action.addEventListener("click", () =>
-        deliverMasterHandoff(state.selectedProject.project_id, handoff)
-      );
-      copy.append(action);
-    }
-    // Marker is CSS ::before — do not prepend an extra empty span
-    // (it steals the content column and collapses copy into a 10px vertical strip).
-    row.append(copy);
-    timeline.append(row);
-  }
-  for (const message of state.roomMessages) {
-    const row = node("div", "timeline-item room-message");
-    const copy = node("div", "timeline-copy");
-    copy.append(
-      node("strong", "", `${message.kind} / ${message.sender}`),
-      node("small", "", message.body),
-      node("small", "", `${message.delivery_state} / ${message.created_at}`)
-    );
-    row.append(copy);
-    timeline.append(row);
-  }
-  for (const item of state.dispatches) {
-    const dispatch = item.dispatch;
-    const row = node("div", "timeline-item");
-    const copy = node("div", "timeline-copy");
-    const title = node("strong", "", dispatch.title);
-    const badge = node("span", "status-badge", dispatch.status);
-    badge.dataset.status = dispatch.status;
-    const meta = node(
-      "small",
-      "",
-      `${dispatch.requested_mode} / ${item.updated_at}`
-    );
-    copy.append(title, badge, meta);
-    if (Array.isArray(item.events)) {
-      for (const event of item.events) {
-        copy.append(
-          node(
-            "small",
-            "event-evidence",
-            `${event.status} · ${event.evidence_ref}`
-          )
-        );
-      }
-    }
-    if (item.result_packet) {
-      copy.append(
-        node(
-          "small",
-          "result-summary",
-          `Result · ${item.result_packet.summary}`
-        )
-      );
-    }
-    if (dispatch.status === "QUEUED") {
-      const action = node("button", "timeline-action", "Deliver");
-      action.type = "button";
-      action.addEventListener("click", () => deliverDispatch(dispatch.dispatch_id));
-      copy.append(action);
-    }
-    row.append(copy);
-    timeline.append(row);
+  for (const entry of entries) {
+    timeline.append(entry.render());
   }
   elements.activity.append(timeline);
-}
-
-async function deliverDispatch(dispatchId) {
-  if (!window.confirm("Write this dispatch to the Project MASTER inbox?")) {
-    return;
-  }
-  try {
-    await api(`/v1/dispatches/${encodeURIComponent(dispatchId)}/deliver`, {
-      method: "POST",
-      body: { approval: "APPROVED" },
-    });
-    toast("Dispatch delivered");
-    await selectProject(state.selectedProject.project_id);
-    showInspectorTab("activity");
-  } catch (error) {
-    toast(error.message, true);
-  }
 }
 
 function renderEmpty() {
@@ -13730,29 +13681,6 @@ async function submitDispatch(event) {
     toast(error.message, true);
   } finally {
     elements.dispatchSubmit.disabled = false;
-  }
-}
-
-async function prepareProjectSeed() {
-  if (!state.selectedProject) {
-    toast("Select a project", true);
-    return;
-  }
-  elements.prepareProject.disabled = true;
-  try {
-    await api(
-      `/v1/projects/${encodeURIComponent(
-        state.selectedProject.project_id
-      )}/discovery-dispatch`,
-      { method: "POST", body: {} }
-    );
-    toast("Project seed preparation queued");
-    await selectProject(state.selectedProject.project_id);
-    showProjectScreen("activity");
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    elements.prepareProject.disabled = false;
   }
 }
 
@@ -17364,7 +17292,6 @@ function bindEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeComposerActionMenu();
   });
-  elements.prepareProject.addEventListener("click", prepareProjectSeed);
   elements.exitNodeUniverse.addEventListener("click", exitNodeUniverse);
   elements.closeInspector.addEventListener("click", closeInspector);
   if (elements.conductorSummaryToggle && elements.conductorSummary) {
