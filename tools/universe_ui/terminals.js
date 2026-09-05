@@ -1064,6 +1064,15 @@ function bindTerminalIme(term, socket, getSurface) {
       }
       lastMouseMotionSentAt = now;
     }
+    // A touch-scroll can hand xterm's mouse-tracking a rect it can't measure
+    // yet (mid-reflow), producing a malformed SGR report with a literal
+    // "NaN" column/row (e.g. "\x1b[<0;NaN;NaNM") — confirmed by a live
+    // capture during touch-scroll. A real report is always all digits; never
+    // let a broken one leak to the PTY as visible garbage text.
+    if (data.startsWith("\x1b[<") && data.includes("NaN")) {
+      imeLog("onData:drop(mouse-nan)", "");
+      return;
+    }
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
     // iOS: the `input` listener mirrors every printable key and every
