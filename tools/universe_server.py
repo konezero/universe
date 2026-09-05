@@ -372,6 +372,14 @@ PROJECT_MASTER_MESSAGE_STATES = frozenset(
 # reclaimed back to QUEUED once its lease expires. 5 minutes is generous for
 # a live session to renew (renew_master_message_lease) well before it lapses.
 MASTER_MESSAGE_LEASE_TTL_SECONDS = 300
+# _conductor_worker_loop consumes conductor_room_message off _conductor_queue,
+# a stdlib queue.Queue - already safe for any number of consumer threads
+# calling .get() concurrently (exactly one thread ever receives a given
+# item), so "N concurrent Conductor instances" for this in-process automation
+# loop is just N threads running the same target, not a new concurrency
+# primitive. Default kept small: this is in-process automation throughput,
+# not a knob end users are expected to tune per deployment size.
+CONDUCTOR_WORKER_POOL_SIZE_DEFAULT = 3
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
 CONDUCTOR_ROOM_UI_ACTION_SCHEMA = "universe.conductor-room-ui-action.v1"
 CONDUCTOR_ROOM_STREAM_SCHEMA = "universe.conductor-room-stream.v1"
@@ -25546,8 +25554,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         auto_start_memory_scheduler: bool = True,
         auto_start_goal_scheduler: bool = True,
         use_pty_supervisor: bool = False,
+        conductor_worker_pool_size: int = CONDUCTOR_WORKER_POOL_SIZE_DEFAULT,
     ):
         self.store = store
+        self._conductor_worker_pool_size = max(1, int(conductor_worker_pool_size))
         self.project_task_proposals = ProjectTaskProposalAdapter()
         self.session_supervisor = store.session_supervisor
         self.token = token
@@ -25792,12 +25802,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.provider_quota_registry = ProviderQuotaRegistry()
         self.ui_debug_trace: dict[str, Any] | None = None
-        self._conductor_worker = threading.Thread(
-            target=self._conductor_worker_loop,
-            name="universe-conductor-room-worker",
-            daemon=True,
-        )
-        self._conductor_worker.start()
+        # N threads pulling from the SAME _conductor_queue (queue.Queue is
+        # already safe for any number of concurrent .get() callers) - this is
+        # the whole generalization: no change to _conductor_worker_loop or
+        # claim_conductor_room_message's own CAS, both already written to be
+        # correct under concurrent callers.
+        self._conductor_workers: list[threading.Thread] = []
+        for worker_index in range(self._conductor_worker_pool_size):
+            worker = threading.Thread(
+                target=self._conductor_worker_loop,
+                name=f"universe-conductor-room-worker-{worker_index}",
+                daemon=True,
+            )
+            worker.start()
+            self._conductor_workers.append(worker)
         self._conductor_delegation_worker = threading.Thread(
             target=self._conductor_delegation_worker_loop,
             name="universe-conductor-delegation-worker",
@@ -38180,12 +38198,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         self.conductor_permissions.cancel_all()
         self._conductor_stop.set()
-        self._conductor_queue.put(None)
-        if self._conductor_worker.is_alive():
-            close_step(
-                "conductor_room_worker",
-                lambda: self._conductor_worker.join(timeout=5),
-            )
+        # One None sentinel per worker: each blocked queue.get() only ever
+        # consumes a single item, so N live workers need N sentinels to all
+        # unblock and observe the stop event.
+        for _ in self._conductor_workers:
+            self._conductor_queue.put(None)
+        for worker in self._conductor_workers:
+            if worker.is_alive():
+                close_step(
+                    f"conductor_room_worker[{worker.name}]",
+                    lambda worker=worker: worker.join(timeout=5),
+                )
         self._conductor_delegation_stop.set()
         self._conductor_delegation_queue.put(None)
         if self._conductor_delegation_worker.is_alive():
@@ -44149,6 +44172,7 @@ def create_server(
     file_selector: Callable[[str], str | None] | None = None,
     auto_start_goal_scheduler: bool = True,
     use_pty_supervisor: bool = False,
+    conductor_worker_pool_size: int = CONDUCTOR_WORKER_POOL_SIZE_DEFAULT,
 ) -> UniverseHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -44186,6 +44210,7 @@ def create_server(
         file_selector=file_selector,
         auto_start_goal_scheduler=auto_start_goal_scheduler,
         use_pty_supervisor=use_pty_supervisor,
+        conductor_worker_pool_size=conductor_worker_pool_size,
     )
 
 

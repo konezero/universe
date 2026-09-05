@@ -7857,7 +7857,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual("FAILED", state)
         self.assertEqual("WORKER_PROVIDER_UNAVAILABLE", failure["code"])
-        self.assertTrue(self.server._conductor_worker.is_alive())
+        self.assertTrue(all(worker.is_alive() for worker in self.server._conductor_workers))
 
     def test_registration_refresh_and_listing_are_idempotent(self) -> None:
         status, result = self.request(
@@ -17250,6 +17250,73 @@ class UniverseDefaultServerBootTests(unittest.TestCase):
                     server.planning_binding_status()["status"],
                 )
                 self.assertEqual(b"not a sqlite database", stale_session.read_bytes())
+            finally:
+                server.server_close()
+        finally:
+            temp.cleanup()
+
+    def test_conductor_worker_pool_spawns_n_workers_and_shuts_down_cleanly(
+        self,
+    ) -> None:
+        """The generalization for N concurrent Conductor instances: this
+        in-process automation loop's own queue.Queue is already safe for any
+        number of consumer threads calling .get() concurrently, so 'N
+        workers' is just N threads running the existing
+        _conductor_worker_loop target - no change to that loop or to
+        claim_conductor_room_message's own CAS, both already correct under
+        concurrent callers."""
+
+        temp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(temp.name)
+            server = create_server(
+                database_path=root / "universe.sqlite3",
+                token="pool-token",
+                auto_start_project_masters=False,
+                host_profile=HostProfileStore(root / "host.json"),
+                service_state_path=root / "server.json",
+                remote_gateway_state_path=root / "remote-gateway.json",
+                remote_connector_state_path=root / "remote-connector.json",
+                remote_connector_config_path=root / "remote-connector-config.json",
+                conductor_worker_pool_size=5,
+            )
+            try:
+                self.assertEqual(5, len(server._conductor_workers))
+                self.assertEqual(
+                    5, len({worker.name for worker in server._conductor_workers})
+                )
+                self.assertTrue(
+                    all(worker.is_alive() for worker in server._conductor_workers)
+                )
+            finally:
+                # One None sentinel must reach every worker, not just one -
+                # this is the regression this test guards: a leftover
+                # single put(None) would leave N-1 workers blocked forever
+                # on their own queue.get().
+                server.server_close()
+            self.assertTrue(
+                all(not worker.is_alive() for worker in server._conductor_workers)
+            )
+        finally:
+            temp.cleanup()
+
+    def test_conductor_worker_pool_size_clamps_below_one_to_one(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        try:
+            root = Path(temp.name)
+            server = create_server(
+                database_path=root / "universe.sqlite3",
+                token="pool-clamp-token",
+                auto_start_project_masters=False,
+                host_profile=HostProfileStore(root / "host.json"),
+                service_state_path=root / "server.json",
+                remote_gateway_state_path=root / "remote-gateway.json",
+                remote_connector_state_path=root / "remote-connector.json",
+                remote_connector_config_path=root / "remote-connector-config.json",
+                conductor_worker_pool_size=0,
+            )
+            try:
+                self.assertEqual(1, len(server._conductor_workers))
             finally:
                 server.server_close()
         finally:
