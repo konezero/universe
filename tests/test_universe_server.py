@@ -16243,6 +16243,108 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertFalse((self.project_root / ".ai" / "universe").exists())
 
+    def test_master_message_queue_http_lifecycle(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        create_status, created = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages",
+            {
+                "idempotency_key": "seed-v2",
+                "title": "Prepare Universe project seed",
+                "instruction": "Read the project and publish Seed assets.",
+            },
+            self.token,
+        )
+        self.assertEqual(201, create_status)
+        self.assertEqual("MASTER_MESSAGE_QUEUED", created["status"])
+        self.assertEqual("QUEUED", created["message"]["delivery_state"])
+
+        # Retrying the same idempotency_key + content returns the same item.
+        retry_status, retried = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages",
+            {
+                "idempotency_key": "seed-v2",
+                "title": "Prepare Universe project seed",
+                "instruction": "Read the project and publish Seed assets.",
+            },
+            self.token,
+        )
+        self.assertEqual(200, retry_status)
+        self.assertEqual("MASTER_MESSAGE_ALREADY_QUEUED", retried["status"])
+        self.assertEqual(
+            created["message"]["message_id"], retried["message"]["message_id"]
+        )
+
+        list_status, listed = self.request(
+            "GET", "/v1/projects/GCS/master-messages", None, self.token
+        )
+        self.assertEqual(200, list_status)
+        self.assertEqual(1, len(listed["messages"]))
+
+        claim_status, claimed = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages/claim",
+            {"provider": "CLAUDE"},
+            self.token,
+        )
+        self.assertEqual(200, claim_status)
+        self.assertEqual("MASTER_MESSAGE_CLAIMED", claimed["status"])
+        message_id = claimed["message"]["message_id"]
+        self.assertEqual("PROCESSING", claimed["message"]["delivery_state"])
+
+        empty_claim_status, empty_claim = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages/claim",
+            {"provider": "CODEX"},
+            self.token,
+        )
+        self.assertEqual(200, empty_claim_status)
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", empty_claim["status"])
+        self.assertIsNone(empty_claim["message"])
+
+        complete_status, completed = self.request(
+            "POST",
+            f"/v1/master-messages/{message_id}/complete",
+            {"provider": "CLAUDE", "result_ref": "artifact://seed/1"},
+            self.token,
+        )
+        self.assertEqual(200, complete_status)
+        self.assertEqual("MASTER_MESSAGE_COMPLETED", completed["status"])
+        self.assertEqual("DONE", completed["message"]["delivery_state"])
+
+    def test_master_message_fail_route_and_conflict_status(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        _, created = self.request(
+            "POST",
+            "/v1/projects/GCS/master-messages",
+            {
+                "idempotency_key": "seed-v2",
+                "title": "Prepare Universe project seed",
+                "instruction": "Read the project and publish Seed assets.",
+            },
+            self.token,
+        )
+        message_id = created["message"]["message_id"]
+        fail_status, failed = self.request(
+            "POST",
+            f"/v1/master-messages/{message_id}/fail",
+            {"code": "BLOCKED", "reason": "no live Master session"},
+            self.token,
+        )
+        self.assertEqual(200, fail_status)
+        self.assertEqual("MASTER_MESSAGE_FAILED", failed["status"])
+        self.assertEqual("FAILED", failed["message"]["delivery_state"])
+
+        conflict_status, conflict = self.request(
+            "POST",
+            f"/v1/master-messages/{message_id}/complete",
+            {"provider": "CLAUDE"},
+            self.token,
+        )
+        self.assertEqual(409, conflict_status)
+        self.assertEqual("MASTER_MESSAGE_STATE_CONFLICT", conflict["error_code"])
+
     def test_project_seed_rejects_digest_mismatch_and_root_escape(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         invalid_digest = self.project_seed()

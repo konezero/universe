@@ -358,6 +358,10 @@ AUTH_PROFILE_SCHEMA = "universe.auth-profile.v1"
 INTERFACE_PROFILE_SCHEMA = "universe.interface-profile.v1"
 CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
+PROJECT_MASTER_MESSAGE_SCHEMA = "universe.project-master-message.v1"
+PROJECT_MASTER_MESSAGE_STATES = frozenset(
+    {"QUEUED", "PROCESSING", "DONE", "FAILED"}
+)
 CONDUCTOR_ROOM_MESSAGE_SCHEMA = "universe.conductor-room-message.v1"
 CONDUCTOR_ROOM_UI_ACTION_SCHEMA = "universe.conductor-room-ui-action.v1"
 CONDUCTOR_ROOM_STREAM_SCHEMA = "universe.conductor-room-stream.v1"
@@ -4489,6 +4493,52 @@ def normalize_conductor_ui_action(value: Any) -> dict[str, Any]:
     }
 
 
+def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
+    """A Project Master work-queue item — claimable by any idle Master
+    instance for this project (see claim_master_message). Distinct from
+    project_room_message, which is a display/audit feed, not a work queue.
+    """
+
+    if not isinstance(value, dict):
+        raise UniverseError(
+            "REQUEST_INVALID", "Master message body must be an object"
+        )
+    title = _required_text(value.get("title"), "title")
+    if len(title) > 200:
+        raise UniverseError("MASTER_MESSAGE_TITLE_INVALID", "title is too long")
+    instruction = _required_text(value.get("instruction"), "instruction")
+    if len(instruction) > 20000:
+        raise UniverseError(
+            "MASTER_MESSAGE_INSTRUCTION_INVALID", "instruction is too long"
+        )
+    idempotency_key = _required_text(value.get("idempotency_key"), "idempotency_key")
+    metadata = value.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise UniverseError(
+            "MASTER_MESSAGE_METADATA_INVALID", "metadata must be an object"
+        )
+    material = {
+        "project_id": project_id,
+        "title": title,
+        "instruction": instruction,
+        "metadata": metadata,
+    }
+    return {
+        "schema": PROJECT_MASTER_MESSAGE_SCHEMA,
+        "message_id": "master_msg_" + uuid.uuid4().hex,
+        "project_id": project_id,
+        "idempotency_key": idempotency_key,
+        "title": title,
+        "instruction": instruction,
+        "metadata": metadata,
+        "content_digest": hashlib.sha256(
+            _canonical_json(material).encode("utf-8")
+        ).hexdigest(),
+        "delivery_state": "QUEUED",
+        "created_at": utc_now(),
+    }
+
+
 def normalize_conductor_room_message(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UniverseError(
@@ -6693,6 +6743,23 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS conductor_room_message_time
                 ON conductor_room_message(created_at, message_id);
+
+                -- Project Master work queue: unlike conductor_room_message (one
+                -- global queue), Master is project-scoped, so idempotency is
+                -- unique per (project_id, idempotency_key) rather than globally.
+                CREATE TABLE IF NOT EXISTS project_master_message (
+                    message_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    message_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, idempotency_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_master_message_project_time
+                ON project_master_message(project_id, created_at, message_id);
 
                 CREATE TABLE IF NOT EXISTS conductor_delegation (
                     delegation_id TEXT PRIMARY KEY,
@@ -19529,6 +19596,74 @@ class UniverseStore:
             )
         return original, reply
 
+    def _cas_update_json_message(
+        self,
+        table: str,
+        message_id: str,
+        *,
+        expected_states: set[str],
+        next_state: str,
+        updates: dict[str, Any] | None,
+        not_found_error: tuple[str, str],
+        conflict_error: tuple[str, str],
+        required: bool,
+    ) -> dict[str, Any] | None:
+        """Optimistic-concurrency transition of a JSON-blob-backed queue row.
+
+        `table` and `id_column`-equivalent are always internal literals, never
+        request-derived, so the f-string table name below is not an
+        injection surface. The important part is the WHERE clause on the
+        UPDATE: it is pinned to the EXACT delivery_state value just read, not
+        merely "state IN expected_states". Under real concurrent claims, two
+        readers can observe the same pre-transition state before either
+        writes (a plain SELECT takes no lock); pinning the guarded UPDATE to
+        that exact observed value means only the writer SQLite's write
+        serialization lets go first still finds a matching row (rowcount==1)
+        — the loser's UPDATE matches zero rows (the winner already changed
+        delivery_state) instead of silently clobbering the winner's change.
+        This replaces an earlier version of this method (conductor-only) that
+        read-then-wrote with no such guard: safe only because there was ever
+        exactly one caller (_conductor_worker_loop); unsafe the moment a
+        second concurrent claimer exists, which is exactly what the parallel
+        Conductor/Master session work introduces.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                f"SELECT message_json FROM {table} WHERE message_id = ?",
+                (_required_text(message_id, "message_id"),),
+            ).fetchone()
+            if row is None:
+                if not required:
+                    return None
+                code, detail = not_found_error
+                raise UniverseError(code, detail, HTTPStatus.NOT_FOUND)
+            message = json.loads(row["message_json"])
+            current_state = message.get("delivery_state")
+            if current_state not in expected_states:
+                if not required:
+                    return None
+                code, detail = conflict_error
+                raise UniverseError(code, detail, HTTPStatus.CONFLICT)
+            message["delivery_state"] = next_state
+            message["updated_at"] = utc_now()
+            if updates:
+                message.update(updates)
+            cursor = connection.execute(
+                f"""
+                UPDATE {table}
+                SET message_json = ?
+                WHERE message_id = ?
+                  AND json_extract(message_json, '$.delivery_state') = ?
+                """,
+                (_canonical_json(message), message_id, current_state),
+            )
+            if cursor.rowcount != 1:
+                if not required:
+                    return None
+                code, detail = conflict_error
+                raise UniverseError(code, detail, HTTPStatus.CONFLICT)
+        return message
+
     def _transition_conductor_room_message(
         self,
         message_id: str,
@@ -19543,45 +19678,208 @@ class UniverseStore:
                 "CONDUCTOR_ROOM_STATE_INVALID",
                 "unsupported conductor room delivery state",
             )
+        return self._cas_update_json_message(
+            "conductor_room_message",
+            message_id,
+            expected_states=expected_states,
+            next_state=delivery_state,
+            updates=updates,
+            not_found_error=(
+                "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
+                "conductor room message is not registered",
+            ),
+            conflict_error=(
+                "CONDUCTOR_ROOM_STATE_CONFLICT",
+                "conductor room message state transition is not allowed",
+            ),
+            required=required,
+        )
+
+    def create_master_message(
+        self, project_id: str, value: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """Queue a Master work item for `project_id`. Idempotent per
+        (project_id, idempotency_key): a retry with the same key and content
+        returns the existing item (created=False); the same key with
+        different content is a conflict.
+        """
+
+        project = self.get_project(project_id)
+        message = normalize_master_message(project["project_id"], value)
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT message_json, created_at
+                FROM project_master_message
+                WHERE project_id = ? AND idempotency_key = ?
+                """,
+                (project["project_id"], message["idempotency_key"]),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["message_json"])
+                if stored["content_digest"] != message["content_digest"]:
+                    raise UniverseError(
+                        "MASTER_MESSAGE_IDEMPOTENCY_CONFLICT",
+                        "idempotency_key already refers to another Master message",
+                        HTTPStatus.CONFLICT,
+                    )
+                stored["created_at"] = existing["created_at"]
+                return stored, False
+            connection.execute(
+                """
+                INSERT INTO project_master_message(
+                    message_id, project_id, idempotency_key, message_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    message["message_id"],
+                    project["project_id"],
+                    message["idempotency_key"],
+                    _canonical_json(message),
+                    message["created_at"],
+                ),
+            )
+        return message, True
+
+    def list_master_messages(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_json, created_at
+                FROM project_master_message
+                WHERE project_id = ?
+                ORDER BY created_at, rowid
+                LIMIT ?
+                """,
+                (project["project_id"], max(1, min(int(limit), 500))),
+            ).fetchall()
+        messages = []
+        for row in rows:
+            message = json.loads(row["message_json"])
+            message["created_at"] = row["created_at"]
+            messages.append(message)
+        return messages
+
+    def get_master_message(self, message_id: str) -> dict[str, Any]:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT message_json
-                FROM conductor_room_message
+                SELECT message_json, created_at
+                FROM project_master_message
                 WHERE message_id = ?
                 """,
                 (_required_text(message_id, "message_id"),),
             ).fetchone()
-            if row is None:
-                if not required:
-                    return None
-                raise UniverseError(
-                    "CONDUCTOR_ROOM_MESSAGE_NOT_FOUND",
-                    "conductor room message is not registered",
-                    HTTPStatus.NOT_FOUND,
-                )
-            message = json.loads(row["message_json"])
-            if message.get("delivery_state") not in expected_states:
-                if not required:
-                    return None
-                raise UniverseError(
-                    "CONDUCTOR_ROOM_STATE_CONFLICT",
-                    "conductor room message state transition is not allowed",
-                    HTTPStatus.CONFLICT,
-                )
-            message["delivery_state"] = delivery_state
-            message["updated_at"] = utc_now()
-            if updates:
-                message.update(updates)
-            connection.execute(
-                """
-                UPDATE conductor_room_message
-                SET message_json = ?
-                WHERE message_id = ?
-                """,
-                (_canonical_json(message), message_id),
+        if row is None:
+            raise UniverseError(
+                "MASTER_MESSAGE_NOT_FOUND",
+                "Master message is not registered",
+                HTTPStatus.NOT_FOUND,
             )
+        message = json.loads(row["message_json"])
+        message["created_at"] = row["created_at"]
         return message
+
+    def claim_master_message(
+        self, project_id: str, *, provider: str
+    ) -> dict[str, Any] | None:
+        """Claim the oldest QUEUED item for this project, safe under any
+        number of concurrent Master instances racing on the same project's
+        queue. Tries a small batch of the oldest candidates in order, since
+        the first one may have just lost the race by the time we attempt it.
+
+        Orders by rowid (true insertion order), not message_id: utc_now()
+        only has second-level precision, so a burst of items queued within
+        the same second all share one created_at value, and message_id (a
+        random UUID) is not a valid tie-break for "oldest first".
+        """
+
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            candidates = connection.execute(
+                """
+                SELECT message_id
+                FROM project_master_message
+                WHERE project_id = ?
+                  AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                ORDER BY created_at, rowid
+                LIMIT 8
+                """,
+                (project["project_id"],),
+            ).fetchall()
+        for row in candidates:
+            claimed = self._transition_master_message(
+                row["message_id"],
+                expected_states={"QUEUED"},
+                delivery_state="PROCESSING",
+                updates={"provider": provider, "started_at": utc_now()},
+                required=False,
+            )
+            if claimed is not None:
+                return claimed
+        return None
+
+    def fail_master_message(self, message_id: str, *, code: str, reason: str) -> None:
+        self._transition_master_message(
+            message_id,
+            expected_states={"QUEUED", "PROCESSING"},
+            delivery_state="FAILED",
+            updates={
+                "failure": {
+                    "code": _required_text(code, "failure.code")[:160],
+                    "reason": _required_text(reason, "failure.reason")[:1000],
+                },
+                "completed_at": utc_now(),
+            },
+        )
+
+    def complete_master_message(
+        self, message_id: str, *, provider: str, result_ref: str = ""
+    ) -> dict[str, Any]:
+        return self._transition_master_message(
+            message_id,
+            expected_states={"PROCESSING"},
+            delivery_state="DONE",
+            updates={
+                "provider": provider,
+                "result_ref": str(result_ref or ""),
+                "completed_at": utc_now(),
+            },
+        )
+
+    def _transition_master_message(
+        self,
+        message_id: str,
+        *,
+        expected_states: set[str],
+        delivery_state: str,
+        updates: dict[str, Any] | None = None,
+        required: bool = True,
+    ) -> dict[str, Any] | None:
+        if delivery_state not in PROJECT_MASTER_MESSAGE_STATES:
+            raise UniverseError(
+                "MASTER_MESSAGE_STATE_INVALID",
+                "unsupported Master message delivery state",
+            )
+        return self._cas_update_json_message(
+            "project_master_message",
+            message_id,
+            expected_states=expected_states,
+            next_state=delivery_state,
+            updates=updates,
+            not_found_error=(
+                "MASTER_MESSAGE_NOT_FOUND",
+                "Master message is not registered",
+            ),
+            conflict_error=(
+                "MASTER_MESSAGE_STATE_CONFLICT",
+                "Master message state transition is not allowed",
+            ),
+            required=required,
+        )
 
     def send_room_message(
         self, project_id: str, value: Any
@@ -39357,6 +39655,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/master-messages":
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MASTER_MESSAGES_COLLECTED",
+                        "project_id": project_id,
+                        "messages": self.server.store.list_master_messages(project_id),
+                    },
+                )
+                return
             if suffix == "/release-proposals":
                 self._send(
                     HTTPStatus.OK,
@@ -41911,6 +42220,41 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/master-messages":
+                message, created = self.server.store.create_master_message(
+                    parts[0], body
+                )
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "MASTER_MESSAGE_QUEUED"
+                            if created
+                            else "MASTER_MESSAGE_ALREADY_QUEUED"
+                        ),
+                        "message": message,
+                    },
+                )
+                return
+            if parts is not None and parts[1] == "/master-messages/claim":
+                provider = _required_text((body or {}).get("provider"), "provider")
+                claimed = self.server.store.claim_master_message(
+                    parts[0], provider=provider
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "MASTER_MESSAGE_CLAIMED"
+                            if claimed is not None
+                            else "MASTER_MESSAGE_QUEUE_EMPTY"
+                        ),
+                        "message": claimed,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/sync":
                 result = self.server.store.sync_project_seed_assets(parts[0])
                 self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
@@ -42597,6 +42941,42 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
+            master_message_parts = self._master_message_path(path)
+            if master_message_parts is not None:
+                message_id, operation = master_message_parts
+                if operation == "/complete":
+                    provider = _required_text(
+                        (body or {}).get("provider"), "provider"
+                    )
+                    message = self.server.store.complete_master_message(
+                        message_id,
+                        provider=provider,
+                        result_ref=str((body or {}).get("result_ref") or ""),
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "MASTER_MESSAGE_COMPLETED",
+                            "message": message,
+                        },
+                    )
+                    return
+                if operation == "/fail":
+                    self.server.store.fail_master_message(
+                        message_id,
+                        code=_required_text((body or {}).get("code"), "code"),
+                        reason=_required_text((body or {}).get("reason"), "reason"),
+                    )
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "schema": API_SCHEMA,
+                            "status": "MASTER_MESSAGE_FAILED",
+                            "message": self.server.store.get_master_message(message_id),
+                        },
+                    )
+                    return
             self._not_found()
         except ProviderSessionError as error:
             self._send_provider_session_error(error)
@@ -42930,6 +43310,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/runtime-worker-invocations",
             "/dispatches",
             "/discovery-dispatch",
+            "/master-messages/claim",
+            "/master-messages",
             "/projection",
             "/events",
             "/skill-observations",
@@ -43142,6 +43524,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if remainder.endswith(suffix):
                 return unquote(remainder[: -len(suffix)]), suffix
         return unquote(remainder), ""
+
+    @staticmethod
+    def _master_message_path(path: str) -> tuple[str, str] | None:
+        prefix = "/v1/master-messages/"
+        if not path.startswith(prefix):
+            return None
+        remainder = path[len(prefix) :]
+        for suffix in ("/complete", "/fail"):
+            if remainder.endswith(suffix):
+                return unquote(remainder[: -len(suffix)]), suffix
+        return None
 
     @staticmethod
     def _master_handoff_path(path: str) -> tuple[str, str, str] | None:
