@@ -854,18 +854,37 @@ function bindTerminalIme(term, socket, getSurface) {
   // commit it on a boundary (next syllable, Enter, blur, quiet timeout).
   let imeMarked = "";
   let lastKey229At = 0;
-  // iOS only: keyCode of the most recent keydown. xterm's core recognizes
-  // any key with a real (non-zero) legacy keyCode — digits, # % ^ * _ + | =
-  // ~ > < , ' . and friends — and preventDefaults it to emit onData itself,
-  // which blocks the browser's native textarea edit and, with it, the
-  // `input` event the mirror below depends on: that data would otherwise be
-  // silently lost (confirmed via ?imedebug=1 — every real-keyCode key
-  // produced onData+drop and zero `input` lines). A key with NO legacy
-  // mapping (keyCode 0 — Hangul jamo, £/¥/•, anything exotic) is left alone
-  // by xterm, so the native edit and `input` mirror fire normally and must
-  // stay the single source of truth for those (needed for the jamo
-  // delete+reinsert refinement dance). onData below drops only the latter.
-  let lastIosKeydownKeyCode = -1;
+  // iOS only: whether a given printable key gets an `input` mirror event at
+  // all is NOT decided by its keyCode — confirmed via ?imedebug=1: digits
+  // and ASCII punctuation (real keyCodes) get onData+drop and zero `input`
+  // lines (xterm preventDefaults them — lost outright without a fallback),
+  // but a SHIFTED LETTER (also a real keyCode) gets onData AND a genuine
+  // `input` mirror event both firing for the same character (double-send).
+  // So instead of guessing from the keydown, race the two: schedule a short
+  // fallback send of the raw key, and cancel it the moment a real `input`
+  // event actually claims that keystroke. Jamo/£/¥/•-class keys resolve
+  // this within ~10ms every time observed; only a key with truly no mirror
+  // (digits, punctuation) ever reaches the timeout.
+  const IOS_INPUT_MIRROR_TIMEOUT_MS = 30;
+  let mostRecentIosFallback = null; // { char, resolved }
+  const scheduleIosFallback = (char) => {
+    const entry = { char, resolved: false };
+    mostRecentIosFallback = entry;
+    window.setTimeout(() => {
+      if (entry.resolved) return;
+      entry.resolved = true;
+      sendPtyText(socket, char);
+      imeLog("ios-fallback:send", char);
+    }, IOS_INPUT_MIRROR_TIMEOUT_MS);
+  };
+  // Idempotent — safe to call for both `input` events in a jamo-refinement
+  // pair (deleteContentBackward then insertText); the second call is a
+  // harmless no-op since the entry is already resolved by the first.
+  const resolveIosFallback = () => {
+    if (mostRecentIosFallback && !mostRecentIosFallback.resolved) {
+      mostRecentIosFallback.resolved = true;
+    }
+  };
   let imeInputAt = 0;
   let imeFlushTimer = 0;
   // xterm emits the just-committed syllable's onData asynchronously relative
@@ -912,19 +931,20 @@ function bindTerminalIme(term, socket, getSurface) {
       imeLog("keydown", `key=${event.key} code=${event.keyCode} isComposing=${event.isComposing} IS_IOS=${IS_IOS}`);
       if (event.keyCode === 229) lastKey229At = Date.now();
       if (IS_IOS) {
-        lastIosKeydownKeyCode = event.keyCode;
-        // Backspace is the one key iOS never mirrors through `input`: xterm's
-        // own keydown handling preventDefaults it (emitting onData("\x7f")
-        // itself, which the onData filter below drops for iOS), so the
-        // browser's native textarea delete — and the `input` event that would
-        // carry it — never fires. Confirmed via ?imedebug=1: 7 consecutive
-        // Backspace presses after finishing a word produced 7x
-        // keydown+onData/drop and zero `input` lines. Send the DEL byte here
-        // instead; jamo-refinement deletes (a jamo key producing
-        // deleteContentBackward+insertText to refine the syllable) are a
-        // different path and never hit this branch.
+        // Backspace is the one key iOS NEVER mirrors through `input`, with no
+        // exception observed: xterm's own keydown handling preventDefaults it
+        // (emitting onData("\x7f") itself, which the onData filter below
+        // drops for iOS), so the browser's native textarea delete — and the
+        // `input` event that would carry it — never fires. Confirmed via
+        // ?imedebug=1: 7 consecutive Backspace presses after finishing a word
+        // produced 7x keydown+onData/drop and zero `input` lines. Send the
+        // DEL byte here directly, no fallback timer needed; jamo-refinement
+        // deletes (a jamo key producing deleteContentBackward+insertText to
+        // refine the syllable) are a different path and never hit this.
         if (event.key === "Backspace") {
           sendPtyText(socket, "\x7f");
+        } else if (event.key.length === 1) {
+          scheduleIosFallback(event.key);
         }
         // Never preventDefault on iOS — the soft keyboard needs the keydown to
         // reach the textarea so it emits the `input` events we mirror. xterm's
@@ -998,6 +1018,11 @@ function bindTerminalIme(term, socket, getSurface) {
       const it = event.inputType;
       imeLog("input", `type=${it} data=${JSON.stringify(event.data || "")} composing=${composing}`);
       if (IS_IOS) {
+        // A real `input` event just claimed this keystroke — cancel its
+        // fallback timer so the raw key never sends a second time. Harmless
+        // no-op if already resolved (the jamo-refinement pair below fires
+        // this twice for one keydown).
+        resolveIosFallback();
         // Leave textarea.value alone — iOS tracks its own composition state and
         // clearing it mid-syllable desyncs the next deleteContentBackward.
         if (it === "deleteContentBackward" || it === "deleteWordBackward") {
@@ -1088,18 +1113,11 @@ function bindTerminalIme(term, socket, getSurface) {
     }
     const isControlData =
       !data || data === "\x7f" || data.charCodeAt(0) < 0x20;
-    // iOS: \x7f is always a duplicate — the Backspace keydown handler above
-    // already sent it directly. A printable char is a duplicate only when
-    // its keydown had no legacy keyCode (jamo/£/¥/•/...), meaning the
-    // `input` mirror owns it; a real-keyCode key (digits, # % ^ * _ + | =
-    // ~ > < , ' ., ...) never reaches the mirror at all and must go through
-    // here or it's lost outright. Enter / arrows / Esc (other control
-    // bytes) always pass through either way.
-    if (IS_IOS && data === "\x7f") {
-      imeLog("onData:drop(ios-backspace)", "");
-      return;
-    }
-    if (IS_IOS && lastIosKeydownKeyCode === 0 && !isControlData) {
+    // iOS: every printable key and \x7f is handled by the keydown fallback
+    // race + `input` mirror above (scheduleIosFallback/resolveIosFallback),
+    // never by xterm's own onData — drop both here unconditionally. Enter /
+    // arrows / Esc (other control bytes) still pass through.
+    if (IS_IOS && (!isControlData || data === "\x7f")) {
       imeLog("onData:drop(ios)", "");
       return;
     }

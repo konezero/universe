@@ -221,11 +221,15 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("if (IS_IOS) {", TERM)
         self.assertIn('it === "deleteContentBackward"', TERM)
         self.assertIn('sendPtyText(socket, "\\x7f")', TERM)
-        self.assertIn('if (IS_IOS && data === "\\x7f")', TERM)
-        self.assertIn(
-            'if (IS_IOS && lastIosKeydownKeyCode === 0 && !isControlData)', TERM
-        )
-        self.assertIn("lastIosKeydownKeyCode = event.keyCode;", TERM)
+        self.assertIn('if (IS_IOS && (!isControlData || data === "\\x7f"))', TERM)
+        # Whether a printable key gets an `input` mirror at all isn't decided
+        # by keyCode (a real-keyCode digit/symbol never gets one; a
+        # real-keyCode SHIFTED LETTER gets one AND xterm's own onData, i.e.
+        # a double) — race a short fallback against the mirror instead.
+        self.assertIn("const scheduleIosFallback = (char) => {", TERM)
+        self.assertIn("const resolveIosFallback = () => {", TERM)
+        self.assertIn("scheduleIosFallback(event.key)", TERM)
+        self.assertIn("resolveIosFallback();", TERM)
         self.assertIn("withTerminalReplayGuard", TERM)
         self.assertIn("attachTerminalMouseWheelHandler", TERM)
         # The wheel handler must let xterm process every event (scrollback +
