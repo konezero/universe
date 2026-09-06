@@ -135,6 +135,79 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
             self.assertEqual("host-1001", historical["host_session_ref"])
             self.assertFalse(historical["reconnect_eligible"])
 
+    def test_launch_registry_refusal_and_reclaim_matrix(self) -> None:
+        # Regression coverage for the launch() discovery fallback: which stale
+        # anchor-*.json records may be reclaimed and which must be refused.
+        cases = {
+            # name: (state_json_builder, pid_is_alive, expect)
+            "dead_legacy_record_is_reclaimed": (
+                lambda a: {"schema": STATE_SCHEMA, "anchor_ref": a, "pid": 9001,
+                           "endpoint": "tcp://127.0.0.1:1", "auth_token": "t"},
+                lambda pid: False,
+                "RECLAIMED",
+            ),
+            "live_legacy_pid_is_refused": (
+                lambda a: {"schema": STATE_SCHEMA, "anchor_ref": a, "pid": 9002,
+                           "endpoint": "tcp://127.0.0.1:1", "auth_token": "t"},
+                lambda pid: pid == 9002,
+                "REFUSED",
+            ),
+            "schema_mismatch_is_refused": (
+                lambda a: {"schema": "something.else.v9", "anchor_ref": a, "pid": 9003,
+                           "endpoint": "tcp://127.0.0.1:1", "auth_token": "t"},
+                lambda pid: False,
+                "REFUSED",
+            ),
+            "anchor_mismatch_is_refused": (
+                lambda a: {"schema": STATE_SCHEMA, "anchor_ref": "anchor-other",
+                           "pid": 9004, "endpoint": "tcp://127.0.0.1:1", "auth_token": "t"},
+                lambda pid: False,
+                "REFUSED",
+            ),
+            "live_but_unreachable_full_record_is_refused": (
+                None,  # full v2 record via write_state; discover() fails on IPC
+                lambda pid: pid == 9005,
+                "REFUSED",
+            ),
+        }
+        for name, (builder, alive, expect) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp, patch(
+                "universe_app.reconnection_host.provision_private_registry_directory"
+            ):
+                root = Path(temp)
+                binary = root / "host.exe"
+                binary.touch()
+                registry = ReconnectionHostRegistry(root, binary)
+                anchor = "anchor-matrix"
+                state_path = registry.state_path(anchor)
+                if builder is None:
+                    self.write_state(registry, anchor, pid=9005, started_at=1.0)
+                else:
+                    state_path.write_text(json.dumps(builder(anchor)), encoding="utf-8")
+                with patch(
+                    "universe_app.reconnection_host.process_is_alive", side_effect=alive
+                ), patch(
+                    "universe_app.reconnection_host.process_start_time",
+                    side_effect=lambda pid: 1.0 if alive(pid) else None,
+                ), patch(
+                    "universe_app.reconnection_host.subprocess.Popen",
+                    side_effect=AssertionError("SPAWN_REACHED"),
+                ):
+                    try:
+                        registry.launch(anchor, cwd=root)
+                    except AssertionError as spawn:
+                        self.assertEqual("SPAWN_REACHED", str(spawn))
+                        outcome = "RECLAIMED"
+                    except ReconnectionHostError:
+                        outcome = "REFUSED"
+                    else:  # pragma: no cover - launch has no other exit here
+                        outcome = "UNEXPECTED_SUCCESS"
+                self.assertEqual(expect, outcome)
+                if expect == "RECLAIMED":
+                    self.assertFalse(state_path.exists())
+                else:
+                    self.assertTrue(state_path.exists())
+
     def write_state(
         self,
         registry: ReconnectionHostRegistry,
