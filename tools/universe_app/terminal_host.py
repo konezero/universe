@@ -2094,6 +2094,7 @@ class TerminalHost:
             )
         return performed
 
+    @_serialize_reconnection_lifecycle
     def close(
         self,
         terminal_id: str,
@@ -2101,6 +2102,10 @@ class TerminalHost:
         audit_context: Mapping[str, Any] | None = None,
         terminate_host: bool = False,
     ) -> dict[str, Any]:
+        # terminate / detach / reclaim run under the same Reconnection Host
+        # lifecycle boundary as create and reconcile, so a concurrent
+        # reconcile cannot rebuild a session mid-teardown (the churn that left
+        # just-terminated terminals reattached).
         session = self.get(terminal_id)
         terminal = session.public()
         request_event = "TERMINATE_REQUESTED" if terminate_host else "DETACH_REQUESTED"

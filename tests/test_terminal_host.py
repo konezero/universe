@@ -604,6 +604,58 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual(1, registry.clients["anchor-atomic-host"].generation)
             host.terminate(created["terminal_id"])
 
+    def test_terminate_serializes_against_background_reconcile(self) -> None:
+        registry = FakeReconnectionRegistry()
+        reconcile_started = threading.Event()
+        reconcile_finished = threading.Event()
+        reconcile_thread: threading.Thread | None = None
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "T"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(
+                audit_database_path=Path(tmp) / "audit.sqlite3",
+                reconnection_registry=registry,
+            )
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-term-serialize",
+                provider="CODEX",
+                supervisor_session_id="sup-term-serialize",
+            )
+            client = registry.clients["anchor-term-serialize"]
+            base_shutdown = client.shutdown
+
+            def shutdown() -> None:
+                nonlocal reconcile_thread
+
+                def reconcile() -> None:
+                    reconcile_started.set()
+                    host.reconcile_reconnection_hosts()
+                    reconcile_finished.set()
+
+                reconcile_thread = threading.Thread(target=reconcile)
+                reconcile_thread.start()
+                self.assertTrue(reconcile_started.wait(1))
+                # terminate holds the lifecycle lock here -> reconcile is blocked
+                self.assertFalse(reconcile_finished.wait(0.1))
+                base_shutdown()
+
+            client.shutdown = shutdown
+            host.terminate(created["terminal_id"])
+            # terminate held the lifecycle lock through client.shutdown(), so the
+            # racing reconcile could not run mid-teardown (it only completes once
+            # terminate returns and releases the lock).
+            self.assertIsNotNone(reconcile_thread)
+            reconcile_thread.join(timeout=2)
+            self.assertTrue(reconcile_finished.is_set())
+
     def test_reconcile_uses_complete_creation_history_for_live_registry_hosts(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(
@@ -705,7 +757,8 @@ class TerminalHostTests(unittest.TestCase):
                 "UNIVERSE_SESSION_ANCHOR_REF": TEST_ANCHOR,
                 "GROK_CLAUDE_HOOKS_ENABLED": "0",
                 "UNIVERSE_MODEL_REF": "",
-                "UNIVERSE_EFFORT": "AUTO",
+                # an unspecified MASTER defaults to MEDIUM effort
+                "UNIVERSE_EFFORT": "MEDIUM",
                 "UNIVERSE_SUPERVISOR_SESSION_ID": "",
                 "UNIVERSE_TERMINAL_ID": created["terminal_id"],
                 "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(
