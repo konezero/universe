@@ -9432,7 +9432,14 @@ function setDialogCategoryTab(root, { tabAttr, panelAttr, stateKey, allowed, fal
 }
 
 function setSettingsTab(tabId) {
-  const allowed = new Set(["service", "remote", "rooms", "providers", "host"]);
+  const allowed = new Set([
+    "service",
+    "remote",
+    "rooms",
+    "providers",
+    "host",
+    "releases",
+  ]);
   if (allowed.has(tabId)) state.settingsTab = tabId;
   setDialogCategoryTab(elements.settingsDialog, {
     tabAttr: "data-settings-tab",
@@ -16795,8 +16802,9 @@ function bindEvents() {
   }
 
   document
-    .querySelector("#release-button")
+    .querySelector("#open-release-catalog")
     .addEventListener("click", () => {
+      elements.settingsDialog?.close();
       elements.releaseFormError.textContent = "";
       renderReleaseCatalog();
       elements.releaseDialog.showModal();
