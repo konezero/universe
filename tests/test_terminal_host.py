@@ -1079,6 +1079,23 @@ class TerminalHostTests(unittest.TestCase):
             startup_argv("CODEX", "abc", model_ref="gpt-5.6", effort="HIGH"),
         )
 
+    def test_claude_master_startup_appends_the_master_role_system_prompt(self) -> None:
+        argv = startup_argv(
+            "CLAUDE", "", mode="MASTER", project_id="career", claude_channel_enabled=True
+        )
+        self.assertIn("--append-system-prompt", argv)
+        prompt = argv[argv.index("--append-system-prompt") + 1]
+        self.assertIn("MASTER session", prompt)
+        self.assertIn("/v1/projects/career/master-messages", prompt)
+        self.assertNotIn('"', prompt)  # no embedded quotes to survive shell requoting
+        # A non-MASTER Claude terminal and other providers get no append.
+        self.assertNotIn(
+            "--append-system-prompt", startup_argv("CLAUDE", "", mode="CONDUCTOR")
+        )
+        self.assertNotIn(
+            "--append-system-prompt", startup_argv("CODEX", "", mode="MASTER")
+        )
+
     def test_fresh_codex_and_grok_sessions_receive_bounded_bootstrap_input(self) -> None:
         expected = (
             b"Initialize this Universe session without calling tools. "
