@@ -263,6 +263,52 @@ class TerminalHostTests(unittest.TestCase):
             finally:
                 host.terminate(created["terminal_id"])
 
+    def test_rust_host_late_binds_shell_identity_instead_of_reclaiming(self) -> None:
+        registry = FakeReconnectionRegistry()
+        identity_box: dict[str, object] = {"value": None}
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="claude.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["/c", "echo", "CLAUDE"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            side_effect=lambda _pid: identity_box["value"],
+        ), patch(
+            "universe_app.terminal_host.ensure_local_channel_server_registered"
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="career",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-late-bind",
+                provider="CLAUDE",
+                supervisor_session_id="sup-late-bind",
+            )
+            tid = created["terminal_id"]
+            session = host.get(tid)
+            self.assertIsNone(session.managed_shell.shell)  # bind got None at spawn
+
+            now = time.time()
+            probes = {
+                "is_alive": lambda pid: pid == 4242,
+                "children_of": lambda _pid: [],
+                "start_time_of": lambda _pid: now - 5,
+                "source": "TEST",
+            }
+            # child cmd still absent -> MISSING is held as CLI_STARTING, not reclaimed
+            held = host.poll_managed_shell(tid, probes=probes, now=now)
+            self.assertFalse(held["reclaimed"])
+
+            # child cmd now visible: sampler late-binds and writes the identity
+            identity_box["value"] = ProcessIdentity(pid=4242, started_at=now - 5)
+            bound = host.poll_managed_shell(tid, probes=probes, now=now)
+            self.assertFalse(bound["reclaimed"])
+            self.assertIsNotNone(host.get(tid).managed_shell.shell)
+            self.assertTrue(Path(session.managed_shell_identity_file).is_file())
+            host.terminate(tid)
+
     def test_rust_host_creation_and_audit_reconstruction_share_one_terminal(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(

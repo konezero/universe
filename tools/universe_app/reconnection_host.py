@@ -795,7 +795,19 @@ class ReconnectionPty:
 
     @property
     def pid(self) -> int | None:
-        return self._pid
+        # The Host may report the terminal before it has spawned the child cmd,
+        # so child_pid can be absent from the attach response. Re-read it from
+        # live status until it resolves -- callers (managed-shell identity
+        # binding) need the real pid, and a permanently-None pid leaves the
+        # terminal wedged in the reclaim loop.
+        if not (isinstance(self._pid, int) and self._pid > 0) and not self._closed:
+            try:
+                live = self.client.status().get("child_pid")
+            except Exception:  # noqa: BLE001 - status is best effort here
+                live = None
+            if isinstance(live, int) and live > 0:
+                self._pid = live
+        return self._pid if isinstance(self._pid, int) and self._pid > 0 else None
 
     @property
     def host_id(self) -> str:

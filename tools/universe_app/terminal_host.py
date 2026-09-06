@@ -399,6 +399,15 @@ MANAGED_SHELL_RECLAIM_STATES = frozenset(
     }
 )
 
+# The managed-shell identity file is written from the CLI's SessionStart hook,
+# which only runs once the CLI is past its own startup prompts (folder trust,
+# --dangerously-load-development-channels confirm, ...). Until then "no identity
+# file" is ordinary startup, not an orphan: reclaiming would kill the CLI
+# mid-prompt and the reconcile loop would respawn it into the same wall. Hold a
+# grace window, measured from the spawned shell's own start time, during which a
+# MISSING identity on a still-live shell is reported as CLI_STARTING.
+MANAGED_SHELL_STARTUP_GRACE_SECONDS = 180.0
+
 
 def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
     return (
@@ -1728,6 +1737,48 @@ class TerminalHost:
             )
         return shell.evaluate(observation, now=time.time() if now is None else now)
 
+    @staticmethod
+    def _within_startup_grace(
+        shell: Any,
+        *,
+        probes: Mapping[str, Any] | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """True while the CLI is still inside its startup window.
+
+        Used to hold a MISSING managed-shell identity as CLI_STARTING instead of
+        a reclaim trigger: the identity file lands only after the CLI clears its
+        own startup prompts (folder trust, dev-channel confirm) and runs the
+        SessionStart hook. The window is anchored on the CLI launch request (or
+        the bound shell's start time), so it works even before the shell
+        identity has bound. When the shell identity *is* bound, a dead pid ends
+        the grace early.
+        """
+
+        current = time.time() if now is None else now
+        identity = getattr(shell, "shell", None)
+        anchor = getattr(identity, "started_at", None)
+        if not isinstance(anchor, (int, float)) or anchor <= 0:
+            anchor = getattr(shell, "cli_launch_requested_at", None)
+        if not isinstance(anchor, (int, float)) or anchor <= 0:
+            return False
+        if current - float(anchor) > MANAGED_SHELL_STARTUP_GRACE_SECONDS:
+            return False
+        pid = getattr(identity, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            resolved = probes if probes is not None else host_process_probes()
+            is_alive = (
+                resolved.get("is_alive")
+                if resolved is not None and hasattr(resolved, "get")
+                else None
+            )
+            if callable(is_alive):
+                try:
+                    return bool(is_alive(pid))
+                except Exception:  # noqa: BLE001 - a probe failure is not a death claim
+                    return True
+        return True
+
     def sample_managed_shell(
         self,
         terminal_id: str,
@@ -1747,7 +1798,50 @@ class TerminalHost:
             raise TerminalHostError(
                 "TERMINAL_NOT_MANAGED", "terminal has no managed shell"
             )
+        if getattr(shell, "shell", None) is None:
+            # The shell identity binds at spawn from live_pid(), but a Rust Host
+            # can report the terminal before its child cmd exists, so the bind
+            # gets None and the identity file is never written. Late-bind here
+            # the moment the pid resolves, then persist the identity so the next
+            # sample verifies instead of reclaiming.
+            late_pid = session.live_pid()
+            late_identity = (
+                resolve_shell_identity(late_pid) if late_pid else None
+            )
+            if late_identity is not None:
+                shell.bind_shell_identity(late_identity)
+                identity_path = str(
+                    getattr(session, "managed_shell_identity_file", "") or ""
+                )
+                if identity_path:
+                    try:
+                        write_managed_shell_identity(Path(identity_path), session)
+                    except OSError:
+                        pass
         identity_state = self._managed_shell_identity_state(session)
+        if identity_state == MANAGED_SHELL_IDENTITY_MISSING and self._within_startup_grace(
+            shell, probes=probes, now=now
+        ):
+            previous_state = shell.last_state
+            shell.last_state = CLI_STARTING
+            if previous_state != CLI_STARTING:
+                self.record_audit_event(
+                    "TERMINAL_MANAGED_STATE",
+                    terminal=session.public(),
+                    context={
+                        "lifecycle_state": CLI_STARTING,
+                        "previous_state": previous_state,
+                        "detail": "identity file pending within startup grace",
+                    },
+                )
+            return {
+                "terminal_id": terminal_id,
+                "state": CLI_STARTING,
+                "recovery": [],
+                "identity_file": getattr(
+                    session, "managed_shell_identity_file", ""
+                ),
+            }
         if identity_state not in {"VERIFIED", "NOT_CONFIGURED"}:
             previous_state = shell.last_state
             shell.last_state = identity_state
