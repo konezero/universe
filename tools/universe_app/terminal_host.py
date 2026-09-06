@@ -2615,7 +2615,13 @@ class TerminalHost:
         # this the channel never loads and the session eventually fails on an
         # unrelated-looking error. Watch the CLI's own output for that prompt
         # (rather than guessing a delay) and confirm it the moment it renders.
-        awaiting_channel_confirm = session.channel_broker is not None
+        # The flag is added whenever channel support is enabled, on both the
+        # in-process broker path and the Rust reconnection-host path, so the
+        # auto-confirm has to cover both -- keying it on channel_broker alone
+        # left every Rust-hosted terminal wedged at the prompt.
+        awaiting_channel_confirm = bool(
+            getattr(session, "channel_enabled", False)
+        ) or session.channel_broker is not None
         channel_confirm_tail = b""
         awaiting_bootstrap = bool(
             session.bootstrap_input and not session.bootstrap_delivered

@@ -208,6 +208,61 @@ class TerminalHostTests(unittest.TestCase):
             _DEV_CHANNEL_PROMPT_RE.search(b"local production environment")
         )
 
+    def test_rust_hosted_claude_auto_confirms_the_dev_channel_prompt(self) -> None:
+        registry = FakeReconnectionRegistry()
+        prompt = (
+            b"\x1b[2J WARNING: Loading development channels\r\n"
+            b" Channels: server:universe_channel\r\n"
+            b" 1. I am using this for local development\r\n"
+            b" 2. Exit\r\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="claude.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["/c", "echo", "CLAUDE"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.terminal_host.ensure_local_channel_server_registered"
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="career",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-dev-channel",
+                provider="CLAUDE",
+                supervisor_session_id="sup-dev-channel",
+            )
+            client = registry.clients["anchor-dev-channel"]
+            emitted = {"done": False}
+            base_request = client.request
+
+            def request(action: str, **fields):
+                if action == "read" and not emitted["done"]:
+                    emitted["done"] = True
+                    return {
+                        "host": client._host(),
+                        "output": {
+                            "data_base64": base64.b64encode(prompt).decode("ascii"),
+                            "start_cursor": 0,
+                            "next_cursor": len(prompt),
+                            "truncated": False,
+                        },
+                    }
+                return base_request(action, **fields)
+
+            client.request = request
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline and b"\r" not in b"".join(client.writes):
+                    time.sleep(0.05)
+                self.assertIn(b"\r", client.writes)
+            finally:
+                host.terminate(created["terminal_id"])
+
     def test_rust_host_creation_and_audit_reconstruction_share_one_terminal(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(
