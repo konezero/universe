@@ -750,19 +750,24 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertEqual(4343, observed["shell_candidates"][0]["cli_pid"])
         self.assertEqual(124.5, observed["shell_candidates"][0]["cli_started_at"])
 
-    def test_claude_hook_quotes_windows_script_path_for_shell(self) -> None:
+    def test_claude_hook_invokes_script_by_absolute_path_off_universe_repo(self) -> None:
         payload = _claude_settings_hook(
-            r"C:\workspace\universe\tools\universe_session_inject_hook.py"
+            r"C:\workspace\universe\tools\universe_session_inject_hook.py",
+            python_exe=r"C:\py\python.exe",
         )
         command = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         self.assertEqual(
-            "python -c \"import runpy; "
-            "runpy.run_path('C:/workspace/universe/tools/"
-            "universe_session_inject_hook.py', run_name='__main__')\" "
+            '"C:\\py\\python.exe" '
+            '"C:/workspace/universe/tools/universe_session_inject_hook.py" '
             "--repo-root . --provider CLAUDE --from-stdin --trigger session_start",
             command,
         )
-        self.assertNotIn("\\", command)
+        # No bare `python` (pyenv shim risk) and no `-c` (shim mangles it).
+        self.assertNotIn(" -c ", command)
+        self.assertNotIn("runpy", command)
+        # Forward slashes in the script path so a shell never sees a bare
+        # backslash escape.
+        self.assertNotIn("universe\\tools", command)
 
     def test_setup_writes_project_claude_and_grok_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -784,10 +789,11 @@ class SessionInjectHookTests(unittest.TestCase):
             claude_text = claude_hook.read_text(encoding="utf-8")
             self.assertIn("--provider CLAUDE", claude_text)
             # A non-universe repo cannot `-m tools.universe_session_inject_hook`;
-            # the hook is written as an absolute runpy command instead, and
+            # the hook is written as an absolute script invocation instead, and
             # CLAUDE.md is ensured.
-            self.assertIn("runpy.run_path", claude_text)
+            self.assertIn("universe_session_inject_hook.py", claude_text)
             self.assertNotIn("-m tools.universe_session_inject_hook", claude_text)
+            self.assertNotIn("runpy", claude_text)
             self.assertEqual("WRITTEN", result["providers"]["CLAUDE_MD"]["status"])
             self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text(encoding="utf-8"))
             again = setup_provider_hooks(

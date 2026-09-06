@@ -1329,14 +1329,26 @@ def _grok_hook_payload(python_exe: str, script_path: str) -> dict[str, Any]:
 
 
 def _claude_settings_hook(
-    script_path: str, *, project: bool = False
+    script_path: str, *, project: bool = False, python_exe: str | None = None
 ) -> dict[str, Any]:
     normalized_script = Path(script_path).as_posix()
-    target = (
-        "-m tools.universe_session_inject_hook"
-        if project
-        else f'-c "import runpy; runpy.run_path({normalized_script!r}, run_name=\'__main__\')"'
-    )
+    if project:
+        # In the universe repo the hook runs as a module against `.`.
+        command = (
+            "python -m tools.universe_session_inject_hook "
+            "--repo-root . --provider CLAUDE --from-stdin --trigger session_start"
+        )
+    else:
+        # A project split into its own repo has no importable `tools` package,
+        # so run the hook script by absolute path.  Invoke a concrete
+        # interpreter rather than a bare `python`: on Windows the `python`
+        # launcher is often a pyenv shim (.bat) that mangles a quoted argument
+        # list, and `-c "import runpy; ..."` in particular fails through it.
+        interpreter = (python_exe or "python").strip() or "python"
+        command = (
+            f'"{interpreter}" "{normalized_script}" '
+            "--repo-root . --provider CLAUDE --from-stdin --trigger session_start"
+        )
     return {
         "hooks": {
             "SessionStart": [
@@ -1344,7 +1356,7 @@ def _claude_settings_hook(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": f"python {target} --repo-root . --provider CLAUDE --from-stdin --trigger session_start",
+                            "command": command,
                         }
                     ]
                 }
@@ -1606,7 +1618,9 @@ def setup_provider_hooks(
             results["CLAUDE_PROJECT"] = {
                 "status": _merge_claude_settings(
                     repo_root / ".claude" / "settings.json",
-                    _claude_settings_hook(sp, project=is_universe_repo),
+                    _claude_settings_hook(
+                        sp, project=is_universe_repo, python_exe=py
+                    ),
                 ),
                 "path": str((repo_root / ".claude" / "settings.json")),
             }
@@ -1616,12 +1630,27 @@ def setup_provider_hooks(
             results["CLAUDE_MD"] = ensure_project_claude_md(
                 repo_root, project_id or repo_root.name
             )
+            # Trust the folder in ~/.claude.json now, while no Claude process is
+            # running in this project.  Seeding it at terminal-spawn time races
+            # Claude Code's own writes to that file (it read-merges from an
+            # in-memory copy loaded before the spawn), so a deliberate
+            # install-time write is what actually sticks for the first launch.
+            try:
+                from claude_channel_broker import ensure_local_channel_server_registered
+
+                ensure_local_channel_server_registered(str(repo_root))
+                results["CLAUDE_HOME_TRUST"] = {"status": "SEEDED", "path": str(repo_root)}
+            except Exception as error:  # noqa: BLE001 - best effort
+                results["CLAUDE_HOME_TRUST"] = {
+                    "status": "ERROR",
+                    "detail": f"{type(error).__name__}: {error}",
+                }
         if global_:
             settings_path = home / ".claude" / "settings.json"
             try:
                 results["CLAUDE"] = {
                     "status": _merge_claude_settings(
-                        settings_path, _claude_settings_hook(sp)
+                        settings_path, _claude_settings_hook(sp, python_exe=py)
                     ),
                     "path": str(settings_path),
                 }
