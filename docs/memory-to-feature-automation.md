@@ -52,9 +52,18 @@ Universe already provides:
 - bounded Goal automation projection and a receipt-backed scheduler.
 
 The missing product boundary is the orchestration between those foundations.
-Memory Candidate `START_PRODUCT_DESIGN` and Work Loop `KEEP` currently terminate as
-review states; neither produces a reviewable Feature Node proposal. Feature Node
-creation begins from a manual Meeting Room form, and the Goal scheduler deliberately
+Memory Candidate `START_PRODUCT_DESIGN` now materialises through the proposal
+compiler. Work Loop predictions that a user reviews and keeps (`review_state`
+`KEPT`) now feed the same compiler as `WORK_LOOP_PREDICTION` evidence: their
+`GOAL`/`PLAN`/`MILESTONE` suggestions become proposal source entries, so a
+Bench- and Experience-backed direction can surface as a reviewable Feature Node
+proposal instead of terminating at the prediction review. `RISK` suggestions are
+recurrence warnings, not product intent, and stay out. Two edges remain:
+predictions are not yet bound to a specific Feature Node as node-derived
+predicted paths (`todo_prediction_paths_bound_to_feature_node_v1`), and
+prediction-versus-outcome calibration is still P1
+(`todo_proposal_feedback_fleet_projection_v1`). Feature Node creation still
+begins from a manual Meeting Room form, and the Goal scheduler deliberately
 stops before Task Frame execution, Todo selection, and result application.
 
 ## Canonical entities
@@ -206,7 +215,13 @@ intervention. Every stop exposes a stable code and next permitted action.
 The first two implementation slices preserve review before materialization:
 
 1. Build deterministic Feature Node proposals from selected project Memory and Work
-   Loop evidence.
+   Loop evidence. Work Loop evidence is now wired: `generate_feature_node_proposals`
+   passes `list_work_loop_predictions`, and `_source_entries` emits a
+   `WORK_LOOP_PREDICTION` entry per `GOAL`/`PLAN`/`MILESTONE` suggestion of every
+   `KEPT` prediction (`source_ref`
+   `universe://work-loop/predictions/{proposal_id}/suggestions/{index}`, weight
+   scaled from the suggestion confidence). Generation stays digest-stable over
+   unchanged evidence.
 2. Store each proposal with exact evidence and digest provenance.
 3. Expose list, generate, and per-proposal review APIs.
 4. Project proposals as `FEATURE_NODE_PROPOSAL` ghost nodes in the semantic graph.

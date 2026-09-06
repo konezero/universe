@@ -106,5 +106,119 @@ class FeatureNodeProposalTests(unittest.TestCase):
         self.assertEqual(2, len(proposals[0]["evidence_refs"]))
 
 
+    def test_kept_work_loop_prediction_becomes_proposal_evidence(self) -> None:
+        predictions = [
+            {
+                "proposal_id": "workloop_abc123",
+                "review_state": "KEPT",
+                "suggestions": [
+                    {
+                        "kind": "GOAL",
+                        "title": "Anchor-native semantic retrieval spine",
+                        "rationale": "Supported by BENCH, MEMORY; reviewable proposal only.",
+                        "confidence": 0.72,
+                    }
+                ],
+            }
+        ]
+        first = build_feature_node_proposals(
+            project_id="universe",
+            memories=[],
+            memory_candidates=[],
+            feature_nodes=[],
+            work_loop_predictions=predictions,
+        )
+        second = build_feature_node_proposals(
+            project_id="universe",
+            memories=[],
+            memory_candidates=[],
+            feature_nodes=[],
+            work_loop_predictions=predictions,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(1, len(first))
+        self.assertEqual("NEW_FEATURE", first[0]["proposal_kind"])
+        self.assertEqual(
+            ["universe://work-loop/predictions/workloop_abc123/suggestions/0"],
+            first[0]["evidence_refs"],
+        )
+
+    def test_unreviewed_and_rejected_predictions_are_ignored(self) -> None:
+        proposals = build_feature_node_proposals(
+            project_id="universe",
+            memories=[],
+            memory_candidates=[],
+            feature_nodes=[],
+            work_loop_predictions=[
+                {
+                    "proposal_id": "workloop_pending",
+                    "review_state": "PROPOSAL_ONLY",
+                    "suggestions": [
+                        {"kind": "GOAL", "title": "Pending direction", "confidence": 0.8}
+                    ],
+                },
+                {
+                    "proposal_id": "workloop_rejected",
+                    "review_state": "REJECTED",
+                    "suggestions": [
+                        {"kind": "PLAN", "title": "Rejected direction", "confidence": 0.8}
+                    ],
+                },
+            ],
+        )
+        self.assertEqual([], proposals)
+
+    def test_risk_prediction_suggestion_is_not_product_intent(self) -> None:
+        proposals = build_feature_node_proposals(
+            project_id="universe",
+            memories=[],
+            memory_candidates=[],
+            feature_nodes=[],
+            work_loop_predictions=[
+                {
+                    "proposal_id": "workloop_risk",
+                    "review_state": "KEPT",
+                    "suggestions": [
+                        {
+                            "kind": "RISK",
+                            "title": "Repeating the failed migration",
+                            "confidence": 0.7,
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual([], proposals)
+
+    def test_kept_prediction_clusters_with_related_memory(self) -> None:
+        proposals = build_feature_node_proposals(
+            project_id="universe",
+            memories=[
+                {
+                    "memory_id": "memory-editor",
+                    "title": "Native semantic editor protocol",
+                    "state": "QUESTION",
+                }
+            ],
+            memory_candidates=[],
+            feature_nodes=[],
+            work_loop_predictions=[
+                {
+                    "proposal_id": "workloop_editor",
+                    "review_state": "KEPT",
+                    "suggestions": [
+                        {
+                            "kind": "PLAN",
+                            "title": "Native semantic editor protocol rollout",
+                            "confidence": 0.66,
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(1, len(proposals))
+        self.assertEqual(2, len(proposals[0]["evidence_refs"]))
+
+
 if __name__ == "__main__":
     unittest.main()

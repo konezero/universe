@@ -17,6 +17,11 @@ FEATURE_NODE_PROPOSAL_DECISIONS = frozenset({"EXPLORE", "REJECT"})
 INTENT_MEMORY_STATES = frozenset({"BRAINSTORM", "QUESTION", "DECISION_NOTE"})
 INTENT_CANDIDATE_STATES = frozenset({"EXPLORE", "START_PRODUCT_DESIGN"})
 INTENT_CANDIDATE_KINDS = frozenset({"IDEA", "HYPOTHESIS", "PRODUCT"})
+# A reviewed-and-kept Work Loop prediction is Bench/Experience-backed product
+# direction. GOAL/PLAN/MILESTONE suggestions become proposal evidence; RISK
+# suggestions are recurrence warnings, not product intent, so they stay out.
+INTENT_PREDICTION_KINDS = frozenset({"GOAL", "PLAN", "MILESTONE"})
+INTENT_PREDICTION_REVIEW_STATES = frozenset({"KEPT"})
 TOKEN_RE = re.compile(r"[a-z0-9가-힣]{2,}", re.IGNORECASE)
 STOP_WORDS = frozenset(
     {
@@ -50,6 +55,7 @@ def _tokens(value: Any) -> frozenset[str]:
 def _source_entries(
     memories: Sequence[Mapping[str, Any]],
     memory_candidates: Sequence[Mapping[str, Any]],
+    work_loop_predictions: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for memory in memories:
@@ -92,6 +98,43 @@ def _source_entries(
                 "weight": 0.15 if kind == "PRODUCT" else 0.10,
             }
         )
+    for prediction in work_loop_predictions:
+        if (
+            str(prediction.get("review_state") or "").upper()
+            not in INTENT_PREDICTION_REVIEW_STATES
+        ):
+            continue
+        proposal_id = _text(prediction.get("proposal_id"))
+        suggestions = prediction.get("suggestions")
+        if not proposal_id or not isinstance(suggestions, Sequence):
+            continue
+        for index, suggestion in enumerate(suggestions):
+            if not isinstance(suggestion, Mapping):
+                continue
+            kind = str(suggestion.get("kind") or "").upper()
+            title = _text(suggestion.get("title"))
+            if kind not in INTENT_PREDICTION_KINDS or not title:
+                continue
+            try:
+                confidence = float(suggestion.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            rationale = _text(suggestion.get("rationale")) or title
+            entries.append(
+                {
+                    "source_kind": "WORK_LOOP_PREDICTION",
+                    "source_id": f"{proposal_id}#{index}",
+                    "source_ref": (
+                        f"universe://work-loop/predictions/{proposal_id}"
+                        f"/suggestions/{index}"
+                    ),
+                    "title": title,
+                    "intent_text": rationale[:1000],
+                    "tokens": _tokens(title),
+                    "weight": round(0.05 + 0.10 * confidence, 4),
+                }
+            )
     entries.sort(key=lambda item: (item["source_kind"], item["source_id"]))
     return entries
 
@@ -155,10 +198,11 @@ def build_feature_node_proposals(
     memories: Sequence[Mapping[str, Any]],
     memory_candidates: Sequence[Mapping[str, Any]],
     feature_nodes: Sequence[Mapping[str, Any]],
+    work_loop_predictions: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """Build stable proposal records without mutating Feature, Goal, or Todo state."""
 
-    entries = _source_entries(memories, memory_candidates)
+    entries = _source_entries(memories, memory_candidates, work_loop_predictions)
     proposals: list[dict[str, Any]] = []
     for members in _clusters(entries):
         evidence_refs = sorted(str(item["source_ref"]) for item in members)

@@ -11506,6 +11506,9 @@ class UniverseStore:
                 project["project_id"], limit=200
             ),
             feature_nodes=self.list_feature_nodes(project["project_id"]),
+            work_loop_predictions=self.list_work_loop_predictions(
+                project["project_id"], limit=200
+            ),
         )
         created_count = 0
         persisted: list[dict[str, Any]] = []
