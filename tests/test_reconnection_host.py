@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.reconnection_host import (  # noqa: E402
+    CHILD_LIVENESS_STATES,
     CURRENT_RUNTIME_VERSIONS,
     ReconnectionHostError,
     ReconnectionHostIncompatible,
@@ -23,6 +24,7 @@ from universe_app.reconnection_host import (  # noqa: E402
     STATE_SCHEMA,
     evaluate_runtime_compatibility,
     provision_private_registry_directory,
+    verify_child_liveness,
 )
 
 
@@ -89,6 +91,42 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
         ):
             self.assertIn(
                 evaluate_runtime_compatibility(value), RUNTIME_COMPATIBILITY_STATES
+            )
+
+    def test_verify_child_liveness_matched_exited_stale_and_unverifiable(self) -> None:
+        alive = {4242: 100.0}  # pid -> real start time
+
+        def is_alive(pid: int) -> bool:
+            return pid in alive
+
+        def start_time_of(pid: int) -> float | None:
+            return alive.get(pid)
+
+        common = dict(is_alive=is_alive, start_time_of=start_time_of)
+
+        # matched: live pid, no expected start time -> trust the live pid
+        self.assertEqual("MATCHED", verify_child_liveness(4242, None, **common))
+        # matched: live pid, expected start time within tolerance
+        self.assertEqual("MATCHED", verify_child_liveness(4242, 100.9, **common))
+        # exited: pid is not a live process
+        self.assertEqual("EXITED", verify_child_liveness(9999, 100.0, **common))
+        # stale / PID reuse: pid is live but a different process now owns it
+        self.assertEqual("STALE", verify_child_liveness(4242, 55.0, **common))
+        # unverifiable: nothing to check
+        for bad in (None, 0, -1, "4242"):
+            self.assertEqual("UNVERIFIABLE", verify_child_liveness(bad, 100.0, **common))
+        # a probe that throws is never a liveness claim
+        self.assertEqual(
+            "UNVERIFIABLE",
+            verify_child_liveness(
+                4242, 100.0,
+                is_alive=lambda _pid: (_ for _ in ()).throw(OSError("boom")),
+                start_time_of=start_time_of,
+            ),
+        )
+        for pid, expected in ((4242, None), (9999, 1.0), (4242, 55.0), (None, None)):
+            self.assertIn(
+                verify_child_liveness(pid, expected, **common), CHILD_LIVENESS_STATES
             )
 
     def test_incompatible_exception_carries_the_judged_state(self) -> None:

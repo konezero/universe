@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .windows_process import process_is_alive, process_start_time
 
@@ -103,6 +103,57 @@ def runtime_version_snapshot(value: Mapping[str, Any]) -> dict[str, str]:
 
 
 RUNTIME_COMPATIBILITY_STATES = ("CURRENT", "COMPATIBLE_OLD", "INCOMPATIBLE", "UNKNOWN")
+
+CHILD_LIVENESS_STATES = ("MATCHED", "EXITED", "STALE", "UNVERIFIABLE")
+# Windows recycles PIDs; matching a recorded start time to within this window
+# is what separates the same child from a stranger that inherited its PID.
+CHILD_START_TOLERANCE_SECONDS = 2.0
+
+
+def verify_child_liveness(
+    child_pid: object,
+    expected_started_at: float | None,
+    *,
+    is_alive: Callable[[int], bool],
+    start_time_of: Callable[[int], float | None],
+    tolerance: float = CHILD_START_TOLERANCE_SECONDS,
+) -> str:
+    """Independently judge a Host-reported child process against the OS.
+
+    - ``UNVERIFIABLE`` -- no usable child PID to check.
+    - ``EXITED``       -- the PID is not a live process.
+    - ``STALE``        -- the PID is live but its start time does not match the
+                          expected one (PID reuse: a different process now owns
+                          the number).
+    - ``MATCHED``      -- the PID is live and, when an expected start time was
+                          supplied, corroborates it. With no expected start time
+                          a live PID is reported ``MATCHED`` (the Host's own
+                          child handle stays the primary signal; this check
+                          only tightens once the Host reports the start time).
+
+    A Supervisor must not treat a Host ``runtime_state`` of LIVE as trustworthy
+    while this returns ``EXITED`` or ``STALE``.
+    """
+
+    if not isinstance(child_pid, int) or child_pid <= 0:
+        return "UNVERIFIABLE"
+    try:
+        alive = bool(is_alive(child_pid))
+    except Exception:  # noqa: BLE001 - a probe failure is not a liveness claim
+        return "UNVERIFIABLE"
+    if not alive:
+        return "EXITED"
+    if not isinstance(expected_started_at, (int, float)) or expected_started_at <= 0:
+        return "MATCHED"
+    try:
+        observed = start_time_of(child_pid)
+    except Exception:  # noqa: BLE001
+        observed = None
+    if observed is None:
+        return "MATCHED"
+    if abs(float(observed) - float(expected_started_at)) <= tolerance:
+        return "MATCHED"
+    return "STALE"
 
 
 def evaluate_runtime_compatibility(
@@ -515,6 +566,23 @@ class ReconnectionHostRegistry:
         runtime_state = str(observed.get("runtime_state") or "UNKNOWN")
         if runtime_state != "LIVE":
             raise ReconnectionHostRuntimeStopped(client, runtime_state)
+        # Do not take the Host's LIVE at face value: independently check its
+        # reported child PID against the OS. A dead PID (or, once the Host
+        # reports it, a mismatched start time = PID reuse) means the runtime is
+        # not actually live regardless of what the Host claims.
+        child_started_at = observed.get("child_started_at_unix_ms")
+        child_liveness = verify_child_liveness(
+            observed.get("child_pid"),
+            (float(child_started_at) / 1000.0)
+            if isinstance(child_started_at, (int, float)) and child_started_at
+            else None,
+            is_alive=process_is_alive,
+            start_time_of=process_start_time,
+        )
+        if child_liveness in {"EXITED", "STALE"}:
+            raise ReconnectionHostRuntimeStopped(
+                client, f"CHILD_{child_liveness}"
+            )
         # The single reattachment path: only a LIVE Host whose four-version
         # tuple judges CURRENT or COMPATIBLE_OLD is handed back for reuse.
         # INCOMPATIBLE and UNKNOWN both refuse; the observation is still
