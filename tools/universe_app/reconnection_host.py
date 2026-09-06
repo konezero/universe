@@ -74,17 +74,25 @@ class ReconnectionHostRuntimeStopped(ReconnectionHostError):
 
 
 class ReconnectionHostIncompatible(ReconnectionHostError):
-    """A live authenticated Host cannot be reused by the current Supervisor."""
+    """A live authenticated Host cannot be reused by the current Supervisor.
+
+    ``compatibility`` is either ``INCOMPATIBLE`` (all four runtime versions read
+    and the tuple is not a declared reuse target) or ``UNKNOWN`` (at least one
+    version could not be read). Both refuse reuse; the caller archives with a
+    reason derived from this field.
+    """
 
     def __init__(
         self,
         client: "ReconnectionHostClient",
         host: Mapping[str, Any],
+        *,
+        compatibility: str = "INCOMPATIBLE",
     ) -> None:
-        super().__init__("Authenticated Host runtime tuple is INCOMPATIBLE")
+        super().__init__(f"Authenticated Host runtime tuple is {compatibility}")
         self.client = client
         self.host = dict(host)
-        self.compatibility = "INCOMPATIBLE"
+        self.compatibility = compatibility
 
 
 def runtime_version_snapshot(value: Mapping[str, Any]) -> dict[str, str]:
@@ -94,13 +102,33 @@ def runtime_version_snapshot(value: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+RUNTIME_COMPATIBILITY_STATES = ("CURRENT", "COMPATIBLE_OLD", "INCOMPATIBLE", "UNKNOWN")
+
+
 def evaluate_runtime_compatibility(
     value: Mapping[str, Any],
     *,
     matrix: Mapping[str, set[tuple[str, ...]]] = DECLARED_COMPATIBILITY_MATRIX,
 ) -> str:
+    """Judge a Server/Supervisor/Host/PTY version tuple as one of four states.
+
+    - ``CURRENT`` / ``COMPATIBLE_OLD`` -- the exact four-tuple is a declared,
+      contract-tested reuse target.
+    - ``UNKNOWN`` -- at least one of the four versions could not be read
+      (missing, blank, or the ``UNKNOWN`` sentinel). Reuse is refused, but this
+      is not a version conflict and does not by itself justify replacement of a
+      healthy Host.
+    - ``INCOMPATIBLE`` -- all four versions are known and the tuple is not a
+      declared reuse target.
+
+    The judgement never falls back to pairwise field equality, PID liveness, or
+    a terminal state.
+    """
+
     snapshot = runtime_version_snapshot(value)
     version_tuple = tuple(snapshot[field] for field in RUNTIME_VERSION_FIELDS)
+    if any(part == "UNKNOWN" for part in version_tuple):
+        return "UNKNOWN"
     if version_tuple in matrix.get("CURRENT", set()):
         return "CURRENT"
     if version_tuple in matrix.get("COMPATIBLE_OLD", set()):
@@ -487,9 +515,15 @@ class ReconnectionHostRegistry:
         runtime_state = str(observed.get("runtime_state") or "UNKNOWN")
         if runtime_state != "LIVE":
             raise ReconnectionHostRuntimeStopped(client, runtime_state)
+        # The single reattachment path: only a LIVE Host whose four-version
+        # tuple judges CURRENT or COMPATIBLE_OLD is handed back for reuse.
+        # INCOMPATIBLE and UNKNOWN both refuse; the observation is still
+        # projected by list_observed_hosts, and launch() drives replacement.
         compatibility = evaluate_runtime_compatibility(observed)
-        if compatibility == "INCOMPATIBLE":
-            raise ReconnectionHostIncompatible(client, observed)
+        if compatibility not in {"CURRENT", "COMPATIBLE_OLD"}:
+            raise ReconnectionHostIncompatible(
+                client, observed, compatibility=compatibility
+            )
         return client
 
     def list_live_clients(self) -> list[ReconnectionHostClient]:
@@ -636,7 +670,12 @@ class ReconnectionHostRegistry:
                         "Authenticated incompatible Host did not terminate for replacement"
                     ) from incompatible_host
                 self._archive_state_record(
-                    state_path, reason="INCOMPATIBLE_HOST_REPLACED"
+                    state_path,
+                    reason=(
+                        "INCOMPATIBLE_HOST_REPLACED"
+                        if incompatible_host.compatibility == "INCOMPATIBLE"
+                        else "VERSION_UNVERIFIED_HOST_REPLACED"
+                    ),
                 )
                 state_path.unlink(missing_ok=True)
             except ReconnectionHostRuntimeStopped as stopped_host:

@@ -16,8 +16,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_app.reconnection_host import (  # noqa: E402
     CURRENT_RUNTIME_VERSIONS,
     ReconnectionHostError,
+    ReconnectionHostIncompatible,
     ReconnectionHostRegistry,
     ReconnectionPty,
+    RUNTIME_COMPATIBILITY_STATES,
     STATE_SCHEMA,
     evaluate_runtime_compatibility,
     provision_private_registry_directory,
@@ -58,6 +60,45 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
             evaluate_runtime_compatibility(incompatible, matrix=matrix),
             "INCOMPATIBLE",
         )
+
+    def test_a_partly_readable_version_tuple_judges_unknown_not_incompatible(self) -> None:
+        # A missing / blank / sentinel field means the tuple could not be read.
+        # That is refused for reuse but is not a version conflict.
+        for mutate in (
+            lambda v: v.pop("host_version"),
+            lambda v: v.__setitem__("supervisor_version", ""),
+            lambda v: v.__setitem__("server_version", "UNKNOWN"),
+            lambda v: v.__setitem__("pty_version", "   "),
+        ):
+            with self.subTest(mutate=mutate):
+                value = dict(CURRENT_RUNTIME_VERSIONS)
+                mutate(value)
+                self.assertEqual("UNKNOWN", evaluate_runtime_compatibility(value))
+        # empty everything is still just UNKNOWN, never INCOMPATIBLE
+        self.assertEqual("UNKNOWN", evaluate_runtime_compatibility({}))
+        # a fully-known tuple that is not declared stays INCOMPATIBLE
+        wrong = dict(CURRENT_RUNTIME_VERSIONS, host_version="UniverseSessionHost/7")
+        self.assertEqual("INCOMPATIBLE", evaluate_runtime_compatibility(wrong))
+
+    def test_the_judge_only_ever_returns_one_of_four_states(self) -> None:
+        for value in (
+            CURRENT_RUNTIME_VERSIONS,
+            {},
+            dict(CURRENT_RUNTIME_VERSIONS, pty_version="UniverseConPty/99"),
+            dict(CURRENT_RUNTIME_VERSIONS, host_version=""),
+        ):
+            self.assertIn(
+                evaluate_runtime_compatibility(value), RUNTIME_COMPATIBILITY_STATES
+            )
+
+    def test_incompatible_exception_carries_the_judged_state(self) -> None:
+        default = ReconnectionHostIncompatible(client=None, host={})
+        self.assertEqual("INCOMPATIBLE", default.compatibility)
+        unknown = ReconnectionHostIncompatible(
+            client=None, host={}, compatibility="UNKNOWN"
+        )
+        self.assertEqual("UNKNOWN", unknown.compatibility)
+        self.assertIn("UNKNOWN", str(unknown))
 
     def test_replaced_host_history_is_redacted_and_never_reconnect_eligible(self) -> None:
         with (
