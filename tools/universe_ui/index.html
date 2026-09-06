@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-22-drop-map-refresh">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-23-stroke-icons">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
   <style>
     /* Boot splash — painted before app.js so a reconnecting browser never
@@ -49,7 +49,7 @@
   </div>
   <div class="app-shell mockup-shell">
     <header class="topbar">
-      <button id="mobile-menu-btn" class="mobile-icon-btn" type="button" aria-label="Menu" aria-expanded="false">&#9776;</button>
+      <button id="mobile-menu-btn" class="mobile-icon-btn" type="button" aria-label="Menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/></svg></button>
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <span class="brand-copy"><strong>Universe</strong><small>Work Spine Command Center</small></span>
@@ -71,12 +71,12 @@
         <a id="universe-list-link" class="text-button" href="/join" title="Public universe list (rendezvous)">목록</a>
         <span id="service-status" class="status-dot local-node-chip" data-state="loading">Local Node</span>
         <span id="mode-status" class="mode-label" data-state="loading">—</span>
-        <button id="todo-button" class="icon-button" type="button" title="Todo work map" aria-label="Todo work map">&#9745;</button>
-        <button id="session-observatory-topbar-button" class="icon-button" type="button" title="Session observatory" aria-label="Session observatory">&#9678;</button>
-        <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
-        <button id="release-button" class="icon-button" type="button" title="Release catalog">&#9638;</button>
-        <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings">&#9881;</button>
-        <button id="refresh-button" class="icon-button" type="button" title="Refresh">&#8635;</button>
+        <button id="todo-button" class="icon-button" type="button" title="Todo work map" aria-label="Todo work map"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="6" height="6" rx="1"/><path d="m3 17 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg></button>
+        <button id="session-observatory-topbar-button" class="icon-button" type="button" title="Session observatory" aria-label="Session observatory"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="19" cy="6" r="3"/><path d="M22 11.5V16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h9.5"/><path d="M12 18v4"/><path d="M8 22h8"/></svg></button>
+        <button id="start-project-topbar-button" class="icon-button mobile-project-start" type="button" title="Start fresh project" aria-label="Start fresh project"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 9.9 8.9 4 11l5.9 2.1L12 19l2.1-5.9L20 11l-5.9-2.1z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg></button>
+        <button id="release-button" class="icon-button" type="button" title="Release catalog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></button>
+        <button id="settings-button" class="icon-button" type="button" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
+        <button id="refresh-button" class="icon-button" type="button" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg></button>
         <span class="user-chip" title="Session">UC</span>
       </div>
     </header>
@@ -90,14 +90,14 @@
     </div>
 
     <nav class="utility-rail" aria-label="Universe tools">
-      <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true">&#8644;</span><small>Fleet</small></button>
-      <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true">&#9675;</span><small>Galaxy</small></button>
-      <button type="button" data-primary-view="activity" title="Project activity"><span aria-hidden="true">&#8801;</span><small>Activity</small></button>
-      <button type="button" data-primary-view="memory" title="Project memory"><span aria-hidden="true">&#9673;</span><small>Memory</small></button>
-      <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true">&#9638;</span><small>Bench</small></button>
-      <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true">&#9633;</span><small>Docs</small></button>
-      <button type="button" data-primary-view="meeting" title="Collaboration Rooms"><span aria-hidden="true">&#9672;</span><small>Rooms</small></button>
-      <button id="add-project-rail-button" type="button" title="Add project"><span aria-hidden="true">&#43;</span><small>Project</small></button>
+      <button class="selected" type="button" data-primary-view="fleet" title="Fleet — kanban home"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="M15 3v18"/></svg></span><small>Fleet</small></button>
+      <button type="button" data-primary-view="map" title="Galaxy product map"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><path d="M10.4 21.9a10 10 0 0 0 9.941-15.416"/><path d="M13.5 2.1a10 10 0 0 0-9.841 15.416"/></svg></span><small>Galaxy</small></button>
+      <button type="button" data-primary-view="activity" title="Project activity"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span><small>Activity</small></button>
+      <button type="button" data-primary-view="memory" title="Project memory"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg></span><small>Memory</small></button>
+      <button type="button" data-primary-view="bench" title="Bench"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2v6l5.5 9.5a2 2 0 0 1-1.7 3H6.2a2 2 0 0 1-1.7-3L10 8V2"/><path d="M8.5 2h7"/><path d="M7 16h10"/></svg></span><small>Bench</small></button>
+      <button type="button" data-primary-view="documents" title="Documents"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg></span><small>Docs</small></button>
+      <button type="button" data-primary-view="meeting" title="Collaboration Rooms"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><small>Rooms</small></button>
+      <button id="add-project-rail-button" type="button" title="Add project"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg></span><small>Project</small></button>
     </nav>
     <div id="mobile-scrim" class="mobile-scrim" hidden></div>
 
@@ -110,8 +110,8 @@
       <div class="section-heading legacy-rail-surface">
           <span>Projects</span>
         <span class="section-actions">
-          <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project">&#10022;</button>
-          <button id="add-project-button" class="icon-button compact" type="button" title="Connect project" aria-label="Connect project">+</button>
+          <button id="start-project-button" class="icon-button compact" type="button" title="Start fresh project" aria-label="Start fresh project"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 9.9 8.9 4 11l5.9 2.1L12 19l2.1-5.9L20 11l-5.9-2.1z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg></button>
+          <button id="add-project-button" class="icon-button compact" type="button" title="Connect project" aria-label="Connect project"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
         </span>
       </div>
       <div id="project-list" class="project-list legacy-rail-surface" role="listbox" aria-label="Projects"></div>
@@ -119,7 +119,7 @@
       <div class="rail-block session-block legacy-rail-surface">
         <div class="section-heading rail-subhead">
           <span>Sessions</span>
-          <button id="session-observatory-button" class="icon-button compact" type="button" title="Manage sessions" aria-label="Manage sessions">&#8943;</button>
+          <button id="session-observatory-button" class="icon-button compact" type="button" title="Manage sessions" aria-label="Manage sessions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg></button>
         </div>
         <div class="session-rail-filters">
           <input id="session-rail-search" type="search" placeholder="Search sessions" aria-label="Search sessions">
@@ -138,7 +138,7 @@
       <div class="rail-quick-actions legacy-rail-surface">
         <button id="quick-new-session-button" type="button"><span aria-hidden="true">+</span> New session</button>
         <button id="quick-conductor-button" type="button"><span aria-hidden="true">+</span> New Conductor conversation</button>
-        <button id="quick-task-button" type="button"><span aria-hidden="true">&#9745;</span> Create task</button>
+        <button id="quick-task-button" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg> Create task</button>
       </div>
     </aside>
 
@@ -174,7 +174,7 @@
         <div id="fleet-board" class="fleet-board" aria-label="Fleet execution board" hidden></div>
         <div id="home-view" class="home-view" hidden aria-label="Project → node → todo → kanban">
           <div id="home-mobile-bar" class="home-mobile-bar" hidden>
-            <button id="home-mobile-back" class="home-mobile-back" type="button" aria-label="Back">&#8592;</button>
+            <button id="home-mobile-back" class="home-mobile-back" type="button" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg></button>
             <span id="home-mobile-crumb" class="home-mobile-crumb"></span>
           </div>
           <div class="home-col home-col-projects">
@@ -241,7 +241,7 @@
       <div class="graph-toolbar glass-bar">
         <div class="toolbar-filters">
           <div id="galaxy-view-switch" class="galaxy-view-switch" role="tablist" aria-label="Galaxy view" hidden></div>
-          <button id="galaxy-fullscreen-toggle" class="galaxy-fullscreen-toggle" type="button" title="Full-screen Galaxy (Esc to exit)" hidden>&#9635; Full screen</button>
+          <button id="galaxy-fullscreen-toggle" class="galaxy-fullscreen-toggle" type="button" title="Full-screen Galaxy (Esc to exit)" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg> Full screen</button>
         </div>
         <div id="graph-legend" class="toolbar-legend graph-legend" aria-hidden="true">
           <span><i class="node-key project"></i>Project</span>
@@ -257,7 +257,7 @@
         <div id="graph-empty" class="graph-empty">Universe multiverse map</div>
         <p id="graph-hint" class="graph-hint">Universe hub · projects around · click a project to expand nodes · pan/zoom</p>
         <nav id="node-breadcrumb" class="node-breadcrumb hidden" aria-label="Universe navigation">
-          <button id="exit-node-universe" class="icon-button compact" type="button" title="Return" aria-label="Return">&#8592;</button>
+          <button id="exit-node-universe" class="icon-button compact" type="button" title="Return" aria-label="Return"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg></button>
           <span id="node-breadcrumb-project"></span>
           <span aria-hidden="true">/</span>
           <strong id="node-breadcrumb-node"></strong>
@@ -268,11 +268,11 @@
         <div id="chat-resize-handle" class="chat-resize-handle" role="separator" aria-orientation="vertical" aria-valuemin="300" aria-valuemax="900" aria-valuenow="380" aria-label="Resize chat panel" tabindex="0"></div>
         <div id="conductor-summary" class="conductor-summary collapsed">
           <button id="conductor-summary-toggle" class="summary-dock-toggle" type="button" title="Expand overview" aria-label="Expand overview" aria-expanded="false">
-            <span class="summary-dock-icon" aria-hidden="true">&#9638;</span>
+            <span class="summary-dock-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></span>
             <span class="summary-dock-label">Overview</span>
             <span id="conductor-summary-line" class="summary-dock-line">P 0 · T 0 · D 0 · —</span>
             <time id="conductor-clock-compact" class="summary-dock-clock"></time>
-            <span class="summary-dock-chevron" aria-hidden="true">&#9660;</span>
+            <span class="summary-dock-chevron" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
           </button>
           <div class="conductor-summary-body">
             <header class="conductor-header">
@@ -300,17 +300,17 @@
         <section id="conversation-layer" class="conversation-layer conductor-chat" aria-label="Session conversation">
           <header class="conversation-layer-header">
             <button id="conversation-toggle" class="chat-dock-toggle" type="button" title="Collapse session dock" aria-label="Collapse session dock" aria-expanded="true">
-              <span class="chat-dock-chevron" aria-hidden="true">&#9660;</span>
+              <span class="chat-dock-chevron" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
             </button>
             <button id="conversation-title-toggle" class="conversation-title-wrap" type="button" aria-label="Toggle session dock">
               <strong id="conversation-title">Terminal</strong>
               <small id="conversation-target-label">No terminal tab</small>
             </button>
             <div class="terminal-new-wrap">
-              <button id="terminal-new-session" class="icon-button compact" type="button" title="New session" aria-label="New session" aria-haspopup="menu" aria-expanded="false">&#43;</button>
+              <button id="terminal-new-session" class="icon-button compact" type="button" title="New session" aria-label="New session" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
               <div id="terminal-new-menu" class="terminal-new-menu hidden" hidden role="menu" aria-label="New or re-attach session"></div>
             </div>
-            <button id="terminal-dock-side" class="icon-button compact" type="button" title="Dock to bottom / right" aria-label="Dock to bottom or right">&#9660;</button>
+            <button id="terminal-dock-side" class="icon-button compact" type="button" title="Dock to bottom / right" aria-label="Dock to bottom or right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg></button>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
             <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
               Actions
@@ -340,7 +340,7 @@
             </div>
           </div>
           <textarea id="dispatch-instruction" name="instruction" rows="1" placeholder="Message Universe Conductor…" required autocomplete="off" spellcheck="false"></textarea>
-          <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send" aria-label="Send">&#8593;</button>
+          <button id="dispatch-submit" class="primary-button send-button" type="submit" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 7-7 7 7"/><path d="M12 19V5"/></svg></button>
           <div class="room-actions">
             <span id="room-context" class="room-context">Universe Conductor</span>
             <span id="room-hint" class="room-hint">Use + to call a Project Master</span>
@@ -1268,7 +1268,7 @@
 
       <section id="fresh-project-adopted" class="wizard-panel hidden">
         <div class="wizard-complete">
-          <span class="wizard-complete-mark" aria-hidden="true">&#10003;</span>
+          <span class="wizard-complete-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span>
           <h3>Project plan adopted</h3>
           <p id="fresh-project-adoption-ref"></p>
           <p id="fresh-project-handoff-status" class="handoff-status"></p>

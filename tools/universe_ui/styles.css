@@ -312,6 +312,50 @@ a.text-button:hover {
   height: 26px;
 }
 
+/* Stroke icons: inline SVGs inherit button color and stay crisp at any zoom. */
+.icon-button svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+.icon-button.compact svg {
+  width: 15px;
+  height: 15px;
+}
+.mobile-icon-btn svg {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+.utility-rail button span svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+.home-mobile-back svg,
+.summary-dock-icon svg,
+.summary-dock-chevron svg,
+.chat-dock-chevron svg,
+.send-button svg,
+.wizard-complete-mark svg,
+.galaxy-fullscreen-toggle svg {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.15em;
+}
+.summary-dock-chevron svg,
+.chat-dock-chevron svg {
+  width: 14px;
+  height: 14px;
+}
+#quick-task-button svg {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.15em;
+}
+
 .project-rail,
 .inspector {
   min-width: 0;
