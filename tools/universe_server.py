@@ -29379,6 +29379,79 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         with self.project_release_application_lock:
             return self._apply_project_release(project_id, request)
 
+    def repin_release_fleet(self, release_id: str, value: Any) -> dict[str, Any]:
+        """Point every project that already has a release selection at
+        `release_id`, in one operator action instead of N proposals. Only
+        projects with a current selection are touched; a per-project failure
+        (e.g. an unmanaged collision) is recorded and the rest continue."""
+
+        request = _exact_object_fields(
+            value,
+            field="release_fleet_repin",
+            required=frozenset(),
+            optional=frozenset({"install_mode"}),
+        )
+        install_mode = str(request.get("install_mode") or "COPY").strip().upper()
+        if install_mode not in {"COPY", "LINKED"}:
+            raise UniverseError(
+                "REQUEST_INVALID",
+                f"install_mode must be COPY or LINKED, got {install_mode!r}",
+            )
+        normalized_release = _identifier(release_id, "release_id")
+        self.store.get_release_artifact_binding(normalized_release)
+
+        results: list[dict[str, Any]] = []
+        with self.project_release_application_lock:
+            for project in self.store.list_projects():
+                project_id = project["project_id"]
+                selection = self.store.selected_project_release_binding(project_id)
+                if selection.get("status") != "SELECTED":
+                    continue
+                try:
+                    proposal, _created = self.store.create_project_release_proposal(
+                        project_id,
+                        {
+                            "release_id": normalized_release,
+                            "mode": MASTER_MODE,
+                            "install_mode": install_mode,
+                        },
+                    )
+                    applied = self._apply_project_release(
+                        project_id,
+                        {
+                            "approval": "APPROVED",
+                            "proposal_id": proposal["proposal_id"],
+                            "proposal_digest": proposal["proposal_digest"],
+                        },
+                    )
+                    receipt = applied.get("receipt") or {}
+                    results.append(
+                        {
+                            "project_id": project_id,
+                            "status": applied["status"],
+                            "operation": receipt.get("operation"),
+                            "changed_count": receipt.get("changed_count", 0),
+                        }
+                    )
+                except UniverseError as error:
+                    results.append(
+                        {
+                            "project_id": project_id,
+                            "status": "FAILED",
+                            "error_code": error.code,
+                            "detail": error.detail,
+                        }
+                    )
+        return {
+            "schema": API_SCHEMA,
+            "status": "RELEASE_FLEET_REPINNED",
+            "release_id": normalized_release,
+            "install_mode": install_mode,
+            "applied": sum(1 for item in results if item["status"] != "FAILED"),
+            "failed": sum(1 for item in results if item["status"] == "FAILED"),
+            "results": results,
+        }
+
     def prepare_project_connection(self, value: Any) -> dict[str, Any]:
         request = _exact_object_fields(
             value,
@@ -41188,6 +41261,17 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 self._send(
                     HTTPStatus.OK,
                     self.server.bind_planning_runtime(body),
+                )
+                return
+            release_fleet_match = re.fullmatch(
+                r"/v1/releases/([^/]+)/fleet-repin", path
+            )
+            if release_fleet_match is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.repin_release_fleet(
+                        unquote(release_fleet_match.group(1)), body
+                    ),
                 )
                 return
             if path == "/v1/releases/import":

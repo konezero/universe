@@ -381,6 +381,33 @@ class ProjectReleaseApplyTests(unittest.TestCase):
         self.assertEqual("OS_UPDATE", updated["plan"]["user_command"])
         self.assertEqual("MANAGED", updated["plan"]["installed_runtime"]["state"])
 
+    def test_copy_to_linked_migration_adopts_every_managed_file(self) -> None:
+        store = self.root / "runtime-store"
+        approval = build_project_release_approval(
+            project_id="demo",
+            proposal=self._proposal(install_mode="COPY"),
+            evidence_ref="universe://approval/demo",
+        )
+        apply_project_release_proposal(
+            project_root=self.project,
+            project_id="demo",
+            proposal=self._proposal(install_mode="COPY"),
+            approval=approval,
+            database_path=self.database,
+            manifest_path=self.manifest,
+        )
+        core = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        self.assertFalse(os.path.islink(core))
+        original = core.read_bytes()
+
+        linked_proposal = self._proposal(install_mode="LINKED")
+        self.assertEqual("RUNTIME_UPDATE", linked_proposal["plan"]["operation"])
+        receipt = self._apply(linked_proposal, store=store)
+
+        self.assertTrue(all(c["operation"] == "ADOPT" for c in receipt["changed"]))
+        self.assertTrue(os.path.islink(core))
+        self.assertEqual(original, core.read_bytes())
+
     def test_linked_apply_blocks_on_a_foreign_managed_file(self) -> None:
         store = self.root / "runtime-store"
         core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
