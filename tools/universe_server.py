@@ -33289,9 +33289,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if isinstance(raw_providers, list)
             else ["CODEX", "GROK", "CLAUDE"]
         )
-        repo_root = Path(__file__).resolve().parents[1]
+        # Default target is the universe repo (its own CLI host). A caller may
+        # name a connected project instead, so a project split into its own repo
+        # gets the same install through the control plane rather than by hand.
+        project_id = str(body.get("project_id") or "").strip()
+        if project_id and project_id.casefold() != "universe":
+            project = self.store.get_project(project_id)
+            repo_root = Path(
+                _required_text(project.get("project_root"), "project.project_root")
+            )
+        else:
+            project_id = project_id or None
+            repo_root = Path(__file__).resolve().parents[1]
         result = _setup(
             repo_root,
+            project_id=project_id,
             global_=global_,
             providers=providers,
         )
@@ -33304,7 +33316,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     session_supervisor=self.session_supervisor,
                     multi_rooms=self.multi_rooms,
                     body={
-                        "project_id": repo_root.name,
+                        "project_id": project_id or repo_root.name,
                         "mode": item.get("mode") or "MASTER",
                         "provider": "GROK",
                         "provider_session_ref": item.get("session_ref") or "",
@@ -42531,6 +42543,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/cli-host/install":
+                install_body = dict(body) if isinstance(body, dict) else {}
+                install_body["project_id"] = parts[0]
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.setup_provider_hooks(install_body),
+                )
+                return
             if parts is not None and parts[1] == "/discovery-dispatch":
                 message, created = (
                     self.server.store.create_project_seed_discovery_dispatch(parts[0])
@@ -43606,6 +43626,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-bridge/replies",
             "/master-bridge",
             "/master-session/prepare",
+            "/cli-host/install",
             "/runtime-lease/activate",
             "/runtime-lease/renew",
             "/runtime-lease/release",

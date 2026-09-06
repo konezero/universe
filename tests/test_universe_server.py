@@ -399,6 +399,26 @@ class UniverseLocalServiceTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def test_cli_host_install_targets_the_named_project_root(self) -> None:
+        self.server.store.register_project(self.registration())
+        with patch(
+            "universe_session_inject_hook.setup_provider_hooks",
+            return_value={"status": "SETUP_HOOKS_DONE", "providers": {}},
+        ) as setup:
+            status, payload = self.request(
+                "POST",
+                "/v1/projects/GCS/cli-host/install",
+                {"providers": ["CLAUDE"]},
+                self.token,
+            )
+        self.assertEqual(200, status)
+        self.assertEqual("SETUP_HOOKS_DONE", payload["status"])
+        self.assertEqual(1, setup.call_count)
+        call = setup.call_args
+        self.assertEqual(Path(str(self.project_root)), call.args[0])
+        self.assertEqual("GCS", call.kwargs["project_id"])
+        self.assertEqual(["CLAUDE"], call.kwargs["providers"])
+
     def test_native_directory_picker_returns_selected_host_path(self) -> None:
         self.server.directory_selector = lambda: str(self.project_root)
 

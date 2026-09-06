@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_session_inject_hook import (  # noqa: E402
     _claude_settings_hook,
     _supervisor_identity_observation,
+    ensure_project_claude_md,
     is_universe_managed_host,
     main,
     provider_hook_stdout,
@@ -780,11 +781,15 @@ class SessionInjectHookTests(unittest.TestCase):
             self.assertEqual("WRITTEN", result["providers"]["CLAUDE_PROJECT"]["status"])
             self.assertTrue(grok_hook.is_file())
             self.assertIn("--provider GROK", grok_hook.read_text(encoding="utf-8"))
-            self.assertIn("--provider CLAUDE", claude_hook.read_text(encoding="utf-8"))
-            self.assertIn(
-                "python -m tools.universe_session_inject_hook",
-                claude_hook.read_text(encoding="utf-8"),
-            )
+            claude_text = claude_hook.read_text(encoding="utf-8")
+            self.assertIn("--provider CLAUDE", claude_text)
+            # A non-universe repo cannot `-m tools.universe_session_inject_hook`;
+            # the hook is written as an absolute runpy command instead, and
+            # CLAUDE.md is ensured.
+            self.assertIn("runpy.run_path", claude_text)
+            self.assertNotIn("-m tools.universe_session_inject_hook", claude_text)
+            self.assertEqual("WRITTEN", result["providers"]["CLAUDE_MD"]["status"])
+            self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text(encoding="utf-8"))
             again = setup_provider_hooks(
                 root,
                 global_=False,
@@ -794,6 +799,25 @@ class SessionInjectHookTests(unittest.TestCase):
             )
             self.assertEqual("CURRENT", again["providers"]["GROK_PROJECT"]["status"])
             self.assertEqual("CURRENT", again["providers"]["CLAUDE_PROJECT"]["status"])
+            self.assertEqual("CURRENT", again["providers"]["CLAUDE_MD"]["status"])
+
+    def test_claude_project_hook_is_module_form_for_universe_repo(self) -> None:
+        # project=True (universe repo) keeps the module invocation.
+        payload = _claude_settings_hook("tools/universe_session_inject_hook.py", project=True)
+        command = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("python -m tools.universe_session_inject_hook", command)
+
+    def test_ensure_project_claude_md_appends_to_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CLAUDE.md").write_text("# local rules\n\nkeep me\n", encoding="utf-8")
+            r1 = ensure_project_claude_md(root, "career")
+            self.assertEqual("UPDATED", r1["status"])
+            text = (root / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("keep me", text)
+            self.assertIn("@AGENTS.md", text)
+            r2 = ensure_project_claude_md(root, "career")
+            self.assertEqual("CURRENT", r2["status"])
 
     def test_setup_updates_existing_inject_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1502,6 +1502,48 @@ def repair_claude_compat_observer_stamps(
     return repairs
 
 
+_CLAUDE_MD_OVERLAY_START = "<!-- ai-career-project-runtime-overlay:start -->"
+_CLAUDE_MD_OVERLAY_END = "<!-- ai-career-project-runtime-overlay:end -->"
+
+
+def ensure_project_claude_md(repo_root: Path, project_id: str) -> dict[str, Any]:
+    """Ensure ``<repo_root>/CLAUDE.md`` imports the project Agent Router.
+
+    Claude Code does not auto-load ``AGENTS.md``; without a ``CLAUDE.md`` that
+    ``@AGENTS.md``-imports it, the project's Mode Intent / router policy is never
+    in context.  A monorepo subdir that only ever had ``AGENTS.md`` needs this
+    written when it becomes its own repo.
+    """
+    path = repo_root / "CLAUDE.md"
+    overlay = (
+        f"{_CLAUDE_MD_OVERLAY_START}\n"
+        "## Managed ai-career Runtime Binding\n\n"
+        "This source-managed block augments the project-owned policy outside the\n"
+        "block. The project may keep richer local routing, but shared Runtime\n"
+        "package entry, capability, and execution-gate references in this block\n"
+        "remain source-bound. Edit project policy outside this block.\n\n"
+        "Claude Code imports the project Agent Router through the managed\n"
+        "Runtime overlay below. Project-owned Claude instructions may remain\n"
+        "outside that overlay.\n\n"
+        "@AGENTS.md\n"
+        f"{_CLAUDE_MD_OVERLAY_END}\n"
+    )
+    try:
+        existing = path.read_text(encoding="utf-8") if path.is_file() else None
+    except OSError as error:
+        return {"status": "ERROR", "detail": str(error), "path": str(path)}
+    if existing is not None and "@AGENTS.md" in existing:
+        return {"status": "CURRENT", "path": str(path)}
+    body = f"# {project_id} Claude Code Entry\n\n{overlay}"
+    if existing is not None and existing.strip():
+        body = existing.rstrip() + "\n\n" + overlay
+    try:
+        path.write_text(body, encoding="utf-8")
+    except OSError as error:
+        return {"status": "ERROR", "detail": str(error), "path": str(path)}
+    return {"status": "WRITTEN" if existing is None else "UPDATED", "path": str(path)}
+
+
 def setup_provider_hooks(
     repo_root: Path,
     *,
@@ -1516,12 +1558,24 @@ def setup_provider_hooks(
     """Write SessionStart hook configs for Codex and/or Grok (and Claude).
 
     Returns a dict with per-provider status strings.
+
+    When ``repo_root`` is not the universe repo itself (a project split into its
+    own repo), the Claude project hook is written as an absolute-path
+    ``runpy.run_path`` command instead of ``-m tools.universe_session_inject_hook``
+    (which only resolves when run from the universe repo), and ``CLAUDE.md`` is
+    ensured.
     """
     import sys as _sys
     py = python_exe or _sys.executable
     sp = script_path or str(Path(__file__).resolve())
     targets = [p.upper() for p in (providers or ["CODEX", "GROK", "CLAUDE"])]
     results: dict[str, Any] = {}
+
+    universe_repo = Path(__file__).resolve().parents[1]
+    try:
+        is_universe_repo = repo_root.resolve() == universe_repo
+    except OSError:
+        is_universe_repo = False
 
     home = Path.home()
 
@@ -1552,12 +1606,16 @@ def setup_provider_hooks(
             results["CLAUDE_PROJECT"] = {
                 "status": _merge_claude_settings(
                     repo_root / ".claude" / "settings.json",
-                    _claude_settings_hook(sp, project=True),
+                    _claude_settings_hook(sp, project=is_universe_repo),
                 ),
                 "path": str((repo_root / ".claude" / "settings.json")),
             }
         except OSError as error:
             results["CLAUDE_PROJECT"] = {"status": "ERROR", "detail": str(error)}
+        if not is_universe_repo:
+            results["CLAUDE_MD"] = ensure_project_claude_md(
+                repo_root, project_id or repo_root.name
+            )
         if global_:
             settings_path = home / ".claude" / "settings.json"
             try:

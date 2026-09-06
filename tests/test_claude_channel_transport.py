@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from claude_channel_broker import (  # noqa: E402
     ClaudeChannelBroker,
     ClaudeChannelError,
+    ensure_local_channel_server_registered,
     session_lookup_path,
 )
 import claude_channel_mcp  # noqa: E402
@@ -55,6 +56,37 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
         )
         self.addCleanup(broker.close)
         return broker.start()
+
+    def test_channel_registration_trusts_the_project_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / ".claude.json"
+            proj = r"C:\workspace\career"
+            with patch.dict(os.environ, {"UNIVERSE_CLAUDE_CONFIG_PATH": str(cfg)}):
+                ensure_local_channel_server_registered(proj)
+                data = json.loads(cfg.read_text(encoding="utf-8"))
+                for key in (proj, proj.replace("\\", "/")):
+                    entry = data["projects"][key]
+                    self.assertTrue(entry["hasTrustDialogAccepted"])
+                    self.assertTrue(entry["hasCompletedProjectOnboarding"])
+                    self.assertIn("universe_channel", entry["mcpServers"])
+                # idempotent: a second call must not rewrite / raise
+                before = cfg.read_text(encoding="utf-8")
+                ensure_local_channel_server_registered(proj)
+                self.assertEqual(before, cfg.read_text(encoding="utf-8"))
+
+    def test_channel_registration_trusts_even_when_mcp_entry_is_current(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / ".claude.json"
+            proj = "/tmp/proj"
+            with patch.dict(os.environ, {"UNIVERSE_CLAUDE_CONFIG_PATH": str(cfg)}):
+                ensure_local_channel_server_registered(proj)
+                data = json.loads(cfg.read_text(encoding="utf-8"))
+                # drop only the trust flags, keep the (current) mcp entry
+                data["projects"][proj].pop("hasTrustDialogAccepted")
+                cfg.write_text(json.dumps(data), encoding="utf-8")
+                ensure_local_channel_server_registered(proj)
+                entry = json.loads(cfg.read_text(encoding="utf-8"))["projects"][proj]
+                self.assertTrue(entry["hasTrustDialogAccepted"])
 
     def test_bootstrap_is_single_use_and_push_poll_is_authenticated(self) -> None:
         broker = self.make_broker()

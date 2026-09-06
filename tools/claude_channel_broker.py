@@ -87,12 +87,23 @@ def _claude_config_path() -> Path:
 
 
 def ensure_local_channel_server_registered(project_root: str) -> None:
-    """Idempotently register universe_channel as a local-scope MCP server.
+    """Prepare ~/.claude.json for a Universe-managed Claude terminal in this project.
 
-    This edits the user's shared ~/.claude.json, so it only writes when the
-    entry is missing or stale, and does a fresh read-merge-atomic-replace
-    right before writing to keep the window where a concurrent Claude Code
-    write could be clobbered as small as possible.
+    Two idempotent edits on the project's ``projects`` entry:
+
+    1. Register ``universe_channel`` as a local-scope MCP server.
+    2. Mark the folder trusted (``hasTrustDialogAccepted`` /
+       ``hasCompletedProjectOnboarding``).  A managed PTY has no way to answer
+       the interactive folder-trust dialog, so without this a freshly split /
+       newly connected project deadlocks at ``SHELL_READY`` — the CLI is alive
+       but never runs its SessionStart hook or loads MCP.  A managed terminal
+       only spawns for a project the operator connected to Universe, so trusting
+       it here is the CLI-host install step, not a bypass.
+
+    Edits the user's shared ~/.claude.json, so it only writes when something is
+    missing or stale, and does a fresh read-merge-atomic-replace right before
+    writing to keep the window where a concurrent Claude Code write could be
+    clobbered as small as possible.
     """
     root = str(Path(project_root or "").expanduser())
     if not root:
@@ -125,6 +136,10 @@ def ensure_local_channel_server_registered(project_root: str) -> None:
             if servers.get(MCP_SERVER_NAME) != desired:
                 servers[MCP_SERVER_NAME] = desired
                 changed = True
+            for trust_field in ("hasTrustDialogAccepted", "hasCompletedProjectOnboarding"):
+                if entry.get(trust_field) is not True:
+                    entry[trust_field] = True
+                    changed = True
         if not changed:
             return
         tmp = config_path.with_name(config_path.name + f".tmp{os.getpid()}")
