@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from release_runtime import ReleaseRuntime, ReleaseRuntimeError
+from release_runtime import (
+    INSTALL_STATE_PATH,
+    INSTALL_STATE_SCHEMA,
+    ReleaseRuntime,
+    ReleaseRuntimeError,
+)
+from runtime_store import default_store_root
 
 
 RELEASE_APPROVAL_SCHEMA = "universe.project-release-approval.v1"
@@ -32,15 +38,83 @@ class ProjectReleaseApplyError(ValueError):
         )
 
 
+def _install_mode(value: Any) -> str:
+    mode = str(value or "COPY").strip().upper()
+    if mode not in {"COPY", "LINKED"}:
+        raise ProjectReleaseApplyError(
+            "PROJECT_RELEASE_INSTALL_MODE_INVALID",
+            f"unsupported install mode: {value!r}",
+        )
+    return mode
+
+
+def _read_linked_pin(pin_path: Path) -> Mapping[str, Any] | None:
+    """Return the LINKED install pin (UNIVERSE_RELEASE_INSTALL.json) if the
+    project is currently link-installed, else None."""
+
+    if not pin_path.is_file() or pin_path.is_symlink():
+        return None
+    try:
+        data = json.loads(pin_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    if data.get("schema") != INSTALL_STATE_SCHEMA:
+        return None
+    if str(data.get("install_mode") or "").upper() != "LINKED":
+        return None
+    return data
+
+
 def plan_project_release_lifecycle(
     *,
     project_root: Path,
     project_id: str,
     release_id: str,
     source_commit: str,
+    install_mode: str = "COPY",
 ) -> dict[str, Any]:
     root = _project_root(project_root)
     normalized_project = _text(project_id, "project_id")
+    mode = _install_mode(install_mode)
+
+    if mode == "LINKED":
+        pin_path = root / INSTALL_STATE_PATH
+        linked_pin = _read_linked_pin(pin_path)
+        if linked_pin is not None:
+            installed_commit = str(linked_pin.get("source_commit", "UNKNOWN"))
+            manifest_sha256 = hashlib.sha256(pin_path.read_bytes()).hexdigest()
+            operation = "RUNTIME_UPDATE"
+            user_command = "OS_UPDATE"
+            installed_state = "MANAGED"
+        else:
+            installed_commit = "NONE"
+            manifest_sha256 = "NONE"
+            operation = "FRESH_INSTALL"
+            user_command = "OS_INSTALL"
+            installed_state = "ABSENT"
+        material = {
+            "schema": LIFECYCLE_PLAN_SCHEMA,
+            "project_id": normalized_project,
+            "target_root": str(root),
+            "release_id": _text(release_id, "release_id"),
+            "source_commit": _commit(source_commit),
+            "operation": operation,
+            "user_command": user_command,
+            "install_mode": mode,
+            "installed_runtime": {
+                "state": installed_state,
+                "source_commit": installed_commit,
+                "manifest_sha256": manifest_sha256,
+            },
+            "project_host_preflight": "REQUIRED",
+            "candidate_execution": "FORBIDDEN",
+        }
+        material["plan_digest"] = _digest(material)
+        material["status"] = "PROJECT_RUNTIME_LIFECYCLE_PLAN_READY"
+        return material
+
     installation_manifest = root / INSTALLATION_MANIFEST_PATH
     if installation_manifest.exists():
         if not installation_manifest.is_file() or installation_manifest.is_symlink():
@@ -150,10 +224,12 @@ def apply_project_release_proposal(
     approval: Any,
     database_path: Path,
     manifest_path: Path,
+    install_mode: str = "COPY",
 ) -> dict[str, Any]:
     root = _project_root(project_root)
     normalized_proposal = _proposal(project_id, proposal)
     normalized_approval = _approval(normalized_proposal, approval)
+    mode = _install_mode(install_mode)
 
     try:
         with ReleaseRuntime(
@@ -173,17 +249,32 @@ def apply_project_release_proposal(
                     "PROJECT_RELEASE_ARTIFACT_MISMATCH",
                     "release database digest does not match the proposal",
                 )
-            install_plan = runtime.plan_project_install(root)
-            if install_plan["collisions"]:
-                collision = install_plan["collisions"][0]
-                raise ProjectReleaseApplyError(
-                    "UNMANAGED_TARGET_COLLISION",
-                    f"unmanaged file at {collision['path']}",
+            if mode == "LINKED":
+                store_root = default_store_root()
+                link_plan = runtime.link_project_plan(root, store_root=store_root)
+                if link_plan["collisions"]:
+                    collision = link_plan["collisions"][0]
+                    raise ProjectReleaseApplyError(
+                        "UNMANAGED_TARGET_COLLISION",
+                        f"unmanaged file at {collision['path']}",
+                    )
+                install_result = runtime.link_project_install(
+                    target_root=root,
+                    store_root=store_root,
+                    approved_plan_digest=link_plan["plan_digest"],
                 )
-            install_result = runtime.apply_project_install(
-                target_root=root,
-                approved_plan_digest=install_plan["plan_digest"],
-            )
+            else:
+                install_plan = runtime.plan_project_install(root)
+                if install_plan["collisions"]:
+                    collision = install_plan["collisions"][0]
+                    raise ProjectReleaseApplyError(
+                        "UNMANAGED_TARGET_COLLISION",
+                        f"unmanaged file at {collision['path']}",
+                    )
+                install_result = runtime.apply_project_install(
+                    target_root=root,
+                    approved_plan_digest=install_plan["plan_digest"],
+                )
     except ProjectReleaseApplyError:
         raise
     except (OSError, ReleaseRuntimeError) as error:
@@ -361,7 +452,8 @@ def _proposal(expected_project_id: str, value: Any) -> dict[str, Any]:
         "proposal_id",
         "status",
     }
-    if not required.issubset(value) or set(value) - (required | {"created_at"}):
+    allowed = required | {"created_at", "install_mode"}
+    if not required.issubset(value) or set(value) - allowed:
         raise ProjectReleaseApplyError(
             "PROJECT_RELEASE_PROPOSAL_INVALID",
             "proposal fields are invalid",

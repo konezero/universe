@@ -456,6 +456,7 @@ const elements = {
   releaseDatabaseBrowse: document.querySelector("#release-database-browse"),
   releaseManifestBrowse: document.querySelector("#release-manifest-browse"),
   releaseTargetProject: document.querySelector("#release-target-project"),
+  releaseInstallMode: document.querySelector("#release-install-mode"),
   releaseList: document.querySelector("#release-list"),
   releaseFormError: document.querySelector("#release-form-error"),
   releaseProposalOutput: document.querySelector("#release-proposal-output"),
@@ -5651,7 +5652,11 @@ async function proposeProjectRelease(releaseId, button = null) {
       )}/release-proposals`,
       {
         method: "POST",
-        body: { release_id: releaseId, mode: "MASTER" },
+        body: {
+          release_id: releaseId,
+          mode: "MASTER",
+          install_mode: elements.releaseInstallMode?.value || "COPY",
+        },
       }
     );
     state.releaseProposals = [
