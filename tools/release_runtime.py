@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from core_release import CoreReleaseError, canonical_bytes, verify_release
+from runtime_store import ensure_blob, store_symlink_sha
 
 
 INSTALL_STATE_SCHEMA = "universe.project-release-install.v1"
@@ -19,6 +20,7 @@ INSTALL_STATE_PATH = (
     ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json"
 )
 PLAN_SCHEMA = "universe.project-release-plan.v1"
+LINK_PLAN_SCHEMA = "universe.project-release-link-plan.v1"
 PROFILE_CATALOG_REQUIRED = "PROFILE_CATALOG_REQUIRED"
 GOVERNANCE_CONTEXT_SCHEMA = "universe.release-governance-context.v1"
 GOVERNANCE_SELECTOR_FIELDS = (
@@ -721,6 +723,195 @@ class ReleaseRuntime:
             "candidate_execution": "FORBIDDEN",
         }
 
+    # -- LINKED install: managed files are symlinks into a shared blob store --
+    #
+    # Parallel to plan_project_install / apply_project_install (which copy);
+    # kept separate so the COPY path and its guards stay byte-identical. The
+    # pin (INSTALL_STATE_PATH) is shared: LINKED writes install_mode="LINKED"
+    # + store_root, and its inventory {path: sha256} is the symlink map.
+
+    @staticmethod
+    def _linked_target_state(target: Path, store_root: Path) -> dict[str, str]:
+        if target.is_symlink():
+            sha = store_symlink_sha(target, store_root)
+            if sha is not None:
+                return {"kind": "STORE_SYMLINK", "sha256": sha}
+            return {"kind": "FOREIGN_SYMLINK", "sha256": "NONE"}
+        if not target.exists():
+            return {"kind": "ABSENT", "sha256": "NONE"}
+        if not target.is_file():
+            return {"kind": "UNSUPPORTED", "sha256": "NONE"}
+        return {
+            "kind": "REAL_FILE",
+            "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        }
+
+    def link_project_plan(
+        self, target_root: Path, *, store_root: Path
+    ) -> dict[str, Any]:
+        root = _project_root(target_root)
+        store = Path(store_root).expanduser()
+        previous = _load_install_state(root)
+        previous_inventory = (
+            previous.get("inventory", {}) if previous is not None else {}
+        )
+        if not isinstance(previous_inventory, dict):
+            raise ReleaseRuntimeError("project release inventory is invalid")
+        desired = {item.path: item for item in self.iter_release_files()}
+        actions: list[dict[str, Any]] = []
+        collisions: list[dict[str, Any]] = []
+
+        for path, item in desired.items():
+            state = self._linked_target_state(_target_path(root, path), store)
+            prior_digest = previous_inventory.get(path)
+            if state["kind"] == "ABSENT":
+                action = "LINK"
+            elif state["kind"] == "STORE_SYMLINK":
+                action = "NOOP" if state["sha256"] == item.sha256 else "RELINK"
+            elif state["kind"] == "REAL_FILE" and state["sha256"] == item.sha256:
+                action = "ADOPT"
+            elif (
+                state["kind"] == "REAL_FILE"
+                and isinstance(prior_digest, str)
+                and state["sha256"] == prior_digest
+            ):
+                action = "RELINK"
+            else:
+                action = "COLLISION"
+                collisions.append(
+                    {
+                        "path": path,
+                        "actual": state,
+                        "release_sha256": item.sha256,
+                    }
+                )
+            actions.append(
+                {
+                    "action": action,
+                    "path": path,
+                    "release_sha256": item.sha256,
+                    "actual": state,
+                }
+            )
+
+        for path, prior_digest in sorted(previous_inventory.items()):
+            if path in desired:
+                continue
+            state = self._linked_target_state(_target_path(root, path), store)
+            if state["kind"] == "ABSENT":
+                action = "NOOP"
+            elif state["kind"] == "STORE_SYMLINK":
+                action = "UNLINK"
+            elif (
+                state["kind"] == "REAL_FILE"
+                and isinstance(prior_digest, str)
+                and state["sha256"] == prior_digest
+            ):
+                action = "DELETE"
+            else:
+                action = "COLLISION"
+                collisions.append(
+                    {"path": path, "actual": state, "release_sha256": "REMOVED"}
+                )
+            actions.append(
+                {
+                    "action": action,
+                    "path": path,
+                    "release_sha256": "REMOVED",
+                    "actual": state,
+                }
+            )
+
+        material = {
+            "schema": LINK_PLAN_SCHEMA,
+            "operation": "UPDATE" if previous is not None else "FRESH_LINK",
+            "target_root": str(root),
+            "store_root": str(store),
+            "release_id": self.release_id,
+            "source_commit": self.metadata["source_commit"],
+            "previous_release_id": (
+                previous.get("release_id", "NONE")
+                if previous is not None
+                else "NONE"
+            ),
+            "actions": actions,
+            "collisions": collisions,
+            "candidate_execution": "FORBIDDEN",
+        }
+        material["plan_digest"] = _digest(material)
+        material["status"] = (
+            "PROJECT_RELEASE_LINK_PLAN_BLOCKED"
+            if collisions
+            else "PROJECT_RELEASE_LINK_PLAN_READY"
+        )
+        return material
+
+    def link_project_install(
+        self,
+        *,
+        target_root: Path,
+        store_root: Path,
+        approved_plan_digest: str,
+    ) -> dict[str, Any]:
+        plan = self.link_project_plan(target_root, store_root=store_root)
+        if plan["plan_digest"] != _required_text(
+            approved_plan_digest, "approved_plan_digest"
+        ):
+            raise ReleaseRuntimeError(
+                "project release link plan approval is stale"
+            )
+        if plan["collisions"]:
+            raise ReleaseRuntimeError(
+                "project release link plan has unmanaged collisions"
+            )
+        root = Path(plan["target_root"])
+        store = Path(plan["store_root"])
+        desired = {item.path: item for item in self.iter_release_files()}
+        changed: list[dict[str, str]] = []
+        for action in plan["actions"]:
+            operation = action["action"]
+            path = action["path"]
+            target = _target_path(root, path)
+            if operation in {"LINK", "RELINK", "ADOPT"}:
+                item = desired[path]
+                blob = ensure_blob(store, item.sha256, item.content)
+                _replace_symlink(target, blob)
+                changed.append({"operation": operation, "path": path})
+            elif operation in {"UNLINK", "DELETE"}:
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+                changed.append({"operation": operation, "path": path})
+
+        state = {
+            "schema": INSTALL_STATE_SCHEMA,
+            "install_mode": "LINKED",
+            "store_root": str(store),
+            "release_id": self.release_id,
+            "source_commit": self.metadata["source_commit"],
+            "payload_sha256": self.metadata["payload_sha256"],
+            "database_sha256": self.verification["database_sha256"],
+            "installed_at": _utc_now(),
+            "inventory": {
+                path: item.sha256 for path, item in sorted(desired.items())
+            },
+        }
+        state_path = _target_path(root, INSTALL_STATE_PATH)
+        _replace_file(
+            state_path,
+            (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return {
+            "status": "PROJECT_RELEASE_LINKED",
+            "operation": plan["operation"],
+            "target_root": str(root),
+            "store_root": str(store),
+            "release_id": self.release_id,
+            "changed": changed,
+            "changed_count": len(changed),
+            "state_path": INSTALL_STATE_PATH,
+            "candidate_execution": "FORBIDDEN",
+        }
+
     def _require_profiles(self) -> None:
         if self.profile_catalog_status != "PRESENT":
             raise ReleaseRuntimeError(PROFILE_CATALOG_REQUIRED)
@@ -857,6 +1048,25 @@ def _replace_file(path: Path, content: bytes) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _replace_symlink(target: Path, blob: Path) -> None:
+    """Point ``target`` at the absolute store ``blob`` via a symlink,
+    replacing whatever is there.  Raises a legible ReleaseRuntimeError if the
+    host cannot create symlinks (Windows without Developer Mode / elevation)
+    before the project is left in a half-linked state."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    try:
+        os.symlink(os.fspath(blob), os.fspath(target))
+    except OSError as error:
+        raise ReleaseRuntimeError(
+            "SYMLINK_UNSUPPORTED: cannot create runtime symlinks on this host "
+            "(enable Windows Developer Mode or run elevated) "
+            f"[{type(error).__name__}: {error}]"
+        ) from error
 
 
 def _digest(value: dict[str, Any]) -> str:

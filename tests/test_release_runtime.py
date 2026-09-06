@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -15,9 +16,14 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from core_release import CoreReleaseError, build_release  # noqa: E402
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError  # noqa: E402
+from runtime_store import sweep_unreferenced  # noqa: E402
 
 
-class ReleaseRuntimeTests(unittest.TestCase):
+class _ReleaseFixture:
+    """Temp git repo -> real Release DB -> temp target/. Mixed into the
+    concrete TestCase classes so the fixture is built once per test class,
+    not re-run as a duplicate suite."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -130,6 +136,7 @@ class ReleaseRuntimeTests(unittest.TestCase):
             manifest_path=self.manifest,
         )
 
+class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
     def test_resolves_skill_and_mode_profiles_in_database_order(self) -> None:
         with ReleaseRuntime(
             database_path=self.database,
@@ -505,6 +512,174 @@ class ReleaseRuntimeTests(unittest.TestCase):
                 source.content,
                 (bundle / "objects" / "sha256" / entry["sha256"]).read_bytes(),
             )
+
+
+class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
+    """LINKED install: managed files are symlinks into a shared blob store."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = self.root / "store"
+        self.core_rel = ".ai/core/CORE_SURFACE_REGISTRY.md"
+
+    def _release_paths(self) -> dict[str, str]:
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            return {
+                item.path: item.sha256 for item in runtime.iter_release_files()
+            }
+
+    def _link(self, target: Path | None = None) -> dict[str, object]:
+        target = target or self.target
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            plan = runtime.link_project_plan(target, store_root=self.store)
+            return runtime.link_project_install(
+                target_root=target,
+                store_root=self.store,
+                approved_plan_digest=plan["plan_digest"],
+            )
+
+    def test_linked_install_symlinks_resolve_to_release_content(self) -> None:
+        paths = self._release_paths()
+        result = self._link()
+
+        self.assertEqual("PROJECT_RELEASE_LINKED", result["status"])
+        self.assertEqual("FRESH_LINK", result["operation"])
+        for rel in paths:
+            self.assertTrue(os.path.islink(self.target / rel), rel)
+        self.assertEqual(
+            "# Core v1\n",
+            (self.target / self.core_rel).read_text(encoding="utf-8"),
+        )
+        pin = json.loads(
+            (
+                self.target
+                / ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual("LINKED", pin["install_mode"])
+        self.assertEqual(str(self.store), pin["store_root"])
+        self.assertEqual(paths, pin["inventory"])
+
+    def test_two_projects_share_one_blob(self) -> None:
+        paths = self._release_paths()
+        target2 = self.root / "target2"
+        target2.mkdir()
+        self._link(self.target)
+        self._link(target2)
+
+        first = os.path.realpath(self.target / self.core_rel)
+        second = os.path.realpath(target2 / self.core_rel)
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith(os.path.realpath(self.store)))
+        objects = list((self.store / "objects" / "sha256").iterdir())
+        self.assertEqual(len(set(paths.values())), len(objects))
+
+    def test_linked_update_relinks_only_changed(self) -> None:
+        before = self._release_paths()
+        self._link()
+
+        self._write(self.core_rel, "# Core v2\n")
+        self.commit = self._commit("core-v2")
+        self._build()
+        after = self._release_paths()
+
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            plan = runtime.link_project_plan(self.target, store_root=self.store)
+            actions = {item["path"]: item["action"] for item in plan["actions"]}
+            runtime.link_project_install(
+                target_root=self.target,
+                store_root=self.store,
+                approved_plan_digest=plan["plan_digest"],
+            )
+
+        self.assertEqual("RELINK", actions[self.core_rel])
+        self.assertEqual(
+            {"NOOP"},
+            {value for key, value in actions.items() if key != self.core_rel},
+        )
+        self.assertEqual(
+            "# Core v2\n",
+            (self.target / self.core_rel).read_text(encoding="utf-8"),
+        )
+        removed = sweep_unreferenced(self.store, keep=set(after.values()))
+        self.assertEqual([before[self.core_rel]], removed)
+
+    def test_editing_a_linked_file_hits_the_read_only_blob(self) -> None:
+        self._link()
+        with self.assertRaises(PermissionError):
+            (self.target / self.core_rel).write_text("edit\n", encoding="utf-8")
+
+    def test_foreign_file_at_a_managed_path_is_a_collision(self) -> None:
+        planted = self.target / self.core_rel
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("hand edit\n", encoding="utf-8")
+
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            plan = runtime.link_project_plan(self.target, store_root=self.store)
+            self.assertEqual(
+                "PROJECT_RELEASE_LINK_PLAN_BLOCKED", plan["status"]
+            )
+            self.assertIn(
+                self.core_rel, [item["path"] for item in plan["collisions"]]
+            )
+            with self.assertRaisesRegex(
+                ReleaseRuntimeError, "unmanaged collisions"
+            ):
+                runtime.link_project_install(
+                    target_root=self.target,
+                    store_root=self.store,
+                    approved_plan_digest=plan["plan_digest"],
+                )
+
+        self.assertFalse(os.path.islink(planted))
+        self.assertEqual("hand edit\n", planted.read_text(encoding="utf-8"))
+
+    def test_adopt_identical_real_file_becomes_a_symlink(self) -> None:
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            release_bytes = {
+                item.path: item.content
+                for item in runtime.iter_release_files()
+            }[self.core_rel]
+        planted = self.target / self.core_rel
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_bytes(release_bytes)
+
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            plan = runtime.link_project_plan(self.target, store_root=self.store)
+            actions = {item["path"]: item["action"] for item in plan["actions"]}
+            self.assertEqual("ADOPT", actions[self.core_rel])
+            runtime.link_project_install(
+                target_root=self.target,
+                store_root=self.store,
+                approved_plan_digest=plan["plan_digest"],
+            )
+
+        self.assertTrue(os.path.islink(planted))
+        self.assertEqual(release_bytes, planted.read_bytes())
+
+    def test_stale_link_plan_digest_is_rejected_before_writes(self) -> None:
+        with ReleaseRuntime(
+            database_path=self.database, manifest_path=self.manifest
+        ) as runtime:
+            with self.assertRaisesRegex(ReleaseRuntimeError, "stale"):
+                runtime.link_project_install(
+                    target_root=self.target,
+                    store_root=self.store,
+                    approved_plan_digest="0" * 64,
+                )
+        self.assertEqual([], list(self.target.iterdir()))
 
 
 if __name__ == "__main__":
