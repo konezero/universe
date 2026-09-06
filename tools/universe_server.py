@@ -45772,6 +45772,23 @@ def main() -> int:
 
             if args.command == "status":
                 result = service_status(args.state_file)
+                # The PTY Supervisor is a separate long-lived process; surface it
+                # here so a stale one (old terminal_host code) is visible.
+                try:
+                    from universe_app.pty_supervisor import load_state as _pty_load_state
+
+                    pty_state = _pty_load_state(default_pty_supervisor_state_path()) or {}
+                except Exception:  # noqa: BLE001 - status must not fail on this
+                    pty_state = {}
+                if pty_state:
+                    result = {
+                        **result,
+                        "pty_supervisor": {
+                            "pid": pty_state.get("pid"),
+                            "started_at": pty_state.get("started_at"),
+                            "endpoint": pty_state.get("endpoint"),
+                        },
+                    }
             elif args.command == "start":
                 result = start_service(
                     state_path=args.state_file,
@@ -45788,6 +45805,25 @@ def main() -> int:
                     mode_registry=args.mode_registry,
                     open_ui=bool(args.open_ui),
                 )
+                # A plain restart used to leave the PTY Supervisor running the
+                # terminal_host.py it loaded days ago -- code changes silently
+                # did nothing. Cascade the restart so one command reloads both.
+                if str(result.get("status") or "") == "READY":
+                    try:
+                        result = {
+                            **result,
+                            "pty_supervisor": restart_supervisor(
+                                state_path=default_pty_supervisor_state_path()
+                            ),
+                        }
+                    except Exception as error:  # noqa: BLE001 - server is already up
+                        result = {
+                            **result,
+                            "pty_supervisor": {
+                                "status": "PTY_RESTART_FAILED",
+                                "detail": f"{type(error).__name__}: {error}",
+                            },
+                        }
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
             status_text = str(result.get("status") or "")
             if status_text in {
