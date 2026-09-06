@@ -5568,7 +5568,16 @@ function renderReleaseCatalog() {
     action.addEventListener("click", () =>
       proposeProjectRelease(release.release_id, action)
     );
-    card.append(action);
+    const fleet = node(
+      "button",
+      "secondary-button",
+      "Re-pin fleet to this release"
+    );
+    fleet.type = "button";
+    fleet.addEventListener("click", () =>
+      repinReleaseFleet(release.release_id, fleet)
+    );
+    card.append(action, fleet);
     elements.releaseList.append(card);
   }
 }
@@ -5635,6 +5644,57 @@ function releasePlanErrorMessage(error) {
     ? error.message.trim()
     : "";
   return detail || "Project update plan could not be created";
+}
+
+async function repinReleaseFleet(releaseId, button = null) {
+  const installMode = elements.releaseInstallMode?.value || "COPY";
+  if (
+    !window.confirm(
+      `Re-pin every project that already has a runtime selection to ${releaseId} (${installMode})?`
+    )
+  ) {
+    return;
+  }
+  elements.releaseFormError.textContent = "";
+  if (button) button.disabled = true;
+  try {
+    const result = await api(
+      `/v1/releases/${encodeURIComponent(releaseId)}/fleet-repin`,
+      { method: "POST", body: { install_mode: installMode } }
+    );
+    const failed = result.results.filter((item) => item.status === "FAILED");
+    elements.releaseProposalOutput.replaceChildren(
+      node("h3", "", result.status),
+      node(
+        "p",
+        "",
+        `${result.applied} applied, ${result.failed} failed → ${releaseId} (${installMode})`
+      ),
+      ...result.results.map((item) =>
+        node(
+          "p",
+          item.status === "FAILED" ? "form-error" : "",
+          `${item.project_id}: ${item.status}${
+            item.error_code ? ` (${item.error_code})` : ""
+          }`
+        )
+      )
+    );
+    elements.releaseProposalOutput.classList.remove("hidden");
+    toast(
+      failed.length
+        ? `Fleet re-pin: ${failed.length} failed`
+        : `Fleet re-pinned (${result.applied})`,
+      failed.length > 0
+    );
+    await refresh({ syncSelectedProject: false });
+  } catch (error) {
+    const detail = releasePlanErrorMessage(error);
+    elements.releaseFormError.textContent = detail;
+    toast(detail, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 async function proposeProjectRelease(releaseId, button = null) {

@@ -48,9 +48,10 @@ def _install_mode(value: Any) -> str:
     return mode
 
 
-def _read_linked_pin(pin_path: Path) -> Mapping[str, Any] | None:
-    """Return the LINKED install pin (UNIVERSE_RELEASE_INSTALL.json) if the
-    project is currently link-installed, else None."""
+def _read_release_pin(pin_path: Path) -> Mapping[str, Any] | None:
+    """Return the ReleaseRuntime install pin (UNIVERSE_RELEASE_INSTALL.json)
+    if the project has one, regardless of install_mode (a COPY pin is a valid
+    prior state for a LINKED migration), else None."""
 
     if not pin_path.is_file() or pin_path.is_symlink():
         return None
@@ -61,8 +62,6 @@ def _read_linked_pin(pin_path: Path) -> Mapping[str, Any] | None:
     if not isinstance(data, Mapping):
         return None
     if data.get("schema") != INSTALL_STATE_SCHEMA:
-        return None
-    if str(data.get("install_mode") or "").upper() != "LINKED":
         return None
     return data
 
@@ -81,9 +80,9 @@ def plan_project_release_lifecycle(
 
     if mode == "LINKED":
         pin_path = root / INSTALL_STATE_PATH
-        linked_pin = _read_linked_pin(pin_path)
-        if linked_pin is not None:
-            installed_commit = str(linked_pin.get("source_commit", "UNKNOWN"))
+        prior_pin = _read_release_pin(pin_path)
+        if prior_pin is not None:
+            installed_commit = str(prior_pin.get("source_commit", "UNKNOWN"))
             manifest_sha256 = hashlib.sha256(pin_path.read_bytes()).hexdigest()
             operation = "RUNTIME_UPDATE"
             user_command = "OS_UPDATE"

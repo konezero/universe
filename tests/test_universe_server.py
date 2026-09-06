@@ -13047,6 +13047,69 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "LINKED", apply_release.call_args.kwargs["install_mode"]
         )
 
+    def test_fleet_repin_touches_only_projects_with_a_selection(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        second_root = self.temp_root / "second-project"
+        second_root.mkdir()
+        (second_root / "REPOSITORY_MANIFEST.md").write_text("# second\n", "utf-8")
+        self.request(
+            "POST",
+            "/v1/projects/register",
+            self.registration(project_id="SECOND", project_root=str(second_root)),
+            self.token,
+        )
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        release_id = imported["release"]["release_id"]
+
+        # GCS gets a real selection; SECOND stays unselected.
+        _, proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {"release_id": release_id, "mode": "MASTER"},
+            self.token,
+        )
+        proposal = proposed["proposal"]
+        self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals/apply",
+            {
+                "approval": "APPROVED",
+                "proposal_id": proposal["proposal_id"],
+                "proposal_digest": proposal["proposal_digest"],
+            },
+            self.token,
+        )
+
+        status, fleet = self.request(
+            "POST",
+            f"/v1/releases/{release_id}/fleet-repin",
+            {"install_mode": "COPY"},
+            self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("RELEASE_FLEET_REPINNED", fleet["status"])
+        touched = {item["project_id"] for item in fleet["results"]}
+        self.assertEqual({"GCS"}, touched)
+        self.assertEqual(0, fleet["failed"])
+
+        status, bad = self.request(
+            "POST",
+            f"/v1/releases/{release_id}/fleet-repin",
+            {"install_mode": "BOGUS"},
+            self.token,
+        )
+        self.assertEqual(400, status)
+
     def test_release_proposal_rejects_an_unknown_install_mode(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         database, manifest = self.build_release_fixture()
