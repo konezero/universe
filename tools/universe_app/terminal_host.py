@@ -1335,7 +1335,13 @@ class TerminalHost:
         executable = resolve_cli_executable(selected)
         resolved_provider = selected if selected != "AUTO" else infer_provider(executable)
         selected_model = str(model_ref or "").strip()
-        selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
+        selected_effort = str(effort or "").strip().upper()
+        if not selected_effort or selected_effort == "AUTO":
+            # A MASTER runs long autonomous agentic loops (discovery, governed
+            # per-file writes, dozens of tool calls). AUTO trends high there and
+            # burns the session budget fast, so default an unspecified MASTER to
+            # MEDIUM; an explicit effort on the request still wins.
+            selected_effort = "MEDIUM" if requested_mode == "MASTER" else "AUTO"
         supervisor = str(supervisor_session_id or "").strip()
         terminal_id = "term_" + secrets.token_hex(8)
         profile = str(launch_profile or "INTERACTIVE").strip().upper()

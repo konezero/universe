@@ -1079,6 +1079,59 @@ class TerminalHostTests(unittest.TestCase):
             startup_argv("CODEX", "abc", model_ref="gpt-5.6", effort="HIGH"),
         )
 
+    def test_claude_master_defaults_to_medium_effort(self) -> None:
+        registry = FakeReconnectionRegistry()
+        seen: dict[str, object] = {}
+
+        def fake_startup_argv(*a, **kw):
+            seen.update(kw)
+            return ["/c", "echo", "X"]
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="claude.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", side_effect=fake_startup_argv
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.terminal_host.ensure_local_channel_server_registered"
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="career",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-effort",
+                provider="CLAUDE",
+                supervisor_session_id="sup-effort",
+            )
+            self.assertEqual("MEDIUM", seen.get("effort"))
+            self.assertEqual("MEDIUM", host.get(created["terminal_id"]).effort)
+            host.terminate(created["terminal_id"])
+            seen.clear()
+            # An explicit effort still wins; CONDUCTOR is left on AUTO.
+            host.create(
+                project_id="universe",
+                mode="CONDUCTOR",
+                cwd=tmp,
+                session_anchor_ref="anchor-effort-2",
+                provider="CLAUDE",
+                supervisor_session_id="sup-effort-2",
+            )
+            self.assertEqual("AUTO", seen.get("effort"))
+            seen.clear()
+            host.create(
+                project_id="career",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-effort-3",
+                provider="CLAUDE",
+                supervisor_session_id="sup-effort-3",
+                effort="HIGH",
+            )
+            self.assertEqual("HIGH", seen.get("effort"))
+
     def test_claude_master_startup_appends_the_master_role_system_prompt(self) -> None:
         argv = startup_argv(
             "CLAUDE", "", mode="MASTER", project_id="career", claude_channel_enabled=True
