@@ -1,9 +1,10 @@
 # Governance Archaeology — where each rule came from
 
 Status: REFERENCE
-Date: 2026-09-04
+Date: 2026-09-04 (amended 2026-09-06: added #11, runtime distribution)
 Source: excavated from the legacy `ai-career` repo (`.ai/diary/`,
 `.ai/incident/`, `.ai/journal/`, `.ai/governance/`, `.ai/core/`).
+#11 is Universe-era, from building the release-DB lifecycle itself.
 
 Purpose: Universe's governance (the managed `AGENTS.md` / `CLAUDE.md`
 blocks, execution-guard, Work Receipts, Authority / Assignment, the
@@ -174,6 +175,60 @@ drifts."* Design turns from one-line corrections:
 managed block; the "Facts only" console discipline; Conductor / Master /
 Worker roles.
 
+### 11. Runtime distribution — the Core Release DB lifecycle
+**Added:** 2026-09-06 (Universe-era, not ai-career).
+**Origin:** two real needs — (a) Universe distributes the governed
+`ai-career` runtime to attached projects **without** those projects
+cloning the private career repo; (b) a resident session must Boot against
+a pinned, verifiable runtime, not the mutable working-tree `HEAD` — #7's
+"drift" defense applied to the runtime package itself
+(`docs/core-release-db.md`).
+**Became:** `core_release.py build` → content-addressed Release DB (git
+objects, per-file SHA-256, external + payload digests,
+`candidate_execution: FORBIDDEN`) → `POST /v1/releases/import` →
+`release-proposals` (resolves `OS_INSTALL` / `OS_UPDATE`, read-only plan)
+→ `.../apply` (APPROVED + proposal digest → materialize bundle → run the
+pinned lifecycle → durable `project_release_application` receipt → atomic
+`project_release_selection`).
+**In Universe now:** every project's `.ai/` tree is an *installed overlay*
+of a selected release; `core/runtime-source/.ai/` is the tracked source.
+
+**Rough edges hit 2026-09-06** (installing the
+[[architecture-review-2026-09-05-followup]] fixes):
+- `build` takes the 40-hex commit **twice** (`--source-ref` +
+  `--expected-commit`) plus four more flags; import / propose / apply are
+  three separate bearer-token POSTs. Heavy for "point this project's
+  runtime at commit X".
+- Apply is fail-closed on `UNMANAGED_TARGET_COLLISION` and the **server
+  path has no `--force`** — only the CLI `project_runtime_installer.py`
+  does. A self-hosting repo (`universe`) whose `.ai/` gets hand-touched
+  hits a wall only manual file surgery clears (back up + delete the
+  colliding files, re-apply).
+- The installed overlay had drifted **3+ commits behind** canonical
+  (missing the prior session's Role Resolution + Resource Presence
+  entirely) and nothing surfaced the lag until an install failed on it.
+- The runtime *is* 178 files of `core/*.md` + `skills/**/SKILL.md` +
+  `reference_runtime/*.py`, shipped and materialized per project — #8's
+  "governance-as-prose" bet at distribution scale.
+- Apply is **per-project**: one propose + apply per attached project, no
+  "update the fleet to release X" operation (`core-release-db.md` lists
+  "project fleet update orchestration" as not implemented). N projects on
+  one machine sharing one runtime still means N applies.
+- Test isolation: `test_universe_server.py` session/anchor tests write the
+  **real** `project_runtime.sqlite3` (clobbered a live mode anchor's
+  `observer_session_ref` with a fixture value) — the state path is not
+  injected or sandboxed
+  (see [[test-universe-server-contaminates-real-project-runtime-store]]).
+
+**Keep:** content-addressed immutable release identity + verify-before-apply
++ durable application receipt; "resident Boot binds to the selected
+release, not working-tree `HEAD`" (this is #7 for the runtime package).
+**Redesign lean:** the multi-step build/import/propose/apply ceremony; the
+no-server-`--force` dead end; overlay-vs-canonical drift with no
+visibility. In a Rust harness where the AI emits IR and the runtime is OS
+primitive, most of the 178-file prose scaffold collapses and "install"
+gets closer to "check out a pinned ref + verify digests".
+
 ## Classification for the Rust harness diet
 
 | Keep — substrate defenses, domain-general | Redesign lean — tool/incident scar tissue | Re-evaluate — environment-specific |
@@ -181,9 +236,11 @@ Worker roles.
 | Anchor model + context-layer lifetimes (#7) | branch+PR ceremony (#3 — a GitHub-connector artifact; local git differs) | remote-connector vs local-codex split (#4 — Claude Code is one surface) |
 | source grounding / "UNKNOWN not inference" (#1) | whole-file-replace guard (#2 — connector truncation; N/A with real file tools) | chat-title-as-coordinate (#7 — no equivalent API surface) |
 | candidate → verified promotion (#9) | the heavy `prepare`/`consume` Work Receipt (#3 — defense against connector writes) | Commander Wait "야" buffering (#6 — real turn boundaries handle it) |
-| global-command-before-role resolution (#5) | | |
-| "loaded context ≠ authority" (#4) | | |
-| governance-as-prose for cold boot (#8) | | |
+| global-command-before-role resolution (#5) | build/import/propose/apply ceremony + no-server-`--force` dead end (#11) | per-project apply fan-out (#11 — no fleet update; may be fine at small N) |
+| "loaded context ≠ authority" (#4) | overlay-vs-canonical drift with no visibility (#11) | 178-file prose-runtime distribution model (#11/#8 at scale) |
+| governance-as-prose for cold boot (#8) | test state paths not injected/sandboxed (#11) | |
+| content-addressed release identity + verify + receipt (#11) | | |
+| "Boot binds selected release, not working-tree HEAD" (#11 = #7 for the runtime) | | |
 
 The keep column is the actual invariant core. Everything in the other two
 columns earned its place against a specific failure that a from-scratch
