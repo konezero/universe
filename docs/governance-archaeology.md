@@ -229,6 +229,18 @@ visibility. In a Rust harness where the AI emits IR and the runtime is OS
 primitive, most of the 178-file prose scaffold collapses and "install"
 gets closer to "check out a pinned ref + verify digests".
 
+The deeper lesson (operator, 2026-09-06): **separating the runtime from
+Core was the right goal; doing it as a per-project materialized copy was
+the mistake.** That form turned "separation" into "N copies + sync
+machinery" — the drift, the collisions, the per-project apply fan-out all
+follow from every project owning a full copy it is not supposed to edit.
+The same ownership boundary and reproducibility come from a **shared
+content-addressed store per machine + a per-project pin** (the pnpm
+model): the store is written once, projects hold a pointer, the boundary
+is enforced by "projects cannot write the shared runtime dir" rather than
+by trusting each project not to touch its own copy, and a runtime update
+is one store write plus pin bumps — no fan-out.
+
 ## Classification for the Rust harness diet
 
 | Keep — substrate defenses, domain-general | Redesign lean — tool/incident scar tissue | Re-evaluate — environment-specific |
@@ -237,7 +249,7 @@ gets closer to "check out a pinned ref + verify digests".
 | source grounding / "UNKNOWN not inference" (#1) | whole-file-replace guard (#2 — connector truncation; N/A with real file tools) | chat-title-as-coordinate (#7 — no equivalent API surface) |
 | candidate → verified promotion (#9) | the heavy `prepare`/`consume` Work Receipt (#3 — defense against connector writes) | Commander Wait "야" buffering (#6 — real turn boundaries handle it) |
 | global-command-before-role resolution (#5) | build/import/propose/apply ceremony + no-server-`--force` dead end (#11) | per-project apply fan-out (#11 — no fleet update; may be fine at small N) |
-| "loaded context ≠ authority" (#4) | overlay-vs-canonical drift with no visibility (#11) | 178-file prose-runtime distribution model (#11/#8 at scale) |
+| "loaded context ≠ authority" (#4) | per-project **materialized copy** of the runtime (#11 — separation goal keep, copy mechanism cut; shared store + per-project pin instead) | 178-file prose-runtime distribution model (#11/#8 at scale) |
 | governance-as-prose for cold boot (#8) | test state paths not injected/sandboxed (#11) | |
 | content-addressed release identity + verify + receipt (#11) | | |
 | "Boot binds selected release, not working-tree HEAD" (#11 = #7 for the runtime) | | |
