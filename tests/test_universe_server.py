@@ -12981,6 +12981,98 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(409, stale_status)
         self.assertEqual("PROJECT_RELEASE_APPROVAL_STALE", stale["error_code"])
 
+    def test_release_proposal_and_apply_carry_linked_install_mode(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        release_id = imported["release"]["release_id"]
+
+        status, copy_proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {"release_id": release_id, "mode": "MASTER"},
+            self.token,
+        )
+        self.assertEqual(201, status)
+
+        status, linked_proposed = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {"release_id": release_id, "mode": "MASTER", "install_mode": "LINKED"},
+            self.token,
+        )
+        self.assertEqual(201, status)
+        linked = linked_proposed["proposal"]
+        self.assertEqual("LINKED", linked["install_mode"])
+        self.assertEqual("LINKED", linked["plan"]["install_mode"])
+        # LINKED and COPY are distinct proposals (their lifecycle plans differ).
+        self.assertNotEqual(
+            copy_proposed["proposal"]["proposal_id"], linked["proposal_id"]
+        )
+
+        request = {
+            "approval": "APPROVED",
+            "proposal_id": linked["proposal_id"],
+            "proposal_digest": linked["proposal_digest"],
+        }
+        with patch(
+            "universe_server.apply_project_release_proposal",
+            return_value={
+                "schema": "universe.project-release-apply-receipt.v1",
+                "status": "PROJECT_RELEASE_APPLIED",
+                "project_id": "GCS",
+                "proposal_id": linked["proposal_id"],
+                "proposal_digest": linked["proposal_digest"],
+                "release_id": release_id,
+                "receipt_digest": "a" * 64,
+            },
+        ) as apply_release:
+            status, _applied = self.request(
+                "POST",
+                "/v1/projects/GCS/release-proposals/apply",
+                request,
+                self.token,
+            )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "LINKED", apply_release.call_args.kwargs["install_mode"]
+        )
+
+    def test_release_proposal_rejects_an_unknown_install_mode(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        database, manifest = self.build_release_fixture()
+        _, imported = self.request(
+            "POST",
+            "/v1/releases/import",
+            {
+                "database_path": str(database),
+                "manifest_path": str(manifest),
+                "mode": "MASTER",
+            },
+            self.token,
+        )
+        status, body = self.request(
+            "POST",
+            "/v1/projects/GCS/release-proposals",
+            {
+                "release_id": imported["release"]["release_id"],
+                "mode": "MASTER",
+                "install_mode": "HARDLINK",
+            },
+            self.token,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_INVALID", body["error_code"])
+
     def test_rboot_text_is_an_ordinary_project_room_message(self) -> None:
         ordinary = ({"message_id": "message-001"}, True)
         with patch.object(

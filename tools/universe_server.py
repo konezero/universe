@@ -23805,8 +23805,15 @@ class UniverseStore:
             value,
             field="project_release_proposal",
             required=frozenset({"release_id", "mode"}),
+            optional=frozenset({"install_mode"}),
         )
         require_release_lifecycle_mode(request["mode"])
+        install_mode = str(request.get("install_mode") or "COPY").strip().upper()
+        if install_mode not in {"COPY", "LINKED"}:
+            raise UniverseError(
+                "REQUEST_INVALID",
+                f"install_mode must be COPY or LINKED, got {install_mode!r}",
+            )
         project = self.get_project(project_id)
         release_id = _identifier(request["release_id"], "release_id")
         with self._connection() as connection:
@@ -23834,6 +23841,7 @@ class UniverseStore:
                     project_id=project["project_id"],
                     release_id=runtime.release_id,
                     source_commit=runtime.metadata["source_commit"],
+                    install_mode=install_mode,
                 )
         except (
             CoreReleaseError,
@@ -23865,6 +23873,9 @@ class UniverseStore:
         material["proposal_digest"] = _json_sha256(material)
         material["proposal_id"] = "release_proposal_" + material["proposal_digest"][:20]
         material["status"] = "PROJECT_RELEASE_PROPOSAL_READY"
+        # install_mode rides alongside (not in proposal_digest); the
+        # authoritative signal is plan.install_mode, which IS digested.
+        material["install_mode"] = install_mode
         now = utc_now()
         with self._connection() as connection:
             existing = connection.execute(
@@ -29559,6 +29570,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 approval=approval,
                 database_path=Path(artifact["database_path"]),
                 manifest_path=Path(artifact["manifest_path"]),
+                install_mode=str(proposal.get("install_mode") or "COPY"),
             )
         except ProjectReleaseApplyError as error:
             raise UniverseError(

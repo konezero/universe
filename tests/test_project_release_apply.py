@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,7 +153,7 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             ),
         )
 
-    def _proposal(self) -> dict[str, Any]:
+    def _proposal(self, *, install_mode: str = "COPY") -> dict[str, Any]:
         with ReleaseRuntime(
             database_path=self.database,
             manifest_path=self.manifest,
@@ -161,6 +163,7 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 project_id="demo",
                 release_id=runtime.release_id,
                 source_commit=self.commit,
+                install_mode=install_mode,
             )
             material = {
                 "schema": "universe.project-release-proposal.v1",
@@ -180,7 +183,27 @@ class ProjectReleaseApplyTests(unittest.TestCase):
             "proposal_digest": proposal_digest,
             "proposal_id": "release_proposal_" + proposal_digest[:20],
             "status": "PROJECT_RELEASE_PROPOSAL_READY",
+            "install_mode": install_mode.upper(),
         }
+
+    def _apply(self, proposal: dict[str, Any], *, store: Path) -> dict[str, Any]:
+        approval = build_project_release_approval(
+            project_id="demo",
+            proposal=proposal,
+            evidence_ref="universe://approval/demo",
+        )
+        with mock.patch.dict(
+            os.environ, {"UNIVERSE_RUNTIME_STORE": str(store)}
+        ):
+            return apply_project_release_proposal(
+                project_root=self.project,
+                project_id="demo",
+                proposal=proposal,
+                approval=approval,
+                database_path=self.database,
+                manifest_path=self.manifest,
+                install_mode=proposal["install_mode"],
+            )
 
     def test_fresh_project_plan_uses_os_install(self) -> None:
         proposal = self._proposal()
@@ -315,6 +338,57 @@ class ProjectReleaseApplyTests(unittest.TestCase):
                 database_path=self.database,
                 manifest_path=self.manifest,
             )
+        self.assertEqual("UNMANAGED_TARGET_COLLISION", ctx.exception.code)
+
+    # -- LINKED install mode ------------------------------------------------
+
+    def test_linked_proposal_plan_carries_install_mode(self) -> None:
+        proposal = self._proposal(install_mode="LINKED")
+        self.assertEqual("LINKED", proposal["install_mode"])
+        self.assertEqual("LINKED", proposal["plan"]["install_mode"])
+        self.assertEqual("FRESH_INSTALL", proposal["plan"]["operation"])
+        self.assertNotEqual(
+            proposal["plan"]["plan_digest"],
+            self._proposal(install_mode="COPY")["plan"]["plan_digest"],
+        )
+
+    def test_linked_apply_symlinks_release_files_into_the_store(self) -> None:
+        store = self.root / "runtime-store"
+        proposal = self._proposal(install_mode="LINKED")
+        receipt = self._apply(proposal, store=store)
+
+        self.assertEqual("PROJECT_RELEASE_APPLIED", receipt["status"])
+        self.assertEqual("FRESH_LINK", receipt["operation"])
+        core = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        self.assertTrue(os.path.islink(core))
+        self.assertTrue(
+            os.path.realpath(core).startswith(os.path.realpath(store))
+        )
+        pin = json.loads(
+            (
+                self.project
+                / ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual("LINKED", pin["install_mode"])
+
+    def test_linked_update_is_os_update_once_a_pin_exists(self) -> None:
+        store = self.root / "runtime-store"
+        self._apply(self._proposal(install_mode="LINKED"), store=store)
+
+        updated = self._proposal(install_mode="LINKED")
+        self.assertEqual("RUNTIME_UPDATE", updated["plan"]["operation"])
+        self.assertEqual("OS_UPDATE", updated["plan"]["user_command"])
+        self.assertEqual("MANAGED", updated["plan"]["installed_runtime"]["state"])
+
+    def test_linked_apply_blocks_on_a_foreign_managed_file(self) -> None:
+        store = self.root / "runtime-store"
+        core_file = self.project / ".ai" / "core" / "CORE_SURFACE_REGISTRY.md"
+        core_file.parent.mkdir(parents=True)
+        core_file.write_text("hand edit\n", encoding="utf-8")
+
+        with self.assertRaises(ProjectReleaseApplyError) as ctx:
+            self._apply(self._proposal(install_mode="LINKED"), store=store)
         self.assertEqual("UNMANAGED_TARGET_COLLISION", ctx.exception.code)
 
 
