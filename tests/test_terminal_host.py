@@ -263,6 +263,60 @@ class TerminalHostTests(unittest.TestCase):
             finally:
                 host.terminate(created["terminal_id"])
 
+    def test_rust_host_dev_channel_confirm_retries_until_it_takes(self) -> None:
+        registry = FakeReconnectionRegistry()
+        prompt = (
+            b"\x1b[2J WARNING: Loading development channels\r\n"
+            b" 1. I am using this for local development\r\n 2. Exit\r\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="claude.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "X"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.terminal_host.ensure_local_channel_server_registered"
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="career",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-dev-retry",
+                provider="CLAUDE",
+                supervisor_session_id="sup-dev-retry",
+            )
+            client = registry.clients["anchor-dev-retry"]
+            base_request = client.request
+            # The menu keeps re-rendering: every read yields the prompt again,
+            # and channel_state never reports READY.
+            def request(action: str, **fields):
+                if action == "read":
+                    return {
+                        "host": client._host(),
+                        "output": {
+                            "data_base64": base64.b64encode(prompt).decode("ascii"),
+                            "start_cursor": 0,
+                            "next_cursor": len(prompt),
+                            "truncated": False,
+                        },
+                    }
+                return base_request(action, **fields)
+
+            client.request = request
+            try:
+                deadline = time.time() + 6
+                while (
+                    time.time() < deadline
+                    and b"".join(client.writes).count(b"\r") < 2
+                ):
+                    time.sleep(0.05)
+                self.assertGreaterEqual(b"".join(client.writes).count(b"\r"), 2)
+            finally:
+                host.terminate(created["terminal_id"])
+
     def test_rust_host_late_binds_shell_identity_instead_of_reclaiming(self) -> None:
         registry = FakeReconnectionRegistry()
         identity_box: dict[str, object] = {"value": None}

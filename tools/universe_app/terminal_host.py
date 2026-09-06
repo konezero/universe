@@ -2717,6 +2717,14 @@ class TerminalHost:
             getattr(session, "channel_enabled", False)
         ) or session.channel_broker is not None
         channel_confirm_tail = b""
+        # One \r is not enough: on the Rust-host path the menu often re-renders
+        # after the first keypress lands (or the write races the TUI), so keep
+        # answering it until the prompt stops coming back or we give up.
+        channel_confirm_sends = 0
+        channel_confirm_next_send = 0.0
+        channel_confirm_deadline = time.time() + 60.0
+        CHANNEL_CONFIRM_MAX_SENDS = 12
+        CHANNEL_CONFIRM_RESEND_SECONDS = 2.0
         awaiting_bootstrap = bool(
             session.bootstrap_input and not session.bootstrap_delivered
         )
@@ -2786,29 +2794,47 @@ class TerminalHost:
                 elif len(bootstrap_tail) > 16384:
                     bootstrap_tail = bootstrap_tail[-8192:]
             if awaiting_channel_confirm:
-                # Search the full accumulated buffer *before* capping it - the
-                # confirmation screen is one large write (box borders, ANSI
-                # color codes, the warning paragraph, ...) and the phrase can
-                # sit well before the end of it, so trimming first would cut
-                # the match off.
-                channel_confirm_tail += chunk
-                if _DEV_CHANNEL_PROMPT_RE.search(_ANSI_ESCAPE_RE.sub(b"", channel_confirm_tail)):
-                    awaiting_channel_confirm = False
+                # Keep a window wide enough to hold the whole confirmation
+                # screen (box borders, ANSI, the warning paragraph, the menu).
+                channel_confirm_tail = (channel_confirm_tail + chunk)[-8192:]
+                prompt_visible = bool(
+                    _DEV_CHANNEL_PROMPT_RE.search(
+                        _ANSI_ESCAPE_RE.sub(b"", channel_confirm_tail)
+                    )
+                )
+                if channel_confirm_sends > 0:
+                    # Already answered once; the channel loading is the real
+                    # success signal (the menu bytes linger in the window even
+                    # after it is dismissed).
+                    try:
+                        confirmed = self.channel_state(session.terminal_id) == "READY"
+                    except Exception:  # noqa: BLE001 - state probe is best effort
+                        confirmed = False
+                    if confirmed or now >= channel_confirm_deadline or (
+                        channel_confirm_sends >= CHANNEL_CONFIRM_MAX_SENDS
+                    ):
+                        awaiting_channel_confirm = False
+                if awaiting_channel_confirm and prompt_visible and (
+                    now >= channel_confirm_next_send
+                ):
                     try:
                         backend.write(b"\r")
-                        self.record_audit_event(
-                            "INPUT_CONTROL_WRITTEN",
-                            terminal=session.public(),
-                            context={
-                                "source": "SUPERVISOR_AUTO_CONFIRM",
-                                "access_surface": "SUPERVISOR",
-                            },
-                            details=_input_control_metadata(b"\r"),
-                        )
-                    except Exception:  # noqa: BLE001 - best effort
+                    except Exception:  # noqa: BLE001 - best effort, retry next loop
                         pass
-                elif len(channel_confirm_tail) > 4096:
-                    channel_confirm_tail = channel_confirm_tail[-64:]
+                    else:
+                        channel_confirm_sends += 1
+                        channel_confirm_next_send = now + CHANNEL_CONFIRM_RESEND_SECONDS
+                        channel_confirm_tail = b""
+                        if channel_confirm_sends == 1:
+                            self.record_audit_event(
+                                "INPUT_CONTROL_WRITTEN",
+                                terminal=session.public(),
+                                context={
+                                    "source": "SUPERVISOR_AUTO_CONFIRM",
+                                    "access_surface": "SUPERVISOR",
+                                },
+                                details=_input_control_metadata(b"\r"),
+                            )
             with session.lock:
                 self._record_output(session, chunk)
                 waiters = list(session.subscribers)
