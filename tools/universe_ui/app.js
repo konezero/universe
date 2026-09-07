@@ -12774,6 +12774,43 @@ function featureProposalEvidenceItems(proposal) {
         hasSourceBody: false,
       };
     }
+    const predictionMatch = String(evidenceRef || "").match(
+      /work-loop\/predictions\/([^/]+)\/suggestions\/(\d+)/
+    );
+    if (predictionMatch) {
+      const [, predId, sugIdx] = predictionMatch;
+      const prediction = (
+        (state.workLoop && state.workLoop.predictions) ||
+        []
+      ).find((entry) => entry.proposal_id === predId);
+      const suggestion =
+        prediction && (prediction.suggestions || [])[Number(sugIdx)];
+      if (suggestion) {
+        return {
+          kind: "Work Loop prediction",
+          title: suggestion.title || `${predId}#${sugIdx}`,
+          meta: [
+            suggestion.kind,
+            prediction.review_state,
+            `${Math.round(Number(suggestion.confidence || 0) * 100)}%`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          detail: truncate(
+            suggestion.rationale || "Kept Work Loop prediction.",
+            360
+          ),
+          hasSourceBody: false,
+        };
+      }
+      return {
+        kind: "Work Loop prediction",
+        title: `${predId}#${sugIdx}`,
+        meta: "Kept prediction",
+        detail: String(evidenceRef),
+        hasSourceBody: false,
+      };
+    }
     return {
       kind: "Evidence",
       title: evidenceId || "Unknown evidence",
