@@ -542,6 +542,87 @@ TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
+NODE_PLANNING_MEETING_SESSION_SCHEMA = (
+    "universe.node-planning-meeting-session.v1"
+)
+# Meeting mode role rosters (docs/meeting-topic-role-guide.md S3). The
+# Conductor is the orchestrator, never an auto-assigned fresh session, so
+# it is not in these rosters. A Feature Node with competing implementation
+# routes is DESIGN; one with no settled shape starts VISION.
+NODE_PLANNING_MEETING_ROSTER = {
+    "VISION": [
+        "Visionary",
+        "Architecture Steward",
+        "Product/UX Advocate",
+        "Veteran QA",
+        "Research Scout",
+    ],
+    "DESIGN": [
+        "Architecture Steward",
+        "Pragmatic Implementer",
+        "Product/UX Advocate",
+        "Veteran QA",
+        "Security Reviewer",
+    ],
+}
+NODE_PLANNING_MEETING_ROLE_BRIEFS = {
+    "Visionary": {
+        "mandate": "Challenge assumptions; propose materially different shapes",
+        "bias": "novel direction over incremental change",
+        "attack_targets": ["unstated assumptions", "premature narrowing"],
+        "required_evidence": ["novel route", "falsification test"],
+        "deliverable": "1+ distinct architecture family with assumptions",
+        "limits": "no final decision; respect current product constraints",
+    },
+    "Architecture Steward": {
+        "mandate": "Protect ownership boundaries, invariants, compatibility",
+        "bias": "structural integrity and migration safety",
+        "attack_targets": ["boundary violations", "hidden coupling"],
+        "required_evidence": ["component ownership", "interfaces", "migrations"],
+        "deliverable": "boundary and interface assessment with trade-offs",
+        "limits": "no aesthetic veto; unfamiliar is not a rejection reason",
+    },
+    "Pragmatic Implementer": {
+        "mandate": "Find the smallest coherent vertical slice; expose real cost",
+        "bias": "shippable increments over broad rewrites",
+        "attack_targets": ["scope creep", "shortcut passed off as full design"],
+        "required_evidence": ["files affected", "dependencies", "test points"],
+        "deliverable": "bounded route with ownership, dependencies, risks",
+        "limits": "do not silently narrow the user intent",
+    },
+    "Product/UX Advocate": {
+        "mandate": "Protect comprehension, accessibility, low-friction workflow",
+        "bias": "user journey clarity and failure recovery",
+        "attack_targets": ["confusing flows", "hidden provenance"],
+        "required_evidence": ["user journey", "interaction constraints"],
+        "deliverable": "UX assessment of the candidate routes",
+        "limits": "do not override runtime invariants or authority boundaries",
+    },
+    "Veteran QA": {
+        "mandate": "Attack happy-path assumptions with regressions and edge cases",
+        "bias": "operational history and reproducible failure",
+        "attack_targets": ["happy-path assumptions", "acceptance gaps"],
+        "required_evidence": ["reproducible failure scenarios", "severity"],
+        "deliverable": "failure scenarios and acceptance gaps with severity",
+        "limits": "no evidence-free veto; no unrelated redesign",
+    },
+    "Research Scout": {
+        "mandate": "Retrieve current external evidence; compare sources",
+        "bias": "source-linked freshness over recalled fact",
+        "attack_targets": ["stale assumptions", "unsourced claims"],
+        "required_evidence": ["direct source refs", "observation dates"],
+        "deliverable": "source-linked findings and unanswered questions",
+        "limits": "inform only; cannot decide, adopt, mutate, or adopt RAG",
+    },
+    "Security Reviewer": {
+        "mandate": "Examine trust, identity, authority, data flow, external effects",
+        "bias": "least privilege and explicit trust boundaries",
+        "attack_targets": ["trust assumptions", "authority derivation"],
+        "required_evidence": ["threats", "violated invariant", "misuse path"],
+        "deliverable": "threat assessment with bounded mitigations",
+        "limits": "no permission from Mode, Role, READY, or a room invitation",
+    },
+}
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
 EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
@@ -5620,6 +5701,10 @@ class UniverseStore:
         # multi-room source must live beside the other project stores.  The
         # HTTP server reuses this instance for its event/control surface.
         self.multi_rooms = MultiRoomStore(str(self.database_path))
+        # Account-level provider quota. The HTTP server records SDK and
+        # transcript readings onto this same instance; the Meeting Room
+        # auto-assignment path reads its EXHAUSTED signal.
+        self.provider_quota_registry = ProviderQuotaRegistry()
         # Task Frame lineage also feeds the semantic project graph.  Keep a
         # single store instance so projection and delivery observe the same
         # durable Anchor Graph source.
@@ -5863,6 +5948,19 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS node_planning_context_project_order
                 ON node_planning_context(project_id, created_at DESC, context_id);
+
+                CREATE TABLE IF NOT EXISTS node_planning_meeting_session (
+                    context_id TEXT PRIMARY KEY
+                        REFERENCES node_planning_context(context_id) ON DELETE CASCADE,
+                    project_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    assignment_state TEXT NOT NULL,
+                    stop_code TEXT,
+                    meeting_mode TEXT NOT NULL,
+                    session_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS feature_expected_path (
                     expected_path_id TEXT PRIMARY KEY,
@@ -11720,6 +11818,20 @@ class UniverseStore:
         context["created_at"] = str(row["created_at"])
         return context
 
+    def _with_meeting_session(
+        self, context: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Attach the non-digested Meeting Room session assignment record.
+        It is deliberately outside context_digest so replay stays stable
+        while live session assignment evolves."""
+
+        if context is None:
+            return None
+        context["meeting_session"] = self._meeting_session_for_context(
+            str(context.get("context_id") or "")
+        )
+        return context
+
     def find_node_planning_context_for_proposal(
         self, proposal_id: str
     ) -> dict[str, Any] | None:
@@ -11729,7 +11841,9 @@ class UniverseStore:
                 "SELECT * FROM node_planning_context WHERE proposal_id = ?",
                 (normalized,),
             ).fetchone()
-        return self._node_planning_context_row(row) if row is not None else None
+        return self._with_meeting_session(
+            self._node_planning_context_row(row) if row is not None else None
+        )
 
     def get_node_planning_context(self, context_id: str) -> dict[str, Any]:
         normalized = _identifier(context_id, "context_id")
@@ -11744,7 +11858,7 @@ class UniverseStore:
                 "Node Planning Context does not exist",
                 HTTPStatus.NOT_FOUND,
             )
-        return self._node_planning_context_row(row)
+        return self._with_meeting_session(self._node_planning_context_row(row))
 
     def _attach_feature_meeting_room(
         self, feature_id: str, room_id: str
@@ -11863,16 +11977,292 @@ class UniverseStore:
             ):
                 neighbor_refs.add(other_id)
 
+        # LINKED project Memory and canonical DECISION_NOTE (RAG decision)
+        # that share vocabulary with the proposed node, or that are already
+        # linked to this Feature. References only; bodies stay out.
+        linked_memory_refs: set[str] = set()
+        decision_note_refs: set[str] = set()
+        for memory in self.list_project_memories(project_id, limit=200):
+            state = str(memory.get("state") or "").upper()
+            link_state = str(memory.get("link_state") or "").upper()
+            if state != "DECISION_NOTE" and link_state != "LINKED":
+                continue
+            memory_node_ref = str(memory.get("node_ref") or "")
+            haystack = f"{memory.get('title') or ''} {memory.get('body') or ''}"
+            if memory_node_ref != feature_id and not overlaps(haystack):
+                continue
+            ref = str(
+                memory.get("origin_ref")
+                or (
+                    f"universe://projects/{project_id}/memories/"
+                    + str(memory.get("memory_id") or "")
+                )
+            )
+            if not ref:
+                continue
+            if state == "DECISION_NOTE":
+                decision_note_refs.add(ref)
+            else:
+                linked_memory_refs.add(ref)
+
         return {
             "bench_observation_refs": sorted(bench_refs)[:20],
             "experience_failure_refs": sorted(failure_refs)[:20],
             "neighbor_feature_refs": sorted(neighbor_refs)[:20],
+            "linked_memory_refs": sorted(linked_memory_refs)[:20],
+            "decision_note_refs": sorted(decision_note_refs)[:20],
             "counts": {
                 "bench_observation": len(bench_refs),
                 "experience_failure": len(failure_refs),
                 "neighbor_feature": len(neighbor_refs),
+                "linked_memory": len(linked_memory_refs),
+                "decision_note": len(decision_note_refs),
             },
         }
+
+    # -- Meeting Room session auto-assignment (planning-context slice-2) --
+
+    @staticmethod
+    def _node_planning_meeting_mode(feature: Mapping[str, Any]) -> str:
+        """DESIGN when the Feature Node already carries competing routes;
+        VISION when it has no settled shape yet."""
+
+        paths = feature.get("expected_paths")
+        return "DESIGN" if isinstance(paths, list) and paths else "VISION"
+
+    def _verified_meeting_sessions(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        """Sessions eligible to join a Meeting Room: a valid provider
+        binding (Host-bound PTY or standalone CLI, either is fine) and
+        currentness CURRENT ([[verified-provider-session-for-meeting-assignment]]).
+        Host attachment is not required."""
+
+        eligible: list[dict[str, Any]] = []
+        try:
+            sessions = self.session_supervisor.list_sessions(
+                node=project_id, include_hidden=True
+            )
+        except SessionSupervisorError:
+            return []
+        for session in sessions:
+            if str(session.get("currentness") or "").upper() != "CURRENT":
+                continue
+            binding_history = session.get("binding_history")
+            binding_history = (
+                binding_history if isinstance(binding_history, list) else []
+            )
+            current_binding = next(
+                (
+                    item
+                    for item in reversed(binding_history)
+                    if isinstance(item, Mapping) and item.get("is_current")
+                ),
+                None,
+            )
+            provider = str(
+                (current_binding or {}).get("provider")
+                or session.get("provider")
+                or ""
+            ).strip().upper()
+            provider_session_ref = str(
+                (current_binding or {}).get("provider_session_ref")
+                or session.get("provider_session_ref")
+                or ""
+            ).strip()
+            if not provider or not provider_session_ref:
+                continue
+            eligible.append(
+                {
+                    "supervisor_session_id": str(session.get("session_id") or ""),
+                    "provider": provider,
+                    "provider_session_ref": provider_session_ref,
+                    "session_anchor_ref": str(
+                        session.get("session_anchor_ref") or ""
+                    ),
+                    "alias": str(session.get("alias") or ""),
+                }
+            )
+        eligible.sort(key=lambda item: item["supervisor_session_id"])
+        return eligible
+
+    def _exhausted_providers(self) -> set[str]:
+        try:
+            view = self.provider_quota_registry.view()
+        except Exception:  # noqa: BLE001 - a quota read must never break assignment
+            return set()
+        return {
+            str(row.get("provider") or "").upper()
+            for row in view.get("providers", [])
+            if str(row.get("state") or "").upper() == "EXHAUSTED"
+        }
+
+    def _compute_node_planning_meeting_session(
+        self, *, project_id: str, context_id: str, room_id: str,
+        feature: Mapping[str, Any], now: str,
+    ) -> dict[str, Any]:
+        meeting_mode = self._node_planning_meeting_mode(feature)
+        roster = list(NODE_PLANNING_MEETING_ROSTER.get(meeting_mode, []))
+        verified = self._verified_meeting_sessions(project_id)
+        record: dict[str, Any] = {
+            "schema": NODE_PLANNING_MEETING_SESSION_SCHEMA,
+            "context_id": context_id,
+            "project_id": project_id,
+            "room_id": room_id,
+            "meeting_mode": meeting_mode,
+            "roster": roster,
+            "assigned": [],
+            "unassigned_roles": roster,
+            "spare_session_count": 0,
+            "updated_at": now,
+        }
+        if not verified:
+            record["assignment_state"] = "STOPPED"
+            record["stop_code"] = "NODE_PLANNING_MEETING_NO_VERIFIED_SESSION"
+            record["next_action"] = (
+                "Register and verify a provider session (Host-bound PTY or "
+                "standalone CLI, currentness CURRENT), then POST "
+                "/v1/node-planning-contexts/" + context_id + "/meeting-session"
+            )
+            return record
+        exhausted = self._exhausted_providers()
+        eligible = [s for s in verified if s["provider"] not in exhausted]
+        if not eligible:
+            record["assignment_state"] = "STOPPED"
+            record["stop_code"] = (
+                "NODE_PLANNING_MEETING_PROVIDER_QUOTA_EXHAUSTED"
+            )
+            record["next_action"] = (
+                "Every verified session's provider is account-EXHAUSTED. Wait "
+                "for the quota window to reset or verify a session on another "
+                "provider, then POST /v1/node-planning-contexts/"
+                + context_id + "/meeting-session"
+            )
+            record["exhausted_providers"] = sorted(exhausted)
+            return record
+        assigned: list[dict[str, Any]] = []
+        for index, role in enumerate(roster):
+            if index >= len(eligible):
+                break
+            session = eligible[index]
+            brief = NODE_PLANNING_MEETING_ROLE_BRIEFS.get(role, {})
+            binding_id = ""
+            try:
+                attach = self.multi_rooms.attach_session(
+                    room_id,
+                    {
+                        "slot_role": "WORKER",
+                        "provider": session["provider"],
+                        "provider_session_ref": session["provider_session_ref"],
+                        "supervisor_session_id": session["supervisor_session_id"],
+                        "session_anchor_ref": session["session_anchor_ref"] or None,
+                        "display_name": role,
+                        "participant_state": "OBSERVED",
+                        "metadata": {
+                            "node_planning_context_id": context_id,
+                            "meeting_mode": meeting_mode,
+                            "catalog_role": role,
+                            "role_brief": brief,
+                        },
+                    },
+                )
+                binding_id = str(
+                    (attach.get("binding") or {}).get("binding_id") or ""
+                )
+            except MultiRoomError as error:
+                record["assignment_state"] = "STOPPED"
+                record["stop_code"] = "NODE_PLANNING_MEETING_ROOM_ATTACH_FAILED"
+                record["next_action"] = (
+                    "Room attach failed (" + error.code + "). Re-run POST "
+                    "/v1/node-planning-contexts/" + context_id + "/meeting-session"
+                )
+                record["assigned"] = assigned
+                record["unassigned_roles"] = roster[len(assigned):]
+                return record
+            assigned.append(
+                {
+                    "catalog_role": role,
+                    "slot_role": "WORKER",
+                    "provider": session["provider"],
+                    "provider_session_ref": session["provider_session_ref"],
+                    "supervisor_session_id": session["supervisor_session_id"],
+                    "binding_id": binding_id,
+                    "role_brief": brief,
+                }
+            )
+        record["assignment_state"] = "ASSIGNED"
+        record["stop_code"] = None
+        record["assigned"] = assigned
+        record["unassigned_roles"] = roster[len(assigned):]
+        record["spare_session_count"] = max(0, len(eligible) - len(assigned))
+        record["next_action"] = "MEETING_PATH_PROPOSALS"
+        return record
+
+    def _persist_node_planning_meeting_session(
+        self, connection: sqlite3.Connection, record: Mapping[str, Any], now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO node_planning_meeting_session(
+                context_id, project_id, room_id, assignment_state, stop_code,
+                meeting_mode, session_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(context_id) DO UPDATE SET
+                assignment_state = excluded.assignment_state,
+                stop_code = excluded.stop_code,
+                meeting_mode = excluded.meeting_mode,
+                session_json = excluded.session_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                record["context_id"],
+                record["project_id"],
+                record["room_id"],
+                record["assignment_state"],
+                record.get("stop_code"),
+                record["meeting_mode"],
+                _canonical_json(record),
+                now,
+                now,
+            ),
+        )
+
+    def _meeting_session_for_context(
+        self, context_id: str
+    ) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_json, created_at, updated_at FROM "
+                "node_planning_meeting_session WHERE context_id = ?",
+                (context_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row["session_json"])
+        record["created_at"] = str(row["created_at"])
+        record["updated_at"] = str(row["updated_at"])
+        return record
+
+    def assign_node_planning_meeting_session(
+        self, context_id: str
+    ) -> dict[str, Any]:
+        """(Re)run Meeting Room session auto-assignment for one planning
+        context. Safe to call repeatedly - a STOPPED record is replaced when
+        the blocking condition clears."""
+
+        context = self.get_node_planning_context(context_id)
+        feature = self.get_feature_node(context["feature_id"])
+        now = utc_now()
+        record = self._compute_node_planning_meeting_session(
+            project_id=context["project_id"],
+            context_id=context["context_id"],
+            room_id=context["room_id"],
+            feature=feature,
+            now=now,
+        )
+        with self._connection() as connection:
+            self._persist_node_planning_meeting_session(connection, record, now)
+        return self.get_node_planning_context(context_id)
 
     def explore_feature_node_proposal(
         self, proposal_id: str, value: Any
@@ -12048,6 +12438,14 @@ class UniverseStore:
                     False,
                     False,
                 )
+        try:
+            self.assign_node_planning_meeting_session(
+                context_material["context_id"]
+            )
+        except (UniverseError, MultiRoomError, sqlite3.Error):
+            # Auto-assignment is best-effort; the planning context and room
+            # still exist and assignment can be re-run against the endpoint.
+            pass
         return (
             self.get_node_planning_context(context_material["context_id"]),
             feature,
@@ -26148,7 +26546,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if auto_start_project_masters
             else None
         )
-        self.provider_quota_registry = ProviderQuotaRegistry()
+        self.provider_quota_registry = store.provider_quota_registry
         self.ui_debug_trace: dict[str, Any] | None = None
         # N threads pulling from the SAME _conductor_queue (queue.Queue is
         # already safe for any number of concurrent .get() callers) - this is
@@ -41734,6 +42132,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             else "FEATURE_NODE_PROPOSALS_REPLAYED"
                         ),
                         **result,
+                    },
+                )
+                return
+            node_planning_meeting_session = re.fullmatch(
+                r"/v1/node-planning-contexts/([^/]+)/meeting-session", path
+            )
+            if node_planning_meeting_session is not None:
+                context = self.server.store.assign_node_planning_meeting_session(
+                    unquote(node_planning_meeting_session.group(1))
+                )
+                meeting_session = context.get("meeting_session") or {}
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": (
+                            "NODE_PLANNING_MEETING_SESSION_ASSIGNED"
+                            if meeting_session.get("assignment_state") == "ASSIGNED"
+                            else "NODE_PLANNING_MEETING_SESSION_STOPPED"
+                        ),
+                        "planning_context": context,
+                        "meeting_session": meeting_session,
                     },
                 )
                 return

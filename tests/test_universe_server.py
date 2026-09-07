@@ -8688,6 +8688,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "bench_observation_refs",
                 "experience_failure_refs",
                 "neighbor_feature_refs",
+                "linked_memory_refs",
+                "decision_note_refs",
                 "counts",
             },
             set(bundle),
@@ -8695,6 +8697,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(
             all(isinstance(value, int) for value in bundle["counts"].values())
         )
+        # No verified provider session was registered, so Meeting Room
+        # session auto-assignment stops with an explicit code + next action
+        # rather than silently proceeding.
+        meeting_session = context["meeting_session"]
+        self.assertEqual("STOPPED", meeting_session["assignment_state"])
+        self.assertEqual(
+            "NODE_PLANNING_MEETING_NO_VERIFIED_SESSION",
+            meeting_session["stop_code"],
+        )
+        self.assertIn("meeting-session", meeting_session["next_action"])
+        self.assertEqual([], meeting_session["assigned"])
+        self.assertIn(meeting_session["meeting_mode"], {"VISION", "DESIGN"})
         self.assertEqual("EXPLORING", feature["state"])
         self.assertEqual("MEETING", room["room_type"])
         self.assertTrue(started["feature_node_created"])
@@ -17330,6 +17344,159 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(observations))
         self.assertEqual(
             "task-frame-debate", observations[0]["skill"]["skill_id"]
+        )
+
+
+    def _explore_proposal_for_meeting(self):
+        self.server.store.register_project(self.registration())
+        status, _ = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "rag.record-decision",
+                "request": {
+                    "project_id": "GCS",
+                    "decision_ref": "meeting-auto-seed",
+                    "title": "Meeting auto assignment seed",
+                    "body": "Auto-assign verified provider sessions to the meeting room.",
+                    "node_ref": "universe",
+                    "graph": "functional",
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        status, generated = self.request(
+            "POST",
+            "/v1/projects/GCS/feature-node-proposals/generate",
+            {},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        proposal = generated["proposals"][0]
+        status, _ = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/reviews",
+            {"decision": "EXPLORE", "rationale": "explore"},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        return proposal
+
+    def test_node_planning_meeting_room_auto_assigns_a_verified_session(self) -> None:
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "meeting-verified-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "meeting-verified-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        proposal = self._explore_proposal_for_meeting()
+        status, started = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            {"expected_proposal_digest": proposal["proposal_digest"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        meeting_session = started["planning_context"]["meeting_session"]
+        self.assertEqual("ASSIGNED", meeting_session["assignment_state"])
+        self.assertIsNone(meeting_session["stop_code"])
+        self.assertEqual("MEETING_PATH_PROPOSALS", meeting_session["next_action"])
+        self.assertEqual(1, len(meeting_session["assigned"]))
+        assigned = meeting_session["assigned"][0]
+        self.assertEqual("CLAUDE", assigned["provider"])
+        self.assertEqual("WORKER", assigned["slot_role"])
+        self.assertEqual(
+            meeting_session["roster"][0], assigned["catalog_role"]
+        )
+        self.assertTrue(assigned["role_brief"]["mandate"])
+        bindings = self.server.multi_rooms.list_bindings(
+            started["room"]["room_id"]
+        )
+        worker = next(
+            item
+            for item in bindings
+            if item["slot_role"] == "WORKER" and item["state"] == "ACTIVE"
+        )
+        self.assertEqual(
+            assigned["catalog_role"],
+            worker["metadata"]["catalog_role"],
+        )
+
+    def test_node_planning_meeting_room_stops_when_provider_quota_exhausted(
+        self,
+    ) -> None:
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "meeting-exhausted-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "meeting-exhausted-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        self.server.provider_quota_registry.record(
+            {
+                "provider": "CODEX",
+                "state": "EXHAUSTED",
+                "windows": [{"name": "WINDOW", "used_percent": 100.0}],
+            }
+        )
+        proposal = self._explore_proposal_for_meeting()
+        status, started = self.request(
+            "POST",
+            f"/v1/feature-node-proposals/{proposal['proposal_id']}/explorations",
+            {"expected_proposal_digest": proposal["proposal_digest"]},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        meeting_session = started["planning_context"]["meeting_session"]
+        self.assertEqual("STOPPED", meeting_session["assignment_state"])
+        self.assertEqual(
+            "NODE_PLANNING_MEETING_PROVIDER_QUOTA_EXHAUSTED",
+            meeting_session["stop_code"],
+        )
+        self.assertEqual(["CODEX"], meeting_session["exhausted_providers"])
+
+        # The retry endpoint picks the session up once a non-exhausted
+        # provider session becomes available.
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": "meeting-recovered-session",
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "meeting-recovered-provider-ref",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        context_id = started["planning_context"]["context_id"]
+        status, retried = self.request(
+            "POST",
+            f"/v1/node-planning-contexts/{context_id}/meeting-session",
+            {},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "NODE_PLANNING_MEETING_SESSION_ASSIGNED", retried["status"]
+        )
+        self.assertEqual(
+            "ASSIGNED", retried["meeting_session"]["assignment_state"]
+        )
+        self.assertEqual(
+            "CLAUDE", retried["meeting_session"]["assigned"][0]["provider"]
         )
 
 
