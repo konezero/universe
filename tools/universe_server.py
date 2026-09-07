@@ -307,6 +307,7 @@ from universe_app.work_loop_prediction import (
     WORK_LOOP_RESULT_FANOUT_SCHEMA,
     build_result_fanout,
     build_work_loop_predictions,
+    tokenize as _wl_tokenize,
 )
 from universe_app.feature_node_proposal import (
     FEATURE_NODE_PROPOSAL_DECISIONS,
@@ -11762,6 +11763,96 @@ class UniverseStore:
                 )
         return self.get_feature_node(feature["feature_id"])
 
+    def _node_planning_evidence_bundle(
+        self,
+        project_id: str,
+        *,
+        title: str,
+        intent_text: str,
+        feature_id: str,
+    ) -> dict[str, Any]:
+        """Reference-only project evidence for a Node Planning Context.
+
+        Deterministic over unchanged project evidence so an idempotent
+        exploration replay recomputes the same context digest. Pulls Bench
+        observations, failed Experience, and neighbour Feature Nodes that share
+        vocabulary with the proposed node; bodies never enter the context.
+        """
+
+        tokens = _wl_tokenize(f"{title} {intent_text}")
+
+        def overlaps(text: str) -> bool:
+            return len(tokens & _wl_tokenize(text)) >= 2
+
+        bench_refs: set[str] = set()
+        for observation in self.list_skill_observations(project_id, limit=200):
+            skill = observation.get("skill")
+            skill = skill if isinstance(skill, Mapping) else {}
+            context = observation.get("execution_context")
+            context = context if isinstance(context, Mapping) else {}
+            haystack = " ".join(
+                str(part)
+                for part in (
+                    skill.get("skill_id"),
+                    context.get("task_kind"),
+                    observation.get("task_frame_ref"),
+                    observation.get("source_ref"),
+                )
+                if part
+            )
+            if overlaps(haystack):
+                ref = str(
+                    observation.get("source_ref")
+                    or observation.get("observation_id")
+                    or ""
+                )
+                if ref:
+                    bench_refs.add(ref)
+
+        failure_refs: set[str] = set()
+        for case in self.list_experience_cases(project_id, limit=200):
+            observations = case.get("observations")
+            observations = observations if isinstance(observations, list) else []
+            failed = str(case.get("outcome") or "").upper() in {
+                "FAILED",
+                "FAIL",
+                "ERROR",
+            } or any(
+                str(item.get("outcome") or "").upper() in {"FAILED", "FAIL", "ERROR"}
+                for item in observations
+                if isinstance(item, Mapping)
+            )
+            text = " ".join(
+                str(part)
+                for part in (case.get("title"), case.get("case_id"))
+                if part
+            )
+            if failed and overlaps(text):
+                case_id = str(case.get("case_id") or "")
+                if case_id:
+                    failure_refs.add(f"universe://experience-cases/{case_id}")
+
+        neighbor_refs: set[str] = set()
+        for other in self.list_feature_nodes(project_id):
+            other_id = str(other.get("feature_id") or "")
+            if not other_id or other_id == feature_id:
+                continue
+            if overlaps(
+                f"{other.get('title') or ''} {other.get('intent_text') or ''}"
+            ):
+                neighbor_refs.add(other_id)
+
+        return {
+            "bench_observation_refs": sorted(bench_refs)[:20],
+            "experience_failure_refs": sorted(failure_refs)[:20],
+            "neighbor_feature_refs": sorted(neighbor_refs)[:20],
+            "counts": {
+                "bench_observation": len(bench_refs),
+                "experience_failure": len(failure_refs),
+                "neighbor_feature": len(neighbor_refs),
+            },
+        }
+
     def explore_feature_node_proposal(
         self, proposal_id: str, value: Any
     ) -> tuple[
@@ -11879,6 +11970,12 @@ class UniverseStore:
                 [feature["feature_id"]]
                 if proposal["proposal_kind"] == "LINK_EXISTING"
                 else []
+            ),
+            "evidence_bundle": self._node_planning_evidence_bundle(
+                proposal["project_id"],
+                title=proposal["title"],
+                intent_text=proposal["intent_text"],
+                feature_id=feature["feature_id"],
             ),
             "review": proposal.get("review"),
             "redaction": "REFERENCES_AND_PROPOSAL_SUMMARY_ONLY",

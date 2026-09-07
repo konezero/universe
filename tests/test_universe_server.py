@@ -3004,6 +3004,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
             cursors[0]["last_event_id"],
         )
 
+    def test_node_planning_evidence_bundle_pulls_matching_project_evidence(
+        self,
+    ) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        candidate = self.skill_observation_candidate()
+        observation = candidate["candidate"]["observations"][0]
+        observation["skill"]["skill_id"] = "semantic-editor-protocol"
+        observation["skill"]["context_pack_digest"] = "d" * 64
+        observation["observation_digest"] = "e" * 64
+        self.server.store.ingest_skill_observations("GCS", candidate)
+
+        bundle = self.server.store._node_planning_evidence_bundle(
+            "GCS",
+            title="Rust native semantic editor protocol",
+            intent_text="Compact symbol IR editor",
+            feature_id="feature-under-planning",
+        )
+        self.assertEqual(1, bundle["counts"]["bench_observation"])
+        self.assertEqual(
+            ["git:GCS@1111111111111111111111111111111111111111"],
+            bundle["bench_observation_refs"],
+        )
+
+        unrelated = self.server.store._node_planning_evidence_bundle(
+            "GCS",
+            title="Billing invoice reconciliation",
+            intent_text="Ledger export",
+            feature_id="feature-unrelated",
+        )
+        self.assertEqual(0, unrelated["counts"]["bench_observation"])
+
     def test_collection_prediction_is_proposal_only(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.propose_work_loop_predictions = Mock(
@@ -8651,6 +8682,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(room["room_id"], context["room_id"])
         self.assertEqual("REFERENCES_AND_PROPOSAL_SUMMARY_ONLY", context["redaction"])
         self.assertNotIn("Use compact symbol IR for agent editing.", json.dumps(context))
+        bundle = context["evidence_bundle"]
+        self.assertEqual(
+            {
+                "bench_observation_refs",
+                "experience_failure_refs",
+                "neighbor_feature_refs",
+                "counts",
+            },
+            set(bundle),
+        )
+        self.assertTrue(
+            all(isinstance(value, int) for value in bundle["counts"].values())
+        )
         self.assertEqual("EXPLORING", feature["state"])
         self.assertEqual("MEETING", room["room_type"])
         self.assertTrue(started["feature_node_created"])
