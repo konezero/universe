@@ -17210,6 +17210,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
                     "skill_run_observation_count": 1,
                     "duration_ms": 1234.5,
+                    "input_tokens": 1500,
+                    "output_tokens": 420,
                     "repository_write": False,
                     "result": {"text": "must not persist"},
                 }
@@ -17248,6 +17250,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "provider://GROK/model/grok-test", observation["model_ref"]
         )
         self.assertEqual(1234.5, observation["metrics"]["duration_ms"])
+        self.assertEqual(1500.0, observation["metrics"]["input_tokens"])
+        self.assertEqual(420.0, observation["metrics"]["output_tokens"])
+        # The synthetic role-segmented skill_id is only a fallback: this
+        # invocation resolved the DEFAULT_AUTO binding, which names no Skill.
+        self.assertEqual("runtime-worker-routine", observation["skill"]["skill_id"])
         encoded = json.dumps(observation, sort_keys=True)
         self.assertNotIn("must not persist", encoded)
 
@@ -17256,6 +17263,73 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(
             1, len(self.server.store.list_skill_observations("GCS"))
+        )
+
+
+    def test_runtime_worker_bench_observation_skill_id_from_worker_binding(self) -> None:
+        class FakeRuntimeHost:
+            def provider_capabilities(self) -> list[dict[str, str]]:
+                return [{"provider": "GROK", "status": "AVAILABLE"}]
+
+            def invoke_read_only(self, _request: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "TASK_FRAME_RESULT_RECORDED",
+                    "provider": "GROK",
+                    "model_ref": "provider://GROK/model/grok-test",
+                    "worker_id": "grok-worker-skill",
+                    "worker_run_ref": "worker-run-skill",
+                    "result_receipt_ref": "result-skill",
+                    "terminal_result_verified": True,
+                    "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
+                    "skill_run_observation_count": 1,
+                    "repository_write": False,
+                    "result": {"text": "must not persist"},
+                }
+
+        self.server.runtime_host = FakeRuntimeHost()
+        status, _ = self.request("POST", "/v1/projects/register", self.registration())
+        self.assertEqual(HTTPStatus.CREATED, status)
+        status, _ = self.request(
+            "POST",
+            "/v1/settings/worker-bindings",
+            {
+                "scope_kind": "PROJECT",
+                "scope_id": "GCS",
+                "worker_role": "ROUTINE",
+                "task_type": "*",
+                "provider": "GROK",
+                "model_ref": "grok-test",
+                "effort": "LOW",
+                "skill_refs": ["universe://skills/common/task-frame-debate"],
+                "enabled": True,
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        payload = {
+            "schema": "universe.runtime-worker-invocation-request.v1",
+            "invocation_id": "runtime-worker-skill-001",
+            "provider": "GROK",
+            "worker_role": "ROUTINE",
+            "endpoint": "http://127.0.0.1:19090",
+            "token": "never-store-this-token",
+            "session_id": "session-skill",
+            "frame_id": "frame-skill",
+            "turn_id": "turn-skill",
+            "invoker_actor_ref": "universe-host",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "context_pack": {"prompt": "must not persist"},
+            "output_contract": {"format": "review"},
+            "max_turns": 1,
+        }
+        status, _ = self.request(
+            "POST", "/v1/projects/GCS/runtime-worker-invocations", payload
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        observations = self.server.store.list_skill_observations("GCS")
+        self.assertEqual(1, len(observations))
+        self.assertEqual(
+            "task-frame-debate", observations[0]["skill"]["skill_id"]
         )
 
 

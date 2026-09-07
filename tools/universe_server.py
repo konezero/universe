@@ -2677,6 +2677,27 @@ def _skill_metrics(value: Any, field: str) -> dict[str, int | float]:
     return normalized
 
 
+def _runtime_worker_skill_id(skill_refs: Any, worker_role: str) -> str:
+    """Resolve the auto Bench observation ``skill_id`` from the Worker Binding.
+
+    The binding's declared ``skill_refs`` are the real Skill identity; the
+    role-segmented ``runtime-worker-<role>`` value is only a fallback for a
+    binding that names no Skill (or none whose trailing segment survives
+    identifier normalization).
+    """
+
+    fallback = f"runtime-worker-{worker_role.lower()}"
+    if not isinstance(skill_refs, (list, tuple)):
+        return fallback
+    for raw_ref in skill_refs:
+        if not isinstance(raw_ref, str) or not raw_ref.strip():
+            continue
+        segment = re.split(r"[/:]", raw_ref.strip())[-1].strip()
+        if segment and PROJECT_ID_PATTERN.fullmatch(segment):
+            return segment
+    return fallback
+
+
 def normalize_skill_observation_candidate(
     project_id: str, value: Any
 ) -> dict[str, Any]:
@@ -24496,6 +24517,16 @@ class UniverseStore:
         }
         if duration_ms is not None:
             result_record["duration_ms"] = round(float(duration_ms), 3)
+        for token_key in ("input_tokens", "output_tokens"):
+            raw_tokens = result.get(token_key)
+            if (
+                isinstance(raw_tokens, bool)
+                or not isinstance(raw_tokens, (int, float))
+                or not math.isfinite(raw_tokens)
+                or raw_tokens < 0
+            ):
+                continue
+            result_record[token_key] = round(float(raw_tokens), 3)
         terminal_status = result_record["status"].upper()
         is_terminal = (
             terminal_status in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"}
@@ -24629,7 +24660,7 @@ class UniverseStore:
             worker_role = "ROUTINE"
         task_type = str(binding.get("task_type") or "*").strip().upper() or "*"
         task_kind = task_type if task_type != "*" else "RUNTIME_WORKER"
-        skill_id = f"runtime-worker-{worker_role.lower()}"
+        skill_id = _runtime_worker_skill_id(binding.get("skill_refs"), worker_role)
 
         binding_digest = str(binding.get("binding_digest") or "").strip()
         if not re.fullmatch(r"[0-9a-f]{64}", binding_digest):
@@ -24654,6 +24685,11 @@ class UniverseStore:
         if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
             if math.isfinite(duration_ms) and duration_ms >= 0:
                 metrics["duration_ms"] = float(duration_ms)
+        for token_key in ("input_tokens", "output_tokens"):
+            raw_metric = result_record.get(token_key)
+            if isinstance(raw_metric, (int, float)) and not isinstance(raw_metric, bool):
+                if math.isfinite(raw_metric) and raw_metric >= 0:
+                    metrics[token_key] = float(raw_metric)
 
         observation_digest = _json_sha256(
             {
