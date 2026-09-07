@@ -373,6 +373,10 @@ class TerminalHostTests(unittest.TestCase):
         ), patch(
             "universe_app.terminal_host.resolve_shell_identity",
             return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.windows_process.process_is_alive", return_value=True
+        ), patch(
+            "universe_app.windows_process.process_start_time", return_value=123.5
         ):
             root = Path(tmp)
             audit_path = root / "audit.sqlite3"
@@ -665,6 +669,10 @@ class TerminalHostTests(unittest.TestCase):
         ), patch(
             "universe_app.terminal_host.resolve_shell_identity",
             return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.windows_process.process_is_alive", return_value=True
+        ), patch(
+            "universe_app.windows_process.process_start_time", return_value=123.5
         ):
             audit_path = Path(tmp) / "audit.sqlite3"
             first = TerminalHost(
@@ -704,6 +712,59 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
             self.assertEqual(created["terminal_id"], reconciled[0]["terminal_id"])
             second.close(created["terminal_id"])
+
+    def test_reconcile_skips_reattach_when_host_child_is_not_live(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv", return_value=["/c", "echo", "X"]
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.windows_process.process_is_alive", return_value=True
+        ), patch(
+            "universe_app.windows_process.process_start_time", return_value=123.5
+        ):
+            audit_path = Path(tmp) / "audit.sqlite3"
+            first = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            created = first.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-dead-child-host",
+                provider="CODEX",
+                supervisor_session_id="provider-session-dead-child",
+            )
+            first_session = first.get(created["terminal_id"])
+            first_session.pump_stop.set()
+            if first_session.pump_thread is not None:
+                first_session.pump_thread.join(timeout=1)
+                first_session.pump_thread = None
+            first.record_audit_event(
+                "TERMINAL_CLOSED",
+                terminal=created,
+                context={"source": "TEST", "access_surface": "TEST"},
+            )
+
+            second = TerminalHost(
+                audit_database_path=audit_path,
+                reconnection_registry=registry,
+            )
+            # The Host still reports runtime_state LIVE, but its cmd child PID is
+            # not a live process: reconcile must refuse to reattach.
+            with patch(
+                "universe_app.windows_process.process_is_alive", return_value=False
+            ):
+                reconciled = second.reconcile_reconnection_hosts()
+            self.assertEqual("HOST_REATTACH_FAILED", reconciled[0]["status"])
+            self.assertIn("CHILD_EXITED", reconciled[0]["detail"])
+            with self.assertRaises(TerminalHostError):
+                second.get(created["terminal_id"])
 
     def test_create_list_and_close_without_vendor_jsonl(self) -> None:
         spawned: list[tuple] = []

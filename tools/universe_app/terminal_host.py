@@ -58,6 +58,7 @@ from universe_app.reconnection_host import (
     ReconnectionPty,
     evaluate_runtime_compatibility,
     runtime_version_snapshot,
+    verify_child_liveness,
 )
 
 
@@ -995,6 +996,45 @@ class TerminalHost:
             )
         return results
 
+    @staticmethod
+    def _reconcile_child_liveness(
+        details: Mapping[str, Any], status: Mapping[str, Any]
+    ) -> str:
+        """Independently verify the Host-reported child PID before reattaching.
+
+        A Rust Host can report ``runtime_state`` LIVE while its cmd child has
+        already exited, or while that PID has been reused by an unrelated
+        process. The managed-shell identity file's ``shell_started_at`` is the
+        start time of the exact cmd the Host spawned, so it is the expected
+        anchor for ``status["child_pid"]``.
+        """
+
+        from universe_app.windows_process import (
+            process_is_alive,
+            process_start_time,
+        )
+
+        expected_started_at: float | None = None
+        path_text = str(details.get("managed_shell_identity_file") or "").strip()
+        if path_text:
+            try:
+                payload = json.loads(Path(path_text).read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, Mapping):
+                try:
+                    started = float(payload.get("shell_started_at") or 0.0)
+                except (TypeError, ValueError):
+                    started = 0.0
+                if started > 0:
+                    expected_started_at = started
+        return verify_child_liveness(
+            status.get("child_pid"),
+            expected_started_at,
+            is_alive=process_is_alive,
+            start_time_of=process_start_time,
+        )
+
     @_serialize_reconnection_lifecycle
     def reconcile_reconnection_hosts(self) -> list[dict[str, Any]]:
         """Rebuild process-local TerminalSession rows from live Rust Hosts."""
@@ -1063,6 +1103,12 @@ class TerminalHost:
                 status = client.status()
                 if status.get("runtime_state") != "LIVE":
                     raise ReconnectionHostError("Host terminal is not live")
+                child_liveness = self._reconcile_child_liveness(details, status)
+                if child_liveness in {"EXITED", "STALE"}:
+                    raise ReconnectionHostError(
+                        "Host-reported child failed liveness verification: "
+                        f"CHILD_{child_liveness}"
+                    )
                 backend = ReconnectionPty(
                     client,
                     f"terminal-host-{os.getpid()}-{terminal_id}",
