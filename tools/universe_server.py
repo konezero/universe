@@ -181,7 +181,10 @@ from universe_conductor_runtime import (
 )
 from universe_action_registry import (
     ACTION_CONTEXT_SCHEMA,
+    FEATURE_CREATE_ACTION_ID,
     FEATURE_GOAL_START_ACTION_ID,
+    TODO_CREATE_ACTION_ID,
+    TODO_UPDATE_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -27153,6 +27156,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             memory_batch_run_handler=self._handle_memory_batch_run_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
+            work_surface_handlers={
+                FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
+                TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
+                TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
+            },
         )
         self._planning_binding: dict[str, Any] | None = None
         self._planning_binding_error: dict[str, str] | None = None
@@ -28037,9 +28045,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if result.get("status")
             in {
                 "FEATURE_GOAL_STARTED",
+                "FEATURE_NODE_RECORDED",
                 "RAG_MEMORY_ADOPTED",
                 "RAG_DECISION_RECORDED",
                 "SESSION_NEW_COMPLETED",
+                "TODO_RECORDED",
             }
             else HTTPStatus.OK
         )
@@ -28509,6 +28519,82 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id = _identifier(action.pop("project_id"), "project_id")
         result = self.run_memory_batch(project_id, action)
         return {**result, "action_id": MEMORY_BATCH_RUN_ACTION_ID}
+
+    def _handle_feature_create_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        action = _exact_object_fields(
+            request,
+            field="feature_create_action",
+            required=frozenset({"project_id", "feature"}),
+        )
+        project_id = _identifier(action["project_id"], "project_id")
+        feature_body = action["feature"]
+        if not isinstance(feature_body, Mapping):
+            raise UniverseError(
+                "REQUEST_INVALID", "feature_create_action.feature must be an object"
+            )
+        feature, created = self.store.create_feature_node(
+            project_id, {**dict(feature_body), "created_by_role": "USER"}
+        )
+        return {
+            "schema": self.action_registry.lookup(
+                FEATURE_CREATE_ACTION_ID
+            ).result_schema_ref,
+            "status": "FEATURE_NODE_RECORDED" if created else "FEATURE_NODE_REPLAYED",
+            "action_id": FEATURE_CREATE_ACTION_ID,
+            "project_id": project_id,
+            "feature": feature,
+            "feature_created": created,
+        }
+
+    def _handle_todo_create_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        action = _exact_object_fields(
+            request,
+            field="todo_create_action",
+            required=frozenset({"todo"}),
+        )
+        todo_body = action["todo"]
+        if not isinstance(todo_body, Mapping):
+            raise UniverseError(
+                "REQUEST_INVALID", "todo_create_action.todo must be an object"
+            )
+        todo = self.store.create_todo(dict(todo_body))
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_CREATE_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_RECORDED",
+            "action_id": TODO_CREATE_ACTION_ID,
+            "todo": todo,
+            "todo_created": True,
+        }
+
+    def _handle_todo_update_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        action = _exact_object_fields(
+            request,
+            field="todo_update_action",
+            required=frozenset({"todo_id", "todo"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo_body = action["todo"]
+        if not isinstance(todo_body, Mapping):
+            raise UniverseError(
+                "REQUEST_INVALID", "todo_update_action.todo must be an object"
+            )
+        todo = self.store.update_todo(todo_id, dict(todo_body))
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_UPDATE_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_UPDATED",
+            "action_id": TODO_UPDATE_ACTION_ID,
+            "todo": todo,
+        }
 
     def _complete_feature_goal_start(
         self, feature_id: str, value: Mapping[str, Any]

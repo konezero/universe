@@ -1373,6 +1373,100 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
 
+    def test_work_surface_actions_create_and_update_through_actions_route(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+
+        status, created = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "todo.create",
+                "request": {
+                    "todo": {
+                        "scope_kind": "PROJECT",
+                        "project_id": "GCS",
+                        "title": "Draft the work-surface Action",
+                        "detail": "",
+                        "priority": "P1",
+                        "state": "READY",
+                        "source_kind": "USER",
+                        "sort_order": 5,
+                    }
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status, created)
+        self.assertEqual("TODO_RECORDED", created["status"])
+        self.assertEqual("todo.create", created["action_id"])
+        todo_id = created["todo"]["todo_id"]
+        self.assertEqual(1, created["todo"]["revision"])
+
+        self.assertEqual(
+            "Draft the work-surface Action",
+            self.server.store.get_todo(todo_id)["title"],
+        )
+
+        status, updated = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "todo.update",
+                "request": {
+                    "todo_id": todo_id,
+                    "todo": {
+                        "scope_kind": "PROJECT",
+                        "project_id": "GCS",
+                        "title": "Draft and land the work-surface Action",
+                        "detail": "",
+                        "priority": "P0",
+                        "state": "IN_PROGRESS",
+                        "source_kind": "USER",
+                        "sort_order": 5,
+                        "revision": 1,
+                    },
+                },
+            },
+        )
+        self.assertEqual(200, status, updated)
+        self.assertEqual("TODO_UPDATED", updated["status"])
+        self.assertEqual(2, updated["todo"]["revision"])
+        self.assertEqual("P0", updated["todo"]["priority"])
+
+        status, feature = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "feature.create",
+                "request": {
+                    "project_id": "GCS",
+                    "feature": {
+                        "idempotency_key": "work-surface-action-front-door",
+                        "title": "Work-surface Action front door",
+                        "intent_text": (
+                            "One command vocabulary for HTTP and the Conductor runtime."
+                        ),
+                    },
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status, feature)
+        self.assertEqual("FEATURE_NODE_RECORDED", feature["status"])
+        self.assertEqual("GCS", feature["project_id"])
+
+        status, rejected = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "todo.create",
+                "request": {
+                    "todo": {"scope_kind": "UNIVERSE", "title": "x"},
+                    "token": "ghp_secret_value",
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status, rejected)
+        self.assertEqual("ACTION_CREDENTIAL_REF_ONLY", rejected["error_code"])
+
     def test_project_goal_plan_is_hierarchical_and_execution_neutral(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
         status, goal_result = self.request(
