@@ -190,6 +190,8 @@ from universe_action_registry import (
     SESSION_RESUME_ACTION_ID,
     SESSION_RESUME_RESULT_SCHEMA,
     MEMORY_BATCH_RUN_ACTION_ID,
+    MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
+    MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA,
     RAG_ADOPT_ACTION_ID,
     RAG_ADOPT_RESULT_SCHEMA,
     RAG_RECORD_DECISION_ACTION_ID,
@@ -6778,6 +6780,18 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS project_memory_project_link
                 ON project_memory(project_id, link_state, node_ref, memory_id);
+
+                CREATE TABLE IF NOT EXISTS memory_sync_persistence_receipt (
+                    receipt_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    candidate_id TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, candidate_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS career_promotion_queue (
                     queue_id TEXT PRIMARY KEY,
@@ -18019,6 +18033,207 @@ class UniverseStore:
             )
         return material
 
+    def persist_selected_memory_sync(
+        self, project_id: str, prepared_bundle: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one user-selected PREPARED MEMORY_SYNC bundle atomically.
+
+        The bundle is its own provenance evidence.  Its deterministic candidate
+        ID and every selected source reference are verified before a canonical
+        record is written; replay returns the same durable receipt.
+        """
+
+        project = self.get_project(project_id)
+        bundle = _exact_object_fields(
+            prepared_bundle,
+            field="memory_sync_prepared_bundle",
+            required=frozenset({"status", "command", "candidate_id", "candidate"}),
+        )
+        if bundle["status"] != "PREPARED" or bundle["command"] != "MEMORY_SYNC":
+            raise UniverseError(
+                "MEMORY_SYNC_PREPARED_REQUIRED",
+                "memory.sync.persist-selected requires a PREPARED MEMORY_SYNC bundle",
+                HTTPStatus.CONFLICT,
+            )
+        candidate = _exact_object_fields(
+            bundle["candidate"],
+            field="memory_sync_prepared_candidate",
+            required=frozenset(
+                {"session_id", "frame_id", "selection_ref", "selected_items", "observed_at", "target_ref"}
+            ),
+        )
+        candidate_id = _identifier(bundle["candidate_id"], "candidate_id")
+        canonical = json.dumps(
+            candidate, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        expected_candidate_id = "memory_" + hashlib.sha256(canonical).hexdigest()[:16]
+        if candidate_id != expected_candidate_id:
+            raise UniverseError(
+                "MEMORY_SYNC_CANDIDATE_ID_CONFLICT",
+                "prepared bundle candidate_id does not match its candidate evidence",
+                HTTPStatus.CONFLICT,
+            )
+        selected_items = candidate["selected_items"]
+        if not isinstance(selected_items, list) or not selected_items:
+            raise UniverseError(
+                "MEMORY_SYNC_SELECTION_REQUIRED",
+                "prepared candidate must contain at least one selected item",
+            )
+        normalized_items: list[dict[str, Any]] = []
+        seen_memory_ids: set[str] = set()
+        for index, raw_item in enumerate(selected_items):
+            item = _exact_object_fields(
+                raw_item,
+                field=f"memory_sync_prepared_candidate.selected_items[{index}]",
+                required=frozenset({"memory_id", "content", "source_refs"}),
+            )
+            source_refs = item["source_refs"]
+            if (
+                not isinstance(source_refs, list)
+                or not source_refs
+                or not all(isinstance(ref, str) and ref.strip() for ref in source_refs)
+            ):
+                raise UniverseError(
+                    "MEMORY_SYNC_PROVENANCE_REQUIRED",
+                    "every selected memory item requires non-empty source_refs",
+                )
+            memory_id = _identifier(item["memory_id"], "memory_id")
+            if memory_id in seen_memory_ids:
+                raise UniverseError(
+                    "MEMORY_SYNC_SELECTION_DUPLICATE",
+                    "prepared candidate selects a memory_id more than once",
+                    HTTPStatus.CONFLICT,
+                )
+            seen_memory_ids.add(memory_id)
+            content = _required_text(item["content"], "memory_sync_selected_item.content")
+            normalized_items.append(
+                {
+                    "memory_id": memory_id,
+                    "content": content,
+                    "source_refs": sorted({ref.strip() for ref in source_refs}),
+                }
+            )
+        selection_ref = _required_text(candidate["selection_ref"], "memory_sync_selection_ref")
+        candidate_digest = hashlib.sha256(canonical).hexdigest()
+        receipt_id = "memorysync_" + candidate_digest[:24]
+        now = utc_now()
+
+        def material_for(item: Mapping[str, Any]) -> dict[str, Any]:
+            origin_ref = (
+                "universe://projects/"
+                + quote(project["project_id"], safe="")
+                + "/memory-sync/"
+                + quote(candidate_id, safe="")
+                + "/"
+                + quote(str(item["memory_id"]), safe="")
+            )
+            material = {
+                "schema": MEMORY_SCHEMA,
+                "project_id": project["project_id"],
+                "title": "Selected memory " + str(item["memory_id"]),
+                "body": item["content"],
+                "state": "OBSERVED",
+                "link_state": "UNLINKED",
+                "node_ref": None,
+                "graph": None,
+                "origin_ref": origin_ref,
+                "memory_sync": {
+                    "candidate_id": candidate_id,
+                    "candidate_digest": candidate_digest,
+                    "selection_ref": selection_ref,
+                    "source_refs": item["source_refs"],
+                    "source_memory_id": item["memory_id"],
+                    "session_id": candidate["session_id"],
+                    "frame_id": candidate["frame_id"],
+                    "observed_at": candidate["observed_at"],
+                    "target_ref": candidate["target_ref"],
+                },
+                "effects": {
+                    "seed_write": "NONE",
+                    "candidate": "NONE",
+                    "queue_publication": "NONE",
+                    "authority": "NONE",
+                    "execution_assignment": "NONE",
+                },
+                "next_operation": "RETRIEVAL_READY",
+            }
+            material["memory_digest"] = _json_sha256(material)
+            material["memory_id"] = "memory_" + material["memory_digest"][:24]
+            return material
+
+        expected_records = [material_for(item) for item in normalized_items]
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_receipt = connection.execute(
+                "SELECT candidate_digest, receipt_json FROM memory_sync_persistence_receipt "
+                "WHERE project_id = ? AND candidate_id = ?",
+                (project["project_id"], candidate_id),
+            ).fetchone()
+            if existing_receipt is not None:
+                if existing_receipt["candidate_digest"] != candidate_digest:
+                    raise UniverseError(
+                        "MEMORY_SYNC_PERSISTENCE_CONFLICT",
+                        "prepared candidate_id is already bound to different selected evidence",
+                        HTTPStatus.CONFLICT,
+                    )
+                return json.loads(existing_receipt["receipt_json"]), False
+            records: list[dict[str, Any]] = []
+            for material in expected_records:
+                existing = connection.execute(
+                    "SELECT memory_json, created_at, updated_at FROM project_memory "
+                    "WHERE project_id = ? AND origin_ref = ?",
+                    (project["project_id"], material["origin_ref"]),
+                ).fetchone()
+                if existing is not None:
+                    stored = json.loads(existing["memory_json"])
+                    if any(stored.get(key) != material[key] for key in material):
+                        raise UniverseError(
+                            "MEMORY_SYNC_PERSISTENCE_CONFLICT",
+                            "selected memory origin is already bound to different content",
+                            HTTPStatus.CONFLICT,
+                        )
+                    stored["created_at"] = existing["created_at"]
+                    stored["updated_at"] = existing["updated_at"]
+                    records.append(stored)
+                    continue
+                material["created_at"] = now
+                material["updated_at"] = now
+                connection.execute(
+                    """
+                    INSERT INTO project_memory(
+                        memory_id, project_id, title, body, state, link_state,
+                        node_ref, graph, origin_ref, memory_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        material["memory_id"], project["project_id"], material["title"],
+                        material["body"], material["state"], material["link_state"],
+                        None, None, material["origin_ref"], _canonical_json(material), now, now,
+                    ),
+                )
+                records.append(material)
+            receipt = {
+                "schema": MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA,
+                "receipt_id": receipt_id,
+                "action_id": MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
+                "project_id": project["project_id"],
+                "candidate_id": candidate_id,
+                "candidate_digest": candidate_digest,
+                "selection_ref": selection_ref,
+                "record_ids": [record["memory_id"] for record in records],
+                "records": records,
+                "created_at": now,
+            }
+            connection.execute(
+                """
+                INSERT INTO memory_sync_persistence_receipt(
+                    receipt_id, project_id, candidate_id, candidate_digest, receipt_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (receipt_id, project["project_id"], candidate_id, candidate_digest, _canonical_json(receipt), now),
+            )
+        return receipt, True
+
     def record_project_decision_memory(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -27159,6 +27374,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             rag_adopt_handler=self._handle_rag_adopt_action,
             rag_record_decision_handler=self._handle_rag_record_decision_action,
             memory_batch_run_handler=self._handle_memory_batch_run_action,
+            memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
             # Only create/replace Actions are on the generic /v1/actions surface.
@@ -28057,6 +28273,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "FEATURE_NODE_RECORDED",
                 "RAG_MEMORY_ADOPTED",
                 "RAG_DECISION_RECORDED",
+                "MEMORY_SYNC_SELECTED_PERSISTED",
                 "SESSION_NEW_COMPLETED",
                 "TODO_RECORDED",
             }
@@ -28528,6 +28745,51 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id = _identifier(action.pop("project_id"), "project_id")
         result = self.run_memory_batch(project_id, action)
         return {**result, "action_id": MEMORY_BATCH_RUN_ACTION_ID}
+
+    def _handle_memory_sync_persist_selected_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "memory.sync.persist-selected requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request,
+            field="memory_sync_persist_selected_action",
+            required=frozenset({"project_id", "prepared_bundle"}),
+        )
+        project_id = _identifier(action["project_id"], "project_id")
+        prepared_bundle = action["prepared_bundle"]
+        if not isinstance(prepared_bundle, Mapping):
+            raise UniverseError(
+                "MEMORY_SYNC_PREPARED_INVALID",
+                "prepared_bundle must be an object",
+            )
+        receipt, created = self.store.persist_selected_memory_sync(
+            project_id, prepared_bundle
+        )
+        return {
+            "schema": MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA,
+            "status": (
+                "MEMORY_SYNC_SELECTED_PERSISTED"
+                if created
+                else "MEMORY_SYNC_SELECTED_REPLAYED"
+            ),
+            "action_id": MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
+            "project_id": project_id,
+            "receipt": receipt,
+            "records": receipt["records"],
+            "persisted": created,
+            "effects": {
+                "canonical_rag": "CREATED" if created else "IDEMPOTENT_REPLAY",
+                "provider_invocation": "NONE",
+                "authority": "NONE",
+                "execution_assignment": "NONE",
+            },
+        }
 
     def _handle_feature_create_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]

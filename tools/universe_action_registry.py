@@ -127,6 +127,18 @@ LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE = (
     "/v1/projects/{project_id}/memory-batches/run"
 )
 
+# A prepared memory-sync bundle is passive until the user explicitly selects
+# it for canonical persistence.  This Action is the only mutating bridge: it
+# accepts the prepared evidence itself and never shells out to memory-sync.
+MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID = "memory.sync.persist-selected"
+MEMORY_SYNC_PERSIST_SELECTED_REQUEST_SCHEMA = (
+    "universe.memory-sync-persist-selected-action-request.v1"
+)
+MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA = (
+    "universe.memory-sync-persist-selected-receipt.v1"
+)
+MEMORY_SYNC_PERSIST_SELECTED_ACTION_SURFACE = "memory.sync.persist-selected"
+
 SESSION_NEW_ACTION_ID = "session.new"
 SESSION_NEW_REQUEST_SCHEMA = "universe.session-new-action-request.v1"
 SESSION_NEW_RESULT_SCHEMA = "universe.session-new-receipt.v1"
@@ -585,6 +597,7 @@ def build_default_action_registry(
     rag_adopt_handler: ActionHandler | None = None,
     rag_record_decision_handler: ActionHandler | None = None,
     memory_batch_run_handler: ActionHandler | None = None,
+    memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
     work_surface_handlers: Mapping[str, ActionHandler] | None = None,
@@ -647,6 +660,22 @@ def build_default_action_registry(
         surfaces=(MEMORY_BATCH_RUN_ACTION_SURFACE,),
     )
     registry.register_legacy_surface(LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE)
+    registry.register(
+        ActionContract(
+            action_id=MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
+            request_schema_ref=MEMORY_SYNC_PERSIST_SELECTED_REQUEST_SCHEMA,
+            result_schema_ref=MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA,
+            side_effect_class="GOVERNED_KNOWLEDGE_WRITE",
+            metadata={
+                "prepared_bundle_required": True,
+                "actor_context_resolution": "SERVER_SIDE",
+                "idempotency": "CANDIDATE_DIGEST_AND_PROJECT",
+                "provider_invocation": "FORBIDDEN",
+            },
+        ),
+        memory_sync_persist_selected_handler,
+        surfaces=(MEMORY_SYNC_PERSIST_SELECTED_ACTION_SURFACE,),
+    )
     registry.register(
         ActionContract(
             action_id=SESSION_NEW_ACTION_ID,
@@ -764,6 +793,10 @@ __all__ = [
     "MEMORY_BATCH_RUN_ACTION_SURFACE",
     "MEMORY_BATCH_RUN_REQUEST_SCHEMA",
     "MEMORY_BATCH_RUN_RESULT_SCHEMA",
+    "MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID",
+    "MEMORY_SYNC_PERSIST_SELECTED_ACTION_SURFACE",
+    "MEMORY_SYNC_PERSIST_SELECTED_REQUEST_SCHEMA",
+    "MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA",
     "RAG_ADOPT_ACTION_ID",
     "RAG_ADOPT_ACTION_SURFACE",
     "RAG_ADOPT_REQUEST_SCHEMA",

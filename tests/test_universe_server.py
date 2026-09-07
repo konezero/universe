@@ -10050,6 +10050,117 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("RAG_DECISION_STORAGE_CONFLICT", conflict["error_code"])
         self.assertEqual(1, len(self.server.store.list_project_memories("GCS")))
 
+    def test_memory_sync_persist_selected_action_persists_and_replays_bundle(self) -> None:
+        self.server.store.register_project(self.registration())
+        candidate = {
+            "session_id": "session_memory_sync",
+            "frame_id": "frame_memory_sync",
+            "selection_ref": "user-selection://memory-sync/01",
+            "selected_items": [
+                {
+                    "memory_id": "mem-01",
+                    "content": "Keep the governed Action boundary.",
+                    "source_refs": ["conversation://turn/1"],
+                },
+                {
+                    "memory_id": "mem-02",
+                    "content": "Preserve deterministic replay evidence.",
+                    "source_refs": ["conversation://turn/2"],
+                },
+            ],
+            "observed_at": "2026-09-08T00:00:00Z",
+            "target_ref": "project://GCS",
+        }
+        candidate_id = "memory_" + hashlib.sha256(
+            json.dumps(candidate, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        action_request = {
+            "action_id": "memory.sync.persist-selected",
+            "request": {
+                "project_id": "GCS",
+                "prepared_bundle": {
+                    "status": "PREPARED",
+                    "command": "MEMORY_SYNC",
+                    "candidate_id": candidate_id,
+                    "candidate": candidate,
+                },
+            },
+        }
+
+        status, persisted = self.request("POST", "/v1/actions", action_request, self.token)
+        self.assertEqual(HTTPStatus.CREATED, status, persisted)
+        self.assertEqual("MEMORY_SYNC_SELECTED_PERSISTED", persisted["status"])
+        self.assertTrue(persisted["persisted"])
+        self.assertEqual(2, len(persisted["receipt"]["record_ids"]))
+        self.assertEqual(
+            ["mem-01", "mem-02"],
+            [record["memory_sync"]["source_memory_id"] for record in persisted["records"]],
+        )
+        self.assertEqual(2, len(self.server.store.list_project_memories("GCS")))
+
+        status, replayed = self.request("POST", "/v1/actions", action_request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, replayed)
+        self.assertEqual("MEMORY_SYNC_SELECTED_REPLAYED", replayed["status"])
+        self.assertFalse(replayed["persisted"])
+        self.assertEqual(persisted["receipt"]["receipt_id"], replayed["receipt"]["receipt_id"])
+        self.assertEqual(2, len(self.server.store.list_project_memories("GCS")))
+
+    def test_memory_sync_persist_selected_action_rejects_unprepared_or_unselected_input(self) -> None:
+        self.server.store.register_project(self.registration())
+        status, unprepared = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "memory.sync.persist-selected",
+                "request": {"project_id": "GCS", "prepared_bundle": {"status": "DRAFT"}},
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("REQUEST_INVALID", unprepared["error_code"])
+
+        candidate = {
+            "session_id": "session_memory_sync",
+            "frame_id": "frame_memory_sync",
+            "selection_ref": "user-selection://memory-sync/empty",
+            "selected_items": [],
+            "observed_at": "2026-09-08T00:00:00Z",
+            "target_ref": "project://GCS",
+        }
+        candidate_id = "memory_" + hashlib.sha256(
+            json.dumps(candidate, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        status, unselected = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "memory.sync.persist-selected",
+                "request": {
+                    "project_id": "GCS",
+                    "prepared_bundle": {
+                        "status": "PREPARED",
+                        "command": "MEMORY_SYNC",
+                        "candidate_id": candidate_id,
+                        "candidate": candidate,
+                    },
+                },
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("MEMORY_SYNC_SELECTION_REQUIRED", unselected["error_code"])
+        self.assertEqual([], self.server.store.list_project_memories("GCS"))
+
+    def test_memory_sync_persist_selected_action_reports_unknown_action(self) -> None:
+        status, unknown = self.request(
+            "POST",
+            "/v1/actions",
+            {"action_id": "memory.sync.unknown", "request": {}},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("ACTION_ID_UNKNOWN", unknown["error_code"])
+
     def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
         self.server.store.register_project(self.registration())
         room = self.server.multi_rooms.create_meeting_room(
