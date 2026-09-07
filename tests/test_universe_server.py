@@ -16005,6 +16005,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             [event["status"] for event in completed["events"]],
         )
 
+        # No provider on the envelope -> no synthetic Bench observation.
+        self.assertEqual([], self.server.store.list_skill_observations("GCS"))
+
         reopened = UniverseStore(self.server.store.database_path)
         persisted = reopened.get_dispatch(dispatch_id)
         self.assertEqual("COMPLETED", persisted["dispatch"]["status"])
@@ -17719,6 +17722,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertNotIn(
             candidate["candidate_id"],
             {item["candidate_id"] for item in after["attach_candidates"]},
+        )
+
+
+    def _run_dispatch_to_result(self, request_extra, result_body):
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        dispatch_request = {
+            "idempotency_key": "gcs-bench-dispatch",
+            "title": "Refactor the retry helper",
+            "instruction": "Consolidate the two retry helpers into one.",
+            "constraints": ["No behaviour change"],
+            "expected_output": {"tests": "passing"},
+            "requested_mode": "MASTER",
+            **request_extra,
+        }
+        status, queued = self.request(
+            "POST", "/v1/projects/GCS/dispatches", dispatch_request, self.token
+        )
+        self.assertEqual(201, status)
+        dispatch_id = queued["dispatch"]["dispatch_id"]
+        self.request(
+            "POST", f"/v1/dispatches/{dispatch_id}/deliver",
+            {"approval": "APPROVED"}, self.token,
+        )
+        self.request(
+            "POST", f"/v1/dispatches/{dispatch_id}/acknowledge",
+            {"evidence_ref": "project-inbox:ack"}, self.token,
+        )
+        self.request(
+            "POST", f"/v1/dispatches/{dispatch_id}/start",
+            {"evidence_ref": "project-master:tf", "details": {}}, self.token,
+        )
+        status, completed = self.request(
+            "POST", f"/v1/dispatches/{dispatch_id}/result", result_body, self.token
+        )
+        self.assertEqual(200, status)
+        return dispatch_id, completed
+
+    def test_dispatch_result_with_provider_records_a_bench_observation(self) -> None:
+        _dispatch_id, completed = self._run_dispatch_to_result(
+            {"provider": "claude", "model_ref": "claude-sonnet-5"},
+            {
+                "status": "COMPLETED",
+                "summary": "Helpers merged; tests pass.",
+                "evidence_refs": ["commit:def456"],
+                "outputs": {"changed": ["src/retry.py"]},
+            },
+        )
+        self.assertEqual("COMPLETED", completed["dispatch"]["status"])
+        observations = self.server.store.list_skill_observations("GCS")
+        self.assertEqual(1, len(observations))
+        obs = observations[0]
+        self.assertEqual("dispatch-master", obs["skill"]["skill_id"])
+        self.assertEqual("EXECUTE", obs["skill"]["operation_class"])
+        self.assertEqual("SUCCEEDED", obs["outcome"])
+        self.assertEqual("CLAUDE", obs["execution_context"]["provider_ref"])
+        self.assertEqual("DISPATCH", obs["execution_context"]["task_kind"])
+        self.assertEqual("claude-sonnet-5", obs["model_ref"])
+        self.assertEqual({}, obs["metrics"])
+        encoded = json.dumps(obs, sort_keys=True)
+        self.assertNotIn("Consolidate the two retry helpers", encoded)
+
+    def test_blocked_dispatch_result_records_a_failed_bench_observation(self) -> None:
+        self._run_dispatch_to_result(
+            {"provider": "GROK"},
+            {
+                "status": "BLOCKED",
+                "summary": "Blocked: provider quota exhausted mid-run.",
+                "evidence_refs": ["log:quota"],
+                "outputs": {},
+            },
+        )
+        observations = self.server.store.list_skill_observations("GCS")
+        self.assertEqual(1, len(observations))
+        obs = observations[0]
+        self.assertEqual("FAILED", obs["outcome"])
+        self.assertEqual(
+            "PROVIDER_QUOTA", obs["execution_context"]["failure_kind"]
+        )
+        self.assertEqual(
+            "provider://GROK/model/unknown", obs["model_ref"]
         )
 
 

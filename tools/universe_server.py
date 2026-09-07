@@ -25682,6 +25682,121 @@ class UniverseStore:
             "outcome": outcome,
         }
 
+    def _auto_bench_observation_from_result_packet(
+        self, envelope: Mapping[str, Any], packet: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Project one redacted Bench observation from a generic dispatch
+        Result Packet. The dispatch envelope carries no skill metadata, so
+        this only fires when the envelope named a provider (see
+        normalize_dispatch_request); everything else is a synthetic tier.
+        Best-effort - a Bench failure must not fail the Result Packet.
+        Knowledge Collector feeds are a separate path and untouched here.
+        """
+
+        provider = str(envelope.get("provider") or "").strip().upper()
+        if provider not in {"GROK", "CODEX", "CLAUDE"}:
+            return None
+        project_id = str(packet.get("project_id") or "")
+        dispatch_id = str(packet.get("dispatch_id") or "")
+        status = str(packet.get("status") or "").strip().upper()
+        outcome = "SUCCEEDED" if status == "COMPLETED" else "FAILED"
+        summary = str(packet.get("summary") or "")
+        upper_summary = summary.upper()
+        if outcome == "SUCCEEDED":
+            failure_kind = "NONE"
+        elif "QUOTA" in upper_summary or "EXHAUSTED" in upper_summary:
+            failure_kind = "PROVIDER_QUOTA"
+        elif "TIMEOUT" in upper_summary:
+            failure_kind = "TIMEOUT"
+        elif "CANCEL" in upper_summary:
+            failure_kind = "CANCELLED"
+        else:
+            failure_kind = "UNKNOWN"
+        model_ref = str(envelope.get("model_ref") or "").strip()
+        if not model_ref:
+            model_ref = f"provider://{provider}/model/unknown"
+        requested_mode = str(
+            envelope.get("requested_mode") or "MASTER"
+        ).strip().lower() or "master"
+        skill_id = _identifier(f"dispatch-{requested_mode}", "skill_id")
+        context_pack_digest = _json_sha256(
+            {
+                "dispatch_id": dispatch_id,
+                "title": envelope.get("title"),
+                "requested_mode": envelope.get("requested_mode"),
+            }
+        )
+        binding_digest = _json_sha256(
+            {"provider": provider, "model_ref": model_ref, "skill_id": skill_id}
+        )
+        source_ref = (
+            f"universe://projects/{project_id}/dispatches/{dispatch_id}"
+        )
+        result_digest = str(packet.get("result_digest") or "")
+        evidence_refs = [f"result-packet:{result_digest}"] if result_digest else [source_ref]
+        for ref in packet.get("evidence_refs") or []:
+            if isinstance(ref, str) and ref.strip() and ref not in evidence_refs:
+                evidence_refs.append(ref.strip())
+            if len(evidence_refs) >= 20:
+                break
+        observation_digest = _json_sha256(
+            {
+                "project_id": project_id,
+                "dispatch_id": dispatch_id,
+                "result_digest": result_digest,
+                "outcome": outcome,
+                "model_ref": model_ref,
+            }
+        )
+        candidate = {
+            "candidate_id": "skillobs_" + observation_digest[:24],
+            "candidate": {
+                "schema": SKILL_OBSERVATION_CANDIDATE_SCHEMA,
+                "project_ref": f"project://{project_id}",
+                "task_frame_ref": f"dispatch:{dispatch_id}",
+                "source_ref": source_ref,
+                "observations": [
+                    {
+                        "observation_digest": observation_digest,
+                        "skill_binding_digest": binding_digest,
+                        "skill": {
+                            "skill_id": skill_id,
+                            "skill_version": "v1",
+                            "operation_class": "EXECUTE",
+                            "context_pack_digest": context_pack_digest,
+                        },
+                        "model_ref": model_ref,
+                        "outcome": outcome,
+                        "validation_state": "NOT_RUN",
+                        "evidence_refs": evidence_refs,
+                        "metrics": {},
+                        "execution_context": {
+                            "provider_ref": provider,
+                            "worker_role": "ROUTINE",
+                            "task_kind": "DISPATCH",
+                            "node_ref": "NONE",
+                            "failure_kind": failure_kind,
+                            "quota_state": (
+                                "EXHAUSTED"
+                                if failure_kind == "PROVIDER_QUOTA"
+                                else "UNKNOWN"
+                            ),
+                        },
+                    }
+                ],
+                "observed_at": utc_now(),
+                "target_ref": f"universe://projects/{project_id}/bench",
+                "redaction_state": "REDACTED",
+            },
+        }
+        self.ingest_skill_observations(project_id, candidate)
+        return {
+            "status": "DISPATCH_RESULT_BENCH_OBSERVATION_RECORDED",
+            "candidate_id": candidate["candidate_id"],
+            "skill_id": skill_id,
+            "outcome": outcome,
+        }
+
     @staticmethod
     def _runtime_worker_invocation_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -26094,6 +26209,14 @@ class UniverseStore:
                 ),
             )
             self._insert_dispatch_event(connection, event)
+        try:
+            self._auto_bench_observation_from_result_packet(
+                current["dispatch"], packet
+            )
+        except (UniverseError, sqlite3.Error, ValueError, KeyError, TypeError):
+            # Bench auto-projection is best-effort; the Result Packet is
+            # already committed.
+            pass
         return self.get_dispatch(dispatch_id)
 
     def _transition_from_request(

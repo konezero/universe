@@ -638,6 +638,8 @@ def normalize_dispatch_request(project_id: str, value: Any) -> dict[str, Any]:
         "expected_output",
         "requested_mode",
         "inbox_ref",
+        "provider",
+        "model_ref",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -678,6 +680,16 @@ def normalize_dispatch_request(project_id: str, value: Any) -> dict[str, Any]:
         "requested_mode": requested_mode,
         "inbox_ref": inbox_ref,
     }
+    if value.get("provider") is not None:
+        provider = _text(value.get("provider"), "provider").upper()
+        if provider not in {"GROK", "CODEX", "CLAUDE"}:
+            raise DispatchError("provider must be GROK, CODEX, or CLAUDE")
+        material["provider"] = provider
+    if value.get("model_ref") is not None:
+        model_ref = _text(value.get("model_ref"), "model_ref")
+        if len(model_ref) > 200:
+            raise DispatchError("model_ref exceeds size limit")
+        material["model_ref"] = model_ref
     content_digest = _digest(material)
     return {
         "schema": DISPATCH_SCHEMA,
@@ -707,7 +719,8 @@ def normalize_dispatch_envelope(value: Any) -> dict[str, Any]:
         "status",
         "created_at",
     }
-    if set(value) != required:
+    optional = {"provider", "model_ref"}
+    if not required <= set(value) <= required | optional:
         raise DispatchError("dispatch envelope fields are invalid")
     if (
         DISPATCH_ID_PATTERN.fullmatch(_text(value["dispatch_id"], "dispatch_id"))
@@ -716,18 +729,19 @@ def normalize_dispatch_envelope(value: Any) -> dict[str, Any]:
         raise DispatchError("dispatch_id is invalid")
     if value["status"] not in DISPATCH_TRANSITIONS:
         raise DispatchError("dispatch status is invalid")
-    request = normalize_dispatch_request(
-        _project_id(value["project_id"]),
-        {
-            "idempotency_key": value["idempotency_key"],
-            "title": value["title"],
-            "instruction": value["instruction"],
-            "constraints": value["constraints"],
-            "expected_output": value["expected_output"],
-            "requested_mode": value["requested_mode"],
-            "inbox_ref": value["inbox_ref"],
-        },
-    )
+    rederive = {
+        "idempotency_key": value["idempotency_key"],
+        "title": value["title"],
+        "instruction": value["instruction"],
+        "constraints": value["constraints"],
+        "expected_output": value["expected_output"],
+        "requested_mode": value["requested_mode"],
+        "inbox_ref": value["inbox_ref"],
+    }
+    for optional_key in ("provider", "model_ref"):
+        if optional_key in value:
+            rederive[optional_key] = value[optional_key]
+    request = normalize_dispatch_request(_project_id(value["project_id"]), rederive)
     if request["content_digest"] != value["content_digest"]:
         raise DispatchError("dispatch content digest is invalid")
     normalized = dict(value)
