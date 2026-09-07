@@ -38137,6 +38137,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     buffered_terminal = native_terminal_holder.pop("reply", None)
                 if buffered_terminal is not None:
                     project_native_terminal(buffered_terminal)
+                else:
+                    replayed_terminal = native_result.get("reply")
+                    replayed_state = (
+                        str(replayed_terminal.get("state") or "").upper()
+                        if isinstance(replayed_terminal, Mapping)
+                        else ""
+                    )
+                    if replayed_state in {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED"}:
+                        project_native_terminal(replayed_terminal)
             except (
                 ProviderSessionError,
                 SessionBusError,
@@ -38200,10 +38209,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # Manual-terminal fallback. This is intentionally not the Session
             # Bus HEADER path: the SessionStart hook verified this exact live
             # PTY and the message was atomically claimed for its Session Anchor.
-            self.terminal_host.write(
-                terminal_id,
-                (str(delivery["body_text"]) + "\r").encode("utf-8"),
-            )
+            body_text = str(delivery["body_text"])
+            self.terminal_host.write(terminal_id, body_text.encode("utf-8"))
+            time.sleep(RUST_HOST_INPUT_SETTLE_SECONDS)
+            self.terminal_host.write(terminal_id, b"\r")
             completed = self.session_bus.complete_instruction_claim(
                 terminal_id=terminal_id,
                 message_id=str(delivery["message_id"]),

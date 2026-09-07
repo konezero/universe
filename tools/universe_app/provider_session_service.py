@@ -459,7 +459,21 @@ class ProviderSessionService:
             duplicate = self._idempotency.get((key, idempotency_key))
             if duplicate is not None:
                 self._idempotency.move_to_end((key, idempotency_key))
-                return _json_copy(duplicate)
+                replay = _json_copy(duplicate)
+                reply = replay.get("reply")
+                reply_id = str(reply.get("message_id") or "") if isinstance(reply, Mapping) else ""
+                if reply_id:
+                    current_reply = next(
+                        (
+                            item
+                            for item in reversed(self._messages.get(key, ()))
+                            if str(item.get("message_id") or "") == reply_id
+                        ),
+                        None,
+                    )
+                    if isinstance(current_reply, Mapping):
+                        replay["reply"] = _json_copy(current_reply)
+                return replay
             if key in self._active_message_ids:
                 raise ProviderSessionError(
                     "PROVIDER_SESSION_BUSY",
