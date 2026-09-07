@@ -17140,6 +17140,77 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual([], results["results"])
+        # A run that reached the Host but could not verify its terminal result
+        # is still a bounded Worker run: it lands as a FAILED Bench observation.
+        observations = self.server.store.list_skill_observations("GCS")
+        self.assertEqual(1, len(observations))
+        self.assertEqual("FAILED", observations[0]["outcome"])
+        self.assertEqual(
+            "runtime-worker-routine", observations[0]["skill"]["skill_id"]
+        )
+
+    def test_runtime_worker_run_auto_records_a_bench_observation(self) -> None:
+        class FakeRuntimeHost:
+            def provider_capabilities(self) -> list[dict[str, str]]:
+                return [{"provider": "GROK", "status": "AVAILABLE"}]
+
+            def invoke_read_only(self, _request: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "TASK_FRAME_RESULT_RECORDED",
+                    "provider": "GROK",
+                    "model_ref": "provider://GROK/model/grok-test",
+                    "worker_id": "grok-worker-bench",
+                    "worker_run_ref": "worker-run-bench",
+                    "result_receipt_ref": "result-bench",
+                    "terminal_result_verified": True,
+                    "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
+                    "skill_run_observation_count": 1,
+                    "repository_write": False,
+                    "result": {"text": "must not persist"},
+                }
+
+        self.server.runtime_host = FakeRuntimeHost()
+        status, _ = self.request("POST", "/v1/projects/register", self.registration())
+        self.assertEqual(HTTPStatus.CREATED, status)
+        payload = {
+            "schema": "universe.runtime-worker-invocation-request.v1",
+            "invocation_id": "runtime-worker-bench-001",
+            "provider": "GROK",
+            "endpoint": "http://127.0.0.1:19090",
+            "token": "never-store-this-token",
+            "session_id": "session-bench",
+            "frame_id": "frame-bench",
+            "turn_id": "turn-bench",
+            "invoker_actor_ref": "universe-host",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "context_pack": {"prompt": "must not persist"},
+            "output_contract": {"format": "review"},
+            "max_turns": 1,
+        }
+        path = "/v1/projects/GCS/runtime-worker-invocations"
+        status, _ = self.request("POST", path, payload)
+        self.assertEqual(HTTPStatus.CREATED, status)
+
+        observations = self.server.store.list_skill_observations("GCS")
+        self.assertEqual(1, len(observations))
+        observation = observations[0]
+        self.assertEqual("SUCCEEDED", observation["outcome"])
+        self.assertEqual("READ", observation["skill"]["operation_class"])
+        self.assertEqual("runtime-worker-routine", observation["skill"]["skill_id"])
+        self.assertEqual("GROK", observation["execution_context"]["provider_ref"])
+        self.assertEqual(
+            "provider://GROK/model/grok-test", observation["model_ref"]
+        )
+        encoded = json.dumps(observation, sort_keys=True)
+        self.assertNotIn("must not persist", encoded)
+
+        # Re-running the same invocation_id must not double-count.
+        status, repeated = self.request("POST", path, payload)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            1, len(self.server.store.list_skill_observations("GCS"))
+        )
 
 
 class RuntimeLeaseStoreTests(unittest.TestCase):

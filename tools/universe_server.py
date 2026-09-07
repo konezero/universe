@@ -24449,7 +24449,160 @@ class UniverseStore:
             raise UniverseError(
                 "RUNTIME_WORKER_INVOCATION_UNAVAILABLE", "invocation record disappeared"
             )
+        try:
+            self._auto_bench_observation_from_runtime_worker(
+                project["project_id"],
+                redacted,
+                result_record,
+                terminal_evidence,
+                observed_at=completed_at,
+            )
+        except (UniverseError, sqlite3.Error, ValueError, KeyError, TypeError):
+            # Bench auto-projection is best-effort. A bounded Worker run that
+            # completed must still return its result even if the observation
+            # could not be recorded.
+            pass
         return self._runtime_worker_invocation_row(row), True
+
+    def _auto_bench_observation_from_runtime_worker(
+        self,
+        project_id: str,
+        invocation: Mapping[str, Any],
+        result_record: Mapping[str, Any],
+        terminal_evidence: Mapping[str, Any],
+        *,
+        observed_at: str,
+    ) -> dict[str, Any] | None:
+        """Project one redacted Bench observation from a completed Worker run.
+
+        Every bounded runtime Worker invocation becomes a Skill/Worker Bench
+        observation with no manual enqueue + drain: the invocation already
+        carries the redacted worker binding, provider, model, and outcome. A run
+        that never reached the Host (``RUNTIME_HOST_UNAVAILABLE``) is not a run
+        and is skipped.
+        """
+
+        status = str(result_record.get("status") or "").strip().upper()
+        if not status or status == "RUNTIME_HOST_UNAVAILABLE":
+            return None
+        provider = str(
+            result_record.get("provider") or invocation.get("provider") or ""
+        ).strip().upper()
+        if provider not in {"GROK", "CODEX", "CLAUDE"}:
+            return None
+
+        binding = invocation.get("worker_binding_snapshot")
+        binding = dict(binding) if isinstance(binding, Mapping) else {}
+        model_ref = str(result_record.get("model_ref") or "").strip()
+        if not model_ref or model_ref.upper() == "UNKNOWN":
+            model_ref = f"provider://{provider}/model/unknown"
+
+        is_terminal = (
+            status in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"}
+            or status.startswith("TURN_COMPLETED")
+        )
+        verified = result_record.get("terminal_result_verified") is True
+        outcome = "SUCCEEDED" if verified and is_terminal else "FAILED"
+        reason = str(result_record.get("reason") or "").strip().upper()
+        if outcome == "SUCCEEDED":
+            failure_kind = "NONE"
+        elif "QUOTA" in reason or "EXHAUSTED" in reason:
+            failure_kind = "PROVIDER_QUOTA"
+        elif "TIMEOUT" in reason:
+            failure_kind = "TIMEOUT"
+        elif "CANCEL" in reason:
+            failure_kind = "CANCELLED"
+        elif reason:
+            failure_kind = "PROVIDER_ERROR"
+        else:
+            failure_kind = "UNKNOWN"
+
+        worker_role = str(binding.get("worker_role") or "ROUTINE").strip().upper()
+        if worker_role not in WORKER_BINDING_ROLES:
+            worker_role = "ROUTINE"
+        task_type = str(binding.get("task_type") or "*").strip().upper() or "*"
+        task_kind = task_type if task_type != "*" else "RUNTIME_WORKER"
+        skill_id = f"runtime-worker-{worker_role.lower()}"
+
+        binding_digest = str(binding.get("binding_digest") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", binding_digest):
+            binding_digest = _json_sha256({"binding": binding})
+        context_pack_digest = str(invocation.get("request_digest") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", context_pack_digest):
+            context_pack_digest = _json_sha256({"invocation": dict(invocation)})
+
+        invocation_id = str(invocation.get("invocation_id") or "").strip()
+        worker_run_ref = str(result_record.get("worker_run_ref") or "").strip()
+        source_ref = (
+            f"universe://projects/{project_id}"
+            f"/runtime-worker-invocations/{invocation_id}"
+        )
+        evidence_id = ""
+        if isinstance(terminal_evidence, Mapping):
+            evidence_id = str(terminal_evidence.get("evidence_id") or "").strip()
+        evidence_refs = [evidence_id] if evidence_id else [source_ref]
+
+        observation_digest = _json_sha256(
+            {
+                "project_id": project_id,
+                "invocation_id": invocation_id,
+                "worker_run_ref": worker_run_ref,
+                "outcome": outcome,
+                "model_ref": model_ref,
+            }
+        )
+        candidate = {
+            "candidate_id": "skillobs_" + observation_digest[:24],
+            "candidate": {
+                "schema": SKILL_OBSERVATION_CANDIDATE_SCHEMA,
+                "project_ref": f"project://{project_id}",
+                "task_frame_ref": str(
+                    invocation.get("frame_id")
+                    or invocation.get("task_frame_ref")
+                    or f"runtime-worker:{invocation_id}"
+                ),
+                "source_ref": source_ref,
+                "observations": [
+                    {
+                        "observation_digest": observation_digest,
+                        "skill_binding_digest": binding_digest,
+                        "skill": {
+                            "skill_id": skill_id,
+                            "skill_version": "v1",
+                            "operation_class": "READ",
+                            "context_pack_digest": context_pack_digest,
+                        },
+                        "model_ref": model_ref,
+                        "outcome": outcome,
+                        "validation_state": "NOT_RUN",
+                        "evidence_refs": evidence_refs,
+                        "metrics": {},
+                        "execution_context": {
+                            "provider_ref": provider,
+                            "worker_role": worker_role,
+                            "task_kind": task_kind,
+                            "node_ref": "NONE",
+                            "failure_kind": failure_kind,
+                            "quota_state": (
+                                "EXHAUSTED"
+                                if failure_kind == "PROVIDER_QUOTA"
+                                else "UNKNOWN"
+                            ),
+                        },
+                    }
+                ],
+                "observed_at": observed_at,
+                "target_ref": f"universe://projects/{project_id}/bench",
+                "redaction_state": "REDACTED",
+            },
+        }
+        self.ingest_skill_observations(project_id, candidate)
+        return {
+            "status": "RUNTIME_WORKER_BENCH_OBSERVATION_RECORDED",
+            "candidate_id": candidate["candidate_id"],
+            "skill_id": skill_id,
+            "outcome": outcome,
+        }
 
     @staticmethod
     def _runtime_worker_invocation_row(row: sqlite3.Row) -> dict[str, Any]:
