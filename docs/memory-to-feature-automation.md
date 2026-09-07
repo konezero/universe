@@ -58,11 +58,15 @@ compiler. Work Loop predictions that a user reviews and keeps (`review_state`
 `GOAL`/`PLAN`/`MILESTONE` suggestions become proposal source entries, so a
 Bench- and Experience-backed direction can surface as a reviewable Feature Node
 proposal instead of terminating at the prediction review. `RISK` suggestions are
-recurrence warnings, not product intent, and stay out. Two edges remain:
-predictions are not yet bound to a specific Feature Node as node-derived
-predicted paths (`todo_prediction_paths_bound_to_feature_node_v1`), and
-prediction-versus-outcome calibration is still P1
-(`todo_proposal_feedback_fleet_projection_v1`). Feature Node creation still
+recurrence warnings, not product intent, and stay out. Three edges remain:
+newly recorded related Memory and documents do not attach to an already
+materialised Feature Node
+(`todo_memo_document_attach_to_existing_node_v1`); kept predictions are not
+bound to a specific Feature Node as node-derived predicted paths
+(`todo_prediction_paths_bound_to_feature_node_v1`); and prediction-versus-outcome
+calibration - comparing a kept prediction against the Todo/Experience outcome it
+implied and feeding that back as an evidence weight - is not yet built
+(`todo_prediction_versus_outcome_calibration_v1`). Feature Node creation still
 begins from a manual Meeting Room form, and the Goal scheduler deliberately
 stops before Task Frame execution, Todo selection, and result application.
 
