@@ -4068,6 +4068,103 @@ class UniverseLocalServiceTests(unittest.TestCase):
         result_ids = [item["message_id"] for item in inbox["messages"] if item.get("kind") == "RESULT"]
         self.assertIn(reply["result"]["message_id"], result_ids)
 
+    def test_conductor_operating_loop_forwards_result_and_retries_pending_delivery(self) -> None:
+        master_tid = "term-master-operating-loop-001"
+        conductor_tid = "term-conductor-operating-loop-001"
+        master_anchor = "session_anchor_master_operating_loop_001"
+        conductor_anchor = "session_anchor_conductor_operating_loop_001"
+        master = {
+            "terminal_id": master_tid,
+            "project_id": "universe",
+            "mode": "MASTER",
+            "provider": "GROK",
+            "state": "LIVE",
+            "session_anchor_ref": master_anchor,
+            "active_session_anchor_ref": master_anchor,
+        }
+        conductor = {
+            "terminal_id": conductor_tid,
+            "project_id": "universe",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-conductor-operating-loop-001",
+            "session_anchor_ref": conductor_anchor,
+            "active_session_anchor_ref": conductor_anchor,
+        }
+        host = Mock()
+        host.list_sessions.return_value = [master, conductor]
+        host.list_hosts.return_value = []
+        host.get.side_effect = lambda terminal_id: (
+            master if terminal_id == master_tid else conductor
+        )
+        self.server.terminal_host = host
+        self.server.session_supervisor.get_session = Mock(
+            return_value={
+                "session_id": conductor["supervisor_session_id"],
+                "session_anchor_ref": conductor_anchor,
+                "provider": "CODEX",
+                "mode": "CONDUCTOR",
+            }
+        )
+        posted = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=master,
+            source={
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+            },
+            to={"terminal_id": master_tid},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="report operating-loop completion",
+        )
+        self.server.session_bus.claim_instruction(
+            host,
+            terminal_id=master_tid,
+            session_anchor_ref=master_anchor,
+        )
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=master_tid,
+            message_id=posted["message_id"],
+            session_anchor_ref=master_anchor,
+        )
+        reply = self.server.session_bus.reply(
+            posted["message_id"],
+            terminal_id=master_tid,
+            session_anchor_ref=master_anchor,
+            body_text="Master report is ready.",
+            host=host,
+        )
+        self.server._dispatch_pending_session_instruction = Mock(
+            return_value={"status": "DISPATCHED"}
+        )
+
+        observed = self.server.run_conductor_operating_loop_once()
+
+        self.assertEqual("OK", observed["status"])
+        self.assertEqual(
+            [reply["result"]["message_id"]], observed["forwarded_result_ids"]
+        )
+        self.assertEqual(1, len(observed["dispatched_instruction_ids"]))
+        forwarded_id = observed["dispatched_instruction_ids"][0]
+        self.server._dispatch_pending_session_instruction.assert_called_once()
+        dispatched_kwargs = self.server._dispatch_pending_session_instruction.call_args.kwargs
+        self.assertEqual(forwarded_id, dispatched_kwargs["message_id"])
+        self.assertEqual("TURN_IDLE", dispatched_kwargs["trigger"])
+        results = self.server.session_bus.inbox(
+            host,
+            terminal_id=conductor_tid,
+            projection="RESULTS",
+        )["messages"]
+        consumed = next(
+            item
+            for item in results
+            if item["message_id"] == reply["result"]["message_id"]
+        )
+        self.assertEqual("READ", consumed["delivery_state"])
+
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         delegation, created = self.server.store.create_conductor_delegation(

@@ -27976,6 +27976,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         )
         results["provider_activity"] = self.tail_bound_provider_sessions()
+        results["conductor_operating_loop"] = self.run_conductor_operating_loop_once()
         reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
         if callable(reconcile_runtime):
             runtime_state = reconcile_runtime()
@@ -33629,6 +33630,174 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message["dispatch_status"] = dispatch.get("status")
             except (SessionSupervisorError, TerminalHostError, UniverseError):
                 continue
+
+    def run_conductor_operating_loop_once(
+        self, *, max_messages: int = 32
+    ) -> dict[str, Any]:
+        """Sweep live CONDUCTOR anchors and recover abandoned Master work.
+
+        SessionStart handles the usual delivery path, but it cannot recover a
+        result that arrived after the Conductor became idle, nor a pending
+        delivery which failed while a provider transport was still coming up.
+        The bounded sweep retains every hand-off in the Session Bus until its
+        provider adapter accepts the resulting instruction.
+        """
+
+        limit = max(1, min(int(max_messages), 128))
+        result: dict[str, Any] = {
+            "schema": "universe.conductor-operating-loop.v1",
+            "status": "OK",
+            "reclaimed_master_message_ids": [],
+            "forwarded_result_ids": [],
+            "dispatched_instruction_ids": [],
+            "deferred": [],
+        }
+        try:
+            result["reclaimed_master_message_ids"] = (
+                self.store.reclaim_expired_master_messages()
+            )
+        except UniverseError as error:
+            result["status"] = "PARTIAL"
+            result["deferred"].append(
+                {"stage": "MASTER_LEASE_RECLAIM", "detail": str(error)}
+            )
+        try:
+            host = self._session_anchor_terminal_host()
+            terminals = match_live_terminals(host, mode="CONDUCTOR")
+        except (SessionBusError, TerminalHostError, UniverseError) as error:
+            result["status"] = "PARTIAL"
+            result["deferred"].append(
+                {"stage": "CONDUCTOR_DISCOVERY", "detail": str(error)}
+            )
+            return result
+
+        remaining = limit
+        for terminal in terminals:
+            if remaining <= 0:
+                break
+            terminal_id = str(terminal.get("terminal_id") or "").strip()
+            anchor = str(
+                terminal.get("active_session_anchor_ref")
+                or terminal.get("session_anchor_ref")
+                or ""
+            ).strip()
+            session_id = str(terminal.get("supervisor_session_id") or "").strip()
+            if not terminal_id or not anchor or not session_id:
+                result["deferred"].append(
+                    {
+                        "stage": "CONDUCTOR_COORDINATE",
+                        "terminal_id": terminal_id,
+                        "detail": "terminal lacks Session Anchor or supervisor session",
+                    }
+                )
+                continue
+            try:
+                session_value = self.session_supervisor.get_session(session_id)
+                session = (
+                    session_value.public()
+                    if hasattr(session_value, "public")
+                    and callable(session_value.public)
+                    else session_value
+                )
+                if not isinstance(session, Mapping):
+                    result["deferred"].append(
+                        {
+                            "stage": "CONDUCTOR_SESSION",
+                            "terminal_id": terminal_id,
+                            "detail": "supervisor session is unavailable",
+                        }
+                    )
+                    continue
+                reports = self.session_bus.inbox(
+                    host,
+                    terminal_id=terminal_id,
+                    projection="RESULTS",
+                )["messages"]
+            except (SessionBusError, SessionSupervisorError, TerminalHostError) as error:
+                result["deferred"].append(
+                    {
+                        "stage": "CONDUCTOR_INBOX",
+                        "terminal_id": terminal_id,
+                        "detail": str(error),
+                    }
+                )
+                continue
+            for report in reports:
+                if remaining <= 0:
+                    break
+                if (
+                    str(report.get("kind") or "").upper() != "RESULT"
+                    or str(report.get("delivery_state") or "").upper() != "UNREAD"
+                ):
+                    continue
+                try:
+                    self.session_bus.forward_result_as_instruction(
+                        host,
+                        result_message_id=str(report.get("message_id") or ""),
+                        terminal_id=terminal_id,
+                        session_anchor_ref=anchor,
+                    )
+                except SessionBusError as error:
+                    result["deferred"].append(
+                        {
+                            "stage": "RESULT_FORWARD",
+                            "terminal_id": terminal_id,
+                            "message_id": report.get("message_id"),
+                            "detail": str(error),
+                        }
+                    )
+                    continue
+                result["forwarded_result_ids"].append(report["message_id"])
+                remaining -= 1
+
+            if remaining <= 0:
+                break
+            try:
+                pending = self.session_bus.inbox(
+                    host,
+                    terminal_id=terminal_id,
+                    projection="INBOX",
+                )["messages"]
+            except (SessionBusError, TerminalHostError) as error:
+                result["deferred"].append(
+                    {
+                        "stage": "CONDUCTOR_PENDING_INBOX",
+                        "terminal_id": terminal_id,
+                        "detail": str(error),
+                    }
+                )
+                continue
+            for message in pending:
+                if remaining <= 0:
+                    break
+                if (
+                    str(message.get("kind") or "").upper() != "INSTRUCTION"
+                    or str(message.get("delivery_state") or "").upper() != "PENDING"
+                ):
+                    continue
+                message_id = str(message.get("message_id") or "")
+                dispatch = self._dispatch_pending_session_instruction(
+                    project_id=str(terminal.get("project_id") or ""),
+                    session=session,
+                    trigger="TURN_IDLE",
+                    message_id=message_id,
+                )
+                if dispatch.get("status") == "DISPATCHED":
+                    result["dispatched_instruction_ids"].append(message_id)
+                    remaining -= 1
+                else:
+                    result["deferred"].append(
+                        {
+                            "stage": "INSTRUCTION_DISPATCH",
+                            "terminal_id": terminal_id,
+                            "message_id": message_id,
+                            "detail": str(dispatch.get("status") or "UNKNOWN"),
+                        }
+                    )
+        if result["deferred"]:
+            result["status"] = "PARTIAL"
+        result["observed_at"] = utc_now()
+        return result
 
     def _wake_live_master_sessions(self, project_id: str, *, reason: str) -> int:
         """Best-effort nudge: tell every live Master session for this

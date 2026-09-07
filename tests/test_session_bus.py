@@ -33,6 +33,9 @@ class FakePty:
         self.closed = False
         self.size = (120, 32)
         self.pid = 4242
+        self.runtime_versions: dict[str, str] = {}
+        self.compatibility = "UNKNOWN"
+        self.protocol_state = "UNKNOWN"
         self._chunks: list[bytes] = []
 
     def write(self, data: bytes) -> None:
@@ -803,6 +806,65 @@ class SessionBusDurabilityTests(unittest.TestCase):
         self.assertEqual(1, len(results["messages"]))
         self.assertEqual("RESULT", results["messages"][0]["kind"])
         self.assertEqual("durable result body", results["messages"][0]["body_text"])
+
+    def test_forward_result_as_instruction_is_durable_and_idempotent(self) -> None:
+        bus = SessionBus(database_path=self.db_path)
+        anchor = "anchor_target_durable"
+        posted = bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "kind": "INSTRUCTION",
+                "body_text": "produce a durable report",
+            },
+        )
+        bus.claim_instruction(
+            self.host,
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+        )
+        bus.complete_instruction_claim(
+            terminal_id=self.terminal_id,
+            message_id=posted["message_id"],
+            session_anchor_ref=anchor,
+        )
+        reply = bus.reply(
+            posted["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+            body_text="durable report",
+            host=self.host,
+        )
+
+        forwarded = bus.forward_result_as_instruction(
+            self.host,
+            result_message_id=reply["result"]["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+        )
+        repeated = bus.forward_result_as_instruction(
+            self.host,
+            result_message_id=reply["result"]["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+        )
+
+        self.assertEqual("INSTRUCTION", forwarded["kind"])
+        self.assertEqual("PENDING", forwarded["delivery_state"])
+        self.assertEqual(reply["result"]["message_id"], forwarded["in_reply_to"])
+        self.assertEqual(forwarded["message_id"], repeated["message_id"])
+        result = next(
+            item
+            for item in bus.inbox(
+                self.host,
+                terminal_id=self.terminal_id,
+                projection="RESULTS",
+            )["messages"]
+            if item["message_id"] == reply["result"]["message_id"]
+        )
+        self.assertEqual("READ", result["delivery_state"])
+        self.assertEqual("DONE", result["lifecycle_state"])
 
     def test_provider_restart_rebinds_same_anchor_and_replies_after_service_restart(self) -> None:
         bus_a = SessionBus(database_path=self.db_path)

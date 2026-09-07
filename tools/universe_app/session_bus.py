@@ -937,6 +937,122 @@ class SessionBus:
                 ]
                 self._persist_message(tid, message)
 
+    def forward_result_as_instruction(
+        self,
+        host: Any,
+        *,
+        result_message_id: str,
+        terminal_id: str,
+        session_anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Durably hand one unread result to its live provider as an instruction.
+
+        A provider result remains ``UNREAD`` for UI projection, while the
+        CONDUCTOR operating loop must act on that report.  Creating a separate
+        pending instruction and acknowledging the result under one lock makes
+        this hand-off idempotent across a server restart.
+        """
+
+        mid = _text(result_message_id, "result_message_id", required=True, limit=80)
+        tid = _text(terminal_id, "terminal_id", required=True, limit=80)
+        anchor = _text(
+            session_anchor_ref,
+            "session_anchor_ref",
+            required=True,
+            limit=256,
+        )
+        terminal = _public_session(host, tid)
+        if str(terminal.get("state") or "").upper() != "LIVE":
+            raise SessionBusError("BUS_TARGET_NOT_FOUND", "terminal is not live", 404)
+        if _terminal_anchor(terminal) != anchor:
+            raise SessionBusError(
+                "BUS_RECIPIENT_MISMATCH",
+                "Session Anchor does not own the result",
+                409,
+            )
+        with self._lock:
+            result = self._messages.get(mid)
+            if not isinstance(result, dict):
+                raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message does not exist", 404)
+            if str(result.get("kind") or "").upper() != "RESULT":
+                raise SessionBusError(
+                    "BUS_RESULT_REQUIRED",
+                    "only a Session Bus result can be forwarded",
+                    409,
+                )
+            if str(result.get("recipient_anchor_ref") or "") != anchor:
+                raise SessionBusError(
+                    "BUS_RECIPIENT_MISMATCH",
+                    "Session Anchor does not own the result",
+                    409,
+                )
+            lifecycle = result.setdefault("lifecycle", {})
+            existing_id = str(lifecycle.get("forwarded_instruction_id") or "")
+            if existing_id:
+                existing = self._messages.get(existing_id)
+                if isinstance(existing, dict):
+                    return self._public_message(existing, headers_only=False)
+                raise SessionBusError(
+                    "BUS_RESULT_FORWARD_INTEGRITY",
+                    "result references a missing forwarded instruction",
+                    409,
+                )
+            if str(result.get("delivery_state") or "").upper() != "UNREAD":
+                raise SessionBusError(
+                    "BUS_RESULT_ALREADY_CONSUMED",
+                    "result is no longer unread",
+                    409,
+                )
+
+            now = utc_now()
+            instruction_id = "msg_" + secrets.token_hex(8)
+            target = {
+                **dict(result.get("to") or {}),
+                "terminal_id": tid,
+                "project_id": str(terminal.get("project_id") or ""),
+                "mode": str(terminal.get("mode") or "").upper(),
+                "provider": str(terminal.get("provider") or "").upper(),
+                "session_anchor_ref": anchor,
+            }
+            instruction = {
+                "message_id": instruction_id,
+                "_terminal_id": tid,
+                "thread_id": str(result.get("thread_id") or instruction_id),
+                "room_id": str(result.get("room_id") or ""),
+                "kind": "INSTRUCTION",
+                "from": dict(result.get("from") or {}),
+                "to": target,
+                "body_text": str(result.get("body_text") or ""),
+                "bytes": int(result.get("bytes") or 0),
+                "created_at": now,
+                "delivery_state": "PENDING",
+                "session_anchor_ref": anchor,
+                "recipient_anchor_ref": anchor,
+                "source_anchor_ref": str(result.get("source_anchor_ref") or ""),
+                "in_reply_to": mid,
+                "lifecycle_state": "QUEUED",
+                "lifecycle": {
+                    "queued_at": now,
+                    "forwarded_from_result_id": mid,
+                },
+                "updated_at": now,
+                "provenance": {
+                    "kind": "SESSION_BUS_RESULT_FORWARD",
+                    "source_result_id": mid,
+                },
+            }
+            self._messages[instruction_id] = instruction
+            self._inbox.setdefault(tid, []).append(instruction_id)
+            result["delivery_state"] = "READ"
+            result["lifecycle_state"] = "DONE"
+            result["updated_at"] = now
+            lifecycle["done_at"] = now
+            lifecycle["forwarded_at"] = now
+            lifecycle["forwarded_instruction_id"] = instruction_id
+            self._persist_message(tid, instruction)
+            self._persist_message(tid, result)
+            return self._public_message(instruction, headers_only=False)
+
     def inbox(
         self,
         host: Any,
