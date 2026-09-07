@@ -432,6 +432,39 @@ class SessionInjectHookTests(unittest.TestCase):
         self.assertNotIn("mode", result["inject_body"])
         self.assertNotIn("node", result["inject_body"])
 
+    def test_managed_session_start_binds_selected_mode_at_rust_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ai" / "runtime" / "tmp").mkdir(parents=True)
+            with mock.patch(
+                "universe_session_inject_hook.bind_rust_host_identity",
+                return_value={
+                    "status": "BOUND",
+                    "host_id": "host-session-start-conductor",
+                    "session_binding_generation": 2,
+                },
+            ) as bound:
+                result = run_hook(
+                    _args(
+                        repo_root=root,
+                        project_id="universe",
+                        provider="CODEX",
+                        session_ref="provider-session-conductor",
+                        dry_run=True,
+                        trigger="session_start",
+                    ),
+                    environment={
+                        "UNIVERSE_SUPERVISOR_SESSION_ID": "session_managed_2",
+                        "UNIVERSE_SESSION_HOST_ID": "host-session-start-conductor",
+                        "UNIVERSE_MODE": "CONDUCTOR",
+                    },
+                )
+
+        self.assertEqual("DRY_RUN", result["status"])
+        self.assertEqual("CONDUCTOR", result["mode"])
+        self.assertEqual("BOUND", result["rust_host_binding"]["status"])
+        self.assertEqual("CONDUCTOR", bound.call_args.kwargs["mode"])
+
     def test_patch_real_observer_overwrites_existing_observer(self) -> None:
         from universe_session_inject_hook import patch_mode_current_anchor
 

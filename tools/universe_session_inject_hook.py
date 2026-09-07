@@ -1191,7 +1191,15 @@ def run_hook(
             environment=env,
             provider=provider,
             session_ref=session_ref,
-            mode=mode if trigger == "mode_change" else "",
+            # A managed SessionStart already carries a server-selected Mode
+            # (UNIVERSE_MODE).  Seal it at the Rust Host with the provider
+            # session identity before the first provider turn.  Leaving this
+            # blank made a direct session.new(CONDUCTOR) look mode-less at the
+            # only authoritative Host even though the PTY/Supervisor knew the
+            # intended coordinate.  An unresolved standalone SessionStart
+            # still supplies an empty mode and remains unbound until an
+            # explicit MODE_CHANGE chooses one.
+            mode=mode if trigger in {"mode_change", "session_start"} else "",
         )
         if session_ref and str(env.get("UNIVERSE_SESSION_HOST_ID") or "").strip()
         else {"status": "NOT_BOUND_HOST_ID_OR_PROVIDER_REF_UNAVAILABLE"}
