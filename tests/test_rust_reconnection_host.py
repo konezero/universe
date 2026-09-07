@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_app.reconnection_host import (  # noqa: E402
     CURRENT_RUNTIME_VERSIONS,
+    ReconnectionHostError,
     ReconnectionHostRegistry,
     ReconnectionPty,
     evaluate_runtime_compatibility,
@@ -285,6 +286,29 @@ class RustReconnectionHostTests(unittest.TestCase):
 
             self.assertFalse(process_is_alive(host_pid))
             self.assertFalse(process_is_alive(child_pid))
+
+    def test_rust_host_seals_provider_session_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            client = registry.launch("anchor-binding", cwd=root, shell_args=("/Q",))
+            try:
+                first = client.bind_provider_session("CODEX", "thread-001")
+                self.assertEqual("CODEX", first["provider"])
+                self.assertEqual("thread-001", first["provider_session_ref"])
+                self.assertEqual(1, first["session_binding_generation"])
+                bound = client.bind_mode("CONDUCTOR")
+                self.assertEqual("CONDUCTOR", bound["mode"])
+                self.assertEqual(2, bound["session_binding_generation"])
+                self.assertEqual(bound, client.bind_mode("CONDUCTOR"))
+                with self.assertRaisesRegex(ReconnectionHostError, "HOST_MODE_BINDING_CONFLICT"):
+                    client.bind_mode("MASTER")
+                with self.assertRaisesRegex(ReconnectionHostError, "HOST_PROVIDER_SESSION_BINDING_CONFLICT"):
+                    client.bind_provider_session("CODEX", "thread-002")
+                self.assertEqual(client.state.host_id, registry.discover_by_host_id(client.state.host_id).state.host_id)
+            finally:
+                client.shutdown()
+                registry.reap_launched_process("anchor-binding")
 
     def test_message_channel_survives_supervisor_reattach(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -31,6 +31,10 @@ from urllib.parse import quote, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from universe_host_state import is_universe_managed_host  # noqa: E402
+from universe_app.reconnection_host import (  # noqa: E402
+    ReconnectionHostError,
+    ReconnectionHostRegistry,
+)
 
 HOOK_SCHEMA = "universe.session-inject-hook.v1"
 PROVIDERS = frozenset({"CLAUDE", "CODEX", "GROK"})
@@ -60,6 +64,41 @@ PROVIDER_HINT_ENV = (
     "AI_PROVIDER",
     "PROVIDER",
 )
+
+
+def bind_rust_host_identity(
+    *,
+    environment: Mapping[str, str],
+    provider: str,
+    session_ref: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Bind identity at the Rust Host; Supervisor state is never evidence here."""
+    host_id = str(environment.get("UNIVERSE_SESSION_HOST_ID") or "").strip()
+    if not host_id:
+        return {"status": "HOST_ID_UNAVAILABLE"}
+    local_app_data = str(environment.get("LOCALAPPDATA") or "").strip()
+    registry_root = Path(
+        str(environment.get("UNIVERSE_RECONNECTION_HOST_REGISTRY") or "").strip()
+        or (Path(local_app_data) / "Universe" / "reconnection-hosts")
+    )
+    binary = Path(
+        str(environment.get("UNIVERSE_RECONNECTION_HOST_BINARY") or "").strip()
+        or (Path(__file__).resolve().parent / "session_host" / "target" / "release" / "universe-session-host.exe")
+    )
+    try:
+        client = ReconnectionHostRegistry(registry_root, binary).discover_by_host_id(host_id)
+        snapshot = client.bind_provider_session(provider, session_ref)
+        if mode:
+            snapshot = client.bind_mode(mode)
+        return {
+            "status": "BOUND",
+            "host_id": str(snapshot.get("host_id") or host_id),
+            "anchor_ref": str(snapshot.get("anchor_ref") or ""),
+            "session_binding_generation": snapshot.get("session_binding_generation"),
+        }
+    except (OSError, ReconnectionHostError, ValueError) as error:
+        return {"status": "BIND_FAILED", "detail": str(error), "host_id": host_id}
 
 # Truthy values that mark this process as a Grok Build / Grok TUI agent.
 _GROK_AGENT_TRUTHY = frozenset({"1", "true", "yes", "on", "GROK", "GROK_AGENT"})
@@ -1147,6 +1186,16 @@ def run_hook(
             "detail": "Session Anchor is created from the PTY supervisor; provider identity is attached later.",
         }
     )
+    rust_host_binding = (
+        bind_rust_host_identity(
+            environment=env,
+            provider=provider,
+            session_ref=session_ref,
+            mode=mode if trigger == "mode_change" else "",
+        )
+        if session_ref and str(env.get("UNIVERSE_SESSION_HOST_ID") or "").strip()
+        else {"status": "NOT_BOUND_HOST_ID_OR_PROVIDER_REF_UNAVAILABLE"}
+    )
 
     inject_body = {
         "project_id": project_id,
@@ -1192,6 +1241,7 @@ def run_hook(
             observation_path=observation_path,
             session_md_status=session_md_status,
             anchor_patch=anchor_patch,
+            rust_host_binding=rust_host_binding,
             inject_body=inject_body,
             **base,
         )
@@ -1210,6 +1260,7 @@ def run_hook(
             observation_path=observation_path,
             session_md_status=session_md_status,
             anchor_patch=anchor_patch,
+            rust_host_binding=rust_host_binding,
             **base,
         )
     if not endpoint_reachable(endpoint):
@@ -1221,6 +1272,7 @@ def run_hook(
             observation_path=observation_path,
             session_md_status=session_md_status,
             anchor_patch=anchor_patch,
+            rust_host_binding=rust_host_binding,
             **base,
         )
 
@@ -1238,6 +1290,7 @@ def run_hook(
             observation_path=observation_path,
             session_md_status=session_md_status,
             anchor_patch=anchor_patch,
+            rust_host_binding=rust_host_binding,
             inject_response={
                 "status": response.get("status"),
                 "supervisor_session_created": response.get(
@@ -1268,6 +1321,7 @@ def run_hook(
         observation_path=observation_path,
         session_md_status=session_md_status,
         anchor_patch=anchor_patch,
+        rust_host_binding=rust_host_binding,
         inject_body=inject_body,
         **base,
     )

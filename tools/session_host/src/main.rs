@@ -57,6 +57,10 @@ struct HostSnapshot {
     pid: u32,
     started_at_unix_ms: u128,
     attachment_generation: u64,
+    session_binding_generation: u64,
+    provider: Option<String>,
+    provider_session_ref: Option<String>,
+    mode: Option<String>,
     attached_supervisor_id: Option<String>,
     runtime_state: String,
     protocol_state: String,
@@ -83,6 +87,9 @@ struct HostRequest {
     cols: Option<u16>,
     rows: Option<u16>,
     channel: Option<Value>,
+    provider: Option<String>,
+    provider_session_ref: Option<String>,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +123,10 @@ struct PublicSnapshot {
     pid: u32,
     started_at_unix_ms: u128,
     attachment_generation: u64,
+    session_binding_generation: u64,
+    provider: Option<String>,
+    provider_session_ref: Option<String>,
+    mode: Option<String>,
     attached_supervisor_id: Option<String>,
     runtime_state: String,
     protocol_state: String,
@@ -348,7 +359,7 @@ struct TerminalRuntime {
 }
 
 impl TerminalRuntime {
-    fn spawn(config: &Config) -> Result<(Self, Option<u32>, Option<u128>), String> {
+    fn spawn(config: &Config, host_id: &str) -> Result<(Self, Option<u32>, Option<u128>), String> {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: config.rows,
@@ -365,6 +376,7 @@ impl TerminalRuntime {
         for (name, value) in &config.environment {
             command.env(name, value);
         }
+        command.env("UNIVERSE_SESSION_HOST_ID", host_id);
         let child = pair
             .slave
             .spawn_command(command)
@@ -480,6 +492,10 @@ impl From<&HostSnapshot> for PublicSnapshot {
             pid: value.pid,
             started_at_unix_ms: value.started_at_unix_ms,
             attachment_generation: value.attachment_generation,
+            session_binding_generation: value.session_binding_generation,
+            provider: value.provider.clone(),
+            provider_session_ref: value.provider_session_ref.clone(),
+            mode: value.mode.clone(),
             attached_supervisor_id: value.attached_supervisor_id.clone(),
             runtime_state: value.runtime_state.clone(),
             protocol_state: value.protocol_state.clone(),
@@ -776,6 +792,38 @@ fn apply_request(
     }
     match request.action.as_str() {
         "status" => success(state),
+        "bind_provider_session" => {
+            let provider = request.provider.unwrap_or_default().trim().to_ascii_uppercase();
+            let session_ref = request.provider_session_ref.unwrap_or_default().trim().to_owned();
+            if !matches!(provider.as_str(), "CLAUDE" | "CODEX" | "GROK") || session_ref.is_empty() {
+                return failure("HOST_PROVIDER_SESSION_BINDING_INVALID", "provider and provider_session_ref are required");
+            }
+            let same = state.provider.as_deref() == Some(provider.as_str())
+                && state.provider_session_ref.as_deref() == Some(session_ref.as_str());
+            if state.provider_session_ref.is_some() && !same {
+                return failure("HOST_PROVIDER_SESSION_BINDING_CONFLICT", "a Rust Host cannot be rebound to a different provider session");
+            }
+            if !same {
+                state.provider = Some(provider);
+                state.provider_session_ref = Some(session_ref);
+                state.session_binding_generation += 1;
+            }
+            success(state)
+        }
+        "bind_mode" => {
+            let mode = request.mode.unwrap_or_default().trim().to_ascii_uppercase();
+            if mode.is_empty() {
+                return failure("HOST_MODE_BINDING_INVALID", "mode is required");
+            }
+            if state.mode.as_deref().is_some_and(|current| current != mode) {
+                return failure("HOST_MODE_BINDING_CONFLICT", "a Rust Host cannot be rebound to a different mode");
+            }
+            if state.mode.as_deref() != Some(mode.as_str()) {
+                state.mode = Some(mode);
+                state.session_binding_generation += 1;
+            }
+            success(state)
+        }
         "attach" => {
             let supervisor_id = match request.supervisor_id {
                 Some(value) if !value.trim().is_empty() => value,
@@ -1016,6 +1064,10 @@ fn handle_connection(
         }
     };
     let before_generation = state.attachment_generation;
+    let before_session_binding_generation = state.session_binding_generation;
+    let before_provider = state.provider.clone();
+    let before_provider_session_ref = state.provider_session_ref.clone();
+    let before_mode = state.mode.clone();
     let before_supervisor = state.attached_supervisor_id.clone();
     let before_runtime_state = state.runtime_state.clone();
     let before_protocol_state = state.protocol_state.clone();
@@ -1035,6 +1087,10 @@ fn handle_connection(
     );
     if response.status == "OK"
         && (before_generation != state.attachment_generation
+            || before_session_binding_generation != state.session_binding_generation
+            || before_provider != state.provider
+            || before_provider_session_ref != state.provider_session_ref
+            || before_mode != state.mode
             || before_supervisor != state.attached_supervisor_id
             || before_runtime_state != state.runtime_state
             || before_protocol_state != state.protocol_state
@@ -1056,8 +1112,9 @@ fn serve(config: Config) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let address: SocketAddr = listener.local_addr().map_err(|error| error.to_string())?;
     let started_at = now_unix_ms();
+    let host_id = format!("host-{}-{started_at:x}", process::id());
     let (terminal, child_pid, child_started_at_unix_ms) =
-        TerminalRuntime::spawn(&config)?;
+        TerminalRuntime::spawn(&config, &host_id)?;
     let cwd = config
         .cwd
         .as_deref()
@@ -1074,7 +1131,7 @@ fn serve(config: Config) -> Result<(), String> {
     };
     let state = HostSnapshot {
         schema: STATE_SCHEMA,
-        host_id: format!("host-{}-{started_at:x}", process::id()),
+        host_id,
         anchor_ref: config.anchor_ref,
         host_kind: config.host_kind,
         owner_ref: config.owner_ref,
@@ -1086,6 +1143,10 @@ fn serve(config: Config) -> Result<(), String> {
         pid: process::id(),
         started_at_unix_ms: started_at,
         attachment_generation: 0,
+        session_binding_generation: 0,
+        provider: None,
+        provider_session_ref: None,
+        mode: None,
         attached_supervisor_id: None,
         runtime_state: "LIVE".to_owned(),
         protocol_state: "NEW".to_owned(),
@@ -1175,6 +1236,10 @@ mod tests {
             pid: 1,
             started_at_unix_ms: 1,
             attachment_generation: 0,
+            session_binding_generation: 0,
+            provider: None,
+            provider_session_ref: None,
+            mode: None,
             attached_supervisor_id: None,
             runtime_state: "LIVE".to_owned(),
             protocol_state: "NEW".to_owned(),
@@ -1215,6 +1280,9 @@ mod tests {
                 cols: None,
                 rows: None,
                 channel: None,
+                provider: None,
+                provider_session_ref: None,
+                mode: None,
             },
             &shutdown,
             None,
@@ -1234,6 +1302,9 @@ mod tests {
                 cols: None,
                 rows: None,
                 channel: None,
+                provider: None,
+                provider_session_ref: None,
+                mode: None,
             },
             &shutdown,
             None,
@@ -1264,6 +1335,9 @@ mod tests {
                 cols: None,
                 rows: None,
                 channel: None,
+                provider: None,
+                provider_session_ref: None,
+                mode: None,
             },
             &shutdown,
             None,
@@ -1288,6 +1362,9 @@ mod tests {
             cols: None,
             rows: None,
             channel: None,
+            provider: None,
+            provider_session_ref: None,
+            mode: None,
         };
 
         assert_eq!(

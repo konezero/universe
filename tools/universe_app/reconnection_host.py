@@ -352,6 +352,18 @@ class ReconnectionHostClient:
     def protocol_initialize_failed(self) -> dict[str, Any]:
         return self.request("protocol_initialize_failed")["host"]
 
+    def bind_provider_session(self, provider: str, provider_session_ref: str) -> dict[str, Any]:
+        """Record the provider identity on the Rust Host, not the Supervisor."""
+        return self.request(
+            "bind_provider_session",
+            provider=str(provider).strip().upper(),
+            provider_session_ref=str(provider_session_ref).strip(),
+        )["host"]
+
+    def bind_mode(self, mode: str) -> dict[str, Any]:
+        """Seal a mode to this Host; a different mode is a Host-side conflict."""
+        return self.request("bind_mode", mode=str(mode).strip().upper())["host"]
+
     def shutdown(self) -> None:
         self.request("shutdown")
 
@@ -613,6 +625,30 @@ class ReconnectionHostRegistry:
                 continue
             clients.append(client)
         return clients
+
+    def discover_by_host_id(self, host_id: str) -> ReconnectionHostClient:
+        """Return one authenticated LIVE Rust Host by its immutable host id."""
+        wanted = str(host_id or "").strip()
+        if not wanted:
+            raise ReconnectionHostError("host_id is required")
+        self.prepare()
+        matches: list[ReconnectionHostClient] = []
+        for path in sorted(self.root.glob("anchor-*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                state = self._read_state_path(path)
+                if state.host_id != wanted or self.state_path(state.anchor_ref) != path:
+                    continue
+                client = self.discover(state.anchor_ref)
+                status = client.status()
+                if status.get("host_id") == wanted and status.get("runtime_state") == "LIVE":
+                    matches.append(client)
+            except ReconnectionHostError:
+                continue
+        if len(matches) != 1:
+            raise ReconnectionHostError("Rust Host id is not uniquely LIVE")
+        return matches[0]
 
     def list_observed_hosts(self) -> list[dict[str, Any]]:
         """Project live, stale, and incompatible Hosts without granting reuse."""
