@@ -45,6 +45,11 @@ BENCH_BONUS = 0.10
 MEMORY_BONUS = 0.05
 RISK_BASE = 0.70
 MAX_CONFIDENCE = 0.95
+CALIBRATION_MATCHES = frozenset({"HIT", "PARTIAL", "MISS"})
+CALIBRATION_STEP = 0.04
+CALIBRATION_CLAMP = 0.15
+PROGRESS_TODO_STATES = frozenset({"DONE"})
+BLOCKED_TODO_STATES = frozenset({"BLOCKED"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -260,15 +265,186 @@ def _bench_hits(
     return hits
 
 
+def _direction_for_kind(kind: Any) -> str:
+    """What a kept suggestion of this kind predicts will happen: a RISK
+    predicts a block/failure, everything else predicts forward progress."""
+
+    return "BLOCKED" if str(kind or "").upper() == "RISK" else "PROGRESS"
+
+
+def _realised_todo_directions(
+    todos: Sequence[Mapping[str, Any]],
+) -> list[tuple[frozenset[str], str, str]]:
+    out: list[tuple[frozenset[str], str, str]] = []
+    for todo in todos:
+        if not isinstance(todo, Mapping):
+            continue
+        state = str(todo.get("state") or "").upper()
+        title = _text(todo.get("title"))
+        if not title:
+            continue
+        if state in PROGRESS_TODO_STATES:
+            direction = "PROGRESS"
+        elif state in BLOCKED_TODO_STATES:
+            direction = "BLOCKED"
+        else:
+            continue
+        out.append(
+            (
+                tokenize(title),
+                direction,
+                "universe://todos/" + _text(todo.get("todo_id")),
+            )
+        )
+    return out
+
+
+def calibrate_predictions(
+    *,
+    predictions: Sequence[Mapping[str, Any]],
+    todos: Sequence[Mapping[str, Any]],
+    experience_cases: Sequence[Mapping[str, Any]],
+    observed_at: str,
+) -> list[dict[str, Any]]:
+    """For each suggestion of every KEPT prediction, resolve what actually
+    happened downstream (Todo state transitions and failed Experience) and
+    compare it with what the suggestion predicted. Deterministic and
+    review-only - it records a match, never a Goal / Todo / adoption.
+    """
+
+    todo_directions = _realised_todo_directions(todos)
+    failed_cases = [
+        (
+            _case_tokens(case),
+            "universe://experience-cases/" + _text(case.get("case_id")),
+        )
+        for case in experience_cases
+        if isinstance(case, Mapping) and _case_failed(case)
+    ]
+    records: list[dict[str, Any]] = []
+    for prediction in predictions:
+        if not isinstance(prediction, Mapping):
+            continue
+        if str(prediction.get("review_state") or "").upper() != "KEPT":
+            continue
+        prediction_id = _text(prediction.get("proposal_id"))
+        if not prediction_id:
+            continue
+        for index, suggestion in enumerate(_items(prediction.get("suggestions"))):
+            if not isinstance(suggestion, Mapping):
+                continue
+            kind = str(suggestion.get("kind") or "").upper()
+            if kind not in SUGGESTION_KINDS:
+                continue
+            predicted = _direction_for_kind(kind)
+            tokens = tokenize(
+                _text(suggestion.get("title"))
+                + " "
+                + _text(suggestion.get("rationale"))
+            )
+            if not tokens:
+                continue
+            realised_dirs: set[str] = set()
+            evidence_refs: list[str] = []
+            for todo_tokens, direction, ref in todo_directions:
+                if len(tokens & todo_tokens) >= 2:
+                    realised_dirs.add(direction)
+                    if ref not in evidence_refs:
+                        evidence_refs.append(ref)
+            for case_tokens, ref in failed_cases:
+                if len(tokens & case_tokens) >= 2:
+                    realised_dirs.add("BLOCKED")
+                    if ref not in evidence_refs:
+                        evidence_refs.append(ref)
+            if not realised_dirs:
+                continue
+            if len(realised_dirs) > 1:
+                realised = "MIXED"
+                match = "PARTIAL"
+            else:
+                realised = next(iter(realised_dirs))
+                match = "HIT" if realised == predicted else "MISS"
+            records.append(
+                {
+                    "prediction_proposal_id": prediction_id,
+                    "suggestion_index": index,
+                    "kind": kind,
+                    "title": _text(suggestion.get("title"))[:160],
+                    "predicted_direction": predicted,
+                    "realised_direction": realised,
+                    "match": match,
+                    "evidence_refs": sorted(evidence_refs)[:10],
+                    "calibrated_at": observed_at,
+                }
+            )
+    records.sort(
+        key=lambda item: (
+            item["prediction_proposal_id"],
+            item["suggestion_index"],
+        )
+    )
+    return records
+
+
+def summarize_calibration(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    kind_stats: dict[str, dict[str, int]] = {}
+    totals = {"HIT": 0, "PARTIAL": 0, "MISS": 0}
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        match = str(record.get("match") or "").upper()
+        if match not in CALIBRATION_MATCHES:
+            continue
+        kind = str(record.get("kind") or "").upper()
+        stats = kind_stats.setdefault(
+            kind, {"HIT": 0, "PARTIAL": 0, "MISS": 0}
+        )
+        stats[match] += 1
+        totals[match] += 1
+    return {
+        "kind_stats": kind_stats,
+        "totals": totals,
+        "count": totals["HIT"] + totals["PARTIAL"] + totals["MISS"],
+    }
+
+
+def calibration_confidence_delta(kind: Any, summary: Mapping[str, Any]) -> float:
+    """Deterministic confidence nudge for a suggestion kind: accumulated
+    HITs raise it, MISSes lower it, both bounded. PARTIAL does not move it.
+    """
+
+    stats = (summary.get("kind_stats") or {}).get(str(kind or "").upper())
+    if not isinstance(stats, Mapping):
+        return 0.0
+    raw = CALIBRATION_STEP * min(int(stats.get("HIT", 0)), 3) - (
+        CALIBRATION_STEP * min(int(stats.get("MISS", 0)), 3)
+    )
+    return round(max(-CALIBRATION_CLAMP, min(CALIBRATION_CLAMP, raw)), 3)
+
+
 def _score(
     *,
     evidence_kinds: set[str],
     recurrence: Sequence[Mapping[str, Any]],
     bench_hits: Sequence[Mapping[str, Any]],
     memory_hit: bool,
+    calibration_delta: float = 0.0,
 ) -> float:
     if recurrence:
-        return min(MAX_CONFIDENCE, RISK_BASE + 0.05 * min(len(recurrence), 4))
+        return round(
+            max(
+                0.0,
+                min(
+                    MAX_CONFIDENCE,
+                    RISK_BASE
+                    + 0.05 * min(len(recurrence), 4)
+                    + calibration_delta,
+                ),
+            ),
+            2,
+        )
     score = KIND_WEIGHT * len(evidence_kinds)
     if "EXPERIENCE_SUCCESS" in evidence_kinds:
         score += SUCCESS_BONUS
@@ -276,7 +452,8 @@ def _score(
         score += BENCH_BONUS
     if memory_hit:
         score += MEMORY_BONUS
-    return min(MAX_CONFIDENCE, round(score, 2))
+    score += calibration_delta
+    return round(max(0.0, min(MAX_CONFIDENCE, score)), 2)
 
 
 def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
@@ -297,6 +474,22 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
     memories = [
         item for item in _items(bundle.get("memories")) if isinstance(item, Mapping)
     ]
+    calibration_records = [
+        item
+        for item in _items(bundle.get("calibration"))
+        if isinstance(item, Mapping)
+    ]
+    calibration_summary = summarize_calibration(calibration_records)
+
+    def _calibration_for(kind: Any) -> dict[str, Any] | None:
+        if not calibration_records:
+            return None
+        return {
+            "delta": calibration_confidence_delta(kind, calibration_summary),
+            "kind_stats": (calibration_summary["kind_stats"]).get(
+                str(kind or "").upper(), {"HIT": 0, "PARTIAL": 0, "MISS": 0}
+            ),
+        }
 
     raw_candidates = (
         _seed_candidates(seed_map or None)
@@ -357,10 +550,16 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     recurrence=recurrence,
                     bench_hits=bench_hits,
                     memory_hit=memory_hit,
+                    calibration_delta=calibration_confidence_delta(
+                        "RISK", calibration_summary
+                    ),
                 ),
                 "adoption_state": "PROPOSAL_ONLY",
                 "recurrence_prevention": recurrence[:5],
             }
+            _calib = _calibration_for("RISK")
+            if _calib is not None:
+                suggestion["calibration"] = _calib
             suggestions.append(suggestion)
             continue
         if item["kind"] == "RISK":
@@ -374,10 +573,16 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     recurrence=[],
                     bench_hits=bench_hits,
                     memory_hit=memory_hit,
+                    calibration_delta=calibration_confidence_delta(
+                        "RISK", calibration_summary
+                    ),
                 ),
                 "adoption_state": "PROPOSAL_ONLY",
                 "recurrence_prevention": [],
             }
+            _calib = _calibration_for("RISK")
+            if _calib is not None:
+                suggestion["calibration"] = _calib
             if suggestion["confidence"] < LOW_CONFIDENCE_THRESHOLD:
                 rejected.append(
                     {
@@ -413,6 +618,9 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
             recurrence=[],
             bench_hits=bench_hits,
             memory_hit=memory_hit,
+            calibration_delta=calibration_confidence_delta(
+                item["kind"], calibration_summary
+            ),
         )
         if confidence < LOW_CONFIDENCE_THRESHOLD:
             rejected.append(
@@ -425,21 +633,23 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
             continue
-        suggestions.append(
-            {
-                "kind": item["kind"],
-                "title": item["title"],
-                "rationale": (
-                    "Supported by "
-                    + ", ".join(sorted(evidence_kinds))
-                    + "; reviewable proposal only."
-                ),
-                "provenance": provenance,
-                "confidence": confidence,
-                "adoption_state": "PROPOSAL_ONLY",
-                "recurrence_prevention": [],
-            }
-        )
+        _general = {
+            "kind": item["kind"],
+            "title": item["title"],
+            "rationale": (
+                "Supported by "
+                + ", ".join(sorted(evidence_kinds))
+                + "; reviewable proposal only."
+            ),
+            "provenance": provenance,
+            "confidence": confidence,
+            "adoption_state": "PROPOSAL_ONLY",
+            "recurrence_prevention": [],
+        }
+        _calib = _calibration_for(item["kind"])
+        if _calib is not None:
+            _general["calibration"] = _calib
+        suggestions.append(_general)
 
     if not raw_candidates:
         rejected.append(
@@ -475,6 +685,10 @@ def build_work_loop_predictions(bundle: Mapping[str, Any]) -> dict[str, Any]:
             "execution_assignment": "NONE",
         },
         "next_operation": "USER_REVIEW_ONLY",
+    }
+    material["calibration"] = {
+        **calibration_summary,
+        "applied": bool(calibration_records),
     }
     material["proposal_digest"] = _digest(
         {

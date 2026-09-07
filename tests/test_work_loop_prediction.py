@@ -12,7 +12,10 @@ from universe_app.work_loop_prediction import (  # noqa: E402
     LOW_CONFIDENCE_THRESHOLD,
     build_result_fanout,
     build_work_loop_predictions,
+    calibrate_predictions,
+    calibration_confidence_delta,
     retrieve_recurrence_prevention,
+    summarize_calibration,
     tokenize,
 )
 
@@ -211,3 +214,136 @@ class WorkLoopPredictionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkLoopCalibrationTests(unittest.TestCase):
+    def _kept(self):
+        return [
+            {
+                "proposal_id": "workloop_cal_1",
+                "review_state": "KEPT",
+                "suggestions": [
+                    {
+                        "kind": "GOAL",
+                        "title": "Ship the anchor retrieval spine",
+                        "rationale": "Bench and Memory backed direction.",
+                    },
+                    {
+                        "kind": "RISK",
+                        "title": "Digest instability under replay churn",
+                        "rationale": "Recurrence warning.",
+                    },
+                ],
+            }
+        ]
+
+    def test_calibrate_predictions_matches_predicted_against_realised(self) -> None:
+        records = calibrate_predictions(
+            predictions=self._kept(),
+            todos=[
+                {
+                    "todo_id": "t1",
+                    "title": "Ship the anchor retrieval spine cache",
+                    "state": "DONE",
+                },
+                {
+                    "todo_id": "t2",
+                    "title": "Digest instability replay churn fix",
+                    "state": "BLOCKED",
+                },
+            ],
+            experience_cases=[],
+            observed_at="2026-09-07T00:00:00Z",
+        )
+        by_index = {r["suggestion_index"]: r for r in records}
+        self.assertEqual("HIT", by_index[0]["match"])
+        self.assertEqual("PROGRESS", by_index[0]["realised_direction"])
+        self.assertEqual("HIT", by_index[1]["match"])
+        self.assertEqual("BLOCKED", by_index[1]["realised_direction"])
+        self.assertIn("universe://todos/t1", by_index[0]["evidence_refs"])
+
+    def test_goal_prediction_that_actually_blocked_is_a_miss(self) -> None:
+        records = calibrate_predictions(
+            predictions=self._kept(),
+            todos=[
+                {
+                    "todo_id": "t3",
+                    "title": "Ship the anchor retrieval spine",
+                    "state": "BLOCKED",
+                }
+            ],
+            experience_cases=[],
+            observed_at="2026-09-07T00:00:00Z",
+        )
+        goal_record = next(r for r in records if r["suggestion_index"] == 0)
+        self.assertEqual("MISS", goal_record["match"])
+
+    def test_calibration_shifts_confidence_and_the_digest(self) -> None:
+        evidence = {
+            "project_id": "GCS",
+            "seed": {
+                "seed_id": "seed-gcs",
+                "project": {"goal": "Ship the operator spine"},
+            },
+            "todos": [
+                {
+                    "todo_id": "todo_done",
+                    "title": "Ship the operator spine",
+                    "state": "DONE",
+                }
+            ],
+            "memories": [
+                {
+                    "memory_id": "memory_1",
+                    "title": "Operator spine notes",
+                    "body": "Ship the operator spine after review.",
+                }
+            ],
+            "experience_cases": [
+                {
+                    "case_id": "case_ok",
+                    "title": "Ship the operator spine",
+                    "observations": [
+                        {
+                            "outcome": "SUCCEEDED",
+                            "validation_state": "PASS",
+                            "skill": {"skill_id": "source-review"},
+                        }
+                    ],
+                }
+            ],
+            "bench_observations": [
+                {
+                    "observation_id": "obs_1",
+                    "outcome": "SUCCEEDED",
+                    "skill": {"skill_id": "source-review"},
+                    "task_kind": "operator",
+                }
+            ],
+        }
+        base = build_work_loop_predictions(evidence)
+        base_goal = next(s for s in base["suggestions"] if s["kind"] == "GOAL")
+        calibrated = build_work_loop_predictions(
+            {
+                **evidence,
+                "calibration": [
+                    {"kind": "GOAL", "match": "HIT"},
+                    {"kind": "GOAL", "match": "HIT"},
+                ],
+            }
+        )
+        self.assertNotEqual(base["proposal_digest"], calibrated["proposal_digest"])
+        self.assertTrue(calibrated["calibration"]["applied"])
+        self.assertFalse(base["calibration"]["applied"])
+        cal_goal = next(s for s in calibrated["suggestions"] if s["kind"] == "GOAL")
+        self.assertGreater(cal_goal["confidence"], base_goal["confidence"])
+        self.assertEqual(0.08, cal_goal["calibration"]["delta"])
+        self.assertGreater(
+            calibration_confidence_delta(
+                "GOAL",
+                summarize_calibration(
+                    [{"kind": "GOAL", "match": "HIT"}, {"kind": "GOAL", "match": "HIT"}]
+                ),
+            ),
+            0.0,
+        )

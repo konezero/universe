@@ -17805,6 +17805,152 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
 
+    def test_kept_prediction_is_calibrated_against_realised_todo_outcomes(self) -> None:
+        self.server.store.register_project(self.registration())
+        prediction = {
+            "proposal_id": "workloop_calib_e2e",
+            "title": "Anchor spine calibration",
+            "suggestions": [
+                {
+                    "kind": "GOAL",
+                    "title": "Ship the anchor retrieval spine",
+                    "rationale": "Bench and Memory backed direction.",
+                },
+                {
+                    "kind": "RISK",
+                    "title": "Digest instability under replay churn",
+                    "rationale": "Recurrence warning only.",
+                },
+            ],
+        }
+        with self.server.store._connection() as connection:
+            connection.execute(
+                "INSERT INTO work_loop_prediction("
+                "proposal_id, project_id, proposal_digest, proposal_json,"
+                " review_state, created_at, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "workloop_calib_e2e",
+                    "GCS",
+                    "calib-e2e-digest",
+                    json.dumps(prediction),
+                    "KEPT",
+                    "2026-09-07T00:00:00Z",
+                    "2026-09-07T00:00:00Z",
+                ),
+            )
+        self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Ship the anchor retrieval spine cache",
+                "detail": "",
+                "priority": "P1",
+                "state": "DONE",
+                "source_kind": "USER",
+                "sort_order": 0,
+            }
+        )
+        self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Digest instability replay churn repair",
+                "detail": "",
+                "priority": "P1",
+                "state": "BLOCKED",
+                "source_kind": "USER",
+                "sort_order": 1,
+            }
+        )
+
+        status, calibrated = self.request(
+            "POST", "/v1/projects/GCS/work-loop/predictions/calibrate", {}, self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("WORK_LOOP_PREDICTION_CALIBRATED", calibrated["status"])
+        by_index = {r["suggestion_index"]: r for r in calibrated["records"]}
+        self.assertEqual("HIT", by_index[0]["match"])
+        self.assertEqual("HIT", by_index[1]["match"])
+        self.assertEqual(2, calibrated["summary"]["totals"]["HIT"])
+
+        status, listed = self.request(
+            "GET", "/v1/projects/GCS/work-loop/predictions", None, self.token
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, listed["calibration"]["summary"]["totals"]["HIT"])
+        item = next(
+            p for p in listed["predictions"]
+            if p["proposal_id"] == "workloop_calib_e2e"
+        )
+        self.assertEqual(
+            ["USER_REVIEW", "OUTCOME_CALIBRATED"], item["feedback"]["bases"]
+        )
+        self.assertEqual("USER_REVIEW", item["feedback"]["basis"])
+        self.assertEqual(2, item["feedback"]["calibration"]["hit"])
+        self.assertEqual(0, item["feedback"]["calibration"]["miss"])
+
+    def test_propose_predictions_feeds_calibration_back_as_evidence_weight(self) -> None:
+        self.server.store.register_project(self.registration())
+        # First proposal: no calibration yet.
+        status, first = self.request(
+            "POST", "/v1/projects/GCS/work-loop/predictions", {}, self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertFalse(first["prediction"]["calibration"]["applied"])
+        # A KEPT prediction + a matching DONE Todo -> the next proposal build
+        # runs calibration first and records it.
+        with self.server.store._connection() as connection:
+            connection.execute(
+                "INSERT INTO work_loop_prediction("
+                "proposal_id, project_id, proposal_digest, proposal_json,"
+                " review_state, created_at, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "workloop_feedback",
+                    "GCS",
+                    "feedback-digest",
+                    json.dumps(
+                        {
+                            "proposal_id": "workloop_feedback",
+                            "suggestions": [
+                                {
+                                    "kind": "GOAL",
+                                    "title": "Operator spine delivery",
+                                    "rationale": "backed",
+                                }
+                            ],
+                        }
+                    ),
+                    "KEPT",
+                    "2026-09-07T00:00:00Z",
+                    "2026-09-07T00:00:00Z",
+                ),
+            )
+        self.server.store.create_todo(
+            {
+                "scope_kind": "PROJECT",
+                "project_id": "GCS",
+                "title": "Operator spine delivery milestone",
+                "detail": "",
+                "priority": "P1",
+                "state": "DONE",
+                "source_kind": "USER",
+                "sort_order": 0,
+            }
+        )
+        calib = self.server.store.calibrate_work_loop_predictions("GCS")
+        self.assertEqual(1, calib["summary"]["totals"]["HIT"])
+        # Calibration feeds back: the changed evidence weight yields a fresh
+        # prediction proposal (CREATED), not a digest-stable replay.
+        status, second = self.request(
+            "POST", "/v1/projects/GCS/work-loop/predictions", {}, self.token
+        )
+        self.assertEqual(HTTPStatus.CREATED, status)
+        self.assertTrue(second["prediction"]["calibration"]["applied"])
+        self.assertEqual(
+            1, second["prediction"]["calibration"]["totals"]["HIT"]
+        )
+
+
 class RuntimeLeaseStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

@@ -307,6 +307,8 @@ from universe_app.work_loop_prediction import (
     WORK_LOOP_RESULT_FANOUT_SCHEMA,
     build_result_fanout,
     build_work_loop_predictions,
+    calibrate_predictions,
+    summarize_calibration,
     tokenize as _wl_tokenize,
 )
 from universe_app.feature_node_proposal import (
@@ -6849,6 +6851,15 @@ class UniverseStore:
 
                 CREATE INDEX IF NOT EXISTS work_loop_prediction_project_time
                 ON work_loop_prediction(project_id, created_at, proposal_id);
+
+                CREATE TABLE IF NOT EXISTS work_loop_prediction_calibration (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    records_json TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    calibrated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS work_loop_result_fanout (
                     fanout_id TEXT PRIMARY KEY,
@@ -21517,6 +21528,12 @@ class UniverseStore:
                 project["project_id"], link_state="LINKED", limit=200
             ),
         }
+        # Close the learning loop (edge C): the prior KEPT predictions are
+        # calibrated against their realised outcomes, and that calibration
+        # becomes a deterministic confidence weight on this fresh build.
+        bundle["calibration"] = self.calibrate_work_loop_predictions(
+            project["project_id"]
+        )["records"]
         material = build_work_loop_predictions(bundle)
         now = utc_now()
         with self._connection() as connection:
@@ -21554,6 +21571,79 @@ class UniverseStore:
         material["reviewed_at"] = None
         return material, True
 
+    def calibrate_work_loop_predictions(
+        self, project_id: str
+    ) -> dict[str, Any]:
+        """Resolve every KEPT prediction against its realised downstream
+        outcome and persist the match records + summary. Review-only: it
+        never creates a Goal, Todo, authority, or execution assignment.
+        """
+
+        project = self.get_project(project_id)
+        now = utc_now()
+        kept = [
+            item
+            for item in self.list_work_loop_predictions(project["project_id"])
+            if str(item.get("review_state") or "").upper() == "KEPT"
+        ]
+        todos = [
+            todo
+            for todo in self.list_todos()
+            if todo.get("project_id") == project["project_id"]
+        ]
+        records = calibrate_predictions(
+            predictions=kept,
+            todos=todos,
+            experience_cases=self.list_experience_cases(
+                project["project_id"], limit=200
+            ),
+            observed_at=now,
+        )
+        summary = summarize_calibration(records)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_loop_prediction_calibration(
+                    project_id, records_json, summary_json, calibrated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    records_json = excluded.records_json,
+                    summary_json = excluded.summary_json,
+                    calibrated_at = excluded.calibrated_at
+                """,
+                (
+                    project["project_id"],
+                    _canonical_json(records),
+                    _canonical_json(summary),
+                    now,
+                ),
+            )
+        return {
+            "schema": "universe.work-loop-prediction-calibration.v1",
+            "status": "WORK_LOOP_PREDICTION_CALIBRATED",
+            "project_id": project["project_id"],
+            "records": records,
+            "summary": summary,
+            "calibrated_at": now,
+        }
+
+    def _load_prediction_calibration(
+        self, project_id: str
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT records_json, summary_json, calibrated_at FROM "
+                "work_loop_prediction_calibration WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return {"records": [], "summary": summarize_calibration([]), "calibrated_at": None}
+        return {
+            "records": json.loads(row["records_json"]),
+            "summary": json.loads(row["summary_json"]),
+            "calibrated_at": str(row["calibrated_at"]),
+        }
+
     def list_work_loop_predictions(
         self, project_id: str, *, limit: int = 50
     ) -> list[dict[str, Any]]:
@@ -21584,10 +21674,33 @@ class UniverseStore:
                     else "PENDING"
                 ),
                 "basis": "USER_REVIEW",
+                "bases": ["USER_REVIEW"],
                 "recorded_at": row["reviewed_at"],
                 "effects": {"goal_created": False, "todo_created": False},
             }
             items.append(item)
+        calibration = self._load_prediction_calibration(project["project_id"])
+        calibration_by_prediction: dict[str, list[dict[str, Any]]] = {}
+        for record in calibration.get("records") or []:
+            if not isinstance(record, Mapping):
+                continue
+            calibration_by_prediction.setdefault(
+                str(record.get("prediction_proposal_id") or ""), []
+            ).append(dict(record))
+        for item in items:
+            matches = calibration_by_prediction.get(
+                str(item.get("proposal_id") or "")
+            )
+            if matches:
+                item["feedback"]["bases"] = ["USER_REVIEW", "OUTCOME_CALIBRATED"]
+                item["feedback"]["calibration"] = {
+                    "matches": matches,
+                    "hit": sum(1 for m in matches if m.get("match") == "HIT"),
+                    "miss": sum(1 for m in matches if m.get("match") == "MISS"),
+                    "partial": sum(
+                        1 for m in matches if m.get("match") == "PARTIAL"
+                    ),
+                }
         features = self.list_feature_nodes(project["project_id"])
         for item in items:
             proposal_id = str(item.get("proposal_id") or "")
@@ -41263,6 +41376,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "predictions": self.server.store.list_work_loop_predictions(
                             project_id
                         ),
+                        "calibration": self.server.store._load_prediction_calibration(
+                            project_id
+                        ),
                     },
                 )
                 return
@@ -44342,6 +44458,10 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/work-loop/predictions/calibrate":
+                result = self.server.store.calibrate_work_loop_predictions(parts[0])
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+                return
             if parts is not None and parts[1] == "/work-loop/predictions/review":
                 prediction, changed = self.server.store.review_work_loop_prediction(
                     parts[0], body
@@ -45076,6 +45196,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/master-handoffs",
             "/experience-cases/from-observations",
             "/experience-cases",
+            "/work-loop/predictions/calibrate",
             "/work-loop/predictions/review",
             "/work-loop/review-candidates/review",
             "/work-loop/predictions",
