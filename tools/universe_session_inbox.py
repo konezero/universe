@@ -215,6 +215,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "outcome": args.outcome,
             },
         )
+    elif command == "post":
+        body = Path(args.body_file).read_text(encoding="utf-8")
+        http_status, payload = _http(
+            endpoint,
+            token,
+            "POST",
+            "/v1/session-bus/messages",
+            {
+                "from": {
+                    "session_anchor_ref": anchor,
+                    "terminal_id": terminal,
+                },
+                "to": {
+                    "session_anchor_ref": args.to_anchor,
+                    "project_id": args.project_id,
+                    "mode": args.to_mode,
+                    "provider": args.to_provider,
+                },
+                "kind": args.kind,
+                "notify": args.notify,
+                "body_text": body,
+            },
+        )
     else:
         deadline = time.monotonic() + max(0.0, float(args.timeout))
         payload = {"messages": []}
@@ -271,6 +294,15 @@ def _parser() -> argparse.ArgumentParser:
     reply.add_argument("--body-file", required=True)
     reply.add_argument("--result-ref", default="")
     reply.add_argument("--outcome", choices=("COMPLETED", "FAILED"), default="COMPLETED")
+
+    posting = subparsers.add_parser("post")
+    posting.add_argument("--to-anchor", required=True)
+    posting.add_argument("--body-file", required=True)
+    posting.add_argument("--project-id", default="")
+    posting.add_argument("--to-mode", default="CONDUCTOR")
+    posting.add_argument("--to-provider", default="")
+    posting.add_argument("--kind", choices=("NOTE", "RESULT", "COORDINATION"), default="RESULT")
+    posting.add_argument("--notify", choices=("NONE", "HEADER"), default="HEADER")
 
     waiting = subparsers.add_parser("wait")
     waiting.add_argument("--timeout", type=float, default=30.0)

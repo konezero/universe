@@ -1246,22 +1246,35 @@ class TerminalHostTests(unittest.TestCase):
             )
             self.assertEqual("HIGH", seen.get("effort"))
 
-    def test_claude_master_startup_appends_the_master_role_system_prompt(self) -> None:
-        argv = startup_argv(
+    def test_master_startup_injects_provider_specific_role_framing(self) -> None:
+        expected_queue = "/v1/projects/career/master-messages"
+        claude_argv = startup_argv(
             "CLAUDE", "", mode="MASTER", project_id="career", claude_channel_enabled=True
         )
-        self.assertIn("--append-system-prompt", argv)
-        prompt = argv[argv.index("--append-system-prompt") + 1]
-        self.assertIn("MASTER session", prompt)
-        self.assertIn("/v1/projects/career/master-messages", prompt)
-        self.assertNotIn('"', prompt)  # no embedded quotes to survive shell requoting
-        # A non-MASTER Claude terminal and other providers get no append.
+        self.assertIn("--append-system-prompt", claude_argv)
+        claude_prompt = claude_argv[claude_argv.index("--append-system-prompt") + 1]
+        self.assertIn("MASTER session", claude_prompt)
+        self.assertIn(expected_queue, claude_prompt)
+        self.assertNotIn('"', claude_prompt)  # no embedded quotes to survive shell requoting
+
+        codex_argv = startup_argv("CODEX", "", mode="MASTER", project_id="career")
+        self.assertIn("--config", codex_argv)
+        codex_config = codex_argv[codex_argv.index("--config") + 1]
+        self.assertTrue(codex_config.startswith("developer_instructions="))
+        codex_prompt = codex_config.split("=", 1)[1]
+        self.assertEqual(claude_prompt, codex_prompt)
+
+        grok_argv = startup_argv("GROK", "", mode="MASTER", project_id="career")
+        self.assertIn("--rules", grok_argv)
+        grok_prompt = grok_argv[grok_argv.index("--rules") + 1]
+        self.assertEqual(claude_prompt, grok_prompt)
+
+        # MASTER framing must not bleed into other modes.
         self.assertNotIn(
             "--append-system-prompt", startup_argv("CLAUDE", "", mode="CONDUCTOR")
         )
-        self.assertNotIn(
-            "--append-system-prompt", startup_argv("CODEX", "", mode="MASTER")
-        )
+        self.assertNotIn("--config", startup_argv("CODEX", "", mode="CONDUCTOR"))
+        self.assertNotIn("--rules", startup_argv("GROK", "", mode="CONDUCTOR"))
 
     def test_fresh_codex_and_grok_sessions_receive_bounded_bootstrap_input(self) -> None:
         expected = (

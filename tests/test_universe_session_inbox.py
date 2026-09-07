@@ -67,6 +67,39 @@ class SessionInboxCliTests(unittest.TestCase):
         self.assertEqual("provider result", posted["body_text"])
         self.assertEqual("term_cli_1", posted["terminal_id"])
 
+    def test_post_sends_result_to_target_anchor(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            body_file = Path(temporary) / "result.txt"
+            body_file.write_text("MASTER completed framing update", encoding="utf-8")
+            args = inbox_cli._parser().parse_args(
+                [
+                    "--anchor",
+                    "master_anchor_1",
+                    "post",
+                    "--to-anchor",
+                    "conductor_anchor_1",
+                    "--body-file",
+                    str(body_file),
+                    "--project-id",
+                    "universe",
+                ]
+            )
+            with mock.patch.object(inbox_cli, "resolve", return_value=self.ready_endpoint()), mock.patch.object(
+                inbox_cli,
+                "_http",
+                return_value=(201, {"status": "CREATED", "message_id": "msg_result_1"}),
+            ) as request:
+                result = inbox_cli.run(args)
+
+        self.assertEqual("INBOX_COMPLETED", result["status"])
+        self.assertEqual("/v1/session-bus/messages", request.call_args.args[3])
+        posted = request.call_args.args[4]
+        self.assertEqual("master_anchor_1", posted["from"]["session_anchor_ref"])
+        self.assertEqual("conductor_anchor_1", posted["to"]["session_anchor_ref"])
+        self.assertEqual("CONDUCTOR", posted["to"]["mode"])
+        self.assertEqual("RESULT", posted["kind"])
+        self.assertEqual("MASTER completed framing update", posted["body_text"])
+
     def test_state_maps_provider_friendly_working_alias(self) -> None:
         args = inbox_cli._parser().parse_args(
             ["--anchor", "anchor_cli_1", "state", "msg_1", "WORKING"]

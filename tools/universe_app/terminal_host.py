@@ -3028,15 +3028,22 @@ def startup_argv(
     argv: list[str] = []
     if name in {"GROK", "CLAUDE", "CODEX"} and model:
         argv.extend(("--model", model))
-    if name == "CLAUDE" and str(mode or "").strip().upper() == "MASTER":
-        argv.extend(
-            (
-                "--append-system-prompt",
-                MASTER_APPEND_SYSTEM_PROMPT.replace(
-                    "PROJECT_ID", str(project_id or "").strip() or "the-project"
-                ),
-            )
+    if str(mode or "").strip().upper() == "MASTER":
+        master_prompt = MASTER_APPEND_SYSTEM_PROMPT.replace(
+            "PROJECT_ID", str(project_id or "").strip() or "the-project"
         )
+        if name == "CLAUDE":
+            argv.extend(("--append-system-prompt", master_prompt))
+        elif name == "CODEX":
+            # Codex accepts per-launch TOML overrides.  Keep the framing as
+            # additive developer instructions rather than replacing its built-in
+            # instructions with model_instructions_file. The managed Windows
+            # cmd boundary rejects literal quotes, while Codex treats an
+            # unparseable config value as a string, so pass the prompt as one
+            # unquoted argv value.
+            argv.extend(("--config", f"developer_instructions={master_prompt}"))
+        elif name == "GROK":
+            argv.extend(("--rules", master_prompt))
     if selected_effort != "AUTO":
         if name == "GROK":
             argv.extend(("--reasoning-effort", selected_effort.lower()))
