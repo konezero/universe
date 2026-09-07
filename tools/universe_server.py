@@ -625,6 +625,12 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
 }
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
 EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
+PREDICTED_EXPECTED_PATH_SCHEMA = (
+    "universe.feature-predicted-expected-path.v1"
+)
+# GOAL / PLAN / MILESTONE prediction suggestions become predicted route
+# steps; RISK suggestions become route risks (recurrence warnings).
+_WORK_LOOP_PREDICTION_STEP_KINDS = ("GOAL", "PLAN", "MILESTONE")
 FEATURE_PATH_ADOPTION_SCHEMA = "universe.feature-path-adoption.v1"
 FEATURE_GOAL_DERIVATION_SCHEMA = "universe.feature-goal-derivation.v1"
 FEATURE_GOAL_START_RECEIPT_SCHEMA = "universe.feature-goal-start-receipt.v1"
@@ -12022,6 +12028,130 @@ class UniverseStore:
 
     # -- Meeting Room session auto-assignment (planning-context slice-2) --
 
+    def _predicted_expected_paths_for_feature(
+        self,
+        feature: Mapping[str, Any],
+        predictions: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Projection-only Expected Path v2 routes derived from the kept
+        Work Loop predictions this Feature Node was compiled from. Never an
+        adopted path: no feature_expected_path row, no Goal start."""
+
+        feature_id = str(feature.get("feature_id") or "")
+        evidence_refs = feature.get("evidence_refs")
+        evidence_refs = evidence_refs if isinstance(evidence_refs, list) else []
+        out: list[dict[str, Any]] = []
+        for prediction in predictions:
+            if str(prediction.get("review_state") or "").upper() != "KEPT":
+                continue
+            proposal_id = str(prediction.get("proposal_id") or "")
+            if not proposal_id:
+                continue
+            prefix = (
+                f"universe://work-loop/predictions/{proposal_id}/"
+            )
+            matched = sorted(
+                {
+                    ref
+                    for ref in evidence_refs
+                    if isinstance(ref, str) and ref.startswith(prefix)
+                }
+            )
+            if not matched:
+                continue
+            suggestions = prediction.get("suggestions")
+            suggestions = suggestions if isinstance(suggestions, list) else []
+            steps: list[dict[str, str]] = []
+            phase_map: dict[str, list[str]] = {}
+            risks: list[dict[str, str]] = []
+            for suggestion in suggestions:
+                if not isinstance(suggestion, Mapping):
+                    continue
+                kind = str(suggestion.get("kind") or "").upper()
+                title = str(suggestion.get("title") or "").strip()
+                if not title:
+                    continue
+                rationale = (
+                    str(suggestion.get("rationale") or "").strip() or title
+                )
+                if kind in _WORK_LOOP_PREDICTION_STEP_KINDS:
+                    step_id = f"s{len(steps) + 1}"
+                    steps.append(
+                        {
+                            "step_id": step_id,
+                            "title": title[:160],
+                            "summary": rationale[:1200],
+                            "phase": kind,
+                        }
+                    )
+                    phase_map.setdefault(kind, []).append(step_id)
+                elif kind == "RISK":
+                    risks.append(
+                        {"risk": title[:500], "mitigation": rationale[:1000]}
+                    )
+            if not steps:
+                continue
+            route_input = {
+                "steps": steps,
+                "dependencies": [
+                    {
+                        "from_step_id": steps[i]["step_id"],
+                        "to_step_id": steps[i + 1]["step_id"],
+                        "kind": "PRECEDES",
+                    }
+                    for i in range(len(steps) - 1)
+                ],
+                "branches": [],
+                "architecture_decisions": [],
+                "implementation_phases": [
+                    {"title": kind.title(), "step_ids": ids}
+                    for kind, ids in phase_map.items()
+                ],
+                "risks": risks[:16],
+                "acceptance_conditions": [],
+                "estimates": {
+                    key: "PREDICTED - not yet estimated"
+                    for key in ("effort", "cost", "quota")
+                },
+                "evidence_refs": matched[:50],
+            }
+            try:
+                route = normalize_expected_path_route(route_input)
+            except UniverseError:
+                continue
+            route_digest = _json_sha256(route)
+            predicted_path_id = "predpath_" + hashlib.sha256(
+                f"{feature_id}:{proposal_id}".encode("utf-8")
+            ).hexdigest()[:24]
+            out.append(
+                {
+                    "schema": PREDICTED_EXPECTED_PATH_SCHEMA,
+                    "predicted_path_id": predicted_path_id,
+                    "feature_id": feature_id,
+                    "node_ref": feature_id,
+                    "prediction_proposal_id": proposal_id,
+                    "title": str(
+                        prediction.get("title")
+                        or f"Predicted route for {feature_id}"
+                    ),
+                    "review_state": "KEPT",
+                    "route": route,
+                    "route_digest": route_digest,
+                    "source_refs": matched[:50],
+                    "adopted": False,
+                    "projection_only": True,
+                }
+            )
+        out.sort(key=lambda item: item["predicted_path_id"])
+        return out
+
+    def predicted_expected_paths(self, feature_id: str) -> list[dict[str, Any]]:
+        feature = self.get_feature_node(feature_id)
+        return self._predicted_expected_paths_for_feature(
+            feature,
+            self.list_work_loop_predictions(feature["project_id"]),
+        )
+
     @staticmethod
     def _node_planning_meeting_mode(feature: Mapping[str, Any]) -> str:
         """DESIGN when the Feature Node already carries competing routes;
@@ -21192,6 +21322,22 @@ class UniverseStore:
                 "effects": {"goal_created": False, "todo_created": False},
             }
             items.append(item)
+        features = self.list_feature_nodes(project["project_id"])
+        for item in items:
+            proposal_id = str(item.get("proposal_id") or "")
+            prefix = f"universe://work-loop/predictions/{proposal_id}/"
+            bound = sorted(
+                {
+                    str(feature.get("feature_id"))
+                    for feature in features
+                    if any(
+                        isinstance(ref, str) and ref.startswith(prefix)
+                        for ref in (feature.get("evidence_refs") or [])
+                    )
+                }
+            )
+            item["node_ref"] = bound[0] if bound else None
+            item["bound_feature_ids"] = bound
         return items
 
     def review_work_loop_prediction(
@@ -21866,7 +22012,9 @@ class UniverseStore:
                 relation = str(functional_edge.get("kind") or "RELATED_TO")
                 add_edge(f"FUNCTIONAL_{relation}", source, target, seed_ref)
 
-        for prediction in self.list_work_loop_predictions(project_id):
+        work_loop_predictions = self.list_work_loop_predictions(project_id)
+        prediction_nodes_by_id: dict[str, str] = {}
+        for prediction in work_loop_predictions:
             proposal_id = str(prediction.get("proposal_id") or "")
             if not proposal_id:
                 continue
@@ -21877,6 +22025,7 @@ class UniverseStore:
                 str(prediction.get("review_state") or "PROPOSAL_ONLY"),
                 "WORK_LOOP_PREDICTION", f"universe://work-loop/predictions/{proposal_id}", prediction,
             )
+            prediction_nodes_by_id[proposal_id] = prediction_node
             add_edge("PROJECT_HAS_PREDICTION", project_node, prediction_node, f"universe://work-loop/predictions/{proposal_id}")
 
         # Document automation remains review-only, but it must be visible as a
@@ -22606,6 +22755,93 @@ class UniverseStore:
                                     target,
                                     f"{path_ref}/route/branches/{branch_index}",
                                 )
+            for predicted in self._predicted_expected_paths_for_feature(
+                detailed_feature, work_loop_predictions
+            ):
+                predicted_id = predicted["predicted_path_id"]
+                predicted_ref = (
+                    f"{feature_ref}/predicted-paths/{predicted_id}"
+                )
+                predicted_node = add_node(
+                    "PREDICTED_EXPECTED_PATH",
+                    predicted_id,
+                    str(predicted["title"]),
+                    "PREDICTED",
+                    "FEATURE_PREDICTED_EXPECTED_PATH",
+                    predicted_ref,
+                    {
+                        "predicted_path_id": predicted_id,
+                        "feature_id": feature_id,
+                        "prediction_proposal_id": predicted["prediction_proposal_id"],
+                        "route_digest": predicted["route_digest"],
+                        "source_refs": predicted["source_refs"],
+                        "adopted": False,
+                        "step_count": len(predicted["route"]["steps"]),
+                    },
+                )
+                add_edge(
+                    "FEATURE_NODE_HAS_PREDICTED_PATH",
+                    feature_node,
+                    predicted_node,
+                    predicted_ref,
+                )
+                prediction_node = prediction_nodes_by_id.get(
+                    predicted["prediction_proposal_id"]
+                )
+                if prediction_node is not None:
+                    add_edge(
+                        "PREDICTED_PATH_FROM_WORK_LOOP_PREDICTION",
+                        predicted_node,
+                        prediction_node,
+                        predicted_ref,
+                    )
+                predicted_step_nodes: dict[str, str] = {}
+                for ordinal, step in enumerate(
+                    predicted["route"]["steps"], start=1
+                ):
+                    step_id = str(step.get("step_id") or "")
+                    if not step_id:
+                        continue
+                    step_ref = f"{predicted_ref}/route/steps/{step_id}"
+                    step_node = add_node(
+                        "PREDICTED_EXPECTED_PATH_STEP",
+                        f"{predicted_id}:{step_id}",
+                        str(step.get("title") or step_id),
+                        "PREDICTED",
+                        "FEATURE_PREDICTED_EXPECTED_PATH_STEP",
+                        step_ref,
+                        {
+                            "predicted_path_id": predicted_id,
+                            "step_id": step_id,
+                            "ordinal": ordinal,
+                            "summary": step.get("summary"),
+                            "phase": step.get("phase"),
+                            "route_digest": predicted["route_digest"],
+                            "predicted": True,
+                        },
+                    )
+                    predicted_step_nodes[step_id] = step_node
+                    add_edge(
+                        "PREDICTED_PATH_HAS_STEP",
+                        predicted_node,
+                        step_node,
+                        step_ref,
+                    )
+                for dependency in predicted["route"]["dependencies"]:
+                    source = predicted_step_nodes.get(
+                        str(dependency.get("from_step_id") or "")
+                    )
+                    target = predicted_step_nodes.get(
+                        str(dependency.get("to_step_id") or "")
+                    )
+                    if source is not None and target is not None:
+                        add_edge(
+                            "PREDICTED_PATH_STEP_"
+                            + str(dependency.get("kind") or "PRECEDES"),
+                            source,
+                            target,
+                            predicted_ref + "/route/dependencies",
+                        )
             adoption = detailed_feature.get("adoption")
             if adoption and str(adoption["expected_path_id"]) in path_nodes:
                 add_edge(
@@ -39894,6 +40130,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "project_id": project_id,
                         "proposals": self.server.store.list_feature_node_proposals(
                             project_id
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        feature_predicted_paths = re.fullmatch(
+            r"/v1/feature-nodes/([^/]+)/predicted-paths", path
+        )
+        if feature_predicted_paths is not None:
+            try:
+                feature_id = unquote(feature_predicted_paths.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_PREDICTED_PATHS_COLLECTED",
+                        "feature_id": feature_id,
+                        "predicted_paths": (
+                            self.server.store.predicted_expected_paths(feature_id)
                         ),
                     },
                 )

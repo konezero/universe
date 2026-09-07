@@ -17500,6 +17500,127 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
 
 
+    def _seed_kept_prediction_and_feature(self):
+        self.server.store.register_project(self.registration())
+        prediction = {
+            "proposal_id": "workloop_predpath_1",
+            "title": "Predicted anchor spine route",
+            "suggestions": [
+                {
+                    "kind": "GOAL",
+                    "title": "Anchor-native retrieval spine",
+                    "rationale": "BENCH and MEMORY backed direction.",
+                    "confidence": 0.72,
+                },
+                {
+                    "kind": "PLAN",
+                    "title": "Projection-only route graph",
+                    "rationale": "Compare predicted route with the route taken.",
+                    "confidence": 0.61,
+                },
+                {
+                    "kind": "RISK",
+                    "title": "Digest instability under replay",
+                    "rationale": "Recurrence warning only.",
+                    "confidence": 0.5,
+                },
+            ],
+        }
+        with self.server.store._connection() as connection:
+            connection.execute(
+                "INSERT INTO work_loop_prediction("
+                "proposal_id, project_id, proposal_digest, proposal_json,"
+                " review_state, created_at, reviewed_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    "workloop_predpath_1",
+                    "GCS",
+                    "predpath-digest-1",
+                    json.dumps(prediction),
+                    "KEPT",
+                    "2026-09-07T00:00:00Z",
+                    "2026-09-07T00:00:00Z",
+                ),
+            )
+        feature, created = self.server.store.create_feature_node(
+            "GCS",
+            {
+                "idempotency_key": "predicted-path-feature",
+                "title": "Anchor spine feature",
+                "intent_text": "Build the anchor-native retrieval spine.",
+                "created_by_role": "CONDUCTOR",
+                "evidence_refs": [
+                    "universe://work-loop/predictions/workloop_predpath_1/suggestions/0",
+                    "universe://work-loop/predictions/workloop_predpath_1/suggestions/1",
+                ],
+            },
+        )
+        self.assertTrue(created)
+        return feature
+
+    def test_kept_prediction_projects_as_a_node_bound_predicted_path(self) -> None:
+        feature = self._seed_kept_prediction_and_feature()
+
+        predicted = self.server.store.predicted_expected_paths(feature["feature_id"])
+        self.assertEqual(1, len(predicted))
+        route = predicted[0]["route"]
+        self.assertEqual(feature["feature_id"], predicted[0]["node_ref"])
+        self.assertEqual("workloop_predpath_1", predicted[0]["prediction_proposal_id"])
+        self.assertFalse(predicted[0]["adopted"])
+        self.assertEqual(64, len(predicted[0]["route_digest"]))
+        self.assertEqual(2, len(route["steps"]))
+        self.assertEqual(
+            ["GOAL", "PLAN"], [step["phase"] for step in route["steps"]]
+        )
+        self.assertEqual(1, len(route["risks"]))
+        self.assertEqual(
+            "universe.feature-expected-path-route.v2", route["schema"]
+        )
+        # projection-only: no adopted Expected Path row was created
+        self.assertEqual([], self.server.store.get_feature_node(
+            feature["feature_id"]
+        )["expected_paths"])
+
+        status, collected = self.request(
+            "GET",
+            f"/v1/feature-nodes/{feature['feature_id']}/predicted-paths",
+            None,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "FEATURE_NODE_PREDICTED_PATHS_COLLECTED", collected["status"]
+        )
+        self.assertEqual(1, len(collected["predicted_paths"]))
+
+        predictions = self.server.store.list_work_loop_predictions("GCS")
+        bound = next(
+            item
+            for item in predictions
+            if item["proposal_id"] == "workloop_predpath_1"
+        )
+        self.assertEqual(feature["feature_id"], bound["node_ref"])
+        self.assertEqual([feature["feature_id"]], bound["bound_feature_ids"])
+
+        graph = self.server.store.semantic_project_graph("GCS")
+        edge_types = {edge["edge_type"] for edge in graph["edges"]}
+        self.assertIn("FEATURE_NODE_HAS_PREDICTED_PATH", edge_types)
+        self.assertIn("PREDICTED_PATH_FROM_WORK_LOOP_PREDICTION", edge_types)
+        predicted_nodes = [
+            node
+            for node in graph["nodes"]
+            if node["entity_type"] == "PREDICTED_EXPECTED_PATH"
+        ]
+        self.assertEqual(1, len(predicted_nodes))
+        self.assertEqual("PREDICTED", predicted_nodes[0]["lifecycle_state"])
+        self.assertTrue(predicted_nodes[0]["projection_only"])
+        step_nodes = [
+            node
+            for node in graph["nodes"]
+            if node["entity_type"] == "PREDICTED_EXPECTED_PATH_STEP"
+        ]
+        self.assertEqual(2, len(step_nodes))
+
+
 class RuntimeLeaseStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
