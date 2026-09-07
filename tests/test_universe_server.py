@@ -1406,31 +1406,46 @@ class UniverseLocalServiceTests(unittest.TestCase):
             self.server.store.get_todo(todo_id)["title"],
         )
 
+        base_update = {
+            "scope_kind": "PROJECT",
+            "project_id": "GCS",
+            "title": "Draft and land the work-surface Action",
+            "detail": "",
+            "priority": "P0",
+            "state": "READY",
+            "source_kind": "USER",
+            "sort_order": 5,
+            "revision": 1,
+        }
         status, updated = self.request(
             "POST",
             "/v1/actions",
             {
                 "action_id": "todo.update",
-                "request": {
-                    "todo_id": todo_id,
-                    "todo": {
-                        "scope_kind": "PROJECT",
-                        "project_id": "GCS",
-                        "title": "Draft and land the work-surface Action",
-                        "detail": "",
-                        "priority": "P0",
-                        "state": "IN_PROGRESS",
-                        "source_kind": "USER",
-                        "sort_order": 5,
-                        "revision": 1,
-                    },
-                },
+                "request": {"todo_id": todo_id, "todo": base_update},
             },
         )
         self.assertEqual(200, status, updated)
         self.assertEqual("TODO_UPDATED", updated["status"])
         self.assertEqual(2, updated["todo"]["revision"])
         self.assertEqual("P0", updated["todo"]["priority"])
+        self.assertEqual("READY", updated["todo"]["state"])
+
+        # todo.update must not carry a lifecycle state transition.
+        status, blocked = self.request(
+            "POST",
+            "/v1/actions",
+            {
+                "action_id": "todo.update",
+                "request": {
+                    "todo_id": todo_id,
+                    "todo": {**base_update, "state": "DONE", "revision": 2},
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status, blocked)
+        self.assertEqual("ACTION_TODO_LIFECYCLE_VIA_RECEIPT", blocked["error_code"])
+        self.assertEqual("READY", self.server.store.get_todo(todo_id)["state"])
 
         status, feature = self.request(
             "POST",

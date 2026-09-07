@@ -27161,6 +27161,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             memory_batch_run_handler=self._handle_memory_batch_run_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
+            # Only create/replace Actions are on the generic /v1/actions surface.
+            # Todo lifecycle transitions stay on the anchor-aware receipt gateway
+            # (/v1/todo-action-mutation-receipts) - see docs/action-ir-work-surface.md.
             work_surface_handlers={
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
@@ -28591,7 +28594,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(
                 "REQUEST_INVALID", "todo_update_action.todo must be an object"
             )
-        todo = self.store.update_todo(todo_id, dict(todo_body))
+        # Lifecycle state transitions never route through the generic Action
+        # surface: they need a Session-Anchor-bound todo-action-mutation-receipt
+        # (POST /v1/todo-action-mutation-receipts + consume). todo.update carries
+        # the plain-PATCH fields only; a state that differs from the current
+        # Todo is rejected, and an absent/equal state is pinned to current.
+        current = self.store.get_todo(todo_id)
+        merged = dict(todo_body)
+        requested_state = merged.get("state")
+        if requested_state is not None and requested_state != current["state"]:
+            raise UniverseError(
+                "ACTION_TODO_LIFECYCLE_VIA_RECEIPT",
+                "todo.update cannot change lifecycle state; use the "
+                "receipt-bound /v1/todos/{todo_id}/actions path",
+                HTTPStatus.BAD_REQUEST,
+            )
+        merged["state"] = current["state"]
+        todo = self.store.update_todo(todo_id, merged)
         return {
             "schema": self.action_registry.lookup(
                 TODO_UPDATE_ACTION_ID

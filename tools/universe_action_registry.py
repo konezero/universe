@@ -66,6 +66,28 @@ TODO_ACTION_IDS = (
     TODO_DELETE_ACTION_ID,
 )
 
+# TODO_ACTION_IDS is the full, stable todo work-surface vocabulary. Only the
+# Actions in IMPLEMENTED_WORK_SURFACE_ACTION_IDS have a server handler and are
+# registered as discoverable contracts; the rest stay unregistered (so coverage
+# never reports them as available) until a handler and a receipt-aware path
+# exist. See docs/action-ir-work-surface.md for the slice-3 decision.
+IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
+    FEATURE_CREATE_ACTION_ID,
+    TODO_CREATE_ACTION_ID,
+    TODO_UPDATE_ACTION_ID,
+)
+PENDING_WORK_SURFACE_ACTION_IDS = (
+    TODO_STATE_ACTION_ID,
+    TODO_PRIORITY_ACTION_ID,
+    TODO_BIND_NODE_ACTION_ID,
+    TODO_BIND_GOAL_ACTION_ID,
+    TODO_MOVE_PROJECT_ACTION_ID,
+    TODO_REORDER_ACTION_ID,
+    TODO_ARCHIVE_ACTION_ID,
+    TODO_RESTORE_ACTION_ID,
+    TODO_DELETE_ACTION_ID,
+)
+
 # credential_handling contract: Actions never accept inline secrets. A caller may
 # pass an opaque ``credential_ref`` the server resolves out of band; any field
 # that would carry the secret value itself is rejected.
@@ -662,86 +684,28 @@ def build_default_action_registry(
     registry.register_legacy_surface(LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE)
 
     supplied_handlers = dict(work_surface_handlers or {})
-    work_surface_specs = (
+    # Only handler-backed work-surface Actions are registered as discoverable
+    # contracts. The pending todo.* Actions are intentionally left unregistered
+    # (coverage reports them UNCOVERED, never available) until they have both a
+    # handler and a receipt-aware path - see docs/action-ir-work-surface.md.
+    implemented_specs = (
         (
             FEATURE_CREATE_ACTION_ID,
             FEATURE_CREATE_REQUEST_SCHEMA,
             FEATURE_CREATE_RESULT_SCHEMA,
-            (
-                "/v1/projects/{project_id}/feature-nodes",
-                "UniverseStore.create_feature_node",
-            ),
         ),
         (
             TODO_CREATE_ACTION_ID,
             "universe.todo-create-action-request.v1",
             "universe.todo-create-receipt.v1",
-            ("/v1/todos", "UniverseStore.create_todo"),
         ),
         (
             TODO_UPDATE_ACTION_ID,
             "universe.todo-update-action-request.v1",
             "universe.todo-update-receipt.v1",
-            ("/v1/todos/{todo_id}", "UniverseStore.update_todo"),
-        ),
-        (
-            TODO_STATE_ACTION_ID,
-            "universe.todo-state-action-request.v1",
-            "universe.todo-state-receipt.v1",
-            ("UniverseStore.update_todo.state",),
-        ),
-        (
-            TODO_PRIORITY_ACTION_ID,
-            "universe.todo-priority-action-request.v1",
-            "universe.todo-priority-receipt.v1",
-            ("UniverseStore.update_todo.priority",),
-        ),
-        (
-            TODO_BIND_NODE_ACTION_ID,
-            "universe.todo-bind-node-action-request.v1",
-            "universe.todo-bind-node-receipt.v1",
-            ("UniverseStore.update_todo.bind_node",),
-        ),
-        (
-            TODO_BIND_GOAL_ACTION_ID,
-            "universe.todo-bind-goal-action-request.v1",
-            "universe.todo-bind-goal-receipt.v1",
-            ("UniverseStore.update_todo.bind_goal",),
-        ),
-        (
-            TODO_MOVE_PROJECT_ACTION_ID,
-            "universe.todo-move-project-action-request.v1",
-            "universe.todo-move-project-receipt.v1",
-            ("UniverseStore.update_todo.move_project",),
-        ),
-        (
-            TODO_REORDER_ACTION_ID,
-            "universe.todo-reorder-action-request.v1",
-            "universe.todo-reorder-receipt.v1",
-            ("UniverseStore.update_todo.reorder",),
-        ),
-        (
-            TODO_ARCHIVE_ACTION_ID,
-            "universe.todo-archive-action-request.v1",
-            "universe.todo-archive-receipt.v1",
-            ("UniverseStore.archive_todo",),
-        ),
-        (
-            TODO_RESTORE_ACTION_ID,
-            "universe.todo-restore-action-request.v1",
-            "universe.todo-restore-receipt.v1",
-            ("UniverseStore.restore_todo",),
-        ),
-        (
-            TODO_DELETE_ACTION_ID,
-            "universe.todo-delete-action-request.v1",
-            "universe.todo-delete-receipt.v1",
-            ("UniverseStore.delete_todo",),
         ),
     )
-    for action_id, request_schema, result_schema, legacy_surfaces in (
-        work_surface_specs
-    ):
+    for action_id, request_schema, result_schema in implemented_specs:
         registry.register(
             ActionContract(
                 action_id=action_id,
@@ -753,8 +717,14 @@ def build_default_action_registry(
             supplied_handlers.get(action_id),
             surfaces=(action_id,),
         )
-        for legacy_surface in legacy_surfaces:
-            registry.register_legacy_surface(legacy_surface)
+    # The HTTP surfaces these Actions front remain first-class legacy routes.
+    registry.register_legacy_surface("/v1/todos")
+    registry.register_legacy_surface("/v1/todos/{todo_id}")
+    registry.register_legacy_surface("/v1/projects/{project_id}/feature-nodes")
+    # Lifecycle transitions never route through /v1/actions; they use the
+    # anchor-aware receipt gateway.
+    registry.register_legacy_surface("/v1/todo-action-mutation-receipts")
+    registry.register_legacy_surface("/v1/todos/{todo_id}/actions")
     return registry
 
 
@@ -779,6 +749,8 @@ __all__ = [
     "FEATURE_CREATE_RESULT_SCHEMA",
     "FEATURE_GOAL_START_ACTION_ID",
     "FEATURE_GOAL_START_ACTION_SURFACE",
+    "IMPLEMENTED_WORK_SURFACE_ACTION_IDS",
+    "PENDING_WORK_SURFACE_ACTION_IDS",
     "FEATURE_GOAL_START_REQUEST_SCHEMA",
     "FEATURE_GOAL_START_RESULT_SCHEMA",
     "LEGACY_DIRECT",

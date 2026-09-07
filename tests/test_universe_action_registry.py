@@ -15,8 +15,11 @@ from universe_action_registry import (  # noqa: E402
     ActionContract,
     ActionContractError,
     ActionRegistry,
+    ActionRegistryError,
     DuplicateActionError,
     FEATURE_CREATE_ACTION_ID,
+    IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
+    PENDING_WORK_SURFACE_ACTION_IDS,
     TODO_ACTION_IDS,
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
@@ -222,15 +225,41 @@ class UniverseActionRegistryTests(unittest.TestCase):
             find_forbidden_credential_fields({"nested": {"token": "leak"}}),
         )
 
-    def test_work_surface_actions_are_registered_with_optional_handlers(self) -> None:
-        registry = build_default_action_registry()
+    def test_only_implemented_work_surface_actions_are_discoverable(self) -> None:
         self.assertEqual(11, len(TODO_ACTION_IDS))
-        self.assertEqual(COVERED, registry.classify_surface(FEATURE_CREATE_ACTION_ID))
-        for action_id in TODO_ACTION_IDS:
-            self.assertEqual(COVERED, registry.classify_surface(action_id))
         self.assertEqual(
-            LEGACY_DIRECT, registry.classify_surface("/v1/todos")
+            (
+                FEATURE_CREATE_ACTION_ID,
+                TODO_CREATE_ACTION_ID,
+                TODO_UPDATE_ACTION_ID,
+            ),
+            IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
         )
+        self.assertEqual(
+            set(TODO_ACTION_IDS) - {TODO_CREATE_ACTION_ID, TODO_UPDATE_ACTION_ID},
+            set(PENDING_WORK_SURFACE_ACTION_IDS),
+        )
+
+        registry = build_default_action_registry()
+        report_ids = set(registry.coverage_report()["registered_action_ids"])
+        for action_id in IMPLEMENTED_WORK_SURFACE_ACTION_IDS:
+            self.assertEqual(COVERED, registry.classify_surface(action_id))
+            self.assertIn(action_id, report_ids)
+        for action_id in PENDING_WORK_SURFACE_ACTION_IDS:
+            self.assertEqual(UNCOVERED, registry.classify_surface(action_id))
+            self.assertNotIn(action_id, report_ids)
+        self.assertEqual(LEGACY_DIRECT, registry.classify_surface("/v1/todos"))
+        self.assertEqual(
+            LEGACY_DIRECT,
+            registry.classify_surface("/v1/todo-action-mutation-receipts"),
+        )
+
+    def test_work_surface_handlers_are_optional_and_bindable(self) -> None:
+        registry = build_default_action_registry()
+        with self.assertRaises(ActionRegistryError) as raised:
+            registry.dispatch(TODO_CREATE_ACTION_ID, {"title": "t"}, {})
+        self.assertEqual("ACTION_HANDLER_UNAVAILABLE", raised.exception.code)
+
         bound = build_default_action_registry(
             work_surface_handlers={
                 TODO_CREATE_ACTION_ID: lambda request, _context: {
