@@ -35091,6 +35091,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         result["injects"] = injects
         return {"schema": API_SCHEMA, **result}
 
+    def terminate_reconnection_host(self, host_id: str) -> dict[str, Any]:
+        try:
+            result = self.terminal_host.terminate_reconnection_host(host_id)
+        except TerminalHostError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.NOT_FOUND) from error
+        return {"schema": API_SCHEMA, **result}
+
     def memory_batch_catalog_settings(self) -> dict[str, Any]:
         return self.memory_batch_config_service.catalog_settings()
 
@@ -41878,6 +41885,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
             except UniverseError as error:
                 self._send_error(error)
+            return
+        reconnection_host_terminate = re.fullmatch(
+            r"/v1/reconnection-hosts/([^/]+)/terminate", path
+        )
+        if reconnection_host_terminate is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.terminate_reconnection_host(
+                        unquote(reconnection_host_terminate.group(1))
+                    ),
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            except Exception as error:  # noqa: BLE001 - a Host shutdown failure must remain an HTTP response
+                self._send_error(
+                    UniverseError(
+                        "HOST_TERMINATE_FAILED",
+                        f"unexpected Host termination failure: {type(error).__name__}: {error}",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                )
             return
         terminal_terminate = re.fullmatch(r"/v1/terminals/([^/]+)/terminate", path)
         if terminal_terminate is not None:

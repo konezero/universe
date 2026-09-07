@@ -392,7 +392,9 @@ class ReconnectionHostRegistry:
         provision_private_registry_directory(self.root)
         self._prepared = True
 
-    def _archive_state_record(self, path: Path, *, reason: str) -> None:
+    def _archive_state_record(
+        self, path: Path, *, reason: str, runtime_state: str = "REPLACED"
+    ) -> None:
         """Preserve a redacted, non-reusable Host lifecycle observation."""
 
         try:
@@ -404,9 +406,9 @@ class ReconnectionHostRegistry:
         payload.pop("auth_token", None)
         payload.update(
             {
-                "runtime_state": "REPLACED",
+                "runtime_state": runtime_state,
                 "reconnect_eligible": False,
-                "archived_reason": str(reason or "HOST_REPLACED"),
+                "archived_reason": str(reason or f"HOST_{runtime_state}"),
                 "archived_at_unix_ms": int(time.time() * 1000),
             }
         )
@@ -607,7 +609,12 @@ class ReconnectionHostRegistry:
         return client
 
     def list_live_clients(self) -> list[ReconnectionHostClient]:
-        """Return every registry Host that passes authenticated LIVE handshake."""
+        """Return every registry Host that passes authenticated LIVE handshake.
+
+        A verified stopped Host is finalized as EXITED before its discovery
+        record is removed.  Transient IPC failures remain unknown and retain
+        their record for a later poll; they must not be mistaken for exit.
+        """
 
         self.prepare()
         clients: list[ReconnectionHostClient] = []
@@ -618,9 +625,25 @@ class ReconnectionHostRegistry:
                 state = self._read_state_path(path)
                 if self.state_path(state.anchor_ref) != path:
                     continue
+                if not process_is_alive(state.pid):
+                    self._archive_state_record(
+                        path,
+                        reason="HOST_PROCESS_EXITED",
+                        runtime_state="EXITED",
+                    )
+                    path.unlink(missing_ok=True)
+                    continue
                 client = self.discover(state.anchor_ref)
                 if client.status().get("runtime_state") != "LIVE":
-                    continue
+                    raise ReconnectionHostRuntimeStopped(client, "NOT_LIVE")
+            except ReconnectionHostRuntimeStopped as stopped_host:
+                self._archive_state_record(
+                    path,
+                    reason=f"HOST_RUNTIME_{stopped_host.runtime_state}",
+                    runtime_state="EXITED",
+                )
+                path.unlink(missing_ok=True)
+                continue
             except ReconnectionHostError:
                 continue
             clients.append(client)

@@ -2217,6 +2217,32 @@ class TerminalHost:
             terminal_id, audit_context=audit_context, terminate_host=True
         )
 
+    def terminate_reconnection_host(self, host_id: str) -> dict[str, Any]:
+        """Terminate a live Rust Host that has no currently open terminal tab."""
+
+        wanted = str(host_id or "").strip()
+        if not wanted:
+            raise TerminalHostError("HOST_ID_REQUIRED", "host id is required")
+        with self._lock:
+            terminal_id = next(
+                (
+                    item.terminal_id
+                    for item in self._sessions.values()
+                    if item.reconnection_host_id == wanted
+                ),
+                None,
+            )
+        if terminal_id is not None:
+            return self.terminate(terminal_id)
+        registry = self._reconnection_registry
+        if registry is None:
+            raise TerminalHostError("HOST_TERMINATE_UNAVAILABLE", "Host registry is unavailable")
+        try:
+            registry.discover_by_host_id(wanted).shutdown()
+        except Exception as error:  # noqa: BLE001 - never drop an HTTP request on Host IPC failure
+            raise TerminalHostError("HOST_TERMINATE_FAILED", str(error)) from error
+        return {"status": "HOST_TERMINATION_REQUESTED", "host_session_ref": wanted}
+
 
     def _session_prompt_activity(self, session: TerminalSession) -> dict[str, Any]:
         status = session.hook_status

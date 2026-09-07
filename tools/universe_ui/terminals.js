@@ -1791,7 +1791,7 @@ function renderTerminalNewMenu() {
   });
   menu.append(neu);
   for (const host of hosts) {
-    const item = document.createElement("button");
+    const item = document.createElement("div");
     item.type = "button";
     item.className = "terminal-new-menu-item";
     item.setAttribute("role", "menuitem");
@@ -1802,6 +1802,20 @@ function renderTerminalNewMenu() {
       closeTerminalNewMenu();
       reattachLiveHost(host).catch((error) => toast(error.message, true));
     });
+    const terminate = document.createElement("button");
+    terminate.type = "button";
+    terminate.className = "terminal-host-terminate";
+    terminate.textContent = "Host 종료";
+    terminate.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const hostId = hostSessionRefOf(host);
+      if (!hostId || !window.confirm("Terminate this persistent Host?")) return;
+      api("/v1/reconnection-hosts/" + encodeURIComponent(hostId) + "/terminate", { method: "POST" })
+        .then(() => loadResumableSessions())
+        .then(() => { renderReattachBanner(); renderTerminalNewMenu(); })
+        .catch((error) => toast(error.message, true));
+    });
+    item.append(terminate);
     menu.append(item);
   }
 }

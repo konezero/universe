@@ -704,6 +704,27 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if (
+            len(host_protocol) == 5
+            and host_protocol[1:3] == ["v1", "hosts"]
+            and host_protocol[4] == "terminate"
+        ):
+            host_session_ref = host_protocol[3]
+            try:
+                result = supervisor.host.terminate_reconnection_host(host_session_ref)
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
+            return
+        if (
             path.startswith("/v1/terminals/")
             and path.endswith("/managed-attach")
             and path.count("/") == 4

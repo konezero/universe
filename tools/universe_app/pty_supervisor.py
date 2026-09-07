@@ -434,6 +434,17 @@ class SupervisedTerminalHost:
             audit_source="UNIVERSE_TERMINAL_TERMINATE",
         )
 
+    def terminate_reconnection_host(self, host_session_ref: str) -> dict[str, Any]:
+        wanted = str(host_session_ref or "").strip()
+        if not wanted:
+            raise TerminalHostError("HOST_ID_REQUIRED", "host id is required")
+        return self._request(
+            "POST",
+            f"/v1/hosts/{quote(wanted, safe='')}/terminate",
+            payload={},
+            audit_source="UNIVERSE_HOST_TERMINATE",
+        )
+
     def channel_state(self, terminal_id: str) -> str:
         payload = self._request(
             "GET", f"/v1/terminals/{quote(terminal_id, safe='')}/channel"
