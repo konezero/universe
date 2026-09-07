@@ -150,6 +150,14 @@ class RustReconnectionHostTests(unittest.TestCase):
                 self.assertEqual(first["host_id"], reused["host_id"])
                 self.assertEqual(first["host_pid"], reused["pid"])
                 self.assertEqual(first["child_pid"], reused["child_pid"])
+                # The Host now reports the child start time so the Supervisor
+                # can catch PID reuse (reconnection_host.verify_child_liveness).
+                child_start = reused["child_started_at_unix_ms"]
+                self.assertIsInstance(child_start, int)
+                self.assertGreater(child_start, 1_700_000_000_000)
+                self.assertEqual(
+                    first["child_started_at_unix_ms"], child_start
+                )
                 self.assertEqual(
                     CURRENT_RUNTIME_VERSIONS,
                     {

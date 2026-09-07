@@ -79,6 +79,7 @@ def main() -> int:
                 "host_pid": status["pid"],
                 "host_started_at_unix_ms": status["started_at_unix_ms"],
                 "child_pid": status["child_pid"],
+                "child_started_at_unix_ms": status.get("child_started_at_unix_ms"),
                 "attachment_generation": status["attachment_generation"],
                 "attached_supervisor_id": status["attached_supervisor_id"],
                 "runtime_state": status["runtime_state"],

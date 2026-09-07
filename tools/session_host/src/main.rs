@@ -64,6 +64,7 @@ struct HostSnapshot {
     shell: String,
     cwd: Option<String>,
     child_pid: Option<u32>,
+    child_started_at_unix_ms: Option<u128>,
     child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
     channel_enabled: bool,
@@ -121,6 +122,7 @@ struct PublicSnapshot {
     shell: String,
     cwd: Option<String>,
     child_pid: Option<u32>,
+    child_started_at_unix_ms: Option<u128>,
     child_exit_code: Option<u32>,
     handle_kinds: [&'static str; 3],
     channel_enabled: bool,
@@ -346,7 +348,7 @@ struct TerminalRuntime {
 }
 
 impl TerminalRuntime {
-    fn spawn(config: &Config) -> Result<(Self, Option<u32>), String> {
+    fn spawn(config: &Config) -> Result<(Self, Option<u32>, Option<u128>), String> {
         let pair = NativePtySystem::default()
             .openpty(PtySize {
                 rows: config.rows,
@@ -368,6 +370,10 @@ impl TerminalRuntime {
             .spawn_command(command)
             .map_err(|error| error.to_string())?;
         let child_pid = child.process_id();
+        // Wall time immediately after spawn; the Supervisor corroborates
+        // this against the OS process start time (with tolerance) to catch
+        // PID reuse in reconnection_host.verify_child_liveness.
+        let child_started_at_unix_ms = child_pid.map(|_| now_unix_ms());
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -402,6 +408,7 @@ impl TerminalRuntime {
                 output,
             },
             child_pid,
+            child_started_at_unix_ms,
         ))
     }
 
@@ -479,6 +486,7 @@ impl From<&HostSnapshot> for PublicSnapshot {
             shell: value.shell.clone(),
             cwd: value.cwd.clone(),
             child_pid: value.child_pid,
+            child_started_at_unix_ms: value.child_started_at_unix_ms,
             child_exit_code: value.child_exit_code,
             handle_kinds: value.handle_kinds,
             channel_enabled: value.channel_enabled,
@@ -1048,7 +1056,8 @@ fn serve(config: Config) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let address: SocketAddr = listener.local_addr().map_err(|error| error.to_string())?;
     let started_at = now_unix_ms();
-    let (terminal, child_pid) = TerminalRuntime::spawn(&config)?;
+    let (terminal, child_pid, child_started_at_unix_ms) =
+        TerminalRuntime::spawn(&config)?;
     let cwd = config
         .cwd
         .as_deref()
@@ -1084,6 +1093,7 @@ fn serve(config: Config) -> Result<(), String> {
         shell: config.shell,
         cwd,
         child_pid,
+        child_started_at_unix_ms,
         child_exit_code: None,
         handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
         channel_enabled,
@@ -1172,12 +1182,21 @@ mod tests {
             shell: "cmd.exe".to_owned(),
             cwd: None,
             child_pid: Some(2),
+            child_started_at_unix_ms: Some(3),
             child_exit_code: None,
             handle_kinds: ["CONPTY", "INPUT_WRITER", "OUTPUT_READER"],
             channel_enabled: false,
             channel_registered: false,
             auth_token: "token".to_owned(),
         }
+    }
+
+    #[test]
+    fn public_snapshot_reports_child_start_time() {
+        let mut state = snapshot();
+        state.child_started_at_unix_ms = Some(123_456);
+        let public = PublicSnapshot::from(&state);
+        assert_eq!(Some(123_456_u128), public.child_started_at_unix_ms);
     }
 
     #[test]

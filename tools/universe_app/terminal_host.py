@@ -1015,8 +1015,13 @@ class TerminalHost:
         )
 
         expected_started_at: float | None = None
+        # The Host's own record of when it spawned the child is authoritative;
+        # fall back to the managed-shell identity file's shell_started_at.
+        host_child_started = status.get("child_started_at_unix_ms")
+        if isinstance(host_child_started, (int, float)) and host_child_started > 0:
+            expected_started_at = float(host_child_started) / 1000.0
         path_text = str(details.get("managed_shell_identity_file") or "").strip()
-        if path_text:
+        if expected_started_at is None and path_text:
             try:
                 payload = json.loads(Path(path_text).read_text(encoding="utf-8"))
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
