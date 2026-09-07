@@ -3559,13 +3559,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("DISPATCHED", dispatched["status"])
         self.assertEqual("RUST_HOST_INPUT", dispatched["delivery_mode"])
         self.assertEqual(posted["message_id"], dispatched["message_id"])
-        expected = (
+        expected_body = (
             f"instruction_ref: session-bus:{posted['message_id']}\n"
-            "Continue through the visible Rust Host session.\r"
+            "Continue through the visible Rust Host session."
         ).encode("utf-8")
-        self.server.terminal_host.write.assert_called_once_with(
-            terminal["terminal_id"],
-            expected,
+        # Turn text and submit key are written separately so a large paste's
+        # trailing bytes do not swallow the "\r".
+        self.assertEqual(
+            [
+                ((terminal["terminal_id"], expected_body), {}),
+                ((terminal["terminal_id"], b"\r"), {}),
+            ],
+            [tuple(call) for call in self.server.terminal_host.write.call_args_list],
         )
         self.server.provider_sessions.submit_channel.assert_not_called()
 

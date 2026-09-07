@@ -545,6 +545,11 @@ TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
+# An interactive Codex/Grok TUI heuristically treats a large session-bus
+# delivery as a paste and absorbs a trailing "\r" into the paste body rather
+# than submitting the turn. Deliver the text, let the TUI settle the paste,
+# then send the submit key on its own so it registers as a keystroke.
+RUST_HOST_INPUT_SETTLE_SECONDS = 0.35
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
 NODE_PLANNING_MEETING_SESSION_SCHEMA = (
@@ -37818,10 +37823,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 instruction_ref = str(delivery.get("instruction_ref") or "").strip()
                 if instruction_ref and not body_text.startswith("instruction_ref:"):
                     body_text = f"instruction_ref: {instruction_ref}\n{body_text}"
-                self.terminal_host.write(
-                    terminal_id,
-                    (body_text + "\r").encode("utf-8"),
-                )
+                # Write the turn text, let the TUI settle the paste, then send
+                # the submit key as its own keystroke (see
+                # RUST_HOST_INPUT_SETTLE_SECONDS).
+                self.terminal_host.write(terminal_id, body_text.encode("utf-8"))
+                time.sleep(RUST_HOST_INPUT_SETTLE_SECONDS)
+                self.terminal_host.write(terminal_id, b"\r")
                 completed = self.session_bus.complete_instruction_claim(
                     terminal_id=terminal_id,
                     message_id=str(delivery["message_id"]),
