@@ -17416,6 +17416,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
             meeting_session["roster"][0], assigned["catalog_role"]
         )
         self.assertTrue(assigned["role_brief"]["mandate"])
+        persona = assigned["role_brief"]["persona"]
+        self.assertTrue(persona["caliber"])
+        self.assertTrue(persona["signature_strengths"])
+        self.assertEqual(persona["caliber"], assigned["caliber"])
+        # caliber sets the model bar, not the effort dial: default MEDIUM.
+        self.assertEqual("MEDIUM", assigned["recommended_effort"])
+        budget = meeting_session["meeting_budget"]
+        self.assertEqual(
+            "MODEL_QUALITY_BAR_NOT_EFFORT_DIAL", budget["caliber_maps_to"]
+        )
+        self.assertEqual("MEDIUM", budget["per_role_effort_default"])
+        self.assertLessEqual(len(meeting_session["roster"]), 4)
         bindings = self.server.multi_rooms.list_bindings(
             started["room"]["room_id"]
         )

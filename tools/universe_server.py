@@ -549,22 +549,38 @@ NODE_PLANNING_MEETING_SESSION_SCHEMA = (
 # Conductor is the orchestrator, never an auto-assigned fresh session, so
 # it is not in these rosters. A Feature Node with competing implementation
 # routes is DESIGN; one with no settled shape starts VISION.
+# Roster stays minimal: 2-4 genuinely divergent personas per mode
+# ([[meeting-role-persona-caliber]]). Specialists (Security Reviewer, Research
+# Scout) are added only when the topic names their failure domain, not stacked
+# by default. A Feature Node with competing routes is DESIGN; one with no
+# settled shape is VISION.
 NODE_PLANNING_MEETING_ROSTER = {
     "VISION": [
         "Visionary",
         "Architecture Steward",
         "Product/UX Advocate",
         "Veteran QA",
-        "Research Scout",
     ],
     "DESIGN": [
         "Architecture Steward",
         "Pragmatic Implementer",
         "Product/UX Advocate",
         "Veteran QA",
-        "Security Reviewer",
     ],
 }
+# effort = the LOWEST tier Bench shows works for the role's task class; MEDIUM
+# is the MASTER default. Retrieval / no-decision roles always run LOW. caliber
+# (in persona) raises the MODEL quality bar, never this dial - a single role
+# escalates one tier only on named evidence.
+NODE_PLANNING_MEETING_DEFAULT_EFFORT = "MEDIUM"
+NODE_PLANNING_MEETING_ROLE_EFFORT = {
+    "Research Scout": "LOW",
+    "Recorder": "LOW",
+    "RAG Librarian": "LOW",
+}
+# role_brief is a rich responsibility + persona contract, never an enum
+# extension of universe_multi_room.MEMBER_ROLES. persona must change what the
+# role attacks and produces, not just its voice ([[meeting-role-persona-caliber]]).
 NODE_PLANNING_MEETING_ROLE_BRIEFS = {
     "Visionary": {
         "mandate": "Challenge assumptions; propose materially different shapes",
@@ -573,6 +589,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["novel route", "falsification test"],
         "deliverable": "1+ distinct architecture family with assumptions",
         "limits": "no final decision; respect current product constraints",
+        "persona": {
+            "domain": "product architecture futures",
+            "caliber": "principal-grade; has shipped category-defining systems",
+            "signature_strengths": [
+                "names the assumption everyone treats as fixed",
+                "proposes structurally different families, not variants",
+            ],
+            "anti_pattern": "novelty asserted as fact; ignoring current constraints",
+        },
     },
     "Architecture Steward": {
         "mandate": "Protect ownership boundaries, invariants, compatibility",
@@ -581,6 +606,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["component ownership", "interfaces", "migrations"],
         "deliverable": "boundary and interface assessment with trade-offs",
         "limits": "no aesthetic veto; unfamiliar is not a rejection reason",
+        "persona": {
+            "domain": "large-system boundaries and migration",
+            "caliber": "staff engineer who owned a core module through 3+ migrations",
+            "signature_strengths": [
+                "traces state authority and ownership precisely",
+                "predicts migration cost and compatibility breaks",
+            ],
+            "anti_pattern": "rejecting the unfamiliar; taste in place of evidence",
+        },
     },
     "Pragmatic Implementer": {
         "mandate": "Find the smallest coherent vertical slice; expose real cost",
@@ -589,6 +623,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["files affected", "dependencies", "test points"],
         "deliverable": "bounded route with ownership, dependencies, risks",
         "limits": "do not silently narrow the user intent",
+        "persona": {
+            "domain": "runtime and language internals",
+            "caliber": "core-contributor-grade, 15y+ production systems",
+            "signature_strengths": [
+                "attacks memory / GIL / event-loop / concurrency pitfalls",
+                "cites stdlib internals and perf profiles",
+            ],
+            "anti_pattern": "calling an incomplete shortcut the full design",
+        },
     },
     "Product/UX Advocate": {
         "mandate": "Protect comprehension, accessibility, low-friction workflow",
@@ -597,6 +640,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["user journey", "interaction constraints"],
         "deliverable": "UX assessment of the candidate routes",
         "limits": "do not override runtime invariants or authority boundaries",
+        "persona": {
+            "domain": "modern application UI",
+            "caliber": "ships trend-aware UI with a low detail-defect rate",
+            "signature_strengths": [
+                "covers every edge state (empty / error / loading)",
+                "microinteractions, accessibility, hierarchy under failure",
+            ],
+            "anti_pattern": "hiding an authority or provenance boundary for polish",
+        },
     },
     "Veteran QA": {
         "mandate": "Attack happy-path assumptions with regressions and edge cases",
@@ -605,6 +657,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["reproducible failure scenarios", "severity"],
         "deliverable": "failure scenarios and acceptance gaps with severity",
         "limits": "no evidence-free veto; no unrelated redesign",
+        "persona": {
+            "domain": "regression and operational history",
+            "caliber": "SDET who has run release gates on a high-traffic system",
+            "signature_strengths": [
+                "reproducible failure scenarios with exact inputs",
+                "finds the acceptance gap the spec omitted",
+            ],
+            "anti_pattern": "turning one concern into an unrelated redesign",
+        },
     },
     "Research Scout": {
         "mandate": "Retrieve current external evidence; compare sources",
@@ -613,6 +674,15 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["direct source refs", "observation dates"],
         "deliverable": "source-linked findings and unanswered questions",
         "limits": "inform only; cannot decide, adopt, mutate, or adopt RAG",
+        "persona": {
+            "domain": "external evidence retrieval",
+            "caliber": "librarian-grade source discipline",
+            "signature_strengths": [
+                "direct source refs with observation dates",
+                "surfaces contradictions between sources",
+            ],
+            "anti_pattern": "citing an unsourced summary as current fact",
+        },
     },
     "Security Reviewer": {
         "mandate": "Examine trust, identity, authority, data flow, external effects",
@@ -621,7 +691,28 @@ NODE_PLANNING_MEETING_ROLE_BRIEFS = {
         "required_evidence": ["threats", "violated invariant", "misuse path"],
         "deliverable": "threat assessment with bounded mitigations",
         "limits": "no permission from Mode, Role, READY, or a room invitation",
+        "persona": {
+            "domain": "trust, identity, authority, external-effect boundaries",
+            "caliber": "appsec engineer who has led threat models for runtime systems",
+            "signature_strengths": [
+                "maps the exact trust boundary crossed",
+                "a concrete exploit or misuse path, not a category",
+            ],
+            "anti_pattern": "deriving permission from Mode / Role / READY",
+        },
     },
+}
+NODE_PLANNING_MEETING_BUDGET = {
+    "schema": "universe.node-planning-meeting-budget.v1",
+    "per_role_effort_default": NODE_PLANNING_MEETING_DEFAULT_EFFORT,
+    "low_effort_roles": sorted(NODE_PLANNING_MEETING_ROLE_EFFORT),
+    "caliber_maps_to": "MODEL_QUALITY_BAR_NOT_EFFORT_DIAL",
+    "reasoning_budget": "BOUNDED_PER_ROLE_SLICE",
+    "escalation_policy": "SINGLE_ROLE_ONE_TIER_ON_NAMED_EVIDENCE",
+    "provider_pick": (
+        "BENCH_INFORMED_CLAMPED_BY_AVAILABILITY_ACCOUNT_QUOTA_AND_MODEL_CEILING"
+    ),
+    "exhausted_provider_policy": "NEXT_BEST_WITH_EXPLICIT_NOTE_NEVER_BLOCK",
 }
 EXPECTED_PATH_SCHEMA = "universe.feature-expected-path.v2"
 EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
@@ -12471,6 +12562,10 @@ class UniverseStore:
                 record["assigned"] = assigned
                 record["unassigned_roles"] = roster[len(assigned):]
                 return record
+            persona = brief.get("persona") if isinstance(brief, Mapping) else None
+            recommended_effort = NODE_PLANNING_MEETING_ROLE_EFFORT.get(
+                role, NODE_PLANNING_MEETING_DEFAULT_EFFORT
+            )
             assigned.append(
                 {
                     "catalog_role": role,
@@ -12480,6 +12575,14 @@ class UniverseStore:
                     "supervisor_session_id": session["supervisor_session_id"],
                     "binding_id": binding_id,
                     "role_brief": brief,
+                    # caliber (persona) sets the model bar; this effort dial
+                    # stays at the Bench-default tier unless evidence escalates.
+                    "recommended_effort": recommended_effort,
+                    "caliber": (
+                        str(persona.get("caliber"))
+                        if isinstance(persona, Mapping)
+                        else None
+                    ),
                 }
             )
         record["assignment_state"] = "ASSIGNED"
@@ -12487,6 +12590,7 @@ class UniverseStore:
         record["assigned"] = assigned
         record["unassigned_roles"] = roster[len(assigned):]
         record["spare_session_count"] = max(0, len(eligible) - len(assigned))
+        record["meeting_budget"] = NODE_PLANNING_MEETING_BUDGET
         record["next_action"] = "MEETING_PATH_PROPOSALS"
         return record
 
