@@ -16,6 +16,11 @@ from universe_action_registry import (  # noqa: E402
     ActionContractError,
     ActionRegistry,
     DuplicateActionError,
+    FEATURE_CREATE_ACTION_ID,
+    TODO_ACTION_IDS,
+    TODO_CREATE_ACTION_ID,
+    TODO_UPDATE_ACTION_ID,
+    find_forbidden_credential_fields,
     LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE,
     MEMORY_BATCH_RUN_ACTION_ID,
     MEMORY_BATCH_RUN_REQUEST_SCHEMA,
@@ -174,6 +179,78 @@ class UniverseActionRegistryTests(unittest.TestCase):
         with self.assertRaises(ActionContractError) as raised:
             registry.dispatch("test.action", {"mode": "MASTER"}, {})
         self.assertEqual("ACTION_CALLER_CONTEXT_FORBIDDEN", raised.exception.code)
+
+    def test_contract_enforces_credential_ref_only_handling(self) -> None:
+        with self.assertRaises(ActionContractError) as raised:
+            ActionContract(
+                action_id="test.credential",
+                request_schema_ref="test://request.v1",
+                result_schema_ref="test://result.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION",
+                credential_handling="INLINE_SECRET",
+            )
+        self.assertEqual(
+            "ACTION_CREDENTIAL_HANDLING_INVALID", raised.exception.code
+        )
+        contract = self.contract("test.credential")
+        self.assertEqual(
+            "CREDENTIAL_REF_ONLY", contract.to_dict()["credential_handling"]
+        )
+
+    def test_registry_rejects_secret_bearing_request_fields(self) -> None:
+        registry = ActionRegistry()
+        registry.register(self.contract(), lambda request, _context: request)
+        for secret_field in ("token", "password", "api_key", "client_secret"):
+            with self.assertRaises(ActionContractError) as raised:
+                registry.dispatch(
+                    "test.action", {"name": "x", secret_field: "leak"}, {}
+                )
+            self.assertEqual("ACTION_CREDENTIAL_REF_ONLY", raised.exception.code)
+        with self.assertRaises(ActionContractError) as raised:
+            registry.dispatch("test.action", {"credential_ref": "  "}, {})
+        self.assertEqual("ACTION_CREDENTIAL_REF_INVALID", raised.exception.code)
+        self.assertEqual(
+            {"name": "x", "credential_ref": "vault://secret/1"},
+            registry.dispatch(
+                "test.action",
+                {"name": "x", "credential_ref": "vault://secret/1"},
+                {},
+            ),
+        )
+        self.assertEqual(
+            ("request.nested.token",),
+            find_forbidden_credential_fields({"nested": {"token": "leak"}}),
+        )
+
+    def test_work_surface_actions_are_registered_with_optional_handlers(self) -> None:
+        registry = build_default_action_registry()
+        self.assertEqual(11, len(TODO_ACTION_IDS))
+        self.assertEqual(COVERED, registry.classify_surface(FEATURE_CREATE_ACTION_ID))
+        for action_id in TODO_ACTION_IDS:
+            self.assertEqual(COVERED, registry.classify_surface(action_id))
+        self.assertEqual(
+            LEGACY_DIRECT, registry.classify_surface("/v1/todos")
+        )
+        bound = build_default_action_registry(
+            work_surface_handlers={
+                TODO_CREATE_ACTION_ID: lambda request, _context: {
+                    "status": "OK",
+                    "echo": request,
+                }
+            }
+        )
+        self.assertEqual(
+            {"status": "OK", "echo": {"title": "t"}},
+            bound.dispatch(TODO_CREATE_ACTION_ID, {"title": "t"}, {}),
+        )
+        bound.bind_handler(
+            TODO_UPDATE_ACTION_ID,
+            lambda request, _context: {"status": "UPDATED", "echo": request},
+        )
+        self.assertEqual(
+            {"status": "UPDATED", "echo": {"todo_id": "x"}},
+            bound.dispatch(TODO_UPDATE_ACTION_ID, {"todo_id": "x"}, {}),
+        )
 
 
 if __name__ == "__main__":

@@ -33,6 +33,56 @@ LEGACY_FEATURE_GOAL_START_HTTP_SURFACE = (
 )
 LEGACY_FEATURE_GOAL_START_STORE_SURFACE = "UniverseStore.start_feature_goal"
 
+# Shared work-surface Actions. These identifiers are deliberately stable:
+# HTTP, the Conductor runtime, and future adapters all use the same registry
+# instead of growing separate command vocabularies.
+FEATURE_CREATE_ACTION_ID = "feature.create"
+FEATURE_CREATE_REQUEST_SCHEMA = "universe.feature-create-action-request.v1"
+FEATURE_CREATE_RESULT_SCHEMA = "universe.feature-create-receipt.v1"
+
+TODO_CREATE_ACTION_ID = "todo.create"
+TODO_UPDATE_ACTION_ID = "todo.update"
+TODO_STATE_ACTION_ID = "todo.state"
+TODO_PRIORITY_ACTION_ID = "todo.priority"
+TODO_BIND_NODE_ACTION_ID = "todo.bind_node"
+TODO_BIND_GOAL_ACTION_ID = "todo.bind_goal"
+TODO_MOVE_PROJECT_ACTION_ID = "todo.move_project"
+TODO_REORDER_ACTION_ID = "todo.reorder"
+TODO_ARCHIVE_ACTION_ID = "todo.archive"
+TODO_RESTORE_ACTION_ID = "todo.restore"
+TODO_DELETE_ACTION_ID = "todo.delete"
+
+TODO_ACTION_IDS = (
+    TODO_CREATE_ACTION_ID,
+    TODO_UPDATE_ACTION_ID,
+    TODO_STATE_ACTION_ID,
+    TODO_PRIORITY_ACTION_ID,
+    TODO_BIND_NODE_ACTION_ID,
+    TODO_BIND_GOAL_ACTION_ID,
+    TODO_MOVE_PROJECT_ACTION_ID,
+    TODO_REORDER_ACTION_ID,
+    TODO_ARCHIVE_ACTION_ID,
+    TODO_RESTORE_ACTION_ID,
+    TODO_DELETE_ACTION_ID,
+)
+
+# credential_handling contract: Actions never accept inline secrets. A caller may
+# pass an opaque ``credential_ref`` the server resolves out of band; any field
+# that would carry the secret value itself is rejected.
+ACTION_CREDENTIAL_REF_FIELD = "credential_ref"
+SENSITIVE_CREDENTIAL_FIELDS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "client_secret",
+        "credential",
+        "credential_value",
+        "password",
+        "secret",
+        "token",
+    }
+)
+
 RAG_ADOPT_ACTION_ID = "rag.adopt"
 RAG_ADOPT_REQUEST_SCHEMA = "universe.rag-adopt-action-request.v1"
 RAG_ADOPT_RESULT_SCHEMA = "universe.rag-adopt-receipt.v1"
@@ -157,6 +207,29 @@ def find_forbidden_caller_fields(value: Any) -> tuple[str, ...]:
     return tuple(sorted(set(_forbidden_field_paths(value))))
 
 
+def _sensitive_credential_field_paths(value: Any, path: str = "request") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            name = str(key)
+            child_path = f"{path}.{name}"
+            if name.casefold() in SENSITIVE_CREDENTIAL_FIELDS:
+                found.append(child_path)
+            found.extend(_sensitive_credential_field_paths(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(
+                _sensitive_credential_field_paths(child, f"{path}[{index}]")
+            )
+    return found
+
+
+def find_forbidden_credential_fields(value: Any) -> tuple[str, ...]:
+    """Return secret-bearing request fields; ``credential_ref`` stays opaque."""
+
+    return tuple(sorted(set(_sensitive_credential_field_paths(value))))
+
+
 def derive_idempotency_key(
     action_id: str,
     request: Mapping[str, Any],
@@ -192,6 +265,7 @@ class ActionContract:
     actor_context_resolution: str = "SERVER_SIDE"
     idempotency_key_derivation: str = "SHA256_CANONICAL_ACTION_AND_REQUEST"
     caller_supplied_actor_context: bool = False
+    credential_handling: str = "CREDENTIAL_REF_ONLY"
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -228,6 +302,11 @@ class ActionContract:
                 "ACTION_CALLER_CONTEXT_ENABLED",
                 "caller-supplied actor and context are forbidden",
             )
+        if self.credential_handling != "CREDENTIAL_REF_ONLY":
+            raise ActionContractError(
+                "ACTION_CREDENTIAL_HANDLING_INVALID",
+                "Actions must use opaque credential_ref values only",
+            )
         if not isinstance(self.metadata, Mapping):
             raise ActionContractError(
                 "ACTION_METADATA_INVALID", "metadata must be an object"
@@ -252,6 +331,20 @@ class ActionContract:
                 "ACTION_CALLER_CONTEXT_FORBIDDEN",
                 "server-owned fields are not accepted: " + ", ".join(forbidden),
             )
+        credential_fields = find_forbidden_credential_fields(request)
+        if credential_fields:
+            raise ActionContractError(
+                "ACTION_CREDENTIAL_REF_ONLY",
+                "secret-bearing fields are not accepted: "
+                + ", ".join(credential_fields),
+            )
+        if ACTION_CREDENTIAL_REF_FIELD in request:
+            credential_ref = request[ACTION_CREDENTIAL_REF_FIELD]
+            if not isinstance(credential_ref, str) or not credential_ref.strip():
+                raise ActionContractError(
+                    "ACTION_CREDENTIAL_REF_INVALID",
+                    "credential_ref must be a non-empty opaque reference",
+                )
         _canonical_json(request)
         return dict(request)
 
@@ -274,6 +367,7 @@ class ActionContract:
                 "caller_supplied": self.caller_supplied_actor_context,
                 "statement": self.actor_context_statement,
             },
+            "credential_handling": self.credential_handling,
             "idempotency_key_derivation": self.idempotency_key_derivation,
             "metadata": dict(self.metadata),
         }
@@ -335,6 +429,25 @@ class ActionRegistry:
         return contract
 
     register_action = register
+
+    def bind_handler(
+        self, action_id: str, handler: ActionHandler
+    ) -> ActionContract:
+        """Attach a server-owned handler after the registry is constructed."""
+
+        if not callable(handler):
+            raise ActionContractError(
+                "ACTION_HANDLER_INVALID", "handler must be callable"
+            )
+        registration = self.lookup_registration(action_id)
+        self._actions[action_id] = RegisteredAction(
+            contract=registration.contract,
+            handler=handler,
+            surfaces=registration.surfaces,
+        )
+        return registration.contract
+
+    set_handler = bind_handler
 
     def lookup(self, action_id: str) -> ActionContract:
         return self.lookup_registration(action_id).contract
@@ -452,8 +565,14 @@ def build_default_action_registry(
     memory_batch_run_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
+    work_surface_handlers: Mapping[str, ActionHandler] | None = None,
 ) -> ActionRegistry:
-    """Build the currently modeled mutating surface registry."""
+    """Build the currently modeled mutating surface registry.
+
+    ``work_surface_handlers`` optionally binds handlers for the shared
+    feature/todo work-surface Actions by action_id; unbound Actions are still
+    registered so their contracts are discoverable.
+    """
 
     registry = ActionRegistry()
     registry.register(
@@ -541,6 +660,101 @@ def build_default_action_registry(
     registry.register_legacy_surface(LEGACY_CLI_TERMINAL_HTTP_SURFACE)
     registry.register_legacy_surface(LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE)
     registry.register_legacy_surface(LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE)
+
+    supplied_handlers = dict(work_surface_handlers or {})
+    work_surface_specs = (
+        (
+            FEATURE_CREATE_ACTION_ID,
+            FEATURE_CREATE_REQUEST_SCHEMA,
+            FEATURE_CREATE_RESULT_SCHEMA,
+            (
+                "/v1/projects/{project_id}/feature-nodes",
+                "UniverseStore.create_feature_node",
+            ),
+        ),
+        (
+            TODO_CREATE_ACTION_ID,
+            "universe.todo-create-action-request.v1",
+            "universe.todo-create-receipt.v1",
+            ("/v1/todos", "UniverseStore.create_todo"),
+        ),
+        (
+            TODO_UPDATE_ACTION_ID,
+            "universe.todo-update-action-request.v1",
+            "universe.todo-update-receipt.v1",
+            ("/v1/todos/{todo_id}", "UniverseStore.update_todo"),
+        ),
+        (
+            TODO_STATE_ACTION_ID,
+            "universe.todo-state-action-request.v1",
+            "universe.todo-state-receipt.v1",
+            ("UniverseStore.update_todo.state",),
+        ),
+        (
+            TODO_PRIORITY_ACTION_ID,
+            "universe.todo-priority-action-request.v1",
+            "universe.todo-priority-receipt.v1",
+            ("UniverseStore.update_todo.priority",),
+        ),
+        (
+            TODO_BIND_NODE_ACTION_ID,
+            "universe.todo-bind-node-action-request.v1",
+            "universe.todo-bind-node-receipt.v1",
+            ("UniverseStore.update_todo.bind_node",),
+        ),
+        (
+            TODO_BIND_GOAL_ACTION_ID,
+            "universe.todo-bind-goal-action-request.v1",
+            "universe.todo-bind-goal-receipt.v1",
+            ("UniverseStore.update_todo.bind_goal",),
+        ),
+        (
+            TODO_MOVE_PROJECT_ACTION_ID,
+            "universe.todo-move-project-action-request.v1",
+            "universe.todo-move-project-receipt.v1",
+            ("UniverseStore.update_todo.move_project",),
+        ),
+        (
+            TODO_REORDER_ACTION_ID,
+            "universe.todo-reorder-action-request.v1",
+            "universe.todo-reorder-receipt.v1",
+            ("UniverseStore.update_todo.reorder",),
+        ),
+        (
+            TODO_ARCHIVE_ACTION_ID,
+            "universe.todo-archive-action-request.v1",
+            "universe.todo-archive-receipt.v1",
+            ("UniverseStore.archive_todo",),
+        ),
+        (
+            TODO_RESTORE_ACTION_ID,
+            "universe.todo-restore-action-request.v1",
+            "universe.todo-restore-receipt.v1",
+            ("UniverseStore.restore_todo",),
+        ),
+        (
+            TODO_DELETE_ACTION_ID,
+            "universe.todo-delete-action-request.v1",
+            "universe.todo-delete-receipt.v1",
+            ("UniverseStore.delete_todo",),
+        ),
+    )
+    for action_id, request_schema, result_schema, legacy_surfaces in (
+        work_surface_specs
+    ):
+        registry.register(
+            ActionContract(
+                action_id=action_id,
+                request_schema_ref=request_schema,
+                result_schema_ref=result_schema,
+                side_effect_class="LOCAL_DATABASE_MUTATION",
+                metadata={"credential_handling": "CREDENTIAL_REF_ONLY"},
+            ),
+            supplied_handlers.get(action_id),
+            surfaces=(action_id,),
+        )
+        for legacy_surface in legacy_surfaces:
+            registry.register_legacy_surface(legacy_surface)
     return registry
 
 
@@ -551,6 +765,7 @@ __all__ = [
     "ACTION_CONTEXT_SCHEMA",
     "ACTION_CONTRACT_VERSION",
     "ACTION_COVERAGE_CLASSES",
+    "ACTION_CREDENTIAL_REF_FIELD",
     "ACTION_REGISTRY_SCHEMA",
     "ActionContract",
     "ActionContractError",
@@ -559,6 +774,9 @@ __all__ = [
     "COVERED",
     "DEFAULT_ACTION_REGISTRY",
     "DuplicateActionError",
+    "FEATURE_CREATE_ACTION_ID",
+    "FEATURE_CREATE_REQUEST_SCHEMA",
+    "FEATURE_CREATE_RESULT_SCHEMA",
     "FEATURE_GOAL_START_ACTION_ID",
     "FEATURE_GOAL_START_ACTION_SURFACE",
     "FEATURE_GOAL_START_REQUEST_SCHEMA",
@@ -591,10 +809,24 @@ __all__ = [
     "SESSION_RESUME_REQUEST_SCHEMA",
     "SESSION_RESUME_RESULT_SCHEMA",
     "RegisteredAction",
+    "SENSITIVE_CREDENTIAL_FIELDS",
     "SERVER_RESOLVED_CALLER_FIELDS",
+    "TODO_ACTION_IDS",
+    "TODO_ARCHIVE_ACTION_ID",
+    "TODO_BIND_GOAL_ACTION_ID",
+    "TODO_BIND_NODE_ACTION_ID",
+    "TODO_CREATE_ACTION_ID",
+    "TODO_DELETE_ACTION_ID",
+    "TODO_MOVE_PROJECT_ACTION_ID",
+    "TODO_PRIORITY_ACTION_ID",
+    "TODO_REORDER_ACTION_ID",
+    "TODO_RESTORE_ACTION_ID",
+    "TODO_STATE_ACTION_ID",
+    "TODO_UPDATE_ACTION_ID",
     "UNCOVERED",
     "UnknownActionError",
     "build_default_action_registry",
     "derive_idempotency_key",
     "find_forbidden_caller_fields",
+    "find_forbidden_credential_fields",
 ]
