@@ -24374,6 +24374,14 @@ class UniverseStore:
             or observation_count < 0
         ):
             observation_count = 0
+        duration_ms = result.get("duration_ms")
+        if (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, (int, float))
+            or not math.isfinite(duration_ms)
+            or duration_ms < 0
+        ):
+            duration_ms = None
         completed_at = utc_now()
         result_record = {
             "status": _required_text(result.get("status"), "runtime result status"),
@@ -24389,6 +24397,8 @@ class UniverseStore:
             "skill_run_observation_count": observation_count,
             "repository_write": False,
         }
+        if duration_ms is not None:
+            result_record["duration_ms"] = round(float(duration_ms), 3)
         terminal_status = result_record["status"].upper()
         is_terminal = (
             terminal_status in {"TASK_COMPLETED", "TASK_FRAME_RESULT_RECORDED"}
@@ -24542,6 +24552,12 @@ class UniverseStore:
             evidence_id = str(terminal_evidence.get("evidence_id") or "").strip()
         evidence_refs = [evidence_id] if evidence_id else [source_ref]
 
+        metrics: dict[str, float] = {}
+        duration_ms = result_record.get("duration_ms")
+        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+            if math.isfinite(duration_ms) and duration_ms >= 0:
+                metrics["duration_ms"] = float(duration_ms)
+
         observation_digest = _json_sha256(
             {
                 "project_id": project_id,
@@ -24576,7 +24592,7 @@ class UniverseStore:
                         "outcome": outcome,
                         "validation_state": "NOT_RUN",
                         "evidence_refs": evidence_refs,
-                        "metrics": {},
+                        "metrics": metrics,
                         "execution_context": {
                             "provider_ref": provider,
                             "worker_role": worker_role,

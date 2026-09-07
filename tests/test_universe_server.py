@@ -17165,6 +17165,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                     "terminal_result_verified": True,
                     "task_frame_result_status": "TASK_FRAME_RESULT_RECORDED",
                     "skill_run_observation_count": 1,
+                    "duration_ms": 1234.5,
                     "repository_write": False,
                     "result": {"text": "must not persist"},
                 }
@@ -17202,6 +17203,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "provider://GROK/model/grok-test", observation["model_ref"]
         )
+        self.assertEqual(1234.5, observation["metrics"]["duration_ms"])
         encoded = json.dumps(observation, sort_keys=True)
         self.assertNotIn("must not persist", encoded)
 
