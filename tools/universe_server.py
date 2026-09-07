@@ -628,6 +628,9 @@ EXPECTED_PATH_ROUTE_SCHEMA = "universe.feature-expected-path-route.v2"
 PREDICTED_EXPECTED_PATH_SCHEMA = (
     "universe.feature-predicted-expected-path.v1"
 )
+FEATURE_NODE_ATTACH_CANDIDATE_SCHEMA = (
+    "universe.feature-node-attach-candidate.v1"
+)
 # GOAL / PLAN / MILESTONE prediction suggestions become predicted route
 # steps; RISK suggestions become route risks (recurrence warnings).
 _WORK_LOOP_PREDICTION_STEP_KINDS = ("GOAL", "PLAN", "MILESTONE")
@@ -12152,6 +12155,165 @@ class UniverseStore:
             self.list_work_loop_predictions(feature["project_id"]),
         )
 
+    # -- Memory / document attach review items for a materialized node ---
+
+    def _feature_attach_candidates(
+        self, feature: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Newly recorded Memory and unlinked project documents that share
+        vocabulary with a materialized Feature Node. These are ATTACH review
+        proposals only - never an adopt, never a Goal or evidence write."""
+
+        feature_id = str(feature.get("feature_id") or "")
+        project_id = str(feature.get("project_id") or "")
+        feature_created_at = str(feature.get("created_at") or "")
+        tokens = _wl_tokenize(
+            f"{feature.get('title') or ''} {feature.get('intent_text') or ''}"
+        )
+
+        def overlaps(text: str) -> bool:
+            return len(tokens & _wl_tokenize(text)) >= 2
+
+        existing = {
+            str(ref)
+            for ref in (feature.get("evidence_refs") or [])
+            if isinstance(ref, str)
+        }
+        candidates: list[dict[str, Any]] = []
+        for memory in self.list_project_memories(project_id, limit=200):
+            if str(memory.get("node_ref") or "") == feature_id:
+                continue
+            created_at = str(memory.get("created_at") or "")
+            # utc_now() is second-granular: treat a Memory recorded in the
+            # same second as the node (or later) as newly recorded.
+            if feature_created_at and created_at < feature_created_at:
+                continue
+            haystack = (
+                f"{memory.get('title') or ''} {memory.get('body') or ''}"
+            )
+            if not overlaps(haystack):
+                continue
+            ref = str(
+                memory.get("origin_ref")
+                or (
+                    f"universe://projects/{project_id}/memories/"
+                    + str(memory.get("memory_id") or "")
+                )
+            )
+            if not ref or ref in existing:
+                continue
+            state = str(memory.get("state") or "").upper()
+            candidates.append(
+                {
+                    "schema": FEATURE_NODE_ATTACH_CANDIDATE_SCHEMA,
+                    "candidate_id": "attachcand_"
+                    + hashlib.sha256(
+                        f"{feature_id}:{ref}".encode("utf-8")
+                    ).hexdigest()[:24],
+                    "feature_id": feature_id,
+                    "kind": (
+                        "DECISION_NOTE" if state == "DECISION_NOTE" else "MEMORY"
+                    ),
+                    "ref": ref,
+                    "title": str(memory.get("title") or ref),
+                    "reason": "NEW_RELATED_MEMORY",
+                    "recorded_at": created_at,
+                    "review_state": "PROPOSED",
+                    "adopted": False,
+                }
+            )
+        try:
+            seed = self.get_project_seed(project_id)
+        except UniverseError:
+            seed = None
+        seed_documents = (
+            seed.get("documents") if isinstance(seed, Mapping) else None
+        )
+        for document in seed_documents or []:
+            if not isinstance(document, Mapping):
+                continue
+            node_ids = document.get("node_ids")
+            node_ids = node_ids if isinstance(node_ids, list) else []
+            if feature_id in {str(item) for item in node_ids}:
+                continue
+            document_id = str(document.get("document_id") or "")
+            haystack = (
+                f"{document.get('title') or ''} {document.get('path') or ''} "
+                f"{document.get('summary') or ''} {document_id}"
+            )
+            if not document_id or not overlaps(haystack):
+                continue
+            ref = f"universe://projects/{project_id}/documents/{document_id}"
+            if ref in existing:
+                continue
+            candidates.append(
+                {
+                    "schema": FEATURE_NODE_ATTACH_CANDIDATE_SCHEMA,
+                    "candidate_id": "attachcand_"
+                    + hashlib.sha256(
+                        f"{feature_id}:{ref}".encode("utf-8")
+                    ).hexdigest()[:24],
+                    "feature_id": feature_id,
+                    "kind": "DOCUMENT",
+                    "ref": ref,
+                    "title": str(
+                        document.get("title") or document.get("path") or document_id
+                    ),
+                    "reason": "RELATED_UNLINKED_DOCUMENT",
+                    "recorded_at": None,
+                    "review_state": "PROPOSED",
+                    "adopted": False,
+                }
+            )
+        candidates.sort(key=lambda item: item["candidate_id"])
+        return candidates[:40]
+
+    def feature_node_attach_candidates(
+        self, feature_id: str
+    ) -> list[dict[str, Any]]:
+        return self._feature_attach_candidates(self.get_feature_node(feature_id))
+
+    def accept_feature_node_attach_candidate(
+        self, feature_id: str, candidate_id: str
+    ) -> dict[str, Any]:
+        """The explicit human ATTACH action: append the candidate ref to the
+        Feature Node evidence set. This does not adopt a path, start a Goal,
+        or promote anything to canonical knowledge."""
+
+        normalized = _identifier(candidate_id, "candidate_id")
+        feature = self.get_feature_node(feature_id)
+        candidate = next(
+            (
+                item
+                for item in self._feature_attach_candidates(feature)
+                if item["candidate_id"] == normalized
+            ),
+            None,
+        )
+        if candidate is None:
+            raise UniverseError(
+                "FEATURE_NODE_ATTACH_CANDIDATE_NOT_FOUND",
+                "attach candidate is not currently proposed for this node",
+                HTTPStatus.NOT_FOUND,
+            )
+        refs = list(feature.get("evidence_refs") or [])
+        if candidate["ref"] not in refs:
+            refs.append(candidate["ref"])
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE feature_node SET evidence_refs_json = ?, "
+                "revision = revision + 1, updated_at = ? WHERE feature_id = ?",
+                (_canonical_json(refs), now, feature["feature_id"]),
+            )
+        return {
+            "schema": FEATURE_NODE_ATTACH_CANDIDATE_SCHEMA,
+            "status": "FEATURE_NODE_ATTACH_CANDIDATE_ACCEPTED",
+            "feature": self.get_feature_node(feature["feature_id"]),
+            "attached_ref": candidate["ref"],
+            "adopted": False,
+        }
+
     @staticmethod
     def _node_planning_meeting_mode(feature: Mapping[str, Any]) -> str:
         """DESIGN when the Feature Node already carries competing routes;
@@ -22755,6 +22917,35 @@ class UniverseStore:
                                     target,
                                     f"{path_ref}/route/branches/{branch_index}",
                                 )
+            for attach_candidate in self._feature_attach_candidates(
+                detailed_feature
+            ):
+                candidate_ref = (
+                    f"{feature_ref}/attach-candidates/"
+                    + attach_candidate["candidate_id"]
+                )
+                candidate_node = add_node(
+                    "FEATURE_NODE_ATTACH_CANDIDATE",
+                    attach_candidate["candidate_id"],
+                    str(attach_candidate["title"]),
+                    "PROPOSED",
+                    "FEATURE_NODE_ATTACH_CANDIDATE",
+                    candidate_ref,
+                    {
+                        "candidate_id": attach_candidate["candidate_id"],
+                        "feature_id": feature_id,
+                        "kind": attach_candidate["kind"],
+                        "ref": attach_candidate["ref"],
+                        "reason": attach_candidate["reason"],
+                        "adopted": False,
+                    },
+                )
+                add_edge(
+                    "FEATURE_NODE_HAS_ATTACH_CANDIDATE",
+                    feature_node,
+                    candidate_node,
+                    candidate_ref,
+                )
             for predicted in self._predicted_expected_paths_for_feature(
                 detailed_feature, work_loop_predictions
             ):
@@ -40136,6 +40327,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        feature_attach_candidates = re.fullmatch(
+            r"/v1/feature-nodes/([^/]+)/attach-candidates", path
+        )
+        if feature_attach_candidates is not None:
+            try:
+                feature_id = unquote(feature_attach_candidates.group(1))
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "FEATURE_NODE_ATTACH_CANDIDATES_COLLECTED",
+                        "feature_id": feature_id,
+                        "attach_candidates": (
+                            self.server.store.feature_node_attach_candidates(
+                                feature_id
+                            )
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         feature_predicted_paths = re.fullmatch(
             r"/v1/feature-nodes/([^/]+)/predicted-paths", path
         )
@@ -42489,6 +42702,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
                     {"schema": API_SCHEMA, "status": "FEATURE_NODE_RECORDED" if created else "FEATURE_NODE_REPLAYED", "feature": feature},
                 )
+                return
+            feature_attach_accept = re.fullmatch(
+                r"/v1/feature-nodes/([^/]+)/attach-candidates/([^/]+)/accept", path
+            )
+            if feature_attach_accept is not None:
+                result = self.server.store.accept_feature_node_attach_candidate(
+                    unquote(feature_attach_accept.group(1)),
+                    unquote(feature_attach_accept.group(2)),
+                )
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
                 return
             feature_archive = re.fullmatch(r"/v1/feature-nodes/([^/]+)/archive", path)
             if feature_archive is not None:

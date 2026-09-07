@@ -17621,6 +17621,95 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(2, len(step_nodes))
 
 
+    def test_new_related_memory_surfaces_as_a_feature_attach_review_item(self) -> None:
+        self.server.store.register_project(self.registration())
+        feature, _ = self.server.store.create_feature_node(
+            "GCS",
+            {
+                "idempotency_key": "attach-target-feature",
+                "title": "Anchor spine retrieval cache",
+                "intent_text": "Add a cache layer to the anchor spine retrieval path.",
+                "created_by_role": "CONDUCTOR",
+            },
+        )
+        # Recorded AFTER the Feature Node, shares vocabulary, not yet linked.
+        related = self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Anchor spine retrieval cache eviction",
+                "body": "The anchor spine retrieval cache needs an eviction policy.",
+                "state": "BRAINSTORM",
+            },
+        )
+        unrelated = self.server.store.create_project_memory(
+            "GCS",
+            {
+                "title": "Terminal reconnection banner copy",
+                "body": "Reword the reconnect banner after a server restart.",
+                "state": "BRAINSTORM",
+            },
+        )
+
+        status, collected = self.request(
+            "GET",
+            f"/v1/feature-nodes/{feature['feature_id']}/attach-candidates",
+            None,
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        candidate = next(
+            item
+            for item in collected["attach_candidates"]
+            if related["memory_id"] in item["ref"]
+        )
+        self.assertEqual("PROPOSED", candidate["review_state"])
+        self.assertEqual("MEMORY", candidate["kind"])
+        self.assertFalse(candidate["adopted"])
+        self.assertNotIn(
+            unrelated["memory_id"],
+            " ".join(item["ref"] for item in collected["attach_candidates"]),
+        )
+
+        # projection-only until the explicit human ATTACH action
+        self.assertEqual(
+            [], self.server.store.get_feature_node(feature["feature_id"])[
+                "evidence_refs"
+            ],
+        )
+        graph = self.server.store.semantic_project_graph("GCS")
+        self.assertIn(
+            "FEATURE_NODE_HAS_ATTACH_CANDIDATE",
+            {edge["edge_type"] for edge in graph["edges"]},
+        )
+
+        status, accepted = self.request(
+            "POST",
+            f"/v1/feature-nodes/{feature['feature_id']}"
+            f"/attach-candidates/{candidate['candidate_id']}/accept",
+            {},
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            "FEATURE_NODE_ATTACH_CANDIDATE_ACCEPTED", accepted["status"]
+        )
+        self.assertFalse(accepted["adopted"])
+        self.assertIn(
+            candidate["ref"], accepted["feature"]["evidence_refs"]
+        )
+        # once attached it is no longer a proposed candidate
+        status, after = self.request(
+            "GET",
+            f"/v1/feature-nodes/{feature['feature_id']}/attach-candidates",
+            None,
+            self.token,
+        )
+        self.assertNotIn(
+            candidate["candidate_id"],
+            {item["candidate_id"] for item in after["attach_candidates"]},
+        )
+
+
 class RuntimeLeaseStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
