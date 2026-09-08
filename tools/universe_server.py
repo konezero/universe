@@ -19548,7 +19548,26 @@ class UniverseStore:
             goal_revision = int(current_goal["revision"])
             application = historical_source.get("application", {})
             todo_ids = application.get("created_items", {}).get("todo_ids", [])
-            todos = [self.get_todo(todo_id) for todo_id in todo_ids]
+            todos = []
+            missing_todo_ids: list[str] = []
+            for todo_id in todo_ids:
+                try:
+                    todos.append(self.get_todo(todo_id))
+                except UniverseError as error:
+                    if error.code != "TODO_NOT_FOUND":
+                        raise
+                    missing_todo_ids.append(todo_id)
+            if todo_ids and not todos:
+                raise UniverseError(
+                    "MASTER_HANDOFF_STALE_WORK_PLAN",
+                    (
+                        "The applied Work Plan's generated Todos no longer exist. "
+                        "Regenerate the Work Plan against the current Goal revision "
+                        "before delivering this handoff to Project Master "
+                        f"(missing Todos: {', '.join(missing_todo_ids)})."
+                    ),
+                    HTTPStatus.CONFLICT,
+                )
             adoption = historical_source.get("adoption", {})
             work_plan = historical_source.get("work_plan", {})
             plan = work_plan.get("plan", {})
@@ -19589,6 +19608,7 @@ class UniverseStore:
                     }
                     for todo in todos
                 ],
+                "missing_todo_ids": list(missing_todo_ids),
                 "retrieval_ref": handoff["instruction_ref"],
             }
         delivered_payload = self._master_handoff_delivered_payload(handoff)
@@ -29742,6 +29762,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "attempts": attempts,
             "result_application": result_application,
         }
+        diagnostic: dict[str, Any] | None = None
         if result_application is not None and goal["state"] == "DONE":
             state = "GOAL_COMPLETED"
             next_operation = "NONE"
@@ -29749,8 +29770,37 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             state = "READY_FOR_GOAL_START_PLAN"
             next_operation = "MATERIALIZE_GOAL_START_PLAN"
         elif application is None:
-            state = "WAITING_USER_WORK_PLAN_APPLICATION"
-            next_operation = "APPLY_ADOPTED_WORK_PLAN"
+            work_plan_eligible = (
+                goal["state"] == "DESIGNING"
+                and work_plans["feature_goal_derivation"] is not None
+            )
+            has_pending_plan = (
+                bool(work_plans["candidates"])
+                or work_plans["adoption"] is not None
+            )
+            if not work_plan_eligible and not has_pending_plan:
+                state = "BLOCKED_GOAL_NOT_PLAN_ELIGIBLE"
+                next_operation = "USER_RESOLUTION_REQUIRED"
+                reasons = []
+                if goal["state"] != "DESIGNING":
+                    reasons.append(
+                        f"Goal state is {goal['state']}, not DESIGNING"
+                    )
+                if work_plans["feature_goal_derivation"] is None:
+                    reasons.append(
+                        "Goal has no adopted Feature Expected Path derivation"
+                    )
+                diagnostic = {
+                    "code": "GOAL_NOT_WORK_PLAN_ELIGIBLE",
+                    "reasons": reasons,
+                    "next_action": (
+                        "Reshape the Goal to a DESIGNING, Feature-path-derived "
+                        "Goal (or adopt a Work Plan candidate) before automation."
+                    ),
+                }
+            else:
+                state = "WAITING_USER_WORK_PLAN_APPLICATION"
+                next_operation = "APPLY_ADOPTED_WORK_PLAN"
         else:
             todo_execution["eligible_todo_ids"] = list(
                 application.get("created_items", {}).get("todo_ids", [])
@@ -29878,6 +29928,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "scheduler": scheduler,
             "automation_state": state,
             "next_operation": next_operation,
+            "diagnostic": diagnostic,
             "effects": {
                 "task_frame_run": "NONE",
                 "todo_state_change": "NONE",

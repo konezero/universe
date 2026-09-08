@@ -15330,6 +15330,134 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GCS", ready_handoff["handoff_id"], {"approval": "DELIVER"}
         )
 
+    def test_goal_automation_surface_blocks_goal_not_plan_eligible(self) -> None:
+        goal = {
+            "goal_id": "goal_not_eligible_001",
+            "project_id": "GCS",
+            "revision": 3,
+            "state": "ACTIVE",
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={
+                    "goal": goal,
+                    "application": None,
+                    "feature_goal_derivation": None,
+                    "candidates": [],
+                    "adoption": None,
+                },
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_start_receipt_for_goal",
+                return_value=None,
+            ),
+            patch.object(
+                self.server.store,
+                "get_goal_automation_scheduler",
+                return_value=None,
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual(
+            "BLOCKED_GOAL_NOT_PLAN_ELIGIBLE", surface["automation_state"]
+        )
+        self.assertEqual("USER_RESOLUTION_REQUIRED", surface["next_operation"])
+        self.assertIsNotNone(surface["diagnostic"])
+        self.assertEqual(
+            "GOAL_NOT_WORK_PLAN_ELIGIBLE", surface["diagnostic"]["code"]
+        )
+        self.assertTrue(surface["diagnostic"]["reasons"])
+
+    def test_goal_automation_surface_waits_when_plan_pending(self) -> None:
+        goal = {
+            "goal_id": "goal_plan_pending_001",
+            "project_id": "GCS",
+            "revision": 1,
+            "state": "ACTIVE",
+        }
+        with (
+            patch.object(
+                self.server.store,
+                "goal_work_plan_surface",
+                return_value={
+                    "goal": goal,
+                    "application": None,
+                    "feature_goal_derivation": None,
+                    "candidates": [],
+                    "adoption": {"adoption_id": "work_plan_adoption_pending_001"},
+                },
+            ),
+            patch.object(
+                self.server.store,
+                "find_goal_start_receipt_for_goal",
+                return_value=None,
+            ),
+            patch.object(
+                self.server.store,
+                "get_goal_automation_scheduler",
+                return_value=None,
+            ),
+        ):
+            surface = self.server.goal_automation_surface(goal["goal_id"])
+        self.assertEqual(
+            "WAITING_USER_WORK_PLAN_APPLICATION", surface["automation_state"]
+        )
+        self.assertEqual("APPLY_ADOPTED_WORK_PLAN", surface["next_operation"])
+        self.assertIsNone(surface["diagnostic"])
+
+    def test_deliver_master_handoff_reports_stale_work_plan(self) -> None:
+        handoff = {
+            "handoff_id": "handoff_stale_plan_0123456789ab",
+            "project_id": "GCS",
+            "delivery_state": "QUEUED_FOR_MASTER",
+            "instruction_ref": "universe://goal/stale",
+            "source": {
+                "kind": "GOAL_WORK_PLAN",
+                "goal": {"goal_id": "goal_stale_plan_001"},
+                "application": {
+                    "application_id": "work_plan_application_stale_plan_001",
+                    "created_items": {
+                        "todo_ids": ["todo_gone_a", "todo_gone_b"]
+                    },
+                },
+                "adoption": {},
+                "work_plan": {},
+            },
+        }
+
+        def _missing_todo(todo_id: str) -> dict:
+            raise UniverseError(
+                "TODO_NOT_FOUND",
+                f"Todo does not exist: {todo_id}",
+                HTTPStatus.NOT_FOUND,
+            )
+
+        with (
+            patch.object(
+                self.server.store,
+                "get_master_handoff",
+                return_value=handoff,
+            ),
+            patch.object(
+                self.server.store,
+                "get_goal",
+                return_value={"goal_id": "goal_stale_plan_001", "revision": 4},
+            ),
+            patch.object(
+                self.server.store, "get_todo", side_effect=_missing_todo
+            ),
+        ):
+            with self.assertRaises(UniverseError) as caught:
+                self.server.store.deliver_master_handoff(
+                    "GCS", handoff["handoff_id"], {"approval": "DELIVER"}
+                )
+        self.assertEqual(
+            "MASTER_HANDOFF_STALE_WORK_PLAN", caught.exception.code
+        )
+
     def test_goal_automation_scheduler_stops_and_recovers_expired_lease(self) -> None:
         self.server.store.register_project(self.registration())
         session, _ = self.server.session_supervisor.register_session(
