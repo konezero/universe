@@ -361,11 +361,13 @@ class PtySupervisorTests(unittest.TestCase):
                     "provider": "CLAUDE",
                     "session_anchor_ref": TEST_ANCHOR,
                     "replace_host_session_ref": "host-stale",
+                    "resume_attachment_authorized": True,
                 },
             )
 
         self.assertEqual(201, status)
         self.assertEqual("host-stale", create.call_args.kwargs["replace_host_session_ref"])
+        self.assertTrue(create.call_args.kwargs["resume_attachment_authorized"])
 
     def test_create_list_and_read_survives_client_disconnect_model(self) -> None:
         status, created = self.request(

@@ -33516,6 +33516,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         model_ref = str(payload.get("model_ref") or "").strip()
         effort = str(payload.get("effort") or "AUTO").strip().upper() or "AUTO"
         resume_ref = str(payload.get("resume_session_ref") or "").strip()
+        resume_attachment_authorized = False
         pty_binding_anchor_ref = str(
             payload.get("pty_binding_anchor_ref") or ""
         ).strip()
@@ -33571,6 +33572,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         HTTPStatus.CONFLICT,
                     )
             resume_ref = stored_ref
+            resume_attachment_authorized = True
         elif pty_binding_anchor_ref:
             binding = self._resolve_project_anchor_pty_binding(
                 project_id=project_id,
@@ -33586,6 +33588,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             provider = binding_provider
             resume_ref = binding["provider_session_id"]
+            resume_attachment_authorized = True
             supervisor_session_id = binding["supervisor_session_id"]
         if not supervisor_session_id:
             supervisor_session_id = "session_" + secrets.token_hex(12)
@@ -33677,6 +33680,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 supervisor_session_id=supervisor_session_id,
                 session_anchor_ref=spawn_anchor_ref,
                 resume_session_ref=resume_ref,
+                resume_attachment_authorized=resume_attachment_authorized,
                 cols=int(payload.get("cols") or 120),
                 rows=int(payload.get("rows") or 32),
             )

@@ -21,7 +21,9 @@ from universe_app.terminal_host import (  # noqa: E402
     _ANSI_ESCAPE_RE,
     _DEV_CHANNEL_PROMPT_RE,
     MANAGED_SHELL_IDENTITY_MISSING,
+    ManagedShell,
     ProcessIdentity,
+    ShellObservation,
     TerminalHost,
     TerminalHostError,
     resolve_cli_executable,
@@ -1409,6 +1411,58 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIsInstance(cmdline, str)
         self.assertTrue(cmdline.startswith("/d /q /s /k "), cmdline)
         self.assertIn("--resume 01a00fe6-afff-7bc0-a75a-fe9e1569b3bf", cmdline)
+
+    def test_server_verified_resume_attachment_requires_authorized_unique_child(self) -> None:
+        shell_identity = ProcessIdentity(pid=700, started_at=1000.0)
+        cli_identity = ProcessIdentity(pid=701, started_at=1001.0)
+        observation = ShellObservation(
+            shell_alive=True,
+            shell=shell_identity,
+            cli_children=(cli_identity,),
+        )
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+
+        def build_session(*, authorized: bool = True, provider: str = "CODEX"):
+            managed = ManagedShell(
+                terminal_id="term-resume",
+                session_anchor_ref="anchor-resume",
+                provider="CODEX",
+                shell=shell_identity,
+            )
+            return SimpleNamespace(
+                terminal_id="term-resume",
+                session_anchor_ref="anchor-resume",
+                provider="CODEX",
+                provider_cli=provider,
+                provider_cli_alive=True,
+                resume_session_ref="provider-thread",
+                resume_attachment_authorized=authorized,
+                managed_shell=managed,
+                managed_shell_identity_file="",
+                public=lambda: {"terminal_id": "term-resume"},
+            )
+
+        with patch.object(host, "record_audit_event") as audit:
+            session = build_session()
+            self.assertTrue(host._attach_server_verified_resume(session, observation))
+            self.assertEqual("provider-thread", session.managed_shell.attach_evidence.provider_session_ref)
+            self.assertEqual("CLI_RUNNING", session.managed_shell.evaluate(observation, now=1002.0))
+            audit.assert_called_once()
+
+        self.assertFalse(
+            host._attach_server_verified_resume(build_session(authorized=False), observation)
+        )
+        self.assertFalse(
+            host._attach_server_verified_resume(build_session(provider="CLAUDE"), observation)
+        )
+        ambiguous = ShellObservation(
+            shell_alive=True,
+            shell=shell_identity,
+            cli_children=(cli_identity, ProcessIdentity(pid=702, started_at=1001.5)),
+        )
+        self.assertFalse(
+            host._attach_server_verified_resume(build_session(), ambiguous)
+        )
 
     def test_find_live_reuses_the_same_coordinate(self) -> None:
         host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())

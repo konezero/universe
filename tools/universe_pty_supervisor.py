@@ -624,6 +624,9 @@ class Handler(BaseHTTPRequestHandler):
                         body.get("replace_host_session_ref") or ""
                     ),
                     resume_session_ref=str(body.get("resume_session_ref") or ""),
+                    resume_attachment_authorized=(
+                        body.get("resume_attachment_authorized") is True
+                    ),
                     launch_profile=str(body.get("launch_profile") or "INTERACTIVE"),
                     provider_arguments=tuple(body.get("provider_arguments") or ()),
                     provider_environment=(

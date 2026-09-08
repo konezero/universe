@@ -584,6 +584,8 @@ class TerminalSession:
     provider_cli: str = ""
     provider_cli_process: str = ""
     provider_cli_alive: bool = False
+    resume_session_ref: str = ""
+    resume_attachment_authorized: bool = False
     prompt_verify_stop: threading.Event = field(default_factory=threading.Event)
 
     def public(self) -> dict[str, Any]:
@@ -1295,6 +1297,7 @@ class TerminalHost:
         replace_terminal_id: str = "",
         replace_host_session_ref: str = "",
         resume_session_ref: str = "",
+        resume_attachment_authorized: bool = False,
         launch_profile: str = "INTERACTIVE",
         provider_arguments: Sequence[str] = (),
         provider_environment: Mapping[str, str] | None = None,
@@ -1478,6 +1481,8 @@ class TerminalHost:
             channel_broker=channel_broker,
             channel_enabled=channel_enabled,
             session_anchor_ref=anchor_ref,
+            resume_session_ref=str(resume_session_ref or "").strip(),
+            resume_attachment_authorized=bool(resume_attachment_authorized),
         )
         session.managed_shell = ManagedShell(
             terminal_id=terminal_id,
@@ -1983,6 +1988,7 @@ class TerminalHost:
             pty_responsive=self._pty_responsive(session),
         )
         self._refresh_provider_cli(session, observation, resolved)
+        self._attach_server_verified_resume(session, observation)
         previous_state = shell.last_state
         state = shell.evaluate(observation, now=time.time() if now is None else now)
         if not observation.cli_children and shell.grace_deadline is not None:
@@ -2305,6 +2311,58 @@ class TerminalHost:
             name="prompt-verify-" + session.terminal_id[:8],
             daemon=True,
         ).start()
+
+    def _attach_server_verified_resume(
+        self,
+        session: TerminalSession,
+        observation: ShellObservation,
+    ) -> bool:
+        shell = session.managed_shell
+        if (
+            shell is None
+            or shell.attach_evidence is not None
+            or not session.resume_attachment_authorized
+            or not session.resume_session_ref
+            or not session.provider_cli_alive
+            or session.provider_cli != session.provider
+            or len(observation.cli_children) != 1
+        ):
+            return False
+        owned_shell = observation.shell or shell.shell
+        if (
+            owned_shell is None
+            or shell.shell is None
+            or not owned_shell.matches(shell.shell)
+        ):
+            return False
+        child = observation.cli_children[0]
+        attach = AttachEvidence(
+            terminal_id=session.terminal_id,
+            shell=shell.shell,
+            cli=child,
+            provider=session.provider,
+            provider_session_ref=session.resume_session_ref,
+            session_anchor_ref=session.session_anchor_ref,
+            observed_at=_now(),
+        )
+        shell.record_attach_evidence(attach)
+        identity_path = str(session.managed_shell_identity_file or "").strip()
+        if identity_path:
+            write_managed_shell_identity(Path(identity_path), session)
+        self.record_audit_event(
+            "TERMINAL_RESUME_ATTACHED",
+            terminal=session.public(),
+            context={
+                "source": "SUPERVISOR_RESUME_COORDINATE",
+                "access_surface": "SUPERVISOR",
+            },
+            details={
+                "session_anchor_ref": session.session_anchor_ref,
+                "provider_session_ref_present": True,
+                "cli_pid": child.pid,
+            },
+        )
+        return True
 
     def _refresh_provider_cli(
         self,

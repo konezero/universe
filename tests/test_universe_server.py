@@ -5998,6 +5998,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("GCS", call["project_id"])
         self.assertEqual("MASTER", call["mode"])
         self.assertEqual("vendor-thread-action", call["resume_session_ref"])
+        self.assertTrue(call["resume_attachment_authorized"])
 
     def test_session_resume_action_routes_project_master_prepare(self) -> None:
         prepared = {
