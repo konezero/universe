@@ -25,6 +25,7 @@ from universe_app.terminal_host import TerminalHostError
 BUS_SCHEMA = "universe.session-bus.v1"
 MAX_BODY_BYTES = 32 * 1024
 KINDS = frozenset({"NOTE", "INSTRUCTION", "RESULT", "COORDINATION"})
+ACTIONABLE_KINDS = frozenset({"INSTRUCTION", "COORDINATION"})
 NOTIFY_MODES = frozenset({"NONE", "HEADER"})
 INSTRUCTION_DELIVERY_STATES = frozenset({"PENDING", "CLAIMED", "DISPATCHED"})
 LIFECYCLE_STATES = frozenset(
@@ -557,7 +558,7 @@ class SessionBus:
                 terminal_id = str(message.get("_terminal_id") or "")
                 if (
                     terminal_id
-                    and str(message.get("kind") or "").upper() == "INSTRUCTION"
+                    and str(message.get("kind") or "").upper() in ACTIONABLE_KINDS
                     and _message_lifecycle(message) in {"ACCEPTED", "STARTED"}
                 ):
                     result[terminal_id] = result.get(terminal_id, 0) + 1
@@ -754,7 +755,7 @@ class SessionBus:
             "body_text": body,
             "bytes": len(body.encode("utf-8")),
             "created_at": utc_now(),
-            "delivery_state": "PENDING" if kind == "INSTRUCTION" else "UNREAD",
+            "delivery_state": "PENDING" if kind in ACTIONABLE_KINDS else "UNREAD",
             "session_anchor_ref": recipient_anchor,
             "recipient_anchor_ref": recipient_anchor,
             "source_anchor_ref": source_anchor,
@@ -835,7 +836,7 @@ class SessionBus:
                 message = self._messages.get(candidate_id)
                 if not isinstance(message, dict):
                     continue
-                if message.get("kind") != "INSTRUCTION":
+                if str(message.get("kind") or "").upper() not in ACTIONABLE_KINDS:
                     continue
                 if message.get("delivery_state") != "PENDING":
                     continue
@@ -884,7 +885,7 @@ class SessionBus:
             if not isinstance(message, dict):
                 raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message is not in that inbox", 404)
             if (
-                message.get("kind") != "INSTRUCTION"
+                str(message.get("kind") or "").upper() not in ACTIONABLE_KINDS
                 or message.get("delivery_state") != "CLAIMED"
                 or message.get("session_anchor_ref") != anchor
             ):
@@ -1052,6 +1053,55 @@ class SessionBus:
             self._persist_message(tid, instruction)
             self._persist_message(tid, result)
             return self._public_message(instruction, headers_only=False)
+
+    def recover_pending_deliveries(self) -> dict[str, Any]:
+        """Requeue interrupted actionable claims and expose all retryable work.
+
+        Delivery is at-least-once. Provider adapters receive the stable
+        ``session-bus:<message_id>`` instruction reference so a restart between
+        transport acceptance and claim completion remains observable and
+        deduplicable by the receiving session.
+        """
+
+        recovered_ids: list[str] = []
+        messages: list[dict[str, Any]] = []
+        with self._lock:
+            for message in self._messages.values():
+                kind = str(message.get("kind") or "").upper()
+                delivery_state = str(message.get("delivery_state") or "").upper()
+                lifecycle_state = _message_lifecycle(message)
+                if kind not in ACTIONABLE_KINDS:
+                    continue
+                legacy_coordination = (
+                    kind == "COORDINATION"
+                    and delivery_state == "UNREAD"
+                    and lifecycle_state == "QUEUED"
+                )
+                interrupted_claim = (
+                    delivery_state == "CLAIMED" and lifecycle_state == "ACCEPTED"
+                )
+                if legacy_coordination or interrupted_claim:
+                    message["delivery_state"] = "PENDING"
+                    message["lifecycle_state"] = "QUEUED"
+                    message.pop("claimed_at", None)
+                    message["updated_at"] = utc_now()
+                    message.setdefault("lifecycle", {})["recovered_at"] = message[
+                        "updated_at"
+                    ]
+                    terminal_id = str(message.get("_terminal_id") or "")
+                    self._persist_message(terminal_id, message)
+                    recovered_ids.append(str(message.get("message_id") or ""))
+                if (
+                    str(message.get("delivery_state") or "").upper() == "PENDING"
+                    and _message_lifecycle(message) == "QUEUED"
+                ):
+                    messages.append(self._public_message(message, headers_only=False))
+        return {
+            "schema": BUS_SCHEMA,
+            "status": "RECOVERED",
+            "recovered_message_ids": recovered_ids,
+            "messages": messages,
+        }
 
     def inbox(
         self,

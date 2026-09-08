@@ -4099,6 +4099,103 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(message["thread_id"], results[0]["thread_id"])
         self.assertEqual(message["message_id"], results[0]["in_reply_to"])
 
+    def test_live_coordination_dispatches_through_common_tui_path(self) -> None:
+        terminal = {
+            "terminal_id": "term-live-coordination-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-live-coordination-001",
+        }
+        self.server.terminal_host.list_sessions = Mock(return_value=[terminal])
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.session_supervisor.register_session(
+            {
+                "session_id": terminal["supervisor_session_id"],
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-code:coordination-001",
+                "session_anchor_ref": "session-anchor-live-coordination-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        self.server._dispatch_pending_session_instruction = Mock(
+            return_value={"status": "DISPATCHED", "delivery_mode": "CLAUDE_CODE_CHANNEL"}
+        )
+
+        posted = self.server.post_session_bus_message(
+            {
+                "to": {"terminal_id": terminal["terminal_id"]},
+                "from": {"project_id": "universe", "mode": "CONDUCTOR", "provider": "CODEX"},
+                "kind": "COORDINATION",
+                "body_text": "Coordinate with the Conductor TUI.",
+            }
+        )
+
+        message = posted["messages"][0]
+        self.assertEqual("DISPATCHED", message["dispatch_status"])
+        self.server._dispatch_pending_session_instruction.assert_called_once_with(
+            project_id="GCS",
+            session=self.server.session_supervisor.get_session(
+                terminal["supervisor_session_id"]
+            ),
+            trigger="TURN_IDLE",
+            message_id=message["message_id"],
+        )
+
+    def test_recovery_rebinds_changed_terminal_id_by_current_anchor(self) -> None:
+        anchor = "session-anchor-rebound-001"
+        rebound = {
+            "terminal_id": "term-rebound-new-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-rebound-001",
+            "active_session_anchor_ref": anchor,
+        }
+        self.server.terminal_host.get = Mock(
+            side_effect=TerminalHostError("TERMINAL_NOT_FOUND", "gone")
+        )
+        self.server.terminal_host.list_sessions = Mock(return_value=[rebound])
+        session = {
+            "session_id": rebound["supervisor_session_id"],
+            "session_anchor_ref": anchor,
+            "provider": "CODEX",
+            "mode": "MASTER",
+            "currentness": "CURRENT",
+        }
+        self.server.session_supervisor.get_session = Mock(return_value=session)
+        self.server._dispatch_pending_session_instruction = Mock(
+            return_value={"status": "DISPATCHED"}
+        )
+        message = {
+            "message_id": "msg_rebound_001",
+            "kind": "COORDINATION",
+            "delivery_state": "PENDING",
+            "recipient_anchor_ref": anchor,
+            "to": {
+                "terminal_id": "term-rebound-old-001",
+                "session_anchor_ref": anchor,
+            },
+        }
+
+        dispatches = self.server._dispatch_live_posted_session_instructions(
+            {"messages": [message]}
+        )
+
+        self.assertEqual("DISPATCHED", dispatches[0]["status"])
+        self.server._dispatch_pending_session_instruction.assert_called_once_with(
+            project_id="GCS",
+            session=session,
+            trigger="TURN_IDLE",
+            message_id=message["message_id"],
+        )
+
     def test_session_bus_state_and_reply_http_routes_project_results(self) -> None:
         terminal_id = "term-session-bus-result-http-001"
         anchor_ref = "anchor-session-bus-result-http-001"
@@ -6396,6 +6493,55 @@ class UniverseLocalServiceTests(unittest.TestCase):
         terminal_host.find_live.assert_not_called()
         terminal_host.create.assert_not_called()
 
+    def test_cli_terminal_reattach_uses_live_host_before_stale_supervisor_provider(self) -> None:
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_stale_provider",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-app-server:stale-thread",
+                "state": "DISCONNECTED",
+                "currentness": "STALE",
+            }
+        )
+        hosted = {
+            "terminal_id": "term_claude_conductor",
+            "host_session_ref": "host-claude-conductor",
+            "project_id": "GCS",
+            "mode": "CONDUCTOR",
+            "provider": "CLAUDE",
+            "supervisor_session_id": "session_host_owned",
+            "session_anchor_ref": supervised["session_anchor_ref"],
+            "host_compatibility": "CURRENT",
+            "host_reconnect_eligible": True,
+            "state": "LIVE",
+        }
+        managed = Mock()
+        managed.public.return_value = hosted
+        terminal_host = Mock()
+        terminal_host.get_host.return_value = managed
+        self.server.terminal_host = terminal_host
+
+        attached = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "CONDUCTOR",
+                "cwd": str(self.project_root),
+                "provider": "CLAUDE",
+                "supervisor_session_id": supervised["session_id"],
+                "pty_binding_anchor_ref": supervised["session_anchor_ref"],
+                "host_session_ref": "host-claude-conductor",
+            }
+        )
+
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached["status"])
+        self.assertEqual(hosted, attached["terminal"])
+        terminal_host.get_host.assert_called_once_with("host-claude-conductor")
+        terminal_host.find_live.assert_not_called()
+        terminal_host.create.assert_not_called()
+
     def test_cli_terminal_pty_binding_resolves_verified_anchor_provider_ref(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None
@@ -6915,6 +7061,36 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("universe", row["project_id"])
         self.assertEqual("universe MASTER CODEX", row["label"])
         self.assertNotIn("UNKNOWN", row["label"])
+
+    def test_reattach_row_prefers_live_host_provider_over_stale_anchor_provider(self) -> None:
+        live_host = {
+            "host_session_ref": "host-live-claude",
+            "session_anchor_ref": "anchor-live-claude",
+            "runtime_state": "LIVE",
+            "reconnect_eligible": True,
+            "compatibility": "CURRENT",
+            "provider": "CLAUDE",
+        }
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = []
+        terminal_host.list_hosts.return_value = [live_host]
+        self.server.terminal_host = terminal_host
+        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+            {
+                "session_anchor_ref": "anchor-live-claude",
+                "universe_session_id": "sess-stale-codex",
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "currentness": "STALE",
+                "last_seen_at": "2026-09-09T09:00:00Z",
+            }
+        ]
+
+        listed = self.server.list_resumable_sessions({"limit": 7})
+
+        self.assertEqual("CLAUDE", listed["reattach"][0]["provider"])
+        self.assertEqual("universe CONDUCTOR CLAUDE", listed["reattach"][0]["label"])
 
     def test_provider_quota_endpoint_returns_three_rows_and_absorbs_a_sweep(
         self,

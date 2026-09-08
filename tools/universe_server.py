@@ -27706,6 +27706,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
+        self._session_bus_recovery_last_run = self.run_session_bus_recovery_once()
 
     def _is_current_live_pty_session(self, session: Mapping[str, Any]) -> bool:
         """Verify currentness through the Mode Anchor and exact live PTY join."""
@@ -28284,6 +28285,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         )
         results["provider_activity"] = self.tail_bound_provider_sessions()
+        results["session_bus_recovery"] = self.run_session_bus_recovery_once()
         results["conductor_operating_loop"] = self.run_conductor_operating_loop_once()
         reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
         if callable(reconcile_runtime):
@@ -33271,7 +33273,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).strip()
             mode = str(session.get("mode") or "").upper()
             provider = str(
-                session.get("provider") or (host or {}).get("provider") or ""
+                (host or {}).get("provider") or session.get("provider") or ""
             ).upper()
             return " ".join(
                 part for part in (project_id or "session", mode, provider) if part
@@ -33305,7 +33307,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             ).strip(),
                             "mode": str(session.get("mode") or "").upper(),
                             "provider": str(
-                                session.get("provider") or host.get("provider") or ""
+                                host.get("provider") or session.get("provider") or ""
                             ).upper(),
                             "compatibility": compatibility,
                             "runtime_state": runtime,
@@ -33327,7 +33329,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).strip()
             mode = str(session.get("mode") or "").upper()
             provider = str(
-                session.get("provider") or host.get("provider") or ""
+                host.get("provider") or session.get("provider") or ""
             ).upper()
             reattach.append(
                 {
@@ -33654,6 +33656,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         requested_host_session_ref = str(
             payload.get("host_session_ref") or ""
         ).strip()
+        # A re-attach names an already-running Rust Host. Its live Host
+        # projection is authoritative for provider identity; stale Supervisor
+        # or Anchor metadata must not turn this into a provider-session resume
+        # and reject an otherwise exact Host attachment.
+        if requested_host_session_ref:
+            try:
+                managed_host = self._session_anchor_terminal_host().get_host(
+                    requested_host_session_ref
+                )
+            except TerminalHostError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+            hosted = managed_host.public()
+            coordinate_matches = (
+                str(hosted.get("project_id") or "").casefold() == project_id.casefold()
+                and str(hosted.get("mode") or "").upper() == mode
+                and (
+                    not pty_binding_anchor_ref
+                    or str(hosted.get("session_anchor_ref") or "")
+                    == pty_binding_anchor_ref
+                )
+                and (
+                    provider in {"", "AUTO"}
+                    or str(hosted.get("provider") or "").upper() == provider
+                )
+            )
+            if not coordinate_matches:
+                raise UniverseError(
+                    "HOST_SESSION_COORDINATE_MISMATCH",
+                    "Host session does not match the requested Session Anchor coordinate",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "CLI_TERMINAL_ATTACHED",
+                "terminal": hosted,
+            }
         if supervisor_session_id:
             try:
                 supervised = self.session_supervisor.get_session(
@@ -33752,39 +33790,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "Supervisor could not resolve a Session Anchor before spawn",
                 HTTPStatus.CONFLICT,
             )
-        if requested_host_session_ref:
-            try:
-                managed_host = self._session_anchor_terminal_host().get_host(
-                    requested_host_session_ref
-                )
-            except TerminalHostError as error:
-                raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
-            hosted = managed_host.public()
-            coordinate_matches = (
-                str(hosted.get("project_id") or "").casefold() == project_id.casefold()
-                and str(hosted.get("mode") or "").upper() == mode
-                and str(hosted.get("session_anchor_ref") or "") == spawn_anchor_ref
-                and (
-                    provider in {"", "AUTO"}
-                    or str(hosted.get("provider") or "").upper() == provider
-                )
-                and (
-                    not supervisor_session_id
-                    or str(hosted.get("supervisor_session_id") or "")
-                    == supervisor_session_id
-                )
-            )
-            if not coordinate_matches:
-                raise UniverseError(
-                    "HOST_SESSION_COORDINATE_MISMATCH",
-                    "Host session does not match the requested Session Anchor coordinate",
-                    HTTPStatus.CONFLICT,
-                )
-            return {
-                "schema": API_SCHEMA,
-                "status": "CLI_TERMINAL_ATTACHED",
-                "terminal": hosted,
-            }
         existing = self._session_anchor_terminal_host().find_live(
             project_id=project_id,
             mode=mode,
@@ -33959,10 +33964,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except TerminalHostError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
+    def run_session_bus_recovery_once(self) -> dict[str, Any]:
+        """Rehydrate retryable bus work and bind it to current live TUIs."""
+
+        recovered = self.session_bus.recover_pending_deliveries()
+        dispatches = self._dispatch_live_posted_session_instructions(recovered)
+        pending_ids = [
+            str(item.get("message_id") or "")
+            for item in recovered.get("messages", [])
+            if str(item.get("message_id") or "")
+            and not any(
+                str(dispatch.get("message_id") or "") == str(item.get("message_id") or "")
+                and str(dispatch.get("status") or "").upper() == "DISPATCHED"
+                for dispatch in dispatches
+            )
+        ]
+        result = {
+            "schema": "universe.session-bus-recovery.v1",
+            "status": "READY" if not pending_ids else "RECOVERY_PENDING",
+            "recovered_message_ids": recovered.get("recovered_message_ids", []),
+            "pending_message_ids": pending_ids,
+            "dispatches": dispatches,
+        }
+        self._session_bus_recovery_last_run = result
+        return result
+
     def _dispatch_live_posted_session_instructions(
         self, posted: Mapping[str, Any]
-    ) -> None:
-        """Deliver newly posted instructions to an already verified live session.
+    ) -> list[dict[str, Any]]:
+        """Deliver newly posted actionable messages to verified live sessions.
 
         This is deliberately best-effort.  A terminal without a current
         Session Anchor keeps its message PENDING for the normal SessionStart
@@ -33970,60 +34000,101 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """
 
         messages = posted.get("messages")
+        dispatches: list[dict[str, Any]] = []
         if not isinstance(messages, list):
-            return
+            return dispatches
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
             if (
-                str(message.get("kind") or "").upper() != "INSTRUCTION"
+                str(message.get("kind") or "").upper() not in {"INSTRUCTION", "COORDINATION"}
                 or str(message.get("delivery_state") or "").upper() != "PENDING"
             ):
                 continue
             target = message.get("to")
-            terminal_id = (
-                str(target.get("terminal_id") or "").strip()
-                if isinstance(target, Mapping)
-                else ""
-            )
-            if not terminal_id:
+            target_map = target if isinstance(target, Mapping) else {}
+            terminal_id = str(target_map.get("terminal_id") or "").strip()
+            target_anchor = str(
+                message.get("recipient_anchor_ref")
+                or target_map.get("session_anchor_ref")
+                or ""
+            ).strip()
+            if not terminal_id and not target_anchor:
                 continue
             try:
-                terminal_value = self._session_anchor_terminal_host().get(
-                    terminal_id
-                )
-                terminal = (
-                    terminal_value.public()
-                    if hasattr(terminal_value, "public")
-                    and callable(terminal_value.public)
-                    else terminal_value
-                )
-                if not isinstance(terminal, Mapping):
+                host = self._session_anchor_terminal_host()
+                candidates: list[Mapping[str, Any]] = []
+                if terminal_id:
+                    try:
+                        terminal_value = host.get(terminal_id)
+                        terminal = (
+                            terminal_value.public()
+                            if hasattr(terminal_value, "public")
+                            and callable(terminal_value.public)
+                            else terminal_value
+                        )
+                        if isinstance(terminal, Mapping):
+                            candidates.append(terminal)
+                    except TerminalHostError:
+                        pass
+                if target_anchor:
+                    for terminal in host.list_sessions():
+                        candidate_anchor = str(
+                            terminal.get("active_session_anchor_ref")
+                            or terminal.get("session_anchor_ref")
+                            or ""
+                        ).strip()
+                        candidate_id = str(terminal.get("terminal_id") or "").strip()
+                        if (
+                            candidate_anchor == target_anchor
+                            and candidate_id
+                            and all(
+                                str(item.get("terminal_id") or "") != candidate_id
+                                for item in candidates
+                            )
+                        ):
+                            candidates.append(terminal)
+
+                selected: tuple[Mapping[str, Any], Mapping[str, Any]] | None = None
+                for terminal in candidates:
+                    if str(terminal.get("state") or "").upper() != "LIVE":
+                        continue
+                    session_id = str(terminal.get("supervisor_session_id") or "").strip()
+                    if not session_id:
+                        continue
+                    try:
+                        session_value = self.session_supervisor.get_session(session_id)
+                    except SessionSupervisorError:
+                        continue
+                    session = (
+                        session_value.public()
+                        if hasattr(session_value, "public")
+                        and callable(session_value.public)
+                        else session_value
+                    )
+                    if not isinstance(session, Mapping):
+                        continue
+                    if str(session.get("currentness") or "CURRENT").upper() == "CURRENT":
+                        selected = (terminal, session)
+                        break
+                posted_message_id = str(message.get("message_id") or "").strip()
+                if selected is None:
+                    dispatches.append({
+                        "status": "CURRENT_TERMINAL_UNAVAILABLE",
+                        "message_id": posted_message_id,
+                    })
                     continue
-                if str(terminal.get("state") or "").upper() != "LIVE":
-                    continue
-                session_id = str(terminal.get("supervisor_session_id") or "").strip()
-                if not session_id:
-                    continue
-                session_value = self.session_supervisor.get_session(session_id)
-                session = (
-                    session_value.public()
-                    if hasattr(session_value, "public")
-                    and callable(session_value.public)
-                    else session_value
-                )
-                if not isinstance(session, Mapping):
-                    continue
+                terminal, session = selected
                 project_id = str(terminal.get("project_id") or "").strip()
                 if not project_id:
                     continue
-                posted_message_id = str(message.get("message_id") or "").strip()
                 dispatch = self._dispatch_pending_session_instruction(
                     project_id=project_id,
                     session=session,
                     trigger="TURN_IDLE",
                     message_id=posted_message_id,
                 )
+                dispatches.append({**dispatch, "message_id": posted_message_id})
                 if isinstance(message, dict):
                     message["delivery_state"] = (
                         "DISPATCHED"
@@ -34034,6 +34105,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message["dispatch_status"] = dispatch.get("status")
             except (SessionSupervisorError, TerminalHostError, UniverseError):
                 continue
+        return dispatches
 
     def run_conductor_operating_loop_once(
         self, *, max_messages: int = 32
@@ -38442,7 +38514,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             started_ids = [
                 str(item.get("message_id") or "")
                 for item in active_messages
-                if str(item.get("kind") or "").upper() == "INSTRUCTION"
+                if str(item.get("kind") or "").upper() in {"INSTRUCTION", "COORDINATION"}
                 and str(item.get("lifecycle_state") or "").upper() == "STARTED"
             ]
             if started_ids:
@@ -38517,7 +38589,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "message_id": message_id,
                 "session_anchor_ref": session_anchor_ref,
                 "sender_id": sender_id,
-                "kind": "INSTRUCTION",
+                "kind": str(claim.get("kind") or "INSTRUCTION").upper(),
                 "project_id": str(project_id),
                 "mode": mode,
                 "provider": provider,

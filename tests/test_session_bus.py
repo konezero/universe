@@ -130,6 +130,18 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual("CREATED", posted["status"])
         self.assertEqual("COORDINATION", posted["messages"][0]["kind"])
+        self.assertEqual("PENDING", posted["messages"][0]["delivery_state"])
+        claim = self.host.bus.claim_instruction(
+            self.host,
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref=_test_anchor("t1"),
+        )
+        self.assertEqual(posted["message_id"], claim["message_id"])
+        self.host.bus.release_instruction_claim(
+            terminal_id=self.universe["terminal_id"],
+            message_id=posted["message_id"],
+            session_anchor_ref=_test_anchor("t1"),
+        )
         inbox = self.host.bus.inbox(
             self.host, terminal_id=self.universe["terminal_id"]
         )
@@ -137,6 +149,32 @@ class SessionBusTests(unittest.TestCase):
         self.assertEqual("COORDINATION", inbox["messages"][0]["kind"])
         overlap_detail = json.loads(inbox["messages"][0]["body_text"])
         self.assertEqual("RESOURCE_OVERLAP", overlap_detail["subtype"])
+
+    def test_restart_requeues_claimed_coordination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "bus.sqlite3"
+            first = SessionBus(database_path=database)
+            posted = first.post(
+                self.host,
+                {
+                    "to": {"terminal_id": self.universe["terminal_id"]},
+                    "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CLAUDE"},
+                    "kind": "COORDINATION",
+                    "body_text": "resume after service restart",
+                },
+            )["messages"][0]
+            first.claim_instruction(
+                self.host,
+                terminal_id=self.universe["terminal_id"],
+                session_anchor_ref=_test_anchor("t1"),
+            )
+
+            restarted = SessionBus(database_path=database)
+            recovered = restarted.recover_pending_deliveries()
+
+            self.assertEqual([posted["message_id"]], recovered["recovered_message_ids"])
+            self.assertEqual("PENDING", recovered["messages"][0]["delivery_state"])
+            self.assertEqual("QUEUED", recovered["messages"][0]["lifecycle_state"])
 
     def test_notify_none_does_not_write_stdin(self) -> None:
         self.host.bus.post(
