@@ -19,6 +19,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from universe_app.prompt_submission_verification import (
+    AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+    AGENT_PROMPT_PENDING,
+    AGENT_PROMPT_STALLED,
+    agent_prompt_paste_bytes,
+    agent_prompt_settle_seconds,
+)
 from universe_app.terminal_host import TerminalHostError
 
 SCHEMA = "universe.pty-supervisor.v1"
@@ -499,13 +506,64 @@ class SupervisedTerminalHost:
             audit_source="UNIVERSE_SESSION_START",
         )
 
-    def write(self, terminal_id: str, data: bytes) -> None:
+    def write(
+        self,
+        terminal_id: str,
+        data: bytes,
+        *,
+        audit_context: Mapping[str, Any] | None = None,
+        prompt_submit: bool | None = None,
+    ) -> None:
+        del prompt_submit  # The supervisor-owned TerminalHost infers submit from CR/LF.
+        source = str((audit_context or {}).get("source") or "").strip()
         self._request(
             "POST",
             f"/v1/terminals/{quote(terminal_id, safe='')}/write",
             payload={"data_b64": base64.b64encode(data).decode("ascii")},
-            audit_source="UNIVERSE_TERMINAL_STREAM",
+            audit_source=source or "UNIVERSE_TERMINAL_STREAM",
         )
+
+    def wait_prompt_delivery(
+        self,
+        terminal_id: str,
+        *,
+        timeout_seconds: float = (AGENT_PROMPT_EFFECT_TIMEOUT_MS / 1000.0) + 0.25,
+    ) -> str:
+        """Poll the supervisor-owned terminal until prompt verification resolves."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            status = str(self.get(terminal_id).public().get("prompt_delivery") or "")
+            if status and status != AGENT_PROMPT_PENDING:
+                return status
+            time.sleep(0.05)
+        status = str(self.get(terminal_id).public().get("prompt_delivery") or "")
+        return status if status and status != AGENT_PROMPT_PENDING else AGENT_PROMPT_STALLED
+
+    def submit_prompt(
+        self,
+        terminal_id: str,
+        text: str,
+        *,
+        audit_context: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Submit one verified prompt through the standalone supervisor."""
+
+        payload = agent_prompt_paste_bytes(text)
+        self.write(
+            terminal_id,
+            payload,
+            audit_context=audit_context,
+            prompt_submit=False,
+        )
+        time.sleep(agent_prompt_settle_seconds(len(payload)))
+        self.write(
+            terminal_id,
+            b"\r",
+            audit_context=audit_context,
+            prompt_submit=True,
+        )
+        return self.wait_prompt_delivery(terminal_id)
 
     def emit_output(self, terminal_id: str, data: bytes) -> None:
         """Fan out display-only bytes without sending them to CLI stdin."""

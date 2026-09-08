@@ -229,6 +229,45 @@ class PtySupervisorTests(unittest.TestCase):
         )
         self.assertNotIn("active_terminals_ended", result)
 
+    def test_supervised_host_submits_and_verifies_prompt(self) -> None:
+        host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)
+        with patch.object(host, "write") as write, patch.object(
+            host, "wait_prompt_delivery", return_value="delivered"
+        ) as wait, patch(
+            "universe_app.pty_supervisor.time.sleep"
+        ):
+            result = host.submit_prompt(
+                "term-supervised",
+                "perform the handoff",
+                audit_context={"source": "SESSION_BUS"},
+            )
+
+        self.assertEqual("delivered", result)
+        self.assertEqual(2, write.call_count)
+        self.assertTrue(write.call_args_list[0].args[1].startswith(b"\x1b[200~"))
+        self.assertEqual(b"\r", write.call_args_list[1].args[1])
+        wait.assert_called_once_with("term-supervised")
+
+    def test_supervised_host_wait_returns_terminal_verifier_state(self) -> None:
+        host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)
+        states = iter(
+            [
+                {"prompt_delivery": "pending"},
+                {"prompt_delivery": "delivered"},
+            ]
+        )
+
+        class Session:
+            def public(self) -> dict:
+                return next(states)
+
+        with patch.object(host, "get", side_effect=lambda _terminal_id: Session()), patch(
+            "universe_app.pty_supervisor.time.sleep"
+        ):
+            result = host.wait_prompt_delivery("term-supervised", timeout_seconds=1)
+
+        self.assertEqual("delivered", result)
+
     def request(self, method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
         body = None
         headers = {"Authorization": "Bearer sup-token", "Accept": "application/json"}
