@@ -26,6 +26,8 @@ from universe_app.terminal_host import (  # noqa: E402
     ShellObservation,
     TerminalHost,
     TerminalHostError,
+    TerminalSession,
+    codex_bootstrap_prompt_visible,
     resolve_cli_executable,
     resume_argv,
     startup_argv,
@@ -1360,6 +1362,50 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(b"", startup_input("CODEX", "abc"))
         self.assertEqual(b"", startup_input("GROK", "abc"))
         self.assertEqual(b"", startup_input("CLAUDE", ""))
+
+    def test_codex_bootstrap_submits_after_its_own_stream_tail_renders_prompt(self) -> None:
+        class BootstrapEchoPty(FakePty):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pending = [b"\x1b[2JOpenAI Codex"]
+                self.alive = True
+
+            def write(self, data: bytes) -> None:
+                super().write(data)
+                if data == b"\r":
+                    self.alive = False
+                else:
+                    self.pending.append(b"\x1b[12;1H" + data)
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                del timeout
+                return self.pending.pop(0) if self.pending else b""
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+        backend = BootstrapEchoPty()
+        session = TerminalSession(
+            terminal_id="term-codex-bootstrap",
+            project_id="universe",
+            mode="MASTER",
+            provider="CODEX",
+            supervisor_session_id="session-codex-bootstrap",
+            cwd=str(ROOT),
+            executable="codex.exe",
+            created_at="2026-09-08T00:00:00Z",
+            state="LIVE",
+            backend=backend,
+            bootstrap_input=startup_input("CODEX", ""),
+        )
+
+        TerminalHost()._pump_session(session)
+
+        prompt = startup_input("CODEX", "")[:-1]
+        self.assertEqual([prompt, b"\r"], backend.writes)
+        self.assertTrue(session.bootstrap_delivered)
+        self.assertTrue(codex_bootstrap_prompt_visible(b"\x1b[12;1H" + prompt))
+        self.assertFalse(codex_bootstrap_prompt_visible(b"OpenAI Codex"))
 
     def test_fresh_claude_terminal_uses_a_new_session_id_without_resume(self) -> None:
         spawned: list[tuple] = []

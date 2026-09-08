@@ -162,6 +162,15 @@ def provider_cli_ready_for_bootstrap(provider: str, output: bytes) -> bool:
     return False
 
 
+def codex_bootstrap_prompt_visible(output: bytes) -> bool:
+    """Return whether one Codex PTY tail shows the injected bootstrap composer text."""
+
+    plain = _ANSI_ESCAPE_RE.sub(b"", bytes(output or b""))
+    compact = re.sub(rb"\s+", b"", plain)
+    expected = re.sub(rb"\s+", b"", SESSION_BOOTSTRAP_PROMPT.encode("utf-8"))
+    return expected in compact
+
+
 class TerminalScreenProjection:
     """Small VT screen model used only to create bounded reconnect snapshots."""
 
@@ -2954,6 +2963,8 @@ class TerminalHost:
             session.bootstrap_input and not session.bootstrap_delivered
         )
         bootstrap_tail = b""
+        awaiting_codex_bootstrap_submit = False
+        codex_bootstrap_submit_tail = b""
         next_managed_sample = time.time() + self._managed_sample_interval
         while not session.pump_stop.is_set() and session.state == "LIVE":
             backend = session.backend
@@ -2997,13 +3008,21 @@ class TerminalHost:
                 if provider_cli_ready_for_bootstrap(
                     session.provider, bootstrap_tail
                 ):
+                    is_codex = str(session.provider or "").strip().upper() == "CODEX"
+                    bootstrap_input = session.bootstrap_input
+                    prompt_input = (
+                        bootstrap_input[:-1]
+                        if is_codex and bootstrap_input.endswith(b"\r")
+                        else bootstrap_input
+                    )
                     try:
-                        backend.write(session.bootstrap_input)
+                        backend.write(prompt_input)
                     except Exception:  # noqa: BLE001 - lifecycle retry remains active
                         pass
                     else:
-                        session.bootstrap_delivered = True
                         awaiting_bootstrap = False
+                        awaiting_codex_bootstrap_submit = is_codex
+                        session.bootstrap_delivered = not is_codex
                         self.record_audit_event(
                             "SESSION_BOOTSTRAP_INPUT_WRITTEN",
                             terminal=session.public(),
@@ -3012,12 +3031,34 @@ class TerminalHost:
                                 "access_surface": "SUPERVISOR",
                             },
                             details={
-                                "byte_count": len(session.bootstrap_input),
+                                "byte_count": len(prompt_input),
                                 "content_persisted": False,
+                                "submit_deferred_to_stream_tail": is_codex,
                             },
                         )
                 elif len(bootstrap_tail) > 16384:
                     bootstrap_tail = bootstrap_tail[-8192:]
+            if awaiting_codex_bootstrap_submit:
+                codex_bootstrap_submit_tail = (
+                    codex_bootstrap_submit_tail + chunk
+                )[-16384:]
+                if codex_bootstrap_prompt_visible(codex_bootstrap_submit_tail):
+                    try:
+                        backend.write(b"\r")
+                    except Exception:  # noqa: BLE001 - retry on the next PTY chunk
+                        pass
+                    else:
+                        awaiting_codex_bootstrap_submit = False
+                        session.bootstrap_delivered = True
+                        self.record_audit_event(
+                            "INPUT_CONTROL_WRITTEN",
+                            terminal=session.public(),
+                            context={
+                                "source": "SUPERVISOR_SESSION_BOOTSTRAP_TAIL",
+                                "access_surface": "SUPERVISOR",
+                            },
+                            details=_input_control_metadata(b"\r"),
+                        )
             if awaiting_channel_confirm:
                 # Keep a window wide enough to hold the whole confirmation
                 # screen (box borders, ANSI, the warning paragraph, the menu).
