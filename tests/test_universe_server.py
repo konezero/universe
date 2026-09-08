@@ -10161,6 +10161,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
         self.assertEqual("ACTION_ID_UNKNOWN", unknown["error_code"])
 
+    def test_action_registry_lookup_lists_persist_selected_contract(self) -> None:
+        status, payload = self.request("GET", "/v1/actions", token=self.token)
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("ACTION_REGISTRY_COLLECTED", payload["status"])
+        registry = payload["registry"]
+        self.assertEqual("universe.action-registry.v1", registry["schema"])
+        self.assertIn(
+            "memory.sync.persist-selected", registry["registered_action_ids"]
+        )
+        contracts = {
+            contract["action_id"]: contract for contract in registry["contracts"]
+        }
+        self.assertEqual(
+            "universe.memory-sync-persist-selected-action-request.v1",
+            contracts["memory.sync.persist-selected"]["request_schema_ref"],
+        )
+
     def test_feature_goal_start_receipt_combines_path_adoption_and_goal_authority(self) -> None:
         self.server.store.register_project(self.registration())
         room = self.server.multi_rooms.create_meeting_room(

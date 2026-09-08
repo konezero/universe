@@ -28791,6 +28791,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             },
         }
 
+    def action_registry_catalog(self) -> dict[str, Any]:
+        """Return the live Action Registry without executing an Action.
+
+        Consumers that gate a governed write on Action availability need a
+        read-only, typed registry observation.  Keep this separate from the
+        POST execution surface so looking up an Action never constructs its
+        server-resolved execution context or invokes a handler.
+        """
+
+        return {
+            "schema": API_SCHEMA,
+            "status": "ACTION_REGISTRY_COLLECTED",
+            "registry": self.action_registry.coverage_report(),
+        }
+
     def _handle_feature_create_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -40553,6 +40568,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if not self._authorize():
+            return
+        if path == "/v1/actions":
+            self._send(HTTPStatus.OK, self.server.action_registry_catalog())
             return
         if path == "/v1/settings/memory-batch/catalog":
             try:
