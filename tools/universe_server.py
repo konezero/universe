@@ -34966,39 +34966,128 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             permission_requester=permission_requester,
         )
 
+    @staticmethod
+    def _provider_session_identity(
+        provider: Any, provider_session_ref: Any
+    ) -> tuple[str, str]:
+        provider_name = str(provider or "").strip().upper()
+        provider_ref = str(provider_session_ref or "").strip()
+        vendor_identity = _vendor_identity_from_observer(provider_ref)
+        if vendor_identity is not None:
+            return vendor_identity
+        return provider_name, provider_ref
+
+    def _register_exact_provider_observer_source(
+        self, *, provider: str, provider_session_ref: str
+    ) -> dict[str, Any]:
+        identity = self._provider_session_identity(provider, provider_session_ref)
+        if not identity[0] or not identity[1]:
+            raise UniverseError(
+                "PROVIDER_OBSERVER_IDENTITY_UNAVAILABLE",
+                "provider observer identity is unavailable",
+                HTTPStatus.CONFLICT,
+            )
+        candidates = [
+            source
+            for source in self.store.discover_provider_session_sources(identity[0])
+            if source.get("identity_state") == "VERIFIED"
+            and self._provider_session_identity(
+                source.get("provider"), source.get("provider_session_id")
+            )
+            == identity
+        ]
+        if not candidates:
+            raise UniverseError(
+                "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
+                "the exact verified provider observer source is unavailable",
+                HTTPStatus.CONFLICT,
+            )
+        source = max(
+            candidates,
+            key=lambda item: (
+                str(item.get("last_modified_at") or ""),
+                _canonical_provider_source_path(item.get("source_path")),
+            ),
+        )
+        registered = self.store.register_provider_session_source(
+            {**source, "start_at_end": True}
+        )
+        if not str(registered.get("source_id") or "").strip():
+            raise UniverseError(
+                "PROVIDER_OBSERVER_REGISTRATION_FAILED",
+                "provider observer registration returned no source identifier",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return registered
+
     def tail_bound_provider_sessions(self) -> list[dict[str, Any]]:
-        sessions = self.session_supervisor.list_sessions(include_hidden=False)
+        live_supervisor_ids = {
+            str(terminal.get("supervisor_session_id") or "").strip()
+            for terminal in self._session_anchor_terminal_host().list_sessions()
+            if str(terminal.get("state") or "").upper() == "LIVE"
+            and terminal.get("supervisor_session_id")
+        }
+        sessions = [
+            session
+            for session in self.session_supervisor.list_sessions(include_hidden=False)
+            if str(session.get("session_id") or "").strip()
+            in live_supervisor_ids
+        ]
         bound_identities = {
-            (
-                str(session.get("provider") or "").upper(),
-                str(session.get("provider_session_ref") or ""),
+            self._provider_session_identity(
+                session.get("provider"), session.get("provider_session_ref")
             )
             for session in sessions
             if session.get("provider_session_ref")
+            and str(session.get("provider") or "").strip().upper()
+            in {"CODEX", "CLAUDE", "GROK"}
         }
-        for provider in ("CODEX", "CLAUDE", "GROK"):
+        source_ids: set[str] = set()
+        observed_identities: set[tuple[str, str]] = set()
+        for source in self.store.list_provider_session_sources():
+            identity = self._provider_session_identity(
+                source.get("provider"), source.get("provider_session_id")
+            )
+            source_id = str(source.get("source_id") or "").strip()
+            if (
+                identity in bound_identities
+                and source_id
+                and bool(source.get("enabled", True))
+            ):
+                source_ids.add(source_id)
+                observed_identities.add(identity)
+        for provider in sorted({identity[0] for identity in bound_identities}):
             for source in self.store.discover_provider_session_sources(provider):
-                identity = (
-                    provider,
-                    str(source.get("provider_session_id") or ""),
+                identity = self._provider_session_identity(
+                    source.get("provider"), source.get("provider_session_id")
                 )
                 if (
                     source.get("identity_state") != "VERIFIED"
                     or identity not in bound_identities
                 ):
                     continue
-                self.store.register_provider_session_source(
+                registered = self.store.register_provider_session_source(
                     {**source, "start_at_end": True}
                 )
-        scans = self.store.scan_registered_provider_sources()
+                source_id = str(registered.get("source_id") or "").strip()
+                if source_id:
+                    source_ids.add(source_id)
+                    observed_identities.add(identity)
+        scans: list[dict[str, Any]] = [
+            {
+                "status": "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
+                "provider": identity[0],
+                "provider_session_id": identity[1],
+            }
+            for identity in sorted(bound_identities - observed_identities)
+        ]
+        for source_id in sorted(source_ids):
+            scans.append(self.store.scan_provider_session_source(source_id))
         sessions_by_identity = {
-            (
-                str(session.get("provider") or "").upper(),
-                str(session.get("provider_session_ref") or ""),
+            self._provider_session_identity(
+                session.get("provider"), session.get("provider_session_ref")
             ): session
-            for session in self.session_supervisor.list_sessions(
-                include_hidden=False
-            )
+            for session in sessions
             if session.get("provider_session_ref")
         }
         for scan in scans:
@@ -38399,6 +38488,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         if rust_host_interactive and provider in {"CODEX", "GROK"}:
             try:
+                observer_source = self._register_exact_provider_observer_source(
+                    provider=provider,
+                    provider_session_ref=provider_session_ref,
+                )
+            except UniverseError as error:
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=message_id,
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {
+                    "status": "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
+                    "error_code": error.code,
+                    "detail": error.detail,
+                    "delivery_mode": "RUST_HOST_INPUT",
+                    "provider": provider,
+                    "message_id": message_id,
+                    "session_anchor_ref": session_anchor_ref,
+                }
+            try:
                 body_text = str(delivery["body_text"])
                 instruction_ref = str(delivery.get("instruction_ref") or "").strip()
                 if instruction_ref and not body_text.startswith("instruction_ref:"):
@@ -38451,6 +38560,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "delivery_mode": "RUST_HOST_INPUT",
                 "prompt_delivery": prompt_delivery,
                 "provider": provider,
+                "observer_source_id": observer_source["source_id"],
                 "message_id": completed["message_id"],
                 "session_anchor_ref": session_anchor_ref,
                 "hook_stdout": outcome.get("hook_stdout"),

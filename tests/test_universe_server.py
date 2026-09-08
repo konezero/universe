@@ -3545,7 +3545,28 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.terminal_host.find_live = Mock(return_value=terminal)
         self.server.terminal_host.get = Mock(return_value=terminal)
         self.server.terminal_host.write = Mock()
-        self.server.terminal_host.submit_prompt = Mock(return_value="delivered")
+        call_order: list[str] = []
+        source = {
+            "provider": "CODEX",
+            "provider_session_id": "codex-thread-native-001",
+            "identity_state": "VERIFIED",
+            "source_path": "C:/provider/codex-thread-native-001.jsonl",
+            "last_modified_at": "2026-09-08T00:00:00Z",
+        }
+        self.server.store.discover_provider_session_sources = Mock(
+            return_value=[source]
+        )
+        self.server.store.register_provider_session_source = Mock(
+            side_effect=lambda value: (
+                call_order.append("register")
+                or {**value, "source_id": "source-codex-native-001"}
+            )
+        )
+        self.server.terminal_host.submit_prompt = Mock(
+            side_effect=lambda *_args, **_kwargs: (
+                call_order.append("submit") or "delivered"
+            )
+        )
         self.server._provider_chat_key_for_session_instruction = Mock(
             return_value="chat_codex_native_should_not_run"
         )
@@ -3575,6 +3596,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("DISPATCHED", dispatched["status"])
         self.assertEqual("RUST_HOST_INPUT", dispatched["delivery_mode"])
         self.assertEqual(posted["message_id"], dispatched["message_id"])
+        self.assertEqual("source-codex-native-001", dispatched["observer_source_id"])
+        self.assertEqual(["register", "submit"], call_order)
+        self.assertTrue(
+            self.server.store.register_provider_session_source.call_args.args[0][
+                "start_at_end"
+            ]
+        )
         expected_body = (
             f"instruction_ref: session-bus:{posted['message_id']}\n"
             "Continue through the visible Rust Host session."
@@ -3585,6 +3613,54 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("SESSION_BUS", self.server.terminal_host.submit_prompt.call_args.kwargs["audit_context"]["source"])
         self.server.terminal_host.write.assert_not_called()
         self.server.provider_sessions.submit_channel.assert_not_called()
+
+    def test_interactive_rust_host_requires_exact_observer_source(self) -> None:
+        terminal = {
+            "terminal_id": "term-rust-host-unobserved-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "GROK",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-rust-host-unobserved-001",
+            "backend_owner": "RUST_RECONNECTION_HOST",
+            "launch_profile": "INTERACTIVE",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.submit_prompt = Mock(return_value="delivered")
+        self.server.store.discover_provider_session_sources = Mock(return_value=[])
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "GROK"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Do not dispatch without observable result lineage.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": terminal["supervisor_session_id"],
+                "session_anchor_ref": "session-anchor-rust-host-unobserved-001",
+                "provider": "GROK",
+                "provider_session_ref": "grok-unobserved-001",
+                "mode": "MASTER",
+            },
+            trigger="TURN_IDLE",
+        )
+
+        self.assertEqual("PROVIDER_OBSERVER_SOURCE_UNAVAILABLE", dispatched["status"])
+        self.assertEqual("PROVIDER_OBSERVER_SOURCE_UNAVAILABLE", dispatched["error_code"])
+        self.server.terminal_host.submit_prompt.assert_not_called()
+        pending = self.server.session_bus.inbox(
+            self.server._session_anchor_terminal_host(),
+            terminal_id=terminal["terminal_id"],
+        )["messages"]
+        self.assertEqual(posted["message_id"], pending[0]["message_id"])
+        self.assertEqual("PENDING", pending[0]["delivery_state"])
+        self.assertEqual("QUEUED", pending[0]["lifecycle_state"])
 
     def test_interactive_rust_host_stalled_prompt_returns_claim_to_pending(self) -> None:
         terminal = {
@@ -3599,6 +3675,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.server.terminal_host.find_live = Mock(return_value=terminal)
         self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.store.discover_provider_session_sources = Mock(
+            return_value=[
+                {
+                    "provider": "CODEX",
+                    "provider_session_id": "codex-stalled-001",
+                    "identity_state": "VERIFIED",
+                    "source_path": "C:/provider/codex-stalled-001.jsonl",
+                }
+            ]
+        )
+        self.server.store.register_provider_session_source = Mock(
+            return_value={"source_id": "source-codex-stalled-001"}
+        )
         self.server.terminal_host.submit_prompt = Mock(return_value="stalled")
         posted = self.server.session_bus.deliver_to_terminal(
             self.server.terminal_host,
@@ -4407,6 +4496,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("TARGET_ACCEPTED", resumed["progress"]["step"])
 
     def test_provider_tail_retries_only_catalog_waiting_anchor(self) -> None:
+        self.server.terminal_host.list_sessions = Mock(
+            return_value=[
+                {
+                    "supervisor_session_id": "supervisor-new-master-001",
+                    "state": "LIVE",
+                }
+            ]
+        )
         self.server.session_supervisor.list_sessions = Mock(
             return_value=[
                 {
@@ -4418,17 +4515,87 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 }
             ]
         )
+        self.server.store.list_provider_session_sources = Mock(return_value=[])
         self.server.store.discover_provider_session_sources = Mock(return_value=[])
-        self.server.store.scan_registered_provider_sources = Mock(return_value=[])
+        self.server.store.scan_provider_session_source = Mock()
         self.server._resume_hook_verified_conductor_allocations = Mock()
 
         scans = self.server.tail_bound_provider_sessions()
 
-        self.assertEqual([], scans)
+        self.assertEqual("PROVIDER_OBSERVER_SOURCE_UNAVAILABLE", scans[0]["status"])
+        self.assertEqual("CODEX", scans[0]["provider"])
+        self.server.store.scan_provider_session_source.assert_not_called()
         self.server._resume_hook_verified_conductor_allocations.assert_called_once_with(
             "GCS",
             "session-anchor-new-master-001",
             retry_catalog_visibility=True,
+        )
+
+    def test_provider_tail_scans_only_sources_bound_to_live_sessions(self) -> None:
+        session = {
+            "session_id": "supervisor-bound-source-001",
+            "project_id": "GCS",
+            "provider": "CODEX",
+            "provider_session_ref": "vendor-bound-source-001",
+            "session_anchor_ref": "session-anchor-bound-source-001",
+        }
+        self.server.terminal_host.list_sessions = Mock(
+            return_value=[
+                {
+                    "supervisor_session_id": session["session_id"],
+                    "state": "LIVE",
+                },
+                {
+                    "supervisor_session_id": "supervisor-stale-source-001",
+                    "state": "ENDED",
+                },
+            ]
+        )
+        self.server.session_supervisor.list_sessions = Mock(
+            return_value=[
+                session,
+                {
+                    **session,
+                    "session_id": "supervisor-stale-source-001",
+                    "provider_session_ref": "vendor-unbound-source-001",
+                },
+            ]
+        )
+        self.server.store.list_provider_session_sources = Mock(
+            return_value=[
+                {
+                    "source_id": "source-bound-001",
+                    "provider": "CODEX",
+                    "provider_session_id": "vendor-bound-source-001",
+                    "enabled": True,
+                },
+                {
+                    "source_id": "source-unbound-001",
+                    "provider": "CODEX",
+                    "provider_session_id": "vendor-unbound-source-001",
+                    "enabled": True,
+                },
+            ]
+        )
+        self.server.store.discover_provider_session_sources = Mock(return_value=[])
+        self.server.store.scan_provider_session_source = Mock(
+            return_value={
+                "source": {
+                    "source_id": "source-bound-001",
+                    "provider": "CODEX",
+                    "provider_session_id": "vendor-bound-source-001",
+                },
+                "added": 0,
+            }
+        )
+        self.server.store.list_provider_session_activities = Mock(return_value=[])
+        self.server._resume_hook_verified_conductor_allocations = Mock()
+
+        scans = self.server.tail_bound_provider_sessions()
+
+        self.assertEqual(1, len(scans))
+        self.server.store.scan_provider_session_source.assert_called_once_with(
+            "source-bound-001"
         )
 
     def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:
