@@ -86,6 +86,7 @@ class FakeReconnectionClient:
             "pid": self.state.pid,
             "started_at_unix_ms": self.state.started_at_unix_ms,
             "child_pid": self.state.child_pid,
+            "child_started_at_unix_ms": 123500,
             "attachment_generation": self.generation,
             "attached_supervisor_id": self.attached_supervisor_id,
             "runtime_state": "LIVE",
@@ -156,6 +157,11 @@ class FakeReconnectionRegistry:
 
     def discover(self, anchor_ref: str):
         return self.clients[anchor_ref]
+
+    def discover_by_host_id(self, host_id: str):
+        return next(
+            client for client in self.clients.values() if client.state.host_id == host_id
+        )
 
     def list_live_clients(self):
         return list(self.clients.values())
@@ -691,6 +697,42 @@ class TerminalHostTests(unittest.TestCase):
             self.assertIsNotNone(reconcile_thread)
             reconcile_thread.join(timeout=2)
             self.assertTrue(reconcile_finished.is_set())
+
+    def test_host_only_terminate_serializes_against_background_reconcile(self) -> None:
+        registry = FakeReconnectionRegistry()
+        reconcile_started = threading.Event()
+        reconcile_finished = threading.Event()
+        reconcile_thread: threading.Thread | None = None
+        with tempfile.TemporaryDirectory() as tmp:
+            host = TerminalHost(
+                audit_database_path=Path(tmp) / "audit.sqlite3",
+                reconnection_registry=registry,
+            )
+            client = registry.launch("anchor-host-only-serialize")
+            base_shutdown = client.shutdown
+
+            def shutdown() -> None:
+                nonlocal reconcile_thread
+
+                def reconcile() -> None:
+                    reconcile_started.set()
+                    host.reconcile_reconnection_hosts()
+                    reconcile_finished.set()
+
+                reconcile_thread = threading.Thread(target=reconcile)
+                reconcile_thread.start()
+                self.assertTrue(reconcile_started.wait(1))
+                self.assertFalse(reconcile_finished.wait(0.1))
+                base_shutdown()
+                registry.clients.clear()
+
+            client.shutdown = shutdown
+            result = host.terminate_reconnection_host(client.state.host_id)
+            self.assertEqual("HOST_TERMINATION_REQUESTED", result["status"])
+            self.assertIsNotNone(reconcile_thread)
+            reconcile_thread.join(timeout=2)
+            self.assertTrue(reconcile_finished.is_set())
+            self.assertTrue(client.shutdown_called)
 
     def test_reconcile_uses_complete_creation_history_for_live_registry_hosts(self) -> None:
         registry = FakeReconnectionRegistry()

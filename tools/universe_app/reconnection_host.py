@@ -125,14 +125,12 @@ def verify_child_liveness(
     - ``STALE``        -- the PID is live but its start time does not match the
                           expected one (PID reuse: a different process now owns
                           the number).
-    - ``MATCHED``      -- the PID is live and, when an expected start time was
-                          supplied, corroborates it. With no expected start time
-                          a live PID is reported ``MATCHED`` (the Host's own
-                          child handle stays the primary signal; this check
-                          only tightens once the Host reports the start time).
+    - ``MATCHED``      -- the PID is live and its observed OS start time
+                          corroborates the Host-reported start time.
 
-    A Supervisor must not treat a Host ``runtime_state`` of LIVE as trustworthy
-    while this returns ``EXITED`` or ``STALE``.
+    A Supervisor must treat every result other than ``MATCHED`` as ineligible
+    for live reattachment. Missing timestamps and failed OS probes remain typed
+    ``UNVERIFIABLE`` gaps rather than implicit liveness claims.
     """
 
     if not isinstance(child_pid, int) or child_pid <= 0:
@@ -144,13 +142,13 @@ def verify_child_liveness(
     if not alive:
         return "EXITED"
     if not isinstance(expected_started_at, (int, float)) or expected_started_at <= 0:
-        return "MATCHED"
+        return "UNVERIFIABLE"
     try:
         observed = start_time_of(child_pid)
     except Exception:  # noqa: BLE001
-        observed = None
-    if observed is None:
-        return "MATCHED"
+        return "UNVERIFIABLE"
+    if not isinstance(observed, (int, float)) or observed <= 0:
+        return "UNVERIFIABLE"
     if abs(float(observed) - float(expected_started_at)) <= tolerance:
         return "MATCHED"
     return "STALE"
@@ -581,9 +579,9 @@ class ReconnectionHostRegistry:
         if runtime_state != "LIVE":
             raise ReconnectionHostRuntimeStopped(client, runtime_state)
         # Do not take the Host's LIVE at face value: independently check its
-        # reported child PID against the OS. A dead PID (or, once the Host
-        # reports it, a mismatched start time = PID reuse) means the runtime is
-        # not actually live regardless of what the Host claims.
+        # reported child PID and start time against the OS. A dead PID, a
+        # mismatched start time (PID reuse), or an unavailable observation means
+        # the runtime is not independently verified regardless of Host claims.
         child_started_at = observed.get("child_started_at_unix_ms")
         child_liveness = verify_child_liveness(
             observed.get("child_pid"),
@@ -593,7 +591,7 @@ class ReconnectionHostRegistry:
             is_alive=process_is_alive,
             start_time_of=process_start_time,
         )
-        if child_liveness in {"EXITED", "STALE"}:
+        if child_liveness != "MATCHED":
             raise ReconnectionHostRuntimeStopped(
                 client, f"CHILD_{child_liveness}"
             )

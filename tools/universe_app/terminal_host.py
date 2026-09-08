@@ -1115,7 +1115,7 @@ class TerminalHost:
                 if status.get("runtime_state") != "LIVE":
                     raise ReconnectionHostError("Host terminal is not live")
                 child_liveness = self._reconcile_child_liveness(details, status)
-                if child_liveness in {"EXITED", "STALE"}:
+                if child_liveness != "MATCHED":
                     raise ReconnectionHostError(
                         "Host-reported child failed liveness verification: "
                         f"CHILD_{child_liveness}"
@@ -2227,6 +2227,7 @@ class TerminalHost:
             terminal_id, audit_context=audit_context, terminate_host=True
         )
 
+    @_serialize_reconnection_lifecycle
     def terminate_reconnection_host(self, host_id: str) -> dict[str, Any]:
         """Terminate a live Rust Host that has no currently open terminal tab."""
 

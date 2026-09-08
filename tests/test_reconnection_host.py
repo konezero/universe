@@ -19,6 +19,7 @@ from universe_app.reconnection_host import (  # noqa: E402
     ReconnectionHostError,
     ReconnectionHostIncompatible,
     ReconnectionHostRegistry,
+    ReconnectionHostRuntimeStopped,
     ReconnectionPty,
     RUNTIME_COMPATIBILITY_STATES,
     STATE_SCHEMA,
@@ -104,10 +105,26 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
 
         common = dict(is_alive=is_alive, start_time_of=start_time_of)
 
-        # matched: live pid, no expected start time -> trust the live pid
-        self.assertEqual("MATCHED", verify_child_liveness(4242, None, **common))
+        # missing expected start time cannot independently establish identity
+        self.assertEqual("UNVERIFIABLE", verify_child_liveness(4242, None, **common))
         # matched: live pid, expected start time within tolerance
         self.assertEqual("MATCHED", verify_child_liveness(4242, 100.9, **common))
+        # a missing or failing OS start-time probe is a typed gap
+        self.assertEqual(
+            "UNVERIFIABLE",
+            verify_child_liveness(
+                4242, 100.0, is_alive=is_alive, start_time_of=lambda _pid: None
+            ),
+        )
+        self.assertEqual(
+            "UNVERIFIABLE",
+            verify_child_liveness(
+                4242,
+                100.0,
+                is_alive=is_alive,
+                start_time_of=lambda _pid: (_ for _ in ()).throw(OSError("boom")),
+            ),
+        )
         # exited: pid is not a live process
         self.assertEqual("EXITED", verify_child_liveness(9999, 100.0, **common))
         # stale / PID reuse: pid is live but a different process now owns it
@@ -124,10 +141,44 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
                 start_time_of=start_time_of,
             ),
         )
-        for pid, expected in ((4242, None), (9999, 1.0), (4242, 55.0), (None, None)):
+        for pid, expected in ((4242, 100.0), (9999, 1.0), (4242, 55.0), (None, None)):
             self.assertIn(
                 verify_child_liveness(pid, expected, **common), CHILD_LIVENESS_STATES
             )
+
+    def test_discover_rejects_live_host_when_child_start_is_unverifiable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "universe_app.reconnection_host.provision_private_registry_directory"
+        ):
+            root = Path(temp)
+            registry = ReconnectionHostRegistry(root, root / "host.exe")
+            self.write_state(
+                registry, "anchor-unverifiable-child", pid=1001, started_at=10.0
+            )
+            observed = {
+                "anchor_ref": "anchor-unverifiable-child",
+                "host_kind": "SESSION",
+                "owner_ref": "anchor-unverifiable-child",
+                "host_id": "host-1001",
+                "pid": 1001,
+                "started_at_unix_ms": 10000,
+                "runtime_state": "LIVE",
+                "child_pid": 4242,
+                **CURRENT_RUNTIME_VERSIONS,
+            }
+            with patch(
+                "universe_app.reconnection_host.process_is_alive", return_value=True
+            ), patch(
+                "universe_app.reconnection_host.process_start_time",
+                side_effect=lambda pid: 10.0 if pid == 1001 else None,
+            ), patch(
+                "universe_app.reconnection_host.ReconnectionHostClient.status",
+                return_value=observed,
+            ):
+                with self.assertRaisesRegex(
+                    ReconnectionHostRuntimeStopped, "CHILD_UNVERIFIABLE"
+                ):
+                    registry.discover("anchor-unverifiable-child")
 
     def test_incompatible_exception_carries_the_judged_state(self) -> None:
         default = ReconnectionHostIncompatible(client=None, host={})
