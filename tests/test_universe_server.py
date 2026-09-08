@@ -2366,7 +2366,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         maintenance = self.server.run_supervisor_maintenance_once(idle_seconds=0)
         self.assertIn("provider_activity", maintenance)
-        self.assertEqual(1, len(maintenance["provider_activity"]))
+        self.assertEqual(0, len(maintenance["provider_activity"]))
         with patch.object(
             self.server,
             "provider_chat_catalog",
@@ -5320,7 +5320,24 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 },
             ]
 
+        terminal_host = self.server._session_anchor_terminal_host()
         with (
+            patch.object(
+                self.server,
+                "_session_anchor_terminal_host",
+                return_value=terminal_host,
+            ),
+            patch.object(
+                terminal_host,
+                "list_sessions",
+                return_value=[
+                    {
+                        "terminal_id": "term-bound-tail",
+                        "state": "LIVE",
+                        "supervisor_session_id": "session-bound-tail",
+                    }
+                ],
+            ),
             patch.object(
                 self.server.store,
                 "discover_provider_session_sources",
@@ -6326,6 +6343,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             supervisor_session_id="session_internal_coordinate",
             session_anchor_ref=ANY,
             resume_session_ref="vendor-thread-123",
+            resume_attachment_authorized=True,
             cols=120,
             rows=32,
         )
@@ -7016,6 +7034,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             supervisor_session_id=ANY,
             session_anchor_ref=ANY,
             resume_session_ref="",
+            resume_attachment_authorized=False,
             cols=120,
             rows=32,
         )
