@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime_store import store_symlink_sha
+
 SCHEMA = "universe.project-file-index.v1"
 SEARCH_SCHEMA = "universe.project-file-search.v1"
 MAX_EXCERPT_BYTES = 32_768
@@ -340,6 +342,35 @@ def should_skip(relative_path: str) -> bool:
     return any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in SKIP_RELATIVE_PREFIXES)
 
 
+LINKED_INSTALL_STATE_PATH = Path(
+    ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json"
+)
+
+
+def _managed_runtime_symlink_digest(
+    root: Path, relative_path: str, link_path: Path
+) -> str | None:
+    if not link_path.is_symlink():
+        return None
+    try:
+        state = json.loads((root / LINKED_INSTALL_STATE_PATH).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, Mapping) or state.get("install_mode") != "LINKED":
+        return None
+    inventory = state.get("inventory")
+    store_root = state.get("store_root")
+    if not isinstance(inventory, Mapping) or not isinstance(store_root, str):
+        return None
+    expected = inventory.get(relative_path)
+    if (
+        not isinstance(expected, str)
+        or store_symlink_sha(link_path, Path(store_root)) != expected
+    ):
+        return None
+    return expected
+
+
 def iter_project_files(project_root: Path) -> list[Path]:
     root = project_root.resolve(strict=True)
     found: list[Path] = []
@@ -363,7 +394,11 @@ def iter_project_files(project_root: Path) -> list[Path]:
             relative = _normalize_relative(path.relative_to(root))
             if should_skip(relative):
                 continue
-            if os.path.islink(path) or is_junction(path):
+            if is_junction(path):
+                continue
+            if os.path.islink(path) and _managed_runtime_symlink_digest(
+                root, relative, path
+            ) is None:
                 continue
             found.append(Path(relative))
     return sorted(found)
@@ -691,6 +726,12 @@ def sync_index(
             unchanged += 1
             continue
         size, mtime_ns, digest, excerpt = file_fingerprint(absolute)
+        expected_link_digest = _managed_runtime_symlink_digest(root, key, absolute)
+        if absolute.is_symlink() and expected_link_digest != digest:
+            raise FileIndexError(
+                "FILE_INDEX_MANAGED_LINK_DIGEST_MISMATCH",
+                f"managed runtime link digest mismatch: {key}",
+            )
         connection.execute(
             """
             INSERT INTO project_file_index(
@@ -749,7 +790,7 @@ def sync_index_paths(
         raw = Path(str(value))
         candidate = raw if raw.is_absolute() else root / raw
         try:
-            relative = candidate.resolve(strict=False).relative_to(root)
+            relative = Path(os.path.abspath(candidate)).relative_to(root)
         except ValueError as error:
             raise FileIndexError(
                 "FILE_INDEX_PATH_OUTSIDE_PROJECT",
@@ -770,7 +811,10 @@ def sync_index_paths(
             """,
             (project_id, key),
         ).fetchone()
-        if not absolute.is_file() or absolute.is_symlink():
+        expected_link_digest = _managed_runtime_symlink_digest(root, key, absolute)
+        if not absolute.is_file() or (
+            absolute.is_symlink() and expected_link_digest is None
+        ):
             if previous is not None:
                 connection.execute(
                     "DELETE FROM project_file_index WHERE project_id = ? AND relative_path = ?",
@@ -790,6 +834,11 @@ def sync_index_paths(
             unchanged += 1
             continue
         size, mtime_ns, digest, excerpt = file_fingerprint(absolute)
+        if expected_link_digest is not None and expected_link_digest != digest:
+            raise FileIndexError(
+                "FILE_INDEX_MANAGED_LINK_DIGEST_MISMATCH",
+                f"managed runtime link digest mismatch: {key}",
+            )
         connection.execute(
             """
             INSERT INTO project_file_index(

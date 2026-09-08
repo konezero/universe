@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -17,6 +19,7 @@ from universe_file_index import (  # noqa: E402
     search_index,
     should_skip,
     sync_index,
+    sync_index_paths,
     sync_project_index_from_hook,
 )
 
@@ -71,6 +74,86 @@ class UniverseFileIndexTests(unittest.TestCase):
             found = search_index(connection, project_id="GCS", query="BrokerClient")
             self.assertEqual("src/broker.py", found["hits"][0]["relative_path"])
             self.assertTrue(found["hits"][0]["match"]["excerpt"])
+
+    def test_linked_runtime_symlink_uses_lexical_project_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = b"# Linked runtime contract\n"
+            digest = hashlib.sha256(content).hexdigest()
+            store = root.parent / (root.name + "-runtime-store")
+            blob = store / "objects" / "sha256" / digest
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(content)
+            relative = ".ai/skills/common/example/SKILL.md"
+            link = root / relative
+            link.parent.mkdir(parents=True)
+            try:
+                link.symlink_to(blob)
+            except OSError as error:
+                self.skipTest(f"symbolic links unavailable: {error}")
+            marker = (
+                root
+                / ".ai"
+                / "runtime"
+                / "project_instance"
+                / "UNIVERSE_RELEASE_INSTALL.json"
+            )
+            marker.parent.mkdir(parents=True)
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema": "universe.project-release-install.v1",
+                        "install_mode": "LINKED",
+                        "store_root": str(store),
+                        "inventory": {relative: digest},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            from universe_file_index import DDL
+
+            connection.executescript(DDL)
+            result = sync_index_paths(
+                connection,
+                project_id="demo",
+                project_root=root,
+                changed_paths=[relative],
+            )
+            self.assertEqual(1, result["created"])
+            row = connection.execute(
+                "SELECT relative_path, sha256 FROM project_file_index WHERE project_id = 'demo'"
+            ).fetchone()
+            self.assertEqual((relative, digest), tuple(row))
+            foreign_relative = ".ai/skills/common/foreign/SKILL.md"
+            foreign_link = root / foreign_relative
+            foreign_link.parent.mkdir(parents=True)
+            foreign_link.symlink_to(blob)
+            ignored = sync_index_paths(
+                connection,
+                project_id="demo",
+                project_root=root,
+                changed_paths=[foreign_relative],
+            )
+            self.assertEqual(0, ignored["created"])
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM project_file_index WHERE relative_path = ?",
+                    (foreign_relative,),
+                ).fetchone()
+            )
+            full = sync_index(connection, project_id="demo", project_root=root)
+            self.assertGreaterEqual(full["unchanged"], 1)
+            with self.assertRaises(FileIndexError) as outside:
+                sync_index_paths(
+                    connection,
+                    project_id="demo",
+                    project_root=root,
+                    changed_paths=[str(root.parent / "outside.txt")],
+                )
+            self.assertEqual("FILE_INDEX_PATH_OUTSIDE_PROJECT", outside.exception.error_code)
+            connection.close()
 
     def test_require_mode_current_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
