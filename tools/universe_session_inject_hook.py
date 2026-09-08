@@ -1124,6 +1124,13 @@ def run_hook(
                 / "standalone-bootstrap"
                 / "scripts"
             )
+            # Keep the Hook installation root lexical: resolving a LINKED
+            # Runtime script follows it into the shared object store.
+            runtime_package_root = (
+                Path(__file__).absolute().parent.parent / ".ai" / "runtime"
+            )
+            if str(runtime_package_root) not in sys.path:
+                sys.path.insert(0, str(runtime_package_root))
             sys.path.insert(0, str(scripts))
             from bootstrap_standalone import bootstrap as standalone_bootstrap
 
