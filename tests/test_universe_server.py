@@ -1112,6 +1112,80 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "todo-attached-provider-ref", json.dumps(guarded_action)
         )
 
+        status, history_result = self.request(
+            "GET", f"/v1/todos/{attached_result['todo']['todo_id']}/actions"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            "TODO_ACTION_HISTORY_COLLECTED", history_result["status"]
+        )
+        history = history_result["history"]
+        self.assertEqual("universe.todo-action-history.v1", history["schema"])
+        self.assertEqual(attached_result["todo"]["todo_id"], history["todo"]["todo_id"])
+        self.assertEqual(2, history["action_count"])
+        self.assertEqual(2, history["receipt_count"])
+        self.assertEqual(
+            ["guarded-start-001", "guarded-completion-001"],
+            [item["action"]["action_id"] for item in history["actions"]],
+        )
+        self.assertTrue(
+            all(item["receipt_link_state"] == "MATCHED" for item in history["actions"])
+        )
+        self.assertEqual([], history["unmatched_receipts"])
+        self.assertEqual(
+            {started["receipt"]["receipt_id"], guarded_action["receipt"]["receipt_id"]},
+            {item["receipt_id"] for item in history["receipts"]},
+        )
+        self.assertEqual(
+            {attached["session_id"]},
+            {item["session_id"] for item in history["receipts"]},
+        )
+        self.assertEqual(
+            {attached["session_anchor_ref"]},
+            {item["session_anchor_ref"] for item in history["receipts"]},
+        )
+        self.assertEqual(
+            {"CODEX"}, {item["provider"] for item in history["receipts"]}
+        )
+        self.assertNotIn("todo-attached-provider-ref", json.dumps(history_result))
+
+        prepared_request = gateway.action_mutation_request(
+            provider="CODEX",
+            provider_session_ref="todo-attached-provider-ref",
+            session_id=attached["session_id"],
+            session_anchor_ref=attached["session_anchor_ref"],
+            instruction_ref="conversation://test/attached-todo-prepared-only",
+            todo_id=attached_result["todo"]["todo_id"],
+            action={
+                "action_id": "guarded-prepared-only-001",
+                "outcome": "REOPENED",
+                "source": "CODEX_DESKTOP",
+                "evidence_ref": "conversation://test/prepared-only",
+            },
+        )
+        prepared_only = gateway.prepare_action(prepared_request)
+        status, prepared_history_result = self.request(
+            "GET", f"/v1/todos/{attached_result['todo']['todo_id']}/actions"
+        )
+        self.assertEqual(200, status)
+        prepared_history = prepared_history_result["history"]
+        self.assertEqual(2, prepared_history["action_count"])
+        self.assertEqual(3, prepared_history["receipt_count"])
+        self.assertEqual(1, len(prepared_history["unmatched_receipts"]))
+        self.assertEqual(
+            prepared_only["receipt"]["receipt_id"],
+            prepared_history["unmatched_receipts"][0]["receipt_id"],
+        )
+        self.assertEqual(
+            "PREPARED", prepared_history["unmatched_receipts"][0]["status"]
+        )
+
+        status, missing = self.request(
+            "GET", "/v1/todos/todo_missing_action_history/actions"
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("TODO_NOT_FOUND", missing["error_code"])
+
         guarded_replay = gateway.apply_action(**action_coordinates)
         self.assertTrue(guarded_replay["replayed"])
         self.assertEqual("DONE", guarded_replay["todo"]["state"])

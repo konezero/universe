@@ -16778,6 +16778,83 @@ class UniverseStore:
             ).fetchall()
         return [self._todo_action_mutation_receipt_row(row) for row in rows]
 
+    def list_todo_action_history(self, todo_id: str) -> dict[str, Any]:
+        """Return durable Todo actions with their receipt evidence.
+
+        Receipt linkage is proven only when a consumed receipt's bound payload
+        digest equals the persisted action payload digest. Prepared or otherwise
+        unmatched receipts remain visible as typed evidence without being
+        inferred onto an action.
+        """
+
+        normalized_todo_id = _identifier(todo_id, "todo_id")
+        todo = self.get_todo(normalized_todo_id)
+        project_id = todo.get("project_id")
+        with self._connection() as connection:
+            event_rows = connection.execute(
+                """
+                SELECT event_id, project_id, payload_json, created_at
+                FROM project_event
+                WHERE project_id = ? AND event_type = 'TODO_ACTION_APPLIED'
+                ORDER BY created_at, event_id
+                """,
+                (project_id,),
+            ).fetchall()
+            receipt_rows = connection.execute(
+                """
+                SELECT * FROM todo_action_mutation_receipt
+                WHERE todo_id = ?
+                ORDER BY prepared_at, receipt_id
+                """,
+                (normalized_todo_id,),
+            ).fetchall()
+
+        receipts = [
+            self._todo_action_mutation_receipt_row(row) for row in receipt_rows
+        ]
+        consumed_by_digest: dict[str, list[dict[str, Any]]] = {}
+        for receipt in receipts:
+            if receipt["status"] == "CONSUMED":
+                consumed_by_digest.setdefault(receipt["payload_sha256"], []).append(
+                    receipt
+                )
+
+        matched_receipt_ids: set[str] = set()
+        actions: list[dict[str, Any]] = []
+        for row in event_rows:
+            action = json.loads(row["payload_json"])
+            if action.get("todo_id") != normalized_todo_id:
+                continue
+            matched = consumed_by_digest.get(_json_sha256(action), [])
+            matched_receipt_ids.update(item["receipt_id"] for item in matched)
+            actions.append(
+                {
+                    "schema": "universe.todo-action-history-entry.v1",
+                    "event_id": row["event_id"],
+                    "project_id": row["project_id"],
+                    "todo_id": normalized_todo_id,
+                    "action": action,
+                    "created_at": row["created_at"],
+                    "receipt_link_state": "MATCHED" if matched else "UNMATCHED",
+                    "receipts": matched,
+                }
+            )
+
+        unmatched_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt["receipt_id"] not in matched_receipt_ids
+        ]
+        return {
+            "schema": "universe.todo-action-history.v1",
+            "todo": todo,
+            "actions": actions,
+            "receipts": receipts,
+            "unmatched_receipts": unmatched_receipts,
+            "action_count": len(actions),
+            "receipt_count": len(receipts),
+        }
+
     @staticmethod
     def _goal_automation_scheduler_mutation_receipt_row(
         row: sqlite3.Row,
@@ -41640,6 +41717,25 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "project_id": project_id,
                         "goals": goals,
                         "unassigned_todos": unassigned,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        todo_action_history = re.fullmatch(r"/v1/todos/([^/]+)/actions", path)
+        if todo_action_history is not None:
+            try:
+                history = self.server.store.list_todo_action_history(
+                    unquote(todo_action_history.group(1))
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_ACTION_HISTORY_COLLECTED",
+                        "history": history,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
                     },
