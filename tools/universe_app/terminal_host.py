@@ -47,7 +47,11 @@ from universe_app.managed_shell import (
 from universe_app.prompt_submission_verification import (
     AGENT_PROMPT_EFFECT_POLL_MS,
     AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+    AGENT_PROMPT_DELIVERED,
     AGENT_PROMPT_PENDING,
+    AGENT_PROMPT_STALLED,
+    agent_prompt_paste_bytes,
+    agent_prompt_settle_seconds,
     prompt_activity,
     verify_agent_prompt_submission,
 )
@@ -2353,12 +2357,17 @@ class TerminalHost:
         data: bytes,
         *,
         audit_context: Mapping[str, Any] | None = None,
+        prompt_submit: bool | None = None,
     ) -> None:
         session = self.get(terminal_id)
         backend = session.backend
         if backend is None or session.state != "LIVE":
             raise TerminalHostError("TERMINAL_NOT_LIVE", "terminal is not live")
-        submit = b"\r" in data or b"\n" in data
+        submit = (
+            b"\r" in data or b"\n" in data
+            if prompt_submit is None
+            else bool(prompt_submit)
+        )
         baseline = self._session_prompt_activity(session) if submit else None
         backend.write(data)
         if submit and baseline is not None:
@@ -2371,6 +2380,48 @@ class TerminalHost:
                 context=audit_context,
                 details=controls,
             )
+
+    def wait_prompt_delivery(
+        self,
+        terminal_id: str,
+        *,
+        timeout_seconds: float = (AGENT_PROMPT_EFFECT_TIMEOUT_MS / 1000.0) + 0.25,
+    ) -> str:
+        """Wait for the verifier armed by the submit keystroke."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            status = str(self.get(terminal_id).prompt_delivery or "")
+            if status and status != AGENT_PROMPT_PENDING:
+                return status
+            time.sleep(AGENT_PROMPT_EFFECT_POLL_MS / 1000.0)
+        status = str(self.get(terminal_id).prompt_delivery or "")
+        return status if status and status != AGENT_PROMPT_PENDING else AGENT_PROMPT_STALLED
+
+    def submit_prompt(
+        self,
+        terminal_id: str,
+        text: str,
+        *,
+        audit_context: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Paste, submit, and verify one interactive provider turn."""
+
+        payload = agent_prompt_paste_bytes(text)
+        self.write(
+            terminal_id,
+            payload,
+            audit_context=audit_context,
+            prompt_submit=False,
+        )
+        time.sleep(agent_prompt_settle_seconds(len(payload)))
+        self.write(
+            terminal_id,
+            b"\r",
+            audit_context=audit_context,
+            prompt_submit=True,
+        )
+        return self.wait_prompt_delivery(terminal_id)
 
 
     @classmethod

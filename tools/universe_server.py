@@ -547,11 +547,6 @@ TODO_SOURCE_KINDS = frozenset({"USER", "CONDUCTOR", "MASTER"})
 TODO_MUTATION_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 TODO_MUTATION_RECEIPT_TTL_SECONDS = 120
 TODO_MUTATION_RECEIPT_MAX_TTL_SECONDS = 600
-# An interactive Codex/Grok TUI heuristically treats a large session-bus
-# delivery as a paste and absorbs a trailing "\r" into the paste body rather
-# than submitting the turn. Deliver the text, let the TUI settle the paste,
-# then send the submit key on its own so it registers as a keystroke.
-RUST_HOST_INPUT_SETTLE_SECONDS = 0.35
 FEATURE_NODE_SCHEMA = "universe.feature-node.v1"
 NODE_PLANNING_CONTEXT_SCHEMA = "universe.node-planning-context.v1"
 NODE_PLANNING_MEETING_SESSION_SCHEMA = (
@@ -35026,6 +35021,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"{source_id}/activity/{latest.get('activity_id')}"
                 ),
             )
+            if isinstance(scan, dict):
+                scan["session_bus_result_projection"] = (
+                    self._project_observed_session_bus_terminal_result(
+                        session=session,
+                        activity=latest,
+                        source_id=source_id,
+                    )
+                )
         # A Session Hook has already verified these anchors.  The provider
         # catalog can still lag that hook by one or more scans, so retry only
         # allocations that were explicitly parked for catalog visibility.
@@ -35040,6 +35043,90 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     retry_catalog_visibility=True,
                 )
         return scans
+
+    @staticmethod
+    def _observed_at_not_before(left: Any, right: Any) -> bool:
+        try:
+            observed = datetime.fromisoformat(str(left).replace("Z", "+00:00"))
+            started = datetime.fromisoformat(str(right).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        return observed >= started
+
+    def _project_observed_session_bus_terminal_result(
+        self,
+        *,
+        session: Mapping[str, Any],
+        activity: Mapping[str, Any],
+        source_id: str,
+    ) -> dict[str, Any]:
+        """Turn one terminal provider observation into one durable Bus RESULT."""
+
+        activity_state = str(activity.get("activity_state") or "").upper()
+        event_kind = str(activity.get("event_kind") or "").upper()
+        if activity_state == "COMPLETED":
+            outcome = "COMPLETED"
+        elif activity_state == "FAILED" or event_kind == "QUOTA_STOP":
+            outcome = "FAILED"
+        else:
+            return {"status": "NOT_TERMINAL", "activity_state": activity_state}
+        anchor = str(session.get("session_anchor_ref") or "").strip()
+        if not anchor:
+            return {"status": "SESSION_ANCHOR_UNAVAILABLE"}
+        observed_at = str(activity.get("observed_at") or "").strip()
+        try:
+            messages = self.session_bus.inbox(
+                self._session_anchor_terminal_host(),
+                session_anchor_ref=anchor,
+                projection="ACTIVITY",
+            )["messages"]
+        except (SessionBusError, TerminalHostError) as error:
+            return {"status": "SESSION_BUS_LOOKUP_FAILED", "detail": str(error)}
+        candidates = [
+            message
+            for message in messages
+            if str(message.get("kind") or "").upper() == "INSTRUCTION"
+            and str(message.get("lifecycle_state") or "").upper() == "STARTED"
+            and self._observed_at_not_before(
+                observed_at,
+                (message.get("lifecycle") or {}).get("started_at"),
+            )
+        ]
+        if not candidates:
+            return {"status": "NO_STARTED_INSTRUCTION"}
+        if len(candidates) != 1:
+            return {
+                "status": "SESSION_BUS_RESULT_CORRELATION_AMBIGUOUS",
+                "message_ids": [str(item.get("message_id") or "") for item in candidates],
+            }
+        original = candidates[0]
+        activity_id = str(activity.get("activity_id") or "").strip()
+        result_ref = (
+            f"universe://provider-session-source/{source_id}/activity/{activity_id}"
+            if activity_id
+            else f"universe://provider-session-source/{source_id}"
+        )
+        try:
+            reply = self.session_bus.reply(
+                str(original["message_id"]),
+                session_anchor_ref=anchor,
+                body_text=(
+                    f"Provider session reported {outcome} for Session Bus instruction "
+                    f"{original['message_id']}."
+                ),
+                result_ref=result_ref,
+                outcome=outcome,
+                host=self._session_anchor_terminal_host(),
+            )
+        except (SessionBusError, TerminalHostError) as error:
+            return {"status": "SESSION_BUS_RESULT_FAILED", "detail": str(error)}
+        return {
+            "status": "SESSION_BUS_RESULT_PROJECTED",
+            "message_id": str(original["message_id"]),
+            "result_message_id": str(reply["result"]["message_id"]),
+            "outcome": outcome,
+            "result_ref": result_ref,
+        }
 
     def tail_live_provider_sessions(self) -> dict[str, Any]:
         """Tail activity and expose only fresh, redacted in-memory deltas."""
@@ -38126,6 +38213,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if not terminal_id:
             return {"status": "TERMINAL_UNAVAILABLE"}
         try:
+            active_messages = self.session_bus.inbox(
+                self._session_anchor_terminal_host(),
+                session_anchor_ref=session_anchor_ref,
+                projection="ACTIVITY",
+            )["messages"]
+            started_ids = [
+                str(item.get("message_id") or "")
+                for item in active_messages
+                if str(item.get("kind") or "").upper() == "INSTRUCTION"
+                and str(item.get("lifecycle_state") or "").upper() == "STARTED"
+            ]
+            if started_ids:
+                return {
+                    "status": "SESSION_BUSY",
+                    "active_message_ids": started_ids,
+                    "session_anchor_ref": session_anchor_ref,
+                }
             claim = self.session_bus.claim_instruction(
                 self._session_anchor_terminal_host(),
                 terminal_id=terminal_id,
@@ -38295,12 +38399,37 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 instruction_ref = str(delivery.get("instruction_ref") or "").strip()
                 if instruction_ref and not body_text.startswith("instruction_ref:"):
                     body_text = f"instruction_ref: {instruction_ref}\n{body_text}"
-                # Write the turn text, let the TUI settle the paste, then send
-                # the submit key as its own keystroke (see
-                # RUST_HOST_INPUT_SETTLE_SECONDS).
-                self.terminal_host.write(terminal_id, body_text.encode("utf-8"))
-                time.sleep(RUST_HOST_INPUT_SETTLE_SECONDS)
-                self.terminal_host.write(terminal_id, b"\r")
+                submit_prompt = getattr(self.terminal_host, "submit_prompt", None)
+                if not callable(submit_prompt):
+                    raise TerminalHostError(
+                        "AGENT_PROMPT_SUBMISSION_UNAVAILABLE",
+                        "terminal Host does not expose verified prompt submission",
+                    )
+                prompt_delivery = str(
+                    submit_prompt(
+                        terminal_id,
+                        body_text,
+                        audit_context={
+                            "source": "SESSION_BUS",
+                            "message_id": message_id,
+                            "session_anchor_ref": session_anchor_ref,
+                        },
+                    )
+                    or ""
+                ).lower()
+                if prompt_delivery != "delivered":
+                    self.session_bus.release_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    return {
+                        "status": "AGENT_PROMPT_" + (prompt_delivery or "UNKNOWN").upper(),
+                        "delivery_mode": "RUST_HOST_INPUT",
+                        "provider": provider,
+                        "message_id": message_id,
+                        "session_anchor_ref": session_anchor_ref,
+                    }
                 completed = self.session_bus.complete_instruction_claim(
                     terminal_id=terminal_id,
                     message_id=str(delivery["message_id"]),
@@ -38316,6 +38445,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return {
                 "status": "DISPATCHED",
                 "delivery_mode": "RUST_HOST_INPUT",
+                "prompt_delivery": prompt_delivery,
                 "provider": provider,
                 "message_id": completed["message_id"],
                 "session_anchor_ref": session_anchor_ref,
@@ -38487,9 +38617,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # Bus HEADER path: the SessionStart hook verified this exact live
             # PTY and the message was atomically claimed for its Session Anchor.
             body_text = str(delivery["body_text"])
-            self.terminal_host.write(terminal_id, body_text.encode("utf-8"))
-            time.sleep(RUST_HOST_INPUT_SETTLE_SECONDS)
-            self.terminal_host.write(terminal_id, b"\r")
+            submit_prompt = getattr(self.terminal_host, "submit_prompt", None)
+            if not callable(submit_prompt):
+                raise TerminalHostError(
+                    "AGENT_PROMPT_SUBMISSION_UNAVAILABLE",
+                    "terminal Host does not expose verified prompt submission",
+                )
+            prompt_delivery = str(
+                submit_prompt(
+                    terminal_id,
+                    body_text,
+                    audit_context={
+                        "source": "SESSION_BUS",
+                        "message_id": str(delivery["message_id"]),
+                        "session_anchor_ref": session_anchor_ref,
+                    },
+                )
+                or ""
+            ).lower()
+            if prompt_delivery != "delivered":
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=str(claim.get("message_id") or ""),
+                    session_anchor_ref=session_anchor_ref,
+                )
+                return {
+                    "status": "AGENT_PROMPT_" + (prompt_delivery or "UNKNOWN").upper(),
+                    "delivery_mode": "PTY_FALLBACK",
+                    "message_id": str(delivery["message_id"]),
+                    "session_anchor_ref": session_anchor_ref,
+                }
             completed = self.session_bus.complete_instruction_claim(
                 terminal_id=terminal_id,
                 message_id=str(delivery["message_id"]),
@@ -38505,6 +38662,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {
             "status": "DISPATCHED",
             "delivery_mode": "PTY_FALLBACK",
+            "prompt_delivery": prompt_delivery,
             "message_id": completed["message_id"],
             "session_anchor_ref": session_anchor_ref,
             "hook_stdout": outcome.get("hook_stdout"),

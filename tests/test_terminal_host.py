@@ -29,6 +29,10 @@ from universe_app.terminal_host import (  # noqa: E402
     startup_argv,
     startup_input,
 )
+from universe_app.prompt_submission_verification import (  # noqa: E402
+    agent_prompt_paste_bytes,
+    agent_prompt_settle_seconds,
+)
 
 
 class FakePty:
@@ -156,6 +160,32 @@ class FakeReconnectionRegistry:
 
 
 class TerminalHostTests(unittest.TestCase):
+    def test_submit_prompt_uses_safe_bracketed_paste_and_separate_enter(self) -> None:
+        pty = FakePty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
+        created = host.create(
+            project_id="universe",
+            mode="CONDUCTOR",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+        )
+        text = "first line\nunsafe \x1b[31m"
+        with (
+            patch.object(host, "_arm_prompt_verification"),
+            patch.object(host, "wait_prompt_delivery", return_value="delivered"),
+            patch("universe_app.terminal_host.time.sleep") as sleep,
+        ):
+            result = host.submit_prompt(created["terminal_id"], text)
+
+        payload = agent_prompt_paste_bytes(text)
+        self.assertEqual("delivered", result)
+        self.assertEqual([payload, b"\r"], pty.writes)
+        self.assertNotIn(b"\x1b[31m", payload)
+        self.assertIn(b"<ESC>[31m", payload)
+        sleep.assert_called_once_with(agent_prompt_settle_seconds(len(payload)))
+        host.close(created["terminal_id"])
+
     def test_reused_new_host_relaunches_provider_command(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(

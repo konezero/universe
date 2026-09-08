@@ -3545,6 +3545,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.terminal_host.find_live = Mock(return_value=terminal)
         self.server.terminal_host.get = Mock(return_value=terminal)
         self.server.terminal_host.write = Mock()
+        self.server.terminal_host.submit_prompt = Mock(return_value="delivered")
         self.server._provider_chat_key_for_session_instruction = Mock(
             return_value="chat_codex_native_should_not_run"
         )
@@ -3577,17 +3578,58 @@ class UniverseLocalServiceTests(unittest.TestCase):
         expected_body = (
             f"instruction_ref: session-bus:{posted['message_id']}\n"
             "Continue through the visible Rust Host session."
-        ).encode("utf-8")
-        # Turn text and submit key are written separately so a large paste's
-        # trailing bytes do not swallow the "\r".
-        self.assertEqual(
-            [
-                ((terminal["terminal_id"], expected_body), {}),
-                ((terminal["terminal_id"], b"\r"), {}),
-            ],
-            [tuple(call) for call in self.server.terminal_host.write.call_args_list],
         )
+        self.server.terminal_host.submit_prompt.assert_called_once()
+        submit_args = self.server.terminal_host.submit_prompt.call_args.args
+        self.assertEqual((terminal["terminal_id"], expected_body), submit_args)
+        self.assertEqual("SESSION_BUS", self.server.terminal_host.submit_prompt.call_args.kwargs["audit_context"]["source"])
+        self.server.terminal_host.write.assert_not_called()
         self.server.provider_sessions.submit_channel.assert_not_called()
+
+    def test_interactive_rust_host_stalled_prompt_returns_claim_to_pending(self) -> None:
+        terminal = {
+            "terminal_id": "term-rust-host-stalled-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "supervisor_session_id": "supervisor-rust-host-stalled-001",
+            "backend_owner": "RUST_RECONNECTION_HOST",
+            "launch_profile": "INTERACTIVE",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.terminal_host.submit_prompt = Mock(return_value="stalled")
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"project_id": "GCS", "mode": "MASTER", "provider": "CODEX"},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="This prompt must be verified before dispatch.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": terminal["supervisor_session_id"],
+                "session_anchor_ref": "session-anchor-rust-host-stalled-001",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-stalled-001",
+                "mode": "MASTER",
+            },
+            trigger="TURN_IDLE",
+        )
+
+        self.assertEqual("AGENT_PROMPT_STALLED", dispatched["status"])
+        pending = self.server.session_bus.inbox(
+            self.server._session_anchor_terminal_host(),
+            terminal_id=terminal["terminal_id"],
+        )["messages"]
+        self.assertEqual("PENDING", pending[0]["delivery_state"])
+        self.assertEqual("QUEUED", pending[0]["lifecycle_state"])
+        self.assertEqual(posted["message_id"], pending[0]["message_id"])
 
     def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
         terminal = {
@@ -4164,6 +4206,161 @@ class UniverseLocalServiceTests(unittest.TestCase):
             if item["message_id"] == reply["result"]["message_id"]
         )
         self.assertEqual("READ", consumed["delivery_state"])
+
+    def test_provider_observer_projects_completed_and_blocked_bus_results(self) -> None:
+        terminal_id = "term-observed-result-001"
+        anchor = "session-anchor-observed-result-001"
+        terminal = {
+            "terminal_id": terminal_id,
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": anchor,
+            "active_session_anchor_ref": anchor,
+            "supervisor_session_id": "supervisor-observed-result-001",
+        }
+        host = Mock()
+        host.get.return_value = terminal
+        host.list_sessions.return_value = [terminal]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        session = {
+            "session_id": terminal["supervisor_session_id"],
+            "session_anchor_ref": anchor,
+            "provider": "CODEX",
+            "mode": "MASTER",
+        }
+
+        for index, (activity_state, event_kind, expected_outcome) in enumerate(
+            [
+                ("COMPLETED", "TURN_COMPLETED", "COMPLETED"),
+                ("WAITING", "QUOTA_STOP", "FAILED"),
+            ],
+            start=1,
+        ):
+            posted = self.server.session_bus.deliver_to_terminal(
+                host,
+                terminal=terminal,
+                source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+                to={"terminal_id": terminal_id, "session_anchor_ref": anchor},
+                kind="INSTRUCTION",
+                notify="NONE",
+                body=f"observed terminal result {index}",
+            )
+            self.server.session_bus.claim_instruction(
+                host,
+                terminal_id=terminal_id,
+                session_anchor_ref=anchor,
+                message_id=posted["message_id"],
+            )
+            self.server.session_bus.complete_instruction_claim(
+                terminal_id=terminal_id,
+                message_id=posted["message_id"],
+                session_anchor_ref=anchor,
+            )
+
+            projected = self.server._project_observed_session_bus_terminal_result(
+                session=session,
+                activity={
+                    "activity_id": f"activity-observed-{index}",
+                    "activity_state": activity_state,
+                    "event_kind": event_kind,
+                    "observed_at": "9999-01-01T00:00:00Z",
+                },
+                source_id="provider-source-observed-001",
+            )
+
+            self.assertEqual("SESSION_BUS_RESULT_PROJECTED", projected["status"])
+            self.assertEqual(expected_outcome, projected["outcome"])
+            original = next(
+                item
+                for item in self.server.session_bus.inbox(
+                    host, terminal_id=terminal_id, projection="ACTIVITY"
+                )["messages"]
+                if item["message_id"] == posted["message_id"]
+            )
+            self.assertEqual("REPLIED", original["lifecycle_state"])
+            result = next(
+                item
+                for item in self.server.session_bus.inbox(
+                    host, session_anchor_ref=anchor, projection="RESULTS"
+                )["messages"]
+                if item["message_id"] == projected["result_message_id"]
+            )
+            self.assertEqual(expected_outcome, result["lifecycle_state"])
+            self.assertEqual(posted["message_id"], result["in_reply_to"])
+
+    def test_provider_observer_projects_result_after_terminal_coordinate_replacement(self) -> None:
+        anchor = "session-anchor-reopened-result-001"
+        original = {
+            "terminal_id": "term-before-reopen-001",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": anchor,
+            "active_session_anchor_ref": anchor,
+            "supervisor_session_id": "supervisor-before-restart-001",
+        }
+        replacement = {
+            **original,
+            "terminal_id": "term-after-reopen-001",
+            "supervisor_session_id": "supervisor-after-restart-001",
+        }
+        host = Mock()
+        host.get.return_value = original
+        host.list_sessions.return_value = [original]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        posted = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=original,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"terminal_id": original["terminal_id"], "session_anchor_ref": anchor},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Finish after reconnecting the provider tab.",
+        )
+        self.server.session_bus.claim_instruction(
+            host,
+            terminal_id=original["terminal_id"],
+            session_anchor_ref=anchor,
+            message_id=posted["message_id"],
+        )
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=original["terminal_id"],
+            message_id=posted["message_id"],
+            session_anchor_ref=anchor,
+        )
+
+        host.get.return_value = replacement
+        host.list_sessions.return_value = [replacement]
+        projected = self.server._project_observed_session_bus_terminal_result(
+            session={
+                "session_id": replacement["supervisor_session_id"],
+                "session_anchor_ref": anchor,
+                "provider": "CODEX",
+                "mode": "MASTER",
+            },
+            activity={
+                "activity_id": "activity-after-reopen-001",
+                "activity_state": "COMPLETED",
+                "event_kind": "TURN_COMPLETED",
+                "observed_at": "9999-01-01T00:00:00Z",
+            },
+            source_id="provider-source-after-restart-001",
+        )
+
+        self.assertEqual("SESSION_BUS_RESULT_PROJECTED", projected["status"])
+        self.assertEqual(posted["message_id"], projected["message_id"])
+        result_ids = {
+            item["in_reply_to"]
+            for item in self.server.session_bus.inbox(
+                host, session_anchor_ref=anchor, projection="RESULTS"
+            )["messages"]
+        }
+        self.assertIn(posted["message_id"], result_ids)
 
     def test_catalog_retry_resumes_only_hook_verified_waiting_allocation(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)

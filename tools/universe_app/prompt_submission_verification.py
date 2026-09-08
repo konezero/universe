@@ -16,6 +16,27 @@ AGENT_PROMPT_EFFECT_TIMEOUT_MS = 30_000
 AGENT_PROMPT_STALLED = "stalled"
 AGENT_PROMPT_DELIVERED = "delivered"
 AGENT_PROMPT_PENDING = "pending"
+AGENT_PROMPT_PASTE_BASE_DELAY_MS = 500
+AGENT_PROMPT_PASTE_BYTES_PER_MS = 64
+BRACKETED_PASTE_START = b"\x1b[200~"
+BRACKETED_PASTE_END = b"\x1b[201~"
+
+
+def agent_prompt_paste_bytes(text: str) -> bytes:
+    """Build one safe bracketed-paste frame for an interactive agent TUI."""
+
+    sanitized = str(text).replace("\x1b", "<ESC>")
+    return BRACKETED_PASTE_START + sanitized.encode("utf-8") + BRACKETED_PASTE_END
+
+
+def agent_prompt_settle_seconds(byte_length: int) -> float:
+    """Return the Orca-derived open-loop ConPTY paste settle interval."""
+
+    length = max(0, int(byte_length))
+    return (
+        AGENT_PROMPT_PASTE_BASE_DELAY_MS
+        + (length / AGENT_PROMPT_PASTE_BYTES_PER_MS)
+    ) / 1000.0
 
 
 def prompt_activity(
