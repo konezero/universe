@@ -513,6 +513,12 @@ class PtySupervisorTests(unittest.TestCase):
                 supervisor_session_id="session_master_2",
             )
         )
+
+        pooled = list(second._connection_pool)
+        self.assertEqual(1, len(pooled))
+        pooled_connection = pooled[0][1]
+        second.list_sessions()
+        self.assertEqual(pooled_connection, second._connection_pool[0][1])
         waiter = second.subscribe(terminal_id)
         seen = b""
         deadline = time.time() + 1
@@ -525,6 +531,7 @@ class PtySupervisorTests(unittest.TestCase):
                 seen += chunk
         self.assertIn(b"hello-supervisor", seen)
         second.unsubscribe(terminal_id, waiter)
+        second.close_transport()
 
     def test_supervised_subscription_does_not_drop_machine_json_bytes(self) -> None:
         host = object.__new__(SupervisedTerminalHost)

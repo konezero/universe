@@ -162,7 +162,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("surface.notifySize?.(0)", TERM)
         self.assertIn("attachCustomKeyEventHandler", TERM)
         self.assertIn("event.isComposing", TERM)
-        self.assertIn("function bindTerminalIme(term, socket, getSurface)", TERM)
+        self.assertIn("function bindTerminalIme(term, getSocket, getSurface)", TERM)
         self.assertIn("IME_STALE_COMPOSITION_MS", TERM)
         self.assertIn("HANGUL_PREEDIT_PATTERN", TERM)
         # A click anywhere in the pane must land keyboard focus in xterm, even
@@ -170,12 +170,16 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         # so does not move focus on its own.
         surface_slice = TERM[
             TERM.index("function ensureTerminalSurface") : TERM.rindex(
-                "bindTerminalIme(term, socket, () => surface)"
+                "bindTerminalIme(term, () => socket, () => surface)"
             )
         ]
         self.assertIn('element.addEventListener(', surface_slice)
         self.assertIn('"pointerdown",', surface_slice)
         self.assertIn("try { term.focus(); }", surface_slice)
+        self.assertIn("if (!socket || socket.readyState !== WebSocket.OPEN) return;", TERM)
+        self.assertIn("const scheduleSocketReconnect = () =>", TERM)
+        self.assertIn("const delay = Math.min(5000", TERM)
+        self.assertIn("surface.disposeSocket?.()", TERM)
         self.assertIn('data.normalize("NFC")', TERM)
         self.assertIn("compositionend", TERM)
         self.assertNotIn("function HangulBuffer()", TERM)
@@ -223,7 +227,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const IS_IOS", TERM)
         self.assertIn("if (IS_IOS) {", TERM)
         self.assertIn('it === "deleteContentBackward"', TERM)
-        self.assertIn('sendPtyText(socket, "\\x7f")', TERM)
+        self.assertIn('sendPtyText(getSocket(), "\\x7f")', TERM)
         self.assertIn('if (IS_IOS && (!isControlData || data === "\\x7f"))', TERM)
         # Whether a printable key gets an `input` mirror at all isn't decided
         # by keyCode (a real-keyCode digit/symbol never gets one; a

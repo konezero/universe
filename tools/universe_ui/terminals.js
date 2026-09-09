@@ -753,7 +753,7 @@ function imeLog(tag, detail) {
 }
 
 function sendPtyText(socket, data) {
-  if (socket.readyState !== WebSocket.OPEN) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const text = typeof data === "string" ? data.normalize("NFC") : String(data || "");
   if (!text) return;
   imeLog("send", JSON.stringify(text));
@@ -824,7 +824,7 @@ const IS_MAC =
 // for an unrelated reason — gate it on platform, not just on behavior.
 const IME_DEGRADED_FALLBACK_PLATFORM = IS_MAC || IS_IOS;
 
-function bindTerminalIme(term, socket, getSurface) {
+function bindTerminalIme(term, getSocket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
   let composing = false;
   let lastComposeAt = 0;
@@ -873,7 +873,7 @@ function bindTerminalIme(term, socket, getSurface) {
     window.setTimeout(() => {
       if (entry.resolved) return;
       entry.resolved = true;
-      sendPtyText(socket, char);
+      sendPtyText(getSocket(), char);
       imeLog("ios-fallback:send", char);
     }, IOS_INPUT_MIRROR_TIMEOUT_MS);
   };
@@ -904,7 +904,7 @@ function bindTerminalIme(term, socket, getSurface) {
     imeMarked = "";
     if (text) {
       imeInputAt = Date.now();
-      sendPtyText(socket, text);
+      sendPtyText(getSocket(), text);
     }
   };
   const endCompose = () => {
@@ -942,7 +942,7 @@ function bindTerminalIme(term, socket, getSurface) {
         // deletes (a jamo key producing deleteContentBackward+insertText to
         // refine the syllable) are a different path and never hit this.
         if (event.key === "Backspace") {
-          sendPtyText(socket, "\x7f");
+          sendPtyText(getSocket(), "\x7f");
         } else if (event.key.length === 1) {
           scheduleIosFallback(event.key);
         }
@@ -1028,7 +1028,7 @@ function bindTerminalIme(term, socket, getSurface) {
         if (it === "deleteContentBackward" || it === "deleteWordBackward") {
           // The only DEL sender on iOS — xterm's own \x7f onData is dropped.
           // Covers both a real Backspace and IME syllable-refinement.
-          sendPtyText(socket, "\x7f");
+          sendPtyText(getSocket(), "\x7f");
           return;
         }
         if (
@@ -1038,11 +1038,11 @@ function bindTerminalIme(term, socket, getSurface) {
             it === "insertCompositionText") &&
           event.data
         ) {
-          sendPtyText(socket, event.data);
+          sendPtyText(getSocket(), event.data);
           return;
         }
         if (it === "insertLineBreak") {
-          sendPtyText(socket, "\r");
+          sendPtyText(getSocket(), "\r");
         }
         return;
       }
@@ -1065,7 +1065,7 @@ function bindTerminalIme(term, socket, getSurface) {
       if (it === "insertText" && event.data && Date.now() - lastKey229At < 600) {
         // A fresh jamo after a 229 key: the previous marked syllable is final.
         if (imeMarked && event.data !== imeMarked) {
-          sendPtyText(socket, imeMarked);
+          sendPtyText(getSocket(), imeMarked);
         }
         imeMarked = event.data === imeMarked ? "" : event.data;
         imeInputAt = Date.now();
@@ -1144,7 +1144,7 @@ function bindTerminalIme(term, socket, getSurface) {
       imeLog("onData:drop(composing)", "");
       return;
     }
-    sendPtyText(socket, data);
+    sendPtyText(getSocket(), data);
   });
 }
 
@@ -1294,22 +1294,17 @@ function ensureTerminalSurface(session) {
   };
   try { term.reset(); } catch (_error) { /* xterm not ready */ }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const socket = new WebSocket(
+  const socketUrl = (
     `${protocol}://${window.location.host}/v1/terminals/${encodeURIComponent(session.terminal_id)}/stream`
   );
-  socket.binaryType = "arraybuffer";
-  socket.addEventListener("message", (event) => {
-    const live = cloneTerminalChunk(event.data);
-    if (surface && (surface.rebuildingHistory || surface.historyInitialized)) {
-      retainLiveChunk(surface, live, !surface.rebuildingHistory);
-    }
-    if (!surface?.rebuildingHistory) writeTerminalBytes(term, live);
-    scheduleInitialLayout(240);
-  });
-  bindTerminalIme(term, socket, () => surface);
+  let socket = null;
+  let socketDisposed = false;
+  let reconnectTimer = 0;
+  let reconnectAttempts = 0;
+  bindTerminalIme(term, () => socket, () => surface);
   let resizeTimer = 0;
   const sendCurrentSize = () => {
-    if (socket.readyState !== WebSocket.OPEN) return false;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     const cols = Number(term.cols) || TERMINAL_COLS;
     const rows = Math.max(TERMINAL_MIN_ROWS, Number(term.rows) || TERMINAL_ROWS);
     const sizeKey = `${cols}x${rows}`;
@@ -1347,13 +1342,75 @@ function ensureTerminalSurface(session) {
       if (surface) surface.restoreSavedViewport = false;
     }, delay);
   };
-  socket.addEventListener("open", () => {
-    scheduleInitialLayout(360);
-  });
-  socket.addEventListener("close", (event) => {
-    const detail = event.reason ? ` ${event.code}: ${event.reason}` : ` code=${event.code}`;
-    term.write(`\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`);
-  });
+  const scheduleSocketReconnect = () => {
+    if (socketDisposed || reconnectTimer) return;
+    const delay = Math.min(5000, 250 * (2 ** Math.min(reconnectAttempts, 5)));
+    reconnectAttempts += 1;
+    reconnectTimer = window.setTimeout(async () => {
+      reconnectTimer = 0;
+      if (socketDisposed) return;
+      try {
+        const payload = await api("/v1/terminals");
+        const current = (payload.terminals || []).find(
+          (item) => item.terminal_id === session.terminal_id
+        );
+        if (!current || String(current.state || "").toUpperCase() !== "LIVE") {
+          socketDisposed = true;
+          term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
+          return;
+        }
+      } catch (_error) {
+        // The main service may itself be restarting. The WebSocket retry is
+        // the authoritative recovery attempt in that case.
+      }
+      connectSocket();
+    }, delay);
+  };
+  const connectSocket = () => {
+    if (socketDisposed) return;
+    const nextSocket = new WebSocket(socketUrl);
+    socket = nextSocket;
+    if (surface) surface.socket = nextSocket;
+    nextSocket.binaryType = "arraybuffer";
+    nextSocket.addEventListener("message", (event) => {
+      if (socket !== nextSocket) return;
+      const live = cloneTerminalChunk(event.data);
+      if (surface && (surface.rebuildingHistory || surface.historyInitialized)) {
+        retainLiveChunk(surface, live, !surface.rebuildingHistory);
+      }
+      if (!surface?.rebuildingHistory) writeTerminalBytes(term, live);
+      scheduleInitialLayout(240);
+    });
+    nextSocket.addEventListener("open", () => {
+      if (socket !== nextSocket) return;
+      reconnectAttempts = 0;
+      if (surface) surface.lastSentSizeKey = null;
+      scheduleInitialLayout(360);
+    });
+    nextSocket.addEventListener("close", (event) => {
+      if (socket !== nextSocket || socketDisposed) return;
+      socket = null;
+      if (surface) surface.socket = null;
+      if (event.code === 1000) {
+        socketDisposed = true;
+        const detail = event.reason ? ` ${event.code}: ${event.reason}` : "";
+        term.write(`\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`);
+        return;
+      }
+      if (reconnectAttempts === 0) {
+        term.write("\r\n\x1b[90m[stream reconnecting]\x1b[0m\r\n");
+      }
+      scheduleSocketReconnect();
+    });
+  };
+  const disposeSocket = () => {
+    socketDisposed = true;
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = 0;
+    const current = socket;
+    socket = null;
+    try { current?.close(1000, "surface disposed"); } catch (_error) { /* closed */ }
+  };
   window.addEventListener("resize", notifySize);
   const resizeObserver = new ResizeObserver(() => {
     if (element.hidden) return;
@@ -1364,6 +1421,7 @@ function ensureTerminalSurface(session) {
     element,
     term,
     socket,
+    disposeSocket,
     notifySize,
     resizeObserver,
     fitAddon,
@@ -1393,6 +1451,7 @@ function ensureTerminalSurface(session) {
     );
   });
   state.terminalSurfaces[session.terminal_id] = surface;
+  connectSocket();
   return surface;
 }
 
@@ -1546,7 +1605,7 @@ async function closeTerminalTab(terminalId) {
   const surface = (state.terminalSurfaces || {})[terminalId];
   if (surface) {
     try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
-    try { surface.socket.close(); } catch (_e) { /* already closed */ }
+    try { surface.disposeSocket?.(); } catch (_e) { /* already closed */ }
     try { surface.term.dispose(); } catch (_e) { /* ok */ }
     surface.element.remove();
     delete state.terminalSurfaces[terminalId];

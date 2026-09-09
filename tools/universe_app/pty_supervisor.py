@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import queue
@@ -17,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from universe_app.prompt_submission_verification import (
     AGENT_PROMPT_EFFECT_TIMEOUT_MS,
@@ -28,6 +29,7 @@ from universe_app.terminal_host import TerminalHostError
 
 SCHEMA = "universe.pty-supervisor.v1"
 STATE_NAME = "pty-supervisor.json"
+HTTP_CONNECTION_POOL_SIZE = 16
 
 
 def default_data_dir() -> Path:
@@ -286,10 +288,65 @@ class SupervisedTerminalHost:
         self._state_path = state_path or default_state_path()
         self._state = ensure_supervisor(state_path=self._state_path)
         self._lock = threading.Lock()
+        self._connection_slots = threading.BoundedSemaphore(HTTP_CONNECTION_POOL_SIZE)
+        self._connection_pool: list[tuple[str, http.client.HTTPConnection]] = []
 
     def _refresh(self) -> dict[str, Any]:
+        # A provider output subscription may issue thousands of bounded reads.
+        # Re-probing /health before every read doubles the connection churn and
+        # can exhaust Windows' ephemeral TCP ports. Reload the local state file
+        # and let the actual request prove transport health; use the expensive
+        # ensure path only when the recorded supervisor process is gone.
+        current = load_state(self._state_path)
+        if current is not None and pid_is_running(int(current.get("pid") or 0)):
+            self._state = current
+            return self._state
         self._state = ensure_supervisor(state_path=self._state_path)
         return self._state
+
+    def _borrow_connection(
+        self, endpoint: str, *, timeout: float
+    ) -> http.client.HTTPConnection:
+        with self._lock:
+            while self._connection_pool:
+                pooled_endpoint, connection = self._connection_pool.pop()
+                if pooled_endpoint == endpoint:
+                    connection.timeout = timeout
+                    return connection
+                connection.close()
+        parsed = urlsplit(endpoint)
+        if parsed.scheme.lower() != "http" or not parsed.hostname:
+            raise TerminalHostError(
+                "PTY_SUPERVISOR_ENDPOINT_INVALID",
+                "PTY supervisor endpoint must be local HTTP",
+            )
+        return http.client.HTTPConnection(
+            parsed.hostname,
+            parsed.port or 80,
+            timeout=timeout,
+        )
+
+    def _return_connection(
+        self, endpoint: str, connection: http.client.HTTPConnection
+    ) -> None:
+        with self._lock:
+            if len(self._connection_pool) < HTTP_CONNECTION_POOL_SIZE:
+                self._connection_pool.append((endpoint, connection))
+                return
+        connection.close()
+
+    def close_transport(self) -> None:
+        with self._lock:
+            connections = [item[1] for item in self._connection_pool]
+            self._connection_pool.clear()
+        for connection in connections:
+            connection.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close_transport()
+        except Exception:
+            pass
 
     def _request(
         self,
@@ -311,33 +368,63 @@ class SupervisedTerminalHost:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            str(state["endpoint"]).rstrip("/") + path,
-            data=body,
-            headers=headers,
-            method=method,
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as error:
-            detail = error.reason
-            try:
-                parsed = json.loads(error.read().decode("utf-8"))
-                error_code = str(parsed.get("error_code") or "").strip()
-                error_detail = str(parsed.get("detail") or "").strip()
-                detail = (
-                    f"{error_code}: {error_detail}"
-                    if error_code and error_detail
-                    else error_code or error_detail or str(detail)
-                )
-            except Exception:
-                pass
-            raise TerminalHostError(str(detail), str(detail)) from error
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        endpoint = str(state["endpoint"]).rstrip("/")
+        parsed_endpoint = urlsplit(endpoint)
+        request_path = (parsed_endpoint.path.rstrip("/") + path) or "/"
+        if parsed_endpoint.query:
+            request_path += "?" + parsed_endpoint.query
+        acquired = self._connection_slots.acquire(timeout=max(0.1, timeout))
+        if not acquired:
             raise TerminalHostError(
-                "PTY_SUPERVISOR_UNAVAILABLE", str(error)
-            ) from error
+                "PTY_SUPERVISOR_BUSY",
+                "PTY supervisor HTTP connection pool is saturated",
+            )
+        connection: http.client.HTTPConnection | None = None
+        reusable = False
+        try:
+            for attempt in range(2):
+                connection = self._borrow_connection(endpoint, timeout=timeout)
+                try:
+                    connection.request(method, request_path, body=body, headers=headers)
+                    response = connection.getresponse()
+                    raw = response.read().decode("utf-8")
+                    reusable = not response.will_close
+                    status = int(response.status)
+                    reason = str(response.reason or "")
+                    break
+                except (http.client.HTTPException, TimeoutError, OSError) as error:
+                    connection.close()
+                    connection = None
+                    if attempt == 0:
+                        continue
+                    raise TerminalHostError(
+                        "PTY_SUPERVISOR_UNAVAILABLE", str(error)
+                    ) from error
+            else:  # pragma: no cover - loop always returns or raises
+                raise TerminalHostError(
+                    "PTY_SUPERVISOR_UNAVAILABLE", "PTY supervisor request failed"
+                )
+            if status >= 400:
+                detail = reason
+                try:
+                    parsed = json.loads(raw)
+                    error_code = str(parsed.get("error_code") or "").strip()
+                    error_detail = str(parsed.get("detail") or "").strip()
+                    detail = (
+                        f"{error_code}: {error_detail}"
+                        if error_code and error_detail
+                        else error_code or error_detail or detail
+                    )
+                except Exception:
+                    pass
+                raise TerminalHostError(str(detail), str(detail))
+        finally:
+            if connection is not None:
+                if reusable:
+                    self._return_connection(endpoint, connection)
+                else:
+                    connection.close()
+            self._connection_slots.release()
         if not raw:
             return {}
         try:
