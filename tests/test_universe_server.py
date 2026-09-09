@@ -4439,6 +4439,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
             body_text="Master report is ready.",
             host=host,
         )
+        coordination = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=conductor,
+            source={
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "GROK",
+            },
+            to={"terminal_id": conductor_tid},
+            kind="COORDINATION",
+            notify="NONE",
+            body="retry queued coordination while the Conductor is idle",
+        )
         self.server._dispatch_pending_session_instruction = Mock(
             return_value={"status": "DISPATCHED"}
         )
@@ -4449,12 +4462,20 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             [reply["result"]["message_id"]], observed["forwarded_result_ids"]
         )
-        self.assertEqual(1, len(observed["dispatched_instruction_ids"]))
-        forwarded_id = observed["dispatched_instruction_ids"][0]
-        self.server._dispatch_pending_session_instruction.assert_called_once()
-        dispatched_kwargs = self.server._dispatch_pending_session_instruction.call_args.kwargs
-        self.assertEqual(forwarded_id, dispatched_kwargs["message_id"])
-        self.assertEqual("TURN_IDLE", dispatched_kwargs["trigger"])
+        self.assertEqual(2, len(observed["dispatched_instruction_ids"]))
+        self.assertIn(
+            coordination["message_id"], observed["dispatched_instruction_ids"]
+        )
+        self.assertEqual(2, self.server._dispatch_pending_session_instruction.call_count)
+        dispatched_kwargs = [
+            call.kwargs
+            for call in self.server._dispatch_pending_session_instruction.call_args_list
+        ]
+        self.assertEqual(
+            set(observed["dispatched_instruction_ids"]),
+            {item["message_id"] for item in dispatched_kwargs},
+        )
+        self.assertTrue(all(item["trigger"] == "TURN_IDLE" for item in dispatched_kwargs))
         results = self.server.session_bus.inbox(
             host,
             terminal_id=conductor_tid,
@@ -4492,10 +4513,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "mode": "MASTER",
         }
 
-        for index, (activity_state, event_kind, expected_outcome) in enumerate(
+        for index, (kind, activity_state, event_kind, expected_outcome) in enumerate(
             [
-                ("COMPLETED", "TURN_COMPLETED", "COMPLETED"),
-                ("WAITING", "QUOTA_STOP", "FAILED"),
+                ("INSTRUCTION", "COMPLETED", "TURN_COMPLETED", "COMPLETED"),
+                ("INSTRUCTION", "WAITING", "QUOTA_STOP", "FAILED"),
+                ("COORDINATION", "COMPLETED", "TURN_COMPLETED", "COMPLETED"),
             ],
             start=1,
         ):
@@ -4504,7 +4526,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 terminal=terminal,
                 source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
                 to={"terminal_id": terminal_id, "session_anchor_ref": anchor},
-                kind="INSTRUCTION",
+                kind=kind,
                 notify="NONE",
                 body=f"observed terminal result {index}",
             )
@@ -4759,7 +4781,25 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "added": 0,
             }
         )
-        self.server.store.list_provider_session_activities = Mock(return_value=[])
+        latest_observed = {
+            "activity_id": "activity-observed-after-complete",
+            "event_kind": "ACTIVITY",
+            "activity_state": "OBSERVED",
+            "observed_at": "2026-09-09T03:44:25.242Z",
+        }
+        latest_terminal = {
+            "activity_id": "activity-complete-before-observed",
+            "event_kind": "TURN_COMPLETED",
+            "activity_state": "COMPLETED",
+            "observed_at": "2026-09-09T03:44:25.236Z",
+        }
+        self.server.store.list_provider_session_activities = Mock(
+            return_value=[latest_observed, latest_terminal]
+        )
+        self.server.session_supervisor.observe_session_activity = Mock()
+        self.server._project_observed_session_bus_terminal_result = Mock(
+            return_value={"status": "SESSION_BUS_RESULT_PROJECTED"}
+        )
         self.server._resume_hook_verified_conductor_allocations = Mock()
 
         scans = self.server.tail_bound_provider_sessions()
@@ -4767,6 +4807,25 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(1, len(scans))
         self.server.store.scan_provider_session_source.assert_called_once_with(
             "source-bound-001"
+        )
+        self.server.session_supervisor.observe_session_activity.assert_called_once_with(
+            session["session_id"],
+            event_type="PROVIDER_ACTIVITY_OBSERVED",
+            activity_state="OBSERVED",
+            observed_at=latest_observed["observed_at"],
+            evidence_ref=(
+                "universe://provider-session-source/source-bound-001/activity/"
+                "activity-observed-after-complete"
+            ),
+        )
+        self.server._project_observed_session_bus_terminal_result.assert_called_once_with(
+            session=session,
+            activity=latest_terminal,
+            source_id="source-bound-001",
+        )
+        self.assertEqual(
+            "SESSION_BUS_RESULT_PROJECTED",
+            scans[0]["session_bus_result_projection"]["status"],
         )
 
     def test_semantic_graph_extracts_room_decisions_and_todo_candidates(self) -> None:

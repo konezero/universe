@@ -127,10 +127,13 @@ class UniverseServiceControlTests(unittest.TestCase):
                         log_path=root / "service.log",
                         working_directory=root,
                         wait_seconds=0,
+                        port=51799,
                     )
             self.assertEqual("READY", result["status"])
             self.assertEqual("Universe Server", result["program"]["name"])
             self.assertTrue(popen.call_args.kwargs["close_fds"])
+            port_index = result["command"].index("--port")
+            self.assertEqual("51799", result["command"][port_index + 1])
 
     def test_stop_uses_authenticated_graceful_shutdown_without_taskkill(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -224,6 +227,32 @@ class UniverseServiceControlTests(unittest.TestCase):
             result["start"]["reason"],
         )
         start.assert_not_called()
+
+    def test_restart_reuses_previous_loopback_port(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "server.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "endpoint": "http://127.0.0.1:51799",
+                        "token": "secret",
+                        "pid": 42,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "universe_service_control.stop_service",
+                return_value={"status": "STOPPED"},
+            ):
+                with mock.patch(
+                    "universe_service_control.start_service",
+                    return_value={"status": "READY"},
+                ) as start:
+                    result = restart_service(state_path=path)
+
+        self.assertEqual("READY", result["status"])
+        self.assertEqual(51799, start.call_args.kwargs["port"])
 
 
 if __name__ == "__main__":

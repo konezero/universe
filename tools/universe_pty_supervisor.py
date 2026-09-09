@@ -808,6 +808,39 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
             return
+        if path.startswith("/v1/terminals/") and path.endswith("/submit-prompt"):
+            terminal_id = path.split("/")[3]
+            supplied_context = body.get("audit_context")
+            audit_context = (
+                dict(supplied_context) if isinstance(supplied_context, Mapping) else {}
+            )
+            audit_context.update(self._audit_context("PTY_SUPERVISOR_SUBMIT_PROMPT"))
+            try:
+                prompt_delivery = supervisor.host.submit_prompt(
+                    terminal_id,
+                    str(body.get("text") or ""),
+                    audit_context=audit_context,
+                )
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "OK",
+                    "prompt_delivery": prompt_delivery,
+                },
+            )
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/emit"):
             terminal_id = path.split("/")[3]
             raw = str(body.get("data_b64") or "")

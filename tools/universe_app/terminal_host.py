@@ -50,6 +50,7 @@ from universe_app.prompt_submission_verification import (
     AGENT_PROMPT_DELIVERED,
     AGENT_PROMPT_PENDING,
     AGENT_PROMPT_STALLED,
+    agent_prompt_input_bytes,
     agent_prompt_paste_bytes,
     agent_prompt_settle_seconds,
     prompt_activity,
@@ -2466,6 +2467,37 @@ class TerminalHost:
         status = str(self.get(terminal_id).prompt_delivery or "")
         return status if status and status != AGENT_PROMPT_PENDING else AGENT_PROMPT_STALLED
 
+    @staticmethod
+    def _wait_tui_composer_ready(
+        session: TerminalSession,
+        *,
+        baseline_output_sequence: int,
+        fallback_seconds: float,
+    ) -> None:
+        """Wait until an interactive TUI has materialized a paste in its composer."""
+
+        deadline = time.monotonic() + max(2.0, float(fallback_seconds) * 4.0)
+        last_output_sequence = int(baseline_output_sequence)
+        quiet_since: float | None = None
+        while time.monotonic() < deadline:
+            with session.lock:
+                output_sequence = session.output_cursor
+                snapshot = bytes(session.screen_snapshot or b"")
+            now = time.monotonic()
+            if output_sequence > baseline_output_sequence:
+                if b"[Pasted Content " in snapshot:
+                    # Codex paints the paste placeholder before its composer
+                    # has finished committing the burst of input events.  A
+                    # CR sent on that paint edge is intermittently ignored.
+                    time.sleep(max(0.15, min(0.5, float(fallback_seconds))))
+                    return
+                if output_sequence != last_output_sequence:
+                    last_output_sequence = output_sequence
+                    quiet_since = now
+                elif quiet_since is not None and now - quiet_since >= 0.15:
+                    return
+            time.sleep(0.025)
+
     def submit_prompt(
         self,
         terminal_id: str,
@@ -2473,16 +2505,31 @@ class TerminalHost:
         *,
         audit_context: Mapping[str, Any] | None = None,
     ) -> str:
-        """Paste, submit, and verify one interactive provider turn."""
+        """Enter, submit, and verify one interactive provider turn."""
 
-        payload = agent_prompt_paste_bytes(text)
+        session = self.get(terminal_id)
+        provider = str(session.provider or "").strip().upper()
+        payload = (
+            agent_prompt_input_bytes(text)
+            if provider in {"CODEX", "GROK"}
+            else agent_prompt_paste_bytes(text)
+        )
+        baseline_output_sequence = session.output_cursor
         self.write(
             terminal_id,
             payload,
             audit_context=audit_context,
             prompt_submit=False,
         )
-        time.sleep(agent_prompt_settle_seconds(len(payload)))
+        settle_seconds = agent_prompt_settle_seconds(len(payload))
+        if provider in {"CODEX", "GROK"}:
+            self._wait_tui_composer_ready(
+                session,
+                baseline_output_sequence=baseline_output_sequence,
+                fallback_seconds=settle_seconds,
+            )
+        else:
+            time.sleep(settle_seconds)
         self.write(
             terminal_id,
             b"\r",

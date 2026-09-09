@@ -231,22 +231,51 @@ class PtySupervisorTests(unittest.TestCase):
 
     def test_supervised_host_submits_and_verifies_prompt(self) -> None:
         host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)
-        with patch.object(host, "write") as write, patch.object(
-            host, "wait_prompt_delivery", return_value="delivered"
-        ) as wait, patch(
-            "universe_app.pty_supervisor.time.sleep"
-        ):
+        with patch.object(
+            host, "_request", return_value={"prompt_delivery": "delivered"}
+        ) as request:
             result = host.submit_prompt(
                 "term-supervised",
                 "perform the handoff",
-                audit_context={"source": "SESSION_BUS"},
+                audit_context={"source": "SESSION_BUS", "message_id": "msg-1"},
             )
 
         self.assertEqual("delivered", result)
-        self.assertEqual(2, write.call_count)
-        self.assertTrue(write.call_args_list[0].args[1].startswith(b"\x1b[200~"))
-        self.assertEqual(b"\r", write.call_args_list[1].args[1])
-        wait.assert_called_once_with("term-supervised")
+        request.assert_called_once_with(
+            "POST",
+            "/v1/terminals/term-supervised/submit-prompt",
+            payload={
+                "text": "perform the handoff",
+                "audit_context": {"source": "SESSION_BUS", "message_id": "msg-1"},
+            },
+            timeout=40.0,
+            audit_source="SESSION_BUS",
+        )
+
+    def test_http_submit_prompt_runs_inside_supervisor_owned_host(self) -> None:
+        with patch.object(
+            self.server.supervisor.host,
+            "submit_prompt",
+            return_value="delivered",
+        ) as submit:
+            status, payload = self.request(
+                "POST",
+                "/v1/terminals/term-owned/submit-prompt",
+                {
+                    "text": "perform the handoff",
+                    "audit_context": {
+                        "source": "SESSION_BUS",
+                        "message_id": "msg-1",
+                    },
+                },
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual("delivered", payload["prompt_delivery"])
+        submit.assert_called_once()
+        self.assertEqual("term-owned", submit.call_args.args[0])
+        self.assertEqual("perform the handoff", submit.call_args.args[1])
+        self.assertEqual("msg-1", submit.call_args.kwargs["audit_context"]["message_id"])
 
     def test_supervised_host_wait_returns_terminal_verifier_state(self) -> None:
         host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)

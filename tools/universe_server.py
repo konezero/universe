@@ -286,6 +286,7 @@ from universe_app.pty_supervisor import (
     restart_supervisor,
 )
 from universe_app.session_bus import (
+    ACTIONABLE_KINDS,
     SessionBus,
     SessionBusError,
     fanout_meeting_bus,
@@ -34247,7 +34248,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if remaining <= 0:
                     break
                 if (
-                    str(message.get("kind") or "").upper() != "INSTRUCTION"
+                    str(message.get("kind") or "").upper() not in ACTIONABLE_KINDS
                     or str(message.get("delivery_state") or "").upper() != "PENDING"
                 ):
                     continue
@@ -35304,6 +35305,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if not activities:
                 continue
             latest = activities[0]
+            terminal_activity = next(
+                (
+                    activity
+                    for activity in activities
+                    if str(activity.get("activity_state") or "").upper()
+                    in {"COMPLETED", "FAILED"}
+                    or str(activity.get("event_kind") or "").upper() == "QUOTA_STOP"
+                ),
+                latest,
+            )
             self.session_supervisor.observe_session_activity(
                 str(session["session_id"]),
                 event_type="PROVIDER_ACTIVITY_OBSERVED",
@@ -35318,7 +35329,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 scan["session_bus_result_projection"] = (
                     self._project_observed_session_bus_terminal_result(
                         session=session,
-                        activity=latest,
+                        activity=terminal_activity,
                         source_id=source_id,
                     )
                 )
@@ -35378,7 +35389,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         candidates = [
             message
             for message in messages
-            if str(message.get("kind") or "").upper() == "INSTRUCTION"
+            if str(message.get("kind") or "").upper() in ACTIONABLE_KINDS
             and str(message.get("lifecycle_state") or "").upper() == "STARTED"
             and self._observed_at_not_before(
                 observed_at,

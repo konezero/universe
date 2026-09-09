@@ -23,8 +23,6 @@ from universe_app.prompt_submission_verification import (
     AGENT_PROMPT_EFFECT_TIMEOUT_MS,
     AGENT_PROMPT_PENDING,
     AGENT_PROMPT_STALLED,
-    agent_prompt_paste_bytes,
-    agent_prompt_settle_seconds,
 )
 from universe_app.terminal_host import TerminalHostError
 
@@ -547,23 +545,17 @@ class SupervisedTerminalHost:
         *,
         audit_context: Mapping[str, Any] | None = None,
     ) -> str:
-        """Submit one verified prompt through the standalone supervisor."""
+        """Atomically paste and submit through the Supervisor-owned Host."""
 
-        payload = agent_prompt_paste_bytes(text)
-        self.write(
-            terminal_id,
-            payload,
-            audit_context=audit_context,
-            prompt_submit=False,
+        context = dict(audit_context or {})
+        result = self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/submit-prompt",
+            payload={"text": str(text), "audit_context": context},
+            timeout=(AGENT_PROMPT_EFFECT_TIMEOUT_MS / 1000.0) + 10.0,
+            audit_source=str(context.get("source") or "UNIVERSE_SERVER"),
         )
-        time.sleep(agent_prompt_settle_seconds(len(payload)))
-        self.write(
-            terminal_id,
-            b"\r",
-            audit_context=audit_context,
-            prompt_submit=True,
-        )
-        return self.wait_prompt_delivery(terminal_id)
+        return str(result.get("prompt_delivery") or AGENT_PROMPT_STALLED)
 
     def emit_output(self, terminal_id: str, data: bytes) -> None:
         """Fan out display-only bytes without sending them to CLI stdin."""

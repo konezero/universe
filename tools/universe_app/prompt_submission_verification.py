@@ -29,6 +29,21 @@ def agent_prompt_paste_bytes(text: str) -> bytes:
     return BRACKETED_PASTE_START + sanitized.encode("utf-8") + BRACKETED_PASTE_END
 
 
+def agent_prompt_input_bytes(text: str) -> bytes:
+    """Build ordinary terminal input bytes without entering bracketed-paste mode.
+
+    Codex and Grok accept terminal ``onData`` input as ordinary UTF-8.  Newlines
+    are flattened because a literal CR/LF is a submit control in an interactive
+    TUI; submission is always sent separately by ``TerminalHost.submit_prompt``.
+    """
+
+    sanitized = str(text).replace("\x1b", "<ESC>")
+    single_line = " ".join(
+        sanitized.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    )
+    return single_line.encode("utf-8")
+
+
 def agent_prompt_settle_seconds(byte_length: int) -> float:
     """Return the Orca-derived open-loop ConPTY paste settle interval."""
 

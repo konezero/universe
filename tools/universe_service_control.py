@@ -304,6 +304,7 @@ def start_service(
     log_path: Path | None = None,
     working_directory: Path | None = None,
     wait_seconds: float = 12.0,
+    port: int | None = None,
 ) -> dict[str, Any]:
     path = (state_path or default_state_path()).expanduser()
     database = (database_path or default_database_path()).expanduser()
@@ -332,6 +333,8 @@ def start_service(
         "--mode-registry",
         str(registry),
     ]
+    if port is not None:
+        args.extend(["--port", str(port)])
     if open_ui:
         args.append("--open-ui")
     else:
@@ -384,7 +387,17 @@ def restart_service(
     working_directory: Path | None = None,
 ) -> dict[str, Any]:
     path = state_path or default_state_path()
-    stop_result = stop_service(path)
+    previous_state = load_state(path)
+    previous_endpoint = str(previous_state.get("endpoint") or "")
+    previous_port = (
+        urlsplit(previous_endpoint).port
+        if _is_loopback_http_origin(previous_endpoint)
+        else None
+    )
+    # Resident provider-session cleanup can finish just after the ordinary
+    # stop grace window.  A restart waits a little longer so it does not leave
+    # the service down after shutdown was already accepted.
+    stop_result = stop_service(path, timeout_seconds=30.0)
     stop_status = str(stop_result.get("status") or "")
     if stop_status not in {"STOPPED", "ALREADY_STOPPED"}:
         return {
@@ -402,6 +415,7 @@ def restart_service(
         mode_registry=mode_registry,
         open_ui=open_ui,
         working_directory=working_directory,
+        port=previous_port,
     )
     return {
         "schema": "universe.local-service-control.v1",

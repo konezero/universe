@@ -34,6 +34,7 @@ from universe_app.terminal_host import (  # noqa: E402
     startup_input,
 )
 from universe_app.prompt_submission_verification import (  # noqa: E402
+    agent_prompt_input_bytes,
     agent_prompt_paste_bytes,
     agent_prompt_settle_seconds,
 )
@@ -170,7 +171,7 @@ class FakeReconnectionRegistry:
 
 
 class TerminalHostTests(unittest.TestCase):
-    def test_submit_prompt_uses_safe_bracketed_paste_and_separate_enter(self) -> None:
+    def test_codex_submit_uses_safe_terminal_input_and_separate_enter(self) -> None:
         pty = FakePty()
         host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
         created = host.create(
@@ -184,16 +185,107 @@ class TerminalHostTests(unittest.TestCase):
         with (
             patch.object(host, "_arm_prompt_verification"),
             patch.object(host, "wait_prompt_delivery", return_value="delivered"),
-            patch("universe_app.terminal_host.time.sleep") as sleep,
+            patch.object(host, "_wait_tui_composer_ready") as wait_ready,
+        ):
+            result = host.submit_prompt(created["terminal_id"], text)
+
+        payload = agent_prompt_input_bytes(text)
+        self.assertEqual("delivered", result)
+        self.assertEqual([payload, b"\r"], pty.writes)
+        self.assertNotIn(b"\x1b[200~", payload)
+        self.assertNotIn(b"\n", payload)
+        self.assertNotIn(b"\x1b[31m", payload)
+        self.assertIn(b"<ESC>[31m", payload)
+        wait_ready.assert_called_once_with(
+            host.get(created["terminal_id"]),
+            baseline_output_sequence=0,
+            fallback_seconds=agent_prompt_settle_seconds(len(payload)),
+        )
+        host.close(created["terminal_id"])
+
+    def test_claude_submit_keeps_safe_bracketed_paste_and_separate_enter(self) -> None:
+        pty = FakePty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+        )
+        session = host.get(created["terminal_id"])
+        session.provider = "CLAUDE"
+        text = "first line\nsecond line"
+        with (
+            patch.object(host, "_arm_prompt_verification"),
+            patch.object(host, "wait_prompt_delivery", return_value="delivered"),
+            patch("universe_app.terminal_host.time.sleep"),
         ):
             result = host.submit_prompt(created["terminal_id"], text)
 
         payload = agent_prompt_paste_bytes(text)
         self.assertEqual("delivered", result)
         self.assertEqual([payload, b"\r"], pty.writes)
-        self.assertNotIn(b"\x1b[31m", payload)
-        self.assertIn(b"<ESC>[31m", payload)
-        sleep.assert_called_once_with(agent_prompt_settle_seconds(len(payload)))
+        self.assertTrue(payload.startswith(b"\x1b[200~"))
+        self.assertTrue(payload.endswith(b"\x1b[201~"))
+        host.close(created["terminal_id"])
+
+    def test_tui_submit_waits_for_pasted_content_marker_before_enter(self) -> None:
+        pty = FakePty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
+        created = host.create(
+            project_id="universe",
+            mode="CONDUCTOR",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+        )
+        session = host.get(created["terminal_id"])
+
+        sleeps: list[float] = []
+
+        def materialize_paste(seconds: float) -> None:
+            sleeps.append(seconds)
+            with session.lock:
+                session.output_cursor = 1
+                session.screen_snapshot = b"> [Pasted Content 2090 chars]"
+
+        with patch("universe_app.terminal_host.time.sleep", side_effect=materialize_paste):
+            host._wait_tui_composer_ready(
+                session,
+                baseline_output_sequence=0,
+                fallback_seconds=0.5,
+            )
+
+        self.assertEqual([], pty.writes)
+        self.assertGreaterEqual(sleeps[-1], 0.15)
+        host.close(created["terminal_id"])
+
+    def test_grok_submit_uses_tui_composer_readiness_gate(self) -> None:
+        pty = FakePty()
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: pty)
+        created = host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+        )
+        session = host.get(created["terminal_id"])
+        session.provider = "GROK"
+
+        with (
+            patch.object(host, "_arm_prompt_verification"),
+            patch.object(host, "wait_prompt_delivery", return_value="delivered"),
+            patch.object(host, "_wait_tui_composer_ready") as wait_ready,
+        ):
+            result = host.submit_prompt(created["terminal_id"], "check grok inbox")
+
+        self.assertEqual("delivered", result)
+        wait_ready.assert_called_once()
+        self.assertEqual(agent_prompt_input_bytes("check grok inbox"), pty.writes[0])
+        self.assertNotIn(b"\x1b[200~", pty.writes[0])
+        self.assertEqual(b"\r", pty.writes[-1])
         host.close(created["terminal_id"])
 
     def test_reused_new_host_relaunches_provider_command(self) -> None:
