@@ -304,6 +304,53 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual(1, len(active))
         self.assertEqual("child", active[0]["provider_event_id"])
         self.assertEqual("TOOL_PHASE", active[0]["event_kind"])
+        history = self.store.list_activities(
+            str(source["source_id"]), active_only=False
+        )
+        self.assertEqual(["child", "root"], [item["provider_event_id"] for item in history])
+        limited = self.store.list_activities(
+            str(source["source_id"]), active_only=False, limit=1
+        )
+        self.assertEqual(["child"], [item["provider_event_id"] for item in limited])
+
+    def test_claude_skips_uuid_less_session_metadata(self) -> None:
+        source_path = self.root / "claude-session-with-metadata.jsonl"
+        self.write(
+            source_path,
+            {
+                "type": "assistant",
+                "uuid": "assistant-result",
+                "message": {"role": "assistant", "content": "done"},
+            },
+            {"type": "file-history-snapshot", "snapshot": {}},
+            {"type": "file-history-delta", "backup": {}},
+            {"type": "queue-operation", "operation": "dequeue"},
+            {"type": "ai-title", "aiTitle": "redacted"},
+            {"type": "last-prompt", "lastPrompt": "redacted"},
+            {"type": "mode", "mode": "default"},
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "atis-latch", "atis": {}},
+            {"type": "bridge-session", "bridgeSessionId": "bridge-1"},
+        )
+        source = self.register("CLAUDE", source_path)
+
+        result = self.store.scan(str(source["source_id"]))
+        activities = self.store.list_activities(str(source["source_id"]))
+
+        self.assertEqual("ACTIVE", result["source"]["status"])
+        self.assertIsNone(result["source"]["reason"])
+        self.assertEqual(1, result["added"])
+        self.assertEqual("TURN_COMPLETED", activities[0]["event_kind"])
+
+    def test_claude_unknown_uuid_less_event_still_fails_closed(self) -> None:
+        source_path = self.root / "claude-unknown-event.jsonl"
+        self.write(source_path, {"type": "unexpected-new-event"})
+        source = self.register("CLAUDE", source_path)
+
+        result = self.store.scan(str(source["source_id"]))
+
+        self.assertEqual("UNKNOWN", result["source"]["status"])
+        self.assertEqual("SOURCE_SCHEMA_UNSUPPORTED", result["source"]["reason"])
 
     def test_grok_accepts_updates_only(self) -> None:
         with self.assertRaisesRegex(ProviderSessionObserverError, "updates.jsonl only"):

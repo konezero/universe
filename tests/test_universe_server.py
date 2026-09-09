@@ -4808,6 +4808,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.store.scan_provider_session_source.assert_called_once_with(
             "source-bound-001"
         )
+        self.server.store.list_provider_session_activities.assert_called_once_with(
+            "source-bound-001",
+            active_only=False,
+            limit=128,
+        )
         self.server.session_supervisor.observe_session_activity.assert_called_once_with(
             session["session_id"],
             event_type="PROVIDER_ACTIVITY_OBSERVED",

@@ -10466,9 +10466,19 @@ class UniverseStore:
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail) from error
 
-    def list_provider_session_activities(self, source_id: str) -> list[dict[str, Any]]:
+    def list_provider_session_activities(
+        self,
+        source_id: str,
+        *,
+        active_only: bool = True,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         try:
-            return self.provider_session_observer.list_activities(source_id)
+            return self.provider_session_observer.list_activities(
+                source_id,
+                active_only=active_only,
+                limit=limit,
+            )
         except ProviderSessionObserverError as error:
             raise UniverseError(
                 error.code, error.detail, HTTPStatus.NOT_FOUND
@@ -35301,7 +35311,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             source_id = str(source.get("source_id") or "")
             if session is None or not source_id:
                 continue
-            activities = self.store.list_provider_session_activities(source_id)
+            # Claude's conversation DAG marks a completed assistant event
+            # inactive when a following turn-duration/session event becomes
+            # the active leaf. Keep the ordinary projection on the active leaf,
+            # but inspect a bounded recent history for terminal Bus evidence.
+            activities = self.store.list_provider_session_activities(
+                source_id,
+                active_only=False,
+                limit=128,
+            )
             if not activities:
                 continue
             latest = activities[0]

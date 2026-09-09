@@ -25,6 +25,19 @@ OBSERVER_SCHEMA = "universe.provider-session-observer.v1"
 SOURCE_SCHEMA = "universe.provider-session-source.v1"
 ACTIVITY_SCHEMA = "universe.provider-session-activity.v1"
 PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
+CLAUDE_METADATA_EVENT_TYPES = frozenset(
+    {
+        "ai-title",
+        "atis-latch",
+        "bridge-session",
+        "file-history-delta",
+        "file-history-snapshot",
+        "last-prompt",
+        "mode",
+        "permission-mode",
+        "queue-operation",
+    }
+)
 SOURCE_KINDS = {
     "CODEX": "CODEX_ROLLOUT_JSONL",
     "CLAUDE": "CLAUDE_SESSION_JSONL",
@@ -652,7 +665,13 @@ class ProviderSessionObserverStore:
             ]
         return [self.scan(source_id) for source_id in source_ids]
 
-    def list_activities(self, source_id: str, *, active_only: bool = True) -> list[dict[str, Any]]:
+    def list_activities(
+        self,
+        source_id: str,
+        *,
+        active_only: bool = True,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self._connection() as connection:
             exists = connection.execute(
                 "SELECT 1 FROM provider_session_source WHERE source_id = ?", (source_id,)
@@ -663,7 +682,12 @@ class ProviderSessionObserverStore:
             if active_only:
                 query += " AND active = 1"
             query += " ORDER BY ordinal DESC, activity_id DESC"
-            rows = connection.execute(query, (source_id,)).fetchall()
+            parameters: tuple[Any, ...] = (source_id,)
+            if limit is not None:
+                bounded_limit = max(1, min(int(limit), 4096))
+                query += " LIMIT ?"
+                parameters = (source_id, bounded_limit)
+            rows = connection.execute(query, parameters).fetchall()
         return [self._activity_row(row) for row in rows]
 
     def build_batch_candidate(self, source_id: str) -> dict[str, Any]:
@@ -1207,6 +1231,16 @@ class ProviderSessionObserverStore:
         event_id = _event_id(event, f"offset-{byte_offset}")
         parent_id: str | None = None
         if provider == "CLAUDE":
+            # Recent Claude releases append session-control records to the same
+            # JSONL file as conversation events. These records intentionally do
+            # not carry the conversation DAG's uuid/parentUuid fields and must
+            # not become provider activity. Keep the whitelist explicit so an
+            # unknown uuid-less event still fails closed.
+            if (
+                event_type.strip().lower() in CLAUDE_METADATA_EVENT_TYPES
+                and not event.get("uuid")
+            ):
+                return False
             if not isinstance(event.get("uuid"), str) or not str(event["uuid"]).strip():
                 raise ProviderSessionObserverError(
                     "SOURCE_SCHEMA_UNSUPPORTED", "Claude event requires uuid"
