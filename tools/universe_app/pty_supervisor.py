@@ -352,6 +352,14 @@ class SupervisedTerminalHost:
     def list_hosts(self) -> list[dict[str, Any]]:
         return list(self._request("GET", "/v1/terminals").get("hosts") or [])
 
+    def reconcile_reconnection_hosts(self) -> list[dict[str, Any]]:
+        return list(
+            self._request("POST", "/v1/terminals/reconcile", payload={}).get(
+                "results"
+            )
+            or []
+        )
+
     def get(self, terminal_id: str) -> SupervisedSession:
         payload = self._request("GET", f"/v1/terminals/{quote(terminal_id, safe='')}")
         terminal = payload.get("terminal")
@@ -371,6 +379,14 @@ class SupervisedTerminalHost:
             if str(item.get("host_session_ref") or item.get("reconnection_host_id") or "")
             == wanted
         ]
+        if len(matches) != 1:
+            self.reconcile_reconnection_hosts()
+            matches = [
+                item
+                for item in self.list_sessions()
+                if str(item.get("host_session_ref") or item.get("reconnection_host_id") or "")
+                == wanted
+            ]
         if len(matches) != 1:
             raise TerminalHostError(
                 "HOST_SESSION_NOT_FOUND", "Host session does not exist"

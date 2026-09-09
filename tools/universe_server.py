@@ -48452,31 +48452,22 @@ def main() -> int:
             elif args.command == "stop":
                 result = stop_service(args.state_file)
             else:
+                try:
+                    pty_result = restart_supervisor(
+                        state_path=default_pty_supervisor_state_path()
+                    )
+                except Exception as error:  # noqa: BLE001 - still restart the service
+                    pty_result = {
+                        "status": "PTY_RESTART_FAILED",
+                        "detail": f"{type(error).__name__}: {error}",
+                    }
                 result = restart_service(
                     state_path=args.state_file,
                     database_path=args.database,
                     mode_registry=args.mode_registry,
                     open_ui=bool(args.open_ui),
                 )
-                # A plain restart used to leave the PTY Supervisor running the
-                # terminal_host.py it loaded days ago -- code changes silently
-                # did nothing. Cascade the restart so one command reloads both.
-                if str(result.get("status") or "") == "READY":
-                    try:
-                        result = {
-                            **result,
-                            "pty_supervisor": restart_supervisor(
-                                state_path=default_pty_supervisor_state_path()
-                            ),
-                        }
-                    except Exception as error:  # noqa: BLE001 - server is already up
-                        result = {
-                            **result,
-                            "pty_supervisor": {
-                                "status": "PTY_RESTART_FAILED",
-                                "detail": f"{type(error).__name__}: {error}",
-                            },
-                        }
+                result = {**result, "pty_supervisor": pty_result}
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
             status_text = str(result.get("status") or "")
             if status_text in {

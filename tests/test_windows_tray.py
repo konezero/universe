@@ -41,6 +41,8 @@ class WindowsTrayContractTests(unittest.TestCase):
         self.assertIn("Restart PTY Supervisor (ends terminals)", script)
         self.assertIn("Restarting the PTY Supervisor closes every active terminal", script)
         self.assertIn('Args @("pty-restart")', script)
+        self.assertIn('Args @("restart", "--no-open-ui")', script)
+        self.assertIn("PTY Supervisor did not", script)
         self.assertIn('transport_kind = "SAVED"', script)
         self.assertIn("/v1/settings/remote-access/start", script)
         self.assertNotIn("universe_remote_gateway.py", script)

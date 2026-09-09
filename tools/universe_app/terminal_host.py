@@ -2776,6 +2776,14 @@ class TerminalHost:
                 if session.reconnection_host_id == wanted
             ]
         if len(matches) != 1:
+            self.reconcile_reconnection_hosts()
+            with self._lock:
+                matches = [
+                    session
+                    for session in self._sessions.values()
+                    if session.reconnection_host_id == wanted
+                ]
+        if len(matches) != 1:
             raise TerminalHostError(
                 "HOST_SESSION_NOT_FOUND", "host_session_ref is not uniquely managed"
             )

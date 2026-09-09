@@ -1419,6 +1419,29 @@ function terminalProviderFor(_coordinate, session) {
   }
   const fromObserver = observerProvider(session);
   if (fromObserver) return fromObserver;
+  const hostProvider = String(
+    terminalHostForSession(session)?.provider || ""
+  ).toUpperCase();
+  if (["GROK", "CODEX", "CLAUDE"].includes(hostProvider)) {
+    return hostProvider;
+  }
+  const hostRef = String(
+    session?.host_session_ref || session?.reconnection_host_id || ""
+  ).trim();
+  const anchorRef = String(
+    session?.session_anchor_ref || session?.active_session_anchor_ref || ""
+  ).trim();
+  const terminalProvider = String(
+    (state.supervisorTerminals || []).find((terminal) =>
+      (hostRef && String(
+        terminal?.host_session_ref || terminal?.reconnection_host_id || ""
+      ).trim() === hostRef) ||
+      (anchorRef && String(terminal?.session_anchor_ref || "").trim() === anchorRef)
+    )?.provider || ""
+  ).toUpperCase();
+  if (["GROK", "CODEX", "CLAUDE"].includes(terminalProvider)) {
+    return terminalProvider;
+  }
   throw new Error("Choose a provider for this session");
 }
 

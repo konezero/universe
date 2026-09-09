@@ -561,6 +561,17 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         supervisor = self.server.supervisor
         body = self._read_json()
+        if path == "/v1/terminals/reconcile":
+            results = supervisor.host.reconcile_reconnection_hosts()
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "TERMINAL_RECONCILIATION_COMPLETE",
+                    "results": results,
+                },
+            )
+            return
         if path == "/v1/bus/messages":
             try:
                 created = supervisor.host.bus.post(supervisor.host, body)

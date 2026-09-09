@@ -231,8 +231,24 @@ $itemStop.Add_Click({
   })
 
 $itemRestart.Add_Click({
-    Invoke-UniverseCli -Args @("restart", "--no-open-ui") | Out-Null
+    $result = Invoke-UniverseCli -Args @("restart", "--no-open-ui")
     Update-TrayStatus | Out-Null
+    $ptyStatus = "UNKNOWN"
+    $ptyDetail = ""
+    try {
+      $payload = $result.StdOut | ConvertFrom-Json
+      $ptyStatus = [string]$payload.pty_supervisor.status
+      $ptyDetail = [string]$payload.pty_supervisor.detail
+    } catch { }
+    $notify.BalloonTipTitle = "Universe restart"
+    $notify.BalloonTipText = if ($result.ExitCode -ne 0) {
+      "Service restart failed: $($result.StdErr)"
+    } elseif ($ptyStatus -ne "RESTARTED") {
+      "Service restarted, but PTY Supervisor did not: $ptyStatus $ptyDetail"
+    } else {
+      "Service and PTY Supervisor restarted. Active terminals were closed."
+    }
+    $notify.ShowBalloonTip(4000)
   })
 
 $itemRestartPty.Add_Click({
