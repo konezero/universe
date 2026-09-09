@@ -1168,21 +1168,67 @@ async function rebindSelectedSessionWorkingDirectory() {
 }
 
 
+class UniverseApiError extends Error {
+  constructor({ method, path, status, errorCode, detail }) {
+    const context = [method, path, `HTTP ${status}`, errorCode]
+      .filter(Boolean)
+      .join(" ");
+    super(`[${context}] ${detail || "Request failed"}`);
+    this.name = "UniverseApiError";
+    this.method = method;
+    this.path = path;
+    this.status = status;
+    this.errorCode = errorCode || "";
+  }
+}
+
+function sessionLaunchError(stage, error) {
+  const detail = error instanceof Error ? error.message : String(error || "Unknown error");
+  return new Error(`[session launch: ${stage}] ${detail}`);
+}
+
 async function api(path, options = {}) {
+  const method = options.method || "GET";
   const headers = options.body ? { "Content-Type": "application/json" } : {};
   if (options.controlToken) {
     if (!localControlToken) throw new Error("Local operator token is unavailable");
     headers.Authorization = `Bearer ${localControlToken}`;
   }
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-    cache: "no-store",
-  });
-  const payload = await response.json();
+  let response;
+  try {
+    response = await fetch(path, {
+      method,
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new UniverseApiError({
+      method,
+      path,
+      status: "NETWORK",
+      detail: error instanceof Error ? error.message : String(error || "Request failed"),
+    });
+  }
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new UniverseApiError({
+      method,
+      path,
+      status: response.status,
+      detail: `Invalid JSON response: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
   if (!response.ok) {
-    throw new Error(payload.detail || payload.error_code || payload.status);
+    throw new UniverseApiError({
+      method,
+      path,
+      status: response.status,
+      errorCode: payload.error_code || payload.status,
+      detail: payload.detail,
+    });
   }
   return payload;
 }
@@ -2371,9 +2417,21 @@ async function startNewNodeModeSession(coordinate) {
   }
   const selectedProvider = String(coordinate?.provider || "").trim().toUpperCase();
   if (selectedProvider) coordinate.provider = selectedProvider;
-  await createTerminalTab(coordinate);
-  await refreshSupervisorSessions();
-  expandConversationLayer();
+  try {
+    await createTerminalTab(coordinate);
+  } catch (error) {
+    throw sessionLaunchError("CREATE_TERMINAL", error);
+  }
+  try {
+    await refreshSupervisorSessions();
+  } catch (error) {
+    throw sessionLaunchError("REFRESH_SUPERVISOR", error);
+  }
+  try {
+    expandConversationLayer();
+  } catch (error) {
+    throw sessionLaunchError("OPEN_TERMINAL_PANEL", error);
+  }
 }
 
 function openNodeModeSessionActions(coordinate, session) {

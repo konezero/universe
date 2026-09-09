@@ -188,3 +188,41 @@ Execution Assignment: UNASSIGNED
 ## Browser test artifacts
 
 Playwright and browser-test screenshots must use `.artifacts/ui/` as their explicit output directory. Do not write test captures into the repository root.
+
+## Evidence-First Change Rule
+
+For an incident, unexpected error, or behavior whose root cause is not yet
+confirmed, do not patch the first plausible location. `Proceed`, `fix it`, or
+other urgency language authorizes investigation and completion; it does not
+turn an unverified hypothesis into a source-change target.
+
+Before a non-trivial mutation, establish and record the relevant evidence:
+
+1. Observe the live symptom, state projection, and available logs or history.
+2. Trace the complete ownership boundary and state transition across UI, API,
+   gateway, service, Supervisor, Host, and provider as applicable.
+3. Distinguish a confirmed cause from hypotheses and from downstream symptoms.
+4. Patch only the confirmed owner. If evidence is insufficient, improve
+   structured diagnostics at a shared boundary rather than scattering
+   speculative workflow-specific handling.
+
+Errors must retain structured origin data at their shared boundary: operation,
+endpoint or resource identifier when applicable, transport/status, stable error
+code, and detail. Do not hardcode endpoint strings into individual workflow
+catch blocks merely to improve a toast. Validate the exact failure path and its
+adjacent regressions after every change.
+
+Do not create diagnostic spaghetti to compensate for an unconfirmed incident.
+Add observability only at the narrowest shared ownership boundary, with one
+typed error contract and one correlation identifier propagated across layers.
+Do not add per-screen, per-provider, or per-workflow catch-and-rewrite logic
+when the same failure can cross a common client, API, gateway, Supervisor, or
+Host boundary. If no such boundary exists, first introduce the smallest shared
+abstraction and migrate the affected paths together with regression coverage.
+
+Never present an inference, memory, or plausible explanation as an observed
+fact. Before answering a technical question or changing source, cite the
+available direct evidence in the work record and state its limits. When the
+cause, behavior, or ownership is not established, say `UNKNOWN` / `not yet
+determined`, name the missing evidence, and investigate it before proposing a
+fix. Do not guess to appear decisive.
