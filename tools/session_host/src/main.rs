@@ -187,7 +187,7 @@ impl MessageChannel {
         }
         self.registered = true;
         self.bootstrap_token.clear();
-        Ok(json!({"status": "REGISTERED", "session_token": self.session_token}))
+        Ok(json!({"status": "REGISTERED", "session_token": self.session_token, "ack_protocol": 1}))
     }
 
     fn require_session(&self, token: &str) -> Result<(), (&'static str, String)> {
@@ -282,11 +282,22 @@ impl MessageChannel {
                 "channel result body_text is required".to_owned(),
             ));
         }
+        let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("RESULT");
+        let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
+        if !matches!(kind, "ACK" | "RESULT") || (kind == "ACK" && !matches!(phase, "RECEIVED" | "STARTED")) {
+            return Err(("CHANNEL_RESULT_INVALID", "invalid result kind or ACK phase".to_owned()));
+        }
+        let outcome = payload.get("outcome").and_then(Value::as_str).unwrap_or("COMPLETED");
+        if kind == "RESULT" && !matches!(outcome, "COMPLETED" | "FAILED") {
+            return Err(("CHANNEL_RESULT_INVALID", "invalid final outcome".to_owned()));
+        }
         let result = json!({
-            "status": "ACCEPTED",
+            "status": if kind == "ACK" { "ACKNOWLEDGED" } else { "ACCEPTED" },
+            "kind": kind,
+            "phase": phase,
             "message_id": message_id,
             "body_text": body,
-            "outcome": payload.get("outcome").and_then(Value::as_str).unwrap_or("COMPLETED"),
+            "outcome": outcome,
             "result_ref": payload.get("result_ref").and_then(Value::as_str).unwrap_or(""),
             "session_anchor_ref": anchor,
         });
@@ -294,10 +305,15 @@ impl MessageChannel {
             if existing == &result {
                 return Ok(json!({"status": "DUPLICATE", "message_id": message_id}));
             }
-            return Err((
+            if existing.get("kind").and_then(Value::as_str) != Some("ACK") {
+                return Err((
                 "CHANNEL_RESULT_CONFLICT",
                 "channel result conflicts with the stored result".to_owned(),
-            ));
+                ));
+            }
+            if kind == "ACK" && existing.get("phase").and_then(Value::as_str) == Some("STARTED") && phase == "RECEIVED" {
+                return Ok(json!({"status": "DUPLICATE", "message_id": message_id}));
+            }
         }
         self.results.insert(message_id.to_owned(), result.clone());
         Ok(result)
@@ -1437,5 +1453,21 @@ mod tests {
                 .len(),
             OUTPUT_CAPACITY_BYTES
         );
+    }
+
+    #[test]
+    fn channel_ack_is_not_a_final_result() {
+        let mut channel = MessageChannel::new("boot".into(), "session".into());
+        channel.exchange("boot").unwrap();
+        channel.push(&json!({"message_id":"m", "content":"work", "session_anchor_ref":"a"})).unwrap();
+        for phase in ["RECEIVED", "STARTED"] {
+            let ack = channel.submit_result("session", &json!({"message_id":"m", "body_text":"ack", "kind":"ACK", "phase":phase})).unwrap();
+            assert_eq!(ack["status"], "ACKNOWLEDGED");
+        }
+        let final_result = json!({"message_id":"m", "body_text":"done"});
+        assert_eq!(channel.submit_result("session", &final_result).unwrap()["status"], "ACCEPTED");
+        assert_eq!(channel.submit_result("session", &final_result).unwrap()["status"], "DUPLICATE");
+        assert_eq!(channel.submit_result("session", &json!({"message_id":"m", "body_text":"different"})).unwrap_err().0, "CHANNEL_RESULT_CONFLICT");
+        assert_eq!(channel.result("m")["body_text"], "done");
     }
 }

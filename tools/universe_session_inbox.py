@@ -233,7 +233,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "mode": args.to_mode,
                     "provider": args.to_provider,
                 },
-                "kind": args.kind,
+                **({"protocol": args.protocol} if args.protocol else {"kind": args.kind or "RESULT"}),
                 "notify": args.notify,
                 "body_text": body,
             },
@@ -301,8 +301,10 @@ def _parser() -> argparse.ArgumentParser:
     posting.add_argument("--project-id", default="")
     posting.add_argument("--to-mode", default="CONDUCTOR")
     posting.add_argument("--to-provider", default="")
-    posting.add_argument("--kind", choices=("NOTE", "RESULT", "COORDINATION"), default="RESULT")
-    posting.add_argument("--notify", choices=("NONE", "HEADER"), default="HEADER")
+    kind_options = posting.add_mutually_exclusive_group()
+    kind_options.add_argument("--kind", choices=("NOTE", "RESULT", "COORDINATION", "INSTRUCTION"))
+    kind_options.add_argument("--protocol", choices=("WORK", "CONVERSATION", "NOTICE"))
+    posting.add_argument("--notify", choices=("NONE", "HEADER", "UI"), default="UI")
 
     waiting = subparsers.add_parser("wait")
     waiting.add_argument("--timeout", type=float, default=30.0)

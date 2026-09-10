@@ -577,6 +577,7 @@ class SupervisedTerminalHost:
         if on_result is not None and message_id:
             def poll_result() -> None:
                 deadline = time.monotonic() + 24 * 60 * 60
+                last_ack = None
                 while time.monotonic() < deadline:
                     try:
                         observed = self._request(
@@ -586,7 +587,11 @@ class SupervisedTerminalHost:
                     except TerminalHostError:
                         time.sleep(0.25)
                         continue
-                    if isinstance(observed, Mapping) and observed.get("status") in {"ACCEPTED", "DUPLICATE"}:
+                    if isinstance(observed, Mapping) and observed.get("status") == "ACKNOWLEDGED":
+                        if observed != last_ack:
+                            on_result(dict(observed))
+                            last_ack = dict(observed)
+                    elif isinstance(observed, Mapping) and observed.get("status") in {"ACCEPTED", "DUPLICATE"}:
                         on_result(dict(observed))
                         return
                     time.sleep(0.2)

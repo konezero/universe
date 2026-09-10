@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import unquote
 
+from provider_turn_correlation import codex_turn_event
+
 
 OBSERVER_SCHEMA = "universe.provider-session-observer.v1"
 SOURCE_SCHEMA = "universe.provider-session-source.v1"
@@ -502,6 +504,15 @@ class ProviderSessionObserverStore:
                 connection.execute(
                     "ALTER TABLE provider_session_activity ADD COLUMN byte_offset INTEGER"
                 )
+            for column in ("provider_turn_id", "bus_message_id", "bus_dispatch_ref"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE provider_session_activity ADD COLUMN {column} TEXT"
+                    )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS provider_session_activity_turn "
+                "ON provider_session_activity(source_id, provider_turn_id, ordinal)"
+            )
 
     def register_source(self, value: Mapping[str, Any]) -> dict[str, Any]:
         provider = _text(value.get("provider"), "provider").upper()
@@ -1228,6 +1239,20 @@ class ProviderSessionObserverStore:
         event_kind, activity_state = _safe_event_kind(event_type)
         if _provider_semantic_messages(provider, event):
             event_kind, activity_state = "TURN_COMPLETED", "COMPLETED"
+        correlation = codex_turn_event(event) if provider == "CODEX" else None
+        if correlation:
+            event_kind = correlation["event_kind"]
+            activity_state = correlation["activity_state"]
+            if event_kind == "TURN_COMPLETED":
+                bindings = connection.execute(
+                    "SELECT DISTINCT bus_message_id, bus_dispatch_ref "
+                    "FROM provider_session_activity WHERE source_id = ? "
+                    "AND provider_turn_id = ? AND bus_message_id IS NOT NULL "
+                    "AND ordinal < ?",
+                    (source["source_id"], correlation["provider_turn_id"], ordinal),
+                ).fetchall()
+                if len(bindings) == 1:
+                    correlation.update(dict(bindings[0]))
         event_id = _event_id(event, f"offset-{byte_offset}")
         parent_id: str | None = None
         if provider == "CLAUDE":
@@ -1269,6 +1294,9 @@ class ProviderSessionObserverStore:
             "event_type": event_type[:96],
             "parent_id": parent_id,
         }
+        if correlation:
+            safe.update({key: correlation.get(key) for key in
+                         ("provider_turn_id", "bus_message_id", "bus_dispatch_ref")})
         digest = _sha256(_canonical_json(safe))
         activity_id = "activity_" + digest[:24]
         inserted = connection.execute(
@@ -1276,8 +1304,9 @@ class ProviderSessionObserverStore:
                 INSERT OR IGNORE INTO provider_session_activity(
                     activity_id, source_id, provider_event_id, ordinal, event_kind,
                     activity_state, observed_at, activity_digest, byte_offset,
-                    branch_parent_id, active, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    branch_parent_id, active, recorded_at,
+                    provider_turn_id, bus_message_id, bus_dispatch_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
             """,
             (
                 activity_id,
@@ -1291,6 +1320,9 @@ class ProviderSessionObserverStore:
                 byte_offset,
                 parent_id,
                 _now(),
+                (correlation or {}).get("provider_turn_id"),
+                (correlation or {}).get("bus_message_id"),
+                (correlation or {}).get("bus_dispatch_ref"),
             ),
         )
         return inserted.rowcount == 1
@@ -1414,4 +1446,7 @@ class ProviderSessionObserverStore:
             "branch_parent_id": row["branch_parent_id"],
             "active": bool(row["active"]),
             "recorded_at": row["recorded_at"],
+            "provider_turn_id": row["provider_turn_id"],
+            "bus_message_id": row["bus_message_id"],
+            "bus_dispatch_ref": row["bus_dispatch_ref"],
         }

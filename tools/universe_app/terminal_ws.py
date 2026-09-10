@@ -20,6 +20,7 @@ TERMINAL_WS_HEARTBEAT_TIMEOUT_SECONDS = 45.0
 TERMINAL_WS_IO_POLL_SECONDS = 0.2
 TERMINAL_WS_SEND_TIMEOUT_SECONDS = 10.0
 TERMINAL_WS_OUTBOUND_QUEUE_SIZE = 256
+TERMINAL_WS_CLOSE_SERVICE_RESTART = 1012
 
 
 def websocket_accept_key(key: str) -> str:
@@ -40,6 +41,13 @@ def encode_ws_frame(payload: bytes, opcode: int = 2) -> bytes:
         header.append(127)
         header.extend(struct.pack("!Q", length))
     return bytes(header) + payload
+
+
+def encode_ws_close(code: int, reason: str = "") -> bytes:
+    payload = struct.pack("!H", int(code) & 0xFFFF)
+    if reason:
+        payload += reason.encode("utf-8")[:123]
+    return payload
 
 
 def decode_ws_frame(buffer: bytearray) -> tuple[int, bytes, int] | None:
@@ -176,6 +184,7 @@ def pump_terminal_socket(
     buffer = bytearray()
     last_ping_at = time.monotonic()
     pending_ping: tuple[bytes, float] | None = None
+    peer_closed = False
     try:
         while not stop.is_set():
             now = time.monotonic()
@@ -214,6 +223,7 @@ def pump_terminal_socket(
                 opcode, payload, consumed = decoded
                 del buffer[:consumed]
                 if opcode in {8, 0x8}:
+                    peer_closed = True
                     stop.set()
                     break
                 if opcode == 9:
@@ -266,6 +276,13 @@ def pump_terminal_socket(
                     except Exception:
                         pass
     finally:
+        if not peer_closed:
+            sender.send(
+                encode_ws_close(
+                    TERMINAL_WS_CLOSE_SERVICE_RESTART, "service restart"
+                ),
+                opcode=8,
+            )
         stop.set()
         try:
             host.unsubscribe(terminal_id, waiter)

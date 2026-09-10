@@ -152,7 +152,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("const fontForHeight = (ref * at.rows) / TERMINAL_ROWS;", TERM)
         self.assertIn("Math.min(fontForWidth, fontForHeight)", TERM)
         self.assertIn("term.resize(TERMINAL_COLS, TERMINAL_ROWS)", TERM)
-        # GPU renderer, kept only if activate() actually installed a canvas.
+        # WebGL remains available behind a reversible global switch.
         self.assertIn("window.WebglAddon?.WebglAddon", TERM)
         self.assertIn('!surface.element?.querySelector("canvas")', TERM)
         self.assertIn("webglFailedSinceRecovery", TERM)
@@ -328,6 +328,30 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("node-mode-group-nested", APP)
         self.assertIn("childrenByParent.get(group.nodeId)", APP)
         self.assertIn(".node-mode-group-nested", CSS)
+
+    def test_terminal_webgl_is_disabled_globally(self) -> None:
+        self.assertIn("const TERMINAL_WEBGL_ENABLED = false;", TERM)
+        attach = TERM[
+            TERM.index("function attachTerminalWebgl(surface)") : TERM.index(
+                "function retryTerminalWebglAfterFit(surface, fitted)"
+            )
+        ]
+        self.assertIn("if (!TERMINAL_WEBGL_ENABLED) return false;", attach)
+        self.assertNotIn("provider", attach.lower())
+
+    def test_terminal_output_is_serialized_and_wheel_input_is_coalesced(self) -> None:
+        self.assertIn("function queueTerminalRender(surface, data, options = {})", TERM)
+        self.assertIn("surface.term.write(batch, finish)", TERM)
+        self.assertIn("surface.renderWritePending", TERM)
+        self.assertIn("window.requestAnimationFrame(() => drainTerminalRenderQueue(surface))", TERM)
+        self.assertIn("TERMINAL_HIDDEN_RENDER_INTERVAL_MS", TERM)
+        self.assertIn('surface?.provider === "CLAUDE"', TERM)
+        self.assertIn("await flushTerminalRenderQueue(surface)", TERM)
+        self.assertIn("queueTerminalRender(surface, live)", TERM)
+        self.assertIn("if (getSurface?.()?.webglAddon) repaintSoon();", TERM)
+        self.assertIn("const queuePtyWheel = (mouseSgr) =>", TERM)
+        self.assertIn("MOUSE_WHEEL_MAX_STEPS_PER_FRAME", TERM)
+        self.assertIn("report.repeat(Math.abs(steps))", TERM)
 
     def test_mode_cards_use_anchor_sessions_and_host_only_reconnect_projection(self) -> None:
         self.assertIn("selectedModeCoordinateKey: null", APP)

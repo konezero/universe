@@ -301,7 +301,7 @@ class ClaudeChannelBroker:
         # handshake (for example from its MCP inspector). Keep the ephemeral
         # config until the terminal broker closes; the bootstrap is already
         # one-time and cannot be reused.
-        return {"status": "REGISTERED", "session_token": self.token.value}
+        return {"status": "REGISTERED", "session_token": self.token.value, "ack_protocol": 1}
 
     def _write_session_lookup(self) -> None:
         path = session_lookup_path(self.token.terminal_id)
@@ -384,7 +384,13 @@ class ClaudeChannelBroker:
         ).upper()
         if outcome not in {"COMPLETED", "FAILED"}:
             raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_OUTCOME_INVALID")
+        kind = str(payload.get("kind") or "RESULT")
+        phase = str(payload.get("phase") or "")
+        if kind not in {"ACK", "RESULT"} or (kind == "ACK" and phase not in {"RECEIVED", "STARTED"}):
+            raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_INVALID")
         result = {
+            "kind": kind,
+            "phase": phase,
             "message_id": message_id,
             "body_text": body,
             "outcome": outcome,
@@ -396,9 +402,12 @@ class ClaudeChannelBroker:
                 raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_MESSAGE_UNKNOWN")
             existing = self._results.get(message_id)
             if existing is not None:
-                if existing != result:
+                if existing == result:
+                    return {"status": "DUPLICATE", **result}
+                if existing.get("kind") != "ACK":
                     raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_CONFLICT")
-                return {"status": "DUPLICATE", **result}
+                if kind == "ACK" and existing.get("phase") == "STARTED" and phase == "RECEIVED":
+                    return {"status": "DUPLICATE", **existing}
             handler = self._result_handlers.get(message_id)
             if handler is None:
                 raise ClaudeChannelError("CLAUDE_CHANNEL_RESULT_HANDLER_UNAVAILABLE")
@@ -409,8 +418,9 @@ class ClaudeChannelBroker:
                     "CLAUDE_CHANNEL_RESULT_REJECTED:" + str(error)
                 ) from error
             self._results[message_id] = result
-            self._result_handlers.pop(message_id, None)
-        return {"status": "ACCEPTED", **result}
+            if kind == "RESULT":
+                self._result_handlers.pop(message_id, None)
+        return {"status": "ACKNOWLEDGED" if kind == "ACK" else "ACCEPTED", **result}
 
     def poll(self, *, timeout_seconds: float = 2.0) -> dict[str, Any]:
         if self._stopped.is_set():

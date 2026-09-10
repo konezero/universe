@@ -289,6 +289,7 @@ from universe_app.session_bus import (
     ACTIONABLE_KINDS,
     SessionBus,
     SessionBusError,
+    dispatch_body,
     fanout_meeting_bus,
     match_live_terminals,
 )
@@ -321,6 +322,12 @@ from universe_app.feature_node_proposal import (
     FEATURE_NODE_PROPOSAL_DECISIONS,
     FEATURE_NODE_PROPOSAL_SCHEMA,
     build_feature_node_proposals,
+)
+from universe_app.review_inbox_next_work import (
+    MEMORY_CANDIDATE_PAGE_LIMIT,
+    PREDICTION_PAGE_LIMIT,
+    RESULT_REVIEW_PAGE_LIMIT,
+    build_review_inbox_next_work,
 )
 from runtime_state_trust_gate import is_active_ing_state
 from universe_file_index import (
@@ -19195,6 +19202,33 @@ class UniverseStore:
             )
         return candidate, True
 
+    def attach_memory_review_next_work(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if str(candidate.get("state") or "") not in {
+            "EXPLORE",
+            "START_PRODUCT_DESIGN",
+        }:
+            return {}
+        generated = self.generate_feature_node_proposals(
+            str(candidate["project_id"])
+        )
+        snapshot = self.work_loop_snapshot(str(candidate["project_id"]))
+        return {
+            "feature_node_proposals": generated,
+            "review_inbox": snapshot.get("review_inbox"),
+            "effects": generated.get("effects") or {
+                "feature_node_created": False,
+                "goal_created": False,
+                "todo_created": False,
+                "task_frame_created": False,
+                "authority_created": False,
+                "execution_assignment_created": False,
+                "rag_adopted": False,
+            },
+            "next_operation": "USER_REVIEW_ONLY",
+        }
+
     def adopt_memory_candidate(
         self, candidate_id: str, expected_candidate_digest: Any
     ) -> tuple[dict[str, Any], bool]:
@@ -22143,15 +22177,24 @@ class UniverseStore:
                 """,
                 (project["project_id"],),
             ).fetchone()["count"]
+        review_candidates = self.list_work_loop_review_candidates(
+            project["project_id"]
+        )
+        memory_candidates = self.list_memory_candidates(
+            project["project_id"], limit=MEMORY_CANDIDATE_PAGE_LIMIT
+        )
+        todos = [
+            todo
+            for todo in self.list_todos()
+            if todo.get("project_id") == project["project_id"]
+        ]
         return {
             "schema": "universe.work-loop-snapshot.v1",
             "status": "WORK_LOOP_COLLECTED",
             "project_id": project["project_id"],
             "predictions": predictions,
             "result_fanouts": self.list_work_loop_result_fanouts(project["project_id"]),
-            "review_candidates": self.list_work_loop_review_candidates(
-                project["project_id"]
-            ),
+            "review_candidates": review_candidates,
             "memory_schedules": self.list_memory_batch_schedule_states(
                 project["project_id"]
             ),
@@ -22165,6 +22208,17 @@ class UniverseStore:
                 "creates_goal": False,
                 "creates_todo": False,
             },
+            "review_inbox": build_review_inbox_next_work(
+                project_id=project["project_id"],
+                memory_candidates=memory_candidates,
+                predictions=predictions,
+                result_reviews=review_candidates,
+                feature_nodes=self.list_feature_nodes(project["project_id"]),
+                todos=todos,
+                memory_candidate_limit=MEMORY_CANDIDATE_PAGE_LIMIT,
+                prediction_limit=PREDICTION_PAGE_LIMIT,
+                result_review_limit=RESULT_REVIEW_PAGE_LIMIT,
+            ),
             "task_frame_created": False,
             "execution_assignment_created": False,
         }
@@ -30504,6 +30558,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {
             "APPLY_ADOPTED_WORK_PLAN": "USER_WORK_PLAN_APPLICATION_REQUIRED",
             "WAIT": state,
+            "NONE": state,
             "USER_RESOLUTION_REQUIRED": state,
             "BIND_INSTRUCTION_TASK_FRAME": "TASK_FRAME_INPUT_REQUIRED",
             "SELECT_TODOS_FOR_EXECUTION": "TODO_EXECUTION_SELECTION_REQUIRED",
@@ -30540,11 +30595,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "MATERIALIZE_GOAL_START_PLAN",
                     "CREATE_AND_DELIVER_MASTER_HANDOFF",
                     "DELIVER_MASTER_HANDOFF",
+                    "DELIVER_MASTER_HANDOFF_UPDATE",
                 }:
+                    completed = (
+                        operation == "NONE"
+                        and surface.get("automation_state") == "GOAL_COMPLETED"
+                    )
                     scheduler = self.store.finish_goal_automation_scheduler_tick(
                         goal_id,
                         lease_owner=self._goal_scheduler_owner,
-                        status="WAITING",
+                        status="COMPLETED" if completed else "WAITING",
                         stop_reason=self._goal_scheduler_stop_reason(surface),
                         surface=surface,
                     )
@@ -34090,12 +34150,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         break
                 posted_message_id = str(message.get("message_id") or "").strip()
                 if selected is None:
-                    dispatches.append({
+                    unavailable = {
                         "status": "CURRENT_TERMINAL_UNAVAILABLE",
                         "message_id": posted_message_id,
-                    })
+                    }
+                    dispatches.append(unavailable)
+                    self.session_bus.record_dispatch_attempt(posted_message_id, unavailable)
                     continue
                 terminal, session = selected
+                if (str(terminal.get("provider") or "").upper() != str(session.get("provider") or "").upper()
+                    or (target_anchor and str(session.get("session_anchor_ref") or "") != target_anchor)):
+                    mismatch = {"status": "SESSION_IDENTITY_MISMATCH", "error_code": "SESSION_IDENTITY_MISMATCH",
+                                "detail": "Live terminal and Supervisor provider/anchor disagree; reconcile exact Host binding before retry",
+                                "message_id": posted_message_id}
+                    dispatches.append(mismatch)
+                    self.session_bus.record_dispatch_attempt(posted_message_id, mismatch)
+                    continue
                 project_id = str(terminal.get("project_id") or "").strip()
                 if not project_id:
                     continue
@@ -34106,6 +34176,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message_id=posted_message_id,
                 )
                 dispatches.append({**dispatch, "message_id": posted_message_id})
+                self.session_bus.record_dispatch_attempt(posted_message_id, dispatch)
                 if isinstance(message, dict):
                     message["delivery_state"] = (
                         "DISPATCHED"
@@ -34114,8 +34185,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         else str(message.get("delivery_state") or "PENDING")
                     )
                     message["dispatch_status"] = dispatch.get("status")
-            except (SessionSupervisorError, TerminalHostError, UniverseError):
-                continue
+            except (SessionSupervisorError, TerminalHostError, UniverseError) as error:
+                failure = {"status": "DISPATCH_FAILED", "message_id": str(message.get("message_id") or ""),
+                           "error_code": getattr(error, "code", type(error).__name__), "detail": str(error)}
+                dispatches.append(failure)
+                self.session_bus.record_dispatch_attempt(failure["message_id"], failure)
         return dispatches
 
     def run_conductor_operating_loop_once(
@@ -35404,6 +35478,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )["messages"]
         except (SessionBusError, TerminalHostError) as error:
             return {"status": "SESSION_BUS_LOOKUP_FAILED", "detail": str(error)}
+        def _instruction_start_floor(message: Mapping[str, Any]) -> str:
+            lifecycle = message.get("lifecycle") or {}
+            return str(
+                lifecycle.get("provider_started_at")
+                or lifecycle.get("started_at")
+                or lifecycle.get("dispatched_at")
+                or ""
+            )
         candidates = [
             message
             for message in messages
@@ -35411,7 +35493,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and str(message.get("lifecycle_state") or "").upper() == "STARTED"
             and self._observed_at_not_before(
                 observed_at,
-                (message.get("lifecycle") or {}).get("started_at"),
+                _instruction_start_floor(message),
             )
         ]
         if not candidates:
@@ -35422,6 +35504,111 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "message_ids": [str(item.get("message_id") or "") for item in candidates],
             }
         original = candidates[0]
+        original_lifecycle = original.get("lifecycle") or {}
+        # Transports that carry their own authoritative completion (the Claude
+        # typed channel reply, a native provider session's terminal reply) must
+        # never receive a synthesised RESULT from passive activity observation.
+        # The incident this guards against: typed-channel work received a
+        # synthetic COMPLETED before the genuine reply/ACK arrived.
+        if original_lifecycle.get("awaits_authoritative_reply"):
+            return {
+                "status": "SESSION_BUS_RESULT_DEFERRED_TO_REPLY_CHANNEL",
+                "message_id": str(original.get("message_id") or ""),
+                "delivery_channel": str(original_lifecycle.get("delivery_channel") or ""),
+            }
+        if original_lifecycle.get("bus_dispatch_ref"):
+            from provider_turn_correlation import exact_turn_matches
+            if not exact_turn_matches(original_lifecycle, str(original["message_id"]), source_id, activity):
+                return {"status": "SESSION_BUS_RESULT_CORRELATION_UNPROVEN",
+                        "message_id": str(original["message_id"]),
+                        "detail": "explicit source/dispatch/message/turn evidence does not match"}
+            return self._record_observed_session_bus_result(
+                original=original, anchor=anchor, activity=activity,
+                source_id=source_id, outcome=outcome,
+            )
+        # Legacy unbound deliveries retain their existing recovery contract.
+        # New explicit dispatches above NEVER fall back to this heuristic.
+        # Correlate by provider turn, not just session + wall clock: a turn that
+        # was already running (or already finished) when this instruction began
+        # can complete after ``started_at`` and otherwise look like this
+        # instruction's result.  Require the completing activity's ordinal to be
+        # newer than everything the provider had recorded up to the instruction's
+        # start floor.
+        start_floor = _instruction_start_floor(original)
+
+        def _ordinal(row: Mapping[str, Any]) -> int:
+            try:
+                return int(row.get("ordinal") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            history = self.store.list_provider_session_activities(
+                source_id, active_only=False, limit=128
+            )
+        except Exception as error:  # noqa: BLE001 - correlation guard must not raise
+            # Fail closed: without the turn history we cannot prove this
+            # completion belongs to this instruction.
+            return {
+                "status": "SESSION_BUS_RESULT_CORRELATION_UNPROVEN",
+                "message_id": str(original.get("message_id") or ""),
+                "detail": f"turn history unavailable: {error}",
+            }
+        this_ordinal = _ordinal(activity)
+        this_activity_id = str(activity.get("activity_id") or "").strip()
+        history_activity_ids = {
+            str(row.get("activity_id") or "").strip() for row in history
+        }
+        history_ordinals = {_ordinal(row) for row in history}
+        placed_in_history = (this_activity_id and this_activity_id in history_activity_ids) or (
+            this_ordinal and this_ordinal in history_ordinals
+        )
+        if not start_floor or not this_ordinal or not history or not placed_in_history:
+            # Not enough to prove this completion is this instruction's turn:
+            # missing start floor, missing turn ordinal, or the completion is
+            # absent from the provider's own turn history.  Fail closed - a real
+            # channel / native reply remains the authoritative completion.
+            return {
+                "status": "SESSION_BUS_RESULT_CORRELATION_UNPROVEN",
+                "message_id": str(original.get("message_id") or ""),
+                "start_floor": start_floor,
+                "activity_ordinal": this_ordinal,
+                "turn_history_size": len(history),
+            }
+        pre_instruction_ordinals = [
+            _ordinal(row)
+            for row in history
+            if self._observed_at_not_before(start_floor, row.get("observed_at"))
+        ]
+        if not pre_instruction_ordinals:
+            # No provider activity recorded at/before the instruction start
+            # floor: there is no baseline to prove this completion belongs to
+            # this instruction's turn rather than a turn already in flight.
+            # Fail closed - ordinal + wall clock alone is not proof.
+            return {
+                "status": "SESSION_BUS_RESULT_CORRELATION_UNPROVEN",
+                "message_id": str(original.get("message_id") or ""),
+                "start_floor": start_floor,
+                "activity_ordinal": this_ordinal,
+                "turn_history_size": len(history),
+                "detail": "no pre-instruction activity to baseline the turn ordinal",
+            }
+        if this_ordinal <= max(pre_instruction_ordinals):
+            return {
+                "status": "SESSION_BUS_RESULT_TURN_PRECEDES_INSTRUCTION",
+                "message_id": str(original.get("message_id") or ""),
+                "activity_ordinal": this_ordinal,
+                "instruction_started_at": start_floor,
+            }
+        return self._record_observed_session_bus_result(
+            original=original, anchor=anchor, activity=activity,
+            source_id=source_id, outcome=outcome,
+        )
+
+    def _record_observed_session_bus_result(
+        self, *, original: Mapping[str, Any], anchor: str,
+        activity: Mapping[str, Any], source_id: str, outcome: str,
+    ) -> dict[str, Any]:
         activity_id = str(activity.get("activity_id") or "").strip()
         result_ref = (
             f"universe://provider-session-source/{source_id}/activity/{activity_id}"
@@ -38580,7 +38767,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "pending_instruction": {
                         "message_id": claim["message_id"],
                         "instruction_ref": "session-bus:" + claim["message_id"],
-                        "body_text": claim["body_text"],
+                        "body_text": dispatch_body(claim),
                         "provenance": claim.get("provenance"),
                     },
                 }
@@ -38667,6 +38854,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             "Claude Channel result arrived before dispatch completed",
                             409,
                         )
+                    if result.get("kind") == "ACK":
+                        self.session_bus.acknowledge_instruction(
+                            message_id, terminal_id=terminal_id, session_anchor_ref=session_anchor_ref,
+                            phase=str(result.get("phase") or ""),
+                        )
+                        return
                     self.session_bus.reply(
                         message_id,
                         terminal_id=terminal_id,
@@ -38687,6 +38880,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         terminal_id=terminal_id,
                         message_id=message_id,
                         session_anchor_ref=session_anchor_ref,
+                        delivery_channel="CLAUDE_CODE_CHANNEL",
                     )
                     channel_dispatch_started["value"] = True
                     channel_dispatch_ready.set()
@@ -38716,6 +38910,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
 
         if rust_host_interactive and provider in {"CODEX", "GROK"}:
+            bus_dispatch_ref = "dispatch_" + secrets.token_hex(16) if provider == "CODEX" else ""
             try:
                 observer_source = self._register_exact_provider_observer_source(
                     provider=provider,
@@ -38741,6 +38936,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 instruction_ref = str(delivery.get("instruction_ref") or "").strip()
                 if instruction_ref and not body_text.startswith("instruction_ref:"):
                     body_text = f"instruction_ref: {instruction_ref}\n{body_text}"
+                if bus_dispatch_ref:
+                    body_text = (f"universe_dispatch_ref: {bus_dispatch_ref}\n"
+                                 f"instruction_ref: session-bus:{message_id}\n"
+                                 f"{delivery['body_text']}")
                 submit_prompt = getattr(self.terminal_host, "submit_prompt", None)
                 if not callable(submit_prompt):
                     raise TerminalHostError(
@@ -38776,6 +38975,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     terminal_id=terminal_id,
                     message_id=str(delivery["message_id"]),
                     session_anchor_ref=session_anchor_ref,
+                    observer_source_id=str(observer_source["source_id"]),
+                    bus_dispatch_ref=bus_dispatch_ref,
                 )
             except (SessionBusError, TerminalHostError, UnicodeError) as error:
                 self.session_bus.release_instruction_claim(
@@ -38874,6 +39075,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     terminal_id=terminal_id,
                     message_id=str(claim["message_id"]),
                     session_anchor_ref=session_anchor_ref,
+                    delivery_channel="PROVIDER_NATIVE",
                 )
                 self.session_bus.transition(
                     str(claim["message_id"]),
@@ -42990,18 +43192,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 candidate, changed = self.server.store.review_memory_candidate(
                     unquote(candidate_review.group(1)), body
                 )
-                self._send(
-                    HTTPStatus.OK,
-                    {
-                        "schema": API_SCHEMA,
-                        "status": (
-                            "MEMORY_CANDIDATE_REVIEW_RECORDED"
-                            if changed
-                            else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
-                        ),
-                        "candidate": candidate,
-                    },
+                payload = {
+                    "schema": API_SCHEMA,
+                    "status": (
+                        "MEMORY_CANDIDATE_REVIEW_RECORDED"
+                        if changed
+                        else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
+                    ),
+                    "candidate": candidate,
+                }
+                payload.update(
+                    self.server.store.attach_memory_review_next_work(candidate)
                 )
+                self._send(HTTPStatus.OK, payload)
                 return
             if path == "/v1/service/shutdown":
                 self._send(
@@ -45720,18 +45923,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 candidate, changed = self.server.store.review_memory_candidate(
                     str(candidate_id), review
                 )
-                self._send(
-                    HTTPStatus.OK,
-                    {
-                        "schema": API_SCHEMA,
-                        "status": (
-                            "MEMORY_CANDIDATE_REVIEW_RECORDED"
-                            if changed
-                            else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
-                        ),
-                        "candidate": candidate,
-                    },
+                payload = {
+                    "schema": API_SCHEMA,
+                    "status": (
+                        "MEMORY_CANDIDATE_REVIEW_RECORDED"
+                        if changed
+                        else "MEMORY_CANDIDATE_REVIEW_ALREADY_RECORDED"
+                    ),
+                    "candidate": candidate,
+                }
+                payload.update(
+                    self.server.store.attach_memory_review_next_work(candidate)
                 )
+                self._send(HTTPStatus.OK, payload)
                 return
             if parts is not None and parts[1] == "/memories/link":
                 memory_id = _identifier(body.get("memory_id"), "memory_id")

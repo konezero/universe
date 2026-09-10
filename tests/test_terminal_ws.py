@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 
 from universe_app.terminal_ws import (  # noqa: E402
+    TERMINAL_WS_CLOSE_SERVICE_RESTART,
     _SerializedWebSocketSender,
     decode_ws_frame,
     encode_ws_frame,
@@ -137,6 +138,51 @@ class TerminalWebSocketHeartbeatTests(unittest.TestCase):
             self.assertTrue(pump.is_alive())
 
             pump.join(timeout=0.5)
+            self.assertFalse(pump.is_alive())
+            self.assertTrue(host.unsubscribed.is_set())
+            opcode, close_payload = _recv_frame(client_sock, buffer)
+            self.assertEqual(8, opcode)
+            self.assertGreaterEqual(len(close_payload), 2)
+            self.assertEqual(
+                TERMINAL_WS_CLOSE_SERVICE_RESTART,
+                int.from_bytes(close_payload[:2], "big"),
+            )
+        finally:
+            client_sock.close()
+            server_sock.close()
+            pump.join(timeout=1)
+
+
+class TerminalWebSocketCloseTests(unittest.TestCase):
+    def test_pump_sends_service_restart_close_when_heartbeat_times_out(self) -> None:
+        server_sock, client_sock = socket.socketpair()
+        client_sock.settimeout(1.0)
+        host = _TerminalHost()
+        handler = SimpleNamespace(connection=server_sock)
+        pump = threading.Thread(
+            target=pump_terminal_socket,
+            args=(handler, "term-close", host),
+            kwargs={
+                "heartbeat_interval_seconds": 0.03,
+                "heartbeat_timeout_seconds": 0.08,
+                "io_poll_seconds": 0.01,
+                "send_timeout_seconds": 0.5,
+            },
+        )
+        pump.start()
+        buffer = bytearray()
+        try:
+            opcode, ping = _recv_frame(client_sock, buffer)
+            self.assertEqual(9, opcode)
+            self.assertTrue(ping)
+            opcode, payload = _recv_frame(client_sock, buffer)
+            self.assertEqual(8, opcode)
+            self.assertGreaterEqual(len(payload), 2)
+            self.assertEqual(
+                TERMINAL_WS_CLOSE_SERVICE_RESTART,
+                int.from_bytes(payload[:2], "big"),
+            )
+            pump.join(timeout=1)
             self.assertFalse(pump.is_alive())
             self.assertTrue(host.unsubscribed.is_set())
         finally:

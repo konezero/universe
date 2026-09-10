@@ -4512,6 +4512,13 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "provider": "CODEX",
             "mode": "MASTER",
         }
+        # Turn history: the three completing turns plus an older baseline.
+        self.server.store.list_provider_session_activities = Mock(return_value=[
+            {"activity_id": f"activity-observed-{i}", "ordinal": i,
+             "observed_at": "9999-01-01T00:00:00Z"}
+            for i in (1, 2, 3)
+        ] + [{"activity_id": "activity-baseline", "ordinal": 0,
+              "observed_at": "2000-01-01T00:00:00Z"}])
 
         for index, (kind, activity_state, event_kind, expected_outcome) in enumerate(
             [
@@ -4546,6 +4553,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 session=session,
                 activity={
                     "activity_id": f"activity-observed-{index}",
+                    "ordinal": index,
                     "activity_state": activity_state,
                     "event_kind": event_kind,
                     "observed_at": "9999-01-01T00:00:00Z",
@@ -4572,6 +4580,213 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
             self.assertEqual(expected_outcome, result["lifecycle_state"])
             self.assertEqual(posted["message_id"], result["in_reply_to"])
+
+    def test_provider_observer_ignores_turn_completion_that_precedes_instruction(self) -> None:
+        terminal_id = "term-precede-result-001"
+        anchor = "session-anchor-precede-result-001"
+        terminal = {
+            "terminal_id": terminal_id,
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": anchor,
+            "active_session_anchor_ref": anchor,
+            "supervisor_session_id": "supervisor-precede-result-001",
+        }
+        host = Mock()
+        host.get.return_value = terminal
+        host.list_sessions.return_value = [terminal]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        session = {
+            "session_id": terminal["supervisor_session_id"],
+            "session_anchor_ref": anchor,
+            "provider": "CODEX",
+            "mode": "MASTER",
+        }
+        source_id = "provider-source-precede-001"
+        posted = self.server.session_bus.deliver_to_terminal(
+            host,
+            terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"terminal_id": terminal_id, "session_anchor_ref": anchor},
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="new instruction that must not inherit a prior turn's completion",
+        )
+        self.server.session_bus.claim_instruction(
+            host, terminal_id=terminal_id, session_anchor_ref=anchor,
+            message_id=posted["message_id"],
+        )
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=terminal_id, message_id=posted["message_id"],
+            session_anchor_ref=anchor,
+        )
+        # A provider turn that ran and finished *before* this instruction began.
+        prior_turn = {"activity_id": "activity-prior-turn", "ordinal": 40,
+                      "activity_state": "COMPLETED", "event_kind": "TURN_COMPLETED",
+                      "observed_at": "2000-01-01T00:00:00Z"}
+        self.server.store.list_provider_session_activities = Mock(
+            return_value=[prior_turn])
+        stale = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity=dict(prior_turn, observed_at="9999-01-01T00:00:00Z"),
+            source_id=source_id,
+        )
+        self.assertEqual("SESSION_BUS_RESULT_TURN_PRECEDES_INSTRUCTION", stale["status"])
+        results = self.server.session_bus.inbox(
+            host, session_anchor_ref=anchor, projection="RESULTS"
+        )["messages"]
+        self.assertEqual([], results)
+        # A turn that started after the instruction is correlated normally.
+        this_turn = {"activity_id": "activity-this-turn", "ordinal": 99,
+                     "activity_state": "COMPLETED", "event_kind": "TURN_COMPLETED",
+                     "observed_at": "9999-01-01T00:00:00Z"}
+        self.server.store.list_provider_session_activities = Mock(
+            return_value=[this_turn, prior_turn])
+        projected = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity=this_turn,
+            source_id=source_id,
+        )
+        self.assertEqual("SESSION_BUS_RESULT_PROJECTED", projected["status"])
+        self.assertEqual(posted["message_id"], projected["message_id"])
+
+    def test_provider_observer_fails_closed_without_turn_history_or_ordinal(self) -> None:
+        terminal_id = "term-unproven-result-001"
+        anchor = "session-anchor-unproven-result-001"
+        terminal = {
+            "terminal_id": terminal_id, "project_id": "GCS", "mode": "MASTER",
+            "provider": "CODEX", "state": "LIVE", "session_anchor_ref": anchor,
+            "active_session_anchor_ref": anchor,
+            "supervisor_session_id": "supervisor-unproven-001",
+        }
+        host = Mock()
+        host.get.return_value = terminal
+        host.list_sessions.return_value = [terminal]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        session = {"session_id": terminal["supervisor_session_id"],
+                   "session_anchor_ref": anchor, "provider": "CODEX", "mode": "MASTER"}
+        posted = self.server.session_bus.deliver_to_terminal(
+            host, terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"terminal_id": terminal_id, "session_anchor_ref": anchor},
+            kind="INSTRUCTION", notify="NONE", body="must not synthesize without proof",
+        )
+        self.server.session_bus.claim_instruction(
+            host, terminal_id=terminal_id, session_anchor_ref=anchor,
+            message_id=posted["message_id"])
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=terminal_id, message_id=posted["message_id"],
+            session_anchor_ref=anchor)
+
+        # The turn history read raises: fail closed, do not fabricate a result.
+        self.server.store.list_provider_session_activities = Mock(
+            side_effect=RuntimeError("catalog offline"))
+        raised = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity={"activity_id": "a1", "ordinal": 5, "activity_state": "COMPLETED",
+                      "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="provider-source-unproven-001")
+        self.assertEqual("SESSION_BUS_RESULT_CORRELATION_UNPROVEN", raised["status"])
+
+        # The completion carries no turn ordinal: also unproven.
+        self.server.store.list_provider_session_activities = Mock(return_value=[])
+        no_ordinal = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity={"activity_id": "a2", "activity_state": "COMPLETED",
+                      "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="provider-source-unproven-001")
+        self.assertEqual("SESSION_BUS_RESULT_CORRELATION_UNPROVEN", no_ordinal["status"])
+
+        # Empty turn history (successful read, but nothing to place the
+        # completion against): unproven even with a turn ordinal.
+        self.server.store.list_provider_session_activities = Mock(return_value=[])
+        empty_history = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity={"activity_id": "a3", "ordinal": 5, "activity_state": "COMPLETED",
+                      "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="provider-source-unproven-001")
+        self.assertEqual("SESSION_BUS_RESULT_CORRELATION_UNPROVEN", empty_history["status"])
+
+        # Completion absent from the provider's own turn history: unproven.
+        self.server.store.list_provider_session_activities = Mock(return_value=[
+            {"activity_id": "some-other-turn", "ordinal": 2,
+             "observed_at": "2000-01-01T00:00:00Z"}])
+        not_in_history = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity={"activity_id": "a4", "ordinal": 5, "activity_state": "COMPLETED",
+                      "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="provider-source-unproven-001")
+        self.assertEqual(
+            "SESSION_BUS_RESULT_CORRELATION_UNPROVEN", not_in_history["status"])
+
+        # History has the completion but NO activity at/before the instruction
+        # start floor: no baseline to prove the turn is this instruction's.
+        no_baseline_activity = {
+            "activity_id": "a5", "ordinal": 9, "activity_state": "COMPLETED",
+            "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"}
+        self.server.store.list_provider_session_activities = Mock(
+            return_value=[no_baseline_activity])
+        no_baseline = self.server._project_observed_session_bus_terminal_result(
+            session=session, activity=no_baseline_activity,
+            source_id="provider-source-unproven-001")
+        self.assertEqual(
+            "SESSION_BUS_RESULT_CORRELATION_UNPROVEN", no_baseline["status"])
+        self.assertEqual(
+            [], self.server.session_bus.inbox(
+                host, session_anchor_ref=anchor, projection="RESULTS")["messages"])
+
+    def test_provider_observer_defers_typed_channel_delivery_to_real_reply(self) -> None:
+        terminal_id = "term-channel-defer-001"
+        anchor = "session-anchor-channel-defer-001"
+        terminal = {
+            "terminal_id": terminal_id, "project_id": "GCS", "mode": "MASTER",
+            "provider": "CLAUDE", "state": "LIVE", "session_anchor_ref": anchor,
+            "active_session_anchor_ref": anchor,
+            "supervisor_session_id": "supervisor-channel-defer-001",
+        }
+        host = Mock()
+        host.get.return_value = terminal
+        host.list_sessions.return_value = [terminal]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        session = {"session_id": terminal["supervisor_session_id"],
+                   "session_anchor_ref": anchor, "provider": "CLAUDE", "mode": "MASTER"}
+        posted = self.server.session_bus.deliver_to_terminal(
+            host, terminal=terminal,
+            source={"project_id": "universe", "mode": "CONDUCTOR", "provider": "UI"},
+            to={"terminal_id": terminal_id, "session_anchor_ref": anchor},
+            kind="INSTRUCTION", notify="NONE", body="typed channel task awaiting real reply",
+        )
+        self.server.session_bus.claim_instruction(
+            host, terminal_id=terminal_id, session_anchor_ref=anchor,
+            message_id=posted["message_id"])
+        # Delivered over the Claude typed channel: an authoritative reply/ACK is
+        # expected from ``observe_channel_result``.
+        self.server.session_bus.complete_instruction_claim(
+            terminal_id=terminal_id, message_id=posted["message_id"],
+            session_anchor_ref=anchor, delivery_channel="CLAUDE_CODE_CHANNEL")
+        self.server.store.list_provider_session_activities = Mock(return_value=[])
+        deferred = self.server._project_observed_session_bus_terminal_result(
+            session=session,
+            activity={"activity_id": "a1", "ordinal": 99, "activity_state": "COMPLETED",
+                      "event_kind": "TURN_COMPLETED", "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="provider-source-channel-defer-001")
+        self.assertEqual("SESSION_BUS_RESULT_DEFERRED_TO_REPLY_CHANNEL", deferred["status"])
+        self.assertEqual("CLAUDE_CODE_CHANNEL", deferred["delivery_channel"])
+        self.assertEqual(
+            [], self.server.session_bus.inbox(
+                host, session_anchor_ref=anchor, projection="RESULTS")["messages"])
+        # The genuine channel reply remains authoritative.
+        reply = self.server.session_bus.reply(
+            posted["message_id"], session_anchor_ref=anchor,
+            body_text="real channel result", outcome="COMPLETED",
+            host=host)
+        self.assertEqual("REPLIED", reply["message"]["lifecycle_state"])
+        self.assertEqual("real channel result", reply["result"]["body_text"])
 
     def test_provider_observer_projects_result_after_terminal_coordinate_replacement(self) -> None:
         anchor = "session-anchor-reopened-result-001"
@@ -4618,6 +4833,18 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         host.get.return_value = replacement
         host.list_sessions.return_value = [replacement]
+        reopen_activity = {
+            "activity_id": "activity-after-reopen-001",
+            "ordinal": 7,
+            "activity_state": "COMPLETED",
+            "event_kind": "TURN_COMPLETED",
+            "observed_at": "9999-01-01T00:00:00Z",
+        }
+        self.server.store.list_provider_session_activities = Mock(return_value=[
+            reopen_activity,
+            {"activity_id": "activity-before-reopen-baseline", "ordinal": 4,
+             "observed_at": "2000-01-01T00:00:00Z"},
+        ])
         projected = self.server._project_observed_session_bus_terminal_result(
             session={
                 "session_id": replacement["supervisor_session_id"],
@@ -4625,12 +4852,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "provider": "CODEX",
                 "mode": "MASTER",
             },
-            activity={
-                "activity_id": "activity-after-reopen-001",
-                "activity_state": "COMPLETED",
-                "event_kind": "TURN_COMPLETED",
-                "observed_at": "9999-01-01T00:00:00Z",
-            },
+            activity=reopen_activity,
             source_id="provider-source-after-restart-001",
         )
 
@@ -15697,6 +15919,124 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             "MASTER_HANDOFF_STALE_WORK_PLAN", caught.exception.code
         )
+
+    def _scheduler_regression_goal(self) -> dict[str, Any]:
+        self.server.store.register_project(self.registration())
+        goal = self.server.store.create_goal(
+            "GCS",
+            {
+                "title": "Exercise the approved scheduler boundary",
+                "description": "No provider calls or new execution authority.",
+                "owner": "Project Master",
+                "state": "ACTIVE",
+                "sort_order": 0,
+            },
+        )
+        self.server.store.configure_goal_automation_scheduler(
+            goal["goal_id"], action="START",
+            expected_goal_revision=goal["revision"], interval_seconds=5,
+        )
+        return goal
+
+    def test_goal_scheduler_delivers_handoff_update_once_then_waits(self) -> None:
+        goal = self._scheduler_regression_goal()
+        handoff = {"handoff_id": "handoff_scheduler_update"}
+        ready = {
+            "goal": goal,
+            "application": {"application_id": "applied_plan"},
+            "handoff": handoff,
+            "automation_state": "MASTER_HANDOFF_UPDATE_READY",
+            "next_operation": "DELIVER_MASTER_HANDOFF_UPDATE",
+        }
+        waiting = {
+            **ready,
+            "automation_state": "WAITING_MASTER_PROPOSAL",
+            "next_operation": "WAIT",
+        }
+        with (
+            patch.object(
+                self.server, "goal_automation_surface",
+                side_effect=[ready, ready, waiting, waiting],
+            ),
+            patch.object(
+                self.server, "deliver_master_handoff",
+                return_value=(handoff, True, None),
+            ) as deliver,
+        ):
+            result = self.server.run_goal_automation_scheduler_once()
+            idle = self.server.run_goal_automation_scheduler_once()
+        deliver.assert_called_once_with(
+            "GCS", handoff["handoff_id"], {"approval": "DELIVER"}
+        )
+        self.assertEqual(["MASTER_HANDOFF_DELIVERED"], result["operations"])
+        self.assertEqual("NO_DUE_GOAL_AUTOMATION", idle["status"])
+        persisted = self.server.store.get_goal_automation_scheduler(goal["goal_id"])
+        self.assertEqual("WAITING", persisted["status"])
+        self.assertEqual("WAITING_MASTER_PROPOSAL", persisted["last_stop_reason"])
+        self.assertEqual(1, persisted["tick_count"])
+        self.assertFalse(persisted["enabled"])
+        self.assertIsNone(persisted["lease_owner"])
+
+    def test_goal_scheduler_records_verified_completion_not_waiting(self) -> None:
+        goal = self._scheduler_regression_goal()
+        completed = {
+            "goal": goal,
+            "automation_state": "GOAL_COMPLETED",
+            "next_operation": "NONE",
+        }
+        with (
+            patch.object(self.server, "goal_automation_surface", return_value=completed),
+            patch.object(self.server, "advance_goal_automation") as advance,
+        ):
+            result = self.server.run_goal_automation_scheduler_once()
+        advance.assert_not_called()
+        self.assertEqual("COMPLETED", result["scheduler"]["status"])
+        self.assertEqual("GOAL_COMPLETED", result["scheduler"]["last_stop_reason"])
+        self.assertFalse(result["scheduler"]["enabled"])
+        self.assertIsNone(result["scheduler"]["lease_owner"])
+
+    def test_goal_scheduler_preserves_manual_and_execution_boundaries(self) -> None:
+        for state, operation in (
+            ("BLOCKED_GOAL_NOT_PLAN_ELIGIBLE", "USER_RESOLUTION_REQUIRED"),
+            ("WAITING_USER_WORK_PLAN_APPLICATION", "APPLY_ADOPTED_WORK_PLAN"),
+            ("MASTER_PROPOSAL_READY", "BIND_INSTRUCTION_TASK_FRAME"),
+            ("TASK_FRAME_READY", "SELECT_TODOS_FOR_EXECUTION"),
+            ("TASK_FRAME_READY", "RUN_TASK_FRAME"),
+            ("TASK_FRAME_RESULT_READY", "APPLY_TASK_FRAME_RESULT"),
+            ("UNKNOWN", "NONE"),
+        ):
+            with self.subTest(state=state, operation=operation):
+                goal = self._scheduler_regression_goal()
+                surface = {
+                    "goal": goal, "automation_state": state,
+                    "next_operation": operation,
+                }
+                with (
+                    patch.object(self.server, "goal_automation_surface", return_value=surface),
+                    patch.object(self.server, "advance_goal_automation") as advance,
+                ):
+                    result = self.server.run_goal_automation_scheduler_once()
+                advance.assert_not_called()
+                self.assertEqual("WAITING", result["scheduler"]["status"])
+                self.assertFalse(result["scheduler"]["enabled"])
+                self.assertEqual([], result["operations"])
+
+    def test_goal_scheduler_rejects_stale_revision_before_handoff_update(self) -> None:
+        goal = self._scheduler_regression_goal()
+        surface = {
+            "goal": {**goal, "revision": goal["revision"] + 1},
+            "automation_state": "MASTER_HANDOFF_UPDATE_READY",
+            "next_operation": "DELIVER_MASTER_HANDOFF_UPDATE",
+        }
+        with (
+            patch.object(self.server, "goal_automation_surface", return_value=surface),
+            patch.object(self.server, "advance_goal_automation") as advance,
+        ):
+            result = self.server.run_goal_automation_scheduler_once()
+        advance.assert_not_called()
+        self.assertEqual("GOAL_REVISION_CONFLICT", result["error_code"])
+        self.assertEqual("BLOCKED", result["scheduler"]["status"])
+        self.assertIsNone(result["scheduler"]["lease_owner"])
 
     def test_goal_automation_scheduler_stops_and_recovers_expired_lease(self) -> None:
         self.server.store.register_project(self.registration())

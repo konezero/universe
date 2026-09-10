@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from universe_app.session_bus import (  # noqa: E402
     SessionBus,
     SessionBusError,
+    dispatch_body,
     fanout_meeting_bus,
     format_header,
 )
@@ -188,7 +189,7 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual([], self.pty(self.universe["terminal_id"]).writes)
 
-    def test_notify_header_emits_display_pointer_without_cli_stdin(self) -> None:
+    def test_notify_header_is_ui_only_without_terminal_input_or_output(self) -> None:
         display = self.host.subscribe(self.universe["terminal_id"])
         posted = self.host.bus.post(
             self.host,
@@ -201,14 +202,11 @@ class SessionBusTests(unittest.TestCase):
         )
         writes = self.pty(self.universe["terminal_id"]).writes
         self.assertEqual([], writes)
-        text = (display.get(timeout=0.5) or b"").decode("utf-8")
-        self.assertIn("[session-bus] 1 unread", text)
-        self.assertIn(posted["message_id"], text)
-        self.assertNotIn("secret brief", text)
-        self.assertEqual(
-            text.encode("utf-8"),
-            format_header(posted["messages"][0]),
-        )
+        self.assertTrue(display.empty())
+        message = posted["messages"][0]
+        self.assertEqual("UI", message["notification"]["surface"])
+        self.assertFalse(message["notification"]["terminal_output"])
+        self.assertEqual(1, self.host.bus.unread_count(self.universe["terminal_id"]))
 
     def test_hook_claim_binds_one_instruction_to_anchor_and_dispatches_once(self) -> None:
         posted = self.host.bus.post(
@@ -307,11 +305,24 @@ class SessionBusTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(inbox["messages"]))
-        self.assertEqual("WORKING", inbox["messages"][0]["work_state"])
+        # Adapter delivered it but the provider has not acknowledged starting:
+        # visible, and distinct from a turn the provider is actually running.
+        self.assertEqual("DISPATCHED", inbox["messages"][0]["work_state"])
         self.assertEqual(
             1,
             self.host.bus.working_map()[self.universe["terminal_id"]],
         )
+
+        self.host.bus.acknowledge_instruction(
+            posted["message_id"],
+            terminal_id=self.universe["terminal_id"],
+            session_anchor_ref=anchor,
+            phase="STARTED",
+        )
+        inbox = self.host.bus.inbox(
+            self.host, terminal_id=self.universe["terminal_id"]
+        )
+        self.assertEqual("WORKING", inbox["messages"][0]["work_state"])
 
     def test_queued_instruction_can_transfer_to_live_rust_host(self) -> None:
         source_anchor = _test_anchor("t1")
@@ -372,7 +383,7 @@ class SessionBusTests(unittest.TestCase):
         self.assertTrue(claim["provenance"]["user_authorized"])
         self.assertEqual("UNIVERSE_UI", claim["provenance"]["verified_by"])
 
-    def test_mailbox_uses_host_write_without_supervisor_bus_routes(self) -> None:
+    def test_mailbox_never_falls_back_to_host_write_for_notifications(self) -> None:
         class WriteOnlyHost:
             def __init__(self, inner: TerminalHost) -> None:
                 self.inner = inner
@@ -398,9 +409,42 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual("CREATED", posted["status"])
         writes = self.pty(self.universe["terminal_id"]).writes
-        self.assertEqual(1, len(writes))
-        self.assertIn(posted["message_id"].encode("utf-8"), writes[0])
-        self.assertNotIn(b"no supervisor /v1/bus", writes[0])
+        self.assertEqual([], writes)
+
+    def test_protocol_routes_work_conversation_and_notice(self) -> None:
+        for protocol, kind, action, wake in (
+            ("WORK", "INSTRUCTION", "EXECUTE_WORK", True),
+            ("CONVERSATION", "COORDINATION", "RESPOND", True),
+            ("NOTICE", "NOTE", "DISPLAY_ONLY", False),
+        ):
+            with self.subTest(protocol=protocol):
+                bus = SessionBus()
+                posted = bus.post(self.host, {
+                    "to": {"terminal_id": self.universe["terminal_id"]},
+                    "protocol": protocol, "body_text": "payload", "notify": "UI",
+                })
+                message = posted["messages"][0]
+                self.assertEqual(kind, message["kind"])
+                self.assertEqual(protocol, message["protocol"])
+                self.assertEqual(action, message["handling"]["action"])
+                self.assertEqual(wake, message["handling"]["wake_model"])
+                self.assertFalse(message["handling"]["authority_granted"])
+                claim = bus.claim_instruction(self.host,
+                    terminal_id=self.universe["terminal_id"], session_anchor_ref=_test_anchor("t1"))
+                self.assertEqual(wake, claim is not None)
+
+    def test_protocol_rejects_conflicts_and_uncorrelated_explicit_reply(self) -> None:
+        for fields, error in (
+            ({"protocol": "WORK", "kind": "NOTE"}, "BUS_PROTOCOL_KIND_CONFLICT"),
+            ({"protocol": "MISSING"}, "BUS_PROTOCOL_INVALID"),
+            ({"protocol": "REPLY"}, "BUS_REPLY_ROUTE_REQUIRED"),
+        ):
+            with self.subTest(fields=fields), self.assertRaises(SessionBusError) as caught:
+                self.host.bus.post(self.host, {
+                    "to": {"terminal_id": self.universe["terminal_id"]},
+                    "body_text": "payload", **fields,
+                })
+            self.assertEqual(error, caught.exception.code)
 
     def test_missing_target(self) -> None:
         with self.assertRaises(SessionBusError) as ctx:
@@ -462,10 +506,7 @@ class SessionBusTests(unittest.TestCase):
         ):
             self.assertEqual([], self.pty(terminal_id).writes)
             display = self.host.subscribe(terminal_id)
-            replay = (display.get(timeout=0.5) or b"").decode("utf-8")
-            self.assertIn("[session-bus] 1 unread", replay)
-            self.assertIn(room_id, replay)
-            self.assertNotIn("debate the bus", replay)
+            self.assertTrue(display.empty())
         self.assertEqual([], self.pty(grok2["terminal_id"]).writes)
         grok_inbox = self.host.bus.inbox(
             self.host,
@@ -903,6 +944,89 @@ class SessionBusDurabilityTests(unittest.TestCase):
         )
         self.assertEqual("READ", result["delivery_state"])
         self.assertEqual("DONE", result["lifecycle_state"])
+
+        self.assertEqual("REPLY", forwarded["protocol"])
+        self.assertEqual("PROCESS_REPLY", forwarded["handling"]["action"])
+        self.assertFalse(forwarded["handling"]["reply_expected"])
+        self.assertIn("not a new work authorization", dispatch_body(forwarded))
+        # Restart preserves the distinct reply-processing semantics.
+        bus = SessionBus(database_path=self.db_path)
+        bus.claim_instruction(self.host, terminal_id=self.terminal_id,
+            session_anchor_ref=anchor, message_id=forwarded["message_id"])
+        bus.complete_instruction_claim(terminal_id=self.terminal_id,
+            session_anchor_ref=anchor, message_id=forwarded["message_id"])
+        for _ in range(2):
+            consumed = bus.reply(forwarded["message_id"], terminal_id=self.terminal_id,
+                session_anchor_ref=anchor, body_text="report processed", host=self.host)
+            self.assertEqual("REPLY_CONSUMED", consumed["status"])
+            self.assertEqual(reply["result"]["message_id"], consumed["result"]["message_id"])
+        activity = bus.inbox(self.host, terminal_id=self.terminal_id, projection="ACTIVITY")
+        self.assertEqual(1, len([m for m in activity["messages"] if m["kind"] == "RESULT"]))
+
+    def test_repeat_reply_folds_into_one_final_result(self) -> None:
+        bus = SessionBus(database_path=self.db_path)
+        anchor = "anchor_repeat_reply"
+        posted = bus.post(
+            self.host,
+            {
+                "to": {"terminal_id": self.terminal_id},
+                "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+                "kind": "INSTRUCTION",
+                "body_text": "do the work",
+            },
+        )
+        bus.claim_instruction(
+            self.host,
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+        )
+        bus.complete_instruction_claim(
+            terminal_id=self.terminal_id,
+            message_id=posted["message_id"],
+            session_anchor_ref=anchor,
+        )
+        auto = bus.reply(
+            posted["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+            body_text="provider session reported COMPLETED",
+            host=self.host,
+        )
+        explicit = bus.reply(
+            posted["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+            body_text="explicit operator summary with real detail",
+            host=self.host,
+        )
+        again = bus.reply(
+            posted["message_id"],
+            terminal_id=self.terminal_id,
+            session_anchor_ref=anchor,
+            body_text="explicit operator summary with real detail",
+            host=self.host,
+        )
+
+        self.assertEqual(
+            auto["result"]["message_id"], explicit["result"]["message_id"]
+        )
+        self.assertEqual(
+            auto["result"]["message_id"], again["result"]["message_id"]
+        )
+        results = [
+            item
+            for item in bus.inbox(
+                self.host,
+                terminal_id=self.terminal_id,
+                projection="RESULTS",
+            )["messages"]
+            if item["kind"] == "RESULT"
+        ]
+        self.assertEqual(1, len(results))
+        self.assertEqual(
+            "explicit operator summary with real detail", results[0]["body_text"]
+        )
+        self.assertEqual("UNREAD", results[0]["delivery_state"])
 
     def test_provider_restart_rebinds_same_anchor_and_replies_after_service_restart(self) -> None:
         bus_a = SessionBus(database_path=self.db_path)

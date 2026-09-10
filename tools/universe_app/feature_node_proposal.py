@@ -80,12 +80,11 @@ def _source_entries(
         kind = str(candidate.get("kind") or "").upper()
         candidate_id = _text(candidate.get("candidate_id"))
         title = _text(candidate.get("title") or candidate.get("summary"))
-        if (
-            state not in INTENT_CANDIDATE_STATES
-            or kind not in INTENT_CANDIDATE_KINDS
-            or not candidate_id
-            or not title
-        ):
+        memory_design = kind == "MEMORY" and state == "START_PRODUCT_DESIGN"
+        product_candidate = (
+            kind in INTENT_CANDIDATE_KINDS and state in INTENT_CANDIDATE_STATES
+        )
+        if not candidate_id or not title or not (product_candidate or memory_design):
             continue
         entries.append(
             {

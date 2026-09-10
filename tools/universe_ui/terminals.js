@@ -1,3 +1,11 @@
+// Keep every provider on xterm's built-in DOM renderer while multi-terminal
+// WebGL redraw artifacts are being evaluated. Flip this single flag to retry it.
+const TERMINAL_WEBGL_ENABLED = false;
+const TERMINAL_HIDDEN_RENDER_INTERVAL_MS = 80;
+const TERMINAL_ACTIVE_RENDER_BATCH_BYTES = 256 * 1024;
+const TERMINAL_CLAUDE_RENDER_BATCH_BYTES = 512 * 1024;
+const TERMINAL_HIDDEN_RENDER_BATCH_BYTES = 512 * 1024;
+
 function isRemoteBrowser() {
   return String(state.accessSurface || "LOCAL_BROWSER").toUpperCase() === "REMOTE_BROWSER";
 }
@@ -65,22 +73,6 @@ function focusTerminalInput() {
   }
 }
 
-function writeTerminalBytes(term, data) {
-  if (data instanceof Blob) {
-    data.arrayBuffer().then((buffer) => term.write(new Uint8Array(buffer)));
-    return;
-  }
-  if (data instanceof ArrayBuffer) {
-    term.write(new Uint8Array(data));
-    return;
-  }
-  if (ArrayBuffer.isView(data)) {
-    term.write(data);
-    return;
-  }
-  term.write(String(data || ""));
-}
-
 function decodeTerminalHistoryChunk(encoded) {
   const raw = window.atob(String(encoded || ""));
   return Uint8Array.from(raw, (value) => value.charCodeAt(0));
@@ -102,6 +94,161 @@ function cloneTerminalChunk(data) {
     return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
   }
   return new TextEncoder().encode(String(data || ""));
+}
+
+function terminalRenderIsActive(surface) {
+  return Boolean(surface?.terminalId && surface.terminalId === state.activeTerminalId);
+}
+
+function terminalRenderBatchBytes(surface) {
+  if (!terminalRenderIsActive(surface)) return TERMINAL_HIDDEN_RENDER_BATCH_BYTES;
+  return surface?.provider === "CLAUDE"
+    ? TERMINAL_CLAUDE_RENDER_BATCH_BYTES
+    : TERMINAL_ACTIVE_RENDER_BATCH_BYTES;
+}
+
+function clearTerminalRenderSchedule(surface) {
+  if (!surface?.renderScheduleId) return;
+  if (surface.renderScheduleKind === "frame") {
+    window.cancelAnimationFrame(surface.renderScheduleId);
+  } else {
+    window.clearTimeout(surface.renderScheduleId);
+  }
+  surface.renderScheduleId = 0;
+  surface.renderScheduleKind = "";
+}
+
+function settleTerminalRenderWaiters(surface) {
+  if (!surface || surface.renderWritePending || surface.renderQueue.length) return;
+  const waiters = surface.renderIdleWaiters.splice(0);
+  for (const resolve of waiters) resolve();
+}
+
+function takeTerminalRenderBatch(surface) {
+  const limit = terminalRenderBatchBytes(surface);
+  const chunks = [];
+  let total = 0;
+  while (surface.renderQueue.length && total < limit) {
+    const chunk = surface.renderQueue[0];
+    const available = limit - total;
+    if (chunk.length <= available) {
+      chunks.push(surface.renderQueue.shift());
+      total += chunk.length;
+      continue;
+    }
+    chunks.push(chunk.slice(0, available));
+    surface.renderQueue[0] = chunk.slice(available);
+    total += available;
+  }
+  surface.renderQueueBytes = Math.max(0, surface.renderQueueBytes - total);
+  return chunks.length === 1 ? chunks[0] : concatTerminalChunks(chunks);
+}
+
+function drainTerminalRenderQueue(surface) {
+  clearTerminalRenderSchedule(surface);
+  if (
+    !surface
+    || surface.renderDisposed
+    || surface.renderWritePending
+    || (!surface.renderForceDrain && surface.rebuildingHistory)
+  ) {
+    settleTerminalRenderWaiters(surface);
+    return;
+  }
+  if (!surface.renderQueue.length) {
+    settleTerminalRenderWaiters(surface);
+    return;
+  }
+  const batch = takeTerminalRenderBatch(surface);
+  surface.renderWritePending = true;
+  let completed = false;
+  const finish = () => {
+    if (completed) return;
+    completed = true;
+    surface.renderWritePending = false;
+    if (surface.renderDisposed) {
+      settleTerminalRenderWaiters(surface);
+      return;
+    }
+    if (surface.renderQueue.length) {
+      if (surface.renderForceDrain) drainTerminalRenderQueue(surface);
+      else scheduleTerminalRender(surface);
+    } else {
+      settleTerminalRenderWaiters(surface);
+    }
+  };
+  try {
+    surface.term.write(batch, finish);
+  } catch (_error) {
+    finish();
+  }
+}
+
+function scheduleTerminalRender(surface) {
+  if (
+    !surface
+    || surface.renderDisposed
+    || surface.renderScheduleId
+    || surface.renderWritePending
+    || surface.rebuildingHistory
+    || !surface.renderQueue.length
+  ) return;
+  if (terminalRenderIsActive(surface) && !document.hidden) {
+    surface.renderScheduleKind = "frame";
+    surface.renderScheduleId = window.requestAnimationFrame(() => drainTerminalRenderQueue(surface));
+    return;
+  }
+  surface.renderScheduleKind = "timer";
+  surface.renderScheduleId = window.setTimeout(
+    () => drainTerminalRenderQueue(surface),
+    TERMINAL_HIDDEN_RENDER_INTERVAL_MS
+  );
+}
+
+function rescheduleTerminalRender(surface) {
+  if (!surface?.renderQueue.length || surface.renderWritePending) return;
+  clearTerminalRenderSchedule(surface);
+  scheduleTerminalRender(surface);
+}
+
+function queueTerminalRender(surface, data, options = {}) {
+  if (!surface || surface.renderDisposed) return;
+  if (data instanceof Blob) {
+    data.arrayBuffer().then((buffer) => queueTerminalRender(surface, buffer, options));
+    return;
+  }
+  const chunk = cloneTerminalChunk(data);
+  if (!chunk.length) return;
+  surface.renderQueue.push(chunk);
+  surface.renderQueueBytes += chunk.length;
+  if (options.immediate && !surface.renderWritePending && !surface.rebuildingHistory) {
+    drainTerminalRenderQueue(surface);
+  } else {
+    scheduleTerminalRender(surface);
+  }
+}
+
+function waitForTerminalRenderIdle(surface) {
+  if (!surface?.renderWritePending && !surface?.renderQueue?.length) return Promise.resolve();
+  return new Promise((resolve) => surface.renderIdleWaiters.push(resolve));
+}
+
+async function flushTerminalRenderQueue(surface) {
+  if (!surface || surface.renderDisposed) return;
+  clearTerminalRenderSchedule(surface);
+  surface.renderForceDrain = true;
+  if (!surface.renderWritePending) drainTerminalRenderQueue(surface);
+  await waitForTerminalRenderIdle(surface);
+  surface.renderForceDrain = false;
+}
+
+function disposeTerminalRenderQueue(surface) {
+  if (!surface) return;
+  surface.renderDisposed = true;
+  clearTerminalRenderSchedule(surface);
+  surface.renderQueue.length = 0;
+  surface.renderQueueBytes = 0;
+  settleTerminalRenderWaiters(surface);
 }
 
 
@@ -215,7 +362,7 @@ function attachTerminalMouseWheelHandler(term, element, getSurface) {
         // The WebGL renderer leaves stale glyphs where a mouse-tracking TUI
         // redraws shorter lines on scroll (leftover text in the left column
         // and indentation).
-        repaintSoon();
+        if (getSurface?.()?.webglAddon) repaintSoon();
       },
       { passive: false }
     );
@@ -230,6 +377,7 @@ function disposeTerminalWebgl(surface) {
 }
 
 function attachTerminalWebgl(surface) {
+  if (!TERMINAL_WEBGL_ENABLED) return false;
   if (!surface?.term || surface.webglAddon) return Boolean(surface?.webglAddon);
   if (surface.webglFailedSinceRecovery) return false;
   if (typeof window.WebglAddon?.WebglAddon !== "function") return false;
@@ -345,6 +493,7 @@ async function loadOlderTerminalHistory(surface, session) {
   if (!surface || surface.historyLoading || surface.historyExhausted) return;
   surface.historyLoading = true;
   surface.rebuildingHistory = true;
+  await flushTerminalRenderQueue(surface);
   const buffer = surface.term?.buffer?.active;
   const distanceFromBottom = buffer
     ? Math.max(0, buffer.baseY - buffer.viewportY)
@@ -662,6 +811,7 @@ function selectTerminalTab(terminalId) {
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
     surface.element.hidden = grid ? false : id !== terminalId;
+    rescheduleTerminalRender(surface);
     if (id === terminalId) {
       surface.restoreSavedViewport = switchingTabs;
       refitActiveTerminal();
@@ -792,9 +942,10 @@ function watchPromptDelivery(terminalId) {
 // SGR mouse report: \x1b[<Cb;Cx;CyM (press/motion) or ...m (release). Bit
 // 0x20 on Cb marks a motion report (mouse moved, with or without a button
 // held) as opposed to a plain press/release — see the onData throttle below.
-const MOUSE_SGR_PATTERN = /^\x1b\[<(\d+);\d+;\d+[Mm]$/;
+const MOUSE_SGR_PATTERN = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
 const MOUSE_MOTION_MIN_INTERVAL_MS = 32; // ~30/s — plenty for a hover cursor
 let lastMouseMotionSentAt = 0;
+const MOUSE_WHEEL_MAX_STEPS_PER_FRAME = 6;
 
 // The grid width is fixed at 120 columns; the font is scaled so those columns
 // fill the pane, and the row count is whatever fits vertically at that font.
@@ -826,6 +977,39 @@ const IME_DEGRADED_FALLBACK_PLATFORM = IS_MAC || IS_IOS;
 
 function bindTerminalIme(term, getSocket, getSurface) {
   const textarea = term.textarea || term.element?.querySelector(".xterm-helper-textarea");
+  let queuedWheelSteps = 0;
+  let queuedWheelCode = 64;
+  let queuedWheelColumn = "1";
+  let queuedWheelRow = "1";
+  let queuedWheelSuffix = "M";
+  let queuedWheelFrame = 0;
+  const flushQueuedWheel = () => {
+    queuedWheelFrame = 0;
+    const steps = queuedWheelSteps;
+    queuedWheelSteps = 0;
+    if (!steps) return;
+    const code = steps > 0 ? (queuedWheelCode | 1) : (queuedWheelCode & ~1);
+    const report = `\x1b[<${code};${queuedWheelColumn};${queuedWheelRow}${queuedWheelSuffix}`;
+    sendPtyText(getSocket(), report.repeat(Math.abs(steps)));
+  };
+  const queuePtyWheel = (mouseSgr) => {
+    const code = Number(mouseSgr[1]);
+    const direction = (code & 1) === 0 ? -1 : 1;
+    if (queuedWheelSteps && (queuedWheelCode & ~1) !== (code & ~1)) {
+      flushQueuedWheel();
+    }
+    queuedWheelCode = code;
+    queuedWheelColumn = mouseSgr[2];
+    queuedWheelRow = mouseSgr[3];
+    queuedWheelSuffix = mouseSgr[4];
+    queuedWheelSteps = Math.max(
+      -MOUSE_WHEEL_MAX_STEPS_PER_FRAME,
+      Math.min(MOUSE_WHEEL_MAX_STEPS_PER_FRAME, queuedWheelSteps + direction)
+    );
+    if (!queuedWheelFrame) {
+      queuedWheelFrame = window.requestAnimationFrame(flushQueuedWheel);
+    }
+  };
   let composing = false;
   let lastComposeAt = 0;
   let lastCompositionAt = 0;
@@ -1094,7 +1278,13 @@ function bindTerminalIme(term, getSocket, getSurface) {
     // motion) to ~30/s; clicks and wheel reports (no motion bit) are
     // untouched. Losing an intermediate hover position is imperceptible.
     const mouseSgr = MOUSE_SGR_PATTERN.exec(data);
-    if (mouseSgr && (Number(mouseSgr[1]) & 0x20) !== 0) {
+    const mouseCode = mouseSgr ? Number(mouseSgr[1]) : 0;
+    const verticalWheelCode = mouseCode & 0x43;
+    if (mouseSgr && (verticalWheelCode === 64 || verticalWheelCode === 65)) {
+      queuePtyWheel(mouseSgr);
+      return;
+    }
+    if (mouseSgr && (mouseCode & 0x20) !== 0) {
       const now = performance.now();
       if (now - lastMouseMotionSentAt < MOUSE_MOTION_MIN_INTERVAL_MS) {
         imeLog("onData:drop(mouse-motion)", "");
@@ -1342,13 +1532,28 @@ function ensureTerminalSurface(session) {
       if (surface) surface.restoreSavedViewport = false;
     }, delay);
   };
-  const scheduleSocketReconnect = () => {
+  const waitForServiceHealth = async () => {
+    try {
+      const payload = await api("/health");
+      return String(payload && payload.status || "").toUpperCase() === "READY";
+    } catch (_error) {
+      return false;
+    }
+  };
+  const scheduleSocketReconnect = (options = {}) => {
     if (socketDisposed || reconnectTimer) return;
     const delay = Math.min(5000, 250 * (2 ** Math.min(reconnectAttempts, 5)));
     reconnectAttempts += 1;
     reconnectTimer = window.setTimeout(async () => {
       reconnectTimer = 0;
       if (socketDisposed) return;
+      if (options.serviceRestart) {
+        const ready = await waitForServiceHealth();
+        if (!ready) {
+          scheduleSocketReconnect({ serviceRestart: true });
+          return;
+        }
+      }
       try {
         const payload = await api("/v1/terminals");
         const current = (payload.terminals || []).find(
@@ -1356,12 +1561,16 @@ function ensureTerminalSurface(session) {
         );
         if (!current || String(current.state || "").toUpperCase() !== "LIVE") {
           socketDisposed = true;
-          term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
+          queueTerminalRender(surface, "\r\n\x1b[90m[session closed]\x1b[0m\r\n", { immediate: true });
           return;
         }
       } catch (_error) {
         // The main service may itself be restarting. The WebSocket retry is
         // the authoritative recovery attempt in that case.
+        if (options.serviceRestart) {
+          scheduleSocketReconnect({ serviceRestart: true });
+          return;
+        }
       }
       connectSocket();
     }, delay);
@@ -1378,7 +1587,7 @@ function ensureTerminalSurface(session) {
       if (surface && (surface.rebuildingHistory || surface.historyInitialized)) {
         retainLiveChunk(surface, live, !surface.rebuildingHistory);
       }
-      if (!surface?.rebuildingHistory) writeTerminalBytes(term, live);
+      if (!surface?.rebuildingHistory) queueTerminalRender(surface, live);
       scheduleInitialLayout(240);
     });
     nextSocket.addEventListener("open", () => {
@@ -1394,13 +1603,24 @@ function ensureTerminalSurface(session) {
       if (event.code === 1000) {
         socketDisposed = true;
         const detail = event.reason ? ` ${event.code}: ${event.reason}` : "";
-        term.write(`\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`);
+        queueTerminalRender(
+          surface,
+          `\r\n\x1b[90m[session closed${detail}]\x1b[0m\r\n`,
+          { immediate: true }
+        );
         return;
       }
+      const serviceRestart = event.code === 1012 || event.code === 1006;
       if (reconnectAttempts === 0) {
-        term.write("\r\n\x1b[90m[stream reconnecting]\x1b[0m\r\n");
+        queueTerminalRender(
+          surface,
+          serviceRestart
+            ? "\r\n\x1b[90m[stream restarting]\x1b[0m\r\n"
+            : "\r\n\x1b[90m[stream reconnecting]\x1b[0m\r\n",
+          { immediate: true }
+        );
       }
-      scheduleSocketReconnect();
+      scheduleSocketReconnect({ serviceRestart });
     });
   };
   const disposeSocket = () => {
@@ -1418,6 +1638,8 @@ function ensureTerminalSurface(session) {
   });
   resizeObserver.observe(element);
   surface = {
+    terminalId: session.terminal_id,
+    provider: String(session.provider || "").trim().toUpperCase(),
     element,
     term,
     socket,
@@ -1439,6 +1661,14 @@ function ensureTerminalSurface(session) {
     retainedLiveChunks: [],
     replaying: false,
     replayDepth: 0,
+    renderQueue: [],
+    renderQueueBytes: 0,
+    renderWritePending: false,
+    renderScheduleId: 0,
+    renderScheduleKind: "",
+    renderIdleWaiters: [],
+    renderForceDrain: false,
+    renderDisposed: false,
     webglAddon: null,
     webglFailedSinceRecovery: false,
   };
@@ -1606,6 +1836,7 @@ async function closeTerminalTab(terminalId) {
   if (surface) {
     try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
     try { surface.disposeSocket?.(); } catch (_e) { /* already closed */ }
+    disposeTerminalRenderQueue(surface);
     try { surface.term.dispose(); } catch (_e) { /* ok */ }
     surface.element.remove();
     delete state.terminalSurfaces[terminalId];

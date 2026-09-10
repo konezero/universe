@@ -1809,6 +1809,23 @@ body.inspector-open .inspector {
   overflow-wrap: anywhere;
 }
 
+.review-inbox-next-work {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.review-inbox-bundle {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.review-inbox-bundle:first-of-type {
+  border-top: 0;
+}
+
 .delegation-message {
   border-left: 2px solid var(--cyan);
 }
@@ -3455,6 +3472,43 @@ dialog label {
   margin: 0;
   color: var(--red);
   font-size: 11px;
+}
+
+#provider-hooks-form {
+  display: grid;
+  gap: 16px;
+}
+
+#provider-hooks-form p,
+#provider-hooks-form .release-target-field {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+#provider-hooks-providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  min-width: 0;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+#provider-hooks-providers label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+#provider-hooks-providers input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--teal);
 }
 
 .release-layout {

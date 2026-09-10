@@ -3840,9 +3840,45 @@ class ProjectMasterSessionStore:
             if item["is_default"]
         )
 
+    def assert_provider_session_ownership(self, provider: str) -> None:
+        """A default selection alone cannot authorize a live provider switch."""
+        if self.session_supervisor is None:
+            return
+        normalized_provider = _provider(provider)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM host_metadata WHERE key = ?",
+                ("supervisor_session_id:PROJECT_MASTER",),
+            ).fetchone()
+        owned_id = str(row["value"] or "") if row is not None else ""
+        sessions = self.session_supervisor.list_sessions(
+            node=self.session_node, mode=self.requested_mode
+        )
+        selected = next(
+            (session for session in sessions if session["session_id"] == owned_id),
+            next((session for session in sessions if session["is_default"]), None),
+        )
+        self._assert_selected_provider_ownership(normalized_provider, selected, owned_id)
+
+    def _assert_selected_provider_ownership(
+        self, provider: str, session: Mapping[str, Any] | None, owned_id: str
+    ) -> None:
+        if (
+            session is not None
+            and session["session_id"] != owned_id
+            and session["state"] == "LIVE"
+            and session["provider"] != provider
+            and self._legacy_provider_session() != {
+                "provider": session["provider"],
+                "session_ref": session["provider_session_ref"],
+            }
+        ):
+            raise ProjectMasterHostError("MODE_SESSION_PROVIDER_OWNERSHIP_CONFLICT")
+
     def observe_provider_session(self, provider: str, session_ref: str) -> str:
         normalized_provider = _provider(provider)
         normalized_session = _text(session_ref, "session_ref")
+        self.assert_provider_session_ownership(normalized_provider)
         previous = self.last_provider_session()
         if previous is None:
             state = "NEW"
@@ -3899,6 +3935,9 @@ class ProjectMasterSessionStore:
                     )
                     break
                 supervisor_session_id = str(selected["session_id"])
+                self._assert_selected_provider_ownership(
+                    normalized_provider, selected, owned_id
+                )
                 if (
                     selected.get("provider") == normalized_provider
                     and selected.get("provider_session_ref") == normalized_session
@@ -5657,6 +5696,9 @@ class ResidentModeSessionHost:
     ) -> MasterProvider:
         normalized_action = normalize_session_action(session_action)
         force_new_session = normalized_action == "NEW"
+        if not force_new_session:
+            # Validate before closing a provider or launching its replacement.
+            self.store.assert_provider_session_ownership(provider)
         if model is not None or effort is not None:
             self._profile_provider = provider
             if model is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,29 @@ class FakePty:
 
 
 class ClaudeChannelBrokerTests(unittest.TestCase):
+    def test_stdio_entrypoint_starts_and_answers_initialize_and_ping(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("UNIVERSE_TERMINAL_ID", None)
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        ]
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", str(ROOT / "tools" / "claude_channel_mcp.py")],
+            input="".join(json.dumps(request) + "\n" for request in requests),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            env=environment,
+            shell=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        replies = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual([1, 2], [reply["id"] for reply in replies])
+        self.assertIn("claude/channel", replies[0]["result"]["capabilities"]["experimental"])
+        self.assertEqual({}, replies[1]["result"])
+
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -159,6 +183,32 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
                 }
             )
 
+    def test_ack_then_final_result_does_not_conflict(self) -> None:
+        broker = self.make_broker()
+        lookup = json.loads(session_lookup_path(broker.token.terminal_id).read_text(encoding="utf-8"))
+        broker.exchange_bootstrap(lookup["bootstrap_token"])
+        observed = []
+        broker.push({"message_id": "msg_ack", "session_anchor_ref": TEST_ANCHOR,
+                     "content": "work", "meta": {}}, on_result=observed.append)
+        for phase in ("RECEIVED", "STARTED"):
+            response = broker.submit_result({"message_id": "msg_ack", "kind": "ACK", "phase": phase, "body_text": "ack"})
+            self.assertEqual("ACKNOWLEDGED", response["status"])
+        result = {"message_id": "msg_ack", "body_text": "finished", "outcome": "COMPLETED"}
+        self.assertEqual("ACCEPTED", broker.submit_result(result)["status"])
+        self.assertEqual("DUPLICATE", broker.submit_result(result)["status"])
+        self.assertEqual(["ACK", "ACK", "RESULT"], [r["kind"] for r in observed])
+        with self.assertRaisesRegex(ClaudeChannelError, "CONFLICT"):
+            broker.submit_result({**result, "body_text": "different final"})
+
+    def test_ack_tool_is_not_a_final_reply(self) -> None:
+        with patch.object(claude_channel_mcp, "_ACK_SUPPORTED", True), patch.object(claude_channel_mcp, "_SESSION_TOKEN", "session-token"), patch.object(
+            claude_channel_mcp, "_post", return_value={"status": "ACKNOWLEDGED"}
+        ) as post:
+            result = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "universe_channel_ack", "arguments": {"message_id": "msg_ack", "phase": "RECEIVED"}}})
+        self.assertFalse(result["result"]["isError"])
+        self.assertEqual("ACK", post.call_args.args[1]["kind"])
+
     def test_authenticated_result_callback_is_idempotent(self) -> None:
         broker = self.make_broker(terminal_id="term_channel_result_001")
         lookup = json.loads(
@@ -197,7 +247,7 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
 
 
 class ClaudeChannelMcpToolTests(unittest.TestCase):
-    def test_initialize_requires_in_thread_result_reply(self) -> None:
+    def test_initialize_negotiates_tool_discovery_and_reply(self) -> None:
         initialized = handle_message(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
         )
@@ -205,6 +255,35 @@ class ClaudeChannelMcpToolTests(unittest.TestCase):
             "call universe_channel_reply exactly once",
             initialized["result"]["instructions"],
         )
+        self.assertIn("tools", initialized["result"]["capabilities"])
+
+        listed = handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = [tool["name"] for tool in listed["result"]["tools"]]
+        self.assertIn("universe_channel_status", names)
+        self.assertIn("universe_channel_reply", names)
+
+        with patch.object(claude_channel_mcp, "_SESSION_TOKEN", "session-token"), patch.object(
+            claude_channel_mcp,
+            "_post",
+            return_value={"status": "ACCEPTED", "message_id": "msg_negotiated"},
+        ) as post:
+            response = handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "universe_channel_reply",
+                        "arguments": {
+                            "message_id": "msg_negotiated",
+                            "body_text": "done",
+                            "outcome": "COMPLETED",
+                        },
+                    },
+                }
+            )
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual("/v1/claude-channel/result", post.call_args.args[0])
 
     def test_status_tool_is_discoverable_and_read_only(self) -> None:
         listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

@@ -1548,6 +1548,49 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertNotIn("authority", replaced_status)
         self.assertNotIn("currentness", replaced_status)
 
+    def test_resident_resume_rejects_foreign_live_provider_before_launch(self) -> None:
+        for provider_name in ("CLAUDE", "CODEX"):
+            with self.subTest(provider=provider_name):
+                supervisor = SessionSupervisorStore(
+                    self.root / f"foreign-{provider_name}.sqlite"
+                )
+                foreign, _ = supervisor.register_session({
+                    "session_id": "foreign-cli",
+                    "node": "universe", "mode": "CONDUCTOR",
+                    "provider": "GROK", "provider_session_ref": "grok-cli-existing",
+                    "state": "LIVE", "currentness": "CURRENT",
+                })
+                supervisor.set_default(
+                    foreign["session_id"],
+                    expected_pointer_version=foreign["default_pointer_version"],
+                )
+                before = supervisor.get_session(foreign["session_id"])
+                with patch("project_master_host.ResidentModeSessionHost._default_provider") as factory:
+                    host = ResidentModeSessionHost(
+                        self.root, "universe", "CONDUCTOR",
+                        self.root / f"host-{provider_name}.sqlite",
+                        actor_label="Universe Conductor",
+                        session_supervisor=supervisor,
+                    )
+                    try:
+                        with self.assertRaisesRegex(
+                            ProjectMasterHostError, "MODE_SESSION_PROVIDER_OWNERSHIP_CONFLICT"
+                        ):
+                            host.prepare(provider_name)
+                        factory.assert_not_called()
+                        with self.assertRaisesRegex(
+                            ProjectMasterHostError, "MODE_SESSION_PROVIDER_OWNERSHIP_CONFLICT"
+                        ):
+                            host.store.observe_provider_session(provider_name, "new-coordinate")
+                        self.assertEqual(before, supervisor.get_session(foreign["session_id"]))
+                        # Same-provider attachment remains an allowed selection.
+                        self.assertEqual(
+                            "REUSED",
+                            host.store.observe_provider_session("GROK", "grok-cli-existing"),
+                        )
+                    finally:
+                        host.close()
+
     def test_live_bridge_invokes_provider_and_posts_reply_once(self) -> None:
         worker = self._worker()
         host = LiveProjectMasterBridgeHost(

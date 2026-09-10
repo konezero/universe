@@ -376,8 +376,8 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         replacement = self.session()
         replacement.update(
             {
-                "provider": "CLAUDE",
-                "provider_session_ref": "claude-thread-live",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-thread-live",
                 "state": "DISCONNECTED",
             }
         )
@@ -393,6 +393,42 @@ class SessionSupervisorStoreTests(unittest.TestCase):
             ],
         )
         self.assertNotEqual(acquired["lease_token"], "")
+
+    def test_cross_provider_rebind_cannot_steal_live_owned_session(self) -> None:
+        first, _ = self.store.register_session(self.session())
+        self.store.acquire_lease(first["session_id"], self.process())
+        before = self.store.get_session(first["session_id"])
+        replacement = {**self.session(), "provider": "CLAUDE", "provider_session_ref": "foreign"}
+        for operation in (
+            lambda: self.store.register_session(replacement),
+            lambda: self.store.bind_provider_session(first["session_id"], provider="CLAUDE",
+                provider_session_ref="foreign", expected_version=before["row_version"]),
+        ):
+            with self.assertRaises(SessionSupervisorError) as caught:
+                operation()
+            self.assertEqual("LIVE_SESSION_PROVIDER_MISMATCH", caught.exception.code)
+        after = self.store.get_session(first["session_id"])
+        self.assertEqual(before["provider"], after["provider"])
+        self.assertEqual(before["row_version"], after["row_version"])
+
+    def test_cross_provider_rebind_cannot_steal_live_session_without_legacy_lease(self) -> None:
+        payload = {**self.session(), "state": "LIVE"}
+        first, _ = self.store.register_session(payload)
+        before = self.store.get_session(first["session_id"])
+        self.assertIsNone(before["process_lease"])
+        for operation in (
+            lambda: self.store.register_session({**payload, "provider": "CLAUDE",
+                "provider_session_ref": "foreign", "state": "DISCONNECTED"}),
+            lambda: self.store.bind_provider_session(first["session_id"], provider="CLAUDE",
+                provider_session_ref="foreign", expected_version=before["row_version"]),
+        ):
+            with self.assertRaises(SessionSupervisorError) as caught:
+                operation()
+            self.assertEqual("LIVE_SESSION_PROVIDER_MISMATCH", caught.exception.code)
+        after = self.store.get_session(first["session_id"])
+        self.assertEqual(before["provider"], after["provider"])
+        self.assertEqual(before["row_version"], after["row_version"])
+        self.assertEqual(before["binding_history"], after["binding_history"])
 
     def test_initialize_migrates_only_legacy_provider_aliases(self) -> None:
         legacy, _ = self.store.register_session(self.session("legacy-alias"))

@@ -1038,6 +1038,7 @@ class SessionSupervisorStore:
                 (session["session_id"],),
             ).fetchone()
             if existing is not None:
+                self._assert_live_provider_identity(connection, existing, session["provider"])
                 material = self._session_material(connection, existing)
                 if material["session_kind"] != session["session_kind"]:
                     raise SessionSupervisorError(
@@ -1376,6 +1377,18 @@ class SessionSupervisorStore:
                 connection, self._require_session(connection, normalized_id)
             )
 
+    def _assert_live_provider_identity(self, connection: sqlite3.Connection,
+                                       row: sqlite3.Row, provider: str) -> None:
+        if (str(row["state"]) == "LIVE"
+            and str(row["provider"] or "").upper() not in {"", "UNKNOWN", provider}):
+            # Rust Host sessions are LIVE without a legacy process_lease row.
+            # Missing lease evidence is not permission to replace their identity.
+            raise SessionSupervisorError(
+                "LIVE_SESSION_PROVIDER_MISMATCH",
+                "cannot rebind a live session to another provider; stop/reconcile its Host first",
+                status=409,
+            )
+
     def bind_provider_session(
         self,
         session_id: str,
@@ -1395,6 +1408,7 @@ class SessionSupervisorStore:
                 raise SessionSupervisorError(
                     "SESSION_VERSION_CONFLICT", "session row version changed", status=409
                 )
+            self._assert_live_provider_identity(connection, row, normalized_provider)
             provider_ref_hash = self._hash_provider_ref(normalized_ref)
             owner = connection.execute(
                 """

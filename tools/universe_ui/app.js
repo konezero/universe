@@ -257,6 +257,7 @@ const elements = {
   sessionBusTabs: Array.from(document.querySelectorAll("[data-session-bus-projection]")),
   sessionBusCompose: document.querySelector("#session-bus-compose"),
   sessionBusBody: document.querySelector("#session-bus-body"),
+  sessionBusProtocol: document.querySelector("#session-bus-protocol"),
   sessionObservatoryDetail: document.querySelector("#session-observatory-detail"),
   sessionObservatoryDetailMeta: document.querySelector(
     "#session-observatory-detail-meta"
@@ -348,6 +349,12 @@ const elements = {
   refreshProviderModels: document.querySelector("#refresh-provider-models-button"),
   setupProviderHooks: document.querySelector("#setup-provider-hooks-button"),
   setupProviderHooksStatus: document.querySelector("#setup-provider-hooks-status"),
+  providerHooksDialog: document.querySelector("#provider-hooks-dialog"),
+  providerHooksForm: document.querySelector("#provider-hooks-form"),
+  providerHooksTarget: document.querySelector("#provider-hooks-target"),
+  providerHooksPath: document.querySelector("#provider-hooks-path"),
+  providerHooksProviders: document.querySelector("#provider-hooks-providers"),
+  providerHooksError: document.querySelector("#provider-hooks-error"),
   hostProfilePath: document.querySelector("#host-profile-path"),
   hostToolSettings: document.querySelector("#host-tool-settings"),
   discoverHostTools: document.querySelector("#discover-host-tools-button"),
@@ -2558,7 +2565,7 @@ async function refreshSessionBusMessages() {
     const heading = node(
       "header",
       "session-bus-item-head",
-      `${message.kind || "NOTE"} · ${workState} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
+      `${({ WORK: "작업 지시", REPLY: "회신", CONVERSATION: "대화·조율", NOTICE: "알림" })[message.protocol] || message.kind || "NOTE"} · ${message.handling?.action || ""} · ${workState} · ${from.project_id || "unknown"}/${from.mode || "UNKNOWN"}/${from.provider || "UNKNOWN"}`
     );
     const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
     item.append(heading, body, renderSessionBusEvidence(message));
@@ -2670,8 +2677,8 @@ async function sendSessionBusCompose(event) {
         mode: pending.coordinate?.mode || pending.session?.mode || "",
         provider: "UI",
       },
-      kind: "INSTRUCTION",
-      notify: "HEADER",
+      protocol: elements.sessionBusProtocol?.value || "WORK",
+      notify: "UI",
       body_text: body,
     },
   });
@@ -5908,6 +5915,7 @@ async function selectProject(
         review_candidates: [],
         memory_schedules: [],
         document_automation: null,
+        review_inbox: { bundles: [], counts: {} },
       })
     ),
     api(`/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`).catch(
@@ -7245,34 +7253,83 @@ async function refreshProviderModels() {
   }
 }
 
-async function setupProviderHooks(opts = {}) {
+function renderProviderHookTarget() {
+  const project = visibleProjects().find(
+    (item) => item.project_id === elements.providerHooksTarget.value
+  );
+  elements.providerHooksPath.textContent = project?.project_root
+    ? `Repository: ${project.project_root}`
+    : "Choose a connected repository to install its hooks.";
+  elements.setupProviderHooks.disabled = !project?.project_root ||
+    !elements.providerHooksProviders.querySelector('input:checked');
+}
+
+function openProviderHooks() {
+  elements.settingsDialog?.close();
+  if (!elements.providerHooksTarget.disabled) {
+    elements.providerHooksTarget.replaceChildren(new Option("Select a repository", ""));
+    for (const project of visibleProjects()) {
+      if (!project.project_root) continue;
+      elements.providerHooksTarget.append(new Option(
+        `${projectDisplayName(project)} · ${project.project_root}`, project.project_id
+      ));
+    }
+    elements.setupProviderHooksStatus.textContent = "";
+    elements.providerHooksError.textContent = "";
+    renderProviderHookTarget();
+  }
+  elements.providerHooksDialog.showModal();
+}
+
+async function setupProviderHooks() {
   const button = elements.setupProviderHooks;
   const status = elements.setupProviderHooksStatus;
-  if (elements.settingsError) elements.settingsError.textContent = "";
-  if (status) status.textContent = "Writing hook files…";
-  if (button) button.disabled = true;
+  const target = elements.providerHooksTarget;
+  if (target.disabled) return;
+  const projectId = target.value;
+  const project = visibleProjects().find((item) => item.project_id === projectId);
+  const providers = Array.from(
+    elements.providerHooksProviders.querySelectorAll('input:checked'), (input) => input.value
+  );
+  elements.providerHooksError.textContent = "";
+  if (!project?.project_root || !providers.length) {
+    elements.providerHooksError.textContent = "Select a connected repository and at least one CLI.";
+    return;
+  }
+  if (status) status.textContent = `Installing CLI hooks in ${projectId}…`;
+  button.disabled = true;
+  target.disabled = true;
+  elements.providerHooksProviders.disabled = true;
   try {
     const result = await api("/v1/settings/setup-provider-hooks", {
       method: "POST",
-      body: { providers: ["CODEX", "GROK", "CLAUDE"], global: true, ...opts },
+      body: {
+        providers,
+        global: false,
+        project_id: projectId,
+      },
     });
     const lines = Object.entries(result.providers || {})
-      .map(([p, r]) => `${p}: ${r.status || r}`)
+      .map(([p, r]) => `${p}: ${r.status || r}${r.detail ? ` (${r.detail})` : ""}`)
       .join(", ");
     const repaired = (result.repairs || []).filter((item) => item.status === "REPAIRED");
     const suffix = repaired.length
       ? `; repaired ${repaired.map((item) => item.mode || "mode").join(", ")} to GROK`
       : "";
-    const message = `CLI hooks: ${lines || "done"}${suffix}`;
+    const message = `CLI hooks (${projectId}): ${lines || "done"}${suffix}`;
     if (status) status.textContent = message;
-    toast(message);
+    const failed = Object.values(result.providers || {}).some((item) => item.status === "ERROR");
+    if (failed) elements.providerHooksError.textContent = "Some hooks could not be installed. See the results above.";
+    toast(message, failed);
   } catch (error) {
     const message = error.message || "CLI hook setup failed";
     if (status) status.textContent = message;
-    if (elements.settingsError) elements.settingsError.textContent = message;
+    elements.providerHooksError.textContent = message;
     toast(message, true);
   } finally {
-    if (button) button.disabled = false;
+    target.disabled = false;
+    elements.providerHooksProviders.disabled = false;
+    renderProviderHookTarget();
   }
 }
 
@@ -13080,6 +13137,8 @@ function renderWorkLoopDetails() {
       "Predictions are evidence-backed proposals only. They never auto-adopt Goals or Todos."
     )
   );
+  const inbox = renderReviewInboxNextWork();
+  if (inbox) group.append(inbox);
   if (!predictions.length) {
     group.append(node("p", "empty-copy", "No prediction proposal yet."));
   }
@@ -16355,6 +16414,83 @@ async function adoptMemoryCandidate(candidate) {
   }
 }
 
+function pageCountLabel(count, label) {
+  if (!count) return `${label} 0`;
+  const returned = Number(count.returned || 0);
+  const limit = Number(count.limit || 0);
+  const range = limit ? `showing ${returned}/${limit}` : `showing ${returned}`;
+  return `${label} ${returned}${count.truncated ? ` · ${range} truncated` : ` · ${range}`}`;
+}
+
+function renderReviewInboxNextWork() {
+  const inbox = state.workLoop?.review_inbox;
+  const bundles = inbox?.bundles || [];
+  const counts = inbox?.counts || {};
+  const group = node("div", "review-inbox-next-work");
+  group.append(
+    node("h4", "", "Next work from review inbox"),
+    node(
+      "p",
+      "empty-copy",
+      [
+        pageCountLabel(counts.memory_candidates, "Memory candidates"),
+        pageCountLabel(counts.predictions, "Predictions"),
+        pageCountLabel(counts.result_reviews, "Result reviews"),
+      ].join(" · ")
+    ),
+    node(
+      "p",
+      "empty-copy",
+      "Bundles preserve one-item review. They never auto-adopt RAG or start a Goal."
+    )
+  );
+  if (!bundles.length) {
+    group.append(
+      node("p", "empty-copy", "No review bundle maps to existing Todo or Proposed Nodes yet.")
+    );
+    return group;
+  }
+  for (const bundle of bundles.slice(0, 8)) {
+    const card = node("article", "review-inbox-bundle");
+    card.append(
+      node("strong", "", bundle.title || "Review bundle"),
+      node(
+        "small",
+        "",
+        `${bundle.next_action || "REVIEW_CANDIDATES"} · ${(bundle.labels || []).join(" / ") || "ungrouped"} · ${bundle.item_count || 0} item(s)`
+      )
+    );
+    if (bundle.related_todo_title) {
+      card.append(
+        node(
+          "p",
+          "empty-copy",
+          `Existing Todo · ${bundle.related_todo_state || "READY"} · ${bundle.related_todo_title}`
+        )
+      );
+    }
+    const actions = node("div", "memory-candidate-actions");
+    if (bundle.next_action === "OPEN_EXISTING_TODO" && bundle.related_todo_id) {
+      const openTodo = node("button", "primary-button compact-action", "Open existing Todo");
+      openTodo.type = "button";
+      openTodo.addEventListener("click", () => openTodoDialog(false));
+      actions.append(openTodo);
+    } else if (bundle.next_action === "DISCOVER_FEATURE_PROPOSAL") {
+      const discover = node("button", "secondary-button compact-action", "Open Proposed Nodes");
+      discover.type = "button";
+      discover.addEventListener("click", () => {
+        generateFeatureNodeProposals()
+          .then(() => showInspectorTab("details"))
+          .catch((error) => toast(error.message, true));
+      });
+      actions.append(discover);
+    }
+    if (actions.childNodes.length) card.append(actions);
+    group.append(card);
+  }
+  return group;
+}
+
 function renderMemoryCandidateReview() {
   const group = node("div", "detail-group memory-candidate-review");
   group.append(
@@ -16382,6 +16518,8 @@ function renderMemoryCandidateReview() {
     filters.append(memoryBatchField(label, select));
   }
   group.append(filters);
+  const inbox = renderReviewInboxNextWork();
+  if (inbox) group.append(inbox);
   const filtersState = state.memoryCandidateFilters;
   const candidates = (state.memoryCandidates || []).filter((candidate) =>
     (!filtersState.stage || candidate.stage === filtersState.stage) &&
@@ -16428,8 +16566,27 @@ function renderMemoryCandidateReview() {
                 ? result.candidate
                 : item
             );
+            if (result.feature_node_proposals?.proposals) {
+              state.featureNodeProposals = result.feature_node_proposals.proposals;
+            }
+            if (result.review_inbox) {
+              state.workLoop = {
+                ...(state.workLoop || {}),
+                review_inbox: result.review_inbox,
+              };
+            }
             renderMemory();
-            toast(`Candidate ${decision.toLowerCase()}`);
+            if (decision === "START_PRODUCT_DESIGN" || decision === "EXPLORE") {
+              renderDetails();
+            }
+            const next = result.review_inbox?.bundles?.[0];
+            toast(
+              next?.next_action === "OPEN_EXISTING_TODO"
+                ? `Candidate ${decision.toLowerCase()} · open existing Todo`
+                : next?.next_action === "DISCOVER_FEATURE_PROPOSAL"
+                  ? `Candidate ${decision.toLowerCase()} · Proposed Nodes ready`
+                  : `Candidate ${decision.toLowerCase()}`
+            );
           } catch (error) {
             toast(error.message, true);
           }
@@ -17200,8 +17357,16 @@ function bindEvents() {
       refreshProviderModels().catch((error) => toast(error.message, true));
     });
   }
-  if (elements.setupProviderHooks) {
-    elements.setupProviderHooks.addEventListener("click", () => {
+  document.querySelector("#open-provider-hooks")?.addEventListener("click", openProviderHooks);
+  elements.providerHooksTarget?.addEventListener("change", () => {
+    elements.setupProviderHooksStatus.textContent = "";
+    elements.providerHooksError.textContent = "";
+    renderProviderHookTarget();
+  });
+  elements.providerHooksProviders?.addEventListener("change", renderProviderHookTarget);
+  if (elements.providerHooksForm) {
+    elements.providerHooksForm.addEventListener("submit", (event) => {
+      event.preventDefault();
       setupProviderHooks().catch((error) => toast(error.message, true));
     });
   }

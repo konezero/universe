@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-23-stroke-icons">
+  <link rel="stylesheet" href="/styles.css?v=work-spine-24-repo-hooks-dialog">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
   <style>
     /* Boot splash — painted before app.js so a reconnecting browser never
@@ -812,10 +812,6 @@
               <button id="refresh-provider-models-button" class="secondary-button" type="button">
                 Refresh models
               </button>
-              <button id="setup-provider-hooks-button" class="secondary-button" type="button" title="Write Grok, Codex, and Claude SessionStart inject hooks. Grok compat must not stamp Claude.">
-                Setup CLI Hooks
-              </button>
-              <small id="setup-provider-hooks-status" class="setup-provider-hooks-status"></small>
             </div>
             <div id="provider-model-catalog" class="provider-model-catalog"></div>
           </section>
@@ -854,6 +850,15 @@
                 <small>Import an immutable Release DB, then propose and apply a runtime update to a project. Import and apply require MASTER.</small>
               </div>
               <button id="open-release-catalog" type="button" class="secondary-button">Open catalog&hellip;</button>
+            </div>
+          </section>
+          <section class="settings-section">
+            <div class="settings-section-heading">
+              <div>
+                <strong>Project CLI hooks</strong>
+                <small>Choose a connected repository and install its session hooks.</small>
+              </div>
+              <button id="open-provider-hooks" type="button" class="secondary-button">CLI Hooks&hellip;</button>
             </div>
           </section>
         </div>
@@ -949,6 +954,12 @@
     </div>
     <div id="session-bus-messages" class="session-bus-messages"></div>
     <form id="session-bus-compose" class="session-bus-compose">
+      <label for="session-bus-protocol">메시지 용도</label>
+      <select id="session-bus-protocol">
+        <option value="WORK">작업 지시 — 자동 처리</option>
+        <option value="CONVERSATION">대화·조율 — 응답 요청</option>
+        <option value="NOTICE">알림 — 표시만</option>
+      </select>
       <label>
         <span class="sr-only">Message</span>
         <textarea id="session-bus-body" rows="4" placeholder="Send without pasting into the CLI" autocomplete="off" spellcheck="false"></textarea>
@@ -1408,6 +1419,35 @@
     </form>
   </dialog>
 
+  <dialog id="provider-hooks-dialog" class="wide-dialog" aria-labelledby="provider-hooks-title">
+    <form id="provider-hooks-form">
+      <div class="dialog-heading">
+        <h2 id="provider-hooks-title">Project CLI hooks</h2>
+        <button class="icon-button" type="button" data-close-dialog title="Close">&times;</button>
+      </div>
+      <label class="release-target-field">
+        Target repository
+        <select id="provider-hooks-target" required>
+          <option value="">Select a repository</option>
+        </select>
+      </label>
+      <p id="provider-hooks-path" class="boundary-copy">Choose a connected repository to install its hooks.</p>
+      <fieldset id="provider-hooks-providers">
+        <legend>CLI providers</legend>
+        <label><input type="checkbox" name="provider" value="CODEX" checked> Codex</label>
+        <label><input type="checkbox" name="provider" value="GROK" checked> Grok</label>
+        <label><input type="checkbox" name="provider" value="CLAUDE" checked> Claude</label>
+      </fieldset>
+      <p class="boundary-copy">SessionStart hooks connect CLI sessions in this repository to Universe.</p>
+      <p id="setup-provider-hooks-status" role="status" aria-live="polite"></p>
+      <p id="provider-hooks-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" data-close-dialog class="secondary-button">Close</button>
+        <button id="setup-provider-hooks-button" type="submit" class="primary-button" disabled>Install hooks</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="release-dialog" class="wide-dialog">
     <form id="release-form" method="dialog">
       <div class="dialog-heading">
@@ -1502,6 +1542,6 @@
   <script src="/xterm-addon-web-links.min.js?v=0.13.0-beta.300"></script>
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
   <script src="/terminals.js?v=term-56-ios-fallback-race" defer></script>
-  <script src="/app.js?v=work-spine-28-fleet-repin" defer></script>
+  <script src="/app.js?v=work-spine-29-repo-hooks-dialog" defer></script>
 </body>
 </html>

@@ -345,6 +345,8 @@ Inspector **Memory** tab:
 - configure and run the four Memory batch stages
 - filter candidates by stage, kind, and review state
 - review candidate provenance summaries and record bounded decisions
+- next-work bundles on the existing Memory and Work Loop surfaces group review items by duplicate/stale/conflict/related Feature, show API page limits, and point at an existing Todo or Proposed Nodes without auto-adopting RAG or starting a Goal
+- `START_PRODUCT_DESIGN` / `EXPLORE` review generates Proposed Nodes as `USER_REVIEW_ONLY` and returns the same review-inbox projection
 
 Inspector **Future** tab aggregates Seed structure, Bench/Experience counts,
 Memory, and Master handoffs for a single planning surface.

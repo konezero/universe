@@ -2,8 +2,8 @@
 
 Messages are persisted to SQLite when a database_path is supplied so that
 inboxes and conversation threads survive PTY, provider, and service restarts.
-The only optional terminal notification is a one-line HEADER pointer emitted
-to the xterm display surface; it never crosses a provider's stdin boundary.
+Notifications are UI-only metadata. Neither PTY input nor terminal output
+may carry display headers: the provider owns its terminal cursor and screen.
 Meeting-room fan-out is a Universe-side helper that copies one thread into
 each live participant inbox.
 """
@@ -26,7 +26,64 @@ BUS_SCHEMA = "universe.session-bus.v1"
 MAX_BODY_BYTES = 32 * 1024
 KINDS = frozenset({"NOTE", "INSTRUCTION", "RESULT", "COORDINATION"})
 ACTIONABLE_KINDS = frozenset({"INSTRUCTION", "COORDINATION"})
-NOTIFY_MODES = frozenset({"NONE", "HEADER"})
+NOTIFY_MODES = frozenset({"NONE", "HEADER", "UI"})
+PROTOCOL_KINDS = {
+    "WORK": "INSTRUCTION",
+    "REPLY": "RESULT",
+    "CONVERSATION": "COORDINATION",
+    "NOTICE": "NOTE",
+}
+
+
+def normalize_message_kind(payload: Mapping[str, Any]) -> str:
+    protocol = str(payload.get("protocol") or "").strip().upper()
+    kind = str(payload.get("kind") or "").strip().upper()
+    if protocol:
+        if protocol not in PROTOCOL_KINDS:
+            raise SessionBusError("BUS_PROTOCOL_INVALID", "unsupported message protocol")
+        if kind and kind != PROTOCOL_KINDS[protocol]:
+            raise SessionBusError("BUS_PROTOCOL_KIND_CONFLICT", "protocol and kind disagree")
+        kind = PROTOCOL_KINDS[protocol]
+    kind = kind or "NOTE"
+    if kind not in KINDS:
+        raise SessionBusError("BUS_KIND_INVALID", f"unsupported kind: {kind}")
+    if protocol == "REPLY":
+        raise SessionBusError("BUS_REPLY_ROUTE_REQUIRED", "use the original message /reply endpoint")
+    return kind
+
+
+def message_handling(message: Mapping[str, Any]) -> dict[str, Any]:
+    """Server-derived processing contract; never an authority grant."""
+    lifecycle = message.get("lifecycle") or {}
+    forwarded = bool(lifecycle.get("forwarded_from_result_id"))
+    kind = str(message.get("kind") or "NOTE").upper()
+    protocol = "REPLY" if forwarded else next(
+        (name for name, legacy in PROTOCOL_KINDS.items() if legacy == kind), "NOTICE"
+    )
+    action = {
+        "WORK": "EXECUTE_WORK", "CONVERSATION": "RESPOND",
+        "REPLY": "PROCESS_REPLY" if forwarded else "CORRELATE_REPLY",
+        "NOTICE": "DISPLAY_ONLY",
+    }[protocol]
+    return {
+        "protocol": protocol,
+        "action": action,
+        "wake_model": kind in ACTIONABLE_KINDS,
+        "reply_expected": protocol in {"WORK", "CONVERSATION"},
+        "authority_granted": False,
+    }
+
+
+def dispatch_body(message: Mapping[str, Any]) -> str:
+    body = str(message.get("body_text") or "")
+    if message_handling(message)["action"] == "PROCESS_REPLY":
+        return (
+            "[Session Bus: PROCESS_REPLY] This is a reply to existing work, "
+            "not a new work authorization. Process it in its original thread. "
+            "Your completion acknowledges receipt; it does not request another reply.\n\n"
+            + body
+        )
+    return body
 INSTRUCTION_DELIVERY_STATES = frozenset({"PENDING", "CLAIMED", "DISPATCHED"})
 LIFECYCLE_STATES = frozenset(
     {
@@ -324,6 +381,7 @@ class SessionBus:
         result_observer: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         self._lock = threading.Lock()
+        self._active_claims: set[str] = set()
         self.result_observer = result_observer
         self._messages: dict[str, dict[str, Any]] = {}
         self._inbox: dict[str, list[str]] = {}
@@ -602,6 +660,9 @@ class SessionBus:
             "thread_id": message["thread_id"],
             "room_id": message.get("room_id") or "",
             "kind": message["kind"],
+            "protocol": message_handling(message)["protocol"],
+            "handling": message_handling(message),
+            "notification": {"surface": "UI", "terminal_output": False},
             "from": dict(message.get("from") or {}),
             "to": dict(message.get("to") or {}),
             "created_at": message["created_at"],
@@ -632,9 +693,7 @@ class SessionBus:
             )
         to = _coord(to_raw)
         source = _coord(payload.get("from"))
-        kind = _text(payload.get("kind") or "NOTE", "kind", limit=32).upper()
-        if kind not in KINDS:
-            raise SessionBusError("BUS_KIND_INVALID", f"unsupported kind: {kind}")
+        kind = normalize_message_kind(payload)
         notify = _text(payload.get("notify") or "NONE", "notify", limit=16).upper()
         if notify not in NOTIFY_MODES:
             raise SessionBusError("BUS_NOTIFY_INVALID", f"unsupported notify: {notify}")
@@ -778,19 +837,9 @@ class SessionBus:
             inbox.append(message_id)
             self._messages[message_id] = message
         self._persist_message(terminal_id, message)
-        if notify == "HEADER" and terminal_id:
-            # A bus notification is display-only.  Never send the header back
-            # through the provider's stdin: Claude may interpret it as a user
-            # prompt (and it can trigger the same prompt-injection path as the
-            # instruction body).  TerminalHost emits it to xterm subscribers
-            # without crossing the PTY input boundary.
-            emitter = getattr(host, "emit_output", None)
-            if callable(emitter):
-                emitter(terminal_id, format_header(message))
-            else:
-                # Compatibility for small test/dummy hosts that predate the
-                # display-only surface.
-                host.write(terminal_id, format_header(message))
+        # HEADER is a compatibility alias for a UI-only notification. The
+        # existing inbox/unread API drives the UI; never paint into the TUI
+        # and never fall back to typing a notification into provider stdin.
         return self._public_message(message, headers_only=False)
 
     def claim_instruction(
@@ -842,6 +891,7 @@ class SessionBus:
                     continue
                 previous_tid = str(message.get("_terminal_id") or "")
                 message["delivery_state"] = "CLAIMED"
+                self._active_claims.add(candidate_id)
                 message["_terminal_id"] = tid
                 message["session_anchor_ref"] = anchor
                 message["recipient_anchor_ref"] = anchor
@@ -869,9 +919,27 @@ class SessionBus:
         terminal_id: str,
         message_id: str,
         session_anchor_ref: str,
+        delivery_channel: str = "",
+        observer_source_id: str = "",
+        bus_dispatch_ref: str = "",
     ) -> dict[str, Any]:
-        """Record successful provider-adapter delivery for the exact claim."""
+        """Record successful provider-adapter delivery for the exact claim.
 
+        ``delivery_channel`` names the transport when it carries its own
+        authoritative completion signal (the Claude typed channel's
+        ``observe_channel_result`` reply, or a native provider session's
+        ``on_terminal`` reply).  For those, the passive provider-activity
+        observer must never synthesise a terminal RESULT: the real reply is
+        authoritative.  An empty value means a transport with no reply channel
+        (PTY fallback, Codex/Grok activity observation) where the observer is
+        the completion signal.
+
+        ``bus_dispatch_ref`` binds a new Codex PTY attempt to its exact observer
+        source. These attempts must not use time/ordinal-only completion.
+        """
+
+        dispatch_ref = _text(bus_dispatch_ref, "bus_dispatch_ref", limit=80)
+        observer_ref = _text(observer_source_id, "observer_source_id", required=bool(dispatch_ref), limit=128)
         tid = _text(terminal_id, "terminal_id", required=True, limit=80)
         mid = _text(message_id, "message_id", required=True, limit=80)
         anchor = _text(
@@ -895,12 +963,27 @@ class SessionBus:
                     409,
                 )
             message["delivery_state"] = "DISPATCHED"
+            self._active_claims.discard(mid)
+            # ``lifecycle_state`` stays STARTED so the ~15 call sites that gate
+            # on it keep working, and providers without a STARTED-ACK transport
+            # (Codex / Grok over the PTY) still reach a terminal result.  The
+            # adapter-delivered vs provider-actually-running distinction lives
+            # in ``lifecycle.execution_phase``: DISPATCHED here, promoted to
+            # RUNNING only by an explicit provider ACK (acknowledge_instruction).
             message["lifecycle_state"] = "STARTED"
             message["dispatched_at"] = utc_now()
             message["updated_at"] = message["dispatched_at"]
-            message.setdefault("lifecycle", {})["started_at"] = message[
-                "dispatched_at"
-            ]
+            lifecycle = message.setdefault("lifecycle", {})
+            lifecycle["started_at"] = message["dispatched_at"]
+            lifecycle["dispatched_at"] = message["dispatched_at"]
+            lifecycle.setdefault("execution_phase", "DISPATCHED")
+            channel = _text(delivery_channel, "delivery_channel", limit=64)
+            if channel:
+                lifecycle["delivery_channel"] = channel
+                lifecycle["awaits_authoritative_reply"] = True
+            if dispatch_ref:
+                lifecycle["bus_dispatch_ref"] = dispatch_ref
+                lifecycle["observer_source_id"] = observer_ref
             self._persist_message(tid, message)
             return self._public_message(message, headers_only=False)
 
@@ -928,7 +1011,9 @@ class SessionBus:
             if (
                 message.get("delivery_state") == "CLAIMED"
                 and message.get("session_anchor_ref") == anchor
+                and message.get("_terminal_id") == tid
             ):
+                self._active_claims.discard(mid)
                 message["delivery_state"] = "PENDING"
                 message["lifecycle_state"] = "QUEUED"
                 message.pop("claimed_at", None)
@@ -1079,6 +1164,7 @@ class SessionBus:
                 )
                 interrupted_claim = (
                     delivery_state == "CLAIMED" and lifecycle_state == "ACCEPTED"
+                    and str(message.get("message_id") or "") not in self._active_claims
                 )
                 if legacy_coordination or interrupted_claim:
                     message["delivery_state"] = "PENDING"
@@ -1094,6 +1180,7 @@ class SessionBus:
                 if (
                     str(message.get("delivery_state") or "").upper() == "PENDING"
                     and _message_lifecycle(message) == "QUEUED"
+                    and float((message.get("lifecycle", {}).get("dispatch_attempt") or {}).get("next_retry_epoch") or 0) <= time.time()
                 ):
                     messages.append(self._public_message(message, headers_only=False))
         return {
@@ -1242,7 +1329,14 @@ class SessionBus:
                 row["terminal_id"] = stored_terminal
                 recipient_anchor = str(message.get("recipient_anchor_ref") or "")
                 live_target = live_by_anchor.get(recipient_anchor)
-                if lifecycle in {"ACCEPTED", "STARTED"}:
+                execution_phase = str(
+                    (message.get("lifecycle") or {}).get("execution_phase") or ""
+                ).upper()
+                if lifecycle == "STARTED" and execution_phase == "DISPATCHED":
+                    # Adapter delivered the instruction but the provider has not
+                    # acknowledged starting it (e.g. still queued inside the CLI).
+                    work_state = "DISPATCHED"
+                elif lifecycle in {"ACCEPTED", "STARTED"}:
                     work_state = "WORKING"
                 elif lifecycle in {"COMPLETED", "FAILED", "REPLIED", "CANCELLED", "DONE"}:
                     work_state = "COMPLETE"
@@ -1335,6 +1429,49 @@ class SessionBus:
             if mid not in self._inbox.setdefault(target_tid, []):
                 self._inbox[target_tid].append(mid)
             self._persist_message(target_tid, message)
+            return self._public_message(message, headers_only=False)
+
+    def record_dispatch_attempt(self, message_id: str, result: Mapping[str, Any]) -> None:
+        """Persist the shared dispatch outcome without changing ownership."""
+        with self._lock:
+            message = self._messages.get(message_id)
+            if message is None:
+                return
+            lifecycle = message.setdefault("lifecycle", {})
+            attempts = int((lifecycle.get("dispatch_attempt") or {}).get("count") or 0) + 1
+            status = str(result.get("status") or "UNKNOWN")
+            lifecycle["dispatch_attempt"] = {
+                "count": attempts, "status": status, "observed_at": utc_now(),
+                "error_code": str(result.get("error_code") or ""),
+                "detail": str(result.get("detail") or "")[:1000],
+                "next_retry_epoch": 0 if status == "DISPATCHED" else time.time() + min(60, 2 ** min(attempts, 6)),
+            }
+            self._persist_message(str(message.get("_terminal_id") or ""), message)
+
+    def acknowledge_instruction(self, message_id: str, *, terminal_id: str,
+                                session_anchor_ref: str, phase: str) -> dict[str, Any]:
+        """Provider ACK is progress evidence, never a final result or inbox dismissal."""
+        if phase not in {"RECEIVED", "STARTED"}:
+            raise SessionBusError("BUS_ACK_PHASE_INVALID", "invalid ACK phase")
+        with self._lock:
+            message = self._messages.get(message_id)
+            if not message or message.get("_terminal_id") != terminal_id or message.get("recipient_anchor_ref") != session_anchor_ref:
+                raise SessionBusError("BUS_ACK_RECIPIENT_MISMATCH", "ACK must match the dispatched recipient", 409)
+            if message.get("kind") not in ACTIONABLE_KINDS or _message_lifecycle(message) not in {"STARTED", "COMPLETED", "REPLIED", "DONE", "FAILED"}:
+                raise SessionBusError("BUS_ACK_NOT_DISPATCHED", "ACK requires a dispatched instruction", 409)
+            lifecycle = message.setdefault("lifecycle", {})
+            lifecycle.setdefault("provider_received_at", utc_now())
+            if phase == "STARTED":
+                # The provider confirmed it began this turn: this is the real
+                # STARTED evidence, distinct from adapter delivery.  Stamp the
+                # real start once (repeat ACKs are idempotent) so it is a stable
+                # terminal-result correlation floor.
+                if not lifecycle.get("provider_started_at"):
+                    started_at = utc_now()
+                    lifecycle["provider_started_at"] = started_at
+                    lifecycle["started_at"] = started_at
+                lifecycle["execution_phase"] = "RUNNING"
+            self._persist_message(terminal_id, message)
             return self._public_message(message, headers_only=False)
 
     def ack(self, message_id: str, terminal_id: str) -> dict[str, Any]:
@@ -1486,6 +1623,65 @@ class SessionBus:
             recipient_tid = stored_tid
         return recipient_tid, recipient_anchor
 
+    def _resupply_final_result(
+        self,
+        *,
+        original: dict[str, Any],
+        existing: dict[str, Any],
+        body: str,
+        terminal_state: str,
+        result_ref: str,
+        now: str,
+    ) -> dict[str, Any]:
+        """Fold a repeat reply into the one canonical final RESULT.
+
+        The first ``reply`` for an instruction mints the final RESULT and
+        stamps ``lifecycle.final_result_id``.  A later automatic or explicit
+        reply for the same instruction must not mint a second RESULT (which
+        the CONDUCTOR loop would forward as a duplicate INSTRUCTION).  An
+        identical body/outcome is an idempotent no-op; a changed body is
+        preserved by revising the existing RESULT in place, keeping its id so
+        per-result forward idempotency still holds.
+        """
+
+        same_body = body == str(existing.get("body_text") or "")
+        same_outcome = terminal_state == str(existing.get("lifecycle_state") or "").upper()
+        result_lifecycle = existing.setdefault("lifecycle", {})
+        if not (same_body and same_outcome):
+            existing.setdefault("revisions", []).append(
+                {
+                    "body_text": existing.get("body_text"),
+                    "lifecycle_state": existing.get("lifecycle_state"),
+                    "superseded_at": now,
+                }
+            )
+            existing["body_text"] = body
+            existing["bytes"] = len(body.encode("utf-8"))
+            existing["lifecycle_state"] = terminal_state
+            existing["updated_at"] = now
+            result_lifecycle[terminal_state.lower() + "_at"] = now
+            if result_ref:
+                result_lifecycle["result_ref"] = _text(
+                    result_ref, "result_ref", limit=512
+                )
+            if not str(result_lifecycle.get("forwarded_instruction_id") or ""):
+                existing["delivery_state"] = "UNREAD"
+            original["updated_at"] = now
+            self._persist_message(str(existing.get("_terminal_id") or ""), existing)
+        thread_id = str(original.get("thread_id") or original.get("message_id") or "")
+        packet = {
+            "schema": BUS_SCHEMA,
+            "status": "REPLIED",
+            "thread_id": thread_id,
+            "message": self._public_message(original, headers_only=False),
+            "result": self._public_message(existing, headers_only=False),
+        }
+        if not (same_body and same_outcome):
+            observer = self.result_observer
+            if callable(observer):
+                observer(packet)
+        return packet
+
     def reply(
         self,
         message_id: str,
@@ -1542,6 +1738,30 @@ class SessionBus:
                     409,
                 )
             current = _message_lifecycle(original)
+            forwarded_id = str((original.get("lifecycle") or {}).get("forwarded_from_result_id") or "")
+            if forwarded_id:
+                # Processing a reply is not a new work request. Acknowledge
+                # consumption without creating a reply-to-reply loop.
+                source_result = self._messages.get(forwarded_id)
+                if not isinstance(source_result, dict):
+                    raise SessionBusError("BUS_RESULT_FORWARD_INTEGRITY", "source result is missing", 409)
+                if current not in {"STARTED", "COMPLETED", "FAILED", "DONE"}:
+                    raise SessionBusError("BUS_LIFECYCLE_TRANSITION_INVALID", f"cannot consume while {current}", 409)
+                now = utc_now()
+                original["lifecycle_state"] = "DONE"
+                original["delivery_state"] = "READ"
+                original.setdefault("lifecycle", {}).setdefault("handling_receipt", {
+                    "body_text": body, "outcome": terminal_state, "consumed_at": now,
+                })
+                source_result.setdefault("lifecycle", {}).setdefault("consumed_at", now)
+                self._persist_message(stored_tid, original)
+                self._persist_message(str(source_result.get("_terminal_id") or ""), source_result)
+                return {
+                    "schema": BUS_SCHEMA, "status": "REPLY_CONSUMED",
+                    "thread_id": str(original.get("thread_id") or mid),
+                    "message": self._public_message(original, headers_only=False),
+                    "result": self._public_message(source_result, headers_only=False),
+                }
             if current not in {"STARTED", "COMPLETED", "FAILED", "REPLIED"}:
                 raise SessionBusError(
                     "BUS_LIFECYCLE_TRANSITION_INVALID",
@@ -1549,6 +1769,20 @@ class SessionBus:
                     409,
                 )
             now = utc_now()
+            prior_final_id = str(
+                (original.get("lifecycle") or {}).get("final_result_id") or ""
+            )
+            if current == "REPLIED" and prior_final_id:
+                existing_final = self._messages.get(prior_final_id)
+                if isinstance(existing_final, dict):
+                    return self._resupply_final_result(
+                        original=original,
+                        existing=existing_final,
+                        body=body,
+                        terminal_state=terminal_state,
+                        result_ref=result_ref,
+                        now=now,
+                    )
             original["lifecycle_state"] = "REPLIED"
             original["delivery_state"] = "REPLIED"
             original["updated_at"] = now
@@ -1605,6 +1839,8 @@ class SessionBus:
             )
             self._messages[result_id] = result
             self._inbox.setdefault(inbox_key, []).append(result_id)
+            lifecycle["final_result_id"] = result_id
+            self._persist_message(stored_tid, original)
             self._persist_message(recipient_tid, result)
             packet = {
                 "schema": BUS_SCHEMA,
@@ -1654,9 +1890,7 @@ def fanout_meeting_bus(
     if str(room.get("state") or "").upper() != "OPEN":
         raise SessionBusError("BUS_ROOM_CLOSED", "cannot post to a closed meeting room", 409)
     source = _coord(payload.get("from"))
-    kind = _text(payload.get("kind") or "NOTE", "kind", limit=32).upper()
-    if kind not in KINDS:
-        raise SessionBusError("BUS_KIND_INVALID", f"unsupported kind: {kind}")
+    kind = normalize_message_kind(payload)
     notify = _text(payload.get("notify") or "NONE", "notify", limit=16).upper()
     if notify not in NOTIFY_MODES:
         raise SessionBusError("BUS_NOTIFY_INVALID", f"unsupported notify: {notify}")
