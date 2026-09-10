@@ -10746,6 +10746,68 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertTrue(all("plan" not in node["data"] for node in work_plan_nodes))
         self.assertTrue(all(node["data"]["plan_in_graph"] is False for node in work_plan_nodes))
 
+    def test_goal_work_plan_final_todo_result_closes_goal_and_replays(self) -> None:
+        # Reuse the real HTTP/storage planning and partial-result path. Its
+        # provider and frame-creation boundaries are fixtures, not live proof.
+        self.test_feature_node_expected_path_adoption_http_and_graph()
+        goal = self.server.store.list_project_goals("GCS")[0]
+        selection = self.server.store.get_goal_todo_execution_selection(goal["goal_id"])
+        self.assertIsNotNone(selection)
+        remaining = [todo_id for todo_id in selection["todo_ids"]
+                     if self.server.store.get_todo(todo_id)["state"] != "DONE"]
+        self.assertEqual(1, len(remaining))
+        result, _ = self.server.task_frame_lineage.attach_result(
+            result_ref="goal-plan-final-result", frame_ref=selection["task_frame_id"],
+            origin_session_anchor_ref=selection["session_anchor_ref"],
+            result={"todo_actions": [{"todo_id": remaining[0], "outcome": "COMPLETED",
+                "evidence_ref": "task-frame://goal-plan-frame-001/final",
+                "validation": {"status": "PASSED", "evidence_ref": "test-run://final/pass"}}]},
+        )
+        request = {"provider": "CODEX", "provider_session_ref": "goal-automation-conductor-provider",
+                   "session_id": selection["session_id"], "session_anchor_ref": selection["session_anchor_ref"],
+                   "expected_goal_revision": goal["revision"], "approval": "APPLY_RESULT",
+                   "result_ref": result["result_ref"]}
+        path = f"/v1/goals/{goal['goal_id']}/automation/todo-results"
+        self.server.store.configure_goal_automation_scheduler(
+            goal["goal_id"], action="START",
+            expected_goal_revision=goal["revision"], interval_seconds=5,
+        )
+        status, applied = self.request("POST", path, request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, applied)
+        self.assertEqual("GOAL_COMPLETED", applied["surface"]["automation_state"])
+        self.assertEqual("NONE", applied["surface"]["next_operation"])
+        self.assertEqual("DONE", self.server.store.get_goal(goal["goal_id"])["state"])
+        tick = self.server.run_goal_automation_scheduler_once()
+        self.assertEqual("COMPLETED", tick["scheduler"]["status"], tick)
+        self.assertFalse(tick["scheduler"]["enabled"])
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual("DONE", reopened.get_goal(goal["goal_id"])["state"])
+        self.assertEqual(
+            applied["result_application"],
+            reopened.get_goal_task_frame_result_application(goal["goal_id"]),
+        )
+        self.assertEqual(
+            "COMPLETED", reopened.get_goal_automation_scheduler(goal["goal_id"])["status"]
+        )
+        status, replay = self.request("POST", path, request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, replay)
+        self.assertEqual("GOAL_COMPLETED", replay["surface"]["automation_state"])
+        self.assertEqual(applied["surface"]["goal"]["revision"], replay["surface"]["goal"]["revision"])
+        status, conflict = self.request("POST", path,
+            {**request, "result_ref": "goal-plan-result-partial-001"}, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, conflict)
+        self.assertEqual("GOAL_TASK_FRAME_RESULT_APPLICATION_CONFLICT", conflict["error_code"])
+        status, stale = self.request("POST", path,
+            {**request, "expected_goal_revision": goal["revision"] + 100}, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, stale)
+        self.assertEqual("GOAL_TASK_FRAME_RESULT_APPLICATION_CONFLICT", stale["error_code"])
+        status, wrong_actor = self.request(
+            "POST", path,
+            {**request, "provider_session_ref": "unknown-provider-session"}, self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status, wrong_actor)
+        self.assertEqual("TODO_MUTATION_SESSION_NOT_CURRENT", wrong_actor["error_code"])
+
     def test_action_server_rejects_client_context_claims(self) -> None:
         with self.assertRaises(UniverseError) as raised:
             self.server.execute_action(
@@ -13200,7 +13262,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "sort_order": 0,
             },
         )
-        application, created = self.server.store.apply_goal_only_task_frame_result(
+        application, created = self.server.store.apply_goal_task_frame_result(
             goal_id=goal["goal_id"],
             expected_goal_revision=goal["revision"],
             task_frame_id="goal-only-frame-001",
@@ -13212,7 +13274,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         completed = self.server.store.get_goal(goal["goal_id"])
         self.assertEqual("DONE", completed["state"])
         self.assertEqual(goal["revision"] + 1, completed["revision"])
-        replay, replay_created = self.server.store.apply_goal_only_task_frame_result(
+        replay, replay_created = self.server.store.apply_goal_task_frame_result(
             goal_id=goal["goal_id"],
             expected_goal_revision=completed["revision"],
             task_frame_id="goal-only-frame-001",
@@ -13221,6 +13283,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertFalse(replay_created)
         self.assertEqual(application["application_id"], replay["application_id"])
+
+    def test_goal_work_plan_completion_requires_every_goal_todo(self) -> None:
+        self.server.store.register_project(self.registration())
+        cases = (
+            ("empty-plan", [], [], False),
+            ("missing-required", [], [0], False),
+            ("partial", ["DONE", "IN_PROGRESS"], [0, 1], False),
+            ("failed", ["DONE", "BLOCKED"], [0, 1], False),
+            ("unselected-open", ["DONE", "READY"], [0], False),
+            ("all-done", ["DONE", "DONE"], [0, 1], True),
+        )
+        for name, states, required_indexes, expected_completion in cases:
+            with self.subTest(name=name):
+                goal = self.server.store.create_goal(
+                    "GCS",
+                    {"title": name, "description": "Completion boundary fixture",
+                     "owner": "CONDUCTOR", "state": "ACTIVE", "sort_order": 0},
+                )
+                todo_ids = [f"todo-{name}-{index}" for index in range(2)]
+                for index, state in enumerate(states):
+                    self.server.store.create_todo({
+                        "todo_id": todo_ids[index], "scope_kind": "PROJECT",
+                        "project_id": "GCS", "goal_id": goal["goal_id"],
+                        "title": f"Required item {index}", "detail": "Store fixture",
+                        "priority": "P0", "state": state, "source_kind": "USER",
+                        "sort_order": index,
+                    })
+                application, created = self.server.store.apply_goal_task_frame_result(
+                    goal_id=goal["goal_id"], expected_goal_revision=goal["revision"],
+                    task_frame_id=f"frame-{name}", result_ref=f"result-{name}",
+                    result_digest="b" * 64,
+                    required_todo_ids=[todo_ids[index] for index in required_indexes],
+                )
+                self.assertEqual(expected_completion, created)
+                persisted = self.server.store.get_goal(goal["goal_id"])
+                self.assertEqual("DONE" if expected_completion else "ACTIVE", persisted["state"])
+                self.assertEqual(goal["revision"] + int(expected_completion), persisted["revision"])
+                self.assertEqual(
+                    application,
+                    self.server.store.get_goal_task_frame_result_application(goal["goal_id"]),
+                )
+                if not expected_completion:
+                    self.assertIsNone(application)
 
     def test_instruction_task_frame_http_route_uses_proposal_reference_only(
         self,

@@ -12,6 +12,13 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from knowledge_redaction import SECRET_VALUE_PATTERNS
+from universe_app.failure_reuse import (
+    FailureReuseError,
+    failure_candidate_id,
+    normalize_failure_knowledge,
+)
+
 MEMORY_SCHEMA = "universe.project-memory.v1"
 MEMORY_RAG_BATCH_SCHEMA = "universe.project-memory-rag-batch.v1"
 MEMORY_STATES = frozenset({"BRAINSTORM", "OBSERVED", "QUESTION", "DECISION_NOTE"})
@@ -1228,6 +1235,30 @@ def normalize_memory_candidate(
         "relations": relations,
         "relevance": {"repetition_count": repetition_count},
     }
+    failure_fields = {}
+    if "failure" in value:
+        if normalized_kind != "MEMORY":
+            raise MemoryError(
+                "FAILURE_KNOWLEDGE_KIND_INVALID",
+                "failure knowledge must remain a MEMORY candidate",
+            )
+        if any(pattern.search(summary) for pattern in SECRET_VALUE_PATTERNS):
+            raise MemoryError(
+                "FAILURE_REUSE_SECRET_FORBIDDEN", "secret-like summaries are not accepted"
+            )
+        try:
+            failure = normalize_failure_knowledge(value["failure"])
+        except FailureReuseError as error:
+            raise MemoryError(error.code, error.detail) from error
+        expected_id = failure_candidate_id(normalized_project, failure)
+        if candidate_id and candidate_id != expected_id:
+            raise MemoryError(
+                "FAILURE_KNOWLEDGE_ID_INVALID",
+                "failure_ref determines the project-local candidate id",
+            )
+        candidate_id = expected_id
+        failure_fields = {"failure": failure}
+        material.update(failure_fields)
     candidate_digest = _digest(material)
     if not candidate_id:
         candidate_id = "memory_candidate_" + candidate_digest[:24]
@@ -1243,6 +1274,7 @@ def normalize_memory_candidate(
         "relations": relations,
         "relevance": {"repetition_count": repetition_count},
         "candidate_digest": candidate_digest,
+        **failure_fields,
         "authority": "NONE",
         "effects": {
             "current_anchor": "NONE",
@@ -1329,6 +1361,13 @@ def consolidate_memory_candidates(
         if existing is None:
             normalized_by_id[candidate["candidate_id"]] = candidate
             continue
+        if "failure" in candidate:
+            if existing["candidate_digest"] != candidate["candidate_digest"]:
+                raise MemoryError(
+                    "MEMORY_CANDIDATE_IDEMPOTENCY_CONFLICT",
+                    "failure_ref refers to conflicting evidence",
+                )
+            continue
         existing["relevance"]["repetition_count"] = min(
             1_000_000,
             int(existing["relevance"]["repetition_count"])
@@ -1343,6 +1382,10 @@ def consolidate_memory_candidates(
             "MEMORY_CANDIDATE_PROJECT_MISMATCH",
             "consolidation input must contain one project",
         )
+    # Structured failure identity/cause is not inferred from summary overlap.
+    # Leave its immutable evidence and review state to the explicit review path.
+    failures = [item for item in normalized if "failure" in item]
+    normalized = [item for item in normalized if "failure" not in item]
     by_id = {item["candidate_id"]: item for item in normalized}
     forced_state: dict[str, str] = {}
     forced_relations: dict[str, list[dict[str, str]]] = {}
@@ -1431,7 +1474,7 @@ def consolidate_memory_candidates(
             },
         }
         result.append(normalize_memory_candidate(payload))
-    return sorted(result, key=lambda item: item["candidate_id"])
+    return sorted(result + failures, key=lambda item: item["candidate_id"])
 
 
 def synthesize_memory_candidates(
@@ -1446,6 +1489,7 @@ def synthesize_memory_candidates(
         item
         for item in normalized
         if item["state"] not in {"SUPERSEDED", "IGNORE", "CONFLICTED"}
+        and "failure" not in item
     ]
     if not active:
         return []

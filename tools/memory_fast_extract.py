@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from universe_memory import MemoryError, normalize_memory_candidate
+from knowledge_redaction import SECRET_VALUE_PATTERNS
 
 
 FAST_EXTRACT_REQUEST_SCHEMA = "universe.memory-fast-extract-request.v1"
@@ -28,14 +29,6 @@ FAST_EXTRACT_INPUT_SCHEMA = "universe.memory-fast-extract-context.v1"
 FAST_EXTRACT_CANDIDATE_KIND = "MEMORY"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 WORD = re.compile(r"[\w'-]+", re.UNICODE)
-SECRET_VALUE_PATTERNS = (
-    re.compile(r"\b(?:sk|xai|ghp|github_pat)-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*\S{8,}",
-        re.IGNORECASE,
-    ),
-)
 
 
 class FastExtractError(ValueError):

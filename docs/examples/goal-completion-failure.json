@@ -1,0 +1,35 @@
+{
+  "stage": "CONSOLIDATE",
+  "kind": "MEMORY",
+  "summary": "Goal 완료 회수 누락: 마지막 Todo 결과 후 terminal Goal receipt를 기록해야 한다. HTTP/storage 회귀 검증 PASS, 실행 중 서비스 적용 및 실제 provider 검증 NOT_RUN.",
+  "source_session": "01a0887a-ac62-7051-af6e-0cd044bdefec",
+  "source_refs": ["repo://universe/docs/goal-automation-e2e-20260910.md"],
+  "failure": {
+    "failure_ref": "goal-final-todo-terminal-application-20260910",
+    "observation_kind": "RETROSPECTIVE_OBSERVATION",
+    "component": "goal_automation",
+    "operation": "apply_task_frame_todo_result",
+    "error_code": "TASK_FRAME_READY",
+    "symptom": "All Work Plan Todos are DONE but the Goal automation projection remains TASK_FRAME_READY instead of GOAL_COMPLETED.",
+    "cause": {
+      "key": "work-plan-terminal-application-missing",
+      "summary": "Only the Goal-only route recorded the terminal Goal result application; Work Plan Todo results did not seal the Goal.",
+      "state": "CONFIRMED"
+    },
+    "remedy": {
+      "summary": "After validated Todo actions, atomically verify all required and remaining Goal Todos are DONE, record the exact terminal result application, and recognize that completion in the scheduler.",
+      "applicability": {"completion_route": "WORK_PLAN_TODOS", "execution_plane": "HTTP_STORAGE"}
+    },
+    "validation": [
+      {"plane": "http_storage", "status": "PASS", "evidence_refs": ["repo://universe/docs/goal-automation-e2e-20260910.md", "repo://universe/tests/test_universe_server.py"]},
+      {"plane": "provider", "status": "NOT_RUN", "evidence_refs": []},
+      {"plane": "resident_deployment", "status": "NOT_RUN", "evidence_refs": []}
+    ],
+    "limitations": [
+      "The HTTP/storage fixture mocks provider results and Task Frame creation.",
+      "The running user service has not received this change; live provider completion and restart recovery are not verified.",
+      "TASK_FRAME_READY alone is not this defect: verify all required Todos are DONE and the missing terminal application cause."
+    ],
+    "evidence_refs": ["repo://universe/docs/goal-automation-e2e-20260910.md"]
+  }
+}

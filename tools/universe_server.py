@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from core_release import CoreReleaseError, verify_release
@@ -137,6 +137,7 @@ from project_master_host import (
 )
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
+from universe_app.failure_reuse import FailureReuseError, FailureReuseService
 from universe_memory import (
     MEMORY_BATCH_CONFIG_SCHEMA,
     MEMORY_BATCH_RUN_SCHEMA,
@@ -5825,6 +5826,7 @@ class UniverseStore:
         # durable Anchor Graph source.
         self.task_frame_lineage = TaskFrameLineageStore(self.database_path)
         self.memory_batch_execution_service = MemoryBatchExecutionService(self)
+        self.failure_reuse = FailureReuseService(self)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -14658,10 +14660,15 @@ class UniverseStore:
         node_ids: Sequence[str] | None = None,
         memory_limit: int = 8,
         skill_limit: int = 8,
+        failure: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Retrieve trusted Memory and Bench skill evidence for an LLM turn."""
 
         project = self.get_project(project_id)
+        failure_recall = (
+            self.recall_failure_evidence(project["project_id"], failure)
+            if failure is not None else None
+        )
         ingestion = self.sync_project_lineage_memories(project["project_id"])
         query_tokens = _retrieval_tokens(query)
         selected_nodes = {
@@ -14866,8 +14873,28 @@ class UniverseStore:
                 "project_source_write": "NONE",
             },
         }
+        if failure_recall is not None:
+            material["failure_reuse"] = failure_recall
         material["retrieval_digest"] = _json_sha256(material)
         return material
+
+    def recall_failure_evidence(self, project_id: str, value: Any) -> dict[str, Any]:
+        try:
+            return self.failure_reuse.query(project_id, value)
+        except FailureReuseError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def record_failure_reuse(self, project_id: str, value: Any) -> tuple[dict[str, Any], bool]:
+        try:
+            return self.failure_reuse.record_reuse(project_id, value)
+        except FailureReuseError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def failure_reuse_observations(self, project_id: str, candidate_id: Any) -> dict[str, Any]:
+        try:
+            return self.failure_reuse.observations(project_id, candidate_id)
+        except FailureReuseError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
 
     def _require_project_anchor(self, project_id: str, payload: Mapping[str, Any]) -> dict[str, str]:
         project = self.get_project(project_id)
@@ -14972,6 +14999,7 @@ class UniverseStore:
             bound["project_id"],
             query=str(payload.get("query") or ""),
             node_ids=list(payload.get("node_ids") or []),
+            failure=payload.get("failure"),
         )
         return {
             "schema": API_SCHEMA,
@@ -16600,7 +16628,7 @@ class UniverseStore:
             **{key: row[key] for key in row.keys()},
         }
 
-    def apply_goal_only_task_frame_result(
+    def apply_goal_task_frame_result(
         self,
         *,
         goal_id: str,
@@ -16608,7 +16636,8 @@ class UniverseStore:
         task_frame_id: str,
         result_ref: str,
         result_digest: str,
-    ) -> tuple[dict[str, Any], bool]:
+        required_todo_ids: list[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, bool]:
         goal = self.get_goal(goal_id)
         material = {
             "schema": GOAL_TASK_FRAME_RESULT_APPLICATION_SCHEMA,
@@ -16621,6 +16650,7 @@ class UniverseStore:
         digest = _json_sha256(material)
         application_id = "goal_result_application_" + digest[:24]
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT * FROM goal_task_frame_result_application WHERE goal_id = ?",
                 (goal["goal_id"],),
@@ -16637,6 +16667,19 @@ class UniverseStore:
                         HTTPStatus.CONFLICT,
                     )
                 return current, False
+            if required_todo_ids is not None:
+                # Read completion and seal the Goal in the same transaction.
+                # A partial selection/result must not complete the whole plan.
+                required = set(required_todo_ids)
+                rows = connection.execute(
+                    "SELECT todo_id, state FROM project_todo WHERE goal_id = ?",
+                    (goal["goal_id"],),
+                ).fetchall()
+                states = {row["todo_id"]: row["state"] for row in rows}
+                if not required or any(states.get(todo_id) != "DONE" for todo_id in required):
+                    return None, False
+                if any(state != "DONE" for state in states.values()):
+                    return None, False
             now = utc_now()
             cursor = connection.execute(
                 "UPDATE project_goal SET state = 'DONE', revision = revision + 1, updated_at = ? WHERE goal_id = ? AND revision = ?",
@@ -18949,6 +18992,7 @@ class UniverseStore:
         stored: list[dict[str, Any]] = []
         created_count = 0
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             for candidate in normalized:
                 existing = connection.execute(
                     """
@@ -19035,6 +19079,14 @@ class UniverseStore:
     def create_memory_candidate(
         self, project_id: str, value: Any
     ) -> tuple[dict[str, Any], bool]:
+        if (
+            isinstance(value, Mapping) and "failure" in value
+            and str(value.get("state", "REVIEW_REQUIRED")).upper() != "REVIEW_REQUIRED"
+        ):
+            raise UniverseError(
+                "FAILURE_KNOWLEDGE_REVIEW_REQUIRED",
+                "new failure knowledge must enter the existing candidate review path",
+            )
         candidates, created = self._insert_memory_candidates(project_id, [value])
         return candidates[0], bool(created)
 
@@ -30170,6 +30222,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         request = normalize_goal_todo_result_projection_request(value)
         surface = self.goal_automation_surface(goal_id)
         goal = surface["goal"]
+        completed = surface["todo_execution"].get("result_application")
+        if goal["state"] == "DONE" and completed is not None:
+            self.resolve_todo_mutation_session(request)
+            if (
+                completed["result_ref"] != request["result_ref"]
+                or request["expected_goal_revision"]
+                not in {goal["revision"], goal["revision"] - 1}
+            ):
+                raise UniverseError(
+                    "GOAL_TASK_FRAME_RESULT_APPLICATION_CONFLICT",
+                    "completed Goal accepts only replay of its terminal result",
+                    HTTPStatus.CONFLICT,
+                )
+            return {
+                "schema": API_SCHEMA,
+                "status": "GOAL_TASK_FRAME_RESULT_APPLICATION_REPLAYED",
+                "goal_id": goal["goal_id"],
+                "result_application": completed,
+                "actions": [],
+                "surface": surface,
+            }
         if goal["revision"] != request["expected_goal_revision"]:
             raise UniverseError(
                 "GOAL_REVISION_CONFLICT",
@@ -30222,7 +30295,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
         if selection.get("selection_kind") == "GOAL_ONLY":
-            application, created = self.store.apply_goal_only_task_frame_result(
+            application, created = self.store.apply_goal_task_frame_result(
                 goal_id=goal["goal_id"],
                 expected_goal_revision=request["expected_goal_revision"],
                 task_frame_id=active_task_frame_id,
@@ -30316,6 +30389,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 action=action,
             )
             actions.append(self._apply_goal_todo_action(action_request))
+        completed_application, _ = self.store.apply_goal_task_frame_result(
+            goal_id=goal["goal_id"],
+            expected_goal_revision=request["expected_goal_revision"],
+            task_frame_id=active_task_frame_id,
+            result_ref=result["result_ref"],
+            result_digest=result["result_digest"],
+            required_todo_ids=list(surface["application"]["created_items"]["todo_ids"]),
+        )
         return {
             "schema": API_SCHEMA,
             "status": "GOAL_TASK_FRAME_TODO_RESULT_APPLIED",
@@ -30328,6 +30409,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "attached_at": result["attached_at"],
             },
             "actions": actions,
+            "result_application": completed_application,
             "surface": self.goal_automation_surface(goal["goal_id"]),
         }
 
@@ -30584,23 +30666,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             for _ in range(4):
                 surface = self.goal_automation_surface(goal_id)
                 goal = surface["goal"]
-                if goal["revision"] != job["expected_goal_revision"]:
+                operation = str(surface.get("next_operation") or "UNKNOWN")
+                completed = (
+                    operation == "NONE"
+                    and surface.get("automation_state") == "GOAL_COMPLETED"
+                )
+                # Terminal result application advances the Goal revision.
+                # Observing its completion does not dispatch stale work.
+                if not completed and goal["revision"] != job["expected_goal_revision"]:
                     raise UniverseError(
                         "GOAL_REVISION_CONFLICT",
                         "Goal revision changed before the scheduled tick",
                         HTTPStatus.CONFLICT,
                     )
-                operation = str(surface.get("next_operation") or "UNKNOWN")
                 if operation not in {
                     "MATERIALIZE_GOAL_START_PLAN",
                     "CREATE_AND_DELIVER_MASTER_HANDOFF",
                     "DELIVER_MASTER_HANDOFF",
                     "DELIVER_MASTER_HANDOFF_UPDATE",
                 }:
-                    completed = (
-                        operation == "NONE"
-                        and surface.get("automation_state") == "GOAL_COMPLETED"
-                    )
                     scheduler = self.store.finish_goal_automation_scheduler_tick(
                         goal_id,
                         lease_owner=self._goal_scheduler_owner,
@@ -42565,6 +42649,16 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/failure-reuse/observations":
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    result = self.server.store.failure_reuse_observations(
+                        project_id, (query.get("candidate_id") or [None])[0],
+                    )
+                    self._send(HTTPStatus.OK, result)
+                except UniverseError as error:
+                    self._send_error(error)
+                return
             if suffix == "/memory-candidates":
                 query_map = parse_qs(urlsplit(self.path).query)
                 try:
@@ -43011,6 +43105,9 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
             return
+        if re.fullmatch(r"/v1/projects/[^/]+/failure-reuse/observations", path):
+            if not self._authorize_local_operator():
+                return
         if path in {
             "/v1/conductor/delegations",
             "/v1/conductor-room/delegations",
@@ -45887,6 +45984,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+            if parts is not None and parts[1] == "/failure-reuse/query":
+                self._send(HTTPStatus.OK, self.server.store.recall_failure_evidence(parts[0], body))
+                return
+            if parts is not None and parts[1] == "/failure-reuse/observations":
+                observation, created = self.server.store.record_failure_reuse(parts[0], body)
+                self._send(
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    {"schema": API_SCHEMA,
+                     "status": "FAILURE_REUSE_RECORDED" if created else "FAILURE_REUSE_REPLAYED",
+                     "observation": observation},
+                )
+                return
             if parts is not None and parts[1] == "/memory-candidates":
                 candidate, created = self.server.store.create_memory_candidate(
                     parts[0], body
@@ -46536,6 +46645,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memory-batch-config",
             "/memory-candidates/review",
             "/memory-candidates",
+            "/failure-reuse/query",
+            "/failure-reuse/observations",
             "/memories/propose-links",
             "/memories/maintain",
             "/memories/link",
