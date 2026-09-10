@@ -1297,11 +1297,36 @@ def run_hook(
         payload=inject_body,
     )
     if status_code and 200 <= status_code < 300 and isinstance(response, dict):
+        runtime_bootstrap = {"status": "NOT_REQUESTED"}
+        if is_universe_managed_host(env) and trigger in {"session_start", "mode_change", "manual"}:
+            # Use the identity accepted by the server, not a vendor id or the
+            # previous Mode observer. The same key works before the first turn.
+            try:
+                if __package__:
+                    from .universe_runtime_session_bootstrap import bootstrap_managed_session
+                else:
+                    from universe_runtime_session_bootstrap import bootstrap_managed_session
+                supervised = response.get("supervisor_session")
+                runtime_bootstrap = bootstrap_managed_session(
+                    repo_root, supervised if isinstance(supervised, Mapping) else {},
+                )
+            except Exception as error:  # Preserve the successful transport and failed projection separately.
+                runtime_bootstrap = {"status": "MANAGED_SESSION_BOOTSTRAP_FAILED",
+                                     "error_code": type(error).__name__, "detail": str(error)}
+            if runtime_bootstrap.get("status") != "MANAGED_SESSION_BOOTSTRAP_COMPLETE":
+                return _result(
+                    "RUNTIME_SESSION_BOOTSTRAP_FAILED", **base,
+                    detail="Universe injection succeeded but Runtime session linkage did not",
+                    http_status=status_code, inject_status=response.get("status"),
+                    runtime_bootstrap=runtime_bootstrap, anchor_patch=anchor_patch,
+                    rust_host_binding=rust_host_binding, observation_path=observation_path,
+                )
         return _result(
             "INJECTED",
             detail="session ref injected into Universe",
             endpoint=endpoint,
             http_status=status_code,
+            runtime_bootstrap=runtime_bootstrap,
             observation_path=observation_path,
             session_md_status=session_md_status,
             anchor_patch=anchor_patch,

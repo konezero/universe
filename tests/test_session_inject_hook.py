@@ -52,6 +52,13 @@ def _args(**overrides: object) -> Namespace:
     return Namespace(**base)
 
 
+def _seed_runtime_registry(root: Path) -> None:
+    target = root / ".ai/runtime/project_instance"
+    target.mkdir(parents=True, exist_ok=True)
+    for name in ("mode_registry.json", "DISTRIBUTION_MANIFEST.json"):
+        (target / name).write_bytes((ROOT / ".ai/runtime/project_instance" / name).read_bytes())
+
+
 class SessionInjectHookTests(unittest.TestCase):
     def test_resolve_from_cli(self) -> None:
         provider, ref, source = resolve_provider_and_ref(
@@ -519,6 +526,7 @@ class SessionInjectHookTests(unittest.TestCase):
     def test_injected_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            _seed_runtime_registry(root)
             state = root / "server.json"
             state.write_text(
                 json.dumps(
@@ -531,6 +539,9 @@ class SessionInjectHookTests(unittest.TestCase):
             )
             fake_response = {
                 "status": "SESSION_REF_INJECTED",
+                "supervisor_session": {"session_id": "session_managed_inject",
+                    "session_anchor_ref": "anchor-managed-inject", "provider": "CLAUDE",
+                    "provider_session_ref": "c-2", "mode": "MASTER"},
                 "supervisor_session_created": True,
                 "make_default": True,
                 "resident_runtime_reload": "REQUIRED",
@@ -575,6 +586,7 @@ class SessionInjectHookTests(unittest.TestCase):
     def test_session_start_binds_live_pty_before_provider_id_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            _seed_runtime_registry(root)
             state = root / "server.json"
             state.write_text(
                 json.dumps(
@@ -589,7 +601,9 @@ class SessionInjectHookTests(unittest.TestCase):
 
             def post(*, payload, **_kwargs):
                 captured.update(payload)
-                return 200, {"status": "SESSION_REF_INJECTED"}, None
+                return 200, {"status": "SESSION_REF_INJECTED", "supervisor_session": {
+                    "session_id": "session_pty_start_1", "session_anchor_ref": "anchor-pty-start",
+                    "provider": "CLAUDE", "provider_session_ref": None, "mode": "MASTER"}}, None
 
             with mock.patch(
                 "universe_session_inject_hook.endpoint_reachable",
