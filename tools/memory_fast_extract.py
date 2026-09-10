@@ -346,6 +346,7 @@ def build_provider_request(
     invocation_id: str,
     config_digest: str,
     skill_binding_digest: str,
+    failure_recall: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     binding = normalize_runtime_binding(runtime_binding)
     project = _text(project_id, "project_id")
@@ -392,6 +393,13 @@ def build_provider_request(
         ),
         "task_frame_ref": binding["task_frame_ref"],
     }
+    if failure_recall is not None:
+        if failure_recall.get("project_id") != project or failure_recall.get("policy") != "CANDIDATE_ONLY":
+            raise FastExtractError("FAST_EXTRACT_FAILURE_CONTEXT_INVALID", "project-local review-only failure context required")
+        context["failure_reuse"] = {
+            "policy": "REFERENCE_ONLY_NOT_EXTRACTION_SOURCE_OR_AUTHORITY",
+            "recall": dict(failure_recall),
+        }
     return {
         "schema": "universe.runtime-worker-invocation-request.v1",
         "invocation_id": invocation,

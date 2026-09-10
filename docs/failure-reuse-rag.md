@@ -6,6 +6,10 @@ binding: `binding_3e0be326f0b1a268dc947e9f`.
 
 ## Bounded outcome
 
+The first implementation/verification record below describes commit `6c147af`.
+The 2026-09-11 follow-up at the end extends that slice; its deployment state is
+reported separately from source and fixture results.
+
 Recall project-local failure evidence with its reported cause, proposed remedy,
 applicability and verification limits; record the observed result of trying it.
 No automatic patch, provider invocation, web research, canonical adoption,
@@ -188,3 +192,107 @@ changed_paths:
 This is not completion of the broader P1 automation backlog or the blocked P0
 Goal. The running Universe service is unchanged; no restart, commit, release,
 push, live candidate registration, or canonical RAG adoption was performed.
+
+## 2026-09-11: governed batch failure/retry integration
+
+Instruction: `p1-failure-reuse-live-flow-20260911`.
+Work Receipt: `work_019a1f8415a981729b6f7253`;
+binding: `binding_7810eaf5f1a1d0d2a7601107`.
+
+Confirmed owners and changes:
+
+1. FAST_EXTRACT's old HTTP payload carried `runtime_binding.token`, while the
+   common Action Registry correctly rejects inline credentials. Baseline:
+   two failing tests, both `ACTION_CREDENTIAL_REF_ONLY`, before Worker dispatch.
+   The session-start hook already creates a Host-owned session attachment.
+   Its public projection now supplies an opaque, attachment-specific
+   `credential_ref`; the shared resolver checks exact project/session/anchor,
+   live/current state, and reference before returning transport credentials to
+   internal code only. Missing/stale references fail closed, with no new session
+   or global-Conductor fallback. Task Frame still owns turn authorization.
+2. `retry_memory_batch_run` removed the prior failure and successful completion
+   replaced its result JSON. New `memory_batch_attempt_evidence` rows preserve
+   each terminal attempt in the same transaction as its run transition. This is
+   run evidence, not another knowledge store or automatic candidate promotion.
+3. `fail_memory_batch_run` automatically recalls existing project-local failure
+   candidates. Retry refreshes the original query so newly ignored/superseded
+   evidence is excluded, then prepares a separately labelled Worker context.
+   Immutable snapshots retain the exact evidence seen at failure and retry.
+4. The successful second attempt links its previous attempt reference and
+   candidate IDs/digests. Operation PASS does not imply causal remediation:
+   `remedy_application` and `cause_resolution` remain `UNKNOWN`;
+   `CONTEXT_PREPARED_NOT_PROVEN_APPLIED` is not proof the provider used a remedy.
+   Explicit evaluated reuse still uses the original observation API.
+
+API: `GET /v1/projects/{project_id}/failure-reuse/batch-attempts?run_id=...`.
+It returns the latest 20 records, newest first, with a truncation flag.
+Current run responses also expose `run.attempt_evidence`. The credential-only
+request migration is documented in [universe-memory-rag.md](universe-memory-rag.md).
+No old token-body compatibility bypass was added. No new credential database,
+raw-token registration endpoint, autonomous retry, or repair authority was added.
+
+The integration test registers a clearly fixture-labelled failure candidate,
+executes the actual HTTP/Host/dispatcher path with an intentionally failing
+provider adapter, checks automatic recall, retries under the same run ID,
+asserts the retry context, and verifies history/replay after SQLite reopen.
+The provider adapter and Runtime transport are fixtures, not live providers.
+Separate coverage verifies concurrent exactly-once failed-attempt capture,
+transaction rollback, cross-project rejection and stale/rotated attachments.
+
+Live preflight: the user service at `http://127.0.0.1:60443` reports READY;
+Supervisor reports two LIVE records (one CURRENT, one STALE). The current
+Universe batch listing has 23 runs and no FAILED entries. This does not prove
+the new code is loaded or that historical failures never occurred. Service
+restart approval was requested because active sessions can be interrupted.
+No resident restart, live provider invocation or live candidate/fixture import
+has been performed during this follow-up.
+
+Final follow-up regression: **78 PASS** across failure recall (17),
+FAST_EXTRACT/HTTP retry (6), session credentials (3), Memory (7), Memory
+candidates/delegation (12), Memory execution (3), Action Registry (9), session
+attachment (1), and Goal automation (20). The two prior FAST_EXTRACT failures
+are fixed by migrating the request contract; inline-token rejection remains
+covered. The retry-context test also rejects a candidate ignored between the
+first failure and the second attempt. Targeted Ruff and whitespace checks PASS.
+Host-observed results are `.ai/runtime/tmp/p1-flow-*-result.json`; the baseline
+failure record is `p1-flow-fast-baseline-result.json`.
+
+```yaml
+outcome: PARTIAL
+affected_planes: [source, storage, api_protocol, runtime_context, session_attachment]
+validation:
+  - plane: source_storage_api_protocol
+    state: PASS
+    evidence_refs: [tests/test_failure_reuse.py, tests/test_memory_fast_extract.py]
+  - plane: session_attachment
+    state: PASS
+    evidence_refs: [tests/test_session_runtime_credentials.py, .ai/runtime/tmp/p1-flow-attachment-tests-result.json]
+  - plane: runtime_context
+    state: PASS
+    evidence_refs: [.ai/runtime/tmp/p1-flow-fast-final-result.json]
+  - plane: live_provider_and_resident_application
+    state: NOT_RUN
+    evidence_refs: []
+  - plane: ui
+    state: NOT_APPLICABLE
+    evidence_refs: []
+  - plane: distribution
+    state: NOT_RUN
+    evidence_refs: []
+residual_risks:
+  - Resident restart permission is pending; live application and provider probe remain unverified.
+  - Automatic capture is limited to reserved governed Memory batch attempts, not every product failure or pre-dispatch Action rejection.
+  - Existing legacy callers must adopt the credential reference contract; the basic UI Run stage button does not choose a Task Frame turn.
+  - Source-only Runtime attachments still need genuine Host currentness and Task Frame authorization before execution.
+  - Research-gap filling, semantic search, automatic retry/patch and verified causal-remedy adoption remain outside this slice.
+changed_paths:
+  - tools/universe_app/session_runtime_credentials.py
+  - tools/universe_app/failure_reuse.py
+  - tools/universe_server.py
+  - tools/memory_fast_extract.py
+  - tests/test_session_runtime_credentials.py
+  - tests/test_failure_reuse.py
+  - tests/test_memory_fast_extract.py
+  - docs/universe-memory-rag.md
+  - docs/failure-reuse-rag.md
+```

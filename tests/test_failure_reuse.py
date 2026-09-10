@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -19,7 +20,7 @@ from universe_memory import (
     normalize_memory_candidate,
     synthesize_memory_candidates,
 )
-from universe_server import UniverseStore, create_server
+from universe_server import UniverseError, UniverseStore, create_server
 from universe_app.failure_reuse import FailureReuseError, normalize_failure_query
 
 
@@ -135,6 +136,60 @@ class FailureKnowledgeContractTests(unittest.TestCase):
 
 
 class FailureReuseHttpTests(unittest.TestCase):
+    def test_failed_attempt_and_recall_snapshot_commit_or_rollback_together(self):
+        store = self.server.store
+        store.reserve_memory_batch_run(
+            run_id="batch-atomic",
+            project_id="TEST",
+            stage="FAST_EXTRACT",
+            config_digest="a" * 64,
+            input_digest="b" * 64,
+            execution={},
+        )
+        original = store.failure_reuse.record_batch_attempt
+
+        def fail_after_evidence(*args):
+            original(*args)
+            raise UniverseError("TEST_ABORT", "rollback fixture")
+
+        with patch.object(
+            store.failure_reuse, "record_batch_attempt", side_effect=fail_after_evidence
+        ):
+            with self.assertRaises(UniverseError):
+                store.fail_memory_batch_run(
+                    "batch-atomic",
+                    status="FAILED",
+                    reason="WORKER_PROVIDER_FAILED",
+                    execution={},
+                )
+        self.assertEqual(
+            "RUNNING", store.get_memory_batch_run("batch-atomic")["status"]
+        )
+        self.assertEqual(
+            [], store.failure_reuse_batch_attempts("TEST", "batch-atomic")["attempts"]
+        )
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(
+                executor.map(
+                    lambda _: store.fail_memory_batch_run(
+                        "batch-atomic",
+                        status="FAILED",
+                        reason="WORKER_PROVIDER_FAILED",
+                        execution={},
+                    ),
+                    range(4),
+                )
+            )
+        history = store.failure_reuse_batch_attempts("TEST", "batch-atomic")
+        self.assertEqual(1, len(history["attempts"]))
+        self.assertEqual(
+            "FAILURE_EVIDENCE_NOT_FOUND",
+            history["attempts"][0]["failure_recall"]["status"],
+        )
+        with self.assertRaises(UniverseError) as caught:
+            store.failure_reuse_batch_attempts("OTHER", "batch-atomic")
+        self.assertEqual(404, caught.exception.status)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

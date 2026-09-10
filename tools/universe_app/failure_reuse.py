@@ -274,6 +274,15 @@ class FailureReuseService:
     @staticmethod
     def initialize(connection: Any) -> None:
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS memory_batch_attempt_evidence (
+                project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
+                run_id TEXT NOT NULL REFERENCES memory_batch_run(run_id) ON DELETE CASCADE,
+                attempt INTEGER NOT NULL CHECK(attempt > 0),
+                evidence_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, attempt)
+            )
+        """)
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS failure_reuse_observation (
                 project_id TEXT NOT NULL REFERENCES project_connection(project_id) ON DELETE CASCADE,
                 reuse_ref TEXT NOT NULL,
@@ -376,6 +385,119 @@ class FailureReuseService:
         }
         result["retrieval_digest"] = digest(result)
         return result
+
+    def record_batch_attempt(
+        self, connection: Any, result: Mapping[str, Any], now: str
+    ) -> dict[str, Any]:
+        """Persist with the run transition; a retry is not proof a remedy was used."""
+        project_id, run_id = result["project_id"], result["run_id"]
+        attempt, status = result.get("attempt", 1), result["status"]
+        if status not in {"FAILED", "COMPLETED"}:
+            raise FailureReuseError(
+                "FAILURE_ATTEMPT_STATE_INVALID", "terminal batch state required"
+            )
+        existing = connection.execute(
+            "SELECT evidence_json FROM memory_batch_attempt_evidence WHERE run_id = ? AND attempt = ?",
+            (run_id, attempt),
+        ).fetchone()
+        if existing is not None:
+            evidence = json.loads(existing["evidence_json"])
+            if evidence["status"] != status:
+                raise FailureReuseError(
+                    "FAILURE_ATTEMPT_CONFLICT",
+                    "attempt already has another terminal state",
+                    409,
+                )
+            return evidence
+        source_ref = f"universe://projects/{project_id}/memory-batches/{run_id}/attempts/{attempt}"
+        execution = result.get("execution") or {}
+        evidence = {
+            "schema": "universe.memory-batch-attempt-evidence.v1",
+            "project_id": project_id,
+            "run_id": run_id,
+            "attempt": attempt,
+            "status": status,
+            "source_ref": source_ref,
+            "recorded_at": now,
+            "validation": {
+                "plane": "memory_batch_operation",
+                "status": "PASS" if status == "COMPLETED" else "FAIL",
+            },
+            "remedy_application": "UNKNOWN",
+            "cause_resolution": "UNKNOWN",
+            "effects": {
+                "automatic_retry": False,
+                "automatic_patch": False,
+                "canonical_adoption": False,
+            },
+        }
+        if result.get("retry_failure_recall") is not None:
+            evidence["retry_failure_recall"] = result["retry_failure_recall"]
+            evidence["candidate_use_basis"] = "CONTEXT_PREPARED_NOT_PROVEN_APPLIED"
+        if status == "FAILED":
+            code = str(
+                execution.get("error_code")
+                or (result.get("failure") or {}).get("reason")
+                or "UNKNOWN"
+            )
+            if not KEY.fullmatch(code):
+                code = "UNKNOWN"
+            query = {
+                "component": "memory_batch",
+                "operation": str(result["stage"]).lower(),
+                "error_code": code,
+                "context": {"execution_plane": "governed_task_frame"},
+            }
+            # Do not derive a cause key from an error code, nor create knowledge
+            # claiming an unobserved remedy. Matching remains review-only.
+            evidence["failure_recall"] = self.query(project_id, query)
+        previous = connection.execute(
+            "SELECT evidence_json FROM memory_batch_attempt_evidence WHERE run_id = ? AND attempt < ? ORDER BY attempt DESC LIMIT 1",
+            (run_id, attempt),
+        ).fetchone()
+        if previous is not None:
+            prior = json.loads(previous["evidence_json"])
+            evidence["previous_attempt_ref"] = prior["source_ref"]
+            evidence["previous_failure_candidates"] = [
+                {key: hit[key] for key in ("candidate_id", "candidate_digest")}
+                for hit in prior.get("failure_recall", {}).get("matches", [])
+            ]
+            evidence.setdefault("candidate_use_basis", "SURFACED_NOT_PROVEN_USED")
+        connection.execute(
+            "INSERT INTO memory_batch_attempt_evidence(project_id, run_id, attempt, evidence_json) VALUES (?, ?, ?, ?)",
+            (project_id, run_id, attempt, canonical(evidence)),
+        )
+        return evidence
+
+    def batch_attempts(self, project_id: str, run_id: Any) -> dict[str, Any]:
+        project_id = self.store.get_project(project_id)["project_id"]
+        run_id = _text(run_id, maximum=128)
+        with self.store._connection() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM memory_batch_run WHERE project_id = ? AND run_id = ?",
+                    (project_id, run_id),
+                ).fetchone()
+                is None
+            ):
+                raise FailureReuseError(
+                    "FAILURE_ATTEMPT_RUN_NOT_FOUND",
+                    "batch run not found in this project",
+                    404,
+                )
+            rows = connection.execute(
+                "SELECT evidence_json FROM memory_batch_attempt_evidence WHERE project_id = ? AND run_id = ? ORDER BY attempt DESC LIMIT 21",
+                (project_id, run_id),
+            ).fetchall()
+        return {
+            "schema": "universe.memory-batch-attempt-history.v1",
+            "project_id": project_id,
+            "run_id": run_id,
+            "attempts": [json.loads(row["evidence_json"]) for row in rows[:20]],
+            "truncated": len(rows) > 20,
+            "limit": 20,
+            "policy": "OBSERVED_NOT_PROMOTED",
+        }
 
     def observations(self, project_id: str, candidate_id: Any) -> dict[str, Any]:
         project_id = self.store.get_project(project_id)["project_id"]

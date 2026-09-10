@@ -138,6 +138,9 @@ from project_master_host import (
 from seed import DEFAULT_DATABASE as OFFICIAL_SEED_DATABASE
 from seed import SeedError, suggest_paths
 from universe_app.failure_reuse import FailureReuseError, FailureReuseService
+from universe_app.session_runtime_credentials import (
+    resolve_session_runtime_connection, runtime_credential_ref,
+)
 from universe_memory import (
     MEMORY_BATCH_CONFIG_SCHEMA,
     MEMORY_BATCH_RUN_SCHEMA,
@@ -9025,22 +9028,20 @@ class UniverseStore:
         reason: str,
         execution: Mapping[str, Any],
     ) -> dict[str, Any]:
-        current = self.get_memory_batch_run(run_id)
-        if current is None:
-            raise UniverseError(
-                "MEMORY_BATCH_RUN_UNAVAILABLE", "memory batch run does not exist"
-            )
-        result = {
-            **current["result"],
-            "status": status,
-            "execution": dict(execution),
-            "failure": {
-                "code": _required_text(status, "status"),
-                "reason": _required_text(str(reason)[:256], "reason"),
-            },
-        }
         now = utc_now()
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT result_json, status FROM memory_batch_run WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise UniverseError("MEMORY_BATCH_RUN_UNAVAILABLE", "memory batch run does not exist")
+            if row["status"] != "RUNNING":
+                return self.get_memory_batch_run(run_id)
+            result = {
+                **json.loads(row["result_json"]), "status": status, "execution": dict(execution),
+                "failure": {"code": _required_text(status, "status"),
+                            "reason": _required_text(str(reason)[:256], "reason")},
+            }
+            result["attempt_evidence"] = self.failure_reuse.record_batch_attempt(connection, result, now)
             connection.execute(
                 """
                 UPDATE memory_batch_run
@@ -9049,13 +9050,14 @@ class UniverseStore:
                 """,
                 (status, _canonical_json(result), now, run_id),
             )
-        return self.get_memory_batch_run(run_id) or current
+        return self.get_memory_batch_run(run_id)
 
     def retry_memory_batch_run(
         self,
         run_id: str,
         *,
         execution: Mapping[str, Any],
+        failure_recall: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         current = self.get_memory_batch_run(run_id)
         if current is None or current["status"] != "FAILED":
@@ -9074,6 +9076,9 @@ class UniverseStore:
             "execution": dict(execution),
         }
         result.pop("failure", None)
+        result.pop("attempt_evidence", None)
+        if failure_recall is not None:
+            result["retry_failure_recall"] = dict(failure_recall)
         with self._connection() as connection:
             cursor = connection.execute(
                 """
@@ -9132,6 +9137,7 @@ class UniverseStore:
         observation_rows: list[dict[str, Any]] = []
         created_count = 0
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             run = connection.execute(
                 "SELECT status, started_at, result_json FROM memory_batch_run WHERE run_id = ?",
                 (run_id,),
@@ -9370,6 +9376,9 @@ class UniverseStore:
                     "observation_count": len(observation_rows),
                 },
             }
+            if "retry_failure_recall" in previous_result:
+                result["retry_failure_recall"] = previous_result["retry_failure_recall"]
+            result["attempt_evidence"] = self.failure_reuse.record_batch_attempt(connection, result, now)
             connection.execute(
                 """
                 UPDATE memory_batch_run
@@ -14893,6 +14902,12 @@ class UniverseStore:
     def failure_reuse_observations(self, project_id: str, candidate_id: Any) -> dict[str, Any]:
         try:
             return self.failure_reuse.observations(project_id, candidate_id)
+        except FailureReuseError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def failure_reuse_batch_attempts(self, project_id: str, run_id: Any) -> dict[str, Any]:
+        try:
+            return self.failure_reuse.batch_attempts(project_id, run_id)
         except FailureReuseError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
 
@@ -29287,7 +29302,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "runtime_currentness_observation"
             ),
             "binding_evidence_ref": binding.get("binding_evidence_ref"),
+            "credential_ref": runtime_credential_ref(binding),
         }
+
+    def resolve_attached_runtime_connection(
+        self, project_id: str, request: Mapping[str, Any]
+    ) -> dict[str, str]:
+        session_id = _required_text(request.get("session_id"), "session_id")
+        try:
+            session = self.session_supervisor.get_session(session_id)
+        except SessionSupervisorError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+        with self._session_runtime_lock:
+            return resolve_session_runtime_connection(
+                project_id=self.store.get_project(project_id)["project_id"],
+                session=session,
+                binding=self._session_runtime_bindings.get(session_id),
+                session_anchor_ref=request.get("session_anchor_ref"),
+                credential_ref=request.get("credential_ref"),
+            )
 
     def _ensure_conductor_planning_runtime(self) -> dict[str, Any] | None:
         """Lazily attach the runtime required by the Conductor room worker."""
@@ -36236,7 +36269,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
 
         try:
-            runtime_binding = normalize_runtime_binding(value.get("runtime_binding"))
+            public_binding = _exact_object_fields(
+                value.get("runtime_binding"), field="runtime_binding",
+                required=frozenset({"task_frame_ref", "session_id", "session_anchor_ref",
+                                    "frame_id", "turn_id", "invoker_actor_ref", "credential_ref"}),
+            )
+            transport = self.resolve_attached_runtime_connection(project_id, public_binding)
+            runtime_binding = normalize_runtime_binding({
+                **{key: item for key, item in public_binding.items()
+                   if key not in {"credential_ref", "session_anchor_ref"}},
+                **transport,
+            })
             if "activity_batches" in value:
                 raise FastExtractError(
                     "FAST_EXTRACT_ACTIVITY_PROVENANCE_REQUIRED",
@@ -36283,6 +36326,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         with self.memory_batch_execution_lock:
             retry_existing = False
+            retry_failure_recall = None
             existing = self.store.get_memory_batch_run(run_id)
             if existing is not None:
                 if existing["status"] == "RUNNING":
@@ -36293,6 +36337,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 if existing["status"] == "FAILED":
                     retry_existing = True
+                    previous_recall = (existing["result"].get("attempt_evidence") or {}).get("failure_recall")
+                    if previous_recall:
+                        # Recheck review state/relations before surfacing evidence
+                        # to a new attempt; the original failure snapshot is immutable.
+                        retry_failure_recall = self.store.recall_failure_evidence(
+                            project_id, previous_recall["query"]
+                        )
                 else:
                     return {
                         "schema": API_SCHEMA,
@@ -36341,6 +36392,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.store.retry_memory_batch_run(
                     run_id,
                     execution=execution_pending,
+                    failure_recall=retry_failure_recall,
                 )
             else:
                 self.store.reserve_memory_batch_run(
@@ -36361,6 +36413,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     invocation_id=run_id,
                     config_digest=config_digest,
                     skill_binding_digest=binding_digest,
+                    failure_recall=retry_failure_recall,
                 )
                 capability = getattr(self.runtime_host, "provider_capability", None)
                 if callable(capability):
@@ -42649,6 +42702,14 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/failure-reuse/batch-attempts":
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    self._send(HTTPStatus.OK, self.server.store.failure_reuse_batch_attempts(
+                        project_id, (query.get("run_id") or [None])[0]))
+                except UniverseError as error:
+                    self._send_error(error)
+                return
             if suffix == "/failure-reuse/observations":
                 query = parse_qs(urlsplit(self.path).query)
                 try:
@@ -46647,6 +46708,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memory-candidates",
             "/failure-reuse/query",
             "/failure-reuse/observations",
+            "/failure-reuse/batch-attempts",
             "/memories/propose-links",
             "/memories/maintain",
             "/memories/link",

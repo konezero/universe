@@ -165,7 +165,16 @@ decisions cannot bypass the Action boundary.
 `POST /v1/projects/{project_id}/memory-batches/run` accepts a `FAST_EXTRACT`
 request only when the stored configuration resolves to the exact Codex
 `gpt-5.6-luna`/`MAX` ceiling. The request supplies registered `source_ids` and
-a loopback Runtime binding to one READY Task Frame turn. It cannot assert a
+a secret-free reference to an existing Host-owned session Runtime attachment
+and one READY Task Frame turn. As of the 2026-09-11 follow-up, `runtime_binding`
+contains `session_id`, `session_anchor_ref`, `credential_ref`, `task_frame_ref`,
+`frame_id`, `turn_id`, and `invoker_actor_ref`; `task_frame_ref` must equal
+`frame_id`. Read `credential_ref` from the session-start attachment result.
+The server checks the current live session, project, anchor and exact attachment,
+then resolves its transient endpoint/token internally. No global Conductor
+binding fallback or new attachment is created by a batch request. Old callers
+that send `runtime_binding.token` must migrate; that wire shape remains rejected
+by the Action credential gate. The request cannot assert a
 claim, Worker identity, Worker run, or result receipt. The Host dispatcher owns
 capability planning, claim, ephemeral Worker creation, and terminal result
 recording. The session observer owns a durable per-source byte offset and event
@@ -203,6 +212,20 @@ SkillRunObservation, and run completion share one SQLite transaction. Provider
 request credentials and semantic excerpts remain transient, and persisted
 execution records contain only bounded model, Worker, Task Frame, receipt,
 digest, attempt, and status references.
+
+Failed governed attempts now trigger review-only failure recall using
+`component=memory_batch`, `operation=fast_extract`, the reported error code and
+`execution_plane=governed_task_frame`. Before an explicitly requested retry,
+recall is refreshed against current candidate review states and added to the
+Worker context as reference material, not extraction source or authority.
+The append-only attempt evidence and terminal run transition share one SQLite
+transaction, preserving the original failure after a retry succeeds.
+`GET /v1/projects/{project_id}/failure-reuse/batch-attempts?run_id=...` returns
+the latest 20 immutable attempt records and a truncation flag. Existing historical
+runs are not retroactively fabricated into attempt records.
+Successful retry means the batch operation completed; remedy application and
+causal resolution remain `UNKNOWN` until separately evidenced. This flow neither
+auto-retries nor auto-patches. See [failure-reuse-rag.md](failure-reuse-rag.md).
 
 The integration suite exercises the real Universe Runtime Host and dispatcher
 with a fake provider process. A billable live Codex/Luna extraction over a

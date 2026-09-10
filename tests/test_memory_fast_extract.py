@@ -142,7 +142,9 @@ class FastExtractDispatcher(RuntimeWorkerDispatcher):
 
 
 class FastExtractContractTests(unittest.TestCase):
-    def test_activity_projection_rejects_raw_transcript_and_provider_input_is_redacted(self) -> None:
+    def test_activity_projection_rejects_raw_transcript_and_provider_input_is_redacted(
+        self,
+    ) -> None:
         batch = redact_activity_batch(
             {
                 "source": {
@@ -173,13 +175,15 @@ class FastExtractContractTests(unittest.TestCase):
                     "ordinal": 2,
                     "role": "USER",
                     "text": "Use a review-only candidate before publishing memory.",
-                    "text_digest": __import__("hashlib").sha256(
+                    "text_digest": __import__("hashlib")
+                    .sha256(
                         json.dumps(
                             "Use a review-only candidate before publishing memory.",
                             sort_keys=True,
                             separators=(",", ":"),
                         ).encode("utf-8")
-                    ).hexdigest(),
+                    )
+                    .hexdigest(),
                 }
             ],
             runtime_binding={
@@ -292,6 +296,77 @@ class FastExtractContractTests(unittest.TestCase):
 
 
 class FastExtractServerTests(unittest.TestCase):
+    def attached_binding(self, session_id, frame_id, token):
+        session, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": session_id,
+                "node": "TEST",
+                "project_id": "TEST",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "provider-" + session_id,
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        class FixtureRuntime:
+            def __init__(self, _root, _session):
+                pass
+
+            def start(self):
+                return {
+                    "endpoint": "http://127.0.0.1:17777",
+                    "token": token,
+                    "session_id": session_id,
+                    "origin_anchor_ref": session["session_anchor_ref"],
+                    "origin_frame_id": "current",
+                    "runtime_currentness_observation": "CURRENT",
+                    "binding_evidence_ref": "test-fixture://attachment/" + session_id,
+                }
+
+            def stop(self):
+                pass
+
+        self.server._session_runtime_factory = FixtureRuntime
+        attachment = self.server.ensure_session_runtime_attachment(session)
+        return {
+            "task_frame_ref": frame_id,
+            "frame_id": frame_id,
+            "session_id": session_id,
+            "session_anchor_ref": attachment["session_anchor_ref"],
+            "credential_ref": attachment["credential_ref"],
+            "turn_id": "/root/boss/sub1",
+            "invoker_actor_ref": "/root/boss",
+        }
+
+    def test_runtime_reference_rejects_inline_secret_stale_ref_and_wrong_anchor(self):
+        self.configure()
+        binding = self.attached_binding(
+            "session-credentials", "frame-credentials", "must-not-leak"
+        )
+        for extra, expected in (
+            ({"token": "must-not-leak"}, "ACTION_CREDENTIAL_REF_ONLY"),
+            ({"credential_ref": "wrong-reference"}, "RUNTIME_CREDENTIAL_REF_INVALID"),
+            (
+                {"session_anchor_ref": "wrong-anchor"},
+                "RUNTIME_CREDENTIAL_ATTACHMENT_STALE",
+            ),
+        ):
+            status, result = self.request(
+                "POST",
+                "/v1/projects/TEST/memory-batches/run",
+                {
+                    "stage": "FAST_EXTRACT",
+                    "source_ids": ["unused"],
+                    "runtime_binding": {**binding, **extra},
+                },
+            )
+            self.assertIn(status, {400, 409}, result)
+            self.assertEqual(expected, result["error_code"])
+            self.assertNotIn("must-not-leak", json.dumps(result))
+        self.assertEqual([], self.dispatcher.calls)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -316,7 +391,9 @@ class FastExtractServerTests(unittest.TestCase):
         )
         self.thread.start()
         (root / "TEST").mkdir()
-        (root / "TEST" / "REPOSITORY_MANIFEST.md").write_text("# TEST\n", encoding="utf-8")
+        (root / "TEST" / "REPOSITORY_MANIFEST.md").write_text(
+            "# TEST\n", encoding="utf-8"
+        )
         self.server.store.register_project(
             {"project_id": "TEST", "project_root": str(root / "TEST")}
         )
@@ -366,7 +443,9 @@ class FastExtractServerTests(unittest.TestCase):
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = Request(self.endpoint + path, data=data, headers=headers, method=method)
+        request = Request(
+            self.endpoint + path, data=data, headers=headers, method=method
+        )
         try:
             with urlopen(request, timeout=10) as response:
                 return int(response.status), json.loads(response.read().decode("utf-8"))
@@ -392,7 +471,9 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("AVAILABLE", result["config"]["resolution"]["status"])
 
-    def test_codex_activity_to_fast_extract_candidate_and_bench_is_idempotent(self) -> None:
+    def test_codex_activity_to_fast_extract_candidate_and_bench_is_idempotent(
+        self,
+    ) -> None:
         status, registered = self.request(
             "POST",
             "/v1/session-observer/sources",
@@ -426,15 +507,9 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertNotIn("secret transcript", json.dumps(activities).lower())
 
         self.configure()
-        runtime_binding = {
-            "task_frame_ref": "frame-1",
-            "session_id": "session-1",
-            "frame_id": "frame-1",
-            "turn_id": "/root/boss/sub1",
-            "endpoint": "http://127.0.0.1:17777",
-            "token": "transient-task-frame-token",
-            "invoker_actor_ref": "/root/boss",
-        }
+        runtime_binding = self.attached_binding(
+            "session-1", "frame-1", "transient-task-frame-token"
+        )
         run_body = {
             "stage": "FAST_EXTRACT",
             "source_ids": ["source-1"],
@@ -486,7 +561,9 @@ class FastExtractServerTests(unittest.TestCase):
             f"provider://CODEX/model/{FAST_EXTRACT_MODEL}", observation["model_ref"]
         )
         self.assertEqual("SUCCEEDED", observation["outcome"])
-        self.assertEqual("TASK_FRAME_WORKER", observation["execution_context"]["worker_role"])
+        self.assertEqual(
+            "TASK_FRAME_WORKER", observation["execution_context"]["worker_role"]
+        )
         self.assertEqual(
             completed["execution"]["evidence_refs"], observation["evidence_refs"]
         )
@@ -521,6 +598,12 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertEqual(1, len(self.dispatcher.calls))
 
     def test_failed_fast_extract_run_can_retry_same_input_once(self) -> None:
+        self._exercise_retry(reject_before_retry=False)
+
+    def test_ignored_failure_candidate_is_not_in_retry_context(self) -> None:
+        self._exercise_retry(reject_before_retry=True)
+
+    def _exercise_retry(self, *, reject_before_retry: bool) -> None:
         status, _registered = self.request(
             "POST",
             "/v1/session-observer/sources",
@@ -542,17 +625,50 @@ class FastExtractServerTests(unittest.TestCase):
         run_body = {
             "stage": "FAST_EXTRACT",
             "source_ids": ["source-retry"],
-            "runtime_binding": {
-                "task_frame_ref": "frame-retry",
-                "session_id": "session-retry",
-                "frame_id": "frame-retry",
-                "turn_id": "/root/boss/sub1",
-                "endpoint": "http://127.0.0.1:17777",
-                "token": "transient-retry-token",
-                "invoker_actor_ref": "/root/boss",
-            },
+            "runtime_binding": self.attached_binding(
+                "session-retry", "frame-retry", "transient-retry-token"
+            ),
         }
         self.dispatcher.fail_once = True
+        failure_candidate = json.loads(
+            (ROOT / "docs/examples/goal-completion-failure.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        failure_candidate["summary"] = (
+            "Fixture-only transient Worker failure; retry after the adapter recovers."
+        )
+        failure_candidate["failure"].update(
+            failure_ref="fixture-worker-failure",
+            component="memory_batch",
+            operation="fast_extract",
+            error_code="WORKER_PROVIDER_FAILED",
+            symptom="The test Worker adapter failed its first invocation.",
+            cause={
+                "key": "fixture-transient-adapter",
+                "summary": "Injected first-attempt failure in the test adapter.",
+                "state": "CONFIRMED",
+            },
+            remedy={
+                "summary": "Retry after the fixture adapter has recovered.",
+                "applicability": {"execution_plane": "governed_task_frame"},
+            },
+            validation=[
+                {
+                    "plane": "fixture",
+                    "status": "PASS",
+                    "evidence_refs": ["test-run://fast-extract/retry-fixture"],
+                }
+            ],
+            limitations=[
+                "A fixture, not a real provider failure or validated production remedy."
+            ],
+            evidence_refs=["test-run://fast-extract/retry-fixture"],
+        )
+        status, saved_candidate = self.request(
+            "POST", "/v1/projects/TEST/memory-candidates", failure_candidate
+        )
+        self.assertEqual(201, status, saved_candidate)
         status, failed = self.request(
             "POST", "/v1/projects/TEST/memory-batches/run", run_body
         )
@@ -561,6 +677,25 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("FAILED", runs["runs"][0]["status"])
         self.assertEqual(1, runs["runs"][0]["result"]["attempt"])
+        first_evidence = runs["runs"][0]["result"]["attempt_evidence"]
+        recalled = first_evidence["failure_recall"]
+        self.assertEqual(
+            saved_candidate["candidate"]["candidate_id"],
+            recalled["matches"][0]["candidate_id"],
+        )
+        self.assertTrue(recalled["matches"][0]["match"]["cause_confirmation_required"])
+        self.assertEqual({}, recalled["matches"][0]["reuse_outcomes"])
+
+        if reject_before_retry:
+            status, ignored = self.request(
+                "POST",
+                "/v1/projects/TEST/memory-candidates/review",
+                {
+                    "candidate_id": saved_candidate["candidate"]["candidate_id"],
+                    "decision": "IGNORE",
+                },
+            )
+            self.assertEqual(200, status, ignored)
 
         status, completed = self.request(
             "POST", "/v1/projects/TEST/memory-batches/run", run_body
@@ -568,6 +703,53 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status, completed)
         self.assertEqual("COMPLETED", completed["run"]["status"])
         self.assertEqual(2, completed["run"]["attempt"])
+        terminal_evidence = completed["run"]["attempt_evidence"]
+        self.assertEqual(
+            first_evidence["source_ref"], terminal_evidence["previous_attempt_ref"]
+        )
+        self.assertEqual("COMPLETED", terminal_evidence["status"])
+        self.assertEqual("UNKNOWN", terminal_evidence["remedy_application"])
+        self.assertEqual("UNKNOWN", terminal_evidence["cause_resolution"])
+        self.assertEqual(
+            "CONTEXT_PREPARED_NOT_PROVEN_APPLIED",
+            terminal_evidence["candidate_use_basis"],
+        )
+        self.assertEqual(
+            terminal_evidence["retry_failure_recall"],
+            self.dispatcher.calls[1]["context_pack"]["failure_reuse"]["recall"],
+        )
+        self.assertEqual(
+            0 if reject_before_retry else 1,
+            len(terminal_evidence["retry_failure_recall"]["matches"]),
+        )
+        status, history = self.request(
+            "GET",
+            "/v1/projects/TEST/failure-reuse/batch-attempts?run_id="
+            + completed["run"]["run_id"],
+        )
+        self.assertEqual(200, status, history)
+        self.assertEqual([terminal_evidence, first_evidence], history["attempts"])
+        # The append-only evidence survives reopening; original failure and
+        # candidate validation are not replaced by the successful retry.
+        from universe_server import UniverseStore
+
+        reopened = UniverseStore(self.server.store.database_path)
+        self.assertEqual(
+            history,
+            reopened.failure_reuse_batch_attempts("TEST", completed["run"]["run_id"]),
+        )
+        replay_status, replay_result = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", run_body
+        )
+        self.assertEqual(200, replay_status, replay_result)
+        self.assertEqual("MEMORY_BATCH_RUN_ALREADY_RECORDED", replay_result["status"])
+        self.assertEqual(2, len(self.dispatcher.calls))
+        status, repeated_history = self.request(
+            "GET",
+            "/v1/projects/TEST/failure-reuse/batch-attempts?run_id="
+            + completed["run"]["run_id"],
+        )
+        self.assertEqual(history, repeated_history)
         self.assertEqual(1, completed["run"]["created_count"])
         status, observations = self.request(
             "GET", "/v1/projects/TEST/skill-observations"
