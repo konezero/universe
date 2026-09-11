@@ -19248,11 +19248,36 @@ class UniverseStore:
         stage: str | None = None,
         kind: str | None = None,
         state: str | None = None,
+        candidate_id: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
+        """List candidates, or fully re-evaluate exactly one by id.
+
+        ``candidate_id`` is a targeted single-item request (the project-scoped
+        equivalent of ``get_memory_candidate``, which has no HTTP route of its
+        own): it fully evaluates ``decision_contract.reopen`` (digest,
+        revision, RAG-adoption check) the same way a fresh review/reopen
+        response does. Without it, every row here stays the cheap
+        ``evaluate_reopen=False`` projection - `reopen.allowed` always reads
+        `false`/`NOT_EVALUATED` regardless of the candidate's real state -
+        because evaluating reopen eligibility for an entire page would cost
+        one extra RAG-adoption lookup per KEEP row. A caller that needs an
+        accurate `reopen` block after a page refresh (not just right after
+        its own review/reopen call) must ask for that one candidate_id.
+        """
+
         normalized_project = _project_id(project_id) if project_id else None
         if normalized_project:
             self.get_project(normalized_project)
+        if candidate_id:
+            candidate = self.get_memory_candidate(candidate_id)
+            if normalized_project and candidate["project_id"] != normalized_project:
+                raise UniverseError(
+                    "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                    "candidate_id does not belong to this project",
+                    HTTPStatus.CONFLICT,
+                )
+            return [candidate]
         clauses: list[str] = []
         params: list[Any] = []
         if normalized_project:
@@ -41939,6 +41964,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             stage=(query.get("stage") or [None])[0],
                             kind=(query.get("kind") or [None])[0],
                             state=(query.get("state") or [None])[0],
+                            candidate_id=(query.get("candidate_id") or [None])[0],
                             limit=limit,
                         ),
                     },
@@ -43205,6 +43231,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                             stage=(query_map.get("stage") or [None])[0],
                             kind=(query_map.get("kind") or [None])[0],
                             state=(query_map.get("state") or [None])[0],
+                            candidate_id=(query_map.get("candidate_id") or [None])[0],
                             limit=limit,
                         ),
                     },

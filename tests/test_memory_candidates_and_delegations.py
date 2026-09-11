@@ -616,6 +616,47 @@ class MemoryCandidateApiTests(unittest.TestCase):
             digest, redecided["candidate"]["decision_contract"]["next_action"]["target_ref"]
         )
 
+    def test_memory_candidate_list_reopen_is_cheap_but_candidate_id_refetch_is_exact(
+        self,
+    ) -> None:
+        """Codex B's integration finding: after a page refresh the UI only has
+        the list endpoint, and a plain list keeps reopen.allowed=false/
+        NOT_EVALUATED for every row (by design, to avoid an adoption lookup
+        per row). ?candidate_id= is the single-item re-evaluation path a
+        refreshed UI must call to get an accurate reopen block."""
+
+        candidate = self._create_memory_kind_candidate()
+        candidate_id = candidate["candidate_id"]
+        status, reviewed = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "IGNORE"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(reviewed["candidate"]["decision_contract"]["reopen"]["allowed"])
+
+        status, listed = self.request(
+            "GET", "/v1/projects/TEST/memory-candidates"
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        listed_row = next(
+            item for item in listed["candidates"] if item["candidate_id"] == candidate_id
+        )
+        self.assertFalse(listed_row["decision_contract"]["reopen"]["allowed"])
+        self.assertEqual(
+            "NOT_EVALUATED", listed_row["decision_contract"]["reopen"]["reason"]
+        )
+
+        status, refetched = self.request(
+            "GET", f"/v1/projects/TEST/memory-candidates?candidate_id={candidate_id}"
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(1, len(refetched["candidates"]))
+        exact = refetched["candidates"][0]
+        self.assertEqual(candidate_id, exact["candidate_id"])
+        self.assertTrue(exact["decision_contract"]["reopen"]["allowed"])
+        self.assertIn("review_history", exact)
+
     def test_memory_batch_action_and_legacy_surface_share_the_run_envelope(self) -> None:
         self.configure("FAST_EXTRACT", dry_run=True)
         activity_batch = {
