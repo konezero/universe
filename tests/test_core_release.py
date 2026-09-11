@@ -285,6 +285,39 @@ class CoreReleaseTests(unittest.TestCase):
             connection.close()
         self.assertEqual(0, governance_rows)
 
+    def test_career_build_records_actual_time_and_canonical_display_name(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        before = datetime.now(timezone.utc)
+        manifest = build_release(
+            source_repo=self.repo, source_ref=self.commit,
+            source_repository="https://github.com/konezero/career.git",
+            database_path=self.database, manifest_path=self.manifest,
+        )
+        after = datetime.now(timezone.utc)
+        built = datetime.fromisoformat(manifest["built_at"])
+        self.assertLessEqual(before, built)
+        self.assertLessEqual(built, after)
+        self.assertEqual("career", manifest["source_repository"])
+        self.assertEqual("career-" + built.astimezone(timezone(timedelta(hours=9))).strftime("%Y%m%d-%H%M%S"), manifest["display_name"])
+        verified = verify_release(database_path=self.database, manifest_path=self.manifest)
+        self.assertEqual(manifest["display_name"], verified["display_name"])
+        self.assertEqual(manifest["built_at"], verified["built_at"])
+        manifest["display_name"] = "career-20000101-000000"
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(CoreReleaseError):
+            verify_release(database_path=self.database, manifest_path=self.manifest)
+
+    def test_new_career_build_rejects_legacy_source_identity(self) -> None:
+        with self.assertRaisesRegex(CoreReleaseError, "Career source root requires"):
+            build_release(source_repo=self.repo / "career", source_ref=self.commit,
+                          source_repository="arbitrary-source", source_tree_root="runtime-source",
+                          database_path=self.database, manifest_path=self.manifest)
+        for source in ("konezero/ai-career", "universe-private"):
+            with self.subTest(source=source), self.assertRaisesRegex(CoreReleaseError, "legacy Career source identity"):
+                build_release(source_repo=self.repo, source_ref=self.commit,
+                              source_repository=source, source_tree_root="runtime-source",
+                              database_path=self.database, manifest_path=self.manifest)
+
     def test_builds_logical_package_from_nested_git_tree(self) -> None:
         source_tree_root = "core/runtime-source"
         nested_root = self.repo / source_tree_root

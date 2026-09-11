@@ -58,17 +58,33 @@ compiler. Work Loop predictions that a user reviews and keeps (`review_state`
 `GOAL`/`PLAN`/`MILESTONE` suggestions become proposal source entries, so a
 Bench- and Experience-backed direction can surface as a reviewable Feature Node
 proposal instead of terminating at the prediction review. `RISK` suggestions are
-recurrence warnings, not product intent, and stay out. Three edges remain:
-newly recorded related Memory and documents do not attach to an already
-materialised Feature Node
-(`todo_memo_document_attach_to_existing_node_v1`); kept predictions are not
-bound to a specific Feature Node as node-derived predicted paths
-(`todo_prediction_paths_bound_to_feature_node_v1`); and prediction-versus-outcome
-calibration - comparing a kept prediction against the Todo/Experience outcome it
-implied and feeding that back as an evidence weight - is not yet built
-(`todo_prediction_versus_outcome_calibration_v1`). Feature Node creation still
-begins from a manual Meeting Room form, and the Goal scheduler deliberately
-stops before Task Frame execution, Todo selection, and result application.
+recurrence warnings, not product intent, and stay out. The following connections exist in source; their remaining work is integration
+and live validation, not greenfield implementation:
+
+- Existing-node evidence: `_feature_attach_candidates` and
+  `accept_feature_node_attach_candidate` propose related Memory/Seed documents
+  and append a selected reference to Feature `evidence_refs`. Memory lookup is
+  limited to 200 records and excludes notes created before the Feature; the
+  combined candidate result is capped at 40. ATTACH is explicit and does not
+  adopt canonical RAG. Historical backfill and the next Planning Context need
+  validation under `todo_memo_document_attach_to_existing_node_v1`.
+- Node-derived paths: `_predicted_expected_paths_for_feature` projects related
+  KEPT prediction evidence into node-local predicted routes. A route projection
+  does not adopt a path or start a Goal. Real-data provenance and node matching
+  remain under `todo_prediction_paths_bound_to_feature_node_v1`.
+- Outcome calibration: `calibrate_work_loop_predictions` persists comparisons
+  against project Todos/Experience and feeds calibration into the next prediction
+  build. Source and HTTP tests cover this path; live downstream attribution and
+  ambiguous matches remain under `todo_prediction_versus_outcome_calibration_v1`.
+- Planning preparation: the existing evidence bundle and meeting-session
+  computation collect context and assign verified sessions. Actual participant
+  input, quota/session loss and retry behavior remain under
+  `todo_node_planning_context_meeting_auto_v1`.
+
+The Goal scheduler still stops before Task Frame execution, Todo selection and
+result application. See [Memory RAG](universe-memory-rag.md),
+[Work Loop contracts](work-loop-prediction.md) and
+[failure reuse](failure-reuse-rag.md) for the respective ownership boundaries.
 
 ## Canonical entities
 
@@ -272,3 +288,25 @@ or validation remains an explicit visible stop state.
 - The semantic graph and UI expose proposal state and evidence count.
 - Stale, conflicted, or superseded evidence is visible and does not silently become authority.
 - Focused storage, API, graph, and UI contract tests pass.
+
+## Implementation reconciliation (2026-09-11)
+
+Evidence: `tools/universe_server.py` functions named above, the live Todo read
+surface (`GET /v1/todos`), and 20 passing tests: all of
+`tests.test_review_inbox_next_work`, `tests.test_work_loop_prediction`, plus
+`UniverseLocalServiceTests.test_new_related_memory_surfaces_as_a_feature_attach_review_item`,
+`test_kept_prediction_is_calibrated_against_realised_todo_outcomes`, and
+`test_propose_predictions_feeds_calibration_back_as_evidence_weight` in
+`tests.test_universe_server`.
+
+These tests establish fixture/storage/HTTP behavior, not resident deployment,
+live provider use or UI completion. The ATTACH test verifies the evidence ref
+and disappearance from candidates; it does not establish next-Planning-Context
+consumption, old-note backfill or concurrent replay behavior.
+
+The older statements that attachment and calibration were absent are superseded
+by the evidence above. Existing Todos already track the remaining slices; keep
+their lifecycle states until their full acceptance conditions are validated.
+When requirements and implementation differ, retain the requirement and record
+the gap in its owning Todo. When evidence is insufficient, record UNKNOWN and
+the missing check instead of treating an implementation hypothesis as fact.

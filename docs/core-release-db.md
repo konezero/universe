@@ -4,13 +4,13 @@ Status: TEST_PROTOTYPE
 
 Career produces an immutable Runtime Release DB. Universe distributes the
 selected release without requiring an attached Project to access the private
-ai-career Git repository. Project attachment and project-facing templates are
+Career Git repository. Project attachment and project-facing templates are
 Universe-owned; the Release DB remains Career-owned.
 
 ## Boundary
 
 ```text
-private ai-career Git objects
+Career Git objects (C:\workspace\career, runtime-source)
   -> Core Release DB build
   -> Universe Release Catalog
   -> approved Project Installer
@@ -31,17 +31,51 @@ the internal payload digest before extraction or installation.
 ```powershell
 $sha = "<immutable-pr-head-sha>"
 python tools/core_release.py build `
-  --source-repo C:\workspace\ai-career `
+  --source-repo C:\workspace\career `
   --source-ref $sha `
   --expected-commit $sha `
-  --source-repository konezero/ai-career `
-  --database dist\releases\ai-career-$($sha.Substring(0, 8)).sqlite3 `
-  --manifest dist\releases\ai-career-$($sha.Substring(0, 8)).manifest.json
+  --source-repository career `
+  --source-tree-root runtime-source `
+  --database dist\releases\career-$($sha.Substring(0, 8)).sqlite3 `
+  --manifest dist\releases\career-$($sha.Substring(0, 8)).manifest.json
 
 python tools/core_release.py verify `
-  --database dist\releases\ai-career-$($sha.Substring(0, 8)).sqlite3 `
-  --manifest dist\releases\ai-career-$($sha.Substring(0, 8)).manifest.json
+  --database dist\releases\career-$($sha.Substring(0, 8)).sqlite3 `
+  --manifest dist\releases\career-$($sha.Substring(0, 8)).manifest.json
 ```
+
+## Release identity and time (2026-09-11)
+
+The canonical local source is `C:\workspace\career`; package files come from
+`runtime-source` at the explicitly pinned commit. New Career builds use
+`source_repository: career`. Supported Career Git URL spellings normalize to
+that identity. Legacy ai-career/universe-private source labels are rejected for
+new Career runtime-source builds; existing immutable artifacts retain their
+original evidence.
+
+`display_name` is `career-YYYYMMDD-HHmmss`, computed from the actual build start
+instant in Korea Standard Time (UTC+09:00). `built_at` stores the UTC timestamp;
+`source_committed_at`, catalog `imported_at`, and project `installed_at` are
+separate events. The display name is not a unique key: same-second builds use
+the full immutable `release_id`. The build timestamp participates in the
+payload identity so separate builds cannot silently reuse a release ID while
+changing manifest bytes.
+
+The catalog API exposes the verified name and build timestamp. The UI shows
+the name first and retains the original source, commit, and immutable ID.
+Historical artifacts without a build timestamp say `build time not recorded`;
+commit/import/install timestamps must not be substituted for missing build time.
+
+Current install evidence is `UNIVERSE_RELEASE_INSTALL.json`. The installer uses
+`DISTRIBUTION_MANIFEST.json` only as a legacy fallback when current install state
+is absent. Old source labels in that historical file are not evidence of the
+currently installed release. Both COPY and LINKED installs now record the
+verified display name, build timestamp, and source repository in current state.
+
+For the same source commit `5b79566`, the earlier `ea6f0ed1ca2a` artifact was
+registered/installed with `konezero/ai-career`, while `962f424c1245` was built with
+the Career Git URL but was absent from the current catalog during diagnosis.
+These are distinct artifacts; do not edit their IDs or audit records in place.
 
 ## Current scope
 

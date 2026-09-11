@@ -387,3 +387,29 @@ POST /v1/settings/service
 - `interval_hours = 0` (default): worker idle (rechecks ~30s)
 - `interval_hours > 0`: runs HEURISTIC maintain for each connected project on that period, applying PROPOSED only
 - UI: Settings → Memory maintain interval (hours)
+
+## Collector coverage and related work (2026-09-11 reconciliation)
+
+`UniverseStore.record_semantic_collection_observation` stores a project/source
+cursor with the latest event id/type, source digest and observation time. Its
+upsert establishes a latest-source coordinate; it is not, by itself, evidence
+of exhaustive collection, ordered event replay, crash recovery or extraction
+coverage across sessions, rooms, Task Frames, files, tests, commits and research.
+The global Collector Todo (`todo_89efd4a14c884386855ae58a391908f4`) retains those
+acceptance checks. Inventory each source -> cursor -> Memory/Bench projection
+before claiming global automation is complete.
+
+| Existing Todo | Owning reference and remaining boundary |
+| --- | --- |
+| `todo_89efd4a14c884386855ae58a391908f4` | This document: collection coverage, lineage and recovery |
+| `todo_c4836d989cab441da55c1309f5545e40` | [Work Loop](work-loop-prediction.md): review inbox -> next work; live UI remains unverified |
+| `todo_memo_document_attach_to_existing_node_v1` | [Memory-to-Feature](memory-to-feature-automation.md): existing ATTACH, historical notes and next Planning Context |
+| `todo_node_planning_context_meeting_auto_v1` | [Memory-to-Feature](memory-to-feature-automation.md): actual meeting input and session/quota/retry checks |
+| `todo_prediction_paths_bound_to_feature_node_v1` | [Memory-to-Feature](memory-to-feature-automation.md): node-bound prediction provenance |
+| `todo_prediction_versus_outcome_calibration_v1` | [Work Loop](work-loop-prediction.md): implemented calibration, live result attribution still to verify |
+| `todo_c272adb801ac45348d0315e36c2d07c6` | [Failure reuse](failure-reuse-rag.md): governed batch capture/recall/retry evidence and separately recorded deployment limits |
+
+The status at the top describes the original product slice, not proof that every
+later addition has been applied to the running service. In particular, consult
+the dated failure-reuse follow-up for its resident/provider NOT_RUN boundary.
+No additional Todo is needed for the gaps above: they already have owners.

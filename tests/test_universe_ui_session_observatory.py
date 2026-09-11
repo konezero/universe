@@ -1239,7 +1239,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("flex-wrap: nowrap;", mobile_tabs_block)
         self.assertIn("overflow-x: auto;", mobile_tabs_block)
 
-    def test_memory_candidate_keep_has_explicit_rag_adoption_action(self) -> None:
+    def test_memory_candidate_review_is_server_driven_and_candidate_bound(self) -> None:
         self.assertIn('async function adoptMemoryCandidate(candidate)', APP)
         self.assertIn('invokeServerAction("rag.adopt", {', APP)
         self.assertIn("expected_candidate_digest: candidate.candidate_digest", APP)
@@ -1247,9 +1247,49 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         review_end = APP.index("function renderMemory()", review_start)
         review = APP[review_start:review_end]
         self.assertIn("KEEP marks a candidate only", review)
-        self.assertIn('candidate.state === "KEEP" && candidate.kind === "MEMORY"', review)
-        self.assertIn('"Adopt to RAG"', review)
+        self.assertIn("candidate.decision_contract", APP)
+        self.assertIn("contract.allowed_actions", APP)
+        self.assertIn("memoryCandidateDecisionContract(candidate).next_action", APP)
+        self.assertIn("reopen.allowed", APP)
+        self.assertIn("reopen.candidate_digest", APP)
+        self.assertIn("reopen.candidate_revision", APP)
+        self.assertIn("expected_candidate_digest", APP)
+        self.assertIn("expected_candidate_revision", APP)
+        self.assertIn("reopen.candidate_revision ?? candidate.revision", APP)
+        self.assertIn("memoryCandidateReviewPayload(candidate, action)", APP)
+        self.assertIn("candidate_id: candidate.candidate_id", APP)
+        self.assertIn("/v1/projects/${encodeURIComponent(", APP)
+        self.assertIn("/memory-candidates/review", APP)
+        self.assertNotIn("/memory-candidates/${encodeURIComponent(candidate.candidate_id)}/review", APP)
+        self.assertIn("/memory-candidates/reopen", APP)
+        self.assertNotIn("/memory-candidates/${encodeURIComponent(candidate.candidate_id)}/reopen", APP)
+        self.assertIn("memoryCandidateFollowUp(result, candidate, decision)", APP)
+        self.assertIn("Review response did not return the clicked candidate", APP)
+        self.assertNotIn(
+            'for (const decision of ["IGNORE", "KEEP", "EXPLORE", "START_PRODUCT_DESIGN"])',
+            review,
+        )
+        self.assertNotIn("review_inbox?.bundles?.[0]", APP)
+        card_start = APP.index("function renderMemoryCandidateCard")
+        card_end = APP.index("function renderMemoryCandidateReview", card_start)
+        card = APP[card_start:card_end]
+        self.assertIn('candidate.state === "KEEP" && candidate.kind === "MEMORY"', card)
+        self.assertIn('"Adopt to RAG"', card)
+        self.assertIn("Knowledge candidates", review)
+        self.assertIn("Idea / hypothesis / product proposals", review)
+        self.assertIn("memoryCandidateReviewOutcomes", APP)
 
+    def test_memory_link_states_are_counted_and_rendered_separately(self) -> None:
+        render_start = APP.index("function renderMemory()")
+        render = APP[render_start:]
+        self.assertIn('item.link_state === "UNLINKED"', render)
+        self.assertIn('item.link_state === "PROPOSED"', render)
+        self.assertIn('item.link_state === "LINKED"', render)
+        self.assertIn("Stored knowledge", render)
+        self.assertIn("Link proposed", render)
+        self.assertIn("Confirm LINKED", render)
+        self.assertIn('node("details", "detail-group memory-batch-config")', APP)
+        self.assertIn(".memory-batch-config > summary", CSS)
     def test_direct_decision_registration_uses_the_action_gateway(self) -> None:
         render_start = APP.index("function renderMemory()")
         render = APP[render_start:]

@@ -36,11 +36,12 @@ const state = {
   memoryBatchConfigs: [],
   memoryBatchRuns: [],
   memoryCandidates: [],
+  memoryCandidateReviewOutcomes: {},
   memoryCandidateFilters: { stage: "", kind: "", state: "REVIEW_REQUIRED" },
   workLoop: null,
   selectedNode: null,
   focusedNodeId: null,
-  view: "universe",
+  view: "work",
   roomMessages: [],
   conductorMessages: [],
   conductorDelegations: [],
@@ -4165,12 +4166,13 @@ function setGraphScale(nextScale) {
 
 /** Graph canvas modes only (not inspector tabs). */
 function showGraphView(view) {
+  closeDocumentHover();
   const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
   restoreBenchPanel();
   restoreProjectPanels();
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
-  if (goalWorkspace) goalWorkspace.hidden = false;
+  if (goalWorkspace) goalWorkspace.hidden = true;
   state.view = view;
   document.body.classList.add("graph-mode");
   // The integrated home owns these; leaving it must clear them.
@@ -4187,6 +4189,9 @@ function showGraphView(view) {
   }
   state.selectedNode = null;
   state.focusedNodeId = null;
+  // Navigation clears object selection; only an explicit selection opens details.
+  state.inspectorDismissed = true;
+  document.body.classList.remove("inspector-open");
   elements.nodeBreadcrumb?.classList.add("hidden");
   syncPrimaryNavSelection(
     ["universe", "semantic"].includes(view) ? "map" : view
@@ -5607,16 +5612,16 @@ function renderReleaseCatalog() {
   for (const release of state.releases) {
     const card = node("article", "release-card");
     card.append(
-      node("strong", "", release.release_id),
+      node("strong", "", release.display_name || `${release.source_repository} (build time not recorded)`),
       node(
         "small",
         "",
-        `${release.source_repository} @ ${release.source_commit.slice(0, 12)}`
+        `Source: ${release.source_repository} @ ${release.source_commit.slice(0, 12)}`
       ),
       node(
         "small",
         "",
-        `DB ${release.database_sha256.slice(0, 16)} / profiles ${
+        `ID ${release.release_id} / DB ${release.database_sha256.slice(0, 16)} / profiles ${
           release.profile_catalog.status
         }`
       )
@@ -5733,7 +5738,7 @@ async function repinReleaseFleet(releaseId, button = null) {
       node(
         "p",
         "",
-        `${result.applied} applied, ${result.failed} failed → ${releaseId} (${installMode})`
+        `${result.applied} applied, ${result.failed} failed; excluded: ${(result.excluded_project_ids || []).join(", ") || "none"} → ${releaseId} (${installMode})`
       ),
       ...result.results.map((item) =>
         node(
@@ -5808,6 +5813,7 @@ async function selectProject(
   const project = state.projects.find((item) => item.project_id === projectId);
   if (!project) return;
   state.selectedProject = project;
+  state.memoryCandidateReviewOutcomes = {};
   state.selectedNode = null;
   state.focusedNodeId = null;
   state.inspectorDismissed = !revealInspector;
@@ -12523,43 +12529,248 @@ function graphNodeKindLabel(item) {
   return item.kind || "Node";
 }
 
+
+const hoverKnowledgeCache = new Map();
+
+async function loadHoverKnowledge(projectId, refresh = false) {
+  const cached = hoverKnowledgeCache.get(projectId);
+  if (!refresh && cached && Date.now() - cached.time < 15000) return cached.value;
+  const [memories, candidates] = await Promise.all([
+    api(`/v1/projects/${encodeURIComponent(projectId)}/memories`),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`),
+  ]);
+  const value = { memories: memories.memories || [], candidates: candidates.candidates || [] };
+  hoverKnowledgeCache.set(projectId, { time: Date.now(), value });
+  return value;
+}
+
+function adoptedMemoryForCandidate(candidate, memories) {
+  const origin = `universe://memory-candidates/${candidate.candidate_digest}/${encodeURIComponent(candidate.candidate_id)}`;
+  return memories.find(memory => memory.origin_ref === origin);
+}
+
+function relatedKnowledgeForNode(item, knowledge) {
+  const ids = new Set([item.data?.node_id, item.data?.feature_node_id, item.id].filter(Boolean));
+  const project = item.kind === "project";
+  const memoryId = item.data?.memory_id;
+  const memories = knowledge.memories.filter(memory => memoryId
+    ? memory.memory_id === memoryId
+    : project ? !memory.node_ref : ids.has(memory.node_ref));
+  const candidates = knowledge.candidates.filter(candidate => {
+    if (candidate.kind !== "MEMORY") return false;
+    const adopted = adoptedMemoryForCandidate(candidate, knowledge.memories);
+    if (adopted) return false; // Canonical memory is the single displayed item after adoption.
+    const nodeRef = candidate.node_ref;
+    return project ? !nodeRef : Boolean(nodeRef && ids.has(nodeRef));
+  });
+  return { memories, candidates };
+}
+
+function knowledgeStatus(item, candidate, memories = []) {
+  if (candidate) {
+    if (adoptedMemoryForCandidate(item, memories)) return { label: "RAG adopted", tone: "adopted" };
+    if (item.state === "KEEP") return { label: "KEEP - awaiting RAG adoption", tone: "pending" };
+    if (item.state === "IGNORE") return { label: "Ignored", tone: "muted" };
+    return { label: item.state === "REVIEW_REQUIRED" ? "Review pending" : item.state || "Unknown", tone: "pending" };
+  }
+  return { label: String(item.origin_ref || "").startsWith("universe://memory-candidates/") ? "RAG adopted" : "Stored memory", tone: "adopted" };
+}
+
+function memoryLinkLabel(memory) {
+  return ({ LINKED: "Link confirmed", PROPOSED: "Link proposed", UNLINKED: "Unlinked" })[memory.link_state] || "Unlinked";
+}
+
+async function appendHoverKnowledge(tip, hovered, key) {
+  const projectId = hovered.projectId || hovered.data?.project_id || state.selectedProject?.project_id;
+  if (!projectId || hovered.kind === "document" || hovered.kind === "universe") return;
+  const section = node("div", "hover-memory-section", "Loading memories...");
+  tip.append(section);
+  try {
+    const knowledge = await loadHoverKnowledge(projectId);
+    if (documentHoverKey !== key || !section.isConnected) return;
+    section.replaceChildren(node("small", "", "MEMORIES"));
+    const related = relatedKnowledgeForNode(hovered, knowledge);
+    if (!related.memories.length && !related.candidates.length) section.append(node("p", "empty-copy", "No linked memories"));
+    for (const [item, candidate] of [...related.memories.map(item => [item, false]), ...related.candidates.map(item => [item, true])]) {
+      const link = node("a", "document-hover-link memory-hover-link");
+      link.href = `#memory:${encodeURIComponent(projectId)}:${encodeURIComponent(item.memory_id || item.candidate_id)}`;
+      const status = knowledgeStatus(item, candidate, knowledge.memories);
+      link.append(node("span", "", item.title || item.summary || "Memory"), node("small", `knowledge-badge ${status.tone}`, status.label), node("small", `knowledge-badge ${item.link_state === "PROPOSED" ? "pending" : "muted"}`, candidate ? "Unlinked candidate" : memoryLinkLabel(item)));
+      link.addEventListener("click", event => { event.preventDefault(); openHoverMemory(projectId, item, candidate); });
+      section.append(link);
+    }
+    if (knowledge.candidates.length >= 200) section.append(node("small", "", "Showing up to 200 review candidates"));
+    const wrap = elements.canvas.parentElement.getBoundingClientRect();
+    tip.style.top = `${Math.max(8, Math.min(parseFloat(tip.style.top) || 8, wrap.height - tip.offsetHeight - 8))}px`;
+  } catch (error) {
+    if (documentHoverKey === key && section.isConnected) section.textContent = error.message;
+  }
+}
+
+async function openHoverMemory(projectId, initial, isCandidate) {
+  closeDocumentHover();
+  const dialog = node("dialog", "document-reader memory-reader");
+  const title = node("h2", "", "Memory");
+  title.id = "memory-reader-title";
+  dialog.setAttribute("aria-labelledby", title.id);
+  const close = node("button", "", "Close");
+  close.onclick = () => dialog.close();
+  const header = node("header", "document-reader-header");
+  header.append(title, close);
+  const content = node("div", "document-reader-body", "Loading memory...");
+  dialog.append(header, content);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  let candidate = isCandidate ? initial : null;
+  let memory = isCandidate ? null : initial;
+  let busy = false;
+  async function refresh() {
+    const knowledge = await loadHoverKnowledge(projectId, true);
+    if (candidate) {
+      const latest = await api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?candidate_id=${encodeURIComponent(candidate.candidate_id)}`);
+      const current = (latest.candidates || []).find(item => item.candidate_id === candidate.candidate_id && item.project_id === projectId);
+      if (!current) throw new Error("Candidate is no longer available in this project");
+      candidate = current;
+      memory = adoptedMemoryForCandidate(candidate, knowledge.memories) || null;
+    } else {
+      memory = knowledge.memories.find(item => item.memory_id === initial.memory_id);
+      if (!memory) throw new Error("Memory is no longer available in this project");
+    }
+    if (!dialog.isConnected) return;
+    content.replaceChildren();
+    title.textContent = memory?.title || "Memory candidate";
+    const status = knowledgeStatus(memory || candidate, !memory, knowledge.memories);
+    content.append(node("p", `knowledge-badge ${status.tone}`, `${status.label} / ${memory ? memoryLinkLabel(memory) : "Unlinked candidate"}`));
+    content.append(markdownBody(memory?.body || candidate?.summary || "No content"));
+    if (candidate && !memory) content.append(node("small", "", "Candidate summary; source conversation is not stored here."));
+    const actions = node("div", "memory-candidate-actions");
+    content.append(actions);
+    const run = async (button, execute) => {
+      if (busy) return;
+      busy = true;
+      for (const control of actions.querySelectorAll("button")) control.disabled = true;
+      try {
+        const result = await execute();
+        if (result.candidate && (result.candidate.candidate_id !== candidate?.candidate_id || result.candidate.project_id !== projectId)) throw new Error("Candidate response does not match this project and item");
+        if (result.candidate) candidate = result.candidate;
+        if (result.memory && result.memory.project_id !== projectId) throw new Error("Memory response does not match this project");
+        hoverKnowledgeCache.delete(projectId);
+        await refresh();
+        toast(result.status || "Recorded");
+      } catch (error) {
+        content.append(node("p", "memory-action-error", error.message));
+        for (const control of actions.querySelectorAll("button")) control.disabled = false;
+      } finally { busy = false; }
+    };
+    if (candidate && !memory) {
+      for (const action of memoryCandidateActionSpecs(candidate).filter(action => ["KEEP", "IGNORE"].includes(action.id))) {
+        const button = node("button", "secondary-button compact-action", action.id === "KEEP" ? "KEEP" : "Ignore");
+        button.onclick = () => run(button, () => api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates/review`, { method: "POST", body: memoryCandidateReviewPayload(candidate, action) }));
+        actions.append(button);
+      }
+      if (memoryCandidateNextAction(candidate).kind === "RAG_ADOPT_AVAILABLE" && candidate.kind === "MEMORY" && candidate.state === "KEEP") {
+        const button = node("button", "primary-button compact-action", "Adopt to RAG");
+        button.onclick = () => run(button, () => invokeServerAction("rag.adopt", { candidate_id: candidate.candidate_id, expected_candidate_digest: candidate.candidate_digest }));
+        actions.append(button);
+      }
+    }
+  }
+  try { await refresh(); } catch (error) { if (dialog.isConnected) content.textContent = error.message; }
+}
+
+let documentHoverTimer = null;
+let documentHoverKey = null;
+
+function closeDocumentHover() {
+  clearTimeout(documentHoverTimer);
+  documentHoverKey = null;
+  elements.graphTooltip?.classList.add("hidden");
+  elements.canvas?.classList.remove("is-hovering-node");
+}
+
+function relatedDocumentsForNode(item) {
+  const projectId = item?.projectId || item?.data?.project_id || state.selectedProject?.project_id;
+  const projection = projectionForProject(projectId);
+  const documents = projection?.documents || [];
+  if (!item || !projectId || (projection?.project_id && projection.project_id !== projectId)) return { projectId, documents: [] };
+  if (item.kind === "project") return { projectId, documents: documents.filter(doc => doc.project_wide || !doc.node_ids?.length) };
+  if (item.kind === "document") return { projectId, documents: documents.filter(doc => doc.document_id === item.data?.document_id) };
+  const ids = new Set([item.data?.node_id, item.data?.feature_node_id, item.id].filter(Boolean));
+  return { projectId, documents: documents.filter(doc => doc.node_ids?.some(id => ids.has(id))) };
+}
+
+async function openDocumentReader(projectId, item) {
+  closeDocumentHover();
+  const dialog = node("dialog", "document-reader");
+  const heading = node("h2", "", item.title || item.document_id);
+  heading.id = "document-reader-title";
+  dialog.setAttribute("aria-labelledby", heading.id);
+  const close = node("button", "", "Close");
+  close.addEventListener("click", () => dialog.close());
+  const header = node("header", "document-reader-header");
+  header.append(heading, close);
+  const body = node("div", "document-reader-body", "Loading document...");
+  dialog.append(header, node("code", "document-reader-path", item.path || ""), body);
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
+  try {
+    const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/document-content?document_id=${encodeURIComponent(item.document_id)}`);
+    if (!dialog.isConnected) return;
+    if (result.document.document_id !== item.document_id || result.project_id !== projectId) throw new Error("Document response does not match the requested item");
+    body.replaceChildren();
+    if (result.document.format === "html") {
+      const frame = document.createElement("iframe");
+      frame.title = item.title || "Document content";
+      frame.setAttribute("sandbox", "");
+      frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">` + result.document.content;
+      body.append(frame);
+    } else {
+      body.append(markdownBody(result.document.content));
+    }
+  } catch (error) {
+    if (dialog.isConnected) body.textContent = error.message;
+  }
+}
+
 function updateGraphHoverTooltip(event, hovered) {
   const tip = elements.graphTooltip;
   if (!tip) return;
   if (!hovered) {
-    tip.classList.add("hidden");
-    tip.textContent = "";
-    elements.canvas?.classList.remove("is-hovering-node");
+    if (!documentHoverTimer) documentHoverTimer = setTimeout(() => { documentHoverTimer = null; closeDocumentHover(); }, 220);
     return;
   }
-  elements.canvas?.classList.add("is-hovering-node");
-  const kind = graphNodeKindLabel(hovered);
-  const name = hovered.label || hovered.data?.project_id || hovered.id;
-  tip.replaceChildren();
-  const kindEl = document.createElement("span");
-  kindEl.className = "graph-tooltip-kind";
-  kindEl.textContent = kind;
-  const nameEl = document.createElement("span");
-  nameEl.textContent = name;
-  tip.append(kindEl, nameEl);
-  const work = featureWorkProjection(hovered);
-  if (work) {
-    const progressEl = document.createElement("small");
-    progressEl.textContent = `${work.execution_state} · ${work.todo_done}/${work.todo_total} done · ${work.progress_percent}% · activity ${work.activity_count} · evidence ${work.evidence_count}`;
-    tip.append(progressEl);
+  clearTimeout(documentHoverTimer);
+  documentHoverTimer = null;
+  const { projectId, documents } = relatedDocumentsForNode(hovered);
+  const key = `${projectId}:${hovered.id}`;
+  if (documentHoverKey === key && !tip.classList.contains("hidden")) return;
+  documentHoverKey = key;
+  tip.onpointerenter = () => { clearTimeout(documentHoverTimer); documentHoverTimer = null; };
+  tip.onpointerleave = () => updateGraphHoverTooltip(null, null);
+  tip.onfocusin = tip.onpointerenter;
+  tip.onfocusout = (event) => { if (!tip.contains(event.relatedTarget)) updateGraphHoverTooltip(null, null); };
+  tip.onkeydown = (event) => { if (event.key === "Escape") closeDocumentHover(); };
+  tip.setAttribute("role", "region");
+  tip.setAttribute("aria-label", "Related documents and memories");
+  tip.replaceChildren(node("strong", "", hovered.label || hovered.id));
+  if (!documents.length) tip.append(node("p", "empty-copy", "No linked documents"));
+  for (const item of documents) {
+    const link = node("a", "document-hover-link", `Document: ${item.title || item.document_id}`);
+    link.href = `#document:${encodeURIComponent(projectId)}:${encodeURIComponent(item.document_id)}`;
+    link.title = item.path || item.title;
+    link.addEventListener("click", (event) => { event.preventDefault(); openDocumentReader(projectId, item); });
+    tip.append(link);
   }
   tip.classList.remove("hidden");
-  const wrap = elements.canvas?.parentElement;
-  if (!wrap || !event) return;
-  const wrapRect = wrap.getBoundingClientRect();
-  let left = event.clientX - wrapRect.left;
-  let top = event.clientY - wrapRect.top;
-  // Keep tooltip inside the canvas wrap.
-  const tipWidth = tip.offsetWidth || 120;
-  left = Math.max(tipWidth / 2 + 8, Math.min(wrapRect.width - tipWidth / 2 - 8, left));
-  top = Math.max(28, top);
+  elements.canvas?.classList.add("is-hovering-node");
+  const rect = elements.canvas.parentElement.getBoundingClientRect();
+  const left = Math.max(8, Math.min(rect.width - tip.offsetWidth - 8, event.clientX - rect.left + 12));
+  const top = Math.max(8, Math.min(rect.height - tip.offsetHeight - 8, event.clientY - rect.top + 12));
   tip.style.left = `${left}px`;
   tip.style.top = `${top}px`;
+  appendHoverKnowledge(tip, hovered, key);
 }
 
 function handleGraphPointerHover(event) {
@@ -13261,282 +13472,8 @@ function renderWorkLoopDetails() {
 }
 
 function renderDetails() {
+  document.body.classList.remove("inspector-open");
   elements.details.replaceChildren();
-  const selected = state.selectedNode;
-  if (!state.selectedProject && !selected) {
-    document.body.classList.remove("inspector-open");
-    elements.details.append(
-      node(
-        "p",
-        "empty-copy",
-        "Multiverse map — click Universe hub or a project node"
-      )
-    );
-    return;
-  }
-  // Project / hub selection keeps inspector available unless dismissed.
-  document.body.classList.toggle(
-    "inspector-open",
-    Boolean(state.selectedProject || selected) && !state.inspectorDismissed
-  );
-  const heading = node("div", "detail-group");
-  heading.append(
-    node(
-      "h2",
-      "",
-      selected?.label ||
-        projectDisplayName(state.selectedProject) ||
-        state.selectedProject?.project_id ||
-        "Universe"
-    )
-  );
-  const grid = node("dl", "detail-grid");
-  const data =
-    selected?.data || state.projection?.project || state.selectedProject || {};
-  addDetail(grid, "Type", selected?.kind || "project");
-  addDetail(
-    grid,
-    "State",
-    selected?.kind === "predicted"
-      ? "USER_SELECTION_REQUIRED"
-      : selected?.kind === "setup"
-        ? "PROJECT_RUNTIME_UNINITIALIZED"
-        : "CURRENT"
-  );
-  const featureWork = featureWorkProjection(selected);
-  if (featureWork) {
-    addDetail(grid, "Execution", featureWork.execution_state);
-    addDetail(grid, "Progress", `${featureWork.todo_done}/${featureWork.todo_total} · ${featureWork.progress_percent}%`);
-    addDetail(grid, "Activity", featureWork.activity_count);
-    addDetail(grid, "Evidence", featureWork.evidence_count);
-  }
-  if (data.kind) addDetail(grid, "Kind", data.kind);
-  if (data.role) addDetail(grid, "Role", data.role);
-  if (data.network_role) addDetail(grid, "Network role", data.network_role);
-  if (data.display_name) addDetail(grid, "Display", data.display_name);
-  if (data.note) addDetail(grid, "Note", data.note);
-  if (data.goal) addDetail(grid, "Goal", data.goal);
-  if (data.technologies?.length) addDetail(grid, "Technologies", data.technologies.join(", "));
-  if (data.node_ids?.length) addDetail(grid, "Related to", data.node_ids.join(", "));
-  if (data.path) addDetail(grid, "Path", data.path);
-  if (data.project_root) addDetail(grid, "Root", data.project_root);
-  if (data.project_id) addDetail(grid, "Project id", data.project_id);
-  if (data.symbol) addDetail(grid, "Symbol", data.symbol);
-  if (data.projection_origin === "PROJECT_SEED") {
-    addDetail(grid, "Origin", "Project Seed");
-    if (data.projection_seed_id) addDetail(grid, "Seed", data.projection_seed_id);
-    if (data.projection_source_ref) {
-      addDetail(grid, "Seed source", data.projection_source_ref);
-    }
-    if (data.projection_source_commit) {
-      addDetail(grid, "Source commit", data.projection_source_commit);
-    }
-  }
-  if (
-    selected?.kind === "project" &&
-    state.projection?.source?.commit &&
-    selected?.data?.project_id === state.selectedProject?.project_id
-  ) {
-    addDetail(grid, "Source commit", state.projection.source.commit);
-  }
-  if (selected?.kind === "universe") {
-    addDetail(grid, "Projects", String((state.projects || []).length));
-  }
-  heading.append(grid);
-  elements.details.append(heading);
-
-  // Rooms projected onto this node: a MEETING room whose feature this node is,
-  // or a BOSS room for a Task Frame owned here. Galaxy + inspector share this.
-  const nodeRooms = roomsForSelectedNode(selected);
-  if (nodeRooms.length) {
-    const roomGroup = node("div", "detail-group");
-    roomGroup.append(node("h3", "", `Rooms (${nodeRooms.length})`));
-    for (const room of nodeRooms) {
-      const row = node(
-        "button",
-        "todo-context-open",
-        `${ROOM_TYPE_LABEL[room.room_type] || room.room_type} · ${room.title || room.room_id}`
-      );
-      row.type = "button";
-      row.title = "Open room (observation)";
-      row.addEventListener("click", () =>
-        openRoomObservation(room.room_id).catch((error) => toast(error.message, true))
-      );
-      roomGroup.append(row);
-    }
-    elements.details.append(roomGroup);
-  }
-
-  const matchingTodos = todosForSelectedContext().filter(
-    (todo) => todo.state !== "DONE"
-  );
-  const todoGroup = node("div", "detail-group");
-  const todoHeading = node("div", "detail-heading-row");
-  todoHeading.append(
-    node("h3", "", `Todo (${matchingTodos.length})`)
-  );
-  const addTodo = node("button", "icon-button compact", "+");
-  addTodo.type = "button";
-  addTodo.title = "Add Todo for this context";
-  addTodo.setAttribute("aria-label", addTodo.title);
-  addTodo.addEventListener("click", () => openTodoDialog(true));
-  todoHeading.append(addTodo);
-  todoGroup.append(todoHeading);
-  const ownershipSummary = todoOwnershipSummary(matchingTodos);
-  if (
-    ownershipSummary.task_frame_count ||
-    ownershipSummary.unbound_in_progress_count
-  ) {
-    todoGroup.append(
-      node(
-        "p",
-        "todo-context-ownership",
-        `Work ownership / ${ownershipSummary.task_frame_count} Task Frame(s) / ${ownershipSummary.session_count} target Session Anchor(s) / ${ownershipSummary.live_host_count} live Host(s) / ${ownershipSummary.unbound_in_progress_count} unbound active`
-      )
-    );
-  }
-  if (!matchingTodos.length) {
-    todoGroup.append(node("p", "empty-copy", "No open Todo for this context"));
-  } else {
-    const list = node("ul", "context-list todo-context-list");
-    for (const todo of matchingTodos.slice(0, 6)) {
-      const row = node("li", "todo-context-item");
-      const label = node(
-        "button",
-        "todo-context-open",
-        `${todo.priority} / ${todo.state} / ${todo.title}`
-      );
-      label.type = "button";
-      label.title = "Open Todo work map";
-      label.addEventListener("click", () => openTodoDialog(true));
-      row.append(label);
-      list.append(row);
-    }
-    todoGroup.append(list);
-  }
-  elements.details.append(todoGroup);
-
-  if (state.selectedProject) {
-    elements.details.append(renderFeatureNodeProposalDetails());
-    elements.details.append(renderWorkLoopDetails());
-  }
-
-  if (state.selectedProject) {
-    const handoffGroup = node("div", "detail-group");
-    const handoffHeading = node("div", "detail-heading-row");
-    handoffHeading.append(
-      node("h3", "", `Master handoffs (${state.masterHandoffs.length})`)
-    );
-    handoffGroup.append(handoffHeading);
-    if (!state.masterHandoffs.length) {
-      handoffGroup.append(
-        node(
-          "p",
-          "empty-copy",
-          "No handoff proposals yet. Adopt a Skill Plan or Fresh Composition, then propose delivery."
-        )
-      );
-    } else {
-      const list = node("ul", "context-list");
-      for (const handoff of state.masterHandoffs.slice(0, 6)) {
-        const row = node("li", "handoff-context-item");
-        const sourceKind = handoff.source?.kind || "UNKNOWN";
-        row.append(
-          node(
-            "span",
-            "",
-            `${handoff.delivery_state} · ${sourceKind} · ${handoff.handoff_id.slice(0, 18)}…`
-          )
-        );
-        if (handoff.delivery_state === "PROPOSAL_ONLY") {
-          const deliver = node("button", "handoff-action", "Deliver");
-          deliver.type = "button";
-          deliver.title = "Deliver handoff to Project Master (approval=DELIVER)";
-          deliver.addEventListener("click", () =>
-            deliverMasterHandoff(state.selectedProject.project_id, handoff)
-          );
-          row.append(deliver);
-        }
-        list.append(row);
-      }
-      handoffGroup.append(list);
-    }
-    if (state.skillPlanAdoptions.length) {
-      const undelivered = undeliveredSkillPlanAdoptions();
-      if (undelivered.length) {
-        const propose = node(
-          "button",
-          "secondary-button compact-action",
-          `Propose Skill Plan handoff (${undelivered.length})`
-        );
-        propose.type = "button";
-        propose.addEventListener("click", () =>
-          proposeSkillPlanHandoff(undelivered[0])
-        );
-        handoffGroup.append(propose);
-      }
-    }
-    elements.details.append(handoffGroup);
-  }
-
-  const isProjectContext = !selected || selected.kind === "project";
-  const relatedDocuments = (state.projection?.documents || []).filter((item) =>
-    ["system", "related", "focus"].includes(selected?.kind)
-      ? item.node_ids?.includes(data.node_id)
-      : item.project_wide === true
-  );
-  if (isProjectContext || relatedDocuments.length) {
-    const contextGroup = node("div", "detail-group");
-    contextGroup.append(node("h3", "", isProjectContext ? "Project context" : "Related documents"));
-    if (isProjectContext && data.summary) {
-      contextGroup.append(node("p", "context-copy", data.summary));
-    }
-    if (isProjectContext && data.working_rules?.length) {
-      const rules = node("ul", "context-list");
-      for (const rule of data.working_rules) rules.append(node("li", "", rule));
-      contextGroup.append(rules);
-    }
-    if (relatedDocuments.length) {
-      const references = node("ul", "document-references");
-      for (const document of relatedDocuments) {
-        references.append(
-          node(
-            "li",
-            "",
-            `${document.role} · ${document.title || readableLabel(document.document_id)}`
-          )
-        );
-      }
-      contextGroup.append(references);
-    }
-    elements.details.append(contextGroup);
-  }
-
-  const projectionGroup = node("div", "detail-group");
-  projectionGroup.append(node("h3", "", "Projection"));
-  const projectionGrid = node("dl", "detail-grid");
-  addDetail(
-    projectionGrid,
-    "Nodes",
-    String(state.projection?.nodes?.length || 0)
-  );
-  addDetail(
-    projectionGrid,
-    "Edges",
-    String(state.projection?.edges?.length || 0)
-  );
-  addDetail(
-    projectionGrid,
-    "Documents",
-    String(state.projection?.documents?.length || 0)
-  );
-  addDetail(
-    projectionGrid,
-    "Predicted",
-    String(state.projection?.predicted_paths?.length || 0)
-  );
-  projectionGroup.append(projectionGrid);
-  elements.details.append(projectionGroup);
 }
 
 function addDetail(list, key, value) {
@@ -14734,7 +14671,8 @@ function openGoalEditor(goal) {
 }
 
 function renderGoalPlan() {
-  if (!elements.goalPlanList) return;
+  // Background project refresh must not activate the home over another screen.
+  if (state.view !== "work" || !elements.goalPlanList) return;
   if (!document.body.classList.contains("graph-mode")) {
     syncPrimaryNavSelection("work");
   }
@@ -16229,7 +16167,10 @@ function memoryBatchField(label, control) {
 }
 
 function renderMemoryBatchStages() {
-  const group = node("div", "detail-group memory-batch-config");
+  const group = node("details", "detail-group memory-batch-config");
+  const summary = node("summary", "", "Memory batch stages");
+  summary.title = "Expand batch provider, schedule, and run settings";
+  group.append(summary);
   group.append(
     node("h3", "", "Memory batch stages"),
     node(
@@ -16491,6 +16432,334 @@ function renderReviewInboxNextWork() {
   return group;
 }
 
+function memoryCandidateKindLabel(kind) {
+  const labels = {
+    MEMORY: "Knowledge candidate",
+    IDEA: "Idea proposal",
+    HYPOTHESIS: "Hypothesis proposal",
+    PRODUCT: "Product proposal",
+  };
+  return labels[String(kind || "").toUpperCase()] || "Candidate proposal";
+}
+
+function memoryCandidateDecisionContract(candidate) {
+  return candidate?.decision_contract &&
+    typeof candidate.decision_contract === "object" &&
+    !Array.isArray(candidate.decision_contract)
+    ? candidate.decision_contract
+    : {};
+}
+
+function memoryCandidateActionSpecs(candidate) {
+  const contract = memoryCandidateDecisionContract(candidate);
+  return (Array.isArray(contract.allowed_actions) ? contract.allowed_actions : [])
+    .filter((action) => typeof action === "string" && action.trim())
+    .map((action) => ({ id: action.trim(), label: action.trim() }));
+}
+
+function memoryCandidateDisabledActions(candidate) {
+  const disabled = memoryCandidateDecisionContract(candidate).disabled_actions;
+  if (!disabled || typeof disabled !== "object" || Array.isArray(disabled)) {
+    return [];
+  }
+  return Object.entries(disabled)
+    .map(([id, code]) => ({ id, code: String(code || "UNKNOWN") }))
+    .filter((item) => item.id);
+}
+
+function memoryCandidateReviewPayload(candidate, action) {
+  return { candidate_id: candidate.candidate_id, decision: action.id };
+}
+
+function memoryCandidateNextAction(candidate) {
+  const nextAction = memoryCandidateDecisionContract(candidate).next_action;
+  return nextAction && typeof nextAction === "object" && !Array.isArray(nextAction)
+    ? nextAction
+    : { kind: "NONE", target_ref: null };
+}
+
+function memoryCandidateTargetLabel(target) {
+  if (!target) return "";
+  if (typeof target === "string") return target;
+  if (typeof target !== "object") return String(target);
+  return String(target.label || target.ref || target.id || target.target || "").trim();
+}
+
+function memoryCandidateFollowUp(result, candidate, decision) {
+  const reviewed = result?.candidate;
+  if (!reviewed || reviewed.candidate_id !== candidate.candidate_id) {
+    throw new Error("Review response did not return the clicked candidate");
+  }
+  return {
+    candidate_id: candidate.candidate_id,
+    candidate: reviewed,
+    decision,
+    status: result.status || "RECORDED",
+    next_action: memoryCandidateNextAction(reviewed),
+    effects: result.effects || {},
+    feature_node_proposals: result.feature_node_proposals || null,
+    review_inbox: result.review_inbox || null,
+    candidate_digest: reviewed.candidate_digest || candidate.candidate_digest,
+    revision: reviewed.revision ?? candidate.revision,
+  };
+}
+
+function memoryCandidateOutcome(candidate) {
+  const recorded = state.memoryCandidateReviewOutcomes?.[candidate.candidate_id];
+  if (recorded) return recorded;
+  const contract = memoryCandidateDecisionContract(candidate);
+  if (!contract.current_decision) return null;
+  return {
+    candidate_id: candidate.candidate_id,
+    decision: contract.current_decision,
+    status: "CURRENT",
+    next_action: memoryCandidateNextAction(candidate),
+    candidate_digest: candidate.candidate_digest,
+    revision: candidate.revision,
+  };
+}
+
+function renderMemoryCandidateOutcome(outcome) {
+  if (!outcome) return null;
+  const box = node("div", "memory-candidate-outcome");
+  const heading = outcome.decision
+    ? `Review result · ${outcome.decision}`
+    : `Review result · ${outcome.status || "RECORDED"}`;
+  box.append(node("strong", "", heading));
+  const details = node("dl", "detail-grid memory-candidate-outcome-grid");
+  addDetail(details, "Candidate", outcome.candidate_id || "UNKNOWN");
+  if (outcome.status) addDetail(details, "Status", outcome.status);
+  const nextAction = outcome.next_action || {};
+  if (nextAction.kind) addDetail(details, "Next action", nextAction.kind);
+  const target = memoryCandidateTargetLabel(nextAction.target_ref);
+  if (target) addDetail(details, "Next target", target);
+  if (outcome.revision !== undefined && outcome.revision !== null) {
+    addDetail(details, "Revision", outcome.revision);
+  }
+  if (outcome.candidate_digest) {
+    addDetail(details, "Digest", String(outcome.candidate_digest).slice(0, 16));
+  }
+  const effects = outcome.effects && typeof outcome.effects === "object"
+    ? Object.entries(outcome.effects)
+        .filter(([, value]) => value === true)
+        .map(([key]) => key)
+    : [];
+  if (effects.length) addDetail(details, "Effects", effects.join(" · "));
+  const proposalCount = outcome.feature_node_proposals?.proposals;
+  if (Array.isArray(proposalCount)) {
+    addDetail(details, "Proposed nodes", proposalCount.length);
+  }
+  const bundleCount = outcome.review_inbox?.bundles;
+  if (Array.isArray(bundleCount)) {
+    addDetail(details, "Review bundles", bundleCount.length);
+  }
+  box.append(details);
+  return box;
+}
+
+function renderMemoryCandidateReopenAction(card, candidate) {
+  const reopen = memoryCandidateDecisionContract(candidate).reopen;
+  if (!reopen || typeof reopen !== "object" || Array.isArray(reopen)) return;
+  if (reopen.allowed !== true) {
+    if (reopen.reason) {
+      card.append(
+        node("p", "memory-candidate-disabled", `Re-review unavailable: ${reopen.reason}`)
+      );
+    }
+    return;
+  }
+  const actions = node("div", "memory-candidate-actions");
+  const button = node("button", "secondary-button compact-action", "Re-review");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    const reason = window.prompt(
+      "Reason for re-review (optional, 500 characters maximum)",
+      ""
+    );
+    if (reason === null) return;
+    if (reason.length > 500) {
+      toast("Re-review reason must be 500 characters or fewer", true);
+      return;
+    }
+    const expectedRevision =
+      reopen.candidate_revision ?? candidate.revision;
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+      toast("Re-review unavailable: server candidate revision is missing", true);
+      return;
+    }
+    button.disabled = true;
+    try {
+      const result = await api(
+        `/v1/projects/${encodeURIComponent(
+          candidate.project_id || state.selectedProject.project_id
+        )}/memory-candidates/reopen`,
+        {
+          method: "POST",
+          body: {
+            candidate_id: candidate.candidate_id,
+            expected_candidate_digest:
+              reopen.candidate_digest || candidate.candidate_digest,
+            expected_candidate_revision: expectedRevision,
+            reason,
+          },
+        }
+      );
+      const reviewed = result.candidate;
+      if (!reviewed || reviewed.candidate_id !== candidate.candidate_id) {
+        throw new Error("Re-review response did not return the clicked candidate");
+      }
+      state.memoryCandidates = state.memoryCandidates.map((item) =>
+        item.candidate_id === reviewed.candidate_id ? reviewed : item
+      );
+      state.memoryCandidateReviewOutcomes = {
+        ...(state.memoryCandidateReviewOutcomes || {}),
+        [candidate.candidate_id]: memoryCandidateFollowUp(
+          { ...result, status: result.status || "MEMORY_CANDIDATE_REOPENED" },
+          candidate,
+          "REOPENED"
+        ),
+      };
+      renderMemory();
+      toast("Candidate reopened for review");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  actions.append(button);
+  card.append(actions);
+}
+
+function renderMemoryCandidateCard(candidate) {
+  const card = node("article", "memory-candidate-row");
+  const provenance = candidate.provenance || {};
+  const range = provenance.source_range || {};
+  const refs = Array.isArray(provenance.ref_digests)
+    ? provenance.ref_digests.length
+    : 0;
+  const kind = String(candidate.kind || "UNKNOWN").toUpperCase();
+  card.append(
+    node(
+      "strong",
+      "memory-candidate-heading",
+      `${memoryCandidateKindLabel(kind)} · ${kind} / ${candidate.stage || "UNKNOWN"}`
+    ),
+    node("span", "memory-candidate-state", candidate.state || "UNKNOWN"),
+    node("p", "", candidate.summary || "No summary")
+  );
+  const axes = node("dl", "detail-grid memory-candidate-axis-grid");
+  addDetail(axes, "Kind", kind);
+  const memoryCharacter =
+    candidate.memory_character || candidate.memory_state || candidate.memory_semantics;
+  if (memoryCharacter) addDetail(axes, "Memory character", memoryCharacter);
+  if (candidate.link_state) addDetail(axes, "Link state", candidate.link_state);
+  addDetail(axes, "State", candidate.state || "UNKNOWN");
+  addDetail(
+    axes,
+    "Source",
+    `session ${String(provenance.source_session || "UNKNOWN").slice(0, 16)} / range ${range.start ?? "-"}-${range.end ?? "-"} / refs ${refs} / repeated ${candidate.relevance?.repetition_count || 1}`
+  );
+  if (candidate.candidate_digest) {
+    addDetail(axes, "Digest", String(candidate.candidate_digest).slice(0, 16));
+  }
+  if (candidate.revision !== undefined && candidate.revision !== null) {
+    addDetail(axes, "Revision", candidate.revision);
+  }
+  const history = candidate.review_history;
+  if (Array.isArray(history) && history.length) {
+    addDetail(axes, "Review history", history.length);
+  }
+  card.append(axes);
+
+  const outcomeView = renderMemoryCandidateOutcome(memoryCandidateOutcome(candidate));
+  if (outcomeView) card.append(outcomeView);
+
+  const actionSpecs = memoryCandidateActionSpecs(candidate);
+  if (actionSpecs.length) {
+    const actionWrap = node("div", "memory-candidate-actions");
+    actionWrap.append(node("span", "field-label", "Server actions"));
+    for (const action of actionSpecs) {
+      const button = node("button", "secondary-button compact-action", action.label);
+      button.type = "button";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const result = await api(
+            `/v1/projects/${encodeURIComponent(
+              candidate.project_id || state.selectedProject.project_id
+            )}/memory-candidates/review`,
+            {
+              method: "POST",
+              body: memoryCandidateReviewPayload(candidate, action),
+            }
+          );
+          const reviewed = result.candidate;
+          if (!reviewed || reviewed.candidate_id !== candidate.candidate_id) {
+            throw new Error("Review response did not return the clicked candidate");
+          }
+          state.memoryCandidates = state.memoryCandidates.some(
+            (item) => item.candidate_id === reviewed.candidate_id
+          )
+            ? state.memoryCandidates.map((item) =>
+                item.candidate_id === reviewed.candidate_id ? reviewed : item
+              )
+            : [reviewed, ...state.memoryCandidates];
+          if (result.feature_node_proposals?.proposals) {
+            state.featureNodeProposals = result.feature_node_proposals.proposals;
+          }
+          if (result.review_inbox) {
+            state.workLoop = {
+              ...(state.workLoop || {}),
+              review_inbox: result.review_inbox,
+            };
+          }
+          const outcomeResult = memoryCandidateFollowUp(result, candidate, action.id);
+          state.memoryCandidateReviewOutcomes = {
+            ...(state.memoryCandidateReviewOutcomes || {}),
+            [candidate.candidate_id]: outcomeResult,
+          };
+          renderMemory();
+          const nextKind = outcomeResult.next_action?.kind || "NONE";
+          toast(`Candidate ${action.label.toLowerCase()} · next ${nextKind}`);
+        } catch (error) {
+          toast(error.message, true);
+        } finally {
+          button.disabled = false;
+        }
+      });
+      actionWrap.append(button);
+    }
+    card.append(actionWrap);
+  }
+  const disabledActions = memoryCandidateDisabledActions(candidate);
+  if (disabledActions.length) {
+    card.append(
+      node(
+        "p",
+        "memory-candidate-disabled",
+        `Unavailable by server: ${disabledActions
+          .map((item) => `${item.id} (${item.code})`)
+          .join(" · ")}`
+      )
+    );
+  }
+  renderMemoryCandidateReopenAction(card, candidate);
+  if (candidate.state === "KEEP" && candidate.kind === "MEMORY") {
+    const actions = node("div", "memory-candidate-actions");
+    const adopt = node(
+      "button",
+      "primary-button compact-action",
+      "Adopt to RAG"
+    );
+    adopt.type = "button";
+    adopt.addEventListener("click", () => adoptMemoryCandidate(candidate));
+    actions.append(adopt);
+    card.append(actions);
+  }
+  return card;
+}
+
 function renderMemoryCandidateReview() {
   const group = node("div", "detail-group memory-candidate-review");
   group.append(
@@ -16518,8 +16787,22 @@ function renderMemoryCandidateReview() {
     filters.append(memoryBatchField(label, select));
   }
   group.append(filters);
-  const inbox = renderReviewInboxNextWork();
-  if (inbox) group.append(inbox);
+  group.append(renderReviewInboxNextWork());
+
+  const outcomes = Object.values(state.memoryCandidateReviewOutcomes || {}).filter(Boolean);
+  if (outcomes.length) {
+    const resultGroup = node("div", "memory-candidate-results");
+    resultGroup.append(
+      node("h4", "", "Latest candidate results"),
+      node("p", "context-copy", "Results stay attached to the candidate that was clicked.")
+    );
+    for (const outcome of outcomes.slice(-8).reverse()) {
+      const resultView = renderMemoryCandidateOutcome(outcome);
+      if (resultView) resultGroup.append(resultView);
+    }
+    group.append(resultGroup);
+  }
+
   const filtersState = state.memoryCandidateFilters;
   const candidates = (state.memoryCandidates || []).filter((candidate) =>
     (!filtersState.stage || candidate.stage === filtersState.stage) &&
@@ -16530,89 +16813,43 @@ function renderMemoryCandidateReview() {
     group.append(node("p", "empty-copy", "No candidates match the current filters"));
     return group;
   }
-  const list = node("div", "memory-candidate-list");
-  for (const candidate of candidates.slice(0, 50)) {
-    const card = node("article", "memory-candidate-row");
-    const provenance = candidate.provenance || {};
-    const range = provenance.source_range || {};
-    const refs = Array.isArray(provenance.ref_digests)
-      ? provenance.ref_digests.length
-      : 0;
-    card.append(
-      node("strong", "", `${candidate.kind} / ${candidate.stage}`),
-      node("span", "memory-candidate-state", candidate.state),
-      node("p", "", candidate.summary || "No summary"),
-      node(
-        "small",
-        "",
-        `session ${String(provenance.source_session || "UNKNOWN").slice(0, 16)} / range ${range.start ?? "-"}-${range.end ?? "-"} / refs ${refs} / repeated ${candidate.relevance?.repetition_count || 1}`
-      )
+  const sections = [
+    {
+      title: "Knowledge candidates",
+      note: "MEMORY candidates remain separate from product direction until the server permits a follow-up.",
+      candidates: candidates.filter((candidate) => candidate.kind === "MEMORY"),
+    },
+    {
+      title: "Idea / hypothesis / product proposals",
+      note: "IDEA, HYPOTHESIS, and PRODUCT are proposal kinds; their available actions come from the server.",
+      candidates: candidates.filter((candidate) =>
+        ["IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind)
+      ),
+    },
+    {
+      title: "Other candidate kinds",
+      note: "Unrecognized kinds are shown without client-side action policy.",
+      candidates: candidates.filter(
+        (candidate) => !["MEMORY", "IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind)
+      ),
+    },
+  ];
+  for (const section of sections) {
+    if (!section.candidates.length) continue;
+    const sectionView = node("section", "memory-candidate-kind-group");
+    sectionView.append(
+      node("h4", "memory-candidate-kind-heading", `${section.title} (${section.candidates.length})`),
+      node("p", "context-copy", section.note)
     );
-    if (candidate.state === "REVIEW_REQUIRED") {
-      const actions = node("div", "memory-candidate-actions");
-      for (const decision of ["IGNORE", "KEEP", "EXPLORE", "START_PRODUCT_DESIGN"]) {
-        const button = node("button", "secondary-button compact-action", decision);
-        button.type = "button";
-        button.addEventListener("click", async () => {
-          try {
-            const result = await api(
-              `/v1/memory-candidates/${encodeURIComponent(
-                candidate.candidate_id
-              )}/review`,
-              { method: "POST", body: { decision } }
-            );
-            state.memoryCandidates = state.memoryCandidates.map((item) =>
-              item.candidate_id === result.candidate.candidate_id
-                ? result.candidate
-                : item
-            );
-            if (result.feature_node_proposals?.proposals) {
-              state.featureNodeProposals = result.feature_node_proposals.proposals;
-            }
-            if (result.review_inbox) {
-              state.workLoop = {
-                ...(state.workLoop || {}),
-                review_inbox: result.review_inbox,
-              };
-            }
-            renderMemory();
-            if (decision === "START_PRODUCT_DESIGN" || decision === "EXPLORE") {
-              renderDetails();
-            }
-            const next = result.review_inbox?.bundles?.[0];
-            toast(
-              next?.next_action === "OPEN_EXISTING_TODO"
-                ? `Candidate ${decision.toLowerCase()} · open existing Todo`
-                : next?.next_action === "DISCOVER_FEATURE_PROPOSAL"
-                  ? `Candidate ${decision.toLowerCase()} · Proposed Nodes ready`
-                  : `Candidate ${decision.toLowerCase()}`
-            );
-          } catch (error) {
-            toast(error.message, true);
-          }
-        });
-        actions.append(button);
-      }
-      card.append(actions);
+    const list = node("div", "memory-candidate-list");
+    for (const candidate of section.candidates.slice(0, 50)) {
+      list.append(renderMemoryCandidateCard(candidate));
     }
-    if (candidate.state === "KEEP" && candidate.kind === "MEMORY") {
-      const actions = node("div", "memory-candidate-actions");
-      const adopt = node(
-        "button",
-        "primary-button compact-action",
-        "Adopt to RAG"
-      );
-      adopt.type = "button";
-      adopt.addEventListener("click", () => adoptMemoryCandidate(candidate));
-      actions.append(adopt);
-      card.append(actions);
-    }
-    list.append(card);
+    sectionView.append(list);
+    group.append(sectionView);
   }
-  group.append(list);
   return group;
 }
-
 function renderMemory() {
   if (!elements.memoryPanel) return;
   elements.memoryPanel.replaceChildren();
@@ -16824,7 +17061,18 @@ function renderMemory() {
   elements.memoryPanel.append(decisionCreate);
 
   const unlinked = state.memories.filter((item) => item.link_state === "UNLINKED");
-  const linked = state.memories.filter((item) => item.link_state !== "UNLINKED");
+  const proposed = state.memories.filter((item) => item.link_state === "PROPOSED");
+  const linked = state.memories.filter((item) => item.link_state === "LINKED");
+  const memoryLinkSummary = node("div", "memory-link-summary");
+  memoryLinkSummary.append(
+    node("strong", "", `Stored knowledge · ${state.memories.length}`),
+    node(
+      "span",
+      "memory-link-counts",
+      `Unlinked ${unlinked.length} · Link proposed ${proposed.length} · Linked ${linked.length}`
+    )
+  );
+  elements.memoryPanel.append(memoryLinkSummary);
   const unlinkedGroup = node("div", "detail-group");
   unlinkedGroup.append(
     node("h3", "", `Unlinked (${unlinked.length})`)
@@ -16900,6 +17148,38 @@ function renderMemory() {
   elements.memoryPanel.append(unlinkedGroup);
 
   const linkedGroup = node("div", "detail-group");
+  const proposedGroup = node("div", "detail-group memory-link-state-group");
+  proposedGroup.append(
+    node("h3", "", `Link proposed (${proposed.length})`),
+    node("p", "context-copy", "Stored memories with link_state=PROPOSED remain separate from confirmed Linked memory.")
+  );
+  if (!proposed.length) {
+    proposedGroup.append(node("p", "empty-copy", "No proposed memory links"));
+  } else {
+    const list = node("ul", "context-list bench-list");
+    for (const memory of proposed.slice(0, 8)) {
+      const row = node("li", "bench-case-row");
+      row.append(
+        node("span", "", `${memory.link_state} · ${memory.node_ref || "-"} · ${memory.title}`)
+      );
+      if (memory.node_ref) {
+        const confirm = node("button", "handoff-action", "Confirm LINKED");
+        confirm.type = "button";
+        confirm.addEventListener("click", () =>
+          linkMemory(
+            memory.memory_id,
+            memory.node_ref,
+            memory.graph || "functional",
+            "LINKED"
+          )
+        );
+        row.append(confirm);
+      }
+      list.append(row);
+    }
+    proposedGroup.append(list);
+  }
+  elements.memoryPanel.append(proposedGroup);
   const nodeScoped = selectedNode
     ? linked.filter((item) => item.node_ref === selectedNode)
     : linked;
@@ -17120,11 +17400,19 @@ function bindEvents() {
 
   document
     .querySelector("#open-release-catalog")
-    .addEventListener("click", () => {
+    .addEventListener("click", async () => {
       elements.settingsDialog?.close();
       elements.releaseFormError.textContent = "";
-      renderReleaseCatalog();
+      elements.releaseList.replaceChildren(node("p", "empty-copy", "Loading releases..."));
       elements.releaseDialog.showModal();
+      try {
+        const result = await api("/v1/releases");
+        state.releases = result.releases;
+        renderReleaseCatalog();
+      } catch (error) {
+        elements.releaseList.replaceChildren();
+        elements.releaseFormError.textContent = error.message;
+      }
     });
   elements.releaseTargetProject.addEventListener("change", () => {
     state.selectedReleaseTargetProjectId =

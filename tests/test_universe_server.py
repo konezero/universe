@@ -14407,6 +14407,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(
             [release["release_id"]], [item["release_id"] for item in listed["releases"]]
         )
+        build_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(build_manifest["display_name"], listed["releases"][0]["display_name"])
+        self.assertEqual(build_manifest["built_at"], listed["releases"][0]["built_at"])
 
         status, proposed = self.request(
             "POST",
@@ -14725,6 +14728,28 @@ class UniverseLocalServiceTests(unittest.TestCase):
         touched = {item["project_id"] for item in fleet["results"]}
         self.assertEqual({"GCS"}, touched)
         self.assertEqual(0, fleet["failed"])
+
+        # Exclusion preserves both registration and the current release selection.
+        registration = self.registration()
+        registration["metadata"] = {"fleet_repin_enabled": False}
+        self.request("POST", "/v1/projects/register", registration, self.token)
+        # A normal rediscovery must not silently opt the project back in.
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        status, excluded = self.request(
+            "POST", f"/v1/releases/{release_id}/fleet-repin",
+            {"install_mode": "COPY"}, self.token,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([], excluded["results"])
+        self.assertEqual(["GCS"], excluded["excluded_project_ids"])
+        self.assertEqual(0, excluded["applied"])
+        self.assertEqual(0, excluded["failed"])
+        self.assertIs(False, self.server.store.get_project("GCS")["metadata"]["fleet_repin_enabled"])
+        self.assertEqual("SELECTED", self.server.store.selected_project_release_binding("GCS")["status"])
+        registration["metadata"]["fleet_repin_enabled"] = True
+        self.request("POST", "/v1/projects/register", registration, self.token)
+        _, included = self.request("POST", f"/v1/releases/{release_id}/fleet-repin", {}, self.token)
+        self.assertEqual(["GCS"], [item["project_id"] for item in included["results"]])
 
         status, bad = self.request(
             "POST",

@@ -295,6 +295,10 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
 
         self.assertEqual("PROJECT_RELEASE_APPLIED", result["status"])
         self.assertEqual("FRESH_INSTALL", result["operation"])
+        installed = json.loads((self.target / ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json").read_text(encoding="utf-8"))
+        built = json.loads(self.manifest.read_text(encoding="utf-8"))
+        for field in ("display_name", "built_at", "source_repository"):
+            self.assertEqual(built[field], installed[field])
         self.assertTrue(
             (
                 self.target

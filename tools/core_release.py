@@ -9,6 +9,7 @@ import sqlite3
 import subprocess  # nosec B404
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -500,6 +501,7 @@ def _payload_material(
     schema: str = RELEASE_SCHEMA,
     profile_catalog: dict[str, Any] | None = None,
     governance_catalog: dict[str, Any] | None = None,
+    built_at: str = "",
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema": schema,
@@ -511,6 +513,8 @@ def _payload_material(
         "distribution_manifest_sha256": distribution_manifest_sha256,
         "files": files,
     }
+    if built_at:
+        result["built_at"] = built_at
     if source_tree_root:
         result["source_tree_root"] = source_tree_root
     if profile_catalog is not None:
@@ -534,6 +538,17 @@ def build_release(
     normalized_repository = source_repository.strip()
     if not normalized_repository:
         raise CoreReleaseError("source_repository is required")
+    career_aliases = {"career", "konezero/career", "https://github.com/konezero/career.git", "https://github.com/konezero/career", "git@github.com:konezero/career.git"}
+    legacy_aliases = {"ai-career", "konezero/ai-career", "https://github.com/konezero/ai-career.git", "universe-private", "konezero/universe-private", "https://github.com/konezero/universe-private.git"}
+    if normalized_repository in legacy_aliases and source_tree_root == "runtime-source":
+        raise CoreReleaseError("legacy Career source identity; use --source-repository career")
+    if normalized_repository in career_aliases:
+        normalized_repository = "career"
+    if source_repo.resolve().name.casefold() == "career" and normalized_repository != "career":
+        raise CoreReleaseError("Career source root requires --source-repository career")
+    built_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    project_name = normalized_repository.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    display_name = project_name + "-" + datetime.fromisoformat(built_at).astimezone(timezone(timedelta(hours=9))).strftime("%Y%m%d-%H%M%S")
     source_index_path = validate_release_path(source_index_path)
     source_tree_root = validate_source_tree_root(source_tree_root)
     reader = GitObjectReader(source_repo)
@@ -573,6 +588,7 @@ def build_release(
     payload = _payload_material(
         source_repository=normalized_repository,
         source_commit=source_commit,
+        built_at=built_at,
         package_name=str(distribution["package"]["name"]),
         source_index_path=source_index_path,
         source_index_sha256=blob_by_path[source_index_path].sha256,
@@ -595,6 +611,8 @@ def build_release(
         "source_ref": source_ref,
         "source_commit": source_commit,
         "source_committed_at": reader.committed_at(source_commit),
+        "built_at": built_at,
+        "display_name": display_name,
         "package_name": str(distribution["package"]["name"]),
         "source_index_path": source_index_path,
         "source_index_sha256": blob_by_path[source_index_path].sha256,
@@ -663,6 +681,8 @@ def build_release(
         "source_ref": source_ref,
         "source_commit": source_commit,
         "source_committed_at": metadata["source_committed_at"],
+        "built_at": built_at,
+        "display_name": display_name,
         "package_name": metadata["package_name"],
         "file_count": len(blobs),
         "payload_bytes": int(metadata["payload_bytes"]),
@@ -1085,6 +1105,7 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         )
     payload = _payload_material(
         source_repository=metadata.get("source_repository", ""),
+        built_at=metadata.get("built_at", ""),
         source_commit=metadata.get("source_commit", ""),
         package_name=metadata.get("package_name", ""),
         source_index_path=metadata.get("source_index_path", ""),
@@ -1126,6 +1147,9 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         expected_manifest["governance_catalog"] = governance_material
     if "source_tree_root" in metadata:
         expected_manifest["source_tree_root"] = metadata["source_tree_root"]
+    for field in ("built_at", "display_name"):
+        if field in metadata:
+            expected_manifest[field] = metadata[field]
     for field, value in expected_manifest.items():
         if manifest.get(field) != value:
             raise CoreReleaseError(f"release manifest field mismatch: {field}")
@@ -1133,6 +1157,8 @@ def verify_release(*, database_path: Path, manifest_path: Path) -> dict[str, Any
         raise CoreReleaseError("release manifest database name does not match")
     result = {
         "status": "CORE_RELEASE_VERIFIED",
+        "built_at": metadata.get("built_at"),
+        "display_name": metadata.get("display_name"),
         "release_id": metadata["release_id"],
         "source_commit": metadata["source_commit"],
         "file_count": len(files),

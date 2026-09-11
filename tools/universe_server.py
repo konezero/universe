@@ -1903,6 +1903,8 @@ def normalize_registration(value: Any) -> dict[str, Any]:
     if not isinstance(metadata_value, dict):
         raise UniverseError("PROJECT_METADATA_INVALID", "metadata must be an object")
     metadata = dict(metadata_value)
+    if "fleet_repin_enabled" in metadata and not isinstance(metadata["fleet_repin_enabled"], bool):
+        raise UniverseError("PROJECT_METADATA_INVALID", "fleet_repin_enabled must be boolean")
     node_tag = metadata.get("node_tag")
     if node_tag is None:
         metadata["node_tag"] = _node_tag_from_project_root(project_root)
@@ -9547,7 +9549,7 @@ class UniverseStore:
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT project_root, attachment_json
+                SELECT project_root, attachment_json, metadata_json
                 FROM project_connection
                 WHERE project_id = ?
                 """,
@@ -9562,6 +9564,10 @@ class UniverseStore:
                     "project_id is already attached to another root",
                     HTTPStatus.CONFLICT,
                 )
+            if existing is not None and "fleet_repin_enabled" not in project["metadata"]:
+                stored_metadata = json.loads(existing["metadata_json"])
+                if "fleet_repin_enabled" in stored_metadata:
+                    project["metadata"]["fleet_repin_enabled"] = stored_metadata["fleet_repin_enabled"]
             if existing is not None and existing["attachment_json"]:
                 try:
                     stored_attachment = normalize_project_attachment(
@@ -26165,6 +26171,8 @@ class UniverseStore:
             "schema": RELEASE_ARTIFACT_SCHEMA,
             "release_id": row["release_id"],
             "source_repository": row["source_repository"],
+            "display_name": verification.get("display_name"),
+            "built_at": verification.get("built_at"),
             "source_commit": row["source_commit"],
             "package_name": row["package_name"],
             "payload_sha256": row["payload_sha256"],
@@ -31996,9 +32004,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self.store.get_release_artifact_binding(normalized_release)
 
         results: list[dict[str, Any]] = []
+        excluded: list[str] = []
         with self.project_release_application_lock:
             for project in self.store.list_projects():
                 project_id = project["project_id"]
+                if project.get("metadata", {}).get("fleet_repin_enabled") is False:
+                    excluded.append(project_id)
+                    continue
                 selection = self.store.selected_project_release_binding(project_id)
                 if selection.get("status") != "SELECTED":
                     continue
@@ -32040,6 +32052,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {
             "schema": API_SCHEMA,
             "status": "RELEASE_FLEET_REPINNED",
+            "excluded_project_ids": excluded,
             "release_id": normalized_release,
             "install_mode": install_mode,
             "applied": sum(1 for item in results if item["status"] != "FAILED"),
@@ -43570,6 +43583,19 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/document-content":
+                from universe_app.document_reader import read_document, DocumentReadError
+                document_id = parse_qs(urlsplit(self.path).query).get("document_id", [""])[0]
+                try:
+                    document = read_document(
+                        self.server.store.get_project(project_id),
+                        self.server.store.get_project_projection(project_id),
+                        document_id,
+                    )
+                except DocumentReadError as error:
+                    raise UniverseError(error.code, str(error), HTTPStatus.BAD_REQUEST) from error
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "DOCUMENT_CONTENT_COLLECTED", "project_id": project_id, "document": document})
+                return
             if suffix == "/projection":
                 self._send(
                     HTTPStatus.OK,
@@ -47322,6 +47348,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/discovery-dispatch",
             "/master-messages/claim",
             "/master-messages",
+            "/document-content",
             "/projection",
             "/events",
             "/skill-observations",

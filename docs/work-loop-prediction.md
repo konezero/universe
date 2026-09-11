@@ -43,3 +43,40 @@ Rejected candidates retain `reason` (`UNSUPPORTED` or `LOW_CONFIDENCE`), confide
 A terminal Todo transition records one idempotent Result fan-out descriptor and five independently reviewable candidates: `GOAL_PLAN`, `EXPERIENCE`, `MEMORY`, `BENCH`, and `DOCUMENT_AUTOMATION`. Repeating the same terminal transition reuses the same fan-out and candidates. No candidate is placed in public chat, auto-adopted, or treated as a Goal, Todo, Memory, Bench result, or document until it is reviewed and a later domain-specific action incorporates it.
 
 Recovery only changes an `IN_PROGRESS` Todo when a linked room message has explicit `FAILED` delivery evidence, then emits a recovery event. An unlinked Todo remains untouched because absence is not failure evidence. Recovery creates no Task Frame or execution assignment. Operators should inspect the returned `recovered` list before resuming work.
+
+## Review inbox and next work
+
+`GET /v1/projects/{project_id}/work-loop` also exposes `review_inbox` bundles
+from `build_review_inbox_next_work`. Bundles relate review candidates to existing
+Features/Todos; they do not create a new task merely because a match is shown.
+The UI consumes this projection in `tools/universe_ui/app.js`.
+
+Memory Candidate `EXPLORE` and `START_PRODUCT_DESIGN` review decisions invoke
+`attach_memory_review_next_work`, which generates Feature proposals and returns
+an updated inbox with `next_operation: USER_REVIEW_ONLY`. Review does not adopt
+RAG or automatically start a Feature, Goal, Todo or Task Frame. The full Collector
+surface and resident UI flow remain acceptance work, tracked by
+`todo_c4836d989cab441da55c1309f5545e40`.
+
+## Prediction-versus-outcome calibration
+
+`POST /v1/projects/{project_id}/work-loop/predictions/calibrate` compares KEPT
+predictions with project Todo outcomes and Experience, persists records and a
+summary, and returns `WORK_LOOP_PREDICTION_CALIBRATED`. Prediction generation
+calls the same calibration path before building its next proposal, allowing
+calibration to affect confidence and the proposal digest. Prediction listing
+also exposes the stored calibration feedback.
+
+A KEEP decision is curation, not an execution HIT. Matching and confidence are
+deterministic evidence processing, not proof of causal attribution. Live
+prediction-to-outcome provenance, insufficient evidence and incorrect matches
+remain under `todo_prediction_versus_outcome_calibration_v1`.
+
+The 2026-09-11 reconciliation ran 20 tests covering the inbox, prediction engine,
+ATTACH HTTP flow and calibration persistence/next-build feedback. See the exact
+[test set and limits](memory-to-feature-automation.md#implementation-reconciliation-2026-09-11).
+Resident UI and provider end-to-end validation were NOT_RUN in this audit.
+
+Related contracts: [Memory RAG](universe-memory-rag.md),
+[Memory-to-Feature automation](memory-to-feature-automation.md) and
+[failure reuse RAG](failure-reuse-rag.md).
