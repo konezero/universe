@@ -34204,6 +34204,78 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "supervisor_session_id": "",
         }
 
+    def _attempt_reconnect_dispatch(
+        self, terminal: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Best-effort pending-instruction check on a re-attach/reuse response.
+
+        A Claude Code SessionStart hook does not re-fire when the same CLI
+        process is reattached to an existing Rust reconnection host PTY (only
+        the display connection changed, not the process) - so a message that
+        arrived while disconnected previously depended entirely on the 30s
+        supervisor maintenance sweep to ever reach this terminal. Firing the
+        same idempotent claim check here, at the moment the Host confirms this
+        terminal is attached/reused, closes that gap without touching
+        terminal_host.py's own reattach internals.
+
+        ``claim_instruction`` only claims a message while its delivery_state
+        is still PENDING (session_bus.py:884-891, guarded by one lock across
+        the read-and-flip) - calling this from a duplicated or retried
+        reattach request, or racing the SessionStart hook / periodic sweep,
+        cannot double-claim or re-execute the same instruction; a second
+        caller simply observes NO_PENDING_INSTRUCTION. Never raises: this is
+        an auxiliary check on top of an already-succeeded attach and must not
+        turn that attach into a failure.
+        """
+
+        try:
+            session_id = str(terminal.get("supervisor_session_id") or "").strip()
+            session_anchor_ref = str(terminal.get("session_anchor_ref") or "").strip()
+            provider = str(terminal.get("provider") or "").strip().upper()
+            mode = str(terminal.get("mode") or "").strip().upper()
+            project_id = str(terminal.get("project_id") or "").strip()
+            if not (session_id and session_anchor_ref and provider and mode and project_id):
+                return None
+            return self._dispatch_pending_session_instruction(
+                project_id=project_id,
+                session={
+                    "session_id": session_id,
+                    "session_anchor_ref": session_anchor_ref,
+                    "provider": provider,
+                    "mode": mode,
+                },
+                trigger="RECONNECT",
+                terminal=terminal,
+            )
+        except Exception as error:  # noqa: BLE001 - never break an attach response
+            return {"status": "RECONNECT_DISPATCH_UNAVAILABLE", "detail": str(error)}
+
+    @staticmethod
+    def _pending_work_notice(dispatch: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """Secondary, display-only signal - never the delivery path itself.
+
+        Only ``SESSION_BUSY`` names concrete evidence (the blocking message
+        ids) worth surfacing; every other non-delivered status here is a
+        transient coordinate/infra gap already covered by the 30s sweep, not
+        something a human needs to act on by reading a notice.
+        """
+
+        if not isinstance(dispatch, Mapping):
+            return None
+        if dispatch.get("status") != "SESSION_BUSY":
+            return None
+        active_ids = dispatch.get("active_message_ids")
+        return {
+            "schema": "universe.pending-work-notice.v1",
+            "reason": "SESSION_BUSY",
+            "detail": (
+                "One or more session-bus messages are waiting for the "
+                "currently active instruction to be replied to before they "
+                "can be delivered."
+            ),
+            "blocking_message_ids": list(active_ids) if isinstance(active_ids, list) else [],
+        }
+
     def create_cli_terminal(self, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
         project_id = str(payload.get("project_id") or "").strip()
@@ -34254,11 +34326,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "Host session does not match the requested Session Anchor coordinate",
                     HTTPStatus.CONFLICT,
                 )
-            return {
+            dispatch = self._attempt_reconnect_dispatch(hosted)
+            response = {
                 "schema": API_SCHEMA,
                 "status": "CLI_TERMINAL_ATTACHED",
                 "terminal": hosted,
             }
+            notice = self._pending_work_notice(dispatch)
+            if notice is not None:
+                response["pending_work_notice"] = notice
+            return response
         if supervisor_session_id:
             try:
                 supervised = self.session_supervisor.get_session(
@@ -34364,11 +34441,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             supervisor_session_id=supervisor_session_id,
         )
         if existing is not None:
-            return {
+            dispatch = self._attempt_reconnect_dispatch(existing)
+            response = {
                 "schema": API_SCHEMA,
                 "status": "CLI_TERMINAL_ATTACHED",
                 "terminal": existing,
             }
+            notice = self._pending_work_notice(dispatch)
+            if notice is not None:
+                response["pending_work_notice"] = notice
+            return response
         try:
             terminal = self.terminal_host.create(
                 project_id=project_id,
@@ -39205,6 +39287,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         session: Mapping[str, Any],
         trigger: str,
         message_id: str = "",
+        terminal: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Claim and deliver one anchor-bound bus instruction at a safe point.
 
@@ -39213,9 +39296,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         path: Claude uses its authenticated Host channel, while Codex and Grok
         receive the user turn through the Host-owned terminal input channel.
         Provider-native transport is reserved for explicitly headless Hosts.
+
+        ``terminal`` lets a caller that already resolved the exact live
+        terminal (e.g. a re-attach response that named an exact
+        ``host_session_ref``) skip the ``find_live`` lookup below rather than
+        re-discovering by coordinate a second time.
         """
 
-        if trigger not in {"SESSION_START", "TURN_IDLE"}:
+        if trigger not in {"SESSION_START", "TURN_IDLE", "RECONNECT"}:
             return {"status": "NOT_APPLICABLE", "trigger": trigger}
         session_id = str(session.get("session_id") or "").strip()
         session_anchor_ref = str(session.get("session_anchor_ref") or "").strip()
@@ -39226,12 +39314,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         mode = str(session.get("mode") or "").strip().upper()
         if not session_id or not session_anchor_ref or not provider or not mode:
             return {"status": "COORDINATE_UNAVAILABLE"}
-        terminal = self._session_anchor_terminal_host().find_live(
-            project_id=project_id,
-            mode=mode,
-            provider=provider,
-            supervisor_session_id=session_id,
-        )
+        if terminal is None:
+            terminal = self._session_anchor_terminal_host().find_live(
+                project_id=project_id,
+                mode=mode,
+                provider=provider,
+                supervisor_session_id=session_id,
+            )
         if not isinstance(terminal, Mapping):
             return {"status": "TERMINAL_UNAVAILABLE"}
         terminal_id = str(terminal.get("terminal_id") or "").strip()

@@ -1371,6 +1371,34 @@ def _toml_array(items: list[str]) -> str:
     return "[" + ", ".join(json.dumps(i) for i in items) + "]"
 
 
+def _pending_work_secondary_notice(dispatch: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Auxiliary additionalContext for a claim the primary path could not
+    deliver yet, so a cold SessionStart is not silently indistinguishable
+    from "nothing is waiting". Only SESSION_BUSY names concrete evidence
+    (which message ids are blocking); every other non-delivered status here
+    is a transient coordinate/infra gap the 30s supervisor sweep already
+    retries, not something worth surfacing to the model as a notice.
+    """
+
+    if dispatch.get("status") != "SESSION_BUSY":
+        return None
+    active_ids = dispatch.get("active_message_ids")
+    ids_text = ", ".join(str(i) for i in active_ids) if isinstance(active_ids, list) else ""
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": (
+                "Note: one or more session-bus messages are queued for this "
+                "session but held back because an active instruction "
+                f"({ids_text or 'unknown'}) has not been replied to yet. "
+                "They will deliver automatically once that instruction's "
+                "reply is sent - this is informational only, not a new "
+                "instruction."
+            ),
+        }
+    }
+
+
 def provider_hook_stdout(
     result: Mapping[str, Any],
     *,
@@ -1390,7 +1418,9 @@ def provider_hook_stdout(
     if not isinstance(dispatch, Mapping):
         return None
     output = dispatch.get("hook_stdout")
-    return dict(output) if isinstance(output, Mapping) else None
+    if isinstance(output, Mapping):
+        return dict(output)
+    return _pending_work_secondary_notice(dispatch)
 
 
 def _codex_hook_block(python_exe: str, script_path: str) -> str:

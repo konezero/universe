@@ -671,6 +671,45 @@ class SessionInjectHookTests(unittest.TestCase):
             "SessionStart", output["hookSpecificOutput"]["hookEventName"]
         )
 
+    def test_claude_hook_stdout_synthesizes_session_busy_notice(self) -> None:
+        output = provider_hook_stdout(
+            {
+                "inject_response": {
+                    "pending_instruction_dispatch": {
+                        "status": "SESSION_BUSY",
+                        "active_message_ids": ["msg_a", "msg_b"],
+                    }
+                }
+            },
+            provider="CLAUDE",
+            trigger="session_start",
+        )
+        self.assertIsNotNone(output)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("msg_a, msg_b", context)
+        self.assertIn("queued", context)
+
+    def test_claude_hook_stdout_stays_silent_for_other_non_delivered_statuses(
+        self,
+    ) -> None:
+        for status in (
+            "NO_PENDING_INSTRUCTION",
+            "TERMINAL_UNAVAILABLE",
+            "NOT_APPLICABLE",
+            "COORDINATE_UNAVAILABLE",
+        ):
+            with self.subTest(status=status):
+                output = provider_hook_stdout(
+                    {
+                        "inject_response": {
+                            "pending_instruction_dispatch": {"status": status}
+                        }
+                    },
+                    provider="CLAUDE",
+                    trigger="session_start",
+                )
+                self.assertIsNone(output)
+
     def test_claude_session_start_is_silent_without_common_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = StringIO()

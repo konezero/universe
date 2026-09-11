@@ -6828,6 +6828,187 @@ class UniverseLocalServiceTests(unittest.TestCase):
         terminal_host.find_live.assert_not_called()
         terminal_host.create.assert_not_called()
 
+    def test_cli_terminal_reattach_auto_claims_pending_instruction_once(self) -> None:
+        """A re-attach (not a fresh SessionStart) must still pick up work that
+        arrived while this terminal was disconnected, and a second identical
+        re-attach (duplicate hook fire / retried reconnect) must not
+        re-dispatch the same instruction a second time."""
+
+        self.server.store.register_project(self.registration())
+        anchor_ref = "session_anchor_reconnect_test"
+        posted = self.server.post_session_bus_message(
+            {
+                "from": {"session_anchor_ref": "session_anchor_other"},
+                "to": {"session_anchor_ref": anchor_ref},
+                "kind": "INSTRUCTION",
+                "notify": "NONE",
+                "body_text": "work queued while disconnected",
+            }
+        )
+        message_id = posted["messages"][0]["message_id"]
+        # No live terminal exists for this anchor yet: the immediate best-effort
+        # dispatch on post must leave it PENDING rather than claim it.
+        pending = self.server.session_bus_inbox({"session_anchor_ref": anchor_ref})
+        self.assertEqual(
+            "PENDING", pending["messages"][0]["delivery_state"]
+        )
+
+        hosted = {
+            "terminal_id": "term_reconnect_test",
+            "host_session_ref": "host-reconnect-test",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "supervisor_session_id": "session_reconnect_test",
+            "session_anchor_ref": anchor_ref,
+            "host_compatibility": "CURRENT",
+            "host_reconnect_eligible": True,
+            "state": "LIVE",
+        }
+        managed = Mock()
+        managed.public.return_value = hosted
+        terminal_host = Mock()
+        terminal_host.get_host.return_value = managed
+        terminal_host.get.return_value = managed
+        terminal_host.channel_state.return_value = "READY"
+        terminal_host.push_channel.return_value = {}
+        self.server.terminal_host = terminal_host
+
+        attached = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CLAUDE",
+                "host_session_ref": "host-reconnect-test",
+            }
+        )
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached["status"])
+        self.assertNotIn("pending_work_notice", attached)
+        terminal_host.push_channel.assert_called_once()
+
+        delivered = self.server.session_bus_inbox({"session_anchor_ref": anchor_ref})
+        delivered_message = next(
+            item for item in delivered["messages"] if item["message_id"] == message_id
+        )
+        self.assertEqual("DISPATCHED", delivered_message["delivery_state"])
+        self.assertEqual("STARTED", delivered_message["lifecycle_state"])
+
+        # Duplicate reattach (e.g. a hook firing twice, or a retried
+        # reconnect) must not re-claim or re-push the same instruction.
+        attached_again = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CLAUDE",
+                "host_session_ref": "host-reconnect-test",
+            }
+        )
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached_again["status"])
+        terminal_host.push_channel.assert_called_once()  # still just the one call
+        still_delivered = self.server.session_bus_inbox({"session_anchor_ref": anchor_ref})
+        still_message = next(
+            item for item in still_delivered["messages"] if item["message_id"] == message_id
+        )
+        self.assertEqual("DISPATCHED", still_message["delivery_state"])
+        self.assertEqual("STARTED", still_message["lifecycle_state"])
+
+    def test_cli_terminal_reattach_reports_pending_work_notice_when_session_busy(
+        self,
+    ) -> None:
+        self.server.store.register_project(self.registration())
+        supervised, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session_busy_reconnect_test",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "provider_session_ref": "claude-busy-reconnect-test",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+        anchor_ref = supervised["session_anchor_ref"]
+        hosted = {
+            "terminal_id": "term_busy_reconnect_test",
+            "host_session_ref": "host-busy-reconnect-test",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "supervisor_session_id": "session_busy_reconnect_test",
+            "session_anchor_ref": anchor_ref,
+            "host_compatibility": "CURRENT",
+            "host_reconnect_eligible": True,
+            "state": "LIVE",
+        }
+        managed = Mock()
+        managed.public.return_value = hosted
+        terminal_host = Mock()
+        terminal_host.get_host.return_value = managed
+        terminal_host.get.return_value = managed
+        terminal_host.list_sessions.return_value = [hosted]
+        terminal_host.channel_state.return_value = "READY"
+        terminal_host.push_channel.return_value = {}
+        self.server.terminal_host = terminal_host
+
+        first_posted = self.server.post_session_bus_message(
+            {
+                "from": {"session_anchor_ref": "session_anchor_other"},
+                "to": {"session_anchor_ref": anchor_ref},
+                "kind": "INSTRUCTION",
+                "notify": "NONE",
+                "body_text": "first instruction, still active",
+            }
+        )
+        first_message_id = first_posted["messages"][0]["message_id"]
+        # The terminal is already live+channel-ready, so posting the first
+        # instruction dispatches it immediately (best-effort TURN_IDLE path)
+        # and leaves it STARTED - exactly the state that must block a second
+        # instruction until it is replied to.
+        first_state = self.server.session_bus_inbox({"session_anchor_ref": anchor_ref})
+        first_message = next(
+            item
+            for item in first_state["messages"]
+            if item["message_id"] == first_message_id
+        )
+        self.assertEqual("STARTED", first_message["lifecycle_state"])
+
+        second_posted = self.server.post_session_bus_message(
+            {
+                "from": {"session_anchor_ref": "session_anchor_other"},
+                "to": {"session_anchor_ref": anchor_ref},
+                "kind": "COORDINATION",
+                "notify": "NONE",
+                "body_text": "second message queued behind the active one",
+            }
+        )
+        second_message_id = second_posted["messages"][0]["message_id"]
+
+        attached = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CLAUDE",
+                "host_session_ref": "host-busy-reconnect-test",
+            }
+        )
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached["status"])
+        self.assertIn("pending_work_notice", attached)
+        self.assertEqual("SESSION_BUSY", attached["pending_work_notice"]["reason"])
+        self.assertIn(
+            first_message_id, attached["pending_work_notice"]["blocking_message_ids"]
+        )
+        still_queued = self.server.session_bus_inbox({"session_anchor_ref": anchor_ref})
+        second_message = next(
+            item
+            for item in still_queued["messages"]
+            if item["message_id"] == second_message_id
+        )
+        self.assertEqual("PENDING", second_message["delivery_state"])
+
     def test_cli_terminal_pty_binding_resolves_verified_anchor_provider_ref(self) -> None:
         terminal_host = Mock()
         terminal_host.find_live.return_value = None
