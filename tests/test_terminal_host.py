@@ -578,6 +578,53 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual("TERMINAL_TERMINATED", terminated["status"])
             self.assertTrue(client.shutdown_called)
 
+    def test_rust_detach_preserves_identity_and_reconnect_repairs_missing_identity(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.windows_process.process_is_alive", return_value=True
+        ), patch(
+            "universe_app.windows_process.process_start_time", return_value=123.5
+        ), patch.object(TerminalHost, "_ensure_pump"):
+            host = TerminalHost(
+                audit_database_path=Path(tmp) / "audit.sqlite3",
+                reconnection_registry=registry,
+            )
+            created = host.create(
+                project_id="universe", mode="CONDUCTOR", cwd=tmp,
+                session_anchor_ref="anchor-reconnect", provider="CODEX",
+                supervisor_session_id="provider-session",
+            )
+            tid = created["terminal_id"]
+            identity_path = Path(host.get(tid).managed_shell_identity_file)
+            original_identity = identity_path.read_bytes()
+            host.close(tid)
+            self.assertTrue(identity_path.is_file(), "detach must retain Host identity")
+            self.assertEqual(original_identity, identity_path.read_bytes())
+
+            # Reproduce a legacy detach that already removed the identity file.
+            identity_path.unlink()
+            self.assertEqual("TERMINAL_REATTACHED", host.reconcile_reconnection_hosts()[0]["status"])
+            self.assertTrue(identity_path.is_file())
+            self.assertEqual("VERIFIED", host._managed_shell_identity_state(host.get(tid)))
+            probes = {
+                "is_alive": lambda pid: pid == 4242,
+                "children_of": lambda _pid: [],
+                "start_time_of": lambda _pid: 123.5,
+                "source": "TEST",
+            }
+            for _ in range(3):
+                sampled = host.poll_managed_shell(tid, probes=probes, now=1000)
+                self.assertFalse(sampled["reclaimed"])
+                self.assertEqual([], host.reconcile_reconnection_hosts())
+            self.assertEqual(2, registry.clients["anchor-reconnect"].generation)
+            host.terminate(tid)
+            self.assertFalse(identity_path.exists())
+
     def test_rust_host_defers_claude_json_schema_through_environment(self) -> None:
         registry = FakeReconnectionRegistry()
         schema = '{"type":"object","description":"A&B %PATH% !literal!"}'

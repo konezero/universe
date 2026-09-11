@@ -1086,7 +1086,7 @@ class TerminalHost:
             if callable(list_live_clients)
             else None
         )
-        unmatched_live_anchors = set(live_clients or {})
+        unmatched_live_anchors = set(live_clients or {}) - active_anchor_refs
         terminal_states = {
             "TERMINAL_CLOSED",
             "TERMINAL_TERMINATED",
@@ -1236,6 +1236,10 @@ class TerminalHost:
                     except (ManagedShellError, TypeError, ValueError):
                         pass
             session.managed_shell = managed
+            # A live Host survives detach and owns the verified child identity.
+            # Restore only a missing companion before the sampler can reclaim it.
+            if session.managed_shell_identity_file and not identity_path.exists():
+                write_managed_shell_identity(identity_path, session)
             with self._lock:
                 if terminal_id in self._sessions:
                     backend.close()
@@ -2218,12 +2222,13 @@ class TerminalHost:
             identity_path = str(
                 getattr(session, "managed_shell_identity_file", "") or ""
             ).strip()
-            if identity_path:
-                Path(identity_path).unlink(missing_ok=True)
-            elif getattr(session, "cwd", ""):
-                managed_shell_identity_path(
-                    Path(session.cwd), session.terminal_id
-                ).unlink(missing_ok=True)
+            if terminate_host or not isinstance(backend, ReconnectionPty):
+                if identity_path:
+                    Path(identity_path).unlink(missing_ok=True)
+                elif getattr(session, "cwd", ""):
+                    managed_shell_identity_path(
+                        Path(session.cwd), session.terminal_id
+                    ).unlink(missing_ok=True)
         except OSError:
             pass
         event_type = "TERMINAL_TERMINATED" if terminate_host else "TERMINAL_DETACHED"

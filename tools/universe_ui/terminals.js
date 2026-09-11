@@ -747,11 +747,16 @@ function startProviderQuotaPolling() {
 function applyTerminalGridLayout() {
   const stage = elements.terminalStage;
   if (!stage) return;
-  const grid = Boolean(state.terminalGrid) && (state.terminals || []).length > 1;
+  const sessions = state.terminals || [];
+  const visibleIds = new Set(sessions.map((session) => session.terminal_id));
+  const grid = Boolean(state.terminalGrid) && sessions.length > 1;
   stage.classList.toggle("terminal-grid", grid);
+  if (grid) {
+    for (const session of sessions) ensureTerminalSurface(session);
+  }
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
-    surface.element.hidden = grid ? false : id !== state.activeTerminalId;
+    surface.element.hidden = !visibleIds.has(id) || (!grid && id !== state.activeTerminalId);
   }
   if (grid && typeof refitAllTerminals === "function") {
     setTimeout(() => refitAllTerminals(), 60);
@@ -807,10 +812,9 @@ function selectTerminalTab(terminalId) {
   renderTerminalDock();
   if (typeof renderComposerState === "function") renderComposerState();
   ensureTerminalSurface(session);
-  const grid = Boolean(state.terminalGrid) && (state.terminals || []).length > 1;
+  applyTerminalGridLayout();
   for (const [id, surface] of Object.entries(state.terminalSurfaces || {})) {
     if (!surface?.element) continue;
-    surface.element.hidden = grid ? false : id !== terminalId;
     rescheduleTerminalRender(surface);
     if (id === terminalId) {
       surface.restoreSavedViewport = switchingTabs;
@@ -1829,9 +1833,7 @@ async function stopTerminalSession(terminalId) {
   await closeTerminalTab(id);
 }
 
-async function closeTerminalTab(terminalId) {
-  state.dismissedTerminalIds = state.dismissedTerminalIds || {};
-  state.dismissedTerminalIds[terminalId] = true;
+function disposeTerminalSurface(terminalId) {
   const surface = (state.terminalSurfaces || {})[terminalId];
   if (surface) {
     try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
@@ -1841,6 +1843,12 @@ async function closeTerminalTab(terminalId) {
     surface.element.remove();
     delete state.terminalSurfaces[terminalId];
   }
+}
+
+async function closeTerminalTab(terminalId) {
+  state.dismissedTerminalIds = state.dismissedTerminalIds || {};
+  state.dismissedTerminalIds[terminalId] = true;
+  disposeTerminalSurface(terminalId);
   state.terminals = (state.terminals || []).filter((item) => item.terminal_id !== terminalId);
   if (state.activeTerminalId === terminalId) {
     state.activeTerminalId = state.terminals[0]?.terminal_id || null;
@@ -1916,7 +1924,6 @@ async function loadTerminalTabs() {
       if (!liveIds.has(id)) delete state.dismissedTerminalIds[id];
     }
     const dismissed = state.dismissedTerminalIds;
-    const previous = new Set((state.terminals || []).map((item) => item.terminal_id));
     const visible = incoming.filter(
       (item) => !dismissed[item.terminal_id] && terminalDockVisible(item)
     );
@@ -1927,7 +1934,10 @@ async function loadTerminalTabs() {
       state.activeTerminalId = null;
       state.conversationSurface = "CHAT";
     }
-    const opened = visible.filter((item) => !previous.has(item.terminal_id));
+    const visibleIds = new Set(visible.map((item) => item.terminal_id));
+    for (const id of Object.keys(state.terminalSurfaces || {})) {
+      if (!visibleIds.has(id)) disposeTerminalSurface(id);
+    }
     state.terminals = visible;
     renderTerminalDock();
     if (typeof renderNodeModes === "function") renderNodeModes();
@@ -1936,10 +1946,6 @@ async function loadTerminalTabs() {
     if (typeof renderDetails === "function") renderDetails();
     if (!state.activeTerminalId && visible[0]) {
       selectTerminalTab(visible[0].terminal_id);
-      return;
-    }
-    if (!isRemoteBrowser() && opened[0]) {
-      selectTerminalTab(opened[0].terminal_id);
       return;
     }
     if (state.activeTerminalId) applyCliDockTitle(activeTerminalSession());
