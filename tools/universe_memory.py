@@ -91,6 +91,46 @@ MEMORY_CANDIDATE_FORBIDDEN_FIELDS = frozenset(
 )
 
 
+MEMORY_CANDIDATE_DECISION_CONTRACT_SCHEMA = (
+    "universe.memory-candidate-decision-contract.v1"
+)
+# Fixed render order for allowed_actions/disabled_actions — callers must not
+# re-sort or re-derive this from MEMORY_CANDIDATE_DECISIONS (a frozenset has no
+# stable order).
+MEMORY_CANDIDATE_DECISION_ORDER = (
+    "IGNORE",
+    "KEEP",
+    "EXPLORE",
+    "START_PRODUCT_DESIGN",
+)
+# Which review decisions each candidate kind may use from REVIEW_REQUIRED.
+# MEMORY excludes EXPLORE: a kept MEMORY candidate's knowledge-retention path
+# is KEEP (-> RAG adopt), and its product-intent path is START_PRODUCT_DESIGN;
+# EXPLORE has no defined downstream effect for MEMORY (feature_node_proposal's
+# _source_entries never reads a MEMORY+EXPLORE candidate), so the invalid
+# option is not allowed rather than allowed-but-inert.
+MEMORY_CANDIDATE_KIND_ALLOWED_DECISIONS = {
+    "MEMORY": frozenset({"IGNORE", "KEEP", "START_PRODUCT_DESIGN"}),
+    "IDEA": frozenset(MEMORY_CANDIDATE_DECISIONS),
+    "HYPOTHESIS": frozenset(MEMORY_CANDIDATE_DECISIONS),
+    "PRODUCT": frozenset(MEMORY_CANDIDATE_DECISIONS),
+}
+# (kind, decision) -> stable reason code for a decision excluded above. Only
+# entries a UI might reasonably want to explain go here; a decision that is
+# simply not in MEMORY_CANDIDATE_DECISIONS at all needs no reason.
+MEMORY_CANDIDATE_DISABLED_ACTION_REASONS = {
+    ("MEMORY", "EXPLORE"): "MEMORY_EXPLORE_NO_AUTOMATION",
+}
+MEMORY_CANDIDATE_NEXT_ACTION_KINDS = frozenset(
+    {
+        "NONE",
+        "PRODUCT_PROPOSAL_ATTEMPTED",
+        "RAG_ADOPT_AVAILABLE",
+        "ACKNOWLEDGED_NO_AUTOMATION",
+    }
+)
+
+
 class MemoryError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -1286,6 +1326,110 @@ def normalize_memory_candidate(
             "auto_adoption": False,
         },
         "next_operation": "CANDIDATE_REVIEW",
+    }
+
+
+def memory_candidate_allowed_decisions(kind: str) -> frozenset[str]:
+    """Decisions a candidate of this kind may record from REVIEW_REQUIRED."""
+
+    return MEMORY_CANDIDATE_KIND_ALLOWED_DECISIONS.get(
+        str(kind or "").strip().upper(), frozenset(MEMORY_CANDIDATE_DECISIONS)
+    )
+
+
+def memory_candidate_next_action_kind(
+    kind: str, state: str, *, adopted: bool = False
+) -> str:
+    """Pure kind/state -> next_action.kind mapping (no target_ref).
+
+    A caller that actually ran the side-effecting follow-up (feature node
+    proposal generation, RAG adoption) attaches ``target_ref`` itself; this
+    function only names the category so the UI and the compiler agree on it
+    without either re-deriving the kind x state policy on their own.
+    """
+
+    normalized_kind = str(kind or "").strip().upper()
+    normalized_state = str(state or "").strip().upper()
+    if normalized_state == "REVIEW_REQUIRED":
+        return "NONE"
+    if normalized_state == "IGNORE":
+        return "NONE"
+    if normalized_state == "KEEP":
+        return "RAG_ADOPT_AVAILABLE" if normalized_kind == "MEMORY" else (
+            "ACKNOWLEDGED_NO_AUTOMATION"
+        )
+    if normalized_state in {"EXPLORE", "START_PRODUCT_DESIGN"}:
+        # MEMORY+EXPLORE cannot be newly created (excluded from
+        # allowed_decisions above), but existing rows reviewed before this
+        # contract shipped may still carry it; treat it the same as any
+        # other kind's EXPLORE rather than raising, since a pure formatter
+        # must not fail on historical data it did not create.
+        return "PRODUCT_PROPOSAL_ATTEMPTED"
+    return "NONE"
+
+
+def memory_candidate_decision_contract(
+    candidate: Mapping[str, Any],
+    *,
+    adopted: bool = False,
+    reopen_allowed: bool | None = None,
+    reopen_reason: str | None = None,
+) -> dict[str, Any]:
+    """Build the additive ``decision_contract`` block for one candidate.
+
+    Pure function of the candidate row plus two facts only the store can
+    know cheaply: whether a MEMORY+KEEP candidate has already been adopted
+    into canonical RAG, and (for a single-candidate read) whether reopen is
+    currently allowed. ``reopen_allowed``/``reopen_reason`` are left None on
+    cheap list reads; the caller then reports ``allowed: False`` with reason
+    ``NOT_EVALUATED`` rather than paying a per-row adoption lookup that only
+    matters once a user actually opens reopen for one candidate.
+    """
+
+    kind = str(candidate.get("kind") or "").strip().upper()
+    state = str(candidate.get("state") or "").strip().upper()
+    review_required = state == "REVIEW_REQUIRED"
+    allowed_set = memory_candidate_allowed_decisions(kind)
+    allowed_actions = (
+        [d for d in MEMORY_CANDIDATE_DECISION_ORDER if d in allowed_set]
+        if review_required
+        else []
+    )
+    disabled_actions = {}
+    if review_required:
+        for decision in MEMORY_CANDIDATE_DECISION_ORDER:
+            if decision in allowed_set:
+                continue
+            reason = MEMORY_CANDIDATE_DISABLED_ACTION_REASONS.get(
+                (kind, decision)
+            )
+            if reason:
+                disabled_actions[decision] = reason
+    if reopen_allowed is None:
+        reopen_block = {
+            "allowed": False,
+            "reason": "ALREADY_REVIEW_REQUIRED" if review_required else "NOT_EVALUATED",
+            "candidate_digest": candidate.get("candidate_digest"),
+            "candidate_revision": candidate.get("revision"),
+        }
+    else:
+        reopen_block = {
+            "allowed": bool(reopen_allowed),
+            "reason": reopen_reason,
+            "candidate_digest": candidate.get("candidate_digest"),
+            "candidate_revision": candidate.get("revision"),
+        }
+    return {
+        "schema": MEMORY_CANDIDATE_DECISION_CONTRACT_SCHEMA,
+        "state": candidate.get("state"),
+        "allowed_actions": allowed_actions,
+        "disabled_actions": disabled_actions,
+        "current_decision": None if review_required else candidate.get("state"),
+        "next_action": {
+            "kind": memory_candidate_next_action_kind(kind, state, adopted=adopted),
+            "target_ref": None,
+        },
+        "reopen": reopen_block,
     }
 
 

@@ -453,6 +453,169 @@ class MemoryCandidateApiTests(unittest.TestCase):
             unsupported_budget["error_code"],
         )
 
+    def _create_memory_kind_candidate(self) -> dict:
+        batch = {
+            "source": {
+                "provider": "CODEX",
+                "provider_session_id": "session-reopen",
+                "source_id": "source-reopen",
+            },
+            "activity_refs": [
+                {
+                    "event_kind": "TURN_COMPLETED",
+                    "activity_state": "DONE",
+                    "ordinal": 1,
+                    "activity_digest": "f" * 64,
+                },
+            ],
+        }
+        extracted = extract_memory_candidates_from_activity_batch(
+            batch, project_id="TEST"
+        )
+        self.assertEqual("MEMORY", extracted[0]["kind"])
+        candidate, _created = self.server.store.create_memory_candidate(
+            "TEST", extracted[0]
+        )
+        return candidate
+
+    def test_memory_candidate_rejects_explore_and_exposes_decision_contract(
+        self,
+    ) -> None:
+        candidate = self._create_memory_kind_candidate()
+        candidate_id = candidate["candidate_id"]
+
+        status, fetched = self.request(
+            "GET", f"/v1/projects/TEST/memory-candidates"
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        listed = next(
+            item for item in fetched["candidates"] if item["candidate_id"] == candidate_id
+        )
+        self.assertEqual(
+            ["IGNORE", "KEEP", "START_PRODUCT_DESIGN"],
+            listed["decision_contract"]["allowed_actions"],
+        )
+        self.assertEqual(
+            {"EXPLORE": "MEMORY_EXPLORE_NO_AUTOMATION"},
+            listed["decision_contract"]["disabled_actions"],
+        )
+
+        status, rejected = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "EXPLORE"},
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "MEMORY_CANDIDATE_DECISION_NOT_ALLOWED_FOR_KIND", rejected["error_code"]
+        )
+
+        status, reviewed = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "IGNORE"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("IGNORE", reviewed["candidate"]["state"])
+        self.assertEqual(2, reviewed["candidate"]["revision"])
+        self.assertEqual(
+            "IGNORE", reviewed["candidate"]["decision_contract"]["current_decision"]
+        )
+        self.assertEqual([], reviewed["candidate"]["decision_contract"]["allowed_actions"])
+
+    def test_memory_candidate_reopen_round_trip_and_concurrency_guards(self) -> None:
+        candidate = self._create_memory_kind_candidate()
+        candidate_id = candidate["candidate_id"]
+        digest = candidate["candidate_digest"]
+
+        status, reviewed = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "IGNORE"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(2, reviewed["candidate"]["revision"])
+        self.assertTrue(reviewed["candidate"]["decision_contract"]["reopen"]["allowed"])
+
+        # Stale digest is rejected before revision is even considered.
+        status, stale_digest = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-candidates/reopen",
+            {
+                "candidate_id": candidate_id,
+                "expected_candidate_digest": "0" * 64,
+                "expected_candidate_revision": 2,
+                "reason": "wrong digest",
+            },
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MEMORY_CANDIDATE_DIGEST_STALE", stale_digest["error_code"])
+
+        # Correct digest, stale revision.
+        status, stale_revision = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-candidates/reopen",
+            {
+                "candidate_id": candidate_id,
+                "expected_candidate_digest": digest,
+                "expected_candidate_revision": 1,
+                "reason": "wrong revision",
+            },
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MEMORY_CANDIDATE_REVISION_STALE", stale_revision["error_code"])
+
+        # Correct digest and revision: reopen succeeds and preserves history.
+        status, reopened = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-candidates/reopen",
+            {
+                "candidate_id": candidate_id,
+                "expected_candidate_digest": digest,
+                "expected_candidate_revision": 2,
+                "reason": "user asked to reconsider",
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("REVIEW_REQUIRED", reopened["candidate"]["state"])
+        self.assertEqual(3, reopened["candidate"]["revision"])
+        self.assertIsNone(reopened["candidate"]["decision_contract"]["current_decision"])
+
+        history = reopened["candidate"]["review_history"]
+        self.assertEqual(["REVIEWED", "REOPENED"], [item["event"] for item in history])
+        self.assertEqual("IGNORE", history[0]["decision"])
+        self.assertEqual("user asked to reconsider", history[1]["reason"])
+
+        # Reopening an already-REVIEW_REQUIRED candidate is a conflict.
+        status, already_open = self.request(
+            "POST",
+            "/v1/projects/TEST/memory-candidates/reopen",
+            {
+                "candidate_id": candidate_id,
+                "expected_candidate_digest": digest,
+                "expected_candidate_revision": 3,
+                "reason": "again",
+            },
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("MEMORY_CANDIDATE_STATE_CONFLICT", already_open["error_code"])
+
+        # A fresh decision after reopen keeps history and bumps revision again.
+        status, redecided = self.request(
+            "POST",
+            f"/v1/memory-candidates/{candidate_id}/review",
+            {"decision": "KEEP"},
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("KEEP", redecided["candidate"]["state"])
+        self.assertEqual(4, redecided["candidate"]["revision"])
+        self.assertEqual(
+            "RAG_ADOPT_AVAILABLE", redecided["candidate"]["decision_contract"]["next_action"]["kind"]
+        )
+        self.assertEqual(
+            digest, redecided["candidate"]["decision_contract"]["next_action"]["target_ref"]
+        )
+
     def test_memory_batch_action_and_legacy_surface_share_the_run_envelope(self) -> None:
         self.configure("FAST_EXTRACT", dry_run=True)
         activity_batch = {

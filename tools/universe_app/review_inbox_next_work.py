@@ -7,6 +7,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from universe_app.feature_node_proposal import _related, _text, _tokens
+from universe_app.intent_eligibility import (
+    GENERIC_MARKERS,
+    TEST_ONLY_MARKERS,
+    classify_intent_eligibility,
+)
 
 
 REVIEW_INBOX_SCHEMA = "universe.review-inbox-next-work.v1"
@@ -22,18 +27,6 @@ MEMORY_REVIEW_STATES = frozenset(
 PREDICTION_REVIEW_STATES = frozenset({"PROPOSAL_ONLY", "KEPT"})
 PRODUCT_CANDIDATE_KINDS = frozenset({"IDEA", "HYPOTHESIS", "PRODUCT"})
 PRODUCT_PREDICTION_KINDS = frozenset({"GOAL", "PLAN", "MILESTONE"})
-TEST_ONLY_MARKERS = (
-    "test-only",
-    "respond with",
-    "do not implement",
-    "unit test fixture",
-)
-GENERIC_MARKERS = (
-    "generic summary",
-    "no summary",
-    "placeholder",
-    "lorem ipsum",
-)
 STALE_AFTER = timedelta(days=14)
 
 
@@ -69,18 +62,19 @@ def _is_stale(value: Any, *, now: datetime) -> bool:
     return now - parsed >= STALE_AFTER
 
 
-def _classify_text(value: Any) -> str:
-    folded = _text(value).casefold()
-    if not folded:
-        return "GENERIC"
-    if any(marker in folded for marker in TEST_ONLY_MARKERS):
-        return "TEST_ONLY"
-    if any(marker in folded for marker in GENERIC_MARKERS):
-        return "GENERIC"
-    tokens = _tokens(folded)
-    if len(tokens) < 2:
-        return "GENERIC"
-    return "PRODUCT_INTENT"
+def _classify_text(
+    value: Any, *, source_kind: str = "", origin_ref: str | None = None
+) -> str:
+    """Delegates to the shared intent_eligibility boundary (contract §3).
+
+    ``source_kind``/``origin_ref`` are optional so existing single-argument
+    call sites keep working; passing them lets this converge with
+    feature_node_proposal's eligibility once origin tagging exists upstream.
+    """
+
+    return classify_intent_eligibility(
+        source_kind=source_kind, origin_ref=origin_ref, text=_text(value)
+    )
 
 
 def _entry(
@@ -124,7 +118,7 @@ def _memory_entries(
         if state not in MEMORY_REVIEW_STATES or not candidate_id or not title:
             continue
         kind = str(candidate.get("kind") or "").upper()
-        classification = _classify_text(title)
+        classification = _classify_text(title, source_kind="MEMORY_CANDIDATE")
         product_kind = kind in PRODUCT_CANDIDATE_KINDS or (
             kind == "MEMORY" and state == "START_PRODUCT_DESIGN"
         )
@@ -180,7 +174,8 @@ def _prediction_entries(
             if kind not in PRODUCT_PREDICTION_KINDS or not title:
                 continue
             classification = _classify_text(
-                f"{title} {_text(suggestion.get('rationale'))}"
+                f"{title} {_text(suggestion.get('rationale'))}",
+                source_kind="WORK_LOOP_PREDICTION",
             )
             entries.append(
                 _entry(
@@ -221,7 +216,7 @@ def _result_entries(
         )
         if not candidate_id or not title:
             continue
-        classification = _classify_text(title)
+        classification = _classify_text(title, source_kind="RESULT_REVIEW")
         entries.append(
             _entry(
                 source_kind="RESULT_REVIEW",

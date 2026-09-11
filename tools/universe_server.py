@@ -152,6 +152,9 @@ from universe_memory import (
     MEMORY_SCHEMA,
     MemoryError,
     filter_llm_proposals,
+    memory_candidate_allowed_decisions,
+    memory_candidate_decision_contract,
+    memory_candidate_next_action_kind,
     normalize_memory_batch_config,
     normalize_memory_candidate,
     normalize_memory_create,
@@ -7233,6 +7236,31 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS memory_candidate_review_project_time
                 ON memory_candidate_review(project_id, decided_at, candidate_id);
 
+                -- Append-only decision/reopen history. memory_candidate_review above
+                -- stays the "current decision" row (kept UNIQUE(candidate_id) so the
+                -- existing adopt_memory_candidate lookup is untouched); this table is
+                -- the immutable record explicit reopen needs and never loses a row.
+                CREATE TABLE IF NOT EXISTS memory_candidate_review_history (
+                    history_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL
+                        REFERENCES memory_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    event TEXT NOT NULL
+                        CHECK(event IN ('REVIEWED', 'REOPENED')),
+                    decision TEXT
+                        CHECK(decision IS NULL OR decision IN ('IGNORE', 'KEEP', 'EXPLORE', 'START_PRODUCT_DESIGN')),
+                    reason TEXT,
+                    revision INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_review_history_by_candidate
+                ON memory_candidate_review_history(candidate_id, revision, history_id);
+
                 CREATE TABLE IF NOT EXISTS project_master_bridge (
                     project_id TEXT PRIMARY KEY
                         REFERENCES project_connection(project_id)
@@ -7442,6 +7470,17 @@ class UniverseStore:
                 )
             if "node_ref" not in goal_columns:
                 connection.execute("ALTER TABLE project_goal ADD COLUMN node_ref TEXT")
+            memory_candidate_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_candidate)"
+                ).fetchall()
+            }
+            if "revision" not in memory_candidate_columns:
+                connection.execute(
+                    "ALTER TABLE memory_candidate ADD COLUMN revision "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS project_goal_universe_order "
                 "ON project_goal(universe_goal_id, sort_order, updated_at, goal_id)"
@@ -18977,13 +19016,110 @@ class UniverseStore:
             ),
         }
 
-    @staticmethod
-    def _memory_candidate_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _memory_candidate_row(
+        self, row: sqlite3.Row, *, evaluate_reopen: bool = False
+    ) -> dict[str, Any]:
         candidate = json.loads(row["candidate_json"])
         candidate["schema"] = MEMORY_CANDIDATE_SCHEMA
         candidate["created_at"] = str(row["created_at"])
         candidate["updated_at"] = str(row["updated_at"])
+        try:
+            candidate["revision"] = int(row["revision"])
+        except (IndexError, KeyError, TypeError, ValueError):
+            candidate["revision"] = 1
+        return self._attach_memory_candidate_decision_contract(
+            candidate, evaluate_reopen=evaluate_reopen
+        )
+
+    def _attach_memory_candidate_decision_contract(
+        self, candidate: dict[str, Any], *, evaluate_reopen: bool = False
+    ) -> dict[str, Any]:
+        """Compute and attach ``decision_contract`` on a plain candidate dict.
+
+        Shared by the DB-row path (``_memory_candidate_row``) and
+        ``review_memory_candidate``/``reopen_memory_candidate``, which already
+        hold an updated in-memory candidate and must not persist a stale
+        ``decision_contract`` inside ``candidate_json`` (it depends on RAG
+        adoption state, which lives outside this row).
+        """
+
+        reopen_allowed: bool | None = None
+        reopen_reason: str | None = None
+        adopted = False
+        if candidate["kind"] == "MEMORY" and candidate["state"] == "KEEP":
+            adopted = self._memory_candidate_adopted(candidate)
+        if evaluate_reopen:
+            reopen_allowed, reopen_reason = self._memory_candidate_reopen_eligibility(
+                candidate, adopted=adopted
+            )
+            candidate["review_history"] = self._memory_candidate_review_history(
+                str(candidate["candidate_id"])
+            )
+        candidate["decision_contract"] = memory_candidate_decision_contract(
+            candidate,
+            adopted=adopted,
+            reopen_allowed=reopen_allowed,
+            reopen_reason=reopen_reason,
+        )
         return candidate
+
+    def _memory_candidate_review_history(self, candidate_id: str) -> list[dict[str, Any]]:
+        """Immutable REVIEWED/REOPENED event log, oldest first.
+
+        Only computed for single-candidate reads (get/review/reopen) —
+        ``evaluate_reopen`` gates this the same way it gates the reopen
+        eligibility lookup, to keep ``list_memory_candidates`` free of a
+        per-row query.
+        """
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT event, decision, reason, revision, recorded_at
+                FROM memory_candidate_review_history
+                WHERE candidate_id = ?
+                ORDER BY revision ASC, history_id ASC
+                """,
+                (candidate_id,),
+            ).fetchall()
+        return [
+            {
+                "event": row["event"],
+                "decision": row["decision"],
+                "reason": row["reason"],
+                "revision": int(row["revision"]),
+                "recorded_at": row["recorded_at"],
+            }
+            for row in rows
+        ]
+
+    def _memory_candidate_adopted(self, candidate: Mapping[str, Any]) -> bool:
+        """Whether this MEMORY candidate's digest has already reached canonical RAG.
+
+        Mirrors the origin_ref shape ``adopt_memory_candidate`` writes; does not
+        change candidate state, so this is the only signal available.
+        """
+
+        origin_ref = (
+            "universe://memory-candidates/"
+            f"{candidate['candidate_digest']}/{quote(str(candidate['candidate_id']), safe='')}"
+        )
+        try:
+            existing = self._find_project_memory_by_origin_ref(
+                str(candidate["project_id"]), origin_ref
+            )
+        except UniverseError:
+            return False
+        return existing is not None
+
+    def _memory_candidate_reopen_eligibility(
+        self, candidate: Mapping[str, Any], *, adopted: bool
+    ) -> tuple[bool, str | None]:
+        if candidate["state"] == "REVIEW_REQUIRED":
+            return False, "ALREADY_REVIEW_REQUIRED"
+        if candidate["kind"] == "MEMORY" and candidate["state"] == "KEEP" and adopted:
+            return False, "RAG_ALREADY_ADOPTED"
+        return True, None
 
     def _insert_memory_candidates(
         self,
@@ -19169,7 +19305,7 @@ class UniverseStore:
                 "memory candidate does not exist",
                 HTTPStatus.NOT_FOUND,
             )
-        return self._memory_candidate_row(row)
+        return self._memory_candidate_row(row, evaluate_reopen=True)
 
     def review_memory_candidate(
         self,
@@ -19213,29 +19349,64 @@ class UniverseStore:
                 "candidate is no longer reviewable",
                 HTTPStatus.CONFLICT,
             )
+        allowed_decisions = memory_candidate_allowed_decisions(candidate["kind"])
+        if decision not in allowed_decisions:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_DECISION_NOT_ALLOWED_FOR_KIND",
+                f"{decision} is not a valid decision for {candidate['kind']} candidates",
+                HTTPStatus.CONFLICT,
+            )
         now = utc_now()
-        candidate["state"] = decision
-        candidate["review"] = {
+        current_revision = int(candidate.get("revision") or 1)
+        next_revision = current_revision + 1
+        persisted = {
+            key: value_
+            for key, value_ in candidate.items()
+            if key not in ("decision_contract", "revision")
+        }
+        persisted["state"] = decision
+        persisted["review"] = {
             "decision": decision,
             "note": note,
             "decided_at": now,
         }
-        candidate["updated_at"] = now
+        persisted["updated_at"] = now
         review_id = "memory_review_" + _json_sha256(
-            {"candidate_id": candidate["candidate_id"], "decision": decision}
+            {
+                "candidate_id": candidate["candidate_id"],
+                "decision": decision,
+                "revision": next_revision,
+            }
         )[:24]
+        history_id = "memory_review_history_" + _json_sha256(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "event": "REVIEWED",
+                "revision": next_revision,
+            }
+        )[:24]
+        decision_json = _canonical_json(
+            {
+                "schema": "universe.memory-candidate-review.v1",
+                "decision": decision,
+                "note": note,
+                "decided_at": now,
+            }
+        )
         with self._connection() as connection:
             update = connection.execute(
                 """
                 UPDATE memory_candidate
-                SET state = ?, candidate_json = ?, updated_at = ?
-                WHERE candidate_id = ? AND state = 'REVIEW_REQUIRED'
+                SET state = ?, candidate_json = ?, updated_at = ?, revision = ?
+                WHERE candidate_id = ? AND state = 'REVIEW_REQUIRED' AND revision = ?
                 """,
                 (
                     decision,
-                    _canonical_json(candidate),
+                    _canonical_json(persisted),
                     now,
+                    next_revision,
                     candidate["candidate_id"],
+                    current_revision,
                 ),
             )
             if update.rowcount != 1:
@@ -19250,38 +19421,246 @@ class UniverseStore:
                     review_id, candidate_id, project_id, decision,
                     decision_json, decided_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    review_id = excluded.review_id,
+                    decision = excluded.decision,
+                    decision_json = excluded.decision_json,
+                    decided_at = excluded.decided_at
                 """,
                 (
                     review_id,
                     candidate["candidate_id"],
                     candidate["project_id"],
                     decision,
-                    _canonical_json(
-                        {
-                            "schema": "universe.memory-candidate-review.v1",
-                            "decision": decision,
-                            "note": note,
-                            "decided_at": now,
-                        }
-                    ),
+                    decision_json,
                     now,
                 ),
             )
-        return candidate, True
+            connection.execute(
+                """
+                INSERT INTO memory_candidate_review_history(
+                    history_id, candidate_id, project_id, event, decision,
+                    reason, revision, event_json, recorded_at
+                ) VALUES (?, ?, ?, 'REVIEWED', ?, NULL, ?, ?, ?)
+                """,
+                (
+                    history_id,
+                    candidate["candidate_id"],
+                    candidate["project_id"],
+                    decision,
+                    next_revision,
+                    decision_json,
+                    now,
+                ),
+            )
+        final_candidate = dict(persisted)
+        final_candidate["revision"] = next_revision
+        return (
+            self._attach_memory_candidate_decision_contract(
+                final_candidate, evaluate_reopen=True
+            ),
+            True,
+        )
+
+    def reopen_memory_candidate(
+        self,
+        candidate_id: str,
+        value: Any,
+    ) -> dict[str, Any]:
+        """Explicit re-review: return a decided candidate to REVIEW_REQUIRED.
+
+        Never overwrites or deletes the prior decision row or history — see
+        docs/memory-candidate-decision-contract-20260911.md §2.
+        """
+
+        if not isinstance(value, Mapping):
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REOPEN_INVALID",
+                "reopen body must be an object",
+            )
+        if set(value) - {
+            "expected_candidate_digest",
+            "expected_candidate_revision",
+            "reason",
+            "project_id",
+        }:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REOPEN_INVALID",
+                "reopen contains unsupported fields",
+            )
+        expected_digest = value.get("expected_candidate_digest")
+        if not isinstance(expected_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_digest.strip().lower()
+        ):
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REOPEN_INVALID",
+                "expected_candidate_digest must be a SHA-256 hex digest",
+            )
+        expected_digest = expected_digest.strip().lower()
+        expected_revision = value.get("expected_candidate_revision")
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REOPEN_INVALID",
+                "expected_candidate_revision must be a positive integer",
+            )
+        reason = str(value.get("reason") or "").strip()
+        if len(reason) > 500:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REOPEN_INVALID", "reason is too long"
+            )
+        candidate = self.get_memory_candidate(candidate_id)
+        if value.get("project_id") is not None and _project_id(value["project_id"]) != candidate["project_id"]:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                "reopen project_id does not match candidate",
+                HTTPStatus.CONFLICT,
+            )
+        if candidate["state"] == "REVIEW_REQUIRED":
+            raise UniverseError(
+                "MEMORY_CANDIDATE_STATE_CONFLICT",
+                "candidate is already REVIEW_REQUIRED",
+                HTTPStatus.CONFLICT,
+            )
+        if candidate["candidate_digest"] != expected_digest:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_DIGEST_STALE",
+                "candidate content changed since this digest was observed",
+                HTTPStatus.CONFLICT,
+            )
+        current_revision = int(candidate.get("revision") or 1)
+        if current_revision != expected_revision:
+            raise UniverseError(
+                "MEMORY_CANDIDATE_REVISION_STALE",
+                "candidate was reviewed or reopened again since this revision",
+                HTTPStatus.CONFLICT,
+            )
+        if candidate["kind"] == "MEMORY" and candidate["state"] == "KEEP":
+            if self._memory_candidate_adopted(candidate):
+                raise UniverseError(
+                    "RAG_ALREADY_ADOPTED",
+                    "candidate has already been adopted into canonical RAG",
+                    HTTPStatus.CONFLICT,
+                )
+        now = utc_now()
+        next_revision = current_revision + 1
+        persisted = {
+            key: value_
+            for key, value_ in candidate.items()
+            if key not in ("decision_contract", "revision", "review")
+        }
+        persisted["state"] = "REVIEW_REQUIRED"
+        persisted["updated_at"] = now
+        history_id = "memory_review_history_" + _json_sha256(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "event": "REOPENED",
+                "revision": next_revision,
+            }
+        )[:24]
+        event_json = _canonical_json(
+            {
+                "schema": "universe.memory-candidate-reopen.v1",
+                "reason": reason,
+                "prior_state": candidate["state"],
+                "recorded_at": now,
+            }
+        )
+        with self._connection() as connection:
+            update = connection.execute(
+                """
+                UPDATE memory_candidate
+                SET state = 'REVIEW_REQUIRED', candidate_json = ?, updated_at = ?, revision = ?
+                WHERE candidate_id = ? AND state != 'REVIEW_REQUIRED' AND revision = ?
+                """,
+                (
+                    _canonical_json(persisted),
+                    now,
+                    next_revision,
+                    candidate["candidate_id"],
+                    current_revision,
+                ),
+            )
+            if update.rowcount != 1:
+                raise UniverseError(
+                    "MEMORY_CANDIDATE_REVISION_STALE",
+                    "candidate changed before reopen was recorded",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                """
+                INSERT INTO memory_candidate_review_history(
+                    history_id, candidate_id, project_id, event, decision,
+                    reason, revision, event_json, recorded_at
+                ) VALUES (?, ?, ?, 'REOPENED', NULL, ?, ?, ?, ?)
+                """,
+                (
+                    history_id,
+                    candidate["candidate_id"],
+                    candidate["project_id"],
+                    reason,
+                    next_revision,
+                    event_json,
+                    now,
+                ),
+            )
+        final_candidate = dict(persisted)
+        final_candidate["revision"] = next_revision
+        return self._attach_memory_candidate_decision_contract(
+            final_candidate, evaluate_reopen=True
+        )
+
+    def _memory_candidate_with_next_action_target(
+        self, candidate: Mapping[str, Any], target_ref: str | None
+    ) -> dict[str, Any]:
+        """Copy ``candidate`` with ``decision_contract.next_action.target_ref`` filled.
+
+        Only the review/reopen response needs a concrete target_ref (the
+        actual follow-up work just ran); list/get responses leave it None
+        rather than pay for a generation/lookup on every read.
+        """
+
+        updated = dict(candidate)
+        contract = dict(updated.get("decision_contract") or {})
+        next_action = dict(contract.get("next_action") or {})
+        next_action["target_ref"] = target_ref
+        contract["next_action"] = next_action
+        updated["decision_contract"] = contract
+        return updated
 
     def attach_memory_review_next_work(
         self, candidate: Mapping[str, Any]
     ) -> dict[str, Any]:
-        if str(candidate.get("state") or "") not in {
-            "EXPLORE",
-            "START_PRODUCT_DESIGN",
-        }:
+        kind = str(candidate.get("kind") or "").strip().upper()
+        state = str(candidate.get("state") or "").strip().upper()
+        next_action_kind = memory_candidate_next_action_kind(kind, state)
+        if next_action_kind == "NONE":
             return {}
+        if next_action_kind == "ACKNOWLEDGED_NO_AUTOMATION":
+            # KEEP on a non-MEMORY kind: acknowledged, no automation exists for it.
+            return {"next_operation": "USER_REVIEW_ONLY"}
+        if next_action_kind == "RAG_ADOPT_AVAILABLE":
+            target_ref = str(candidate.get("candidate_digest") or "") or None
+            return {
+                "candidate": self._memory_candidate_with_next_action_target(
+                    candidate, target_ref
+                ),
+                "next_operation": "USER_REVIEW_ONLY",
+            }
+        # PRODUCT_PROPOSAL_ATTEMPTED
         generated = self.generate_feature_node_proposals(
             str(candidate["project_id"])
         )
         snapshot = self.work_loop_snapshot(str(candidate["project_id"]))
+        candidate_source_ref = f"universe://memory-candidates/{candidate['candidate_id']}"
+        target_ref = None
+        for proposal in generated.get("proposals") or []:
+            if candidate_source_ref in (proposal.get("evidence_refs") or []):
+                target_ref = f"universe://feature-node-proposals/{proposal['proposal_id']}"
+                break
         return {
+            "candidate": self._memory_candidate_with_next_action_target(
+                candidate, target_ref
+            ),
             "feature_node_proposals": generated,
             "review_inbox": snapshot.get("review_inbox"),
             "effects": generated.get("effects") or {
@@ -46107,6 +46486,40 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._send(HTTPStatus.OK, payload)
                 return
+            if parts is not None and parts[1] == "/memory-candidates/reopen":
+                if not isinstance(body, Mapping):
+                    raise UniverseError(
+                        "MEMORY_CANDIDATE_REOPEN_INVALID",
+                        "reopen body must be an object",
+                    )
+                candidate_id = body.get("candidate_id")
+                if not candidate_id:
+                    raise UniverseError(
+                        "MEMORY_CANDIDATE_ID_REQUIRED",
+                        "candidate_id is required",
+                    )
+                reopen_request = {
+                    key: body[key]
+                    for key in (
+                        "expected_candidate_digest",
+                        "expected_candidate_revision",
+                        "reason",
+                    )
+                    if key in body
+                }
+                reopen_request["project_id"] = parts[0]
+                candidate = self.server.store.reopen_memory_candidate(
+                    str(candidate_id), reopen_request
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_CANDIDATE_REOPENED",
+                        "candidate": candidate,
+                    },
+                )
+                return
             if parts is not None and parts[1] == "/memories/link":
                 memory_id = _identifier(body.get("memory_id"), "memory_id")
                 memory = self.server.store.link_project_memory(
@@ -46705,6 +47118,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memory-batches/runs",
             "/memory-batch-config",
             "/memory-candidates/review",
+            "/memory-candidates/reopen",
             "/memory-candidates",
             "/failure-reuse/query",
             "/failure-reuse/observations",
