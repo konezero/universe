@@ -18428,6 +18428,207 @@ class UniverseLocalServiceTests(unittest.TestCase):
             claimed["message"]["lease_expires_at"],
         )
 
+    def _fake_master_host(self, terminals: list[dict[str, Any]]) -> Any:
+        class FakeMasterHost:
+            def __init__(self, items: list[dict[str, Any]]) -> None:
+                self._terminals = items
+
+            def list_sessions(self) -> list[dict[str, Any]]:
+                return self._terminals
+
+            def get(self, terminal_id: str) -> dict[str, Any]:
+                for terminal in self._terminals:
+                    if terminal.get("terminal_id") == terminal_id:
+                        return terminal
+                raise TerminalHostError("TERMINAL_NOT_FOUND", "not found", 404)
+
+            def emit_output(self, terminal_id: str, data: bytes) -> None:
+                pass
+
+        return FakeMasterHost(terminals)
+
+    def test_wake_master_queue_on_session_ready_skips_when_queue_empty(self) -> None:
+        """todo_cb7441b2fc3847f6b21427116baceb06 test matrix: empty queue."""
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.assertFalse(self.server.store.has_queued_master_message("GCS"))
+        woken = self.server._wake_master_queue_on_session_ready(
+            "GCS", "MASTER", reason="test"
+        )
+        self.assertEqual(0, woken)
+
+    def test_wake_master_queue_on_session_ready_ignores_non_master_mode(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.create_master_message(
+            "GCS",
+            {
+                "idempotency_key": "conductor-mode-check",
+                "title": "t",
+                "instruction": "i",
+            },
+        )
+        woken = self.server._wake_master_queue_on_session_ready(
+            "GCS", "CONDUCTOR", reason="test"
+        )
+        self.assertEqual(0, woken)
+
+    def test_wake_master_queue_on_session_ready_wakes_for_work_queued_before_session(
+        self,
+    ) -> None:
+        """todo_cb7441b2fc3847f6b21427116baceb06's exact repro: a
+        master-message is registered while no live Master terminal exists
+        for the project (create_master_message's own wake attempt finds
+        nothing to wake), then a Master starts later. Session-ready must
+        retry the wake at that point instead of leaving the item silently
+        QUEUED forever."""
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        # No live terminal yet: create_master_message's own wake call is a
+        # no-op (0 live Master terminals), matching the real repro exactly.
+        _, created = self.server.store.create_master_message(
+            "GCS",
+            {
+                "idempotency_key": "work-before-session",
+                "title": "t",
+                "instruction": "i",
+            },
+        )
+        self.assertTrue(created)
+        self.assertTrue(self.server.store.has_queued_master_message("GCS"))
+
+        fake_host = self._fake_master_host(
+            [
+                {
+                    "terminal_id": "term-late",
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "provider": "CLAUDE",
+                    "state": "LIVE",
+                    "active_session_anchor_ref": "session_anchor_late",
+                }
+            ]
+        )
+        with patch.object(
+            self.server, "_session_anchor_terminal_host", return_value=fake_host
+        ):
+            woken = self.server._wake_master_queue_on_session_ready(
+                "GCS", "MASTER", reason="Master session ready"
+            )
+        self.assertEqual(1, woken)
+        inbox = self.server.session_bus.inbox(fake_host, terminal_id="term-late")
+        messages = inbox.get("messages") or inbox.get("inbox") or []
+        self.assertTrue(messages)
+        self.assertIn("Master queue has work waiting", messages[-1]["body_text"])
+
+    def test_wake_master_queue_on_session_ready_stops_once_claimed(self) -> None:
+        """todo_cb7441b2fc3847f6b21427116baceb06 test matrix: busy/retry -
+        once a Master has claimed the item, further session-ready checks
+        (another Master starting, a reconnect) must not keep nagging."""
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.create_master_message(
+            "GCS", {"idempotency_key": "claimed-item", "title": "t", "instruction": "i"}
+        )
+        self.server.store.claim_master_message("GCS", provider="CLAUDE")
+        self.assertFalse(self.server.store.has_queued_master_message("GCS"))
+        woken = self.server._wake_master_queue_on_session_ready(
+            "GCS", "MASTER", reason="test"
+        )
+        self.assertEqual(0, woken)
+
+    def test_wake_master_queue_on_session_ready_duplicate_hook_fires_do_not_double_claim(
+        self,
+    ) -> None:
+        """todo_cb7441b2fc3847f6b21427116baceb06 test matrix: duplicate
+        hooks/reconnect, concurrent claim. Repeating the nudge is the
+        intended retry-until-claimed behavior (not deduplicated), but the
+        underlying work item itself can still only be claimed once -
+        claim_master_message's own state transition is what prevents
+        double execution, not the wake call."""
+
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        self.server.store.create_master_message(
+            "GCS", {"idempotency_key": "duplicate-fire", "title": "t", "instruction": "i"}
+        )
+        fake_host = self._fake_master_host(
+            [
+                {
+                    "terminal_id": "term-dup",
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "provider": "CLAUDE",
+                    "state": "LIVE",
+                    "active_session_anchor_ref": "session_anchor_dup",
+                }
+            ]
+        )
+        with patch.object(
+            self.server, "_session_anchor_terminal_host", return_value=fake_host
+        ):
+            first = self.server._wake_master_queue_on_session_ready(
+                "GCS", "MASTER", reason="hook fire 1"
+            )
+            second = self.server._wake_master_queue_on_session_ready(
+                "GCS", "MASTER", reason="hook fire 2 (duplicate)"
+            )
+        self.assertEqual(1, first)
+        self.assertEqual(1, second)  # both notify - repetition is intended
+
+        first_claim = self.server.store.claim_master_message("GCS", provider="CLAUDE")
+        self.assertIsNotNone(first_claim)
+        second_claim = self.server.store.claim_master_message("GCS", provider="CODEX")
+        self.assertIsNone(second_claim)  # only one QUEUED item, claimed once
+
+    def test_cli_terminal_reattach_wakes_master_queue(self) -> None:
+        """Integration: the same reconnect path exercised by
+        test_cli_terminal_reattach_auto_claims_pending_instruction_once also
+        retries the master-messages wake, end to end through
+        create_cli_terminal."""
+
+        self.server.store.register_project(self.registration())
+        self.server.store.create_master_message(
+            "GCS", {"idempotency_key": "reattach-wake", "title": "t", "instruction": "i"}
+        )
+        hosted = {
+            "terminal_id": "term_master_queue_reattach",
+            "host_session_ref": "host-master-queue-reattach",
+            "project_id": "GCS",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "supervisor_session_id": "session_master_queue_reattach",
+            "session_anchor_ref": "session_anchor_master_queue_reattach",
+            "host_compatibility": "CURRENT",
+            "host_reconnect_eligible": True,
+            "state": "LIVE",
+        }
+        managed = Mock()
+        managed.public.return_value = hosted
+        terminal_host = Mock()
+        terminal_host.get_host.return_value = managed
+        terminal_host.get.return_value = managed
+        terminal_host.list_sessions.return_value = [hosted]
+        terminal_host.channel_state.return_value = "READY"
+        terminal_host.push_channel.return_value = {}
+        self.server.terminal_host = terminal_host
+
+        attached = self.server.create_cli_terminal(
+            {
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "cwd": str(self.project_root),
+                "provider": "CLAUDE",
+                "host_session_ref": "host-master-queue-reattach",
+            }
+        )
+        self.assertEqual("CLI_TERMINAL_ATTACHED", attached["status"])
+
+        inbox = self.server.session_bus_inbox(
+            {"terminal_id": "term_master_queue_reattach"}
+        )
+        messages = inbox.get("messages") or inbox.get("inbox") or []
+        self.assertTrue(
+            any("Master queue has work waiting" in m["body_text"] for m in messages)
+        )
+
     def test_wake_live_master_sessions_notifies_every_live_master_terminal(
         self,
     ) -> None:

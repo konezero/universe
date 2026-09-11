@@ -21589,6 +21589,26 @@ class UniverseStore:
         message["created_at"] = row["created_at"]
         return message
 
+    def has_queued_master_message(self, project_id: str) -> bool:
+        """Cheap existence check reused by the session-ready wake retry
+        (see UniverseHTTPServer._wake_master_queue_on_session_ready) and by
+        claim_master_message's own candidate query - same
+        json_extract(...) = 'QUEUED' predicate as claim_master_message uses,
+        so "has work to wake for" and "would actually be claimable" agree.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM project_master_message
+                WHERE project_id = ?
+                  AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        return row is not None
+
     def claim_master_message(
         self,
         project_id: str,
@@ -34261,7 +34281,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             project_id = str(terminal.get("project_id") or "").strip()
             if not (session_id and session_anchor_ref and provider and mode and project_id):
                 return None
-            return self._dispatch_pending_session_instruction(
+            result = self._dispatch_pending_session_instruction(
                 project_id=project_id,
                 session={
                     "session_id": session_id,
@@ -34272,6 +34292,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 trigger="RECONNECT",
                 terminal=terminal,
             )
+            self._wake_master_queue_on_session_ready(
+                project_id, mode, reason="Master reconnected - existing queued work"
+            )
+            return result
         except Exception as error:  # noqa: BLE001 - never break an attach response
             return {"status": "RECONNECT_DISPATCH_UNAVAILABLE", "detail": str(error)}
 
@@ -35023,6 +35047,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._dispatch_live_posted_session_instructions({"messages": [delivered]})
             woken += 1
         return woken
+
+    def _wake_master_queue_on_session_ready(
+        self, project_id: str, mode: str, *, reason: str
+    ) -> int:
+        """Retry the master-messages wake nudge on session ready/reconnect,
+        not only at the moment a work item is first queued.
+
+        _wake_live_master_sessions was previously called only from
+        create_master_message's ``if created:`` branch - a message queued
+        while no live Master terminal existed for the project never got a
+        second attempt (todo_cb7441b2fc3847f6b21427116baceb06's repro: a
+        Master started later, reached LIVE/CURRENT, but its Session Bus
+        inbox stayed empty and the item sat QUEUED indefinitely). This is a
+        distinct table/mechanism from session_bus's own message queue
+        (project_master_message has no periodic recovery sweep at all,
+        unlike run_session_bus_recovery_once) and from
+        _dispatch_pending_session_instruction, which never touches it.
+
+        Only MASTER mode has a master-messages queue to wake for. Re-sending
+        the nudge on every ready/reconnect while an item is still QUEUED is
+        the intended retry, not a duplicate-execution bug: this never claims
+        or executes the item (_wake_live_master_sessions's own contract) -
+        claim_master_message's per-item state transition is what actually
+        prevents two Masters from running the same item twice. Never raises.
+        """
+
+        if str(mode or "").strip().upper() != "MASTER":
+            return 0
+        try:
+            if not self.store.has_queued_master_message(project_id):
+                return 0
+        except Exception:  # noqa: BLE001 - a check must never block session ready
+            return 0
+        return self._wake_live_master_sessions(project_id, reason=reason)
 
     def _observe_session_bus_result(self, packet: Mapping[str, Any]) -> None:
         original = packet.get("message")
@@ -39295,6 +39353,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             session=session,
             trigger=trigger,
         )
+        if trigger == "SESSION_START":
+            self._wake_master_queue_on_session_ready(
+                project_id,
+                str(session.get("mode") or ""),
+                reason="Master session ready - existing queued work",
+            )
         self._resume_hook_verified_conductor_allocations(
             project_id, session_anchor_ref
         )
