@@ -413,3 +413,7 @@ The status at the top describes the original product slice, not proof that every
 later addition has been applied to the running service. In particular, consult
 the dated failure-reuse follow-up for its resident/provider NOT_RUN boundary.
 No additional Todo is needed for the gaps above: they already have owners.
+
+## 2026-09-12 자동화 상태 정정
+
+수동 governed 추출의 검증은 예약 자동 실행의 완료 증거가 아니다. 예약 Task Frame 준비가 누락되어 자동 AI 추출은 아직 미완료다. 현재 구현·검증·남은 조건은 [RAG 자동화 점검](rag-automation-status-20260912.md)을 참조한다.

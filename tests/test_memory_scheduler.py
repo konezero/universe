@@ -86,6 +86,14 @@ class MemorySchedulerTests(unittest.TestCase):
         self.assertEqual("host-1", store.claim_args["lease_owner"])
         self.assertEqual("SUCCEEDED", store.finished[0][1]["outcome"])
 
+    def test_wrapped_or_failed_result_is_not_recorded_as_success(self) -> None:
+        for result in ({"run": {"run_id": "r1", "status": "COMPLETED"}}, {"run_id": "r1", "status": "FAILED"}):
+            store = FakeStore({"schedule_id":"s1", "project_id":"p", "stage":"CONSOLIDATE", "due_slot_key":"slot"})
+            scheduler = MemoryBatchScheduler(store, lambda *_: result)
+            scheduler.tick()
+            self.assertEqual("FAILED", store.finished[0][1]["outcome"])
+            self.assertEqual("MEMORY_BATCH_RESULT_INVALID", store.finished[0][1]["error_code"])
+
     def test_failure_is_persisted_and_shutdown_refuses_claims(self) -> None:
         claim = {
             "schedule_id": "schedule_1",

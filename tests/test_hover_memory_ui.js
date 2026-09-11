@@ -18,7 +18,7 @@ let candidate = { candidate_id: 'c1', project_id: 'project-a', candidate_digest:
 let memories = [], calls = [], fail = false;
 const body = new Element('body');
 const context = {
-  Map, Set, Date, console, document: {body},
+  Map, Set, Date, console, state: {view:"documents"}, document: {body, createElement: tag => new Element(tag)}, Option: function(text,value) {return new Element("option", "", text);},
   node: (...args) => new Element(...args), markdownBody: text => new Element('p','',text),
   closeDocumentHover() {}, toast() {},
   memoryCandidateActionSpecs: c => c.decision_contract.allowed_actions.map(id => ({id})),
@@ -33,6 +33,7 @@ const context = {
       candidate = {...candidate, state:'KEEP', decision_contract:{allowed_actions:[], next_action:{kind:'RAG_ADOPT_AVAILABLE'}}};
       return {candidate, status:'REVIEWED'};
     }
+    if (path.endsWith("/projection")) return {projection:{nodes:[]}};
     return path.endsWith('/memories') ? {memories} : {candidates:[candidate]};
   },
   async invokeServerAction(id, request) {
@@ -55,15 +56,15 @@ vm.runInContext(source.slice(source.indexOf('const hoverKnowledgeCache ='),sourc
   const dialog = body.children.at(-1);
   const buttons = () => dialog.querySelectorAll('button');
   fail = true;
-  await buttons().find(b=>b.textContent==='KEEP').onclick();
-  assert.equal(buttons().find(b=>b.textContent==='Adopt to RAG'),undefined);
+  await buttons().find(b=>b.textContent==='보관').onclick();
+  assert.equal(buttons().find(b=>b.textContent==='RAG에 채택'),undefined);
   fail = false;
-  await buttons().find(b=>b.textContent==='KEEP').onclick();
+  await buttons().find(b=>b.textContent==='보관').onclick();
   assert.equal(candidate.state,'KEEP');
   assert.equal(memories.length,0);
-  await buttons().find(b=>b.textContent==='Adopt to RAG').onclick();
+  await buttons().find(b=>b.textContent==='RAG에 채택').onclick();
   assert.equal(memories.length,1);
-  assert.equal(buttons().find(b=>b.textContent==='Adopt to RAG'),undefined);
+  assert.equal(buttons().find(b=>b.textContent==='RAG에 채택'),undefined);
   assert.equal(context.relatedKnowledgeForNode({kind:'project'},{memories,candidates:[candidate]}).candidates.length,0);
   console.log('PASS node scoping, proposed/unlinked separation, failed review, KEEP, governed adoption, adopted deduplication');
 })().catch(error => {console.error(error);process.exitCode=1;});

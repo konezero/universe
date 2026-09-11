@@ -36695,7 +36695,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 item["source_id"]
                 for item in self.store.list_provider_session_sources()
             ]
-        return self.run_memory_batch(project_id, request)
+        result = self.run_memory_batch(project_id, request)
+        return result["run"]
 
     def _propose_prediction_after_collection(self, project_id: str) -> dict[str, Any]:
         """Create an idempotent review-only prediction after collection.
@@ -36825,6 +36826,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
 
+        if not isinstance(value.get("runtime_binding"), Mapping):
+            raise UniverseError(
+                "MEMORY_BATCH_RUNTIME_PREPARATION_REQUIRED",
+                "AI extraction requires a Host-prepared Task Frame and its exact Runtime attachment",
+                HTTPStatus.CONFLICT,
+            )
         try:
             public_binding = _exact_object_fields(
                 value.get("runtime_binding"), field="runtime_binding",

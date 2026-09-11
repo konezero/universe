@@ -89,6 +89,10 @@ class MemoryScheduleStore(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class MemoryScheduleExecutionError(RuntimeError):
+    code = "MEMORY_BATCH_RESULT_INVALID"
+
+
 Execution = Callable[[str, str], Mapping[str, Any]]
 
 
@@ -138,6 +142,8 @@ class MemoryBatchScheduler:
                 break
             try:
                 result = dict(self.execute(claim["project_id"], claim["stage"]))
+                if not result.get("run_id") or result.get("status", "COMPLETED") not in {"COMPLETED", "DRY_RUN_COMPLETED"}:
+                    raise MemoryScheduleExecutionError("Scheduled execution did not return a completed run")
                 completed_at = format_utc(self.clock.now())
                 terminal = self.store.finish_memory_batch_schedule(
                     claim,
