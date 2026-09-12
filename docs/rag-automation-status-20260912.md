@@ -37,3 +37,5 @@
 다음 커서의 source_0394e8578c8e488aa55bd654b3738de7는 실제 등록상 GROK이다. 자동 소스 선택은 이를 포함했지만 기존 redact_activity_batch 계약은 Codex Activity만 허용하여 FAST_EXTRACT_PROVIDER_INVALID로 provider 호출 전에 실패했다. 커서는 이전 성공 위치를 유지했다. 추출 모델 설정(CODEX/gpt-5.6-luna) 오류가 아니라 입력 소스 지원 범위와 자동 선택의 불일치다.
 
 자동 선택에서 기존 FAST_EXTRACT_PROVIDER 계약과 다른 소스를 제외 사유와 함께 건너뛰도록 수정했다. UI는 ‘현재 추출기가 지원하지 않는 소스’로 표시한다. Grok/Claude 추출 지원을 추가한 것은 아니다. 명시적 source_ids 요청의 기존 검증은 유지한다. 혼합 공급자와 지원 소스가 전혀 없는 경우를 포함한 관련 21건 회귀 PASS, JS 문법/diff 검사 PASS.
+
+추가 실서비스 추적에서 Observer의 activity_refs 최대 512개를 넘는 소스가 자동 준비 단계의 SEMANTIC_EVIDENCE_INVALID를 발생시켰고, 이 단계의 예외가 HTTP 오류 변환 밖에 있어 연결만 닫혔다. 자동 선택은 이를 FAST_EXTRACT_SOURCE_TOO_LARGE로 보고하고 건너뛰며, 예상 밖 Observer/추출 검증 오류는 원래 code/detail을 보존한 UniverseError로 반환한다. 512개 경계·혼합 소스·오류 전달을 포함한 관련 23건 PASS. 큰 소스 내부의 활동 단위 분할 수집은 아직 구현하지 않았다. 해당 소스는 일부를 몰래 잘라서 완료 처리하지 않으며 UI에서 분할 필요로 보인다. 전체 Collector 완료 증거는 아니다.

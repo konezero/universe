@@ -62,6 +62,20 @@ class SourceWindowTests(unittest.TestCase):
         with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")
         self.assertEqual("MEMORY_BATCH_SOURCES_UNAVAILABLE",caught.exception.code)
         self.assertEqual(2,json.loads(caught.exception.detail)["skipped_count"])
+    def test_oversized_source_is_reported_without_truncating_history(self):
+        store=self.store(count=2)
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"CODEX"},"activity_refs":[{"id":sid}]*(513 if sid=="s000" else 512)}
+        ids,report=select_source_window(store,"p")
+        self.assertEqual(["s001"],ids)
+        self.assertEqual("FAST_EXTRACT_SOURCE_TOO_LARGE",report["skipped"][0]["error_code"])
+    def test_observer_validation_error_preserves_typed_http_boundary(self):
+        from provider_session_observer import ProviderSessionObserverError
+        store=self.store(count=1)
+        def failed(*args):raise ProviderSessionObserverError("SEMANTIC_EVIDENCE_INVALID","invalid selected reference")
+        store.provider_session_observer.build_transient_semantic_evidence=failed
+        with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")
+        self.assertEqual("SEMANTIC_EVIDENCE_INVALID",caught.exception.code)
+        self.assertEqual("invalid selected reference",caught.exception.detail)
     def test_empty_sources_do_not_invoke_or_advance(self):
         store=self.store(count=3);store.prepare_provider_activity_batch=lambda sid:{"activity_refs":[]}
         with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")

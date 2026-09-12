@@ -1,6 +1,6 @@
 """Bound automatic collection to the extraction contract and retain a source cursor."""
 import json
-from memory_fast_extract import FAST_EXTRACT_PROVIDER, normalize_transient_semantic_evidence
+from memory_fast_extract import FAST_EXTRACT_PROVIDER, FastExtractError, normalize_transient_semantic_evidence
 from provider_session_observer import ProviderSessionObserverError
 from .connection import UniverseError
 
@@ -37,6 +37,9 @@ def select_source_window(store, project_id):
             if provider and provider != FAST_EXTRACT_PROVIDER:
                 code = "FAST_EXTRACT_PROVIDER_INVALID"
                 evidence = None
+            elif len(refs) > 512:
+                code = "FAST_EXTRACT_SOURCE_TOO_LARGE"
+                evidence = None
             elif not refs:
                 code = "NO_ACTIVITY"
                 evidence = None
@@ -44,8 +47,10 @@ def select_source_window(store, project_id):
                 evidence = store.provider_session_observer.build_transient_semantic_evidence(source_id, refs)
                 evidence = normalize_transient_semantic_evidence(evidence)
                 code = None
-        except (UniverseError, ProviderSessionObserverError) as error:
+        except (UniverseError, ProviderSessionObserverError, FastExtractError) as error:
             if error.code not in RECOVERABLE_SOURCE_ERRORS:
+                if not isinstance(error, UniverseError):
+                    raise UniverseError(error.code, error.detail, 409) from error
                 raise
             code = error.code
             evidence = None
