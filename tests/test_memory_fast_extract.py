@@ -18,6 +18,8 @@ from memory_fast_extract import (  # noqa: E402
     FAST_EXTRACT_EFFORT,
     FAST_EXTRACT_MODEL,
     FAST_EXTRACT_RESULT_SCHEMA,
+    FAST_EXTRACT_MODEL_RESULT_SCHEMA,
+    decode_provider_references,
     FastExtractError,
     build_provider_request,
     normalize_provider_candidates,
@@ -109,9 +111,7 @@ class FastExtractDispatcher(RuntimeWorkerDispatcher):
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED", "WORKER_ADAPTER", "TRANSIENT_TEST_FAILURE"
             )
-        ref_digest = request["context_pack"]["activity_batches"][0]["activity_refs"][0][
-            "activity_digest"
-        ]
+        evidence_id = request["context_pack"]["reference_catalog"][0]["evidence_id"]
         return {
             "status": "COMPLETED",
             "worker_id": "codex-app-server:worker-fast-extract",
@@ -122,13 +122,13 @@ class FastExtractDispatcher(RuntimeWorkerDispatcher):
             "result": {
                 "text": json.dumps(
                     {
-                        "schema": FAST_EXTRACT_RESULT_SCHEMA,
+                        "schema": FAST_EXTRACT_MODEL_RESULT_SCHEMA,
                         "candidates": [
                             {
                                 "kind": "MEMORY",
                                 "summary": "Keep extracted memories review-only before publication.",
                                 "source_range": {"start": 2, "end": 2},
-                                "ref_digests": [ref_digest],
+                                "evidence_ids": [evidence_id],
                             }
                         ],
                     }
@@ -142,6 +142,21 @@ class FastExtractDispatcher(RuntimeWorkerDispatcher):
 
 
 class FastExtractContractTests(unittest.TestCase):
+    def test_reference_ids_are_stable_across_sources_and_exclude_metadata_only_refs(self):
+        from memory_fast_extract import evidence_reference_catalog
+        semantics=[{"activity_digest":"b"*64},{"activity_digest":"a"*64},{"activity_digest":"b"*64}]
+        batches=[{"activity_refs":[{"activity_digest":"a"*64},{"activity_digest":"c"*64}]},{"activity_refs":[{"activity_digest":"b"*64}]}]
+        catalog=evidence_reference_catalog(semantics)
+        self.assertEqual(catalog,evidence_reference_catalog(list(reversed(semantics))))
+        self.assertEqual(["E1","E2"],[item["evidence_id"] for item in catalog])
+        wire={"schema":FAST_EXTRACT_MODEL_RESULT_SCHEMA,"candidates":[{"kind":"MEMORY","summary":"lesson","evidence_ids":["E2","E1"]}]}
+        decoded=decode_provider_references(wire,activity_batches=batches,semantic_evidence=semantics)
+        self.assertEqual(["b"*64,"a"*64],decoded["candidates"][0]["ref_digests"])
+        for fields in ({"evidence_ids":["E3"]},{"ref_digests":["a"*64]},{}):
+            bad={**wire,"candidates":[{"kind":"MEMORY","summary":"lesson",**fields}]}
+            with self.assertRaises(FastExtractError):decode_provider_references(bad,activity_batches=batches,semantic_evidence=semantics)
+
+
     def test_activity_projection_rejects_raw_transcript_and_provider_input_is_redacted(
         self,
     ) -> None:
@@ -208,6 +223,17 @@ class FastExtractContractTests(unittest.TestCase):
             "candidates"
         ]["items"]
         self.assertEqual("MEMORY", candidate_schema["properties"]["kind"]["const"])
+        self.assertEqual(["E1"],candidate_schema["properties"]["evidence_ids"]["items"]["enum"])
+        self.assertEqual("E1",request["context_pack"]["semantic_evidence"][0]["evidence_id"])
+        wire={"schema":FAST_EXTRACT_MODEL_RESULT_SCHEMA,"candidates":[{"kind":"MEMORY","summary":"Supported lesson","evidence_ids":["E1"]}]}
+        decoded=decode_provider_references(wire,activity_batches=[batch],semantic_evidence=request["context_pack"]["semantic_evidence"])
+        self.assertEqual(["a"*64],decoded["candidates"][0]["ref_digests"])
+        self.assertNotIn("ref_digests",wire["candidates"][0])
+        for invalid in (["E99"],["a"*64],["E1","E1"],[],[1]):
+            with self.subTest(invalid=invalid),self.assertRaises(FastExtractError):
+                decode_provider_references({**wire,"candidates":[{**wire["candidates"][0],"evidence_ids":invalid}]},activity_batches=[batch],semantic_evidence=request["context_pack"]["semantic_evidence"])
+        self.assertEqual([],decode_provider_references({**wire,"candidates":[]},activity_batches=[batch],semantic_evidence=request["context_pack"]["semantic_evidence"])["candidates"])
+
         with self.assertRaises(FastExtractError) as captured:
             redact_activity_batch({**batch, "prompt": "secret"})
         self.assertEqual("FAST_EXTRACT_RAW_INPUT_FORBIDDEN", captured.exception.code)
@@ -339,6 +365,45 @@ class FastExtractServerTests(unittest.TestCase):
             "turn_id": "/root/boss/sub1",
             "invoker_actor_ref": "/root/boss",
         }
+
+    def test_no_supported_lesson_completes_with_zero_candidates(self):
+        self.configure()
+        self.server.store.register_provider_session_source({"source_id":"source-1","provider":"CODEX","provider_session_id":"session-1","source_path":str(self.source_path),"source_kind":"CODEX_ROLLOUT_JSONL"})
+        self.server.store.scan_provider_session_source("source-1")
+        original=self.dispatcher._invoke_provider
+        def empty(provider,request):
+            result=original(provider,request)
+            result["result"]["text"]=json.dumps({"schema":FAST_EXTRACT_MODEL_RESULT_SCHEMA,"candidates":[]})
+            return result
+        self.dispatcher._invoke_provider=empty
+        binding=self.attached_binding("session-empty","frame-empty","temporary-test-token")
+        status,result=self.request("POST","/v1/projects/TEST/memory-batches/run",{"stage":"FAST_EXTRACT","source_ids":["source-1"],"runtime_binding":binding})
+        self.assertEqual(200,status,result)
+        self.assertEqual("COMPLETED",result["run"]["status"])
+        self.assertEqual(0,result["run"]["created_count"])
+        _,candidates=self.request("GET","/v1/projects/TEST/memory-candidates")
+        self.assertEqual([],candidates["candidates"])
+
+    def test_unknown_model_reference_rejects_entire_batch_without_candidate_writes(self):
+        self.configure()
+        self.server.store.register_provider_session_source({"source_id":"source-1","provider":"CODEX","provider_session_id":"session-1","source_path":str(self.source_path),"source_kind":"CODEX_ROLLOUT_JSONL"})
+        self.server.store.scan_provider_session_source("source-1")
+        original=self.dispatcher._invoke_provider
+        def invalid(provider,request):
+            result=original(provider,request)
+            wire=json.loads(result["result"]["text"])
+            wire["candidates"].append({"kind":"MEMORY","summary":"Unsupported reference","evidence_ids":["E999"]})
+            result["result"]["text"]=json.dumps(wire)
+            return result
+        self.dispatcher._invoke_provider=invalid
+        binding=self.attached_binding("session-invalid-ref","frame-invalid-ref","temporary-test-token")
+        status,result=self.request("POST","/v1/projects/TEST/memory-batches/run",{"stage":"FAST_EXTRACT","source_ids":["source-1"],"runtime_binding":binding})
+        self.assertEqual(409,status,result)
+        self.assertEqual("FAST_EXTRACT_REFERENCE_INVALID",result["error_code"])
+        _,candidates=self.request("GET","/v1/projects/TEST/memory-candidates")
+        self.assertEqual([],candidates["candidates"])
+        _,runs=self.request("GET","/v1/projects/TEST/memory-batches/runs")
+        self.assertEqual("FAILED",runs["runs"][0]["status"])
 
     def test_runtime_reference_rejects_inline_secret_stale_ref_and_wrong_anchor(self):
         self.configure()

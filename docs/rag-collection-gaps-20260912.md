@@ -63,3 +63,6 @@ residual_risks: [missing_files_11, duplicate_source_registrations_17, unvisited_
 evidence_refs: [.ai/runtime/tmp/rag-gaps-live-maintenance.json, .ai/runtime/tmp/rag-gaps-auto-live.json, .ai/runtime/tmp/rag-gaps-history-live-result.json]
 changed_paths: [tools/provider_rag_collection.py, tools/provider_session_observer.py, tools/universe_app/memory_source_window.py, tools/universe_server.py, tools/universe_ui/app.js, tests/test_provider_rag_collection.py]
 ```
+
+
+후속: 위 자동 모델 출처 실패는 [근거 번호 계약 보완](rag-reference-contract-20260912.md) 후 같은 run의 attempt2에서 성공했다. 원래 실패 증거는 유지하며, 입력 참조 형식 보완과 요약의 의미적 사실성 검증을 구분한다.

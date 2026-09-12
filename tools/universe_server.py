@@ -173,6 +173,7 @@ from memory_fast_extract import (
     build_skill_observation_candidate,
     digest as fast_extract_digest,
     normalize_provider_candidates,
+    decode_provider_references,
     normalize_runtime_binding,
     redact_activity_batches,
     redacted_execution_record,
@@ -37100,6 +37101,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "Task Frame result model does not match the FAST_EXTRACT ceiling",
                     )
                 structured_result = provider_result.get("structured_result")
+                structured_result = decode_provider_references(structured_result, activity_batches=activity_batches, semantic_evidence=semantic_evidence)
                 candidates = normalize_provider_candidates(
                     structured_result,
                     project_id=project_id,
