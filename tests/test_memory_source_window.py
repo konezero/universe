@@ -44,7 +44,7 @@ class SourceWindowTests(unittest.TestCase):
         self.assertEqual("SEMANTIC_SOURCE_NOT_CURRENT",report["skipped"][0]["error_code"])
     def test_other_provider_sources_are_reported_and_never_read_for_extraction(self):
         store=self.store(count=3)
-        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"GROK" if sid=="s000" else "CODEX"},"activity_refs":[{"id":sid}]}
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"UNSUPPORTED" if sid=="s000" else "CODEX"},"activity_refs":[{"id":sid}]}
         original=store.provider_session_observer.build_transient_semantic_evidence
         read=[]
         def evidence(sid,refs, **kwargs):
@@ -56,9 +56,17 @@ class SourceWindowTests(unittest.TestCase):
         self.assertEqual(ids,read)
         self.assertEqual(0,report["deferred_count"])
         self.assertEqual([{"source_id":"s000","error_code":"FAST_EXTRACT_PROVIDER_INVALID"}],report["skipped"])
+    def test_all_supported_source_providers_are_selected(self):
+        store=self.store(count=3)
+        providers=dict(zip(["s000","s001","s002"],["CODEX","CLAUDE","GROK"]))
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":providers[sid]},"activity_refs":[{"id":sid}]}
+        ids,report=select_source_window(store,"p")
+        self.assertEqual(list(providers),ids)
+        self.assertEqual(0,report["skipped_count"])
+        self.assertEqual(set(providers.values()),{v["source"]["provider"] for v in report["activity_windows"].values()})
     def test_only_unsupported_sources_do_not_advance(self):
         store=self.store(count=2)
-        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"CLAUDE"},"activity_refs":[{"id":sid}]}
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"UNSUPPORTED"},"activity_refs":[{"id":sid}]}
         with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")
         self.assertEqual("MEMORY_BATCH_SOURCES_UNAVAILABLE",caught.exception.code)
         self.assertEqual(2,json.loads(caught.exception.detail)["skipped_count"])

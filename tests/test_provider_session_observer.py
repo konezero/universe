@@ -622,6 +622,57 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertNotIn("hello world", persisted)
         self.assertNotIn("secret thought", persisted)
 
+    def test_claude_rag_uses_latest_branch_ancestry_and_rejects_abandoned_refs(self):
+        path=self.root/"branch-rag.jsonl"
+        events=[{"type":"user","uuid":"root","message":{"content":"root request"}},
+                {"type":"assistant","uuid":"old","parentUuid":"root","message":{"content":"abandoned answer"}}]
+        self.write(path,*events)
+        source=self.register("CLAUDE",path);sid=str(source["source_id"])
+        self.store.scan(sid)
+        old=self.store.build_batch_candidate(sid)["activity_refs"]
+        self.write(path,*events,{"type":"assistant","uuid":"new","parentUuid":"root","message":{"content":"current answer"}})
+        self.store.scan(sid)
+        refs=self.store.build_batch_candidate(sid)["activity_refs"]
+        self.assertEqual([3,1],[ref["ordinal"] for ref in refs])
+        evidence=self.store.build_transient_semantic_evidence(sid,refs,require_complete=True)
+        self.assertEqual(["root request","current answer"],[item["text"] for item in evidence])
+        with self.assertRaises(ProviderSessionObserverError) as caught:
+            self.store.build_transient_semantic_evidence(sid,old,require_complete=True)
+        self.assertEqual("SEMANTIC_ACTIVITY_NOT_ATTESTED",caught.exception.code)
+
+    def test_multi_provider_rag_evidence_preserves_origin_and_excludes_tools(self) -> None:
+        from memory_fast_extract import redact_activity_batch, normalize_transient_semantic_evidence, FAST_EXTRACT_PROVIDER, FastExtractError
+        cases = {
+            "CLAUDE": ("rag-claude.jsonl", [
+                {"type":"user","uuid":"u","message":{"role":"user","content":[
+                    {"type":"tool_result","content":"private tool output"},
+                    {"type":"text","text":"visible request"}]}},
+                {"type":"assistant","uuid":"a","parentUuid":"u","message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"hidden thought"},
+                    {"type":"tool_use","input":{"text":"private tool input"}},
+                    {"type":"text","text":"visible answer"}]}}
+            ]),
+            "GROK": ("updates.jsonl", [
+                {"method":"session/update","params":{"update":{"sessionUpdate":kind,"content":{"type":"text","text":text}}}}
+                for kind,text in [("user_message_chunk","visible request"),("agent_thought_chunk","hidden thought"),("agent_message_chunk","visible answer")]
+            ])
+        }
+        for provider,(name,events) in cases.items():
+            with self.subTest(provider=provider):
+                path=self.root/name
+                self.write(path,*events)
+                source=self.register(provider,path)
+                sid=str(source["source_id"])
+                self.store.scan(sid)
+                batch=redact_activity_batch(self.store.build_batch_candidate(sid))
+                self.assertEqual(provider,batch["source"]["provider"])
+                evidence=normalize_transient_semantic_evidence(self.store.build_transient_semantic_evidence(sid,batch["activity_refs"],require_complete=True))
+                self.assertEqual(["visible request","visible answer"],[item["text"] for item in evidence])
+                self.assertNotIn("visible answer",json.dumps(batch))
+                batch["source"]["provider"]="UNSUPPORTED"
+                with self.assertRaises(FastExtractError):redact_activity_batch(batch)
+        self.assertEqual("CODEX",FAST_EXTRACT_PROVIDER)
+
     def test_visible_transcript_reads_recent_claude_and_grok_text(self) -> None:
         claude_path = self.root / "claude-chat.jsonl"
         self.write(

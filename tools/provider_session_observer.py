@@ -147,21 +147,17 @@ def _codex_semantic_messages(event: Mapping[str, Any]) -> list[tuple[str, str]]:
 
 
 def _visible_text(value: Any) -> str:
+    """Read visible text blocks only; never descend into tool or thought blocks."""
     if isinstance(value, str):
         return value
     if isinstance(value, Mapping):
-        for key in ("text", "message", "content"):
-            text = _visible_text(value.get(key))
-            if text.strip():
-                return text
-        return ""
+        kind = str(value.get("type") or "").strip().lower()
+        if kind and kind not in {"text", "input_text", "output_text"}:
+            return ""
+        text = value.get("text")
+        return text if isinstance(text, str) else ""
     if isinstance(value, list):
-        chunks = []
-        for item in value:
-            text = _visible_text(item)
-            if text.strip():
-                chunks.append(text)
-        return "\n".join(chunks)
+        return "\n".join(text for item in value if (text := _visible_text(item)).strip())
     return ""
 
 
@@ -702,6 +698,26 @@ class ProviderSessionObserverStore:
             rows = connection.execute(query, parameters).fetchall()
         return [self._activity_row(row) for row in rows]
 
+    @staticmethod
+    def _rag_activity_rows(connection, source_id, provider):
+        rows = connection.execute(
+            "SELECT * FROM provider_session_activity WHERE source_id = ? ORDER BY ordinal DESC, activity_id DESC",
+            (source_id,),
+        ).fetchall()
+        if provider != "CLAUDE":
+            return [row for row in rows if row["active"]]
+        # Status projection retains leaves. RAG needs the latest leaf's ancestry,
+        # not unrelated abandoned branches or only the last message.
+        if not rows:
+            return []
+        lineage = [rows[0]]
+        parent = rows[0]["branch_parent_id"]
+        for row in rows[1:]:
+            if parent is not None and row["provider_event_id"] == parent:
+                lineage.append(row)
+                parent = row["branch_parent_id"]
+        return lineage
+
     def build_batch_candidate(self, source_id: str) -> dict[str, Any]:
         """Prepare, but never publish, one bounded activity-to-memory candidate."""
         with self._connection() as connection:
@@ -710,9 +726,10 @@ class ProviderSessionObserverStore:
             ).fetchone()
             if source is None:
                 raise ProviderSessionObserverError("SOURCE_NOT_FOUND", source_id)
+            rag_rows = self._rag_activity_rows(connection, source_id, str(source["provider"]))
         activities = [
             activity
-            for activity in self.list_activities(source_id)
+            for activity in (self._activity_row(row) for row in rag_rows)
             if activity["event_kind"]
             in {"TURN_COMPLETED", "ERROR", "QUOTA_STOP", "APPROVAL_WAIT"}
         ]
@@ -774,6 +791,7 @@ class ProviderSessionObserverStore:
                 raise ProviderSessionObserverError(
                     "SEMANTIC_SOURCE_NOT_CURRENT", source_id
                 )
+            eligible_ids = {row["activity_id"] for row in self._rag_activity_rows(connection, source_id, provider)}
             selected: list[tuple[sqlite3.Row, Mapping[str, Any]]] = []
             for ref in activity_refs:
                 activity_id = _identifier(ref.get("activity_id"), "activity_id")
@@ -789,11 +807,11 @@ class ProviderSessionObserverStore:
                     """
                     SELECT * FROM provider_session_activity
                     WHERE source_id = ? AND activity_id = ? AND activity_digest = ?
-                      AND ordinal = ? AND active = 1
+                      AND ordinal = ?
                     """,
                     (source_id, activity_id, activity_digest, ordinal),
                 ).fetchone()
-                if row is None or row["byte_offset"] is None:
+                if row is None or row["activity_id"] not in eligible_ids or row["byte_offset"] is None:
                     raise ProviderSessionObserverError(
                         "SEMANTIC_ACTIVITY_NOT_ATTESTED", activity_id
                     )

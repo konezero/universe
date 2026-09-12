@@ -23,6 +23,8 @@ FAST_EXTRACT_RESULT_SCHEMA = "universe.memory-fast-extract-result.v1"
 FAST_EXTRACT_MODEL = "gpt-5.6-luna"
 FAST_EXTRACT_EFFORT = "MAX"
 FAST_EXTRACT_PROVIDER = "CODEX"
+# Input transcript providers are independent of the extraction model.
+FAST_EXTRACT_SOURCE_PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 FAST_EXTRACT_OPERATION = "MEMORY_FAST_EXTRACT"
 FAST_EXTRACT_SKILL_ID = "universe.memory.fast-extract"
 FAST_EXTRACT_SKILL_VERSION = "v1"
@@ -177,10 +179,10 @@ def redact_activity_batch(value: Any) -> dict[str, Any]:
     if set(source) - allowed_source:
         raise FastExtractError("FAST_EXTRACT_ACTIVITY_INVALID", "source has unsupported fields")
     provider = _text(source.get("provider"), "source.provider", maximum=32).upper()
-    if provider != FAST_EXTRACT_PROVIDER:
+    if provider not in FAST_EXTRACT_SOURCE_PROVIDERS:
         raise FastExtractError(
             "FAST_EXTRACT_PROVIDER_INVALID",
-            "FAST_EXTRACT accepts only a Codex Activity source",
+            "FAST_EXTRACT accepts Codex, Claude, or Grok Activity sources",
         )
     provider_session_id = _text(
         source.get("provider_session_id"), "source.provider_session_id"
