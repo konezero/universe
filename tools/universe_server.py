@@ -8827,6 +8827,10 @@ class UniverseStore:
 
     def advance_memory_source_position(self, project_id, run_id, selection):
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute("SELECT last_run_id FROM memory_batch_source_position WHERE project_id = ?", (project_id,)).fetchone()
+            if "previous_run_id" in selection and (current["last_run_id"] if current else None) != selection["previous_run_id"]:
+                raise UniverseError("MEMORY_ACTIVITY_CURSOR_CONFLICT", "Another completed batch advanced the collection position", 409)
             run = connection.execute(
                 "SELECT status FROM memory_batch_run WHERE project_id = ? AND stage = 'FAST_EXTRACT' AND run_id = ?",
                 (project_id, run_id),
@@ -8836,7 +8840,7 @@ class UniverseStore:
             connection.execute(
                 "INSERT INTO memory_batch_source_position VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET next_source_id=excluded.next_source_id, last_run_id=excluded.last_run_id, selection_json=excluded.selection_json, updated_at=excluded.updated_at",
-                (project_id, selection["next_source_id"], run_id, json.dumps(selection, ensure_ascii=True), utc_now()),
+                (project_id, selection["next_source_id"], run_id, json.dumps({key: value for key, value in selection.items() if key != "activity_windows"}, ensure_ascii=True), utc_now()),
             )
         return self.get_memory_source_position(project_id)
 
@@ -36805,7 +36809,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "document_written": False,
         }
 
-    def run_memory_batch(self, project_id: str, value: Any) -> dict[str, Any]:
+    def run_memory_batch(self, project_id: str, value: Any, *, _activity_windows=None) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise UniverseError(
                 "MEMORY_BATCH_REQUEST_INVALID",
@@ -36891,7 +36895,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 with prepared_memory_frame(self.runtime_host, binding, public, config) as prepared:
                     self._memory_batch_runtimes.bind_frame(project_id, prepared)
                     prepared_request["runtime_binding"] = prepared
-                    result = self.run_memory_batch(project_id, prepared_request)
+                    result = self.run_memory_batch(project_id, prepared_request, _activity_windows=selection.get("activity_windows") if selection else None)
                     if selection is not None:
                         result["source_collection"] = self.store.advance_memory_source_position(
                             project_id, result["run"]["run_id"], selection)
@@ -36929,6 +36933,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.store.prepare_provider_activity_batch(str(source_id))
                 for source_id in source_ids
             ]
+            if _activity_windows is not None:
+                from universe_app.memory_source_window import apply_activity_window
+                raw_batches = [apply_activity_window(batch, _activity_windows[str(batch["source"]["source_id"])]) for batch in raw_batches]
             activity_batches = redact_activity_batches(raw_batches)
             semantic_evidence = [
                 excerpt
@@ -36936,6 +36943,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for excerpt in self.store.provider_session_observer.build_transient_semantic_evidence(
                     str(batch["source"]["source_id"]),
                     batch["activity_refs"],
+                    require_complete=_activity_windows is not None,
                 )
             ]
         except (FastExtractError, ProviderSessionObserverError) as error:

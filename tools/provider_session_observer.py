@@ -752,6 +752,7 @@ class ProviderSessionObserverStore:
         self,
         source_id: str,
         activity_refs: list[Mapping[str, Any]],
+        *, require_complete: bool = False,
     ) -> list[dict[str, Any]]:
         """Read exact selected provider message events without persisting text."""
 
@@ -841,11 +842,19 @@ class ProviderSessionObserverStore:
                     raise ProviderSessionObserverError(
                         "SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"])
                     )
-                for role, raw_text in _provider_semantic_messages(provider, event):
+                messages = _provider_semantic_messages(provider, event)
+                if require_complete:
+                    messages = [(role, redacted[index:index + SEMANTIC_EXCERPT_CHAR_LIMIT])
+                                for role, raw in messages
+                                for redacted in [_redact_secrets_only(raw)]
+                                for index in range(0, len(redacted), SEMANTIC_EXCERPT_CHAR_LIMIT)]
+                for role, raw_text in messages:
                     text = _redact_secrets_only(raw_text)
-                    if not text:
+                    if not text.strip():
                         continue
                     remaining = SEMANTIC_TOTAL_CHAR_LIMIT - total_chars
+                    if require_complete and (len(text) > remaining or len(excerpts) >= SEMANTIC_EXCERPT_LIMIT):
+                        raise ProviderSessionObserverError("SEMANTIC_EVIDENCE_WINDOW_LIMIT", "Selected activities exceed the semantic window")
                     if remaining <= 0 or len(excerpts) >= SEMANTIC_EXCERPT_LIMIT:
                         break
                     text = text[:remaining]
@@ -859,7 +868,7 @@ class ProviderSessionObserverStore:
                     )
                     previous_semantic_key = semantic_key
                     previous_ordinal = ordinal
-                    if is_adjacent_telemetry_twin:
+                    if is_adjacent_telemetry_twin and not require_complete:
                         continue
                     total_chars += len(text)
                     excerpts.append(
@@ -877,7 +886,7 @@ class ProviderSessionObserverStore:
                 "SEMANTIC_EVIDENCE_EMPTY",
                 "selected Activity has no bounded user or assistant text",
             )
-        return self._coalesce_excerpts(excerpts)
+        return excerpts if require_complete else self._coalesce_excerpts(excerpts)
 
     def build_transient_live_deltas(
         self,

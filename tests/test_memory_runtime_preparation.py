@@ -85,13 +85,13 @@ class MemoryPreparationTests(unittest.TestCase):
                 list_provider_session_sources=lambda:[{"source_id":"registered-source","enabled":True,"status":"ACTIVE"}],
                 get_memory_source_position=lambda project:{},
                 advance_memory_source_position=lambda project,run,selection:selection,
-                prepare_provider_activity_batch=lambda sid:{"activity_refs":[{"id":"one"}]},
-                provider_session_observer=SimpleNamespace(build_transient_semantic_evidence=lambda *args:[{
+                prepare_provider_activity_batch=lambda sid:{"source":{"provider":"CODEX","source_id":sid},"activity_refs":[{"id":"one"}]},
+                provider_session_observer=SimpleNamespace(build_transient_semantic_evidence=lambda *args, **kwargs:[{
                     "excerpt_id":"e","activity_digest":"a"*64,"ordinal":1,"role":"USER","text":"data",
                     "text_digest":__import__("semantic_evidence").semantic_text_digest("data")}])),
             runtime_host=self.host(),
             _resolve_memory_batch_config=lambda *args:(config,{}))
-        def run(project,request):
+        def run(project,request, **kwargs):
             if "runtime_binding" not in request:
                 return UniverseHTTPServer.run_memory_batch(server,project,request)
             captured.append(request)

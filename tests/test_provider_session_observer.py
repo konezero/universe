@@ -49,6 +49,53 @@ class ProviderSessionObserverTests(unittest.TestCase):
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
         )
 
+    def test_complete_activity_windows_cover_large_transcript_without_coalescing_loss(self):
+        from types import SimpleNamespace
+        from universe_app.memory_source_window import select_source_window, apply_activity_window
+        from memory_fast_extract import normalize_transient_semantic_evidence
+        path = self.root / "rollout-large.jsonl"
+        events = [{"type":"response_item", "id":str(i), "payload":{"type":"message", "role":"assistant",
+                   "content":[{"type":"output_text", "text":str(i) + " " + "x" * 200}]}} for i in range(600)]
+        self.write(path, *events)
+        source = self.register("CODEX", path)
+        sid = source["source_id"]
+        self.store.scan(sid)
+        self.store.scan(sid)
+        position = {}
+        facade = SimpleNamespace(list_provider_session_sources=self.store.list_sources,
+            get_memory_source_position=lambda project:position,
+            prepare_provider_activity_batch=self.store.build_batch_candidate,
+            provider_session_observer=self.store)
+        ordinals = []
+        for _ in range(20):
+            selected, report = select_source_window(facade, "p")
+            window = report["activity_windows"][sid]
+            batch = apply_activity_window(self.store.build_batch_candidate(sid), window)
+            evidence = normalize_transient_semantic_evidence(self.store.build_transient_semantic_evidence(sid, batch["activity_refs"], require_complete=True))
+            self.assertLessEqual(sum(len(e["text"]) for e in evidence), 32000)
+            self.assertLessEqual(len(evidence), 256)
+            self.assertEqual(len(batch["activity_refs"]), len(evidence))
+            ordinals.extend(e["ordinal"] for e in evidence)
+            position = {"next_source_id":report["next_source_id"], "selection":report}
+            if not report["activity_resume"]:break
+        else:self.fail("source pagination did not finish")
+        self.assertEqual(list(range(1,601)), ordinals)
+
+    def test_complete_evidence_splits_long_message_and_rejects_oversized_event(self):
+        path = self.root / "rollout-long-message.jsonl"
+        def event(text):return {"type":"response_item", "id":"long", "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}
+        self.write(path,event("x" * 5000))
+        source=self.register("CODEX",path);sid=source["source_id"];self.store.scan(sid)
+        batch=self.store.build_batch_candidate(sid)
+        evidence=self.store.build_transient_semantic_evidence(sid,batch["activity_refs"],require_complete=True)
+        self.assertEqual(5000,sum(len(e["text"]) for e in evidence))
+        self.assertEqual([2000,2000,1000],[len(e["text"]) for e in evidence])
+        self.write(path,event("x" * 33000))
+        self.store.scan(sid)
+        with self.assertRaises(ProviderSessionObserverError) as caught:
+            self.store.build_transient_semantic_evidence(sid,self.store.build_batch_candidate(sid)["activity_refs"],require_complete=True)
+        self.assertEqual("SEMANTIC_EVIDENCE_WINDOW_LIMIT",caught.exception.code)
+
     def test_codex_incremental_cursor_never_persists_raw_message_text(self) -> None:
         source_path = self.root / "rollout-20260808.jsonl"
         self.write(
