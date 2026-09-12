@@ -8745,3 +8745,10 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 
 .rag-overview > .rag-counts, .rag-overview > .rag-source-issues { grid-column: 1 / -1; }
 .rag-source-issues { padding: 10px 14px; border: 1px solid #ffffff24; border-radius: 8px; }
+
+.rag-review-bundle { border: 1px solid var(--border); border-radius: 8px; margin: 8px 0; padding: 10px; }
+.rag-review-bundle > summary { cursor: pointer; overflow-wrap: anywhere; }
+.rag-review-bundle > summary strong { font-weight: 500; }
+.rag-review-bundle > summary small { display: block; margin-top: 6px; }
+.rag-review-bundle[open] > summary { margin-bottom: 10px; }
+.rag-memory-group > summary { cursor: pointer; padding: 12px 0; }

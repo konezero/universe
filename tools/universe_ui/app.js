@@ -16869,6 +16869,34 @@ function renderMemoryCandidateReview() {
 const RAG_STAGE_LABELS = { FAST_EXTRACT: "후보 수집", CONSOLIDATE: "중복 정리", SYNTHESIZE: "아이디어 분류", INDEPENDENT_CHECK: "품질 점검" };
 let ragScreenGeneration = 0;
 
+function groupRagReviewCandidates(candidates) {
+  const groups = new Map();
+  for (const item of candidates) {
+    if (["IGNORE", "SUPERSEDED"].includes(item.state)) continue;
+    const content = String(item.summary || "").normalize("NFC").trim().replace(/\s+/g, " ");
+    // Keep case and punctuation: technical identifiers can differ in meaning.
+    const key = JSON.stringify([item.project_id || "", item.kind, content || item.candidate_id]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  return [...groups.values()].map(items => {
+    const reasons = new Set();
+    let urgent = false;
+    for (const item of items) {
+      if (item.state === "CONFLICTED" || (item.relations || []).some(r => r.relation === "CONFLICTS_WITH")) { reasons.add("충돌 확인"); urgent = true; }
+      if (!(item.provenance?.ref_digests?.length)) { reasons.add("출처 확인 필요"); urgent = true; }
+      if (item.stage === "SYNTHESIZE" && /^(Idea|Hypothesis|Product) candidate derived from \d+ Memory candidates \([a-f0-9]+\)\.$/.test(item.summary || "")) { reasons.add("내용 보완 필요"); urgent = true; }
+      if (item.state === "KEEP") { reasons.add(item.kind === "MEMORY" ? "RAG 채택 대기" : "다음 행동 확인"); urgent = true; }
+      if (!["REVIEW_REQUIRED", "KEEP", "CONFLICTED"].includes(item.state)) { reasons.add("검토 상태 확인"); urgent = true; }
+    }
+    const organized = items.length > 1 || items.some(item => item.stage === "CONSOLIDATE");
+    if (items.length > 1) reasons.add("동일 내용 묶음");
+    else if (organized) reasons.add("통합 단계 결과");
+    if (!reasons.size) reasons.add("검토 전");
+    return {items, reasons: [...reasons], bucket: urgent ? "decision" : organized ? "organized" : "new"};
+  }).sort((a, b) => Number(b.reasons.includes("충돌 확인")) - Number(a.reasons.includes("충돌 확인")));
+}
+
 function renderMemory() {
   if (!elements.memoryPanel) return;
   const generation = ++ragScreenGeneration;
@@ -16940,13 +16968,11 @@ function renderMemory() {
       card.append(run);
       progress.append(card);
     }
-    const candidates = knowledge.candidates.filter(item => item.kind === "MEMORY" && !adoptedMemoryForCandidate(item, knowledge.memories));
-    const pending = candidates.filter(item => item.state === "REVIEW_REQUIRED");
-    const kept = candidates.filter(item => item.state === "KEEP");
+    const candidates = knowledge.candidates.filter(item => !adoptedMemoryForCandidate(item, knowledge.memories));
     const proposed = knowledge.memories.filter(item => item.link_state === "PROPOSED");
-    const linked = knowledge.memories.filter(item => item.link_state === "LINKED");
-    const stats = node("p", "rag-counts", `검토 대기 ${pending.length} · 채택 대기 ${kept.length} · 연결 제안 ${proposed.length} · 연결 완료 ${linked.length} · 저장된 메모 ${knowledge.memories.length}`);
-    lists.append(stats);
+    const triage = groupRagReviewCandidates(candidates);
+    lists.append(node("p", "rag-counts", "후보 " + candidates.length + "개 → " + triage.length + "묶음 · 연결 제안 " + proposed.length + "개"));
+    lists.append(node("p", "context-copy", "같은 종류·동일 내용은 화면에서 묶습니다. 보관·채택·연결 결정은 항목별로 유지됩니다. 충돌 표시는 등록된 상태·관계 기준이며 내용의 사실성은 별도 검토가 필요합니다."));
     const search = node("input", "document-list-search");
     search.type = "search"; search.placeholder = "메모 제목·내용 검색"; search.setAttribute("aria-label", "메모 검색");
     lists.append(search);
@@ -16954,29 +16980,45 @@ function renderMemory() {
     const draw = () => {
       groups.replaceChildren();
       const query = search.value?.trim().toLowerCase() || "";
-      const matches = item => `${item.title || ""} ${item.body || ""} ${item.summary || ""}`.toLowerCase().includes(query);
-      for (const [title, items, isCandidate] of [
-        ["1. 검토할 메모", pending, true], ["2. RAG 채택 대기", kept, true],
-        ["3. 노드 연결 제안", proposed, false],
-        ["4. 저장된 메모", knowledge.memories.filter(item => item.link_state !== "PROPOSED"), false],
-        ["기타 검토 결과", candidates.filter(item => !["REVIEW_REQUIRED", "KEEP"].includes(item.state)), true],
+      const matches = item => ((item.title || "") + " " + (item.body || "") + " " + (item.summary || "")).toLowerCase().includes(query);
+      const appendRow = (parent, item, candidate) => {
+        const row = node("button", "rag-memory-row");
+        const status = knowledgeStatus(item, candidate, knowledge.memories);
+        row.append(node("strong", "", item.title || item.summary), node("small", "knowledge-badge " + status.tone, status.label + " · " + (candidate ? (RAG_STAGE_LABELS[item.stage] || item.kind) : memoryLinkLabel(item))));
+        row.onclick = () => openHoverMemory(projectId, item, candidate);
+        parent.append(row);
+      };
+      for (const [bucket, title, explanation] of [
+        ["decision", "결정할 것", "충돌·출처 확인·내용 보완·채택 대기 항목을 먼저 확인하세요."],
+        ["new", "새로 모은 것", "아직 검토하지 않은 새 후보입니다. 자동 채택하지 않습니다."],
+        ["organized", "자동 정리한 것", "동일 내용 묶음과 통합 단계 결과입니다. 원본을 삭제하거나 검토 결정을 합치지 않습니다."],
       ]) {
         const section = node("section", "rag-memory-group");
-        const filtered = items.filter(matches);
-        section.append(node("h3", "", `${title} (${filtered.length})`));
-        if (!filtered.length) section.append(node("p", "empty-copy", "해당 항목이 없습니다."));
-        for (const item of filtered) {
-          const row = node("button", "rag-memory-row");
-          const status = knowledgeStatus(item, isCandidate, knowledge.memories);
-          row.append(node("strong", "", item.title || item.summary), node("small", `knowledge-badge ${status.tone}`, `${status.label} · ${isCandidate ? "미연결 후보" : memoryLinkLabel(item)}`));
-          row.onclick = () => openHoverMemory(projectId, item, isCandidate);
-          section.append(row);
+        const bundles = triage.filter(bundle => bundle.bucket === bucket && bundle.items.some(matches));
+        const links = bucket === "decision" ? proposed.filter(matches) : [];
+        section.append(node("h3", "", title + " (" + (bundles.length + links.length) + ")"), node("p", "context-copy", explanation));
+        if (!bundles.length && !links.length) section.append(node("p", "empty-copy", "지금 확인할 항목이 없습니다."));
+        for (const bundle of bundles) {
+          const details = node("details", "rag-review-bundle");
+          const summary = node("summary", "");
+          summary.append(node("strong", "", bundle.items[0].summary), node("small", "knowledge-badge", bundle.reasons.join(" · ") + " · " + bundle.items.length + "개"));
+          details.append(summary);
+          for (const item of bundle.items) appendRow(details, item, true);
+          section.append(details);
         }
+        for (const memory of links) appendRow(section, memory, false);
         groups.append(section);
       }
+      const archive = node("details", "rag-memory-group");
+      const stored = knowledge.memories.filter(item => item.link_state !== "PROPOSED" && matches(item));
+      const reviewed = candidates.filter(item => ["IGNORE", "SUPERSEDED"].includes(item.state) && matches(item));
+      archive.append(node("summary", "", "저장된 메모·이전 검토 결과 (" + (stored.length + reviewed.length) + ")"));
+      for (const item of stored) appendRow(archive, item, false);
+      for (const item of reviewed) appendRow(archive, item, true);
+      groups.append(archive);
     };
     search.oninput = draw; draw();
-    if (knowledge.candidates.length >= 200) lists.append(node("p", "", "후보 목록은 최대 200개입니다."));
+    if (knowledge.candidates.length >= 200) lists.append(node("p", "", "최근 후보 최대 200개를 기준으로 묶었습니다. 전체 이력의 분류 결과는 아닙니다."));
     const settings = renderMemoryBatchStages();
     settings.querySelector("summary").textContent = "자동화 상세 설정";
     lists.append(settings);
