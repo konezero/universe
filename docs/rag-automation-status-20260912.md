@@ -30,4 +30,10 @@
 
 실제 시계가 예약 시각에 도달하여 자동 발화하는 것과 일일 한도 소진/재시작 복구의 live 검증은 NOT_RUN이다. 예약 콜백은 검증한 공통 경로를 사용하며 스케줄러 회귀로 확인했다. 실제 사용자 후보의 검토→채택→노드 연결→검색까지의 변경 검증 역시 NOT_RUN이다. 따라서 전체 RAG/Collector TODO는 DONE으로 처리하지 않는다.
 
-이전 ‘사용자 프로젝트 세션 필요 / 준비 어댑터 미구현’ 설명은 현재 동작이 아니다. 1차 UI 체크포인트는 3b11324394e3182c399ba9dac6af0a92ab5c074c이며, 이 문서의 배치 소유 실행 후속 변경은 아직 미커밋이다. TODO: todo_rag_scheduled_frame_preparation_20260912, 상위 todo_c272adb801ac45348d0315e36c2d07c6.
+이전 ‘사용자 프로젝트 세션 필요 / 준비 어댑터 미구현’ 설명은 현재 동작이 아니다. 1차 UI 체크포인트는 3b11324394e3182c399ba9dac6af0a92ab5c074c이며, 배치 소유 실행 후속 변경은 b8fa69560d52985aae34843cff972b493a540f2f로 커밋했다. TODO: todo_rag_scheduled_frame_preparation_20260912, 상위 todo_c272adb801ac45348d0315e36c2d07c6.
+
+## 커밋 후 수동 실행에서 확인한 후속 수정
+
+다음 커서의 source_0394e8578c8e488aa55bd654b3738de7는 실제 등록상 GROK이다. 자동 소스 선택은 이를 포함했지만 기존 redact_activity_batch 계약은 Codex Activity만 허용하여 FAST_EXTRACT_PROVIDER_INVALID로 provider 호출 전에 실패했다. 커서는 이전 성공 위치를 유지했다. 추출 모델 설정(CODEX/gpt-5.6-luna) 오류가 아니라 입력 소스 지원 범위와 자동 선택의 불일치다.
+
+자동 선택에서 기존 FAST_EXTRACT_PROVIDER 계약과 다른 소스를 제외 사유와 함께 건너뛰도록 수정했다. UI는 ‘현재 추출기가 지원하지 않는 소스’로 표시한다. Grok/Claude 추출 지원을 추가한 것은 아니다. 명시적 source_ids 요청의 기존 검증은 유지한다. 혼합 공급자와 지원 소스가 전혀 없는 경우를 포함한 관련 21건 회귀 PASS, JS 문법/diff 검사 PASS.

@@ -16906,7 +16906,8 @@ function renderMemory() {
         skipped.append(node("summary", "", "제외된 소스 원인"));
         const reasons = {};
         for (const item of collection.skipped || []) reasons[item.error_code] = (reasons[item.error_code] || 0) + 1;
-        const labels = {NO_ACTIVITY: "수집할 내용 없음", SEMANTIC_SOURCE_NOT_CURRENT: "원문 위치 재확인 필요", SEMANTIC_EVIDENCE_EMPTY: "추출할 본문 없음", SEMANTIC_ACTIVITY_NOT_ATTESTED: "수집 기록 재확인 필요", SOURCE_NOT_FOUND: "원본 소스 없음"};
+        const labels = {NO_ACTIVITY: "수집할 내용 없음",
+      FAST_EXTRACT_PROVIDER_INVALID: "현재 추출기가 지원하지 않는 소스", SEMANTIC_SOURCE_NOT_CURRENT: "원문 위치 재확인 필요", SEMANTIC_EVIDENCE_EMPTY: "추출할 본문 없음", SEMANTIC_ACTIVITY_NOT_ATTESTED: "수집 기록 재확인 필요", SOURCE_NOT_FOUND: "원본 소스 없음"};
         for (const [code, count] of Object.entries(reasons)) skipped.append(node("p", "", (labels[code] || code) + ": " + count + "개"));
         if (collection.skipped_count > (collection.skipped || []).length) skipped.append(node("small", "", "원인 표시는 최대 64개 소스 기준입니다."));
         progress.append(skipped);

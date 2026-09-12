@@ -19,7 +19,7 @@ class SourceWindowTests(unittest.TestCase):
         return SimpleNamespace(
             list_provider_session_sources=lambda:[{"source_id":f"s{i:03}","enabled":True,"status":"ACTIVE"} for i in range(count)],
             get_memory_source_position=lambda project:{"next_source_id":start},
-            prepare_provider_activity_batch=lambda sid:{"activity_refs":[{"id":sid}]},
+            prepare_provider_activity_batch=lambda sid:{"source":{"provider":"CODEX"},"activity_refs":[{"id":sid}]},
             provider_session_observer=SimpleNamespace(build_transient_semantic_evidence=lambda *args:evidence))
     def test_batch_count_limit_and_cursor_rotate_without_starvation(self):
         store=self.store()
@@ -42,6 +42,26 @@ class SourceWindowTests(unittest.TestCase):
         ids,report=select_source_window(store,"p")
         self.assertEqual(["s001","s002"],ids);self.assertEqual(1,report["skipped_count"])
         self.assertEqual("SEMANTIC_SOURCE_NOT_CURRENT",report["skipped"][0]["error_code"])
+    def test_other_provider_sources_are_reported_and_never_read_for_extraction(self):
+        store=self.store(count=3)
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"GROK" if sid=="s000" else "CODEX"},"activity_refs":[{"id":sid}]}
+        original=store.provider_session_observer.build_transient_semantic_evidence
+        read=[]
+        def evidence(sid,refs):
+            read.append(sid)
+            return original(sid,refs)
+        store.provider_session_observer.build_transient_semantic_evidence=evidence
+        ids,report=select_source_window(store,"p")
+        self.assertEqual(["s001","s002"],ids)
+        self.assertEqual(ids,read)
+        self.assertEqual(0,report["deferred_count"])
+        self.assertEqual([{"source_id":"s000","error_code":"FAST_EXTRACT_PROVIDER_INVALID"}],report["skipped"])
+    def test_only_unsupported_sources_do_not_advance(self):
+        store=self.store(count=2)
+        store.prepare_provider_activity_batch=lambda sid:{"source":{"provider":"CLAUDE"},"activity_refs":[{"id":sid}]}
+        with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")
+        self.assertEqual("MEMORY_BATCH_SOURCES_UNAVAILABLE",caught.exception.code)
+        self.assertEqual(2,json.loads(caught.exception.detail)["skipped_count"])
     def test_empty_sources_do_not_invoke_or_advance(self):
         store=self.store(count=3);store.prepare_provider_activity_batch=lambda sid:{"activity_refs":[]}
         with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")

@@ -1,6 +1,6 @@
 """Bound automatic collection to the extraction contract and retain a source cursor."""
 import json
-from memory_fast_extract import normalize_transient_semantic_evidence
+from memory_fast_extract import FAST_EXTRACT_PROVIDER, normalize_transient_semantic_evidence
 from provider_session_observer import ProviderSessionObserverError
 from .connection import UniverseError
 
@@ -33,7 +33,11 @@ def select_source_window(store, project_id):
         try:
             batch = store.prepare_provider_activity_batch(source_id)
             refs = batch.get("activity_refs") or []
-            if not refs:
+            provider = str((batch.get("source") or {}).get("provider", "")).strip().upper()
+            if provider and provider != FAST_EXTRACT_PROVIDER:
+                code = "FAST_EXTRACT_PROVIDER_INVALID"
+                evidence = None
+            elif not refs:
                 code = "NO_ACTIVITY"
                 evidence = None
             else:
