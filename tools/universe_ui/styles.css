@@ -8742,3 +8742,6 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .rag-memory-row { display:block; width:100%; text-align:left; padding:12px; margin:6px 0; background:#ffffff06; border:1px solid #ffffff18; border-radius:8px; color:inherit; }
 .rag-memory-row:hover { background:#ffffff12; }
 .rag-memory-row strong { display:block; overflow-wrap:anywhere; }
+
+.rag-overview > .rag-counts, .rag-overview > .rag-source-issues { grid-column: 1 / -1; }
+.rag-source-issues { padding: 10px 14px; border: 1px solid #ffffff24; border-radius: 8px; }

@@ -16898,16 +16898,31 @@ function renderMemory() {
     if (generation !== ragScreenGeneration || state.selectedProject?.project_id !== projectId) return;
     state.memoryBatchConfigs = automation.configs || [];
     progress.replaceChildren();
+    const collection = automation.source_collection?.selection;
+    if (collection) {
+      progress.append(node("p", "rag-counts", "최근 수집 " + collection.selected_count + "개 · 다음 배치 " + collection.deferred_count + "개 · 제외 " + collection.skipped_count + "개"));
+      if (collection.skipped_count) {
+        const skipped = node("details", "rag-source-issues");
+        skipped.append(node("summary", "", "제외된 소스 원인"));
+        const reasons = {};
+        for (const item of collection.skipped || []) reasons[item.error_code] = (reasons[item.error_code] || 0) + 1;
+        const labels = {NO_ACTIVITY: "수집할 내용 없음", SEMANTIC_SOURCE_NOT_CURRENT: "원문 위치 재확인 필요", SEMANTIC_EVIDENCE_EMPTY: "추출할 본문 없음", SEMANTIC_ACTIVITY_NOT_ATTESTED: "수집 기록 재확인 필요", SOURCE_NOT_FOUND: "원본 소스 없음"};
+        for (const [code, count] of Object.entries(reasons)) skipped.append(node("p", "", (labels[code] || code) + ": " + count + "개"));
+        if (collection.skipped_count > (collection.skipped || []).length) skipped.append(node("small", "", "원인 표시는 최대 64개 소스 기준입니다."));
+        progress.append(skipped);
+      }
+    }
     for (const config of automation.configs || []) {
       const schedule = (automation.schedules || []).find(item => item.stage === config.stage);
       const card = node("article", "rag-stage-card");
       let status = config.enabled === false ? "꺼짐" : config.schedule?.kind === "MANUAL" ? "수동 실행" : "예약됨";
-      const needsFrame = config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC";
-      if (needsFrame && config.enabled !== false) status = "자동 수집 준비 안 됨";
-      else if (String(schedule?.last_outcome || "").startsWith("FAILED")) status = "최근 실행 실패";
+      const usesFrame = config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC";
+      const needsFrame = usesFrame && !["READY", "ON_DEMAND"].includes(config.runtime_preparation?.status);
+      if (needsFrame && config.enabled !== false) status = "실행 세션 연결 대기";
+      else if (String(schedule?.last_outcome || "").startsWith("FAILED")) status = "최근 예약 실행 실패";
       else if (schedule?.state === "RUNNING") status = "실행 중";
       card.append(node("h3", "", RAG_STAGE_LABELS[config.stage] || config.stage), node("strong", needsFrame ? "knowledge-badge pending" : "knowledge-badge", status));
-      card.append(node("p", "", needsFrame ? "자동 수집용 실행 세션 준비가 필요합니다." : config.fallback === "DETERMINISTIC" ? "규칙 기반 처리 · AI 호출 없음" : "AI 처리"));
+      card.append(node("p", "", needsFrame ? (config.runtime_preparation?.detail || "자동 수집용 실행 세션 준비가 필요합니다.") : config.fallback === "DETERMINISTIC" ? "규칙 기반 처리 · AI 호출 없음" : (config.runtime_preparation?.detail || "AI 처리")));
       if (schedule?.next_due_at) card.append(node("small", "", `다음 예약: ${new Date(schedule.next_due_at).toLocaleString("ko-KR")}`));
       if (schedule?.last_error_code) card.append(node("code", "rag-error-code", schedule.last_error_code));
       if (schedule?.last_run_id) card.append(node("small", "", `최근 결과: ${schedule.last_run_id}`));

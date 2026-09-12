@@ -85,7 +85,7 @@ class ProviderSessionObserverTests(unittest.TestCase):
                         {
                             "type": "input_text",
                             "text": (
-                                "Keep memory candidates review-only. "
+                                "한글 메모 😀 — Keep memory candidates review-only. "
                                 "api_key=verysecretvalue"
                             ),
                         }
@@ -101,6 +101,10 @@ class ProviderSessionObserverTests(unittest.TestCase):
             [activity],
         )
 
+        from memory_fast_extract import normalize_transient_semantic_evidence, FastExtractError
+        self.assertEqual(evidence, normalize_transient_semantic_evidence(evidence))
+        with self.assertRaises(FastExtractError):
+            normalize_transient_semantic_evidence([{**evidence[0], "text": evidence[0]["text"] + "변조"}])
         self.assertEqual(1, len(evidence))
         self.assertIn("review-only", evidence[0]["text"])
         self.assertIn("[REDACTED]", evidence[0]["text"])

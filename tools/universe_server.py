@@ -7078,6 +7078,13 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS conductor_delegation_state_time
                 ON conductor_delegation(state, updated_at, delegation_id);
 
+                CREATE TABLE IF NOT EXISTS memory_batch_source_position (
+                    project_id TEXT PRIMARY KEY,
+                    next_source_id TEXT NOT NULL,
+                    last_run_id TEXT NOT NULL,
+                    selection_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS memory_batch_config (
                     config_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -8805,6 +8812,33 @@ class UniverseStore:
                 (schedule_id,),
             ).fetchone()
         return self._memory_batch_schedule_row(terminal)
+
+    def get_memory_source_position(self, project_id):
+        self.get_project(project_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT next_source_id, last_run_id, selection_json, updated_at FROM memory_batch_source_position WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return {}
+        return {"next_source_id": row["next_source_id"], "last_run_id": row["last_run_id"],
+                "selection": json.loads(row["selection_json"]), "updated_at": row["updated_at"]}
+
+    def advance_memory_source_position(self, project_id, run_id, selection):
+        with self._connection() as connection:
+            run = connection.execute(
+                "SELECT status FROM memory_batch_run WHERE project_id = ? AND stage = 'FAST_EXTRACT' AND run_id = ?",
+                (project_id, run_id),
+            ).fetchone()
+            if run is None or run["status"] != "COMPLETED":
+                raise UniverseError("MEMORY_BATCH_SOURCE_CURSOR_NOT_COMMITTED", "Only a completed extraction advances source selection", 409)
+            connection.execute(
+                "INSERT INTO memory_batch_source_position VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id) DO UPDATE SET next_source_id=excluded.next_source_id, last_run_id=excluded.last_run_id, selection_json=excluded.selection_json, updated_at=excluded.updated_at",
+                (project_id, selection["next_source_id"], run_id, json.dumps(selection, ensure_ascii=True), utc_now()),
+            )
+        return self.get_memory_source_position(project_id)
 
     def list_memory_batch_runs(
         self, project_id: str, *, limit: int = 100
@@ -28067,6 +28101,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._session_runtime_lock = threading.RLock()
         self._session_runtimes: dict[str, UniverseConductorRuntime] = {}
         self._session_runtime_bindings: dict[str, dict[str, Any]] = {}
+        from universe_batch_runtime import MemoryBatchRuntimePool
+        self._memory_batch_runtimes = MemoryBatchRuntimePool(self._new_memory_batch_runtime)
         self._conductor_session_host_lock = threading.RLock()
         self.conductor_room_events = ConductorRoomEventHub()
         self.project_room_events = ProjectRoomEventHub()
@@ -29741,6 +29777,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self, project_id: str, request: Mapping[str, Any]
     ) -> dict[str, str]:
         session_id = _required_text(request.get("session_id"), "session_id")
+        batch_pool = getattr(self, "_memory_batch_runtimes", None)
+        if batch_pool is not None:
+            transport = batch_pool.resolve(project_id, request)
+            if transport is not None:
+                return transport
         try:
             session = self.session_supervisor.get_session(session_id)
         except SessionSupervisorError as error:
@@ -36659,6 +36700,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def memory_batch_configs(self, project_id: str) -> dict[str, Any]:
         result = self.memory_batch_config_service.list_configs(project_id)
+        for config in result.get("configs", []):
+            if config.get("stage") == "FAST_EXTRACT" and config.get("fallback") == "NONE":
+                config["runtime_preparation"] = {
+                    "status": "ON_DEMAND",
+                    "detail": "배치가 실행될 때 자동으로 준비하고, 끝나면 정리합니다.",
+                    "interactive_session_required": False,
+                }
+        result["source_collection"] = self.store.get_memory_source_position(project_id)
         result["schedules"] = self.store.list_memory_batch_schedule_states(project_id)
         result["scheduler"] = {
             "status": (
@@ -36686,15 +36735,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return result
 
+    def _new_memory_batch_runtime(self, project_id):
+        from universe_batch_runtime import UniverseBatchRuntime
+        project = self.store.get_project(project_id)
+        return UniverseBatchRuntime(
+            Path(project["project_root"]), project_id=project_id,
+            source_binding_resolver=lambda _root: self.store.selected_project_release_binding(project_id),
+        )
+
     def _run_scheduled_memory_batch(
         self, project_id: str, stage: str
     ) -> Mapping[str, Any]:
         request: dict[str, Any] = {"stage": stage, "trigger": "SCHEDULED"}
-        if stage == "FAST_EXTRACT":
-            request["source_ids"] = [
-                item["source_id"]
-                for item in self.store.list_provider_session_sources()
-            ]
         result = self.run_memory_batch(project_id, request)
         return result["run"]
 
@@ -36826,6 +36878,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
 
+        if not isinstance(value.get("runtime_binding"), Mapping) and config.get("persisted"):
+            from universe_app.memory_runtime_preparation import prepared_memory_frame
+            prepared_request = dict(value)
+            selection = None
+            if "source_ids" not in prepared_request:
+                from universe_app.memory_source_window import select_source_window
+                prepared_request["source_ids"], selection = select_source_window(self.store, project_id)
+            if not prepared_request["source_ids"]:
+                raise UniverseError("FAST_EXTRACT_ACTIVITY_INVALID", "No registered activity sources", HTTPStatus.CONFLICT)
+            with self._memory_batch_runtimes.execution(project_id, stage) as (binding, public):
+                with prepared_memory_frame(self.runtime_host, binding, public, config) as prepared:
+                    self._memory_batch_runtimes.bind_frame(project_id, prepared)
+                    prepared_request["runtime_binding"] = prepared
+                    result = self.run_memory_batch(project_id, prepared_request)
+                    if selection is not None:
+                        result["source_collection"] = self.store.advance_memory_source_position(
+                            project_id, result["run"]["run_id"], selection)
+                    return result
         if not isinstance(value.get("runtime_binding"), Mapping):
             raise UniverseError(
                 "MEMORY_BATCH_RUNTIME_PREPARATION_REQUIRED",
@@ -41764,6 +41834,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 lambda: self._supervisor_maintenance_worker.join(timeout=5),
             )
         self.memory_batch_scheduler.stop_accepting()
+        close_step("memory_batch_runtimes", self._memory_batch_runtimes.close)
         self._memory_scheduler_stop.set()
         self._memory_scheduler_wake.set()
         if self._memory_scheduler_worker.is_alive():

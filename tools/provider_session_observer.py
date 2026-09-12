@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from semantic_evidence import semantic_text_digest
 import os
 import sqlite3
 import time
@@ -848,7 +849,7 @@ class ProviderSessionObserverStore:
                     if remaining <= 0 or len(excerpts) >= SEMANTIC_EXCERPT_LIMIT:
                         break
                     text = text[:remaining]
-                    text_digest = _sha256(_canonical_json(text))
+                    text_digest = semantic_text_digest(text)
                     ordinal = int(row["ordinal"])
                     semantic_key = (role, text_digest)
                     is_adjacent_telemetry_twin = (
@@ -1019,7 +1020,7 @@ class ProviderSessionObserverStore:
             cleaned = _redact_semantic_text(str(excerpt.get("text") or ""))
             if not cleaned:
                 continue
-            digest = _sha256(_canonical_json(cleaned))
+            digest = semantic_text_digest(cleaned)
             normalized.append(
                 {
                     **excerpt,
@@ -1058,7 +1059,7 @@ class ProviderSessionObserverStore:
                 pairs.extend(_provider_semantic_messages(provider, event))
         excerpts: list[dict[str, Any]] = []
         for role, text in _coalesce_semantic_pairs(pairs):
-            digest = _sha256(_canonical_json(text))
+            digest = semantic_text_digest(text)
             excerpts.append(
                 {
                     "excerpt_id": "semantic_" + digest[:24],

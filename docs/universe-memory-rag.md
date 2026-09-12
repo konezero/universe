@@ -416,4 +416,4 @@ No additional Todo is needed for the gaps above: they already have owners.
 
 ## 2026-09-12 자동화 상태 정정
 
-수동 governed 추출의 검증은 예약 자동 실행의 완료 증거가 아니다. 예약 Task Frame 준비가 누락되어 자동 AI 추출은 아직 미완료다. 현재 구현·검증·남은 조건은 [RAG 자동화 점검](rag-automation-status-20260912.md)을 참조한다.
+예약 배치와 지금 실행은 Host가 배치 전용 Runtime/Task Frame을 준비하고 종료하는 공통 경로를 사용한다. 사용자가 열린 프로젝트 세션을 지정할 필요가 없다. 기본 입력도 분할 수집하며 성공 후 다음 소스 위치를 저장한다. 실제 Provider 호출과 한글 후보 3개 생성을 검증했다. 예약 시각 자동 발화 및 사용자 검토·채택·연결 전체 live 검증은 별도로 남아 있다. 현재 구현·증거·한계는 [RAG 자동화 점검](rag-automation-status-20260912.md)을 참조한다.

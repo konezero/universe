@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from universe_memory import MemoryError, normalize_memory_candidate
 from knowledge_redaction import SECRET_VALUE_PATTERNS
+from semantic_evidence import semantic_text_digest
 
 
 FAST_EXTRACT_REQUEST_SCHEMA = "universe.memory-fast-extract-request.v1"
@@ -310,8 +311,10 @@ def normalize_transient_semantic_evidence(values: Any) -> list[dict[str, Any]]:
                 "FAST_EXTRACT_SEMANTIC_EVIDENCE_INVALID",
                 f"{field}.role is unsupported",
             )
-        text = _text(value.get("text"), f"{field}.text", maximum=2000)
-        if digest(text) != text_digest:
+        text = value.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+            raise FastExtractError("FAST_EXTRACT_SEMANTIC_EVIDENCE_INVALID", f"{field}.text must contain 1..2000 characters")
+        if semantic_text_digest(text) != text_digest:
             raise FastExtractError(
                 "FAST_EXTRACT_SEMANTIC_EVIDENCE_INVALID",
                 f"{field}.text_digest does not match text",
@@ -414,6 +417,13 @@ def build_provider_request(
         "mutation_scope": {"operations": [], "targets": []},
         "context_pack": context,
         "output_contract": {
+            "instruction": (
+                "Extract concise, reusable MEMORY candidates supported by the supplied activity evidence. "
+                "Write each summary as an original Korean paraphrase; preserve necessary technical names. "
+                "Never reproduce a transcript, command, secret, or a sequence of 12 consecutive source words. "
+                "Summarize the reusable lesson rather than quoting instructions or conversation. "
+                "Use exact activity digests from the input for ref_digests. Keep review and adoption separate."
+            ),
             "json_schema": {
                 "type": "object",
                 "additionalProperties": False,

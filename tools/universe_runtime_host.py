@@ -1158,6 +1158,7 @@ class UniverseRuntimeHost:
         execution_plan: Mapping[str, Any],
         *,
         prefix: str,
+        profile: Path = PLANNING_PROFILE,
     ) -> dict[str, Any]:
         with self._transient_json_file(
             {"execution_plan": dict(execution_plan)},
@@ -1178,7 +1179,7 @@ class UniverseRuntimeHost:
                     "--repo-root",
                     str(self.repository_root),
                     "--profile",
-                    str(PLANNING_PROFILE),
+                    str(profile),
                     "--request",
                     str(request_path),
                 ],
