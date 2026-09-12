@@ -10550,8 +10550,12 @@ class UniverseStore:
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail) from error
 
-    def scan_provider_session_source(self, source_id: str) -> dict[str, Any]:
+    def scan_provider_session_source(self, source_id: str, *, include_history: bool = False) -> dict[str, Any]:
         try:
+            if include_history:
+                maintenance = self.provider_session_observer.prepare_rag_sources([source_id])
+                source = next(item for item in self.provider_session_observer.list_sources() if item["source_id"] == source_id)
+                return {"source": source, "added": maintenance["sources"][0]["observed_added"], "source_maintenance": maintenance}
             return self.provider_session_observer.scan(source_id)
         except ProviderSessionObserverError as error:
             raise UniverseError(
@@ -36712,6 +36716,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "interactive_session_required": False,
                 }
         result["source_collection"] = self.store.get_memory_source_position(project_id)
+        maintenance_status = getattr(self.store.provider_session_observer, "rag_maintenance_status", None)
+        result["source_maintenance"] = maintenance_status() if callable(maintenance_status) else None
         result["schedules"] = self.store.list_memory_batch_schedule_states(project_id)
         result["scheduler"] = {
             "status": (
@@ -36888,7 +36894,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             selection = None
             if "source_ids" not in prepared_request:
                 from universe_app.memory_source_window import select_source_window
+                maintain = getattr(self.store.provider_session_observer, "prepare_rag_sources", None)
+                maintenance = maintain() if callable(maintain) else None
                 prepared_request["source_ids"], selection = select_source_window(self.store, project_id)
+                if maintenance is not None:
+                    selection["source_maintenance"] = maintenance
             if not prepared_request["source_ids"]:
                 raise UniverseError("FAST_EXTRACT_ACTIVITY_INVALID", "No registered activity sources", HTTPStatus.CONFLICT)
             with self._memory_batch_runtimes.execution(project_id, stage) as (binding, public):
@@ -36944,6 +36954,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     str(batch["source"]["source_id"]),
                     batch["activity_refs"],
                     require_complete=_activity_windows is not None,
+                    **({"semantic_page": dict(_activity_windows[str(batch["source"]["source_id"])]["semantic_page"])}
+                       if _activity_windows is not None and "semantic_page" in _activity_windows[str(batch["source"]["source_id"])] else {}),
                 )
             ]
         except (FastExtractError, ProviderSessionObserverError) as error:
@@ -45641,8 +45653,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 r"/v1/session-observer/sources/([^/]+)/scan", path
             )
             if source_scan is not None:
+                request = _exact_object_fields(body, field="provider_source_scan", required=frozenset(), optional=frozenset({"include_history"}))
+                include_history = request.get("include_history", False)
+                if not isinstance(include_history, bool):
+                    raise UniverseError("SOURCE_REQUEST_INVALID", "include_history must be boolean", HTTPStatus.BAD_REQUEST)
                 result = self.server.store.scan_provider_session_source(
-                    unquote(source_scan.group(1))
+                    unquote(source_scan.group(1)), **({"include_history": True} if include_history else {})
                 )
                 self._send(
                     HTTPStatus.OK,

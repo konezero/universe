@@ -31,6 +31,8 @@ PROVIDERS = frozenset({"CODEX", "CLAUDE", "GROK"})
 CLAUDE_METADATA_EVENT_TYPES = frozenset(
     {
         "ai-title",
+        "custom-title",
+        "cost-state",
         "atis-latch",
         "bridge-session",
         "file-history-delta",
@@ -511,6 +513,17 @@ class ProviderSessionObserverStore:
                 "ON provider_session_activity(source_id, provider_turn_id, ordinal)"
             )
 
+            from provider_rag_collection import initialize_history
+            initialize_history(connection)
+
+    def rag_maintenance_status(self):
+        from provider_rag_collection import maintenance_status
+        return maintenance_status(self)
+
+    def prepare_rag_sources(self, source_ids=None):
+        from provider_rag_collection import prepare_sources
+        return prepare_sources(self, source_ids)
+
     def register_source(self, value: Mapping[str, Any]) -> dict[str, Any]:
         provider = _text(value.get("provider"), "provider").upper()
         if provider not in PROVIDERS:
@@ -701,8 +714,10 @@ class ProviderSessionObserverStore:
     @staticmethod
     def _rag_activity_rows(connection, source_id, provider):
         rows = connection.execute(
-            "SELECT * FROM provider_session_activity WHERE source_id = ? ORDER BY ordinal DESC, activity_id DESC",
-            (source_id,),
+            "SELECT * FROM provider_session_activity WHERE source_id = ? "
+            "UNION ALL SELECT * FROM provider_rag_history_activity WHERE source_id = ? "
+            "ORDER BY byte_offset DESC, ordinal DESC, activity_id DESC",
+            (source_id, source_id),
         ).fetchall()
         if provider != "CLAUDE":
             return [row for row in rows if row["active"]]
@@ -769,10 +784,12 @@ class ProviderSessionObserverStore:
         self,
         source_id: str,
         activity_refs: list[Mapping[str, Any]],
-        *, require_complete: bool = False,
+        *, require_complete: bool = False, semantic_page: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Read exact selected provider message events without persisting text."""
 
+        if semantic_page is not None and (not require_complete or len(activity_refs) != 1):
+            raise ProviderSessionObserverError("SEMANTIC_PAGE_INVALID", "A semantic page requires exactly one activity")
         if not activity_refs or len(activity_refs) > 512:
             raise ProviderSessionObserverError(
                 "SEMANTIC_EVIDENCE_INVALID",
@@ -791,7 +808,7 @@ class ProviderSessionObserverStore:
                 raise ProviderSessionObserverError(
                     "SEMANTIC_SOURCE_NOT_CURRENT", source_id
                 )
-            eligible_ids = {row["activity_id"] for row in self._rag_activity_rows(connection, source_id, provider)}
+            eligible_rows = {row["activity_id"]: row for row in self._rag_activity_rows(connection, source_id, provider)}
             selected: list[tuple[sqlite3.Row, Mapping[str, Any]]] = []
             for ref in activity_refs:
                 activity_id = _identifier(ref.get("activity_id"), "activity_id")
@@ -803,21 +820,13 @@ class ProviderSessionObserverStore:
                     raise ProviderSessionObserverError(
                         "SEMANTIC_EVIDENCE_INVALID", "ordinal must be positive"
                     )
-                row = connection.execute(
-                    """
-                    SELECT * FROM provider_session_activity
-                    WHERE source_id = ? AND activity_id = ? AND activity_digest = ?
-                      AND ordinal = ?
-                    """,
-                    (source_id, activity_id, activity_digest, ordinal),
-                ).fetchone()
-                if row is None or row["activity_id"] not in eligible_ids or row["byte_offset"] is None:
-                    raise ProviderSessionObserverError(
-                        "SEMANTIC_ACTIVITY_NOT_ATTESTED", activity_id
-                    )
+                row = eligible_rows.get(activity_id)
+                if (row is None or row["activity_digest"] != activity_digest
+                        or row["ordinal"] != ordinal or row["byte_offset"] is None):
+                    raise ProviderSessionObserverError("SEMANTIC_ACTIVITY_NOT_ATTESTED", activity_id)
                 selected.append((row, ref))
 
-        selected.sort(key=lambda item: int(item[0]["ordinal"]))
+        selected.sort(key=lambda item: (int(item[0]["byte_offset"]), int(item[0]["ordinal"])))
         excerpts: list[dict[str, Any]] = []
         total_chars = 0
         previous_semantic_key: tuple[str, str] | None = None
@@ -866,6 +875,19 @@ class ProviderSessionObserverStore:
                                 for role, raw in messages
                                 for redacted in [_redact_secrets_only(raw)]
                                 for index in range(0, len(redacted), SEMANTIC_EXCERPT_CHAR_LIMIT)]
+                if semantic_page is not None:
+                    messages = [(role, text) for role, text in messages if text.strip()]
+                    start = semantic_page.get("start", 0)
+                    digest = _sha256(_canonical_json(messages))
+                    if (isinstance(start, bool) or not isinstance(start, int) or start < 0
+                            or start >= len(messages)
+                            or (start and not semantic_page.get("digest"))):
+                        raise ProviderSessionObserverError("SEMANTIC_PAGE_INVALID", "Invalid semantic resume position")
+                    if semantic_page.get("digest", digest) != digest:
+                        raise ProviderSessionObserverError("SEMANTIC_SOURCE_NOT_CURRENT", "Activity content changed during pagination")
+                    end = min(len(messages), start + SEMANTIC_TOTAL_CHAR_LIMIT // SEMANTIC_EXCERPT_CHAR_LIMIT)
+                    semantic_page.update(start=start, digest=digest, next_start=end if end < len(messages) else None)
+                    messages = messages[start:end]
                 for role, raw_text in messages:
                     text = _redact_secrets_only(raw_text)
                     if not text.strip():
@@ -1261,7 +1283,9 @@ class ProviderSessionObserverStore:
         event: Mapping[str, Any],
         ordinal: int,
         byte_offset: int,
+        *, history: bool = False,
     ) -> bool:
+        table = "provider_rag_history_activity" if history else "provider_session_activity"
         provider = str(source["provider"])
         event_type = _event_type(event)
         event_kind, activity_state = _safe_event_kind(event_type)
@@ -1274,7 +1298,7 @@ class ProviderSessionObserverStore:
             if event_kind == "TURN_COMPLETED":
                 bindings = connection.execute(
                     "SELECT DISTINCT bus_message_id, bus_dispatch_ref "
-                    "FROM provider_session_activity WHERE source_id = ? "
+                    f"FROM {table} WHERE source_id = ? "
                     "AND provider_turn_id = ? AND bus_message_id IS NOT NULL "
                     "AND ordinal < ?",
                     (source["source_id"], correlation["provider_turn_id"], ordinal),
@@ -1306,8 +1330,8 @@ class ProviderSessionObserverStore:
             parent_id = parent.strip() if isinstance(parent, str) and parent.strip() else None
             if parent_id is not None:
                 connection.execute(
-                    """
-                    UPDATE provider_session_activity SET active = 0
+                    f"""
+                    UPDATE {table} SET active = 0
                     WHERE source_id = ? AND provider_event_id = ?
                     """,
                     (source["source_id"], parent_id),
@@ -1328,8 +1352,8 @@ class ProviderSessionObserverStore:
         digest = _sha256(_canonical_json(safe))
         activity_id = "activity_" + digest[:24]
         inserted = connection.execute(
-            """
-                INSERT OR IGNORE INTO provider_session_activity(
+            f"""
+                INSERT OR IGNORE INTO {table}(
                     activity_id, source_id, provider_event_id, ordinal, event_kind,
                     activity_state, observed_at, activity_digest, byte_offset,
                     branch_parent_id, active, recorded_at,

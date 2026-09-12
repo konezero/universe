@@ -16953,7 +16953,26 @@ function renderMemory() {
     const collection = automation.source_collection?.selection;
     if (collection) {
       progress.append(node("p", "rag-counts", "최근 수집 " + collection.selected_count + "개 · 다음 배치 " + collection.deferred_count + "개 · 제외 " + collection.skipped_count + "개"));
-      if (collection.activity_resume) progress.append(node("p", "rag-counts", "대용량 소스 이어 수집 중 · 활동 " + collection.activity_resume.after.ordinal + "번까지 처리, 다음 배치에서 계속합니다."));
+      if (collection.activity_resume) progress.append(node("p", "rag-counts", collection.activity_resume.semantic_page
+        ? "긴 메시지 나눠 수집 중 · " + collection.activity_resume.semantic_page.start + "개 본문 조각까지 처리, 다음 배치에서 계속합니다."
+        : "대용량 소스 이어 수집 중 · 활동 " + collection.activity_resume.after.ordinal + "번까지 처리, 다음 배치에서 계속합니다."));
+      if (automation.source_maintenance || collection.source_maintenance) {
+        const sources = (automation.source_maintenance || collection.source_maintenance).sources || [];
+        const history = sources.filter(item => item.history?.state === "PENDING").length;
+        const blocked = sources.filter(item => item.status !== "ACTIVE" || item.history?.state === "BLOCKED").length;
+        const added = sources.reduce((count, item) => count + (item.history?.added || 0), 0);
+        progress.append(node("p", "rag-counts", "최근 원본 점검 " + sources.length + "개 · 과거 활동 추가 " + added + "개 · 과거 수집 진행 " + history + "개 · 확인 필요 " + blocked + "개"));
+        if (blocked) {
+          const issues = node("details", "rag-source-issues");
+          issues.append(node("summary", "", "원본 확인이 필요한 항목"));
+          for (const item of sources.filter(item => item.status !== "ACTIVE" || item.history?.state === "BLOCKED")) {
+            const code = item.recovery === "SOURCE_LOCATION_ALREADY_REGISTERED" ? item.recovery : item.history?.error_code || item.error_code;
+            const label = code === "SOURCE_LOCATION_ALREADY_REGISTERED" ? "보관 원본이 다른 항목으로 이미 등록됨" : code === "SOURCE_MISSING" ? "원본 파일을 찾지 못함" : code === "SOURCE_SCHEMA_UNSUPPORTED" ? "기록 형식 확인 필요" : "원본 검증 필요";
+            issues.append(node("p", "", item.provider + " · " + item.source_id + " · " + label + " (" + code + ")"));
+          }
+          progress.append(issues);
+        }
+      }
       if (collection.skipped_count) {
         const skipped = node("details", "rag-source-issues");
         skipped.append(node("summary", "", "제외된 소스 원인"));

@@ -42,7 +42,9 @@ def select_source_window(store, project_id):
                 previous = resume["after"]
                 if previous not in refs:
                     raise UniverseError("MEMORY_ACTIVITY_CURSOR_STALE", "The last processed activity no longer matches this source", 409)
-                refs = refs[refs.index(previous) + 1:]
+                refs = refs[refs.index(previous) + (0 if resume.get("semantic_page") else 1):]
+            page = None
+            saved_page = resume.get("semantic_page") if resume and resume["source_id"] == source_id else None
             remaining_refs = refs
             refs = refs[:512]
             provider = str((batch.get("source") or {}).get("provider", "")).strip().upper()
@@ -54,9 +56,12 @@ def select_source_window(store, project_id):
                 evidence = None
             else:
                 offset = 0
+                if saved_page:
+                    refs = refs[:1]
+                    page = dict(saved_page)
                 while True:
                     try:
-                        evidence = store.provider_session_observer.build_transient_semantic_evidence(source_id, refs, require_complete=True)
+                        evidence = store.provider_session_observer.build_transient_semantic_evidence(source_id, refs, require_complete=True, **({"semantic_page": page} if page is not None else {}))
                         evidence = normalize_transient_semantic_evidence(evidence)
                         break
                     except ProviderSessionObserverError as error:
@@ -64,9 +69,12 @@ def select_source_window(store, project_id):
                             offset += len(refs)
                             refs = remaining_refs[offset:offset + 512]
                             continue
-                        if error.code != "SEMANTIC_EVIDENCE_WINDOW_LIMIT" or len(refs) <= 1:
+                        if error.code != "SEMANTIC_EVIDENCE_WINDOW_LIMIT" or page is not None:
                             raise
-                        refs = refs[:max(1, len(refs) // 2)]
+                        if len(refs) == 1:
+                            page = {"start": 0}
+                        else:
+                            refs = refs[:max(1, len(refs) // 2)]
                 code = None
         except (UniverseError, ProviderSessionObserverError, FastExtractError) as error:
             if (resume and resume["source_id"] == source_id) or error.code not in RECOVERABLE_SOURCE_ERRORS:
@@ -85,7 +93,12 @@ def select_source_window(store, project_id):
                 break
             selected.append(source_id)
             windows[source_id] = {"source": batch["source"], "activity_refs": refs}
-            if offset + len(refs) < len(remaining_refs):
+            if page is not None:
+                windows[source_id]["semantic_page"] = {key: page[key] for key in ("start", "digest")}
+            if page is not None and page["next_start"] is not None:
+                pending_resume = {"source_id": source_id, "after": refs[-1],
+                                  "semantic_page": {"start": page["next_start"], "digest": page["digest"]}}
+            elif offset + len(refs) < len(remaining_refs):
                 pending_resume = {"source_id": source_id, "after": refs[-1]}
             text_chars += chars
             excerpt_count += len(evidence)
