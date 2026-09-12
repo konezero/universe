@@ -16897,6 +16897,30 @@ function groupRagReviewCandidates(candidates) {
   }).sort((a, b) => Number(b.reasons.includes("충돌 확인")) - Number(a.reasons.includes("충돌 확인")));
 }
 
+function ragChangedInWindow(item, start, end) {
+  return [item.created_at, item.updated_at].some(value => {
+    const time = typeof value === "string" && value.trim() ? Date.parse(value) : NaN;
+    return Number.isFinite(time) && time >= start && time <= end;
+  });
+}
+
+function summarizeRagDay(knowledge, now = new Date()) {
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const end = now.getTime();
+  const isNew = item => ragChangedInWindow({created_at: item.created_at}, start, end);
+  const candidates = knowledge.candidates || [];
+  const memories = knowledge.memories || [];
+  const changedCandidates = candidates.filter(item => ragChangedInWindow(item, start, end));
+  return {start, end,
+    newCandidates: candidates.filter(isNew).length,
+    updatedCandidates: changedCandidates.filter(item => !isNew(item)).length,
+    newMemories: memories.filter(isNew).length,
+    updatedMemories: memories.filter(item => !isNew(item) && ragChangedInWindow(item, start, end)).length,
+    unknownDates: [...candidates, ...memories].filter(item => ![item.created_at, item.updated_at].some(value => typeof value === "string" && value.trim() && Number.isFinite(Date.parse(value)))).length,
+    changedCandidates,
+  };
+}
+
 function renderMemory() {
   if (!elements.memoryPanel) return;
   const generation = ++ragScreenGeneration;
@@ -16971,6 +16995,20 @@ function renderMemory() {
     const candidates = knowledge.candidates.filter(item => !adoptedMemoryForCandidate(item, knowledge.memories));
     const proposed = knowledge.memories.filter(item => item.link_state === "PROPOSED");
     const triage = groupRagReviewCandidates(candidates);
+    const daily = summarizeRagDay(knowledge);
+    const digest = node("section", "rag-daily-summary");
+    digest.setAttribute("aria-label", "오늘의 메모 요약");
+    digest.append(node("h3", "", "오늘의 메모 요약"));
+    digest.append(node("p", "rag-counts", "새 후보 " + daily.newCandidates + "개 · 기존 후보 변경 " + daily.updatedCandidates + "개 · 새 저장 메모 " + daily.newMemories + "개 · 기존 메모 변경 " + daily.updatedMemories + "개"));
+    const needsDecision = triage.filter(bundle => bundle.bucket === "decision").length;
+    digest.append(node("p", "", "미처리 확인 대상: 후보 " + needsDecision + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
+    digest.append(node("small", "", new Date(daily.end).toLocaleString("ko-KR") + " 조회 · 브라우저 시간대 " + Intl.DateTimeFormat().resolvedOptions().timeZone + "의 오늘 0시부터 · 현재 불러온 목록 기준"));
+    if (daily.unknownDates) digest.append(node("p", "", "날짜를 확인할 수 없는 " + daily.unknownDates + "개는 오늘 집계에서 제외했습니다."));
+    const todayToggle = node("button", "secondary-button compact-action", "오늘 변경만 보기");
+    todayToggle.setAttribute("aria-pressed", "false");
+    digest.append(todayToggle);
+    lists.append(digest);
+    let todayOnly = false;
     lists.append(node("p", "rag-counts", "후보 " + candidates.length + "개 → " + triage.length + "묶음 · 연결 제안 " + proposed.length + "개"));
     lists.append(node("p", "context-copy", "같은 종류·동일 내용은 화면에서 묶습니다. 보관·채택·연결 결정은 항목별로 유지됩니다. 충돌 표시는 등록된 상태·관계 기준이며 내용의 사실성은 별도 검토가 필요합니다."));
     const search = node("input", "document-list-search");
@@ -16980,7 +17018,7 @@ function renderMemory() {
     const draw = () => {
       groups.replaceChildren();
       const query = search.value?.trim().toLowerCase() || "";
-      const matches = item => ((item.title || "") + " " + (item.body || "") + " " + (item.summary || "")).toLowerCase().includes(query);
+      const matches = item => (!todayOnly || ragChangedInWindow(item, daily.start, daily.end)) && ((item.title || "") + " " + (item.body || "") + " " + (item.summary || "")).toLowerCase().includes(query);
       const appendRow = (parent, item, candidate) => {
         const row = node("button", "rag-memory-row");
         const status = knowledgeStatus(item, candidate, knowledge.memories);
@@ -17016,6 +17054,12 @@ function renderMemory() {
       for (const item of stored) appendRow(archive, item, false);
       for (const item of reviewed) appendRow(archive, item, true);
       groups.append(archive);
+    };
+    todayToggle.onclick = () => {
+      todayOnly = !todayOnly;
+      todayToggle.textContent = todayOnly ? "전체 기간 보기" : "오늘 변경만 보기";
+      todayToggle.setAttribute("aria-pressed", String(todayOnly));
+      draw();
     };
     search.oninput = draw; draw();
     if (knowledge.candidates.length >= 200) lists.append(node("p", "", "최근 후보 최대 200개를 기준으로 묶었습니다. 전체 이력의 분류 결과는 아닙니다."));

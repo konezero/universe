@@ -8752,3 +8752,6 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .rag-review-bundle > summary small { display: block; margin-top: 6px; }
 .rag-review-bundle[open] > summary { margin-bottom: 10px; }
 .rag-memory-group > summary { cursor: pointer; padding: 12px 0; }
+
+.rag-daily-summary { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+.rag-daily-summary small { display: block; margin: 8px 0; }
