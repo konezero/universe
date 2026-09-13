@@ -9,6 +9,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/konezero/.pyenv/pyenv-win/versions/3.14.5/python.exe C:/workspace/universe/tools/universe_session_bus_hook.py --provider CLAUDE",
+            "timeout": 8
+          }
+        ]
+      }
     ]
   }
 }

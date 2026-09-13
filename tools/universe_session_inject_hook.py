@@ -1435,6 +1435,65 @@ def _codex_hook_block(python_exe: str, script_path: str) -> str:
     )
 
 
+def _codex_bus_hook_block(python_exe: str, script_path: str) -> str:
+    import subprocess
+    hook_script = str(Path(script_path).with_name("universe_session_bus_hook.py"))
+    command = subprocess.list2cmdline([python_exe, hook_script, "--provider", "CODEX"])
+    return "".join(
+        f"\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\n"
+        f'type = "command"\ncommand = {json.dumps(command)}\ntimeout = 8\n'
+        for event in ("Stop",)
+    )
+
+
+def _bus_stop_hook_payload(python_exe: str, script_path: str, provider: str) -> dict[str, Any]:
+    import subprocess
+    command = subprocess.list2cmdline([
+        Path(python_exe).as_posix(),
+        Path(script_path).with_name("universe_session_bus_hook.py").as_posix(),
+        "--provider", provider,
+    ])
+    block: dict[str, Any] = {"hooks": [{"type": "command", "command": command, "timeout": 8}]}
+    if provider == "GROK":
+        block["matcher"] = "end_turn"
+    return {"hooks": {"Stop": [block]}}
+
+
+def merge_bus_stop_hook(existing: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+    """Replace only our Stop handler; preserve unrelated hooks/settings."""
+    from copy import deepcopy
+    merged = deepcopy(existing)
+    hooks = merged.setdefault("hooks", {})
+    if not isinstance(hooks, dict) or not isinstance(hooks.get("Stop", []), list):
+        raise ValueError("hooks.Stop must be an array")
+    blocks = []
+    for block in hooks.get("Stop", []):
+        if not isinstance(block, dict) or not isinstance(block.get("hooks"), list):
+            raise ValueError("Stop entries must contain a hooks array")
+        handlers = block["hooks"]
+        kept = [h for h in handlers if "universe_session_bus_hook.py" not in str(h.get("command") or "")]
+        if len(kept) == len(handlers) or kept:
+            blocks.append({**block, "hooks": kept})
+    hooks["Stop"] = blocks + deepcopy(desired["hooks"]["Stop"])
+    return merged
+
+
+def _write_bus_stop_hook(path: Path, python_exe: str, script_path: str, provider: str) -> dict[str, Any]:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(existing, dict):
+            raise ValueError("hook settings must be an object")
+        merged = merge_bus_stop_hook(existing, _bus_stop_hook_payload(python_exe, script_path, provider))
+        status = "CURRENT"
+        if merged != existing:
+            status = "UPDATED" if path.is_file() else "WRITTEN"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return {"status": status, "path": str(path)}
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        return {"status": "ERROR", "path": str(path), "detail": str(error)}
+
+
 def _grok_hook_payload(python_exe: str, script_path: str) -> dict[str, Any]:
     cmd = " ".join([
         python_exe, script_path,
@@ -1691,7 +1750,7 @@ def setup_provider_hooks(
     mode: str | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Write SessionStart hook configs for Codex and/or Grok (and Claude).
+    """Write SessionStart binding and idle Stop reminder configs for providers.
 
     Returns a dict with per-provider status strings.
 
@@ -1728,6 +1787,12 @@ def setup_provider_hooks(
                 with config_path.open("a", encoding="utf-8") as f:
                     f.write(_codex_hook_block(py, sp))
                 results["CODEX"] = {"status": "WRITTEN", "path": str(config_path)}
+            if "universe_session_bus_hook.py" not in existing:
+                with config_path.open("a", encoding="utf-8") as f:
+                    f.write(_codex_bus_hook_block(py, sp))
+                results["CODEX"]["bus_hooks"] = "WRITTEN"
+            else:
+                results["CODEX"]["bus_hooks"] = "ALREADY_PRESENT"
         except OSError as e:
             results["CODEX"] = {"status": "ERROR", "detail": str(e)}
 
@@ -1737,6 +1802,13 @@ def setup_provider_hooks(
         results["GROK_PROJECT"] = _write_grok_session_hook(
             repo_root / ".grok" / "hooks", py, sp
         )
+        results["GROK_PROJECT"]["bus_hooks"] = _write_bus_stop_hook(
+            repo_root / ".grok" / "hooks" / "session-stop.json", py, sp, "GROK"
+        )
+        if global_:
+            results["GROK"]["bus_hooks"] = _write_bus_stop_hook(
+                home / ".grok" / "hooks" / "session-stop.json", py, sp, "GROK"
+            )
     if "CLAUDE" in targets:
         try:
             results["CLAUDE_PROJECT"] = {
@@ -1748,6 +1820,9 @@ def setup_provider_hooks(
                 ),
                 "path": str((repo_root / ".claude" / "settings.json")),
             }
+            results["CLAUDE_PROJECT"]["bus_hooks"] = _write_bus_stop_hook(
+                repo_root / ".claude" / "settings.json", py, sp, "CLAUDE"
+            )
         except OSError as error:
             results["CLAUDE_PROJECT"] = {"status": "ERROR", "detail": str(error)}
         if not is_universe_repo:
@@ -1778,6 +1853,7 @@ def setup_provider_hooks(
                     ),
                     "path": str(settings_path),
                 }
+                results["CLAUDE"]["bus_hooks"] = _write_bus_stop_hook(settings_path, py, sp, "CLAUDE")
             except OSError as error:
                 results["CLAUDE"] = {"status": "ERROR", "detail": str(error)}
 

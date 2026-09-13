@@ -35258,6 +35258,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self._observe_multi_room_collection(message)
 
+    def handle_session_bus_hook(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        from universe_app.session_bus_hooks import handle_hook
+        from universe_app.session_bus import _public_session
+        try:
+            if payload.get("schema") != "universe.session-bus-hook.v1":
+                raise SessionBusError("BUS_HOOK_SCHEMA_INVALID", "unsupported hook schema")
+            tid = str(payload.get("terminal_id") or "")
+            host = self._session_anchor_terminal_host()
+            terminal = _public_session(host, tid)
+            session = self.session_supervisor.get_session(str(terminal.get("supervisor_session_id") or ""))
+            if (terminal.get("state") != "LIVE"
+                    or str(payload.get("session_anchor_ref") or "") != terminal.get("session_anchor_ref")
+                    or str(payload.get("supervisor_session_id") or "") != session["session_id"]
+                    or str(payload.get("session_anchor_ref") or "") != session.get("session_anchor_ref")
+                    or str(payload.get("provider") or "") != session.get("provider")
+                    or str(payload.get("provider") or "") != terminal.get("provider")
+                    or not payload.get("provider_session_ref")
+                    or payload["provider_session_ref"] != session.get("provider_session_ref")):
+                raise SessionBusError("BUS_HOOK_SESSION_MISMATCH", "hook does not match the exact live provider session", 409)
+            return {"schema": "universe.session-bus-hook.v1", **handle_hook(self.session_bus, host, payload)}
+        except (SessionBusError, SessionSupervisorError, TerminalHostError) as error:
+            raise UniverseError(error.code, error.detail, getattr(error, "status", 409)) from error
+
     def ack_session_bus_message(
         self, message_id: str, value: Mapping[str, Any] | None
     ) -> dict[str, Any]:
@@ -43852,6 +43875,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         unquote(terminal_terminate.group(1))
                     ),
                 )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        if path == "/v1/session-bus/hooks":
+            try:
+                self._send(HTTPStatus.OK, self.server.handle_session_bus_hook(self._read_json()))
             except UniverseError as error:
                 self._send_error(error)
             return
