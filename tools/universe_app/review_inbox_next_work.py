@@ -112,6 +112,8 @@ def _memory_entries(
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for candidate in candidates:
+        if candidate.get("source_review", {}).get("bucket") == "archive":
+            continue
         state = str(candidate.get("state") or "").upper()
         candidate_id = _text(candidate.get("candidate_id"))
         title = _text(candidate.get("title") or candidate.get("summary"))
@@ -125,6 +127,8 @@ def _memory_entries(
         if classification == "PRODUCT_INTENT" and not product_kind:
             if state != "START_PRODUCT_DESIGN":
                 classification = "REVIEW_ONLY"
+        if "source_review" in candidate and not candidate["source_review"].get("plan_allowed"):
+            classification = "REVIEW_ONLY"
         relations = candidate.get("relations")
         conflict = state == "CONFLICTED" or (
             isinstance(relations, Sequence)

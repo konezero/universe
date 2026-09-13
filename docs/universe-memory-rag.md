@@ -7,6 +7,10 @@ node link/unlink, search, and propose-links
 Not: automatic Candidate adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
+## Source-grounded candidate eligibility (2026-09-13)
+
+Current implementation evidence is now required before KEEP/adoption. Open TODO-backed future work is kept separate from current facts; outdated or contradicted records are retained in a separate archive. Unverified or stale assessments block adoption. See [source eligibility contract and live verification](rag-source-eligibility-20260913.md). Semantic comparison currently runs explicitly in bounded batches; scheduled INDEPENDENT_CHECK remains a structural check.
+
 ## LLM retrieval context
 
 Every resident Project Master message receives a bounded, project-local

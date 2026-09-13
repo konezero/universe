@@ -12570,6 +12570,7 @@ function relatedKnowledgeForNode(item, knowledge) {
 function knowledgeStatus(item, candidate, memories = []) {
   if (candidate) {
     if (adoptedMemoryForCandidate(item, memories)) return { label: "RAG 채택 완료", tone: "adopted" };
+    if (item.source_review) return {label: item.source_review.label, tone: item.source_review.bucket === "archive" ? "muted" : item.source_review.bucket === "current" ? "adopted" : "pending"};
     if (item.state === "KEEP") return { label: "보관 결정 · RAG 채택 대기", tone: "pending" };
     if (item.state === "IGNORE") return { label: "무시됨", tone: "muted" };
     return { label: ({REVIEW_REQUIRED:"검토 대기",EXPLORE:"구상 검토",START_PRODUCT_DESIGN:"설계로 넘김"})[item.state] || item.state || "확인 필요", tone: "pending" };
@@ -12640,7 +12641,7 @@ async function openHoverMemory(projectId, initial, isCandidate) {
     }
     if (!dialog.isConnected) return;
     content.replaceChildren();
-    title.textContent = memory?.title || "메모 후보";
+    title.textContent = memory?.title || (candidate?.source_review?.bucket === "archive" ? "별도 보관된 기록" : "메모 후보");
     const status = knowledgeStatus(memory || candidate, !memory, knowledge.memories);
     content.append(node("p", `knowledge-badge ${status.tone}`, `${status.label} / ${memory ? memoryLinkLabel(memory) : "미연결 후보"}`));
     content.append(markdownBody(memory?.body || candidate?.summary || "No content"));
@@ -12679,8 +12680,22 @@ async function openHoverMemory(projectId, initial, isCandidate) {
       actions.append(select, connect);
     }
     if (candidate && !memory) {
-      for (const action of memoryCandidateActionSpecs(candidate).filter(action => ["KEEP", "IGNORE"].includes(action.id))) {
-        const button = node("button", "secondary-button compact-action", action.id === "KEEP" ? "보관" : "무시");
+      const review = candidate.source_review;
+      if (review) {
+        content.append(node("p", "context-copy", review.reason));
+        content.append(node("small", "", "AI 소스 대조 · 근거가 부족하면 대기 · 채택은 직접 결정"));
+        for (const evidence of review.evidence || []) content.append(node("p", "", evidence.path ? evidence.path + " : " + (evidence.lines || []).join(", ") : "진행 예정 TODO: " + evidence.todo_id));
+      }
+      if (!review?.source_digest) {
+        const compare = node("button", "secondary-button compact-action", "현재 소스와 대조");
+        compare.onclick = () => run(compare, async () => {
+          const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/memory-source-review`, {method: "POST", body: {candidate_ids: [candidate.candidate_id]}});
+          return {...result, candidate: (result.candidates || []).find(item => item.candidate_id === candidate.candidate_id)};
+        });
+        actions.append(compare);
+      }
+      for (const action of memoryCandidateActionSpecs(candidate).filter(action => ["KEEP", "IGNORE", "START_PRODUCT_DESIGN"].includes(action.id))) {
+        const button = node("button", "secondary-button compact-action", ({KEEP: "채택 대상으로 확인", IGNORE: "무시", START_PRODUCT_DESIGN: "계획으로 검토"})[action.id]);
         button.onclick = () => run(button, () => api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates/review`, { method: "POST", body: memoryCandidateReviewPayload(candidate, action) }));
         actions.append(button);
       }
@@ -16760,7 +16775,7 @@ function renderMemoryCandidateCard(candidate) {
     );
   }
   renderMemoryCandidateReopenAction(card, candidate);
-  if (candidate.state === "KEEP" && candidate.kind === "MEMORY") {
+  if (candidate.state === "KEEP" && candidate.kind === "MEMORY" && memoryCandidateNextAction(candidate).kind === "RAG_ADOPT_AVAILABLE") {
     const actions = node("div", "memory-candidate-actions");
     const adopt = node(
       "button",
@@ -16872,10 +16887,10 @@ let ragScreenGeneration = 0;
 function groupRagReviewCandidates(candidates) {
   const groups = new Map();
   for (const item of candidates) {
-    if (["IGNORE", "SUPERSEDED"].includes(item.state)) continue;
+    if (["IGNORE", "SUPERSEDED"].includes(item.state) || item.source_review?.bucket === "archive") continue;
     const content = String(item.summary || "").normalize("NFC").trim().replace(/\s+/g, " ");
     // Keep case and punctuation: technical identifiers can differ in meaning.
-    const key = JSON.stringify([item.project_id || "", item.kind, content || item.candidate_id]);
+    const key = JSON.stringify([item.project_id || "", item.kind, item.source_review?.bucket || "pending", content || item.candidate_id]);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(item);
   }
@@ -16893,7 +16908,7 @@ function groupRagReviewCandidates(candidates) {
     if (items.length > 1) reasons.add("동일 내용 묶음");
     else if (organized) reasons.add("통합 단계 결과");
     if (!reasons.size) reasons.add("검토 전");
-    return {items, reasons: [...reasons], bucket: urgent ? "decision" : organized ? "organized" : "new"};
+    return {items, reasons: [...reasons], bucket: items[0].source_review?.bucket || "pending"};
   }).sort((a, b) => Number(b.reasons.includes("충돌 확인")) - Number(a.reasons.includes("충돌 확인")));
 }
 
@@ -16942,7 +16957,19 @@ function renderMemory() {
       if (state.selectedProject?.project_id === projectId) renderMemory();
     } catch (error) { toast(error.message, true); suggest.disabled = false; }
   };
-  panel.append(refreshButton, suggest, progress, lists);
+  panel.append(node("p", "context-copy", "소스 대조는 AI가 현재 구현과 열린 TODO를 확인합니다. 한 번에 최대 4개씩 검토하며, 기존 예약 품질 점검은 형식 검사입니다."));
+  const compare = node("button", "primary-button compact-action", "소스 대조 진행 (최대 4개)");
+  compare.onclick = async () => {
+    compare.disabled = true;
+    compare.textContent = "현재 소스와 대조 중…";
+    try {
+      const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/memory-source-review`, {method: "POST", body: {}});
+      toast(result.candidates?.length ? result.candidates.length + "개 대조 완료" : "이번에 대조할 항목이 없습니다.");
+      hoverKnowledgeCache.delete(projectId);
+      if (state.selectedProject?.project_id === projectId) renderMemory();
+    } catch (error) { toast(error.message, true); compare.disabled = false; compare.textContent = "소스 대조 다시 시도"; }
+  };
+  panel.append(refreshButton, compare, suggest, progress, lists);
   Promise.all([
     api(`/v1/projects/${encodeURIComponent(projectId)}/memory-batch-config`),
     loadHoverKnowledge(projectId, true),
@@ -17020,8 +17047,8 @@ function renderMemory() {
     digest.setAttribute("aria-label", "오늘의 메모 요약");
     digest.append(node("h3", "", "오늘의 메모 요약"));
     digest.append(node("p", "rag-counts", "새 후보 " + daily.newCandidates + "개 · 기존 후보 변경 " + daily.updatedCandidates + "개 · 새 저장 메모 " + daily.newMemories + "개 · 기존 메모 변경 " + daily.updatedMemories + "개"));
-    const needsDecision = triage.filter(bundle => bundle.bucket === "decision").length;
-    digest.append(node("p", "", "미처리 확인 대상: 후보 " + needsDecision + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
+    const needsDecision = triage.filter(bundle => ["current", "future"].includes(bundle.bucket)).length;
+    digest.append(node("p", "", "채택·계획 검토 가능 " + needsDecision + "묶음 · 소스 확인 대기 " + triage.filter(bundle => bundle.bucket === "pending").length + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
     digest.append(node("small", "", new Date(daily.end).toLocaleString("ko-KR") + " 조회 · 브라우저 시간대 " + Intl.DateTimeFormat().resolvedOptions().timeZone + "의 오늘 0시부터 · 현재 불러온 목록 기준"));
     if (daily.unknownDates) digest.append(node("p", "", "날짜를 확인할 수 없는 " + daily.unknownDates + "개는 오늘 집계에서 제외했습니다."));
     const todayToggle = node("button", "secondary-button compact-action", "오늘 변경만 보기");
@@ -17029,7 +17056,7 @@ function renderMemory() {
     digest.append(todayToggle);
     lists.append(digest);
     let todayOnly = false;
-    lists.append(node("p", "rag-counts", "후보 " + candidates.length + "개 → " + triage.length + "묶음 · 연결 제안 " + proposed.length + "개"));
+    lists.append(node("p", "rag-counts", "검토 기록 " + candidates.length + "개 → 활성 " + triage.length + "묶음 · 연결 제안 " + proposed.length + "개"));
     lists.append(node("p", "context-copy", "같은 종류·동일 내용은 화면에서 묶습니다. 보관·채택·연결 결정은 항목별로 유지됩니다. 충돌 표시는 등록된 상태·관계 기준이며 내용의 사실성은 별도 검토가 필요합니다."));
     const search = node("input", "document-list-search");
     search.type = "search"; search.placeholder = "메모 제목·내용 검색"; search.setAttribute("aria-label", "메모 검색");
@@ -17047,13 +17074,13 @@ function renderMemory() {
         parent.append(row);
       };
       for (const [bucket, title, explanation] of [
-        ["decision", "결정할 것", "충돌·출처 확인·내용 보완·채택 대기 항목을 먼저 확인하세요."],
-        ["new", "새로 모은 것", "아직 검토하지 않은 새 후보입니다. 자동 채택하지 않습니다."],
-        ["organized", "자동 정리한 것", "동일 내용 묶음과 통합 단계 결과입니다. 원본을 삭제하거나 검토 결정을 합치지 않습니다."],
+        ["current", "현재 소스와 일치", "구현 근거를 확인한 내용입니다. 확인 후 RAG에 채택할 수 있습니다."],
+        ["future", "앞으로 진행할 사항", "열린 프로젝트 TODO와 연결된 계획입니다. 현재 구현된 사실과 구분합니다."],
+        ["pending", "소스 확인 대기", "아직 대조하지 않았거나 근거가 부족한 기록입니다. 확인 전에는 채택할 수 없습니다."],
       ]) {
         const section = node("section", "rag-memory-group");
         const bundles = triage.filter(bundle => bundle.bucket === bucket && bundle.items.some(matches));
-        const links = bucket === "decision" ? proposed.filter(matches) : [];
+        const links = [];
         section.append(node("h3", "", title + " (" + (bundles.length + links.length) + ")"), node("p", "context-copy", explanation));
         if (!bundles.length && !links.length) section.append(node("p", "empty-copy", "지금 확인할 항목이 없습니다."));
         for (const bundle of bundles) {
@@ -17067,6 +17094,17 @@ function renderMemory() {
         for (const memory of links) appendRow(section, memory, false);
         groups.append(section);
       }
+      const linkSection = node("section", "rag-memory-group");
+      const linkItems = proposed.filter(matches);
+      linkSection.append(node("h3", "", "저장 메모의 노드 연결 제안 (" + linkItems.length + ")"), node("p", "context-copy", "기존 저장 메모의 연결 제안입니다. 소스 대조 결과와 별도로 확인합니다."));
+      for (const item of linkItems) appendRow(linkSection, item, false);
+      groups.append(linkSection);
+      const oldRecords = candidates.filter(item => item.source_review?.bucket === "archive" && matches(item));
+      const oldArchive = node("details", "rag-memory-group");
+      oldArchive.append(node("summary", "", "오래되거나 틀린 기록 · 후보 제외 (" + oldRecords.length + ")"));
+      oldArchive.append(node("p", "context-copy", "원문 요약과 제외 이유, 소스 근거를 별도로 보존합니다. 소스가 바뀌면 다시 확인합니다."));
+      for (const item of oldRecords) appendRow(oldArchive, item, true);
+      groups.append(oldArchive);
       const archive = node("details", "rag-memory-group");
       const stored = knowledge.memories.filter(item => item.link_state !== "PROPOSED" && matches(item));
       const reviewed = candidates.filter(item => ["IGNORE", "SUPERSEDED"].includes(item.state) && matches(item));

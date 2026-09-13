@@ -646,6 +646,8 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertNotIn("secret transcript", json.dumps(bench).lower())
 
         candidate_id = candidates["candidates"][0]["candidate_id"]
+        from test_memory_source_review import attest_current_fixture
+        attest_current_fixture(self.server.store, candidate_id)
         status, reviewed = self.request(
             "POST",
             f"/v1/memory-candidates/{candidate_id}/review",

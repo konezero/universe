@@ -273,6 +273,8 @@ class ReviewInboxApiTests(unittest.TestCase):
             },
         )
         self.assertTrue(created)
+        from test_memory_source_review import attest_current_fixture
+        attest_current_fixture(self.server.store, candidate["candidate_id"], "FUTURE")
         status, payload = self.request(
             "POST",
             f"/v1/memory-candidates/{candidate['candidate_id']}/review",
@@ -293,6 +295,7 @@ class ReviewInboxApiTests(unittest.TestCase):
                 "summary": "Keep this bounded project memory.",
             },
         )
+        attest_current_fixture(self.server.store, keep["candidate_id"])
         keep_status, keep_payload = self.request(
             "POST",
             f"/v1/memory-candidates/{keep['candidate_id']}/review",

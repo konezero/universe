@@ -11031,6 +11031,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("RAG_ADOPT_REVIEW_REQUIRED", blocked["error_code"])
         self.assertEqual([], self.server.store.list_project_memories("GCS"))
 
+        from test_memory_source_review import attest_current_fixture
+        attest_current_fixture(self.server.store, candidate["candidate_id"])
         kept, changed = self.server.store.review_memory_candidate(
             candidate["candidate_id"], {"decision": "KEEP"}
         )
@@ -11089,6 +11091,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "summary": "An idea remains a candidate until another product decision.",
             },
         )
+        attest_current_fixture(self.server.store, idea["candidate_id"])
         self.server.store.review_memory_candidate(
             idea["candidate_id"], {"decision": "KEEP"}
         )

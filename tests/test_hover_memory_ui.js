@@ -56,10 +56,10 @@ vm.runInContext(source.slice(source.indexOf('const hoverKnowledgeCache ='),sourc
   const dialog = body.children.at(-1);
   const buttons = () => dialog.querySelectorAll('button');
   fail = true;
-  await buttons().find(b=>b.textContent==='보관').onclick();
+  await buttons().find(b=>b.textContent==='채택 대상으로 확인').onclick();
   assert.equal(buttons().find(b=>b.textContent==='RAG에 채택'),undefined);
   fail = false;
-  await buttons().find(b=>b.textContent==='보관').onclick();
+  await buttons().find(b=>b.textContent==='채택 대상으로 확인').onclick();
   assert.equal(candidate.state,'KEEP');
   assert.equal(memories.length,0);
   await buttons().find(b=>b.textContent==='RAG에 채택').onclick();

@@ -28,6 +28,7 @@ from universe_memory import (  # noqa: E402
     synthesize_memory_candidates,
 )
 from universe_server import UniverseError, create_server  # noqa: E402
+from test_memory_source_review import attest_current_fixture
 from session_anchor_transport import SessionAnchorTransportError  # noqa: E402
 
 
@@ -423,6 +424,7 @@ class MemoryCandidateApiTests(unittest.TestCase):
             )
         )
         candidate_id = synthesize["run"]["candidate_ids"][0]
+        attest_current_fixture(self.server.store, candidate_id)
         status, reviewed = self.request(
             "POST",
             f"/v1/memory-candidates/{candidate_id}/review",
@@ -492,11 +494,11 @@ class MemoryCandidateApiTests(unittest.TestCase):
             item for item in fetched["candidates"] if item["candidate_id"] == candidate_id
         )
         self.assertEqual(
-            ["IGNORE", "KEEP", "START_PRODUCT_DESIGN"],
+            ["IGNORE"],
             listed["decision_contract"]["allowed_actions"],
         )
         self.assertEqual(
-            {"EXPLORE": "MEMORY_EXPLORE_NO_AUTOMATION"},
+            {"EXPLORE": "MEMORY_EXPLORE_NO_AUTOMATION", "KEEP": "MEMORY_SOURCE_REVIEW_REQUIRED", "START_PRODUCT_DESIGN": "MEMORY_SOURCE_REVIEW_REQUIRED"},
             listed["decision_contract"]["disabled_actions"],
         )
 
@@ -600,7 +602,8 @@ class MemoryCandidateApiTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("MEMORY_CANDIDATE_STATE_CONFLICT", already_open["error_code"])
 
-        # A fresh decision after reopen keeps history and bumps revision again.
+        # A fresh decision after source review keeps history and bumps revision again.
+        attest_current_fixture(self.server.store, candidate_id)
         status, redecided = self.request(
             "POST",
             f"/v1/memory-candidates/{candidate_id}/review",

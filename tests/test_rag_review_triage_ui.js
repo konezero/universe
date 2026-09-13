@@ -8,13 +8,16 @@ const candidate = (id, extra = {}) => ({project_id:'p',candidate_id:id,kind:'MEM
 const originals = [candidate('a'),candidate('b',{stage:'CONSOLIDATE'}),candidate('c',{summary:'새 내용'})];
 const before = JSON.stringify(originals);
 let groups = ctx.groupRagReviewCandidates(originals);
-assert.equal(groups.length,2);assert.equal(groups[0].bucket,'organized');assert.equal(groups[0].items.length,2);assert.equal(groups[1].bucket,'new');
+assert.equal(groups.length,2);assert.equal(groups[0].bucket,'pending');assert.equal(groups[0].items.length,2);assert.equal(groups[1].bucket,'pending');
 assert.equal(JSON.stringify(originals),before);
 groups = ctx.groupRagReviewCandidates([candidate('a'),candidate('b',{state:'CONFLICTED'}),candidate('c',{summary:'다른 것',state:'KEEP'})]);
-assert.equal(groups[0].bucket,'decision');assert.ok(groups[0].reasons.includes('충돌 확인'));assert.equal(groups[0].items.length,2);
-assert.equal(groups[1].bucket,'decision');
+assert.equal(groups[0].bucket,'pending');assert.ok(groups[0].reasons.includes('충돌 확인'));assert.equal(groups[0].items.length,2);
+assert.equal(groups[1].bucket,'pending');
 groups = ctx.groupRagReviewCandidates([candidate('a',{provenance:{}}),candidate('b',{kind:'IDEA',stage:'SYNTHESIZE',summary:'Idea candidate derived from 21 Memory candidates (839c598d8aeb80d3).'}),candidate('c',{state:'IGNORE'}),candidate('d',{state:'SUPERSEDED'})]);
 assert.equal(groups.length,2);assert.ok(groups[0].reasons.includes('출처 확인 필요'));assert.ok(groups[1].reasons.includes('내용 보완 필요'));
 groups = ctx.groupRagReviewCandidates([candidate('a',{summary:'ID'}),candidate('b',{summary:'id'}),candidate('c',{kind:'IDEA',summary:'ID'}),candidate('d',{project_id:'other',summary:'ID'})]);
 assert.equal(groups.length,4);
 console.log('PASS grouping, conflict priority, provenance, placeholders, archive, project/kind/case isolation, no mutation');
+
+groups = ctx.groupRagReviewCandidates([candidate('current',{source_review:{bucket:'current'}}), candidate('future',{source_review:{bucket:'future'}}), candidate('old',{source_review:{bucket:'archive'}})]);
+assert.equal(groups.length,2); assert.equal(groups[0].bucket,'current'); assert.equal(groups[1].bucket,'future');

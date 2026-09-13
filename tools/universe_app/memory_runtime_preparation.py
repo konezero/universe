@@ -10,7 +10,7 @@ from .connection import UniverseError
 PROFILE = Path(".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json")
 
 @contextmanager
-def prepared_memory_frame(host, binding, public, config):
+def prepared_memory_frame(host, binding, public, config, *, operation="MEMORY_FAST_EXTRACT", result_schema="universe.memory-fast-extract-model-result.v2"):
     if not config.get("persisted") or not config.get("enabled") or not config.get("config_id") or not config.get("revision"):
         raise UniverseError("MEMORY_BATCH_SCHEDULE_INSTRUCTION_REQUIRED", "Persisted enabled batch configuration required", 409)
     capability = host.provider_capability(config["provider"])
@@ -45,9 +45,9 @@ def prepared_memory_frame(host, binding, public, config):
                                    "task_summary_ref", "source_ref", "execution_assignment_ref")},
             "task_frame_execution_proposal": proposal, "task_frame_execution_approval": None,
             "parent_instruction": {"instruction_id": instruction_id, "instruction_ref": source_ref,
-                "user_instruction_raw": json.dumps({"operation": "MEMORY_FAST_EXTRACT", "scheduled_configuration": config}, sort_keys=True),
+                "user_instruction_raw": json.dumps({"operation": operation, "scheduled_configuration": config}, sort_keys=True),
                 "constraints": ["READ_ONLY", "NO_SOURCE_MUTATION", "NO_AUTOMATIC_ADOPTION", "NO_SUBAGENTS"],
-                "expected_output": {"schema": "universe.memory-fast-extract-result.v1"},
+                "expected_output": {"schema": result_schema},
                 "repository_write_scope": "NONE", "mutation_scope": {"operations": [], "targets": []}},
             "parent_observation": {"status": "MATCHED", "evidence_ref": source_ref}, "observed_at": now}})
         if result.get("status") != "TASK_FRAME_HOST_ACTIVE":

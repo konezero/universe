@@ -7189,6 +7189,11 @@ class UniverseStore:
                 ON memory_batch_schedule_attempt(schedule_id, due_slot_key)
                 WHERE state = 'SUCCEEDED';
 
+                CREATE TABLE IF NOT EXISTS memory_source_assessment (
+                    assessment_id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL, project_id TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL, source_digest TEXT NOT NULL, result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    UNIQUE(candidate_id,candidate_digest,source_digest));
                 CREATE TABLE IF NOT EXISTS memory_candidate (
                     candidate_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -19110,7 +19115,8 @@ class UniverseStore:
             reopen_allowed=reopen_allowed,
             reopen_reason=reopen_reason,
         )
-        return candidate
+        from universe_app.memory_source_review import apply_contract
+        return apply_contract(self, candidate)
 
     def _memory_candidate_review_history(self, candidate_id: str) -> list[dict[str, Any]]:
         """Immutable REVIEWED/REOPENED event log, oldest first.
@@ -19430,13 +19436,16 @@ class UniverseStore:
                 f"{decision} is not a valid decision for {candidate['kind']} candidates",
                 HTTPStatus.CONFLICT,
             )
+        if decision != "IGNORE":
+            from universe_app.memory_source_review import require_eligible
+            require_eligible(self, candidate, decision)
         now = utc_now()
         current_revision = int(candidate.get("revision") or 1)
         next_revision = current_revision + 1
         persisted = {
             key: value_
             for key, value_ in candidate.items()
-            if key not in ("decision_contract", "revision")
+            if key not in ("decision_contract", "revision", "source_review")
         }
         persisted["state"] = decision
         persisted["review"] = {
@@ -19620,7 +19629,7 @@ class UniverseStore:
         persisted = {
             key: value_
             for key, value_ in candidate.items()
-            if key not in ("decision_contract", "revision", "review")
+            if key not in ("decision_contract", "revision", "review", "source_review")
         }
         persisted["state"] = "REVIEW_REQUIRED"
         persisted["updated_at"] = now
@@ -19831,6 +19840,8 @@ class UniverseStore:
                 )
             return existing, False
 
+        from universe_app.memory_source_review import require_eligible
+        require_eligible(self, candidate, "ADOPT")
         try:
             memory = self.create_project_memory(
                 candidate["project_id"],
@@ -43849,6 +43860,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         ):
             if not self._authorize_local_operator():
                 return
+        if re.fullmatch(r"/v1/projects/[^/]+/memory-source-review", path) and not self._authorize_local_operator():
+            return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
             return
         if re.fullmatch(r"/v1/projects/[^/]+/failure-reuse/observations", path):
@@ -45650,6 +45663,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "source": source,
                     },
                 )
+                return
+            source_review = re.fullmatch(r"/v1/projects/([^/]+)/memory-source-review", path)
+            if source_review:
+                request = _exact_object_fields(body, field="memory_source_review", required=frozenset(), optional=frozenset({"candidate_ids"}))
+                ids = request.get("candidate_ids")
+                if ids is not None and (not isinstance(ids, list) or not 1 <= len(ids) <= 4 or any(not isinstance(x, str) for x in ids) or len(set(ids)) != len(ids)):
+                    raise UniverseError("MEMORY_SOURCE_REVIEW_INVALID", "Select 1..4 unique candidate IDs", HTTPStatus.BAD_REQUEST)
+                from universe_app.memory_source_review import review_project
+                self._send(HTTPStatus.OK, review_project(self.server, unquote(source_review.group(1)), ids))
                 return
             source_scan = re.fullmatch(
                 r"/v1/session-observer/sources/([^/]+)/scan", path
