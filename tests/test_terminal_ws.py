@@ -154,6 +154,38 @@ class TerminalWebSocketHeartbeatTests(unittest.TestCase):
 
 
 class TerminalWebSocketCloseTests(unittest.TestCase):
+    def test_output_eof_closes_socket_without_waiting_for_heartbeat(self) -> None:
+        for initial_output in (b"", b"session started"):
+            with self.subTest(initial_output=initial_output):
+                server_sock, client_sock = socket.socketpair()
+                client_sock.settimeout(1.0)
+                host = _TerminalHost()
+                pump = threading.Thread(
+                    target=pump_terminal_socket,
+                    args=(SimpleNamespace(connection=server_sock), "term-detach", host),
+                    kwargs={"heartbeat_interval_seconds": 30, "io_poll_seconds": 0.01},
+                )
+                pump.start()
+                buffer = bytearray()
+                try:
+                    if initial_output:
+                        host.waiter.put(initial_output)
+                        self.assertEqual((2, initial_output), _recv_frame(client_sock, buffer))
+                    host.waiter.put(None)
+                    pump.join(timeout=0.5)
+                    self.assertFalse(pump.is_alive(), "output EOF left a healthy-looking socket")
+                    self.assertTrue(host.unsubscribed.is_set())
+                    opcode, payload = _recv_frame(client_sock, buffer)
+                    self.assertEqual(8, opcode)
+                    self.assertEqual(
+                        TERMINAL_WS_CLOSE_SERVICE_RESTART,
+                        int.from_bytes(payload[:2], "big"),
+                    )
+                finally:
+                    client_sock.close()
+                    server_sock.close()
+                    pump.join(timeout=1)
+
     def test_pump_sends_service_restart_close_when_heartbeat_times_out(self) -> None:
         server_sock, client_sock = socket.socketpair()
         client_sock.settimeout(1.0)

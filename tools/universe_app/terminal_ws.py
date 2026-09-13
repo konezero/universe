@@ -168,6 +168,8 @@ def pump_terminal_socket(
         enqueue_poll_seconds=io_poll_seconds,
     )
 
+    output_ended = threading.Event()
+
     def emit() -> None:
         while not stop.is_set():
             try:
@@ -175,6 +177,9 @@ def pump_terminal_socket(
             except Exception:
                 continue
             if chunk is None:
+                # Host detach ends this subscription even when its process survives.
+                # End the socket too so the browser can reconnect to the new reader.
+                output_ended.set()
                 break
             if chunk and not sender.send(chunk, opcode=2):
                 break
@@ -186,7 +191,7 @@ def pump_terminal_socket(
     pending_ping: tuple[bytes, float] | None = None
     peer_closed = False
     try:
-        while not stop.is_set():
+        while not stop.is_set() and not output_ended.is_set():
             now = time.monotonic()
             if (
                 pending_ping is not None

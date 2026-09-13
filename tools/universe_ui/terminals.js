@@ -1564,6 +1564,17 @@ function ensureTerminalSurface(session) {
           (item) => item.terminal_id === session.terminal_id
         );
         if (!current || String(current.state || "").toUpperCase() !== "LIVE") {
+          const hostRef = hostSessionRefOf(session);
+          const recoveringHost = hostRef && (payload.hosts || []).find(
+            (host) => hostSessionRefOf(host) === hostRef
+          );
+          if (hostRuntimeLive(recoveringHost)
+              && recoveringHost.reconnect_eligible === true
+              && hostCompatibilityOk(recoveringHost)) {
+            // The Supervisor can detach its reader before reattaching a live Host.
+            scheduleSocketReconnect(options);
+            return;
+          }
           socketDisposed = true;
           queueTerminalRender(surface, "\r\n\x1b[90m[session closed]\x1b[0m\r\n", { immediate: true });
           return;
