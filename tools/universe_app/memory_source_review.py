@@ -24,7 +24,11 @@ def initialize(connection):
         UNIQUE(candidate_id,candidate_digest,source_digest))""")
 
 def git(root,*args):
-    result=subprocess.run(["git","-C",str(root),*args],shell=False,capture_output=True,timeout=30)
+    result=subprocess.run(
+        ["git","-C",str(root),*args], shell=False, capture_output=True,
+        stdin=subprocess.DEVNULL, timeout=30,
+        creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0),
+    )
     if result.returncode:raise UniverseError("MEMORY_SOURCE_UNAVAILABLE","Current project Git source could not be read",409)
     return result.stdout
 
