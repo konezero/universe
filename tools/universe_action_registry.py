@@ -597,6 +597,8 @@ def build_default_action_registry(
     rag_adopt_handler: ActionHandler | None = None,
     rag_record_decision_handler: ActionHandler | None = None,
     memory_batch_run_handler: ActionHandler | None = None,
+    rag_archive_candidate_handler: ActionHandler | None = None,
+    rag_memory_retention_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
@@ -661,6 +663,21 @@ def build_default_action_registry(
     )
     registry.register_legacy_surface(LEGACY_MEMORY_BATCH_RUN_HTTP_SURFACE)
     registry.register(
+        ActionContract(action_id="rag.memory-retention", request_schema_ref="universe.rag-memory-retention-request.v1",
+                       result_schema_ref="universe.rag-memory-retention-result.v1", side_effect_class="GOVERNED_KNOWLEDGE_WRITE"),
+        rag_memory_retention_handler, surfaces=("rag.memory-retention",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="rag.archive-candidate",
+            request_schema_ref="universe.rag-archive-candidate-request.v1",
+            result_schema_ref="universe.rag-archive-candidate-result.v1",
+            side_effect_class="GOVERNED_KNOWLEDGE_WRITE",
+        ),
+        rag_archive_candidate_handler,
+        surfaces=("rag.archive-candidate",),
+    )
+    registry.register(
         ActionContract(
             action_id=MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
             request_schema_ref=MEMORY_SYNC_PERSIST_SELECTED_REQUEST_SCHEMA,
@@ -713,6 +730,28 @@ def build_default_action_registry(
     registry.register_legacy_surface(LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE)
 
     supplied_handlers = dict(work_surface_handlers or {})
+    for action_id in ("service.status", "service.restart"):
+        if action_id in supplied_handlers:
+            registry.register(
+                ActionContract(
+                    action_id=action_id,
+                    request_schema_ref=f"universe.{action_id}-request.v1",
+                    result_schema_ref="universe.service-status.v1" if action_id == "service.status" else "universe.service-restart.v1",
+                    side_effect_class="READ_ONLY" if action_id == "service.status" else "SERVICE_LIFECYCLE_MUTATION",
+                    metadata={"target_resolution": "SERVER_SIDE", "preserves_pty_supervisor": True,
+                              "request_fields": ["operation_id?"] if action_id == "service.status" else ["request_id", "expected_pid"]},
+                ), supplied_handlers[action_id], surfaces=(action_id,),
+            )
+    for action_id in ("project.draft.read", "project.draft.list", "project.draft.save"):
+        if action_id in supplied_handlers:
+            registry.register(ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id}-request.v1",
+                result_schema_ref="universe.project-draft-action.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION" if action_id.endswith("save") else "READ_ONLY",
+                metadata={"ownership": "PROJECT_AUTHORING", "revision_control": "EXPECTED_REVISION",
+                          "fields": ["title", "domain", "description", "goal", "target_users", "scenarios", "structure", "capabilities", "validation", "constraints", "project_root"]},
+            ), supplied_handlers[action_id], surfaces=(action_id,))
     # Only handler-backed work-surface Actions are registered as discoverable
     # contracts. The pending todo.* Actions are intentionally left unregistered
     # (coverage reports them UNCOVERED, never available) until they have both a

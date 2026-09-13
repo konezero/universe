@@ -21,3 +21,21 @@ console.log('PASS grouping, conflict priority, provenance, placeholders, archive
 
 groups = ctx.groupRagReviewCandidates([candidate('current',{source_review:{bucket:'current'}}), candidate('future',{source_review:{bucket:'future'}}), candidate('old',{source_review:{bucket:'archive'}})]);
 assert.equal(groups.length,2); assert.equal(groups[0].bucket,'current'); assert.equal(groups[1].bucket,'future');
+
+const topicKnowledge = {kind:'USER_DECISION',topic:'메모 수집',applicability:'대화 수집 시'};
+const records = [candidate('older',{summary:'유효한 사용자 결정',created_at:'2026-09-01',knowledge:topicKnowledge,source_review:{bucket:'current'}}),candidate('newer',{summary:'새로운 미검증 주장',created_at:'2026-09-14',knowledge:topicKnowledge}),candidate('copy',{summary:'유효한 사용자 결정',created_at:'2026-09-13',knowledge:topicKnowledge}),candidate('ignored',{knowledge:topicKnowledge,state:'IGNORE'})];
+const originalRecords = JSON.stringify(records);
+const topics = ctx.groupRagKnowledgeTopics(records, []);
+assert.equal(topics.length,1);
+assert.equal(topics[0].claims.length,2);
+assert.equal(topics[0].entries.length,3);
+assert.equal(topics[0].recent.item.candidate_id,'newer');
+assert.equal(topics[0].verified[0].item.candidate_id,'older');
+assert.equal(JSON.stringify(records),originalRecords);
+assert.equal(ctx.groupRagKnowledgeTopics([records[0],{...records[0],project_id:'other'}],[]).length,2);
+const combined = ctx.groupRagKnowledgeTopics([records[0]],[{memory_id:'m',project_id:'p',body:records[0].summary,knowledge:topicKnowledge}]);
+assert.equal(combined.length,1); assert.equal(combined[0].claims.length,1);assert.equal(combined[0].claims[0].entries.length,2);
+assert.equal(ctx.groupRagKnowledgeTopics([candidate('conflict',{knowledge:topicKnowledge,relations:[{relation:'CONFLICTS_WITH',candidate_id:'x'}]})],[])[0].hasConflict,true);
+assert.equal(ctx.ragTopicFor(candidate('legacy',{summary:'RAG 메모 수집'})).inferred,true);
+assert.equal(ctx.groupRagKnowledgeTopics([], [{memory_id:'ignored',retention:{decision:'IGNORE'}}]).length,0);
+console.log('PASS topic grouping, cross-state duplicates, saved/candidate integration, recency versus validity, conflict retention, ignored memory exclusion');

@@ -23,4 +23,6 @@ assert.equal(JSON.stringify(records),before);
 assert.equal(ctx.ragChangedInWindow({created_at:stamp(start-1)},start,now.getTime()),false);
 assert.equal(ctx.ragChangedInWindow({updated_at:stamp(now.getTime())},start,now.getTime()),true);
 assert.equal(ctx.summarizeRagDay({candidates:[],memories:[]},now).newCandidates,0);
-console.log('PASS local midnight, update versus create, invalid/future timestamps, inclusive now, empty input and no mutation');
+const retentionChange = ctx.summarizeRagDay({candidates:[],memories:[{created_at:stamp(start-1000),retention:{recorded_at:stamp(start+1000)}}]},now);
+assert.equal(retentionChange.newMemories,0);assert.equal(retentionChange.updatedMemories,1);
+console.log('PASS local midnight, update versus create, invalid/future timestamps, retention changes, empty input and no mutation');

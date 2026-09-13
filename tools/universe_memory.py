@@ -348,6 +348,26 @@ def _text(value: Any, field: str, *, max_len: int = 4000) -> str:
     return text
 
 
+def memory_retention(connection, memory_id):
+    row = connection.execute("SELECT event_json FROM project_memory_retention WHERE memory_id = ? ORDER BY revision DESC LIMIT 1", (memory_id,)).fetchone()
+    return json.loads(row[0]) if row else {"decision": "ACTIVE", "revision": 0}
+
+
+def record_memory_retention(connection, memory, *, decision, note, expected_revision, actor):
+    current = memory_retention(connection, memory["memory_id"])
+    if current["decision"] == decision and current.get("note") == note and current.get("prior_revision") == expected_revision:
+        return current, False
+    if current["revision"] != expected_revision:
+        raise MemoryError("MEMORY_RETENTION_CONFLICT", "Memory exclusion changed; refresh before deciding")
+    event = {"decision": decision, "note": note, "actor": actor,
+             "memory_id": memory["memory_id"], "project_id": memory["project_id"],
+             "memory_digest": memory["memory_digest"], "prior_revision": expected_revision,
+             "revision": expected_revision + 1, "recorded_at": datetime.now(timezone.utc).isoformat()}
+    connection.execute("INSERT INTO project_memory_retention(memory_id, revision, event_json) VALUES (?, ?, ?)",
+                       (memory["memory_id"], event["revision"], json.dumps(event, ensure_ascii=False)))
+    return event, True
+
+
 def normalize_memory_create(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise MemoryError("MEMORY_REQUEST_INVALID", "memory body must be an object")
@@ -1341,6 +1361,18 @@ def normalize_memory_candidate(
         candidate_id = expected_id
         failure_fields = {"failure": failure}
         material.update(failure_fields)
+    knowledge_fields = {}
+    if "knowledge" in value:
+        knowledge = value["knowledge"]
+        kinds = {"USER_IDEA", "USER_REQUIREMENT", "USER_DECISION", "REUSABLE_PROCEDURE", "REUSABLE_EXPERIENCE"}
+        if not isinstance(knowledge, Mapping) or set(knowledge) != {"kind", "topic", "applicability"} or knowledge.get("kind") not in kinds:
+            raise MemoryError("MEMORY_KNOWLEDGE_INVALID", "knowledge requires kind, topic and applicability")
+        knowledge_fields = {"knowledge": {
+            "kind": knowledge["kind"],
+            "topic": _memory_batch_text(knowledge.get("topic"), "knowledge.topic", max_len=100),
+            "applicability": _memory_batch_text(knowledge.get("applicability"), "knowledge.applicability", max_len=400),
+        }}
+        material.update(knowledge_fields)
     candidate_digest = _digest(material)
     if not candidate_id:
         candidate_id = "memory_candidate_" + candidate_digest[:24]
@@ -1358,6 +1390,7 @@ def normalize_memory_candidate(
         "candidate_digest": candidate_digest,
         **ownership_fields,
         **failure_fields,
+        **knowledge_fields,
         "authority": "NONE",
         "effects": {
             "current_anchor": "NONE",
@@ -1680,7 +1713,7 @@ def synthesize_memory_candidates(
     active = [
         item
         for item in normalized
-        if item["state"] not in {"SUPERSEDED", "IGNORE", "CONFLICTED"}
+        if item["state"] == "KEEP"
         and "failure" not in item
     ]
     if not active:

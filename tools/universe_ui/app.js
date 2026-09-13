@@ -1241,10 +1241,92 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function refreshServiceRestartControl() {
+  const button = document.querySelector("#restart-local-service");
+  const output = document.querySelector("#restart-local-service-status");
+  if (!button || !output) return;
+  button.disabled = true;
+  try {
+    const catalog = await api("/v1/actions");
+    if (!catalog.registry?.registered_action_ids?.includes("service.restart")) {
+      output.textContent = "서버 업데이트 적용 후 재시작 기능을 사용할 수 있습니다.";
+      return;
+    }
+    const pending = sessionStorage.getItem("universe.restart.operation");
+    button.textContent = pending ? "재시작 결과 확인" : "서버 재시작";
+    if (!pending && !localControlToken) {
+      output.textContent = "트레이에서 서버 화면을 열면 재시작 기능을 사용할 수 있습니다.";
+      return;
+    }
+    button.disabled = false;
+    output.textContent = pending ? "이전 재시작 요청의 결과를 확인할 수 있습니다." : "재시작 후 자동으로 다시 연결됩니다. 터미널 서비스는 유지됩니다.";
+  } catch (error) {
+    output.textContent = error.message;
+  }
+}
+
+async function restartLocalService() {
+  const button = document.querySelector("#restart-local-service");
+  const output = document.querySelector("#restart-local-service-status");
+  button.disabled = true;
+  let operationId = sessionStorage.getItem("universe.restart.operation");
+  try {
+    if (!operationId) {
+      const current = await invokeServerAction("service.status", {});
+      const request = { request_id: crypto.randomUUID(), expected_pid: current.pid };
+      operationId = request.request_id;
+      sessionStorage.setItem("universe.restart.operation", operationId);
+      sessionStorage.setItem("universe.restart.request", JSON.stringify(request));
+      try {
+        await invokeServerAction("service.restart", request);
+      } catch (error) {
+        // Only transport failures leave acceptance uncertain.
+        if (!(error instanceof UniverseApiError) || (typeof error.status === "number" && error.status < 500)) {
+          sessionStorage.removeItem("universe.restart.operation");
+          sessionStorage.removeItem("universe.restart.request");
+          throw error;
+        }
+        output.textContent = error.message;
+      }
+    }
+    const deadline = Date.now() + 150000;
+    while (Date.now() < deadline) {
+      try {
+        const result = await invokeServerAction("service.status", { operation_id: operationId });
+        const operation = result.operation;
+        if (["COMPLETED", "FAILED", "INTERRUPTED"].includes(operation.status)) {
+          sessionStorage.removeItem("universe.restart.operation");
+          sessionStorage.removeItem("universe.restart.request");
+          if (operation.status !== "COMPLETED") throw new Error(operation.error?.detail || operation.status);
+          output.textContent = "서버 재시작 완료. 화면을 다시 연결합니다.";
+          window.location.reload();
+          return;
+        }
+        output.textContent = "서버 재시작 중… 연결을 기다리고 있습니다.";
+      } catch (error) {
+        if (!sessionStorage.getItem("universe.restart.operation")) throw error;
+        const pending = sessionStorage.getItem("universe.restart.request");
+        if (error.errorCode === "SERVICE_OPERATION_NOT_FOUND" && pending) {
+          await invokeServerAction("service.restart", JSON.parse(pending));
+        }
+        output.textContent = "재시작 결과 확인 중… " + error.message;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    output.textContent = "연결 확인 시간이 지났습니다. 결과 확인을 다시 누르면 같은 요청을 조회합니다.";
+  } catch (error) {
+    output.textContent = error.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = sessionStorage.getItem("universe.restart.operation") ? "재시작 결과 확인" : "서버 재시작";
+  }
+}
+
 async function invokeServerAction(actionId, request) {
   return api("/v1/actions", {
     method: "POST",
     body: { action_id: actionId, request },
+    controlToken: actionId === "service.restart",
   });
 }
 
@@ -4328,18 +4410,10 @@ async function submitHomeNode(event) {
   const submit = document.querySelector("#home-node-submit");
   submit.disabled = true;
   try {
-    const result = await api(
-      `/v1/projects/${encodeURIComponent(projectId)}/feature-nodes`,
-      {
-        method: "POST",
-        body: {
-          idempotency_key: crypto.randomUUID(),
-          title,
-          intent_text: intent,
-          created_by_role: "USER",
-        },
-      }
-    );
+    const result = await invokeServerAction("feature.create", {
+      project_id: projectId,
+      feature: { idempotency_key: crypto.randomUUID(), title, intent_text: intent },
+    });
     document.querySelector("#home-node-dialog").close();
     toast("노드를 만들었어요");
     state.homeNodeId = `feat:${result.feature?.feature_id || ""}`;
@@ -4564,7 +4638,10 @@ function homeNodes() {
     const id = String(n.node_id || "");
     const kind = String(n.kind || "").toUpperCase();
     const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
-    if ((kind === "FEATURE" || ownsTodos) && !seen.has(id)) {
+    const knowledge = ["DOCUMENT", "DECISION", "MEMORY"].includes(kind);
+    const runtime = ["SESSION", "TODO", "TASK_FRAME", "GOAL"].includes(kind);
+    const proposed = String(n.state || "ADOPTED").toUpperCase() === "PROPOSED";
+    if (id && !knowledge && !runtime && (!proposed || ownsTodos) && !seen.has(id)) {
       seen.add(id);
       out.push(n);
     }
@@ -9540,6 +9617,7 @@ async function injectSessionRefThin() {
 }
 
 async function openProviderSettings() {
+  void refreshServiceRestartControl();
   elements.settingsError.textContent = "";
   setSettingsTab(state.settingsTab || "service");
   if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
@@ -12537,10 +12615,16 @@ async function loadHoverKnowledge(projectId, refresh = false) {
   const cached = hoverKnowledgeCache.get(projectId);
   if (!refresh && cached && Date.now() - cached.time < 15000) return cached.value;
   const [memories, candidates] = await Promise.all([
-    api(`/v1/projects/${encodeURIComponent(projectId)}/memories`),
+    api(`/v1/projects/${encodeURIComponent(projectId)}/memories?include_ignored=true`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`),
   ]);
-  const value = { memories: memories.memories || [], candidates: candidates.candidates || [] };
+  const candidateItems = candidates.candidates || [];
+  const memoryItems = (memories.memories || []).map(memory => {
+    if (memory.knowledge) return memory;
+    const source = candidateItems.find(candidate => candidate.project_id === memory.project_id && adoptedMemoryForCandidate(candidate, [memory]));
+    return source?.knowledge ? {...memory, knowledge: source.knowledge} : memory;
+  });
+  const value = { memories: memoryItems, candidates: candidateItems };
   hoverKnowledgeCache.set(projectId, { time: Date.now(), value });
   return value;
 }
@@ -12554,11 +12638,11 @@ function relatedKnowledgeForNode(item, knowledge) {
   const ids = new Set([item.data?.node_id, item.data?.feature_node_id, item.id].filter(Boolean));
   const project = item.kind === "project";
   const memoryId = item.data?.memory_id;
-  const memories = knowledge.memories.filter(memory => memoryId
+  const memories = knowledge.memories.filter(memory => memory.retention?.decision !== "IGNORE" && (memoryId
     ? memory.memory_id === memoryId
-    : project ? !memory.node_ref : ids.has(memory.node_ref));
+    : project ? !memory.node_ref : ids.has(memory.node_ref)));
   const candidates = knowledge.candidates.filter(candidate => {
-    if (candidate.kind !== "MEMORY") return false;
+    if (candidate.kind !== "MEMORY" || ["IGNORE", "SUPERSEDED"].includes(candidate.state)) return false;
     const adopted = adoptedMemoryForCandidate(candidate, knowledge.memories);
     if (adopted) return false; // Canonical memory is the single displayed item after adoption.
     const nodeRef = candidate.node_ref;
@@ -12568,8 +12652,10 @@ function relatedKnowledgeForNode(item, knowledge) {
 }
 
 function knowledgeStatus(item, candidate, memories = []) {
+  if (!candidate && item.retention?.decision === "IGNORE") return {label: "무시 · RAG에서 제외", tone: "muted"};
   if (candidate) {
     if (adoptedMemoryForCandidate(item, memories)) return { label: "RAG 채택 완료", tone: "adopted" };
+    if (["IGNORE", "SUPERSEDED"].includes(item.state)) return {label: item.state === "IGNORE" ? "제외 · 이력 보관" : "대체된 기록", tone: "muted"};
     if (item.source_review) return {label: item.source_review.label, tone: item.source_review.bucket === "archive" ? "muted" : item.source_review.bucket === "current" ? "adopted" : "pending"};
     if (item.state === "KEEP") return { label: "보관 결정 · RAG 채택 대기", tone: "pending" };
     if (item.state === "IGNORE") return { label: "무시됨", tone: "muted" };
@@ -12666,7 +12752,22 @@ async function openHoverMemory(projectId, initial, isCandidate) {
       } finally { busy = false; }
     };
     if (memory) {
-      const projectionResult = await api(`/v1/projects/${encodeURIComponent(projectId)}/projection`);
+      const ignored = memory.retention?.decision === "IGNORE";
+      const note = node("textarea", "", "");
+      note.setAttribute("aria-label", "메모 제외·복원 이유");
+      note.placeholder = "제외하거나 복원하는 이유";
+      note.value = ignored ? "사용자 검토 후 복원" : "현재 수집 기준에 맞지 않아 제외";
+      const retain = node("button", "secondary-button compact-action", ignored ? "메모 복원" : "무시 — RAG에서 제외");
+      retain.onclick = () => run(retain, () => invokeServerAction("rag.memory-retention", {
+        project_id: projectId, memory_id: memory.memory_id, expected_memory_digest: memory.memory_digest,
+        expected_revision: memory.retention?.revision || 0, decision: ignored ? "ACTIVE" : "IGNORE", note: note.value,
+      }));
+      actions.append(note, retain);
+      if (memory.retention?.note) content.append(node("p", "context-copy", "최근 결정 이유: " + memory.retention.note));
+      if (ignored) return;
+      let projectionResult;
+      try { projectionResult = await api(`/v1/projects/${encodeURIComponent(projectId)}/projection`); }
+      catch (error) { content.append(node("p", "memory-action-error", error.message)); return; }
       if (!dialog.isConnected) return;
       const select = document.createElement("select");
       select.setAttribute("aria-label", "연결할 노드");
@@ -12694,7 +12795,15 @@ async function openHoverMemory(projectId, initial, isCandidate) {
         });
         actions.append(compare);
       }
-      for (const action of memoryCandidateActionSpecs(candidate).filter(action => ["KEEP", "IGNORE", "START_PRODUCT_DESIGN"].includes(action.id))) {
+      if (!["IGNORE", "SUPERSEDED"].includes(candidate.state)) {
+        const ignore = node("button", "secondary-button compact-action", "무시 — 후보에서 제외");
+        ignore.onclick = () => run(ignore, () => invokeServerAction("rag.archive-candidate", {
+          project_id: projectId, candidate_id: candidate.candidate_id, expected_candidate_digest: candidate.candidate_digest,
+          expected_candidate_revision: candidate.revision || 1, note: "사용자 검토: 현재 수집 기준에 맞지 않아 제외",
+        }));
+        actions.append(ignore);
+      }
+      for (const action of memoryCandidateActionSpecs(candidate).filter(action => ["KEEP", "START_PRODUCT_DESIGN"].includes(action.id))) {
         const button = node("button", "secondary-button compact-action", ({KEEP: "채택 대상으로 확인", IGNORE: "무시", START_PRODUCT_DESIGN: "계획으로 검토"})[action.id]);
         button.onclick = () => run(button, () => api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates/review`, { method: "POST", body: memoryCandidateReviewPayload(candidate, action) }));
         actions.append(button);
@@ -13896,7 +14005,7 @@ function selectedNodeRef() {
 }
 
 function conductorUiContext() {
-  const context = {};
+  const context = typeof projectDraftConversationContext === "function" ? projectDraftConversationContext() : {};
   if (state.selectedProject) {
     context.selected_project_id = state.selectedProject.project_id;
   }
@@ -14148,22 +14257,14 @@ function openConductorTodoDraft(action) {
 
 function openConductorFreshProjectDraft(action) {
   const intent = action?.intent;
-  if (!intent) {
-    toast("Conductor Fresh Project draft is unavailable", true);
+  if (!intent || typeof openProjectDraft !== "function") {
+    toast("프로젝트 초안 편집기를 사용할 수 없습니다.", true);
     return;
   }
-  openFreshProjectWizard();
-  const form = elements.freshProjectForm.elements;
-  form.namedItem("project").value = intent.project || "";
-  form.namedItem("kind").value = intent.kind || "";
-  form.namedItem("goal").value = intent.goal || "";
-  form.namedItem("target_users").value = intent.target_users || "";
-  form.namedItem("technologies").value = (intent.technologies || []).join(", ");
-  form.namedItem("constraints").value = (intent.constraints || []).join(", ");
-  const firstMissing = ["project", "kind", "goal"]
-    .map((name) => form.namedItem(name))
-    .find((field) => !field.value.trim());
-  (firstMissing || form.namedItem("project")).focus();
+  openProjectDraft(null, {
+    title: intent.project || "", domain: intent.kind || "", goal: intent.goal || "",
+    target_users: intent.target_users || "", constraints: (intent.constraints || []).join("\n"),
+  }).catch(error => toast(error.message, true));
 }
 
 function todoScopeLabel(todo) {
@@ -15148,30 +15249,11 @@ function showFreshProjectPanel(name) {
 }
 
 function openFreshProjectWizard() {
-  state.freshProject = {
-    intent: null,
-    routes: [],
-    composition: null,
-    refinementRequest: null,
-    planningBinding: null,
-    providers: [],
-    refinementRun: null,
-    refinementCandidate: null,
-    refinementAdoption: null,
-    adoption: null,
-    handoff: null,
-  };
-  elements.freshProjectForm.reset();
-  elements.freshProjectRouteList.replaceChildren();
-  elements.freshProjectCompositionOutput.replaceChildren();
-  elements.freshProjectRefinementRef.textContent = "";
-  elements.planningProvider.replaceChildren();
-  elements.planningProposal.classList.add("hidden");
-  elements.refinementCandidate.classList.add("hidden");
-  elements.planningRunStatus.textContent = "";
-  renderFreshProjectHandoffControls();
-  showFreshProjectPanel("intent");
-  elements.freshProjectDialog.showModal();
+  if (typeof openProjectDraft !== "function") {
+    toast("서버 업데이트 적용 후 프로젝트 초안을 작성할 수 있습니다.", true);
+    return;
+  }
+  openProjectDraft().catch(error => toast(error.message, true));
 }
 
 function renderFreshProjectRoutes() {
@@ -16912,8 +16994,56 @@ function groupRagReviewCandidates(candidates) {
   }).sort((a, b) => Number(b.reasons.includes("충돌 확인")) - Number(a.reasons.includes("충돌 확인")));
 }
 
+const RAG_KNOWLEDGE_KINDS = {USER_IDEA: "사용자 구상", USER_REQUIREMENT: "사용자 요구", USER_DECISION: "사용자 결정", REUSABLE_PROCEDURE: "재사용 절차", REUSABLE_EXPERIENCE: "재사용 경험"};
+
+function ragTopicFor(item) {
+  const explicit = String(item.knowledge?.topic || "").normalize("NFC").trim().replace(/\s+/g, " ");
+  if (explicit) return {name: explicit, inferred: false};
+  const text = String(item.summary || item.title || "") + " " + String(item.body || "");
+  // Legacy records have no authored topic. These are navigation suggestions,
+  // never a semantic merge, source assessment, or ownership reassignment.
+  const hints = [
+    ["RAG · 메모 · 지식 정리", /\bRAG\b|메모|memory|브레인스토밍/i],
+    ["프로젝트 · 목표 · 노드 · 작업", /Fleet|Galaxy|칸반|노드|TODO|goal|kanban|프로젝트 생성|범용|비전/i],
+    ["배포 · 설치 · 정본 관리", /release|canonical|릴리즈|릴리스|설치|배포|정본|이관/i],
+    ["세션 · 메시지 · 터미널", /세션|session|terminal|터미널|PTY|inbox|메일박스|메시지|message|provider/i],
+    ["운영 절차 · 권한 · 검증", /절차|권한|승인|검증|receipt|guard|authority|assignment|anchor/i],
+  ];
+  return {name: hints.find(([, pattern]) => pattern.test(text))?.[0] || "주제 분류 필요", inferred: true};
+}
+
+function groupRagKnowledgeTopics(candidates, memories) {
+  const topics = new Map();
+  const entries = [...candidates.map(item => ({item, candidate: true})), ...memories.map(item => ({item, candidate: false}))];
+  const created = item => {const n = Date.parse(item.created_at || ""); return Number.isFinite(n) ? n : 0;};
+  const id = entry => String(entry.item.candidate_id || entry.item.memory_id || "");
+  for (const entry of entries) {
+    const {item, candidate} = entry;
+    if (!candidate && item.retention?.decision === "IGNORE") continue;
+    if (candidate && (["IGNORE", "SUPERSEDED"].includes(item.state) || item.source_review?.bucket === "archive")) continue;
+    const topic = ragTopicFor(item);
+    const key = JSON.stringify([item.project_id || "", topic.name.toLocaleLowerCase("ko-KR")]);
+    if (!topics.has(key)) topics.set(key, {name: topic.name, inferred: topic.inferred, entries: []});
+    const group = topics.get(key); group.inferred ||= topic.inferred; group.entries.push(entry);
+  }
+  return [...topics.values()].map(topic => {
+    topic.entries.sort((a, b) => created(b.item) - created(a.item) || id(a).localeCompare(id(b)));
+    const claims = new Map();
+    for (const entry of topic.entries) {
+      const text = String(entry.item.summary || entry.item.body || entry.item.title || "").normalize("NFC").trim().replace(/\s+/g, " ");
+      const key = text || id(entry);
+      if (!claims.has(key)) claims.set(key, {text, entries: []});
+      claims.get(key).entries.push(entry);
+    }
+    const hasConflict = topic.entries.some(({item}) => item.state === "CONFLICTED" || (item.relations || []).some(r => r.relation === "CONFLICTS_WITH"));
+    // Collection time only orders the history. It cannot select canonical truth.
+    const verified = topic.entries.filter(({item, candidate}) => candidate && item.source_review?.bucket === "current");
+    return {...topic, claims: [...claims.values()], verified, hasConflict, recent: topic.entries[0]};
+  }).sort((a, b) => Number(b.hasConflict) - Number(a.hasConflict) || a.name.localeCompare(b.name, "ko-KR"));
+}
+
 function ragChangedInWindow(item, start, end) {
-  return [item.created_at, item.updated_at].some(value => {
+  return [item.created_at, item.updated_at, item.retention?.recorded_at].some(value => {
     const time = typeof value === "string" && value.trim() ? Date.parse(value) : NaN;
     return Number.isFinite(time) && time >= start && time <= end;
   });
@@ -17040,7 +17170,7 @@ function renderMemory() {
       progress.append(card);
     }
     const candidates = knowledge.candidates.filter(item => !adoptedMemoryForCandidate(item, knowledge.memories));
-    const proposed = knowledge.memories.filter(item => item.link_state === "PROPOSED");
+    const proposed = knowledge.memories.filter(item => item.link_state === "PROPOSED" && item.retention?.decision !== "IGNORE");
     const triage = groupRagReviewCandidates(candidates);
     const daily = summarizeRagDay(knowledge);
     const digest = node("section", "rag-daily-summary");
@@ -17048,7 +17178,7 @@ function renderMemory() {
     digest.append(node("h3", "", "오늘의 메모 요약"));
     digest.append(node("p", "rag-counts", "새 후보 " + daily.newCandidates + "개 · 기존 후보 변경 " + daily.updatedCandidates + "개 · 새 저장 메모 " + daily.newMemories + "개 · 기존 메모 변경 " + daily.updatedMemories + "개"));
     const needsDecision = triage.filter(bundle => ["current", "future"].includes(bundle.bucket)).length;
-    digest.append(node("p", "", "채택·계획 검토 가능 " + needsDecision + "묶음 · 소스 확인 대기 " + triage.filter(bundle => bundle.bucket === "pending").length + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
+    digest.append(node("p", "", "소스·계획 근거 확인 " + needsDecision + "묶음 · 소스 확인 대기 " + triage.filter(bundle => bundle.bucket === "pending").length + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
     digest.append(node("small", "", new Date(daily.end).toLocaleString("ko-KR") + " 조회 · 브라우저 시간대 " + Intl.DateTimeFormat().resolvedOptions().timeZone + "의 오늘 0시부터 · 현재 불러온 목록 기준"));
     if (daily.unknownDates) digest.append(node("p", "", "날짜를 확인할 수 없는 " + daily.unknownDates + "개는 오늘 집계에서 제외했습니다."));
     const todayToggle = node("button", "secondary-button compact-action", "오늘 변경만 보기");
@@ -17056,8 +17186,8 @@ function renderMemory() {
     digest.append(todayToggle);
     lists.append(digest);
     let todayOnly = false;
-    lists.append(node("p", "rag-counts", "검토 기록 " + candidates.length + "개 → 활성 " + triage.length + "묶음 · 연결 제안 " + proposed.length + "개"));
-    lists.append(node("p", "context-copy", "같은 종류·동일 내용은 화면에서 묶습니다. 보관·채택·연결 결정은 항목별로 유지됩니다. 충돌 표시는 등록된 상태·관계 기준이며 내용의 사실성은 별도 검토가 필요합니다."));
+    lists.append(node("p", "rag-counts", "주제 " + groupRagKnowledgeTopics(candidates, knowledge.memories).length + "개 · 후보 " + candidates.length + "개 · 활성 저장 메모 " + knowledge.memories.filter(item => item.retention?.decision !== "IGNORE").length + "개 · 연결 제안 " + proposed.length + "개"));
+    lists.append(node("p", "context-copy", "같은 주제의 후보와 저장 메모를 함께 봅니다. 동일 문장은 한 항목으로 접고 출처·검토 이력을 보존합니다. 최근 수집은 최신 유효 지식을 뜻하지 않습니다. 기존 기록의 주제는 자동 분류 제안이며, 의미 통합과 대체 여부는 검토가 필요합니다."));
     const search = node("input", "document-list-search");
     search.type = "search"; search.placeholder = "메모 제목·내용 검색"; search.setAttribute("aria-label", "메모 검색");
     lists.append(search);
@@ -17073,43 +17203,55 @@ function renderMemory() {
         row.onclick = () => openHoverMemory(projectId, item, candidate);
         parent.append(row);
       };
-      for (const [bucket, title, explanation] of [
-        ["current", "현재 소스와 일치", "구현 근거를 확인한 내용입니다. 확인 후 RAG에 채택할 수 있습니다."],
-        ["future", "앞으로 진행할 사항", "열린 프로젝트 TODO와 연결된 계획입니다. 현재 구현된 사실과 구분합니다."],
-        ["pending", "소스 확인 대기", "아직 대조하지 않았거나 근거가 부족한 기록입니다. 확인 전에는 채택할 수 없습니다."],
-      ]) {
+      const topics = groupRagKnowledgeTopics(candidates, knowledge.memories);
+      for (const topic of topics.filter(topic => topic.entries.some(({item}) => matches(item)))) {
         const section = node("section", "rag-memory-group");
-        const bundles = triage.filter(bundle => bundle.bucket === bucket && bundle.items.some(matches));
-        const links = [];
-        section.append(node("h3", "", title + " (" + (bundles.length + links.length) + ")"), node("p", "context-copy", explanation));
-        if (!bundles.length && !links.length) section.append(node("p", "empty-copy", "지금 확인할 항목이 없습니다."));
-        for (const bundle of bundles) {
+        section.append(node("h3", "", topic.name + " (" + topic.claims.length + "항목 · " + topic.entries.length + "기록)"));
+        if (topic.inferred) section.append(node("small", "", "기존 기록의 주제 분류 제안"));
+        if (topic.hasConflict) section.append(node("p", "memory-action-error", "상충하는 기록이 있습니다. 최신 유효 내용은 아직 확정할 수 없습니다."));
+        section.append(node("p", "context-copy", topic.verified.length ? "현재 소스 근거가 있는 기록 " + topic.verified.length + "개 · 주제 전체의 통합·유효성 판정과는 별개입니다." : "최신 유효 내용 미확정 · 수집 날짜만으로 이전 결정을 대체하지 않습니다."));
+        for (const claim of topic.claims) {
+          if (!claim.entries.some(({item}) => matches(item))) continue;
           const details = node("details", "rag-review-bundle");
           const summary = node("summary", "");
-          summary.append(node("strong", "", bundle.items[0].summary), node("small", "knowledge-badge", bundle.reasons.join(" · ") + " · " + bundle.items.length + "개"));
+          const confirmed = claim.entries.find(({item, candidate}) => candidate && item.source_review?.bucket === "current");
+          const saved = claim.entries.find(entry => !entry.candidate);
+          const representative = confirmed || saved || claim.entries[0];
+          const kind = RAG_KNOWLEDGE_KINDS[representative.item.knowledge?.kind] || (saved ? "저장된 지식 · 유효성 별도 검토" : "지식 종류·가치 검토 필요");
+          summary.append(node("strong", "", claim.text), node("small", "knowledge-badge", kind + " · " + claim.entries.length + "기록"));
           details.append(summary);
-          for (const item of bundle.items) appendRow(details, item, true);
+          if (representative.item.knowledge?.applicability) details.append(node("p", "context-copy", "적용 조건: " + representative.item.knowledge.applicability));
+          details.append(node("p", "context-copy", "출처·검토 이력 — 최근 수집 순 (현재 유효성 순서 아님)"));
+          for (const {item, candidate} of claim.entries) {
+            const date = Date.parse(item.created_at || "");
+            details.append(node("small", "", "수집: " + (Number.isFinite(date) ? new Date(date).toLocaleString("ko-KR") : "시각 미확인")));
+            appendRow(details, item, candidate);
+          }
           section.append(details);
         }
-        for (const memory of links) appendRow(section, memory, false);
         groups.append(section);
       }
+      if (!topics.some(topic => topic.entries.some(({item}) => matches(item)))) groups.append(node("p", "empty-copy", "표시할 주제 기록이 없습니다."));
       const linkSection = node("section", "rag-memory-group");
       const linkItems = proposed.filter(matches);
       linkSection.append(node("h3", "", "저장 메모의 노드 연결 제안 (" + linkItems.length + ")"), node("p", "context-copy", "기존 저장 메모의 연결 제안입니다. 소스 대조 결과와 별도로 확인합니다."));
       for (const item of linkItems) appendRow(linkSection, item, false);
       groups.append(linkSection);
-      const oldRecords = candidates.filter(item => item.source_review?.bucket === "archive" && matches(item));
+      const oldRecords = candidates.filter(item => !["IGNORE", "SUPERSEDED"].includes(item.state) && item.source_review?.bucket === "archive" && matches(item));
       const oldArchive = node("details", "rag-memory-group");
       oldArchive.append(node("summary", "", "오래되거나 틀린 기록 · 후보 제외 (" + oldRecords.length + ")"));
       oldArchive.append(node("p", "context-copy", "원문 요약과 제외 이유, 소스 근거를 별도로 보존합니다. 소스가 바뀌면 다시 확인합니다."));
       for (const item of oldRecords) appendRow(oldArchive, item, true);
       groups.append(oldArchive);
+      const excludedMemories = knowledge.memories.filter(item => item.retention?.decision === "IGNORE" && matches(item));
+      const excluded = node("details", "rag-memory-group");
+      excluded.append(node("summary", "", "무시한 저장 메모 (" + excludedMemories.length + ")"));
+      excluded.append(node("p", "context-copy", "목록·RAG 검색·연결 제안에서 제외됩니다. 메모를 열어 복원할 수 있습니다."));
+      for (const item of excludedMemories) appendRow(excluded, item, false);
+      groups.append(excluded);
       const archive = node("details", "rag-memory-group");
-      const stored = knowledge.memories.filter(item => item.link_state !== "PROPOSED" && matches(item));
       const reviewed = candidates.filter(item => ["IGNORE", "SUPERSEDED"].includes(item.state) && matches(item));
-      archive.append(node("summary", "", "저장된 메모·이전 검토 결과 (" + (stored.length + reviewed.length) + ")"));
-      for (const item of stored) appendRow(archive, item, false);
+      archive.append(node("summary", "", "제외·대체된 후보 이력 (" + reviewed.length + ")"));
       for (const item of reviewed) appendRow(archive, item, true);
       groups.append(archive);
     };
@@ -17700,6 +17842,7 @@ function bindEvents() {
     elements.releaseProposalOutput.classList.add("hidden");
     renderReleaseCatalog();
   });
+  document.querySelector("#restart-local-service")?.addEventListener("click", restartLocalService);
   elements.settingsButton.addEventListener("click", () => {
     openProviderSettings().catch((error) => toast(error.message, true));
   });

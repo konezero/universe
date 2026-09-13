@@ -333,6 +333,7 @@ def start_service(
     working_directory: Path | None = None,
     wait_seconds: float = 12.0,
     port: int | None = None,
+    service_token: str | None = None,
 ) -> dict[str, Any]:
     path = (state_path or default_state_path()).expanduser()
     database = (database_path or default_database_path()).expanduser()
@@ -381,10 +382,15 @@ def start_service(
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
+    child_environment = None
+    if service_token:
+        child_environment = dict(os.environ)
+        child_environment["UNIVERSE_TOKEN"] = service_token
     # sys.executable and SERVER_SCRIPT are fixed local executable paths.
     process = subprocess.Popen(  # nosec B603
         args,
         cwd=str(workdir),
+        env=child_environment,
         stdout=stdout,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -414,6 +420,7 @@ def start_service(
 
 def restart_service(
     *,
+    preserve_control_token: bool = False,
     state_path: Path | None = None,
     database_path: Path | None = None,
     mode_registry: Path | None = None,
@@ -450,6 +457,7 @@ def restart_service(
         open_ui=open_ui,
         working_directory=working_directory,
         port=previous_port,
+        **({"service_token": previous_state.get("token")} if preserve_control_token else {}),
     )
     return {
         "schema": "universe.local-service-control.v1",

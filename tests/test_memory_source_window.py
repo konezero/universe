@@ -84,6 +84,22 @@ class SourceWindowTests(unittest.TestCase):
         del refs[511]
         with self.assertRaises(UniverseError) as caught:select_source_window(store,"p")
         self.assertEqual("MEMORY_ACTIVITY_CURSOR_STALE",caught.exception.code)
+    def test_ineligible_resume_is_preserved_and_restored(self):
+        store = self.store(count=2)
+        resume = {"source_id": "removed", "after": {"activity_id": "old", "ordinal": 1}}
+        store.get_memory_source_position = lambda project: {"next_source_id": "removed", "selection": {"activity_resume": resume}}
+        ids, report = select_source_window(store, "p")
+        self.assertEqual(["s000", "s001"], ids)
+        self.assertEqual(resume, report["suspended_activity_resumes"]["removed"])
+        self.assertIsNone(report["activity_resume"])
+        store.get_memory_source_position = lambda project: {"selection": report}
+        store.list_provider_session_sources = lambda: [{"source_id": "removed", "status": "ACTIVE"}]
+        store.prepare_provider_activity_batch = lambda sid: {"source": {"provider": "CODEX"}, "activity_refs": [resume["after"], {"activity_id": "new", "ordinal": 2}]}
+        ids, restored = select_source_window(store, "p")
+        self.assertEqual(["removed"], ids)
+        self.assertEqual({}, restored["suspended_activity_resumes"])
+        self.assertEqual(2, restored["activity_windows"]["removed"]["activity_refs"][0]["ordinal"])
+
     def test_window_revalidation_rejects_changed_activity(self):
         from universe_app.memory_source_window import apply_activity_window
         batch={"source":{"provider":"CODEX","source_id":"s"},"activity_refs":[{"activity_id":"a","activity_digest":"one"}]}

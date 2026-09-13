@@ -130,6 +130,23 @@ class ProviderSessionObserverTests(unittest.TestCase):
         self.assertEqual(1, third["added"])
         self.assertEqual(3, len(self.store.list_activities(str(source["source_id"]))))
 
+    def test_correlated_completion_digest_roundtrips_and_rejects_changed_turn(self) -> None:
+        path = self.root / "rollout-correlated.jsonl"
+        message = {"type": "event_msg", "payload": {"type": "user_message", "message": "Keep brainstorming visible while editing the project."}}
+        completion = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-a"}}
+        self.write(path, message, completion)
+        source = self.register("CODEX", path)
+        sid = str(source["source_id"])
+        self.store.scan(sid)
+        refs = self.store.list_activities(sid)
+        evidence = self.store.build_transient_semantic_evidence(sid, refs)
+        self.assertEqual(1, len(evidence))
+        completion["payload"]["turn_id"] = "turn-b"
+        self.write(path, message, completion)
+        with self.assertRaises(ProviderSessionObserverError) as caught:
+            self.store.build_transient_semantic_evidence(sid, refs)
+        self.assertEqual("SEMANTIC_SOURCE_NOT_CURRENT", caught.exception.code)
+
     def test_codex_semantic_evidence_is_transient_redacted_and_activity_bound(self) -> None:
         source_path = self.root / "rollout-semantic.jsonl"
         self.write(

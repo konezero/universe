@@ -1016,6 +1016,16 @@ class ProviderSessionObserverStore:
                     "event_type": _event_type(event)[:96],
                     "parent_id": parent_id,
                 }
+                # The producer binds Codex turn/bus correlation into its digest.
+                # Reconstruct those same fields; never drop digest validation.
+                if provider == "CODEX" and row["provider_turn_id"] is not None:
+                    correlation = codex_turn_event(event)
+                    if (not correlation or correlation.get("provider_turn_id") != row["provider_turn_id"]
+                            or any(correlation.get(key) is not None and correlation.get(key) != row[key]
+                                   for key in ("bus_message_id", "bus_dispatch_ref"))):
+                        raise ProviderSessionObserverError("SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"]))
+                    safe.update({key: row[key] for key in
+                                 ("provider_turn_id", "bus_message_id", "bus_dispatch_ref")})
                 if _sha256(_canonical_json(safe)) != str(row["activity_digest"]):
                     raise ProviderSessionObserverError(
                         "SEMANTIC_SOURCE_NOT_CURRENT", str(row["activity_id"])

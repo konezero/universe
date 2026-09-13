@@ -54,8 +54,17 @@ def select_source_window(store, project_id):
     position = store.get_memory_source_position(project_id)
     resume = position.get("selection", {}).get("activity_resume")
     next_id = position.get("next_source_id")
+    # Ownership changes can remove a still-active source from this project's
+    # eligible set. Preserve its exact cursor without blocking healthy sources.
+    suspended = dict(position.get("selection", {}).get("suspended_activity_resumes") or {})
     if resume and resume["source_id"] not in source_ids:
-        raise UniverseError("MEMORY_ACTIVITY_CURSOR_STALE", "The pending source is no longer active", 409)
+        suspended[resume["source_id"]] = resume
+        resume = None
+    if resume is None:
+        restored_id = next((sid for sid in source_ids if sid in suspended), None)
+        if restored_id is not None:
+            resume = suspended.pop(restored_id)
+            next_id = restored_id
     if next_id in source_ids:
         index = source_ids.index(next_id)
         source_ids = source_ids[index:] + source_ids[:index]
@@ -153,6 +162,7 @@ def select_source_window(store, project_id):
         "next_source_id": next_source_id,
         "activity_windows": windows,
         "activity_resume": pending_resume,
+        "suspended_activity_resumes": suspended,
         "previous_run_id": position.get("last_run_id"),
     }
     if not selected:

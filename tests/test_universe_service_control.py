@@ -24,6 +24,16 @@ from universe_service_control import (  # noqa: E402
 
 
 class UniverseServiceControlTests(unittest.TestCase):
+    def test_restart_token_is_environment_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch("universe_service_control.service_status", side_effect=[{"status": "STOPPED", "pid_running": False}, {"status": "READY"}, {"status": "READY"}]), mock.patch("universe_service_control.subprocess.Popen") as spawn:
+                spawn.return_value.pid = 12345
+                result = start_service(state_path=root / "server.json", database_path=root / "test.sqlite3", log_path=root / "service.log", service_token="test-private-control-token", open_ui=False)
+            self.assertEqual("test-private-control-token", spawn.call_args.kwargs["env"]["UNIVERSE_TOKEN"])
+            self.assertNotIn("test-private-control-token", json.dumps(result))
+            self.assertNotIn("test-private-control-token", " ".join(spawn.call_args.args[0]))
+
     def test_database_owner_lock_blocks_second_instance_and_releases(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "bus.sqlite3"

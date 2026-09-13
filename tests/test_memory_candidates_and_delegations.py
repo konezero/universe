@@ -74,6 +74,20 @@ class MemoryCandidateContractTests(unittest.TestCase):
         with self.assertRaisesRegex(MemoryError, "model"):
             resolve_memory_batch_config(invalid, catalog)
 
+    def test_knowledge_metadata_roundtrips_and_participates_in_identity(self):
+        raw = {"project_id": "TEST", "stage": "FAST_EXTRACT", "kind": "MEMORY", "summary": "Apply the procedure only after confirming its precondition.", "source_session": "test", "ref_digests": ["a" * 64]}
+        legacy = normalize_memory_candidate(raw)
+        self.assertNotIn("knowledge", legacy)
+        knowledge = {"kind": "REUSABLE_PROCEDURE", "topic": "검증 절차", "applicability": "판단 전에 근거를 확인할 때"}
+        candidate = normalize_memory_candidate({**raw, "knowledge": knowledge})
+        self.assertEqual(knowledge, candidate["knowledge"])
+        self.assertEqual(candidate["candidate_digest"], normalize_memory_candidate(candidate)["candidate_digest"])
+        self.assertNotEqual(legacy["candidate_digest"], candidate["candidate_digest"])
+        self.assertTrue(all(x["knowledge"] == knowledge for x in consolidate_memory_candidates([candidate])))
+        for invalid in [{**knowledge, "kind": "SOURCE_CHANGE"}, {**knowledge, "applicability": ""}, {**knowledge, "topic": "x" * 101}]:
+            with self.assertRaises(MemoryError):
+                normalize_memory_candidate({**raw, "knowledge": invalid})
+
     def test_candidate_pipeline_is_redacted_typed_and_deterministic(self) -> None:
         with self.assertRaises(MemoryError) as raw_error:
             normalize_memory_candidate(
@@ -121,7 +135,11 @@ class MemoryCandidateContractTests(unittest.TestCase):
                 for relation in item["relations"]
             )
         )
-        synthesized = synthesize_memory_candidates(consolidated)
+        # Unreviewed extraction must not multiply into synthetic knowledge.
+        self.assertEqual([], synthesize_memory_candidates(consolidated))
+        reviewed = [{**item, "state": "KEEP"} for item in consolidated
+                    if item["state"] != "SUPERSEDED"]
+        synthesized = synthesize_memory_candidates(reviewed)
         self.assertEqual({"IDEA", "HYPOTHESIS", "PRODUCT"}, {item["kind"] for item in synthesized})
         self.assertTrue(
             all(
@@ -210,6 +228,90 @@ class ConductorDelegationMigrationTests(unittest.TestCase):
 
 
 class MemoryCandidateApiTests(unittest.TestCase):
+    def test_saved_memory_ignore_restore_and_retrieval(self):
+        store = self.server.store
+        memory = store.create_project_memory("TEST", {"title": "Old progress", "body": "Only a completed build report", "state": "OBSERVED"})
+        value = {"project_id": "TEST", "memory_id": memory["memory_id"], "expected_memory_digest": memory["memory_digest"], "expected_revision": 0, "decision": "IGNORE", "note": "Build progress has no reusable knowledge"}
+        def call(v):
+            return self.request("POST", "/v1/actions", {"action_id": "rag.memory-retention", "request": v})
+        self.assertEqual(409, call({**value, "expected_memory_digest": "0" * 64})[0])
+        status, result = call(value)
+        self.assertEqual(200, status, result)
+        self.assertEqual("IGNORE", result["memory"]["retention"]["decision"])
+        self.assertEqual([], store.list_project_memories("TEST", query="completed"))
+        self.assertEqual([], store.propose_memory_links("TEST")["proposals"])
+        self.assertEqual(memory["body"], store.list_project_memories("TEST", include_ignored=True)[0]["body"])
+        self.assertEqual("MEMORY_RETENTION_REPLAYED", call(value)[1]["status"])
+        self.assertEqual(409, call({**value, "note": "Changed reason"})[0])
+        self.assertEqual(400, call({**value, "expected_revision": True})[0])
+        status, result = call({**value, "expected_revision": 1, "decision": "ACTIVE", "note": "Reviewed again"})
+        self.assertEqual(200, status, result)
+        self.assertEqual(1, len(store.list_project_memories("TEST")))
+        self.assertEqual(409, call(value)[0])
+        with store._connection() as connection:
+            self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM project_memory_retention").fetchone()[0])
+        self.assertEqual(1, len(self.request("GET", "/v1/projects/TEST/memories?include_ignored=true")[1]["memories"]))
+
+    def test_ignore_reviewed_adopted_candidate_is_atomic_and_suppresses_recollection(self):
+        store = self.server.store
+        items, _ = store._insert_memory_candidates("TEST", [{"project_id":"TEST", "kind":"MEMORY", "stage":"FAST_EXTRACT", "summary":"Old incident completion", "source_session":"original", "ref_digests":["a" * 64]}])
+        candidate = items[0]
+        attest_current_fixture(store, candidate["candidate_id"])
+        candidate, _ = store.review_memory_candidate(candidate["candidate_id"], {"decision":"KEEP"})
+        memory = store.create_project_memory("TEST", {"title": candidate["summary"], "body": candidate["summary"], "state":"OBSERVED", "origin_ref":"universe://memory-candidates/"+candidate["candidate_digest"]+"/"+candidate["candidate_id"]})
+        value = {"project_id":"TEST", "candidate_id":candidate["candidate_id"], "expected_candidate_digest":candidate["candidate_digest"], "expected_candidate_revision":candidate["revision"], "note":"Completed incident without reusable procedure"}
+        status, result = self.request("POST", "/v1/actions", {"action_id":"rag.archive-candidate", "request":{**value,"expected_candidate_revision":1}})
+        self.assertEqual(409,status,result)
+        status, result = self.request("POST", "/v1/actions", {"action_id":"rag.archive-candidate", "request":value})
+        self.assertEqual(200,status,result)
+        self.assertEqual("IGNORE",store.get_memory_candidate(candidate["candidate_id"])["state"])
+        self.assertEqual([],store.list_project_memories("TEST"))
+        self.assertEqual("IGNORE",store.get_project_memory("TEST",memory["memory_id"])["retention"]["decision"])
+        again, created = store._insert_memory_candidates("TEST", [{"project_id":"TEST", "kind":"MEMORY", "stage":"FAST_EXTRACT", "summary":candidate["summary"], "source_session":"different", "ref_digests":["b" * 64]}])
+        self.assertEqual(([],0),(again,created))
+        with self.assertRaisesRegex(UniverseError, "identical claim"):
+            store.create_memory_candidate("TEST", {"kind":"MEMORY", "stage":"FAST_EXTRACT", "summary":candidate["summary"], "source_session":"third", "ref_digests":["c" * 64]})
+        with store._connection() as connection:
+            self.assertEqual(2,connection.execute("SELECT COUNT(*) FROM memory_candidate_review_history WHERE candidate_id=?",(candidate["candidate_id"],)).fetchone()[0])
+
+    def test_saved_adopted_memory_ignore_also_withdraws_candidate(self):
+        store = self.server.store
+        items,_=store._insert_memory_candidates("TEST",[{"project_id":"TEST","kind":"MEMORY","stage":"FAST_EXTRACT","summary":"Old source-change report","source_session":"s","ref_digests":["a"*64]}])
+        c=items[0];attest_current_fixture(store,c["candidate_id"])
+        store.review_memory_candidate(c["candidate_id"],{"decision":"KEEP"})
+        m=store.create_project_memory("TEST",{"title":c["summary"],"body":c["summary"],"state":"OBSERVED","origin_ref":"universe://memory-candidates/"+c["candidate_digest"]+"/"+c["candidate_id"]})
+        status,result=self.request("POST","/v1/actions",{"action_id":"rag.memory-retention","request":{"project_id":"TEST","memory_id":m["memory_id"],"expected_memory_digest":m["memory_digest"],"expected_revision":0,"decision":"IGNORE","note":"Source history only"}})
+        self.assertEqual(200,status,result)
+        self.assertEqual("IGNORE",store.get_memory_candidate(c["candidate_id"])["state"])
+        self.assertEqual([],store.list_project_memories("TEST"))
+
+    def test_governed_archive_preserves_record_and_checks_identity(self):
+        items, _ = self.server.store._insert_memory_candidates("TEST", [{
+            "project_id": "TEST", "stage": "FAST_EXTRACT", "kind": "MEMORY",
+            "summary": "Test-only response marker", "source_session": "test",
+            "ref_digests": ["a" * 64]}])
+        item = items[0]
+        request = {"project_id": "TEST", "candidate_id": item["candidate_id"],
+                   "expected_candidate_digest": item["candidate_digest"], "note": "Test response is not project knowledge."}
+        def call(value):
+            return self.request("POST", "/v1/actions", {"action_id": "rag.archive-candidate", "request": value})
+        status, _ = call({**request, "expected_candidate_digest": "0" * 64})
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        status, _ = call({**request, "project_id": "OTHER"})
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        status, result = call(request)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RAG_CANDIDATE_ARCHIVED", result["status"])
+        status, replay = call(request)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("RAG_CANDIDATE_ARCHIVE_REPLAYED", replay["status"])
+        self.assertEqual(result["revision"], replay["revision"])
+        status, _ = call({**request, "note": "different reason"})
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        stored = self.server.store.get_memory_candidate(item["candidate_id"])
+        self.assertEqual("IGNORE", stored["state"])
+        self.assertEqual(item["summary"], stored["summary"])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
@@ -229,6 +331,10 @@ class MemoryCandidateApiTests(unittest.TestCase):
         self.server = create_server(
             database_path=root / "universe.sqlite3",
             token="candidate-test-token",
+            service_state_path=root / "server.json",
+            remote_gateway_state_path=root / "remote-gateway.json",
+            remote_connector_state_path=root / "remote-connector.json",
+            remote_connector_config_path=root / "remote-connector-config.json",
             auto_start_project_masters=False,
             auto_start_conductor_runtime=False,
             provider_model_catalog=ProviderModelCatalogStore(path=catalog_path),
@@ -412,6 +518,15 @@ class MemoryCandidateApiTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("CONSOLIDATE", consolidate["run"]["stage"])
+        status, synthesize = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "SYNTHESIZE"}
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(0, synthesize["run"]["candidate_count"])
+        input_id = consolidate["run"]["candidate_ids"][0]
+        attest_current_fixture(self.server.store, input_id)
+        status, _ = self.request("POST", f"/v1/memory-candidates/{input_id}/review", {"decision": "KEEP"})
+        self.assertEqual(HTTPStatus.OK, status)
         status, synthesize = self.request(
             "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "SYNTHESIZE"}
         )

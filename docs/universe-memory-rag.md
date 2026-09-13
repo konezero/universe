@@ -130,6 +130,193 @@ POST /v1/actions
 }
 ```
 
+## Collection priority — 2026-09-13
+
+The operator's collection order supersedes the older broad reusable-lesson prompt:
+
+1. User brainstorming notes, equivalent substantive conversational ideas and
+   requirements, and explicit operational decisions with their reasons. Preserve
+   proposed versus confirmed intent; assistant suggestions are not user decisions.
+2. Transferable procedures, judgments and LLM experience supported by observed
+   decisions/outcomes, with explicit applicability. Extract the useful procedure
+   and rationale, not its surrounding file changes, commits, test counts or repair
+   history. A solved incident with no continuing applicability has no active value.
+
+Policy `reusable-knowledge-topics.v2` requires new provider output to identify
+`knowledge.kind`, a concise stable `knowledge.topic`, and `knowledge.applicability`.
+Kinds distinguish user ideas/requirements/decisions from reusable procedures and
+experience. Metadata is bounded, retained through normalization/consolidation and
+included in the candidate digest. Legacy records retain their original digests and
+are not silently backfilled. Model-suggested metadata is not a value-review receipt.
+
+FAST_EXTRACT receives transcripts, not attested current-source state. It can extract
+an evidenced procedural lesson but cannot certify current implementation or remaining
+recurrence paths. Generic advice and model success self-reports are insufficient.
+Unimplemented user intent remains valuable. Source-currentness and knowledge value
+are separate questions; a newer collection timestamp establishes neither.
+
+The Memory view groups stored records and active candidates by topic, folds identical
+claims across review states, and preserves individual provenance/history. Legacy
+keyword categories are explicitly navigation suggestions, not semantic equivalence.
+Current-source records remain distinguishable from recently collected unverified
+records. Conflicts prevent a canonical-latest implication; there is no automatic
+semantic rewrite or supersession based on date. Excluded candidates are a separate
+history list and show their exclusion status before their stale source-review badge.
+
+Session readiness, approval waiting, routine progress/success, test-response
+instructions, generic agent procedure, placeholders, and repeated summaries are
+excluded. Empty extraction is a valid outcome. The policy version participates in
+run identity so old-policy results cannot masquerade as a fresh evaluation.
+Deterministic synthesis consumes only KEEP-reviewed inputs; it must not amplify
+unreviewed extraction into three new kinds. Existing candidates and memories remain
+unchanged by this source update; historical cleanup is a separate review operation.
+
+## Existing-record cleanup and collection recovery — 2026-09-13
+
+Read-only inspection of the live store found 139 Universe candidates. Sixteen
+records are selected for noise review: nine contentless count/digest synthesis
+records, six concatenated cross-topic synthesis records, and one test-response
+instruction. Twelve remain REVIEW_REQUIRED; four are already EXPLORE and require
+an explicit reopen transition before archival. This is a selected review packet,
+not a claim that live records have been archived. Other user intent and historical
+implementation claims require separate evidence review. Career's 29,075 identical
+candidate summaries were already IGNORE and are not rewritten.
+
+`POST /v1/actions` with `action_id: rag.archive-candidate` accepts exactly
+`project_id`, `candidate_id`, `expected_candidate_digest`, and `note`. It requires
+a server-resolved USER, checks project/content identity, and uses the existing
+review transition and audit history to record IGNORE. It does not delete the
+candidate, auto-reopen an existing decision, or alter canonical Memory. Identical
+replay returns the same revision; changed content, project, or replay reason
+fails. Saved Memory cleanup remains separate from candidate archival.
+
+Two independently observed collection failures have source fixes:
+
+- The pending source was ACTIVE but its ownership had become UNASSIGNED. The
+  project selector treated its old cursor as a fatal inactive-source error. It
+  now retains that cursor in `suspended_activity_resumes`, continues eligible
+  sources, and restores the exact cursor if ownership/eligibility returns.
+  Changed activity evidence within an eligible source still fails closed.
+- Codex producer digests include turn/bus correlation, but semantic reads omitted
+  those fields. Reads now reconstruct the producer's recorded correlation after
+  checking the current event's turn and explicit bus metadata. Existing activity
+  records and hashes are not rewritten; actual event changes still fail.
+
+Validation: 39 observer, source-window and archival API tests passed. A read-only
+probe through the repaired consumer processed 128 live activity references,
+including the exact previously failing activity, and returned semantic evidence.
+This probe did not write the live database.
+
+Live follow-up after operator restart (PID 54144): the governed archive Action
+recorded IGNORE for all 12 selected REVIEW_REQUIRED candidates; API readback
+confirmed their state. Four selected EXPLORE records remain unchanged pending
+an explicit reopen workflow. No canonical Memory was deleted or relinked.
+
+Default collection, without explicit source IDs, completed as
+`memory_batch_run_117b89c5686ac12177860573` in approximately 127 seconds and stored
+five REVIEW_REQUIRED candidates. Their cited excerpts were read back and all
+were user-authored requirements or operational directions. Review is still
+required before treating their wording and scope as canonical decisions.
+The batch processed one bounded source window; six sources were deferred.
+API readback confirmed the new cursor and retained suspended ownership cursor.
+This proves one default batch, not exhaustive recollection or scheduled firing.
+
+### Topic-view validation — 2026-09-14
+
+Observed owner: `groupRagReviewCandidates` previously partitioned exact summaries
+by kind/source bucket, while `renderMemory` separated stored memories from active
+candidates. The topic projection now groups those records for navigation and folds
+identical claims across review states. It does not establish semantic equivalence
+or a canonical replacement. Adoption topic display follows only an exact
+project/digest/candidate origin match; it does not rewrite canonical memory rows.
+
+Validation: 26 Python tests passed (FAST_EXTRACT and candidate/delegation suites),
+three JavaScript UI suites passed, syntax and Git whitespace checks passed. Test
+shutdown emitted resource warnings and two remote-gateway state-file permission
+warnings; successful assertions do not establish clean test-process teardown.
+Live Playwright on the existing service observed 144 candidates and 71 saved
+memories in six suggested topics; search, empty results and history expansion
+passed with no page errors. Existing project selection completed slowly, so a
+second check isolated the Memory view; both passed.
+
+The running service PID remained 54144. Static UI changes were served live, but
+new Python collection policy v2 has not been loaded or exercised by a live provider
+batch in this process. The page also displayed a recent scheduled FAST_EXTRACT
+failure `MEMORY_ACTIVITY_CURSOR_STALE`; its present root cause is UNKNOWN and is
+not declared resolved by this topic-view change. Existing records still need
+semantic/value review before consolidating different statements or selecting a
+current authoritative decision. No chronological auto-supersession was performed.
+
+## Excluding previously saved knowledge — 2026-09-14
+
+Confirmed implementation gap: canonical `project_memory` had no retention state,
+`list_project_memories` returned every saved row to retrieval and maintenance, and
+the Memory detail view offered only node linking. Candidate IGNORE was restricted
+to REVIEW_REQUIRED, leaving previously reviewed noise stranded.
+
+`rag.memory-retention` is the shared human/LLM Action for saved memory exclusion
+and restoration. Required request fields: project_id, memory_id,
+expected_memory_digest, expected_revision (0 before a first decision), decision
+(IGNORE or ACTIVE), and nonempty note (maximum 500 characters). Actor/context are
+server-resolved. An append-only `project_memory_retention` table stores reason,
+actor, content identity and revision. Exact retries replay; stale revisions and
+changed replay reasons conflict. Original bodies, provenance and node links remain.
+The detail view keeps exclusion controls available when optional node projection
+loading fails; the existing structured API error is shown without replacing the
+memory content or retention actions. A projection-less test project returned
+PROJECT_PROJECTION_NOT_FOUND (404), exposing this previously coupled failure path.
+Default memory lists, searches, planning contexts, graph projections and link
+maintenance omit IGNORE before pagination. `include_ignored=true` is an explicit
+review/history list; it does not change normal retrieval. The UI offers **무시 —
+RAG에서 제외**, then **메모 복원** in the excluded-history section. Restore activates
+the saved memory without recreating or approving its old candidate review.
+
+`rag.archive-candidate` now accepts expected_candidate_revision for an already
+reviewed candidate. The candidate review and exclusion of its exactly matched
+adopted memory share one transaction. Excluding an adopted saved memory likewise
+withdraws its source candidate in the same transaction, preserving review history.
+Explicit candidate creation and batch insertion cannot revive the exact same
+excluded summary under a new source identity. This is exact-content suppression,
+not semantic matching of paraphrases or a guarantee about all manual imports.
+
+Cleanup review packet (Universe only): 50 candidates and 37 saved memories were
+selected. The initial live pass changed 43 REVIEW_REQUIRED candidates to IGNORE;
+after the operator restarted the server, all seven already-reviewed candidates
+and 37 saved memories were also ignored through the named Actions. Selection reasons: empty/test responses, one-time session or
+approval status, completed source/release/test reports, unsupported old source
+findings, and metadata-only location/status claims. Product decisions, brainstorming,
+applicable procedures and mixed passages needing extraction were retained. This
+is not a declaration that every remaining record has passed value review.
+
+Validation: 39 Python tests and three JavaScript suites passed, including actual
+HTTP actions, replay/conflict behavior, active-list exclusion, restoration,
+adopted-source withdrawal and exact recollection suppression. A real browser against
+the test HTTP server also completed exclude -> absent from retrieval -> reopen from
+excluded history -> restore, including the projection-less project failure path;
+zero page errors were observed. Screenshot: `.artifacts/ui/rag-ignore-dialog-20260914.png`.
+Existing test-process resource warnings and a test-server request-handler shutdown
+timeout remain; clean teardown is not inferred from successful assertions.
+
+After restart, PID 17944 exposed rag.memory-retention. The remaining 44 Actions
+completed. Readback verified all 50 selected candidates are IGNORE, all 37 selected
+saved memories are IGNORE and absent from ordinary retrieval, and 34 of 71 saved
+memories remain active. The reviewed ID/digest/reason packet remains in the Host
+operation directory as `ignore-review-packet.json`; applied results and readback
+are `ignore-restart-applied.json` and `ignore-restart-verification.json`.
+
+Live browser verification passed: 34 active memories, 37 excluded records, and the
+excluded detail opens with a Restore button, with zero page errors. Playwright's
+initial string-evaluation wait was blocked by CSP; the successful check used CSP
+bypass only in the ephemeral test browser, without altering product CSP. Screenshot:
+`.artifacts/ui/rag-ignore-live-20260914.png`.
+
+Completion evidence for this slice: outcome SUCCEEDED; source/storage/API PASS;
+UI PASS on test and resident HTTP services; resident new-Action activation PASS;
+live selected-record cleanup PASS (50 candidates and 37 saved memories).
+Changed paths: universe_memory.py (retention events), universe_server.py (storage,
+retrieval and handlers), universe_action_registry.py, universe_ui/app.js, affected
+memory/UI tests and this document. No source commit or deployment is asserted.
+
 ## Direct user decision recording
 
 An already-confirmed product or architecture decision uses the separate

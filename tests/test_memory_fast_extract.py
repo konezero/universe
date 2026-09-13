@@ -127,6 +127,7 @@ class FastExtractDispatcher(RuntimeWorkerDispatcher):
                             {
                                 "kind": "MEMORY",
                                 "summary": "Keep extracted memories review-only before publication.",
+                                "knowledge": {"kind": "USER_DECISION", "topic": "메모 검토", "applicability": "지식 게시 전"},
                                 "source_range": {"start": 2, "end": 2},
                                 "evidence_ids": [evidence_id],
                             }
@@ -392,7 +393,7 @@ class FastExtractServerTests(unittest.TestCase):
         def invalid(provider,request):
             result=original(provider,request)
             wire=json.loads(result["result"]["text"])
-            wire["candidates"].append({"kind":"MEMORY","summary":"Unsupported reference","evidence_ids":["E999"]})
+            wire["candidates"].append({"kind":"MEMORY","summary":"Unsupported reference","knowledge":{"kind":"REUSABLE_PROCEDURE","topic":"Evidence validation","applicability":"Before accepting a reference"},"evidence_ids":["E999"]})
             result["result"]["text"]=json.dumps(wire)
             return result
         self.dispatcher._invoke_provider=invalid

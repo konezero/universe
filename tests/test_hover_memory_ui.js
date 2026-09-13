@@ -34,9 +34,14 @@ const context = {
       return {candidate, status:'REVIEWED'};
     }
     if (path.endsWith("/projection")) return {projection:{nodes:[]}};
-    return path.endsWith('/memories') ? {memories} : {candidates:[candidate]};
+    return path.includes('/memories') ? {memories} : {candidates:[candidate]};
   },
   async invokeServerAction(id, request) {
+    if (id === 'rag.memory-retention') {
+      assert.equal(request.memory_id, 'm1');
+      memories = memories.map(m => ({...m, retention:{decision:request.decision, revision:request.expected_revision+1, note:request.note}}));
+      return {memory:memories[0],status:'MEMORY_RETENTION_RECORDED'};
+    }
     assert.equal(id, 'rag.adopt');
     assert.equal(request.expected_candidate_digest, 'digest1');
     assert.equal(request.candidate_id, 'c1');
@@ -47,6 +52,14 @@ const context = {
 vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf('const hoverKnowledgeCache ='),source.indexOf('let documentHoverTimer =')),context);
 (async () => {
+  candidate.knowledge = {kind:'USER_DECISION',topic:'Collection policy',applicability:'During extraction'};
+  memories = [{memory_id:'saved',project_id:'project-a',origin_ref:'universe://memory-candidates/digest1/c1'}];
+  const enriched = await context.loadHoverKnowledge('project-a',true);
+  assert.equal(enriched.memories[0].knowledge.topic,'Collection policy');
+  assert.equal(memories[0].knowledge,undefined);
+  memories = [{memory_id:'other',project_id:'project-a',origin_ref:'universe://memory-candidates/changed/c1'}];
+  assert.equal((await context.loadHoverKnowledge('project-a',true)).memories[0].knowledge,undefined);
+  memories = [];
   const knowledge = {memories:[{memory_id:'linked',node_ref:'n1',link_state:'LINKED'},{memory_id:'proposed',node_ref:'n2',link_state:'PROPOSED'},{memory_id:'free',node_ref:null}],candidates:[candidate]};
   const related = context.relatedKnowledgeForNode({kind:'system',data:{node_id:'n1'}}, knowledge);
   assert.equal(related.memories.length,1); assert.equal(related.memories[0].memory_id,'linked'); assert.equal(related.candidates.length,0);
@@ -66,5 +79,11 @@ vm.runInContext(source.slice(source.indexOf('const hoverKnowledgeCache ='),sourc
   assert.equal(memories.length,1);
   assert.equal(buttons().find(b=>b.textContent==='RAG에 채택'),undefined);
   assert.equal(context.relatedKnowledgeForNode({kind:'project'},{memories,candidates:[candidate]}).candidates.length,0);
-  console.log('PASS node scoping, proposed/unlinked separation, failed review, KEEP, governed adoption, adopted deduplication');
+  await buttons().find(b=>b.textContent==='무시 — RAG에서 제외').onclick();
+  assert.equal(memories[0].retention.decision,'IGNORE');
+  assert.equal(context.relatedKnowledgeForNode({kind:'project'},{memories,candidates:[candidate]}).memories.length,0);
+  assert.equal(buttons().find(b=>b.textContent==='노드 연결 확정'),undefined);
+  await buttons().find(b=>b.textContent==='메모 복원').onclick();
+  assert.equal(memories[0].retention.decision,'ACTIVE');
+  console.log('PASS node scoping, candidate adoption, saved memory exclusion/restoration through governed action, hidden links');
 })().catch(error => {console.error(error);process.exitCode=1;});

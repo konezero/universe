@@ -77,3 +77,16 @@ discoverable contracts — the pending ones report `UNCOVERED`, never available.
   read/get Action, no `GET`) cannot obtain the `current + revision` that
   full-replace `todo.update` needs. That is when a partial + atomic
   `todo.update` variant becomes justified.
+
+
+## Web service lifecycle Actions — 2026-09-14
+
+Handler-backed `service.status` and `service.restart` are now implemented in source. They are registered only on a server running this version. They do not restart the PTY Supervisor.
+
+- `service.status`: `{}` returns service status, pid and endpoint; `{ "operation_id": "<request-id>" }` also retrieves durable restart progress.
+- `service.restart`: `{ "request_id": "<8–100 ASCII letters/digits/_/->", "expected_pid": <observed positive pid> }`. The HTTP gateway requires the existing local service-control Bearer token and rejects remote operators. Caller-supplied role, credentials and context remain forbidden in the Action body. Human Settings and LLM clients use this same contract.
+- The server persists acceptance before launching a fixed external helper. Reusing a request id replays the record; changing its target conflicts. A different active request conflicts. The helper verifies the process again before shutdown, preserves the database, port and control token, and records completion only after a different healthy process appears on the original endpoint.
+- Control tokens are passed to the replacement server only through its environment, never operation records or command arguments. Regular CLI restart semantics are unchanged.
+- Settings → Service exposes restart/result lookup. An uncertain transport response retains the request id in session storage for reconnection; a definite validation/authorization failure clears it. The operation remains queryable after page reload. An interrupted helper is reported as unconfirmed rather than successful.
+
+This product lifecycle Action does not itself grant an agent Runtime Execution Assignment. Agent Hosts use `tools/universe_service_execution.py` for separate exact lifecycle binding, guard permission and immediate one-time consumption before fixed Action dispatch. See [service-restart-execution.md](service-restart-execution.md) for the callable sequence and live completion evidence. Do not use the installed generic COMMAND check's file-only NOT_REQUIRED response as lifecycle authorization.

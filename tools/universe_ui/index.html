@@ -171,6 +171,19 @@
           <div class="goal-plan-empty">Choose a project to begin planning.</div>
         </div>
         <div id="fleet-board" class="fleet-board" aria-label="Fleet execution board" hidden></div>
+          <div class="project-authoring-controls" hidden>
+            <button id="project-draft-edit-selected" class="secondary-button" type="button">프로젝트 목표·계획 편집</button>
+            <button id="project-draft-show-list" class="secondary-button" type="button">저장된 초안</button>
+            <div id="project-draft-list"></div>
+          </div>
+          <section id="project-draft-panel" class="project-draft-panel" hidden aria-label="프로젝트 목표와 계획">
+            <header><h2>프로젝트 목표·계획</h2><button id="project-draft-close" type="button" class="secondary-button">접기</button></header>
+            <p>대화와 직접 입력으로 함께 작성하세요. 초안 저장은 프로젝트 등록이나 작업 실행을 시작하지 않습니다.</p>
+            <div id="project-draft-form" class="project-draft-form"></div>
+            <div class="dialog-actions"><button id="project-draft-save" type="button" class="primary-button">초안 저장</button><button id="project-draft-reload" type="button" class="secondary-button" hidden>서버 버전 비교</button></div>
+            <p id="project-draft-status" role="status" aria-live="polite"></p>
+            <section id="project-draft-comparison" hidden aria-label="서버 버전 비교"></section>
+          </section>
         <div id="home-view" class="home-view" hidden aria-label="Project → node → todo → kanban">
           <div id="home-mobile-bar" class="home-mobile-bar" hidden>
             <button id="home-mobile-back" class="home-mobile-back" type="button" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg></button>
@@ -474,7 +487,7 @@
             <div class="settings-section-heading">
               <div>
                 <strong>Local service</strong>
-                <small>Loopback process lifecycle is CLI-managed</small>
+                <small>웹 서버 상태와 재시작</small>
               </div>
             </div>
             <div id="local-service-status" class="local-service-status">
@@ -485,6 +498,8 @@
               the system tray, or Start Menu shortcuts from
               <code>packaging/windows/install-user.ps1</code>.
             </p>
+            <button id="restart-local-service" type="button" class="secondary-button">서버 재시작</button>
+            <p id="restart-local-service-status" class="settings-help" role="status" aria-live="polite">재시작 후 자동으로 다시 연결됩니다. 터미널 서비스는 유지됩니다.</p>
             <label for="memory-maintain-interval">Memory maintain interval (hours)</label>
             <input
               id="memory-maintain-interval"
@@ -1542,6 +1557,7 @@
   <script src="/xterm-addon-web-links.min.js?v=0.13.0-beta.300"></script>
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
   <script src="/terminals.js?v=term-56-ios-fallback-race" defer></script>
-  <script src="/app.js?v=work-spine-29-repo-hooks-dialog" defer></script>
+  <script src="/project-drafts.js?v=1" defer></script>
+  <script src="/app.js?v=work-spine-30-project-drafts" defer></script>
 </body>
 </html>

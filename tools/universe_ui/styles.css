@@ -8755,3 +8755,14 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 
 .rag-daily-summary { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 16px; }
 .rag-daily-summary small { display: block; margin: 8px 0; }
+
+/* Shared draft stays above Fleet while the conversation dock remains accessible. */
+.project-authoring-controls { display:flex; gap:8px; flex-wrap:wrap; padding:12px 0; }
+.project-draft-panel { padding:20px; margin-bottom:16px; border:1px solid #445356; border-radius:12px; background:#202326; }
+.project-authoring-controls[hidden], .project-draft-panel[hidden], #project-draft-comparison[hidden] { display:none; }
+.project-draft-panel header { display:flex; align-items:center; justify-content:space-between; }
+.project-draft-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+.project-draft-field { display:flex; flex-direction:column; gap:6px; }
+.project-draft-field input, .project-draft-field textarea { box-sizing:border-box; width:100%; padding:10px; background:#17191b; color:#eee; border:1px solid #536367; border-radius:6px; font:inherit; }
+#project-draft-comparison pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+@media(max-width:720px) { .project-draft-form { grid-template-columns:1fr; } }
