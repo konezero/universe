@@ -18856,6 +18856,8 @@ refreshLawStrip = function () {
 }
 
 bindEvents();
+// Establish the home layout before slow data requests can outlast the splash.
+renderGoalPlan();
 window.addEventListener("beforeunload", closeAllProviderSessionStreams);
 
 let bootSplashCleared = false;
