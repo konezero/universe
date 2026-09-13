@@ -1,7 +1,14 @@
 # Universe UI — feature inventory & placement
 
-Where every action/feature lives in the new shell IA
-(`rag/universe-shell-ia-and-galaxy-view`). Status as of this session.
+Where every action/feature lives in the shell IA
+(`rag/universe-shell-ia-and-galaxy-view`). Product intent reconciled 2026-09-13.
+Historical implementation checkmarks below are dated observations, not proof
+that the current product satisfies the target.
+
+The current baseline is [shared human/LLM authoring and surface roles](universe-design-and-bench-flow.md#shared-human-and-llm-authoring):
+Fleet exposes goals, plans, existing nodes, detailed Todos and kanban;
+predictions are displayed only in Galaxy. All editable UI fields have both
+human and LLM input paths over the same objects and revisions.
 
 Shell regions:
 
@@ -21,14 +28,14 @@ Shell regions:
 
 | view | current | target | notes |
 |---|---|---|---|
-| **Fleet** | `showGoalPlanView` + board toggle | ✅ default home; kanban 6 lanes | `body.fleet-mode` strips Goal-Plan chrome |
-| **Galaxy** | `showGraphView("semantic")` → `buildUnifiedGalaxyGraph` | ✅ full-screen view mode | view switcher chips + Esc |
+| **Fleet** | `showGoalPlanView` + integrated project/node/Todo/kanban home | Goal/program description -> plan -> existing nodes -> detailed Todos -> kanban | Goal/plan presentation and complete node coverage remain gaps |
+| **Galaxy** | `showGraphView("semantic")` -> `buildUnifiedGalaxyGraph` | Graph and the sole prediction/future-path display | Existing prediction UI elsewhere must be aligned |
 | **Activity** | `showGraphView("timeline")` / inspector Activity tab | ⏳ needs its own centre view (immutable event log) | today it is a graph mode + an inspector tab |
 | **Docs** | `showGraphView("documents")` | ⏳ ok as a graph mode; could be a list/reader | |
 | **Memory** | inspector tab (`openInspectorSurface`) | ⏳ dedicated screen like Bench, OR keep as inspector | RAG memory list + candidates + batch stages |
 | **Bench** | ✅ dedicated centre screen (`showBenchScreen`) | ✅ done | |
 | **Rooms** | `openProviderSettings` (settings → rooms tab) | ⏳ own view — meeting/boss rooms are primary surfaces | currently buried in Settings |
-| **+ Project** | `openFreshProjectWizard` / `#fresh-project-dialog` | ⏳ keep as a wizard dialog, launched from the rail | see §4 |
+| **+ Project** | `openFreshProjectWizard` / `#fresh-project-dialog` | Shared draft in the upper work area with conversation available | Human, LLM, and direct-entry paths; see §4 |
 
 ## 2. Top bar
 
@@ -53,7 +60,7 @@ Shell regions:
 | `milestone-dialog` | goal card → add milestone | yes |
 | `todo-dialog` | Fleet card / `openTodoDialog` / `openPlanTodos` | yes — create/edit todo |
 | `project-dialog` | rail "+ Project" register, `openEditor` | yes — register existing project |
-| `fresh-project-dialog` | rail "+ Project" new, `openFreshProjectWizard` | yes — multi-step wizard (§4) |
+| `fresh-project-dialog` | current rail "+ Project" new | current implementation; target is the shared draft plus conversation (§4) |
 | `settings-dialog` | ⚙ | yes — tabbed (§5) |
 | `new-session-dialog` | context panel / conductor "New session" | yes — provider/model/effort |
 | `node-session-action-dialog` | session card → actions | yes — Use / Reconnect / Call Master / stop |
@@ -65,14 +72,23 @@ Shell regions:
 
 ## 4. Fresh-project flow ("+ Project")
 
-`openFreshProjectWizard` → `#fresh-project-dialog`, plus `openConductorFreshProjectDraft`
-(a Conductor-room path). Design intent: **Intent → Meeting Room → Expected Paths →
-adopt → Goals/Todos**. Placement:
+Current source uses `openFreshProjectWizard`, `#fresh-project-dialog`, and a
+Conductor draft path. The wizard asks for a route before composition. This is
+an implementation gap, not the intended universal creation flow.
 
-- Rail "+ Project" opens a small chooser: **Register existing** (`project-dialog`)
-  vs **New from intent** (`fresh-project-dialog` wizard).
-- The wizard's later stages (meeting, path adoption) belong in the **Rooms** view,
-  not a modal — the modal only captures the initial intent + project root.
+The target keeps the editable project draft visible in the upper work area and
+the LLM conversation available at the same time. A conversation request can open
+and populate the draft; manual entry can start or continue the same draft.
+Human edits are visible to the LLM, and LLM edits update the open UI. Goal,
+program description, cases, structure, capabilities, and validation planning
+are refined together rather than copied from chat into a separate form.
+
+- Existing-project connection remains available and reuses registered nodes.
+- A new project does not require prediction or Expected Path selection.
+- Relevant Bench/RAG cases may inform planning; forecast display remains in Galaxy.
+- Node creation supports manual entry, LLM operations, and Memory-derived proposals.
+- Rooms can support collaborative planning without requiring every project to
+  visit a Meeting Room or select a forecast before its first goal can exist.
 
 ## 5. Settings dialog — tabs
 
@@ -91,8 +107,9 @@ Board) + the conversation/terminal layer.
 
 - **Greeting + metrics**: move to the **Fleet** context panel or a small
   status strip — they are project-wide status, not chat.
-- **Ghost-actions**: redundant — Multiverse Map = Galaxy, Future = inspector tab,
-  Dispatch Board = Fleet. Drop them.
+- **Ghost-actions**: redundant — Multiverse Map and prediction/Future navigation
+  belong to Galaxy; Dispatch Board belongs to Fleet. Retire duplicate forecast
+  controls in the Inspector when aligning the UI.
 - **Conversation + terminal**: this is the terminal dock (§7).
 
 ## 7. Terminal dock

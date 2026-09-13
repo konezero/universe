@@ -6,6 +6,22 @@ Scope: project-local conversation, Memory, semantic graph, Feature Node planning
 
 ## Product outcome
 
+Product alignment — 2026-09-13:
+[the shared project/work model](universe-design-and-bench-flow.md#fleet-galaxy-and-node-entry)
+allows manual registration, LLM registration, and automatic Memory/brainstorming
+reflection into the same node system. None is the exclusive entry path.
+Automatic reflection materializes a traceable proposed node or an existing-node
+link, not merely text for the operator to retype. The existing adoption and
+execution boundaries below remain; proposal reflection is not silent adoption.
+`Feature` names the first software-domain implementation, not every industry's
+node type. Existing structural nodes do not need duplicate Feature registration
+in order to appear in Fleet.
+
+The Expected Path branch below is optional. Predictions are displayed only in
+Galaxy; normal project/goal/plan authoring proceeds in the shared UI and Fleet
+without first selecting a prediction. RAG automation supports both the
+Memory-to-node path and evidence-backed Galaxy forecasting.
+
 Universe turns ordinary Conductor conversation and accumulated project Memory into
 reviewable product direction without skipping the user's decision boundary:
 

@@ -1,7 +1,13 @@
 # Universe Design and Bench Flow
 
-Status: IMPLEMENTATION_DIRECTION
-Scope: Universe-side design, Bench, and project handoff contract
+Status: IMPLEMENTATION_DIRECTION — product intent reconciled 2026-09-13
+Scope: general-purpose project design, shared human/LLM work surfaces, Bench, and project handoff
+Decision source: operator conversation, 2026-09-13 (update documents first).
+
+The product-model and interaction sections below are the current design baseline
+for the linked UI, graph, Memory, and prediction documents. Implementation notes
+remain evidence of their stated date; this update does not implement a feature,
+change a live record, or grant execution authority.
 
 ## Purpose
 
@@ -122,27 +128,133 @@ into a bounded candidate. That candidate then requires its own provenance,
 redaction, approval, and queue receipt before Universe ingest or Career
 promotion.
 
-## Fresh Project Flow
+## General-purpose project and work model
 
-A Fresh Project starts with minimum user intent rather than a prescribed stack.
-The user supplies enough information to bound discovery: purpose, target users,
-problem, key constraints, and optional desired technologies.
+Coding is the first application domain, not the definition of Universe. Preserve
+[the general vision](universe-vision.md): Resource, Knowledge, Observation,
+Evidence, Decision, Prediction, Execution, and Outcome belong to the common model.
+Git, files, provider terminals, and software tests are domain-specific evidence
+and execution integrations.
+
+The project-facing work hierarchy is:
 
 ```text
-minimum intent
-  -> Universe Bench selection
-  -> bounded Context Pack
-  -> LLM proposal for specification, design, stack, and route
-  -> user adopts or changes meaningful choices
-  -> selected composition becomes the Project Seed
-  -> Project Master receives the implementation handoff
+Project description / purpose / final goal / completion conditions
+  -> Plan: cases, structure, capabilities, validation, dependencies, stages
+  -> Nodes: the subjects or responsibility units of that plan
+  -> Detailed Todos attached to their owning nodes
+  -> Kanban: a view of work lifecycle, not a second set of tasks
+  -> Results and evidence linked back to the plan and goal
 ```
 
-The proposed composition includes functional capabilities and acceptance
-conditions; design and UX direction; data, API, authentication, integration,
-test, release, and operating nodes; technology alternatives; document
-requirements; dependencies; branches; and completion conditions. A selected
-route is a design coordinate, not an execution assignment.
+This is a navigable relationship model, not a requirement to fill out a fixed
+form or finish every plan before any node can exist. Existing projects bring
+existing nodes and evidence. Project-wide planning and integration validation
+must remain representable before decomposition into node work. A node can
+exist without a Todo; that absence must not hide it from Fleet.
+
+| Common concept | Coding example | Other-domain example |
+|---|---|---|
+| Node | capability, component | process, equipment, research topic, experiment |
+| Plan | use cases, architecture, features, tests | scenarios, process design, methods, validation |
+| Evidence | source, test result | measurement, experiment, document, field observation |
+| Executor | coding agent, tool | person, domain tool, agent |
+| Completion condition | acceptance test | domain-specific quality or outcome criterion |
+
+Domain extensions must supply vocabulary, node types, validation rules, and
+execution integrations without replacing common identity, ownership, provenance,
+revision, and relationships. Software enums are the current implementation;
+a versioned domain-extension schema and migration are still design work. This
+reconciliation does not rename or reinterpret existing stored node types.
+
+## Shared human and LLM authoring
+
+All UI inputs must also be readable and writable by an LLM through supported
+application operations. A human can always enter and edit the same information.
+This applies to project creation, goals, plans, nodes, Todo details, and other
+editable application fields, not just a subset of creation buttons.
+
+A project draft stays visible in the upper work area while its conversation
+remains available. For example, saying "build a Universe harness desktop app"
+opens the creation surface and starts a shared draft; it does not require the
+operator to transcribe the conversation into a wizard.
+
+The LLM writes and revises the program description, goal, cases, structure,
+capabilities, and validation plan as the conversation develops. Human edits
+update that same draft and are available to the next LLM operation. Both paths
+use the same field semantics, validation, revision checks, and resulting objects.
+A stale LLM update must not overwrite a newer human edit silently. Changes must
+be visible in the open UI without a browser refresh.
+
+Draft writing and explicit consequential actions are separate operations.
+Existing confirmation and execution boundaries remain; ordinary field editing
+does not require an additional approval at every keystroke. A chat answer alone
+is not proof that a field was saved. Return the updated object/revision or a
+structured failure, and refresh the same draft in both input paths.
+
+## Fresh Project Flow
+
+```text
+minimal intent, expressed in conversation or entered directly
+  -> open the shared project draft above the conversation
+  -> human and LLM refine description, purpose, goal, scope, and completion criteria
+  -> compose cases / structure / capabilities / validation plan
+  -> connect existing nodes or create the needed nodes
+  -> attach detailed Todos and manage their lifecycle in Fleet
+```
+
+Relevant Seeds, Bench cases, and RAG evidence can inform that conversation.
+Reference retrieval and design alternatives are planning assistance; a future
+prediction is not a prerequisite for creating a project or composing its plan.
+Do not require a preselected stack or a predicted route before a draft can exist.
+A selected composition can become Project Seed material and support a Project
+Master handoff in the coding domain. Generic projects do not acquire a coding
+executor merely because they have a goal.
+
+## Fleet, Galaxy, and node entry
+
+- **Fleet** is the shared goal/plan/node/Todo work surface and its kanban view.
+  It must expose existing project nodes, their responsibilities, work details,
+  completion criteria, and result evidence. Do not restrict it to `FEATURE`
+  nodes or nodes that already own Todos. Knowledge documents and memories remain
+  linked evidence rather than indiscriminately becoming work cards.
+- **Galaxy** is the only display surface for predictions and possible future
+  paths. RAG automation supplies current observations, historical evidence,
+  relations, and outcomes for that purpose. Creating a project does not require
+  showing or choosing a prediction. A chosen prediction can later inform a plan;
+  Fleet shows the resulting work, not a duplicate forecast panel.
+- **Memory / brainstorming** supplies another route into nodes. A human can
+  register a node manually, an LLM can register one through the same application
+  operations, and automation can reflect relevant brainstorming into a new node
+  proposal or an evidence link to an existing node. Preserve provenance, project
+  ownership, deduplication, and the distinction between proposed and adopted.
+  Automatic reflection must not stop at chat text or require retyping. It also
+  must not silently adopt unrelated raw memory or start execution.
+
+The automatic path is specified in
+[Memory-to-Feature automation](memory-to-feature-automation.md). `Feature` is its
+current software implementation name, not the universal definition of a node.
+
+## Implementation reconciliation — 2026-09-13
+
+This table distinguishes observed source behavior from the target above. No
+runtime migration or product-completion claim is made by this document update.
+
+| Area | Current evidence | Remaining work |
+|---|---|---|
+| Fleet hierarchy | `renderIntegratedHome` renders project -> node -> Todo/detail -> kanban | Restore visible goal/program description and plan relationships; expose detailed work and evidence |
+| Existing nodes | `homeNodes` selects `FEATURE` or Todo-referenced graph nodes | Include the project's work-bearing structural/domain nodes even before Todo assignment |
+| Creation | `submitFreshProjectIntent` calls `/v1/future-paths` before route/composition selection | Shared conversation-driven draft; remove prediction selection as the creation prerequisite |
+| Human/LLM input | work-surface Action registry implements `feature.create`, `todo.create`, `todo.update` | Full input coverage, draft revision/conflict semantics, and live UI synchronization |
+| Memory -> node | proposal compiler and review/attachment paths exist | Validate automatic reflection end to end, preserving existing ownership and adoption boundaries |
+| Predictions | existing Work Loop Inspector and fresh-project route UI remain in source | Consolidate prediction display in Galaxy; keep planning references distinct |
+| Domain extension | graph helpers have software-focused kind/view lists | Specify extensible domain types, states, validation, and adapters; validate outside coding |
+
+Source references: `tools/universe_ui/app.js` (`renderIntegratedHome`, `homeNodes`,
+`renderHomeDetail`, `submitFreshProjectIntent`), `tools/universe_node_graph.py`,
+`tools/universe_action_registry.py`, and `tools/universe_app/feature_node_proposal.py`.
+The earlier source/API observations for universe and GCS establish that existing
+nodes are present; a missing Fleet card does not require duplicate registration.
 
 ## Bench and Context Pack
 

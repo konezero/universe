@@ -3,6 +3,22 @@
 Status: DECIDED 2026-09-07 (Codex MASTER review `msg_108348ba950aa385`,
 master-messages `master_msg_639d0cff` slices 1-2, `master_msg_742041f6` slice 3).
 
+## Product target versus current coverage — 2026-09-13
+
+[Shared human/LLM authoring](universe-design-and-bench-flow.md#shared-human-and-llm-authoring)
+is the product requirement: every UI input must be accessible to both the human
+and LLM over the same draft/object, validation, revision, and update semantics.
+This includes project description, goals, plans, node details, and Todo details.
+LLM updates must appear in the open UI, and subsequent LLM reads must include
+human edits. Stale writes must report a conflict instead of silently replacing
+newer edits. Direct manual input remains supported.
+
+The three implemented work-surface Actions below are partial coverage, not proof
+of that experience. Project/plan draft operations and synchronized form-state
+coverage are still to be specified and implemented. Existing specialized
+lifecycle/receipt routes remain applicable; this target does not declare every
+operation implemented on `/v1/actions` or bypass its underlying validation.
+
 ## What is on `POST /v1/actions`
 
 The typed Action front door carries **create / full-replace** work-surface

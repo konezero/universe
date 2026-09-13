@@ -4,6 +4,13 @@ Status: NORTH STAR
 Date: 2026-09-04
 Source: operator design memo.
 
+Product reconciliation, 2026-09-13:
+[general-purpose work model and shared authoring](universe-design-and-bench-flow.md#general-purpose-project-and-work-model)
+connect this vision to Fleet, Galaxy, and Memory. Fleet is the shared authored
+work surface; prediction display belongs only to Galaxy. Manual, LLM, and
+Memory-derived node entry coexist. Domain-specific schemas remain an extension
+task; the coding-domain implementation is not the definition of the Core.
+
 Universe is not a coding-only harness. Coding is the first experiment
 domain. The long-term target is a **general causal knowledge and work
 world** applicable across domains (research, design, social/economic
@@ -218,7 +225,7 @@ Knowledge, Observation, Evidence, Decision, Prediction, Execution, Outcome
 
 ## Relation to other design notes
 
-- `docs/unified-node-graph-model.md` — the typed-node graph is where
+- `docs/universe-unified-node-graph-model.md` — the typed-node graph is where
   Observation / Evidence / Cause / Condition relations live.
 - `docs/cooperative-contention-resolution-proposal.md` — how live sessions
   coordinate while working against the same resources.

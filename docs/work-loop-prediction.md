@@ -4,12 +4,24 @@ Universe exposes one project-scoped work-loop view that connects Goal/Plan evide
 
 ## Operator flow
 
-1. Select a project and open its Details inspector.
-2. In **Work Loop**, choose **Predict** to build a deterministic proposal from currently recorded evidence.
+Product placement corrected 2026-09-13: predictions and future paths are
+**displayed only in Galaxy**. This supersedes the previous Details Inspector
+placement. The existing source still contains Inspector prediction controls;
+UI migration is pending. Backend proposal/review/calibration semantics below
+remain implementation documentation.
+
+1. Select a project or node in **Galaxy**.
+2. Inspect or request predictions based on relevant recorded RAG evidence.
+   The current `Predict` operation builds a deterministic proposal; that fact
+   does not establish the full causal forecasting vision as implemented.
 3. Inspect every suggestion's kind, confidence, and provenance. Unsupported and low-confidence candidates remain visible as rejected inputs.
 4. Choose **Keep** or **Reject** for the proposal. Keeping is curation only: it does not create a Goal, Plan, Milestone, Todo, authority, or execution assignment.
 5. Choose **Recover** after an interrupted run to return only recovery-eligible `IN_PROGRESS` Todos to `READY`.
 6. Review each terminal Todo Result candidate independently for Goal/Plan, Experience, Memory, Bench, and Document Automation.
+
+Project creation and shared plan authoring do not require prediction selection.
+Fleet shows authored/adopted work and provenance, not prediction cards. Relevant
+case retrieval for planning is distinct from a forecast.
 
 Predictions never auto-adopt Goals or Todos. Document proposals also remain review-only and are never auto-applied.
 

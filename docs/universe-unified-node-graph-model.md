@@ -1,8 +1,13 @@
 # Universe Unified Node Graph Model (Phase 0 draft)
 
-Status: DRAFT — not committed, not a contract yet. Supersedes the split
-`functional-graph.v1` / `implementation-graph.v1` / `implementation-bindings.v1`
-seed model once accepted.
+Status: evolving design with partial implementation; product intent reconciled
+2026-09-13. The Phase 0 schema and migration notes below retain their historical
+status and are not a current completion inventory.
+
+Current product baseline:
+[General-purpose model and shared authoring](universe-design-and-bench-flow.md#general-purpose-project-and-work-model).
+Coding node kinds below describe the initial domain, not a closed universal set.
+Fleet displays work and planning; prediction display belongs only to Galaxy.
 
 Decision lineage:
 
@@ -35,16 +40,23 @@ planets — a ship is a Task Frame or session in motion toward its target node.
 Fly into a planet and you see its information: the local knowledge graph
 (documents, decisions, memories and their links) and its work board.
 
-**Nodes come from documents.** In the fresh-project flow the author writes the
-skeleton documents (project brief, goal, feature map, architecture, design, …);
-mapping a document to a node is that node's evidence. Automation (memory
-collection, link proposals, work planning) runs *on top of* the nodes — it
-never creates or redefines a structural node.
+**Nodes have shared identity and provenance across input paths.** A human may
+register or edit a node manually; an LLM may do so through the same application
+operations; Memory/brainstorming automation may materialize a proposed node or
+attach relevant evidence to an existing node. A source document is one evidence
+source, not the exclusive creation mechanism. Preserve project ownership,
+revisions, deduplication, and proposed/adopted state; do not create a duplicate
+node merely to make an existing node visible in Fleet.
+
+Descriptions and plans are coauthored in the visible UI and conversation. They
+can produce documents and nodes, with relationships retained in both directions.
+A node exists before its Todos. Fleet must include existing structural/domain
+nodes without requiring a Todo or a `FEATURE` conversion first.
 
 ```text
-author documents ─┐
+human entry / LLM coauthoring / Memory proposals
                   ├─► structural nodes (typed, evidence-backed, positioned)
-draw edges ───────┘        │
+documents / edges ┘        │
                            ├─► knowledge nodes connect in (DOCUMENT / DECISION / MEMORY)
                            ├─► Views: galaxy · functional · structural · flow · knowledge · kanban
                            ├─► Work Items attach (Goal / Milestone / TODO / Task Frame)
@@ -121,15 +133,17 @@ at the Surface zoom, not the Galaxy zoom.
 ### node.state
 
 - `ADOPTED` — a real node. Only adopted structural nodes accept Work Items.
-- `PROPOSED` — a candidate node from a Feature Node's Expected Path. Adopting an
-  Expected Path materialises its nodes as `ADOPTED`.
+- `PROPOSED` — a candidate from manual/LLM authoring, Memory brainstorming, or
+  an optional Expected Path. Preserve its source references. Existing adoption
+  operations determine when it becomes `ADOPTED`; an Expected Path is one route,
+  not the required origin of every node.
 
-**PROPOSED nodes are never deleted or hidden when a sibling Expected Path is
-adopted.** Showing the alternative future branches is the point — in the Galaxy
-they are the routes not yet taken. Each PROPOSED node carries
-`expected_path_ref`; the Feature Node records which path is `adopted`, and that
-never demotes the other proposals. An adopted PROPOSED node keeps its
-`expected_path_ref` for lineage.
+**Adopting one Expected Path does not delete or hide its sibling forecast
+branches in Galaxy.** View selection is separate from retaining candidate
+records. A node derived from an Expected Path carries `expected_path_ref`; its
+adoption retains that lineage. Manually authored or Memory-derived candidates
+use their own provenance and must not invent an Expected Path reference.
+The existing path-adoption state machine is not changed by this display rule.
 
 ### node.rollup (projection-computed, not authored)
 
@@ -177,6 +191,13 @@ Fresh-project living documents (seed-v2 `living_documents`) carry
 materialises / evidences the node.
 
 ## 4. Work Items and ships — attached, not nodes
+
+Project goal -> plan -> nodes -> detailed Todos is the primary authoring path.
+The Expected Path lineage below is an optional Galaxy prediction-adoption path,
+not a prerequisite for creating a project, a goal, or manually authored work.
+The existing owner-node rules describe the current node-work contract; the
+representation of project-wide planning before node decomposition remains an
+explicit schema task, not an implicit migration in this document.
 
 A Work Item hangs off exactly one `ADOPTED` node via `owner_node_ref`.
 
