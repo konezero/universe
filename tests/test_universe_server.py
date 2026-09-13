@@ -2215,6 +2215,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "source_path": str(rollout),
                 "source_kind": "CODEX_ROLLOUT_JSONL",
                 "source_version": "v1",
+                "project_id": "GCS",
             },
         )
         self.assertEqual(201, status)

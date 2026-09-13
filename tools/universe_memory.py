@@ -1180,6 +1180,39 @@ def normalize_memory_candidate(
         )
     raw_provenance = raw_provenance if isinstance(raw_provenance, Mapping) else {}
 
+    # Ownership is a routing assertion, not a free-form claim.  Preserve it
+    # only when the producer supplied the bounded fields; the Store validates
+    # the ids against its registered project catalog before treating them as
+    # authoritative.  Omitting these fields keeps legacy candidate digests
+    # stable until they are explicitly classified.
+    ownership_fields: dict[str, str] = {}
+    for field in ("origin_project_id", "owner_project_id"):
+        raw_owner = value.get(field, raw_provenance.get(field))
+        if raw_owner is None:
+            continue
+        if not isinstance(raw_owner, str) or not raw_owner.strip() or len(raw_owner.strip()) > 128:
+            raise MemoryError(
+                "MEMORY_CANDIDATE_OWNERSHIP_INVALID",
+                f"{field} must be a compact project identifier",
+            )
+        ownership_fields[field] = raw_owner.strip()
+    raw_ownership_state = value.get(
+        "ownership_state", raw_provenance.get("ownership_state")
+    )
+    if raw_ownership_state is not None:
+        if not isinstance(raw_ownership_state, str):
+            raise MemoryError(
+                "MEMORY_CANDIDATE_OWNERSHIP_INVALID",
+                "ownership_state must be a string",
+            )
+        ownership_state = raw_ownership_state.strip().upper()
+        if ownership_state not in {"ASSIGNED", "PROPOSED", "UNASSIGNED", "CONFLICTED"}:
+            raise MemoryError(
+                "MEMORY_CANDIDATE_OWNERSHIP_INVALID",
+                "ownership_state is invalid",
+            )
+        ownership_fields["ownership_state"] = ownership_state
+
     raw_range = value.get("source_range")
     if raw_range is None:
         raw_range = raw_provenance.get("source_range")
@@ -1227,15 +1260,19 @@ def normalize_memory_candidate(
         "end": end,
         "range_digest": _digest({"start": start, "end": end, "ref_digests": ref_digests}),
     }
-    source_session = _candidate_source_session_digest(
+    raw_source_session = value.get(
+        "source_session",
         value.get(
-            "source_session",
-            value.get(
-                "source_session_ref",
-                value.get("source_session_id", raw_provenance.get("source_session")),
-            ),
-        )
+            "source_session_ref",
+            value.get("source_session_id", raw_provenance.get("source_session")),
+        ),
     )
+    source_session = _candidate_source_session_digest(raw_source_session)
+    source_id = ""
+    source_ref = ""
+    if isinstance(raw_source_session, Mapping):
+        source_id = str(raw_source_session.get("source_id") or "").strip()
+        source_ref = str(raw_source_session.get("source_ref") or "").strip()
     relations = _normalize_candidate_relations(value.get("relations"))
     relevance = value.get("relevance")
     if relevance is None:
@@ -1266,6 +1303,11 @@ def normalize_memory_candidate(
         "ref_digests": ref_digests,
         "redaction": "SUMMARY_AND_DIGESTS_ONLY",
     }
+    if source_id:
+        provenance["source_id"] = source_id[:256]
+    if source_ref:
+        provenance["source_ref"] = source_ref[:512]
+    provenance.update(ownership_fields)
     material = {
         "project_id": normalized_project,
         "stage": normalized_stage,
@@ -1314,6 +1356,7 @@ def normalize_memory_candidate(
         "relations": relations,
         "relevance": {"repetition_count": repetition_count},
         "candidate_digest": candidate_digest,
+        **ownership_fields,
         **failure_fields,
         "authority": "NONE",
         "effects": {
@@ -1456,6 +1499,9 @@ def extract_memory_candidates_from_activity_batch(
         "provider_session_id": source.get("provider_session_id"),
         "source_id": source.get("source_id"),
     }
+    for field in ("origin_project_id", "owner_project_id", "ownership_state"):
+        if source.get(field) is not None:
+            source_session[field] = source[field]
     candidates: list[dict[str, Any]] = []
     allowed_events = {"TURN_COMPLETED", "ERROR", "QUOTA_STOP", "APPROVAL_WAIT"}
     for item in refs:
@@ -1475,8 +1521,7 @@ def extract_memory_candidates_from_activity_batch(
             )
         activity_state = str(item.get("activity_state") or "UNKNOWN").strip().upper()
         readable = event_kind.replace("_", " ").lower()
-        candidate = normalize_memory_candidate(
-            {
+        candidate_value = {
                 "project_id": project_id,
                 "stage": "FAST_EXTRACT",
                 "kind": "MEMORY",
@@ -1488,7 +1533,10 @@ def extract_memory_candidates_from_activity_batch(
                 ],
                 "relevance": {"repetition_count": 1},
             }
-        )
+        for field in ("origin_project_id", "owner_project_id", "ownership_state"):
+            if source.get(field) is not None:
+                candidate_value[field] = source[field]
+        candidate = normalize_memory_candidate(candidate_value)
         candidates.append(candidate)
     return sorted(candidates, key=lambda item: (item["provenance"]["source_range"]["start"], item["candidate_id"]))
 
@@ -1637,6 +1685,16 @@ def synthesize_memory_candidates(
     ]
     if not active:
         return []
+    # A prior implementation emitted only a count and a digest, for example
+    # "Idea candidate derived from 3 Memory candidates (...)".  That is not a
+    # knowledge claim and must never become a durable long-term candidate.
+    substantive = [
+        item
+        for item in active
+        if _has_substantive_synthesis_input(item.get("summary"))
+    ]
+    if not substantive:
+        return []
     normalized_kinds: list[str] = []
     for kind in kinds:
         normalized_kind = str(kind).strip().upper()
@@ -1647,9 +1705,21 @@ def synthesize_memory_candidates(
             )
         if normalized_kind not in normalized_kinds:
             normalized_kinds.append(normalized_kind)
-    source_ids = sorted(item["candidate_id"] for item in active)
+    source_ids = sorted(item["candidate_id"] for item in substantive)
     source_digest = _digest(source_ids)
-    ref_digests = sorted(item["candidate_digest"] for item in active)
+    ref_digests = sorted(item["candidate_digest"] for item in substantive)
+    source_summaries = []
+    for item in sorted(substantive, key=lambda candidate: candidate["candidate_id"]):
+        summary = " ".join(str(item.get("summary") or "").split())
+        if summary and summary not in source_summaries:
+            source_summaries.append(summary)
+    claim = " / ".join(source_summaries)[:1350]
+    shared_ownership = {
+        field: substantive[0][field]
+        for field in ("origin_project_id", "owner_project_id", "ownership_state")
+        if all(item.get(field) == substantive[0].get(field) for item in substantive)
+        and substantive[0].get(field) is not None
+    }
     result: list[dict[str, Any]] = []
     for kind in normalized_kinds:
         result.append(
@@ -1658,12 +1728,10 @@ def synthesize_memory_candidates(
                     "project_id": active[0]["project_id"],
                     "stage": "SYNTHESIZE",
                     "kind": kind,
-                    "summary": (
-                        f"{kind.title()} candidate derived from {len(active)} "
-                        f"Memory candidates ({source_digest[:16]})."
-                    ),
+                    "summary": f"{kind.title()} synthesis: {claim}",
                     "source_session": "UNIVERSE_MEMORY_SYNTHESIS",
                     "ref_digests": ref_digests,
+                    **shared_ownership,
                     "relations": [
                         {"relation": "DERIVED_FROM", "candidate_id": candidate_id}
                         for candidate_id in source_ids
@@ -1673,6 +1741,20 @@ def synthesize_memory_candidates(
             )
         )
     return result
+
+
+def _has_substantive_synthesis_input(value: Any) -> bool:
+    """Return false for bookkeeping-only derived-from summaries."""
+
+    summary = " ".join(str(value or "").split()).strip()
+    if not summary:
+        return False
+    lowered = summary.casefold()
+    if re.search(r"\bderived\s+from\s+\d+\s+memory\s+candidates?\b", lowered):
+        return False
+    if re.search(r"\b(?:idea|hypothesis|product)\s+candidate\s+derived\s+from\b", lowered):
+        return False
+    return bool(re.search(r"[A-Za-z0-9가-힣]", summary)) and len(summary) >= 3
 
 
 def independent_check_memory_candidates(

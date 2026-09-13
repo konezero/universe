@@ -103,6 +103,16 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _load_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        loaded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(loaded) if isinstance(loaded, Mapping) else {}
+
+
 def _redact_secrets_only(value: str) -> str:
     redacted = value.replace("\x00", " ")
     for pattern in SECRET_PATTERNS:
@@ -468,6 +478,10 @@ class ProviderSessionObserverStore:
                     last_seen_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    origin_project_id TEXT NOT NULL DEFAULT 'UNASSIGNED',
+                    owner_project_id TEXT NOT NULL DEFAULT 'UNASSIGNED',
+                    ownership_state TEXT NOT NULL DEFAULT 'UNASSIGNED',
+                    ownership_evidence_json TEXT NOT NULL DEFAULT '{}',
                     UNIQUE(provider, provider_session_id, source_path)
                 );
 
@@ -507,6 +521,22 @@ class ProviderSessionObserverStore:
                 if column not in columns:
                     connection.execute(
                         f"ALTER TABLE provider_session_activity ADD COLUMN {column} TEXT"
+                    )
+            source_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(provider_session_source)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("origin_project_id", "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
+                ("owner_project_id", "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
+                ("ownership_state", "TEXT NOT NULL DEFAULT 'UNASSIGNED'"),
+                ("ownership_evidence_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if column not in source_columns:
+                    connection.execute(
+                        f"ALTER TABLE provider_session_source ADD COLUMN {column} {definition}"
                     )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS provider_session_activity_turn "
@@ -559,6 +589,41 @@ class ProviderSessionObserverStore:
         source_id = str(value.get("source_id") or "source_" + uuid.uuid4().hex)
         provider_session_id = _identifier(value.get("provider_session_id"), "provider_session_id")
         source_version = _text(value.get("source_version", "v1"), "source_version")
+        origin_project_id = value.get("origin_project_id")
+        owner_project_id = value.get("owner_project_id")
+        for field, raw in (
+            ("origin_project_id", origin_project_id),
+            ("owner_project_id", owner_project_id),
+        ):
+            if raw is not None:
+                _identifier(raw, field)
+        ownership_state = str(
+            value.get(
+                "ownership_state",
+                "ASSIGNED" if owner_project_id else "UNASSIGNED",
+            )
+            or "UNASSIGNED"
+        ).strip().upper()
+        if ownership_state not in {"ASSIGNED", "PROPOSED", "UNASSIGNED", "CONFLICTED"}:
+            raise ProviderSessionObserverError(
+                "SOURCE_OWNERSHIP_INVALID", "ownership_state is invalid"
+            )
+        ownership_evidence = value.get("ownership_evidence")
+        if ownership_evidence is None:
+            ownership_evidence = {}
+        if not isinstance(ownership_evidence, Mapping):
+            raise ProviderSessionObserverError(
+                "SOURCE_OWNERSHIP_INVALID", "ownership_evidence must be an object"
+            )
+        ownership_evidence_json = _canonical_json(dict(ownership_evidence))
+        if len(ownership_evidence_json) > 16_384:
+            raise ProviderSessionObserverError(
+                "SOURCE_OWNERSHIP_INVALID", "ownership_evidence is too large"
+            )
+        origin_project_id = str(origin_project_id or "UNASSIGNED").strip()
+        owner_project_id = str(owner_project_id or "UNASSIGNED").strip()
+        if owner_project_id == "UNASSIGNED":
+            ownership_state = "UNASSIGNED" if ownership_state == "ASSIGNED" else ownership_state
         start_at_end = value.get("start_at_end") is True
         initial_offset = 0
         initial_identity = None
@@ -571,12 +636,80 @@ class ProviderSessionObserverStore:
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT source_id FROM provider_session_source
+                SELECT * FROM provider_session_source
                 WHERE provider = ? AND provider_session_id = ? AND source_path = ?
                 """,
                 (provider, provider_session_id, str(source_path)),
             ).fetchone()
             if existing is not None:
+                current_owner = str(existing["owner_project_id"] or "UNASSIGNED")
+                current_origin = str(existing["origin_project_id"] or "UNASSIGNED")
+                requested_ownership = any(
+                    key in value
+                    for key in (
+                        "origin_project_id",
+                        "owner_project_id",
+                        "ownership_state",
+                        "ownership_evidence",
+                    )
+                )
+                if requested_ownership:
+                    if (
+                        ownership_state == "CONFLICTED"
+                        and (current_owner != "UNASSIGNED" or current_origin != "UNASSIGNED")
+                    ) or (
+                        current_owner != "UNASSIGNED"
+                        and owner_project_id != "UNASSIGNED"
+                        and current_owner != owner_project_id
+                    ) or (
+                        current_origin != "UNASSIGNED"
+                        and origin_project_id != "UNASSIGNED"
+                        and current_origin != origin_project_id
+                    ):
+                        raise ProviderSessionObserverError(
+                            "SOURCE_OWNERSHIP_CONFLICT",
+                            "provider source ownership is already assigned to a different project",
+                        )
+                    if current_owner == "UNASSIGNED" and owner_project_id != "UNASSIGNED":
+                        connection.execute(
+                            """
+                            UPDATE provider_session_source
+                            SET origin_project_id = ?, owner_project_id = ?,
+                                ownership_state = ?, ownership_evidence_json = ?,
+                                updated_at = ?
+                            WHERE source_id = ?
+                            """,
+                            (
+                                origin_project_id,
+                                owner_project_id,
+                                ownership_state,
+                                ownership_evidence_json,
+                                now,
+                                existing["source_id"],
+                            ),
+                        )
+                    elif current_owner == "UNASSIGNED" and (
+                        origin_project_id != "UNASSIGNED"
+                        or owner_project_id != "UNASSIGNED"
+                        or ownership_state != "UNASSIGNED"
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE provider_session_source
+                            SET origin_project_id = ?, owner_project_id = ?,
+                                ownership_state = ?, ownership_evidence_json = ?,
+                                updated_at = ?
+                            WHERE source_id = ?
+                            """,
+                            (
+                                origin_project_id,
+                                owner_project_id,
+                                ownership_state,
+                                ownership_evidence_json,
+                                now,
+                                existing["source_id"],
+                            ),
+                        )
                 return self._source_row(
                     connection.execute(
                         "SELECT * FROM provider_session_source WHERE source_id = ?",
@@ -588,8 +721,9 @@ class ProviderSessionObserverStore:
                 INSERT INTO provider_session_source(
                     source_id, provider, provider_session_id, source_path, source_kind,
                     source_version, file_identity, cursor_offset, status,
-                    last_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_seen_at, created_at, updated_at, origin_project_id,
+                    owner_project_id, ownership_state, ownership_evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_id,
@@ -604,6 +738,10 @@ class ProviderSessionObserverStore:
                     now if start_at_end else None,
                     now,
                     now,
+                    origin_project_id,
+                    owner_project_id,
+                    ownership_state,
+                    ownership_evidence_json,
                 ),
             )
             row = connection.execute(
@@ -675,6 +813,16 @@ class ProviderSessionObserverStore:
                 "SELECT * FROM provider_session_source ORDER BY updated_at DESC, source_id"
             ).fetchall()
         return [self._source_row(row) for row in rows]
+
+    def inspect_source_metadata(self, provider: str, source_path: str | Path) -> dict[str, Any]:
+        """Read bounded identity/workspace metadata without storing transcript text."""
+
+        normalized_provider = _text(provider, "provider").upper()
+        if normalized_provider not in PROVIDERS:
+            raise ProviderSessionObserverError(
+                "SOURCE_PROVIDER_UNSUPPORTED", normalized_provider
+            )
+        return _bounded_session_metadata(normalized_provider, Path(source_path).expanduser())
 
     def scan_registered_sources(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -763,6 +911,9 @@ class ProviderSessionObserverStore:
                 "provider_session_id": source_view["provider_session_id"],
                 "source_id": source_id,
                 "cursor": source_view["cursor"],
+                "origin_project_id": source_view["origin_project_id"],
+                "owner_project_id": source_view["owner_project_id"],
+                "ownership_state": source_view["ownership_state"],
             },
             "activity_refs": [
                 {
@@ -1414,6 +1565,10 @@ class ProviderSessionObserverStore:
             "reason": row["reason"],
             "last_seen_at": row["last_seen_at"],
             "updated_at": row["updated_at"],
+            "origin_project_id": row["origin_project_id"],
+            "owner_project_id": row["owner_project_id"],
+            "ownership_state": row["ownership_state"],
+            "ownership_evidence": _load_json_object(row["ownership_evidence_json"]),
         }
 
     @staticmethod
@@ -1432,6 +1587,9 @@ class ProviderSessionObserverStore:
             "reason": row["reason"],
             "last_seen_at": row["last_seen_at"],
             "updated_at": row["updated_at"],
+            "origin_project_id": row["origin_project_id"],
+            "owner_project_id": row["owner_project_id"],
+            "ownership_state": row["ownership_state"],
         }
 
     @staticmethod
@@ -1447,6 +1605,9 @@ class ProviderSessionObserverStore:
             "reason",
             "last_seen_at",
             "updated_at",
+            "origin_project_id",
+            "owner_project_id",
+            "ownership_state",
         )
         return {key: row.get(key) for key in allowed}
 

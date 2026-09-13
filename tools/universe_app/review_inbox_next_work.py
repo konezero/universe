@@ -108,10 +108,20 @@ def _entry(
 
 
 def _memory_entries(
-    candidates: Sequence[Mapping[str, Any]], *, now: datetime
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime,
+    project_id: str | None = None,
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for candidate in candidates:
+        ownership = candidate.get("ownership")
+        if project_id is not None and isinstance(ownership, Mapping):
+            if (
+                str(ownership.get("ownership_state") or "").upper() != "ASSIGNED"
+                or str(ownership.get("owner_project_id") or "") != str(project_id)
+            ):
+                continue
         if candidate.get("source_review", {}).get("bucket") == "archive":
             continue
         state = str(candidate.get("state") or "").upper()
@@ -358,7 +368,7 @@ def build_review_inbox_next_work(
 
     clock = now or datetime.now(timezone.utc)
     entries = (
-        _memory_entries(memory_candidates, now=clock)
+        _memory_entries(memory_candidates, now=clock, project_id=project_id)
         + _prediction_entries(predictions, now=clock)
         + _result_entries(result_reviews, now=clock)
     )

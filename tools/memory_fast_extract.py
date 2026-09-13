@@ -176,7 +176,15 @@ def redact_activity_batch(value: Any) -> dict[str, Any]:
     source = value.get("source")
     if not isinstance(source, Mapping):
         raise FastExtractError("FAST_EXTRACT_ACTIVITY_INVALID", "source must be an object")
-    allowed_source = {"provider", "provider_session_id", "source_id", "cursor"}
+    allowed_source = {
+        "provider",
+        "provider_session_id",
+        "source_id",
+        "cursor",
+        "origin_project_id",
+        "owner_project_id",
+        "ownership_state",
+    }
     if set(source) - allowed_source:
         raise FastExtractError("FAST_EXTRACT_ACTIVITY_INVALID", "source has unsupported fields")
     provider = _text(source.get("provider"), "source.provider", maximum=32).upper()
@@ -204,6 +212,20 @@ def redact_activity_batch(value: Any) -> dict[str, Any]:
     }
     if cursor is not None:
         normalized_source["cursor"] = cursor
+    for field in ("origin_project_id", "owner_project_id"):
+        if source.get(field) is not None:
+            normalized = _text(source.get(field), f"source.{field}", maximum=128)
+            normalized_source[field] = normalized
+    if source.get("ownership_state") is not None:
+        ownership_state = _text(
+            source.get("ownership_state"), "source.ownership_state", maximum=32
+        ).upper()
+        if ownership_state not in {"ASSIGNED", "PROPOSED", "UNASSIGNED", "CONFLICTED"}:
+            raise FastExtractError(
+                "FAST_EXTRACT_OWNERSHIP_INVALID",
+                "source.ownership_state is invalid",
+            )
+        normalized_source["ownership_state"] = ownership_state
     material = {"source": normalized_source, "activity_refs": normalized_refs}
     return {
         "schema": "universe.provider-activity-batch-redacted.v1",
@@ -622,6 +644,11 @@ def normalize_provider_candidates(
             "relations": raw.get("relations") or [],
             "source_session": source_session,
         }
+        for field in ("origin_project_id", "owner_project_id"):
+            if source_session.get(field) is not None:
+                candidate[field] = source_session[field]
+        if source_session.get("ownership_state") is not None:
+            candidate["ownership_state"] = source_session["ownership_state"]
         try:
             normalized.append(normalize_memory_candidate(candidate))
         except MemoryError as error:

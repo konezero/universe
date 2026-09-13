@@ -18,7 +18,7 @@ def attest_current_fixture(store,candidate_id,status="CURRENT"):
     todo=None
     if status=="FUTURE":todo=store.create_todo({"scope_kind":"PROJECT","project_id":candidate["project_id"],"title":candidate["summary"][:160],"detail":"Fixture future work","state":"READY","priority":"P1","source_kind":"USER","sort_order":0})
     state=review.source_state(store,candidate["project_id"],fresh=True)
-    evidence=[{"evidence_id":"S1","kind":"IMPLEMENTATION","path":source.name,"lines":[1],"file_digest":state["file_digests"][source.name],"text":"ENABLED = True"}]
+    evidence=[{"evidence_id":"S1","kind":"IMPLEMENTATION","path":source.name,"root_project_id":candidate["project_id"],"root":str(root),"relative_path":source.name,"source_commit":state["head"],"lines":[1],"file_digest":state["file_digests"][source.name],"text":"ENABLED = True"}]
     if todo:evidence=[{"evidence_id":"S1","kind":"OPEN_TODO","todo_id":todo["todo_id"],"revision":todo["revision"],"text":todo["title"]}]
     return review.record(store,candidate,state,evidence,{"status":status,"reason":"Attested model-output fixture","evidence_ids":["S1"]},"fixture://verified-result")
 
@@ -73,6 +73,18 @@ class SourceReviewTests(unittest.TestCase):
         self.assertEqual("REVIEW_REQUIRED",candidate["state"])
         self.assertEqual(self.candidate["summary"],candidate["summary"])
         self.assertEqual(["IGNORE"],candidate["decision_contract"]["allowed_actions"])
+    def test_direct_review_preserves_history_and_noise_as_non_adoptable(self):
+        state=review.source_state(self.store,"TEST",fresh=True)
+        history=review.record(self.store,self.candidate,state,[review.candidate_metadata_evidence(self.candidate)],{"status":"PAST_HISTORY","reason":"Candidate records a completed historical event, not an open plan.","evidence_ids":["C0"]},"master-source-review:test-history",method="MASTER_DIRECT_SOURCE_COMPARISON")
+        self.assertEqual("PAST_HISTORY",history["source_review"]["status"])
+        self.assertEqual("archive",history["source_review"]["bucket"])
+        self.assertFalse(history["source_review"]["adopt_allowed"])
+        noise=self.store.create_memory_candidate("TEST",{"stage":"FAST_EXTRACT","summary":"memory-exact-codex-cli-response","ref_digests":["b"*64]})[0]
+        noise=self.store.get_memory_candidate(noise["candidate_id"])
+        noise_result=review.record(self.store,noise,state,[review.candidate_metadata_evidence(noise)],{"status":"NOISE","reason":"This is a one-shot protocol response with no durable project claim.","evidence_ids":["C0"]},"master-source-review:test-noise",method="MASTER_DIRECT_SOURCE_COMPARISON")
+        self.assertEqual("NOISE",noise_result["source_review"]["status"])
+        self.assertEqual("archive",noise_result["source_review"]["bucket"])
+        self.assertFalse(noise_result["source_review"]["adopt_allowed"])
     def test_missing_or_document_only_evidence_never_establishes_truth(self):
         state=review.source_state(self.store,"TEST",fresh=True);evidence=review.collect_evidence(self.candidate,state)
         for ids in [[],["S999"],[x["evidence_id"] for x in evidence if x["kind"]=="REFERENCE"]]:

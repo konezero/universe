@@ -52,7 +52,9 @@ class RagCollectionTests(unittest.TestCase):
         self.assertEqual(["old request","new answer"],[x["text"] for x in evidence])
     def test_large_activity_pages_cover_entire_redacted_text_and_reject_change(self):
         path=self.root/"rollout-large.jsonl";body="".join(str(i%10) for i in range(70001))
-        self.write(path,[self.event(body)]);sid=self.register(path);self.store.scan(sid)
+        self.write(path,[self.event(body)]);sid=self.register(path)
+        self.store.register_source(dict(provider="CODEX",provider_session_id="session",source_path=str(path),source_kind="CODEX_ROLLOUT_JSONL",origin_project_id="p",owner_project_id="p",ownership_state="ASSIGNED"))
+        self.store.scan(sid)
         position={}
         store=SimpleNamespace(list_provider_session_sources=self.store.list_sources,get_memory_source_position=lambda project:position,prepare_provider_activity_batch=self.store.build_batch_candidate,provider_session_observer=self.store)
         texts=[];saved=None

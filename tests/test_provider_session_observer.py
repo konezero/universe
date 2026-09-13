@@ -58,6 +58,18 @@ class ProviderSessionObserverTests(unittest.TestCase):
                    "content":[{"type":"output_text", "text":str(i) + " " + "x" * 200}]}} for i in range(600)]
         self.write(path, *events)
         source = self.register("CODEX", path)
+        source = self.store.register_source(
+            {
+                "provider": "CODEX",
+                "provider_session_id": "codex-session-1",
+                "source_path": str(path),
+                "source_kind": "CODEX_ROLLOUT_JSONL",
+                "source_version": "v1",
+                "origin_project_id": "p",
+                "owner_project_id": "p",
+                "ownership_state": "ASSIGNED",
+            }
+        )
         sid = source["source_id"]
         self.store.scan(sid)
         self.store.scan(sid)

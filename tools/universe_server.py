@@ -337,6 +337,15 @@ from universe_app.review_inbox_next_work import (
     RESULT_REVIEW_PAGE_LIMIT,
     build_review_inbox_next_work,
 )
+from universe_app.memory_ownership import (
+    MEMORY_OWNERSHIP_SCHEMA,
+    UNASSIGNED,
+    build_project_catalog,
+    candidate_owned_by,
+    classify_candidate_ownership,
+    resolve_registered_project,
+    resolve_source_ownership,
+)
 from runtime_state_trust_gate import is_active_ing_state
 from universe_file_index import (
     FileIndexError,
@@ -7214,6 +7223,39 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS memory_candidate_filter
                 ON memory_candidate(project_id, stage, kind, state, updated_at, candidate_id);
 
+                -- Ownership review is append-only and deliberately separate
+                -- from candidate/review/adoption history.  A reclassification
+                -- for a new candidate revision gets a new row; old evidence
+                -- is never overwritten.
+                CREATE TABLE IF NOT EXISTS memory_candidate_ownership (
+                    ownership_id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL
+                        REFERENCES memory_candidate(candidate_id)
+                        ON DELETE CASCADE,
+                    conversation_project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    candidate_digest TEXT NOT NULL,
+                    candidate_revision INTEGER NOT NULL CHECK(candidate_revision > 0),
+                    origin_project_id TEXT NOT NULL,
+                    proposed_owner_project_id TEXT NOT NULL,
+                    owner_project_id TEXT NOT NULL,
+                    ownership_state TEXT NOT NULL
+                        CHECK(ownership_state IN ('ASSIGNED', 'PROPOSED', 'UNASSIGNED', 'CONFLICTED')),
+                    judgment TEXT NOT NULL
+                        CHECK(judgment IN ('CURRENT', 'FUTURE', 'PAST_HISTORY', 'OUTDATED', 'INCORRECT', 'NOISE', 'UNVERIFIED')),
+                    reason TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(candidate_id, candidate_digest, candidate_revision)
+                );
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_ownership_owner
+                ON memory_candidate_ownership(owner_project_id, ownership_state, created_at);
+
+                CREATE INDEX IF NOT EXISTS memory_candidate_ownership_conversation
+                ON memory_candidate_ownership(conversation_project_id, created_at, candidate_id);
+
                 CREATE TABLE IF NOT EXISTS memory_candidate_relation (
                     relation_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL
@@ -10518,6 +10560,7 @@ class UniverseStore:
         self, value: Mapping[str, Any]
     ) -> dict[str, Any]:
         try:
+            source_value = dict(value)
             if not value.get("source_path") and value.get("source_key"):
                 provider = _required_text(value.get("provider"), "provider").upper()
                 candidates = self.provider_session_observer.discover_sources(provider)
@@ -10545,14 +10588,39 @@ class UniverseStore:
                         "provider metadata does not establish a session identity",
                         HTTPStatus.CONFLICT,
                     )
-                value = {
+                source_value = {
+                    **source_value,
                     "provider": match["provider"],
                     "provider_session_id": match["provider_session_id"],
                     "source_path": match["source_path"],
                     "source_kind": match["source_kind"],
                     "source_version": match["source_version"],
                 }
-            return self.provider_session_observer.register_source(value)
+            provider = _required_text(source_value.get("provider"), "provider").upper()
+            if not source_value.get("workspace") and source_value.get("source_path"):
+                metadata = self.provider_session_observer.inspect_source_metadata(
+                    provider, source_value["source_path"]
+                )
+                if metadata.get("workspace"):
+                    source_value["workspace"] = metadata["workspace"]
+            catalog = self._memory_ownership_catalog()
+            ownership = resolve_source_ownership(
+                source_value,
+                catalog,
+                project_id=source_value.get("project_id"),
+            )
+            source_value.update(
+                {
+                    key: ownership[key]
+                    for key in (
+                        "origin_project_id",
+                        "owner_project_id",
+                        "ownership_state",
+                        "ownership_evidence",
+                    )
+                }
+            )
+            return self.provider_session_observer.register_source(source_value)
         except ProviderSessionObserverError as error:
             raise UniverseError(error.code, error.detail) from error
 
@@ -10568,8 +10636,21 @@ class UniverseStore:
                 error.code, error.detail, HTTPStatus.NOT_FOUND
             ) from error
 
-    def list_provider_session_sources(self) -> list[dict[str, Any]]:
-        return self.provider_session_observer.list_sources()
+    def list_provider_session_sources(
+        self, project_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        sources = self.provider_session_observer.list_sources()
+        if project_id is None:
+            return sources
+        owner = resolve_registered_project(
+            project_id, self._memory_ownership_catalog()
+        ) or str(project_id)
+        return [
+            source
+            for source in sources
+            if str(source.get("ownership_state") or "").upper() == "ASSIGNED"
+            and str(source.get("owner_project_id") or "") == owner
+        ]
 
     def discover_provider_session_sources(self, provider: str) -> list[dict[str, Any]]:
         try:
@@ -10603,11 +10684,49 @@ class UniverseStore:
                 error.code, error.detail, HTTPStatus.NOT_FOUND
             ) from error
 
+    def require_provider_source_owner(
+        self, project_id: str, source_id: str
+    ) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        try:
+            source = next(
+                item
+                for item in self.provider_session_observer.list_sources()
+                if str(item.get("source_id") or "") == str(source_id)
+            )
+        except StopIteration as error:
+            raise UniverseError(
+                "SOURCE_NOT_FOUND", str(source_id), HTTPStatus.NOT_FOUND
+            ) from error
+        owner = str(source.get("owner_project_id") or UNASSIGNED)
+        state = str(source.get("ownership_state") or "UNASSIGNED").upper()
+        if state != "ASSIGNED" or owner != project["project_id"]:
+            raise UniverseError(
+                "MEMORY_SOURCE_OWNERSHIP_REQUIRED"
+                if state != "ASSIGNED"
+                else "MEMORY_SOURCE_OWNERSHIP_CONFLICT",
+                json.dumps(
+                    {
+                        "source_id": source_id,
+                        "project_id": project["project_id"],
+                        "owner_project_id": owner,
+                        "origin_project_id": source.get("origin_project_id") or UNASSIGNED,
+                        "ownership_state": state,
+                        "next_operation": "REGISTER_OR_ROUTE_SOURCE_OWNERSHIP",
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                HTTPStatus.CONFLICT,
+            )
+        return source
+
     def record_provider_activity_memory(
         self, project_id: str, source_id: str
     ) -> tuple[dict[str, Any], bool]:
         """Record an operator-selected redacted activity batch as project memory."""
         project = self.get_project(project_id)
+        self.require_provider_source_owner(project["project_id"], source_id)
         candidate = self.prepare_provider_activity_batch(source_id)
         if candidate["status"] != "REVIEW_REQUIRED":
             raise UniverseError(
@@ -11849,6 +11968,29 @@ class UniverseStore:
             ).fetchall()
         return [self._feature_row(row) for row in rows]
 
+    def list_owned_memory_candidates(
+        self, project_id: str, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return only candidates whose current ownership is assigned here.
+
+        The ordinary candidate listing remains an audit surface and therefore
+        includes unresolved rows. Review inboxes, retrieval, node proposals,
+        and graph projections use this narrower gate so a common-holding or
+        another project's candidate cannot become project work by accident.
+        """
+
+        project = self.get_project(project_id)
+        # Ownership can route a candidate collected in one conversation
+        # project to a different project.  Query the bounded global candidate
+        # surface before filtering; a project-scoped query would hide those
+        # valid cross-project assignments from their owner.
+        candidates = self.list_memory_candidates(None, limit=500)
+        return [
+            candidate
+            for candidate in candidates
+            if candidate_owned_by(candidate, project["project_id"])
+        ][: max(1, min(int(limit), 500))]
+
     @staticmethod
     def _feature_node_proposal_row(row: sqlite3.Row) -> dict[str, Any]:
         proposal = json.loads(row["proposal_json"])
@@ -11872,7 +12014,7 @@ class UniverseStore:
         proposals = build_feature_node_proposals(
             project_id=project["project_id"],
             memories=self.list_project_memories(project["project_id"], limit=200),
-            memory_candidates=self.list_memory_candidates(
+            memory_candidates=self.list_owned_memory_candidates(
                 project["project_id"], limit=200
             ),
             feature_nodes=self.list_feature_nodes(project["project_id"]),
@@ -19085,6 +19227,279 @@ class UniverseStore:
             candidate, evaluate_reopen=evaluate_reopen
         )
 
+    def _memory_ownership_catalog(self) -> dict[str, Any]:
+        return build_project_catalog(self.list_projects())
+
+    def _memory_candidate_ownership(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        candidate_digest = str(candidate.get("candidate_digest") or "")
+        try:
+            revision = int(candidate.get("revision") or 1)
+        except (TypeError, ValueError):
+            revision = 1
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM memory_candidate_ownership
+                WHERE candidate_id = ? AND candidate_digest = ?
+                  AND candidate_revision = ?
+                """,
+                (candidate_id, candidate_digest, revision),
+            ).fetchone()
+        if row is None:
+            projected = classify_candidate_ownership(
+                candidate, self._memory_ownership_catalog()
+            )
+            projected["persistence"] = "PROJECTED"
+            return projected
+        try:
+            evidence = json.loads(str(row["evidence_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = []
+        result = {
+            "schema": MEMORY_OWNERSHIP_SCHEMA,
+            "candidate_id": row["candidate_id"],
+            "candidate_digest": row["candidate_digest"],
+            "candidate_revision": int(row["candidate_revision"]),
+            "conversation_project_id": row["conversation_project_id"],
+            "origin_project_id": row["origin_project_id"],
+            "proposed_owner_project_id": row["proposed_owner_project_id"],
+            "owner_project_id": row["owner_project_id"],
+            "ownership_state": row["ownership_state"],
+            "judgment": row["judgment"],
+            "reason": row["reason"],
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "auto_adoption": False,
+            "ownership_id": row["ownership_id"],
+            "created_at": row["created_at"],
+            "persistence": "RECORDED",
+        }
+        return result
+
+    def _require_memory_candidate_owner(
+        self, candidate: Mapping[str, Any], project_id: str
+    ) -> dict[str, Any]:
+        ownership = candidate.get("ownership")
+        if not isinstance(ownership, Mapping):
+            ownership = self._memory_candidate_ownership(candidate)
+        owner = str(ownership.get("owner_project_id") or UNASSIGNED)
+        state = str(ownership.get("ownership_state") or "UNASSIGNED").upper()
+        if state != "ASSIGNED" or owner != str(project_id):
+            code = (
+                "MEMORY_CANDIDATE_OWNER_MISMATCH"
+                if state == "ASSIGNED" and owner != str(project_id)
+                else "MEMORY_CANDIDATE_OWNER_REVIEW_REQUIRED"
+            )
+            raise UniverseError(
+                code,
+                json.dumps(
+                    {
+                        "candidate_id": candidate.get("candidate_id"),
+                        "conversation_project_id": candidate.get("project_id"),
+                        "owner_project_id": owner,
+                        "ownership_state": state,
+                        "next_operation": "MEMORY_OWNERSHIP_REVIEW",
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                HTTPStatus.CONFLICT,
+            )
+        return dict(ownership)
+
+    def record_memory_candidate_ownership(
+        self, project_id: str, candidate_ids: Sequence[str] | None = None
+    ) -> dict[str, Any]:
+        """Classify one bounded project page without changing candidate state."""
+
+        project = self.get_project(project_id)
+        normalized_project = project["project_id"]
+        requested_ids: list[str] | None = None
+        if candidate_ids is not None:
+            if not isinstance(candidate_ids, list) or any(
+                not isinstance(item, str) or not item.strip() for item in candidate_ids
+            ):
+                raise UniverseError(
+                    "MEMORY_OWNERSHIP_REVIEW_INVALID",
+                    "candidate_ids must be an array of non-empty identifiers",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            requested_ids = list(dict.fromkeys(item.strip() for item in candidate_ids))
+            if len(requested_ids) > 200:
+                raise UniverseError(
+                    "MEMORY_OWNERSHIP_REVIEW_INVALID",
+                    "candidate_ids is limited to 200 items per review",
+                    HTTPStatus.BAD_REQUEST,
+                )
+        with self._connection() as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM memory_candidate WHERE project_id = ?",
+                    (normalized_project,),
+                ).fetchone()["count"]
+            )
+            if requested_ids is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM memory_candidate
+                    WHERE project_id = ?
+                    ORDER BY updated_at DESC, candidate_id DESC
+                    LIMIT 500
+                    """,
+                    (normalized_project,),
+                ).fetchall()
+            else:
+                rows = []
+                for candidate_id in requested_ids:
+                    row = connection.execute(
+                        "SELECT * FROM memory_candidate WHERE candidate_id = ?",
+                        (candidate_id,),
+                    ).fetchone()
+                    if row is None or row["project_id"] != normalized_project:
+                        raise UniverseError(
+                            "MEMORY_CANDIDATE_PROJECT_MISMATCH",
+                            "candidate_id does not belong to this project",
+                            HTTPStatus.CONFLICT,
+                        )
+                    rows.append(row)
+        candidates = [self._memory_candidate_row(row) for row in rows]
+        catalog = self._memory_ownership_catalog()
+        classifications: list[dict[str, Any]] = []
+        recorded_count = 0
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for candidate in candidates:
+                classification = classify_candidate_ownership(candidate, catalog)
+                existing = connection.execute(
+                    """
+                    SELECT ownership_id FROM memory_candidate_ownership
+                    WHERE candidate_id = ? AND candidate_digest = ?
+                      AND candidate_revision = ?
+                    """,
+                    (
+                        classification["candidate_id"],
+                        classification["candidate_digest"],
+                        classification["candidate_revision"],
+                    ),
+                ).fetchone()
+                if existing is None:
+                    ownership_id = "memory_ownership_" + _json_sha256(
+                        {
+                            "candidate_id": classification["candidate_id"],
+                            "candidate_digest": classification["candidate_digest"],
+                            "candidate_revision": classification["candidate_revision"],
+                        }
+                    )[:24]
+                    connection.execute(
+                        """
+                        INSERT INTO memory_candidate_ownership(
+                            ownership_id, candidate_id, conversation_project_id,
+                            candidate_digest, candidate_revision, origin_project_id,
+                            proposed_owner_project_id, owner_project_id,
+                            ownership_state, judgment, reason, evidence_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ownership_id,
+                            classification["candidate_id"],
+                            normalized_project,
+                            classification["candidate_digest"],
+                            classification["candidate_revision"],
+                            classification["origin_project_id"],
+                            classification["proposed_owner_project_id"],
+                            classification["owner_project_id"],
+                            classification["ownership_state"],
+                            classification["judgment"],
+                            classification["reason"],
+                            _canonical_json(classification["evidence"]),
+                            now,
+                        ),
+                    )
+                    classification["ownership_id"] = ownership_id
+                    classification["created_at"] = now
+                    classification["persistence"] = "RECORDED"
+                    recorded_count += 1
+                else:
+                    classification["ownership_id"] = existing["ownership_id"]
+                    classification["persistence"] = "RECORDED"
+                classifications.append(classification)
+        by_owner: dict[str, int] = {}
+        by_judgment: dict[str, int] = {}
+        by_state: dict[str, int] = {}
+        for item in classifications:
+            for bucket, key in (
+                (by_owner, str(item["proposed_owner_project_id"])),
+                (by_judgment, str(item["judgment"])),
+                (by_state, str(item["ownership_state"])),
+            ):
+                bucket[key] = bucket.get(key, 0) + 1
+        selected_count = len(classifications)
+        remaining = max(0, total - selected_count) if requested_ids is None else max(0, total - selected_count)
+        return {
+            "schema": MEMORY_OWNERSHIP_SCHEMA,
+            "status": "MEMORY_OWNERSHIP_CLASSIFICATION_COMPLETED"
+            if selected_count
+            else "MEMORY_OWNERSHIP_NO_CANDIDATES",
+            "project_id": normalized_project,
+            "total_candidates": total,
+            "reviewed_count": selected_count,
+            "recorded_count": recorded_count,
+            "remaining_count": remaining,
+            "limit": 500 if requested_ids is None else len(requested_ids),
+            "truncated": requested_ids is None and remaining > 0,
+            "counts": {
+                "by_proposed_owner": dict(sorted(by_owner.items())),
+                "by_judgment": dict(sorted(by_judgment.items())),
+                "by_ownership_state": dict(sorted(by_state.items())),
+            },
+            "candidates": classifications,
+            "source_preserved": True,
+            "effects": {
+                "candidate_state_changed": False,
+                "review_history_changed": False,
+                "adoption": "NONE",
+                "auto_adoption": False,
+            },
+            "next_operation": "PROJECT_MASTER_REVIEW_OR_ROUTE",
+        }
+
+    def list_memory_candidate_ownership(
+        self, project_id: str | None = None, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        normalized_project = _project_id(project_id) if project_id else None
+        if normalized_project:
+            normalized_project = resolve_registered_project(
+                normalized_project, self._memory_ownership_catalog()
+            ) or normalized_project
+            self.get_project(normalized_project)
+        output_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM memory_candidate
+                ORDER BY updated_at DESC, candidate_id DESC
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = self._memory_candidate_row(row)
+            ownership = candidate.get("ownership")
+            if not isinstance(ownership, Mapping):
+                ownership = self._memory_candidate_ownership(candidate)
+            if normalized_project and not (
+                candidate.get("project_id") == normalized_project
+                or ownership.get("owner_project_id") == normalized_project
+                or ownership.get("proposed_owner_project_id") == normalized_project
+            ):
+                continue
+            result.append(dict(ownership))
+            if len(result) >= output_limit:
+                break
+        return result
+
     def _attach_memory_candidate_decision_contract(
         self, candidate: dict[str, Any], *, evaluate_reopen: bool = False
     ) -> dict[str, Any]:
@@ -19116,7 +19531,9 @@ class UniverseStore:
             reopen_reason=reopen_reason,
         )
         from universe_app.memory_source_review import apply_contract
-        return apply_contract(self, candidate)
+        candidate = apply_contract(self, candidate)
+        candidate["ownership"] = self._memory_candidate_ownership(candidate)
+        return candidate
 
     def _memory_candidate_review_history(self, candidate_id: str) -> list[dict[str, Any]]:
         """Immutable REVIEWED/REOPENED event log, oldest first.
@@ -19246,6 +19663,9 @@ class UniverseStore:
                     "created_at": now,
                     "updated_at": now,
                 }
+                stored_candidate["ownership"] = classify_candidate_ownership(
+                    stored_candidate, self._memory_ownership_catalog()
+                )
                 stored.append(stored_candidate)
                 created_count += 1
             for candidate in stored:
@@ -19293,7 +19713,23 @@ class UniverseStore:
                 "FAILURE_KNOWLEDGE_REVIEW_REQUIRED",
                 "new failure knowledge must enter the existing candidate review path",
             )
-        candidates, created = self._insert_memory_candidates(project_id, [value])
+        project = self.get_project(project_id)
+        candidate_value = dict(value) if isinstance(value, Mapping) else value
+        if isinstance(candidate_value, dict) and not any(
+            key in candidate_value or key in (candidate_value.get("provenance") or {})
+            for key in ("origin_project_id", "owner_project_id", "ownership_state")
+        ):
+            # A project-scoped explicit create is an attested owner scope.  A
+            # provider batch, by contrast, calls _insert directly and keeps an
+            # unassigned source unassigned until its routing evidence is checked.
+            candidate_value.update(
+                {
+                    "origin_project_id": project["project_id"],
+                    "owner_project_id": project["project_id"],
+                    "ownership_state": "ASSIGNED",
+                }
+            )
+        candidates, created = self._insert_memory_candidates(project_id, [candidate_value])
         return candidates[0], bool(created)
 
     def list_memory_candidates(
@@ -19439,6 +19875,7 @@ class UniverseStore:
         if decision != "IGNORE":
             from universe_app.memory_source_review import require_eligible
             require_eligible(self, candidate, decision)
+            self._require_memory_candidate_owner(candidate, candidate["project_id"])
         now = utc_now()
         current_revision = int(candidate.get("revision") or 1)
         next_revision = current_revision + 1
@@ -19718,6 +20155,17 @@ class UniverseStore:
         next_action_kind = memory_candidate_next_action_kind(kind, state)
         if next_action_kind == "NONE":
             return {}
+        if state != "IGNORE":
+            try:
+                self._require_memory_candidate_owner(
+                    candidate, str(candidate.get("project_id") or "")
+                )
+            except UniverseError as error:
+                return {
+                    "ownership_review_required": True,
+                    "ownership_error_code": error.code,
+                    "next_operation": "MEMORY_OWNERSHIP_REVIEW",
+                }
         if next_action_kind == "ACKNOWLEDGED_NO_AUTOMATION":
             # KEEP on a non-MEMORY kind: acknowledged, no automation exists for it.
             return {"next_operation": "USER_REVIEW_ONLY"}
@@ -19809,6 +20257,7 @@ class UniverseStore:
                 "candidate must have an explicit KEEP review record before adoption",
                 HTTPStatus.CONFLICT,
             )
+        self._require_memory_candidate_owner(candidate, candidate["project_id"])
 
         origin_ref = (
             "universe://memory-candidates/"
@@ -22759,7 +23208,7 @@ class UniverseStore:
         review_candidates = self.list_work_loop_review_candidates(
             project["project_id"]
         )
-        memory_candidates = self.list_memory_candidates(
+        memory_candidates = self.list_owned_memory_candidates(
             project["project_id"], limit=MEMORY_CANDIDATE_PAGE_LIMIT
         )
         todos = [
@@ -23477,7 +23926,7 @@ class UniverseStore:
             )
             add_edge("PROJECT_HAS_BENCH_CANDIDATE", project_node, bench_node, f"universe://work-loop/review-candidates/{candidate_id}")
 
-        memory_candidates = self.list_memory_candidates(project_id, limit=200)
+        memory_candidates = self.list_owned_memory_candidates(project_id, limit=200)
         memory_candidate_nodes: dict[str, str] = {}
         for candidate in memory_candidates:
             candidate_id = str(candidate.get("candidate_id") or "")
@@ -36080,7 +36529,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return provider_name, provider_ref
 
     def _register_exact_provider_observer_source(
-        self, *, provider: str, provider_session_ref: str
+        self, *, provider: str, provider_session_ref: str,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         identity = self._provider_session_identity(provider, provider_session_ref)
         if not identity[0] or not identity[1]:
@@ -36112,7 +36562,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
         )
         registered = self.store.register_provider_session_source(
-            {**source, "start_at_end": True}
+            {**source, "start_at_end": True, "project_id": project_id}
         )
         if not str(registered.get("source_id") or "").strip():
             raise UniverseError(
@@ -36144,6 +36594,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and str(session.get("provider") or "").strip().upper()
             in {"CODEX", "CLAUDE", "GROK"}
         }
+        sessions_by_identity = {
+            self._provider_session_identity(
+                session.get("provider"), session.get("provider_session_ref")
+            ): session
+            for session in sessions
+            if session.get("provider_session_ref")
+        }
         source_ids: set[str] = set()
         observed_identities: set[tuple[str, str]] = set()
         for source in self.store.list_provider_session_sources():
@@ -36156,6 +36613,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 and source_id
                 and bool(source.get("enabled", True))
             ):
+                session = sessions_by_identity.get(identity)
+                if (
+                    session is not None
+                    and str(source.get("ownership_state") or "").upper() != "ASSIGNED"
+                ):
+                    try:
+                        source = self.store.register_provider_session_source(
+                            {
+                                **source,
+                                "project_id": session.get("project_id")
+                                or session.get("node"),
+                                "start_at_end": True,
+                            }
+                        )
+                    except UniverseError:
+                        # Keep the source observable for diagnostics; the
+                        # extraction gate will hold it until ownership is fixed.
+                        pass
                 source_ids.add(source_id)
                 observed_identities.add(identity)
         for provider in sorted({identity[0] for identity in bound_identities}):
@@ -36168,9 +36643,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     or identity not in bound_identities
                 ):
                     continue
-                registered = self.store.register_provider_session_source(
-                    {**source, "start_at_end": True}
-                )
+                session = sessions_by_identity.get(identity)
+                try:
+                    registered = self.store.register_provider_session_source(
+                        {
+                            **source,
+                            "project_id": (
+                                session.get("project_id") or session.get("node")
+                                if session is not None
+                                else None
+                            ),
+                            "start_at_end": True,
+                        }
+                    )
+                except UniverseError:
+                    # A source already assigned to another project remains
+                    # discoverable for diagnostics, but must not abort the
+                    # entire bounded tail sweep.
+                    continue
                 source_id = str(registered.get("source_id") or "").strip()
                 if source_id:
                     source_ids.add(source_id)
@@ -36185,13 +36675,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         ]
         for source_id in sorted(source_ids):
             scans.append(self.store.scan_provider_session_source(source_id))
-        sessions_by_identity = {
-            self._provider_session_identity(
-                session.get("provider"), session.get("provider_session_ref")
-            ): session
-            for session in sessions
-            if session.get("provider_session_ref")
-        }
         for scan in scans:
             source = scan.get("source") or {}
             identity = (
@@ -37033,6 +37516,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "FAST_EXTRACT_ACTIVITY_INVALID",
                     "source_ids must contain registered sources",
                 )
+            for source_id in source_ids:
+                self.store.require_provider_source_owner(project_id, str(source_id))
             raw_batches = [
                 self.store.prepare_provider_activity_batch(str(source_id))
                 for source_id in source_ids
@@ -39814,6 +40299,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 observer_source = self._register_exact_provider_observer_source(
                     provider=provider,
                     provider_session_ref=provider_session_ref,
+                    project_id=project_id,
                 )
             except UniverseError as error:
                 self.session_bus.release_instruction_claim(
@@ -42256,6 +42742,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        if path == "/v1/memory-candidate-ownership":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except (TypeError, ValueError):
+                limit = 200
+            try:
+                project_id = (query.get("project_id") or [None])[0]
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "MEMORY_CANDIDATE_OWNERSHIP_COLLECTED",
+                        "project_id": project_id,
+                        "ownership": self.server.store.list_memory_candidate_ownership(
+                            project_id, limit=limit
+                        ),
+                    },
+                )
+            except UniverseError as error:
+                self._send_error(error)
+            return
         if path in {"/v1/governance-proposals", "/v1/governance/proposals/pending"}:
             self._send(
                 HTTPStatus.OK,
@@ -43521,6 +44029,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if suffix == "/memory-ownership":
+                query_map = parse_qs(urlsplit(self.path).query)
+                try:
+                    limit = int((query_map.get("limit") or ["200"])[0])
+                except (TypeError, ValueError):
+                    limit = 200
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "PROJECT_MEMORY_OWNERSHIP_COLLECTED",
+                        "project_id": project_id,
+                        "ownership": self.server.store.list_memory_candidate_ownership(
+                            project_id, limit=limit
+                        ),
+                    },
+                )
+                return
             if suffix == "/skill-plan-proposals":
                 self._send(
                     HTTPStatus.OK,
@@ -43962,7 +44488,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         ):
             if not self._authorize_local_operator():
                 return
-        if re.fullmatch(r"/v1/projects/[^/]+/memory-source-review", path) and not self._authorize_local_operator():
+        if re.fullmatch(r"/v1/projects/[^/]+/memory-source-review(?:/direct)?", path) and not self._authorize_local_operator():
             return
         if path == "/v1/service/shutdown" and not self._authorize_service_control():
             return
@@ -45775,6 +46301,13 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 from universe_app.memory_source_review import review_project
                 self._send(HTTPStatus.OK, review_project(self.server, unquote(source_review.group(1)), ids))
                 return
+            source_review_direct = re.fullmatch(r"/v1/projects/([^/]+)/memory-source-review/direct", path)
+            if source_review_direct:
+                if not isinstance(body, Mapping):
+                    raise UniverseError("MEMORY_SOURCE_REVIEW_INVALID", "direct source review body must be an object", HTTPStatus.BAD_REQUEST)
+                from universe_app.memory_source_review import direct_review
+                self._send(HTTPStatus.OK, direct_review(self.server, unquote(source_review_direct.group(1)), dict(body)))
+                return
             source_scan = re.fullmatch(
                 r"/v1/session-observer/sources/([^/]+)/scan", path
             )
@@ -46903,6 +47436,30 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if parts is not None and parts[1] == "/memory-ownership-review":
+                request = _exact_object_fields(
+                    body,
+                    field="memory_ownership_review",
+                    required=frozenset(),
+                    optional=frozenset({"candidate_ids"}),
+                )
+                ids = request.get("candidate_ids")
+                if ids is not None and (
+                    not isinstance(ids, list)
+                    or any(not isinstance(item, str) for item in ids)
+                    or len(set(ids)) != len(ids)
+                    or len(ids) > 200
+                ):
+                    raise UniverseError(
+                        "MEMORY_OWNERSHIP_REVIEW_INVALID",
+                        "candidate_ids must contain at most 200 unique identifiers",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                result = self.server.store.record_memory_candidate_ownership(
+                    parts[0], ids
+                )
+                self._send(HTTPStatus.OK, result)
+                return
             if parts is not None and parts[1] == "/memory-candidates/review":
                 if not isinstance(body, Mapping):
                     raise UniverseError(
@@ -47567,6 +48124,8 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memory-batches/run",
             "/memory-batches/runs",
             "/memory-batch-config",
+            "/memory-ownership",
+            "/memory-ownership-review",
             "/memory-candidates/review",
             "/memory-candidates/reopen",
             "/memory-candidates",

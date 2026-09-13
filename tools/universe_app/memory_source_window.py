@@ -11,10 +11,46 @@ RECOVERABLE_SOURCE_ERRORS = {
 
 def select_source_window(store, project_id):
     inventory = store.list_provider_session_sources()
+    ownership_visible = any("ownership_state" in item for item in inventory)
+    active_sources = [
+        item
+        for item in inventory
+        if item.get("enabled", True) and item.get("status") == "ACTIVE"
+    ]
+    ownership_filtered_count = sum(
+        1
+        for item in active_sources
+        if ownership_visible
+        and not (
+            str(item.get("ownership_state") or "").upper() == "ASSIGNED"
+            and str(item.get("owner_project_id") or "") == str(project_id)
+        )
+    )
+    unassigned_count = sum(
+        1
+        for item in active_sources
+        if ownership_visible
+        and (
+            str(item.get("ownership_state") or "").upper() != "ASSIGNED"
+            or str(item.get("owner_project_id") or "") == "UNASSIGNED"
+        )
+    )
     source_ids = sorted({item["source_id"] for item in inventory
-                         if item.get("enabled", True) and item.get("status") == "ACTIVE"})
+                         if item.get("enabled", True) and item.get("status") == "ACTIVE"
+                         and (not ownership_visible or (
+                             str(item.get("ownership_state") or "").upper() == "ASSIGNED"
+                             and str(item.get("owner_project_id") or "") == str(project_id)
+                         ))})
     if not source_ids:
-        raise UniverseError("MEMORY_BATCH_SOURCES_UNAVAILABLE", "No active registered collection sources", 409)
+        detail = json.dumps(
+             {"active_count": len(active_sources),
+              "unassigned_count": unassigned_count,
+              "ownership_filtered_count": ownership_filtered_count,
+              "project_id": project_id},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        raise UniverseError("MEMORY_BATCH_SOURCES_UNAVAILABLE", detail, 409)
     position = store.get_memory_source_position(project_id)
     resume = position.get("selection", {}).get("activity_resume")
     next_id = position.get("next_source_id")
@@ -111,6 +147,9 @@ def select_source_window(store, project_id):
         "selected_source_ids": selected, "selected_count": len(selected),
         "skipped_count": skipped_count, "skipped": skipped,
         "deferred_count": len(source_ids) - len(selected) - skipped_count,
+         "ownership_filtered_count": ownership_filtered_count,
+         "unassigned_count": unassigned_count,
+        "ownership_project_id": project_id,
         "next_source_id": next_source_id,
         "activity_windows": windows,
         "activity_resume": pending_resume,
@@ -126,7 +165,7 @@ def apply_activity_window(batch, window):
     """Revalidate a Host-selected window; HTTP callers cannot provide windows."""
     source = batch.get("source") or {}
     expected = window["source"]
-    if any(source.get(key) != expected.get(key) for key in ("source_id", "provider", "provider_session_id")):
+    if any(source.get(key) != expected.get(key) for key in ("source_id", "provider", "provider_session_id", "origin_project_id", "owner_project_id", "ownership_state")):
         raise UniverseError("MEMORY_ACTIVITY_WINDOW_STALE", "Source identity changed after selection", 409)
     current = batch.get("activity_refs") or []
     refs = window["activity_refs"]

@@ -156,9 +156,20 @@ class MemoryBatchExecutionService:
                     batches = []
                     source_ids = request.get("source_ids")
                     if source_ids is None:
+                        inventory = self.store.list_provider_session_sources()
+                        ownership_visible = any(
+                            "ownership_state" in item for item in inventory
+                        )
                         source_ids = [
                             item["source_id"]
-                            for item in self.store.list_provider_session_sources()
+                            for item in inventory
+                            if not ownership_visible
+                            or (
+                                str(item.get("ownership_state") or "").upper()
+                                == "ASSIGNED"
+                                and str(item.get("owner_project_id") or "")
+                                == project["project_id"]
+                            )
                         ]
                     if not isinstance(source_ids, list):
                         raise UniverseError(

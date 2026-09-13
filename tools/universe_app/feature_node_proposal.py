@@ -56,6 +56,8 @@ def _source_entries(
     memories: Sequence[Mapping[str, Any]],
     memory_candidates: Sequence[Mapping[str, Any]],
     work_loop_predictions: Sequence[Mapping[str, Any]] = (),
+    *,
+    project_id: str | None = None,
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for memory in memories:
@@ -76,6 +78,13 @@ def _source_entries(
             }
         )
     for candidate in memory_candidates:
+        ownership = candidate.get("ownership")
+        if project_id is not None and isinstance(ownership, Mapping):
+            if (
+                str(ownership.get("ownership_state") or "").upper() != "ASSIGNED"
+                or str(ownership.get("owner_project_id") or "") != str(project_id)
+            ):
+                continue
         state = str(candidate.get("state") or "").upper()
         kind = str(candidate.get("kind") or "").upper()
         candidate_id = _text(candidate.get("candidate_id"))
@@ -201,7 +210,12 @@ def build_feature_node_proposals(
 ) -> list[dict[str, Any]]:
     """Build stable proposal records without mutating Feature, Goal, or Todo state."""
 
-    entries = _source_entries(memories, memory_candidates, work_loop_predictions)
+    entries = _source_entries(
+        memories,
+        memory_candidates,
+        work_loop_predictions,
+        project_id=project_id,
+    )
     proposals: list[dict[str, Any]] = []
     for members in _clusters(entries):
         evidence_refs = sorted(str(item["source_ref"]) for item in members)
