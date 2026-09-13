@@ -2917,13 +2917,17 @@ class SessionSupervisorStore:
             )
 
     def sweep_stale_live_sessions(
-        self, *, live_session_anchors: Mapping[str, Any] | None = None
+        self, *, live_session_anchors: Mapping[str, Any] | None = None,
+        inventory_complete: bool = True,
     ) -> dict[str, Any]:
         """Demote LIVE/STARTING sessions that have no living process.
 
         - OWNED lease + PID gone / PID reused / process exited → DISCONNECTED
-        - LIVE/STARTING with no lease or non-OWNED lease → DISCONNECTED
-          (cannot prove a live host process; avoids "zombie LIVE" in Observatory)
+        - No lease: demote only with an explicitly supplied PTY inventory.
+          None means this caller did not observe external Hosts; it is not
+          evidence that their processes disappeared. An empty mapping is a
+          successful observation of no live PTYs.
+        - Non-OWNED lease → DISCONNECTED unless an exact live PTY is observed.
 
         Does not kill processes. Uses the same PID+creation-time observer as
         lease recovery.
@@ -3006,6 +3010,14 @@ class SessionSupervisorStore:
                 ):
                     kept_live += 1
                     pty_kept_live += 1
+                    continue
+                if not inventory_complete:
+                    # A single hook's positive observation says nothing about
+                    # other Hosts. Never interpret it as a global inventory.
+                    unknown_probe += 1
+                    continue
+                if lease is None and live_session_anchors is None:
+                    unknown_probe += 1
                     continue
                 if lease is None or str(lease["lease_state"]) != "OWNED":
                     reason = (

@@ -1502,49 +1502,37 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual(b"", startup_input("GROK", "abc"))
         self.assertEqual(b"", startup_input("CLAUDE", ""))
 
-    def test_codex_bootstrap_submits_after_its_own_stream_tail_renders_prompt(self) -> None:
-        class BootstrapEchoPty(FakePty):
-            def __init__(self) -> None:
-                super().__init__()
-                self.pending = [b"\x1b[2JOpenAI Codex"]
-                self.alive = True
+    def test_bootstrap_uses_verified_prompt_submission_for_codex_and_grok(self) -> None:
+        for provider in ("CODEX", "GROK"):
+            for outcome in ("delivered", "stalled", "unknown"):
+                with self.subTest(provider=provider, outcome=outcome):
+                    session = TerminalSession(
+                        terminal_id="term-bootstrap", project_id="universe", mode="MASTER",
+                        provider=provider, supervisor_session_id="session-bootstrap",
+                        cwd=str(ROOT), executable="provider.exe", created_at="2026-09-13T00:00:00Z",
+                        state="LIVE", backend=FakePty(), bootstrap_input=startup_input(provider, ""))
+                    host = TerminalHost()
+                    with patch.object(host, "submit_prompt", return_value=outcome) as submit:
+                        host._submit_session_bootstrap(session)
+                    submit.assert_called_once_with("term-bootstrap", startup_input(provider, "")[:-1].decode(),
+                        audit_context={"source": "SUPERVISOR_SESSION_BOOTSTRAP"})
+                    self.assertEqual(outcome == "delivered", session.bootstrap_delivered)
 
-            def write(self, data: bytes) -> None:
-                super().write(data)
-                if data == b"\r":
-                    self.alive = False
-                else:
-                    self.pending.append(b"\x1b[12;1H" + data)
-
-            def read(self, timeout: float = 0.2) -> bytes:
-                del timeout
-                return self.pending.pop(0) if self.pending else b""
-
-            def is_alive(self) -> bool:
-                return self.alive
-
-        backend = BootstrapEchoPty()
-        session = TerminalSession(
-            terminal_id="term-codex-bootstrap",
-            project_id="universe",
-            mode="MASTER",
-            provider="CODEX",
-            supervisor_session_id="session-codex-bootstrap",
-            cwd=str(ROOT),
-            executable="codex.exe",
-            created_at="2026-09-08T00:00:00Z",
-            state="LIVE",
-            backend=backend,
-            bootstrap_input=startup_input("CODEX", ""),
-        )
-
-        TerminalHost()._pump_session(session)
-
-        prompt = startup_input("CODEX", "")[:-1]
-        self.assertEqual([prompt, b"\r"], backend.writes)
-        self.assertTrue(session.bootstrap_delivered)
-        self.assertTrue(codex_bootstrap_prompt_visible(b"\x1b[12;1H" + prompt))
-        self.assertFalse(codex_bootstrap_prompt_visible(b"OpenAI Codex"))
+    def test_grok_composer_echo_is_not_success_and_retry_does_not_duplicate(self) -> None:
+        session = TerminalSession(terminal_id="grok-composer", project_id="p", mode="MASTER",
+            provider="GROK", supervisor_session_id="s", cwd=str(ROOT), executable="grok.exe",
+            created_at="2026-09-13T00:00:00Z", state="LIVE", backend=FakePty())
+        session.screen_snapshot = "│ > instruction_ref: work-a claim queue │".encode()
+        host = TerminalHost()
+        with patch.object(host, "get", return_value=session), patch.object(host, "write") as sent, \
+             patch.object(host, "_wait_tui_composer_ready"), \
+             patch.object(host, "wait_prompt_delivery", return_value="delivered"):
+            result = host.submit_prompt(session.terminal_id, "instruction_ref: work-a claim queue")
+        self.assertEqual("stalled", result)
+        self.assertEqual(1, sent.call_count)
+        self.assertEqual(b"\r", sent.call_args.args[1])
+        session.screen_snapshot = "instruction_ref: work-a claim queue\n│ > │".encode()
+        self.assertFalse(host._prompt_composer_contains(session, "instruction_ref: work-a claim queue"))
 
     def test_fresh_claude_terminal_uses_a_new_session_id_without_resume(self) -> None:
         spawned: list[tuple] = []

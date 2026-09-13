@@ -25,6 +25,36 @@ class LiveSessionSweepTests(unittest.TestCase):
         self.store = None
         self.temp.cleanup()
 
+    def test_partial_hook_inventory_does_not_disconnect_other_live_masters(self) -> None:
+        sessions = [self.store.register_session({"node": "demo", "mode": "MASTER",
+            "provider": provider, "state": "LIVE", "currentness": "UNKNOWN"})[0]
+            for provider in ("CODEX", "CLAUDE", "GROK")]
+        observed = sessions[0]
+        sweep = self.store.sweep_stale_live_sessions(
+            live_session_anchors={observed["session_id"]: observed["session_anchor_ref"]},
+            inventory_complete=False)
+        self.assertEqual(0, sweep["demoted_count"])
+        for session in sessions:
+            self.assertEqual("LIVE", self.store.get_session(session["session_id"])["state"])
+
+    def test_wrong_provider_hook_cannot_rebind_stale_projection_of_live_host(self) -> None:
+        from universe_server import UniverseError
+        from unittest.mock import Mock
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            session, _ = self.store.register_session({"node": "demo", "mode": "MASTER",
+                "provider": provider, "state": "DISCONNECTED", "currentness": "UNKNOWN"})
+            host = Mock()
+            host.list_sessions.return_value = [{"supervisor_session_id": session["session_id"],
+                "provider": provider, "project_id": "demo", "mode": "MASTER", "state": "LIVE"}]
+            for wrong in {"CODEX", "CLAUDE", "GROK"} - {provider}:
+                with self.subTest(owner=provider, hook=wrong), self.assertRaises(UniverseError) as raised:
+                    perform_session_ref_inject(session_supervisor=self.store, multi_rooms=Mock(),
+                        terminal_host=host, environment={}, body={"provider": wrong,
+                            "provider_session_ref": "foreign", "project_id": "demo",
+                            "supervisor_session_id": session["session_id"]})
+                self.assertEqual("SESSION_HOOK_HOST_IDENTITY_MISMATCH", raised.exception.code)
+                self.assertEqual(provider, self.store.get_session(session["session_id"])["provider"])
+
     def test_live_without_lease_is_demoted(self) -> None:
         registered, created = self.store.register_session(
             {
@@ -40,7 +70,12 @@ class LiveSessionSweepTests(unittest.TestCase):
         )
         self.assertTrue(created)
         self.assertEqual("LIVE", registered["state"])
-        sweep = self.store.sweep_stale_live_sessions()
+        # A caller without a PTY inventory cannot declare another Host dead.
+        unobserved = self.store.sweep_stale_live_sessions()
+        self.assertEqual(0, unobserved["demoted_count"])
+        self.assertEqual(1, unobserved["unknown_probe_count"])
+        self.assertEqual("LIVE", self.store.get_session("session_test_nolease")["state"])
+        sweep = self.store.sweep_stale_live_sessions(live_session_anchors={})
         self.assertGreaterEqual(sweep["demoted_count"], 1)
         reasons = {item["session_id"]: item["reason"] for item in sweep["demoted"]}
         self.assertEqual("NO_PROCESS_LEASE", reasons["session_test_nolease"])
@@ -117,6 +152,11 @@ class LiveSessionSweepTests(unittest.TestCase):
                         "session_anchor_ref": anchor,
                     }
                 )
+
+            def list_sessions(self):
+                return [{"supervisor_session_id": registered["session_id"],
+                         "session_anchor_ref": anchor, "provider": "CLAUDE",
+                         "project_id": "universe", "mode": registered["mode"], "state": "LIVE"}]
 
             def record_managed_attach(self, terminal_id: str, _evidence):
                 return {"status": "MANAGED_SHELL_ATTACHED", "terminal_id": terminal_id}

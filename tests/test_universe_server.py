@@ -3683,7 +3683,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.server.terminal_host.submit_prompt.assert_called_once()
         submit_args = self.server.terminal_host.submit_prompt.call_args.args
-        self.assertEqual((terminal["terminal_id"], expected_body), submit_args)
+        self.assertEqual(terminal["terminal_id"], submit_args[0])
+        self.assertTrue(submit_args[1].startswith("universe_dispatch_ref: dispatch_"))
+        self.assertIn(expected_body, submit_args[1])
+        self.assertIn(f"/v1/session-bus/messages/{posted["message_id"]}/reply", submit_args[1])
+        self.assertIn("Session Bus reply transport for CODEX", submit_args[1])
+        deferred = self.server._project_observed_session_bus_terminal_result(
+            session={"session_anchor_ref": "session-anchor-rust-host-codex-001"},
+            activity={"activity_state": "COMPLETED", "event_kind": "TURN_COMPLETED",
+                      "observed_at": "9999-01-01T00:00:00Z"},
+            source_id="source-codex-native-001",
+        )
+        self.assertEqual("SESSION_BUS_RESULT_DEFERRED_TO_REPLY_CHANNEL", deferred["status"])
+        self.assertEqual("SESSION_BUS_HTTP", deferred["delivery_channel"])
         self.assertEqual("SESSION_BUS", self.server.terminal_host.submit_prompt.call_args.kwargs["audit_context"]["source"])
         self.server.terminal_host.write.assert_not_called()
         self.server.provider_sessions.submit_channel.assert_not_called()
@@ -18291,6 +18303,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
         # queue - the response now carries a claimable "message", not a
         # one-shot "dispatch" needing a manual Deliver click.
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        host = Mock()
+        host.list_sessions.return_value = [
+            {"terminal_id": "term-" + p, "session_anchor_ref": "anchor-" + p,
+             "project_id": "GCS", "provider": p, "mode": "MASTER", "state": "LIVE"}
+            for p in ("CLAUDE", "CODEX")]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        self.server._wake_live_master_sessions = Mock(return_value=0)
         status, result = self.request(
             "POST", "/v1/projects/GCS/discovery-dispatch", {}, self.token
         )
@@ -18318,15 +18338,49 @@ class UniverseLocalServiceTests(unittest.TestCase):
         claim_status, claimed = self.request(
             "POST",
             "/v1/projects/GCS/master-messages/claim",
-            {"provider": "CLAUDE"},
+            {"provider": "CLAUDE", "terminal_id": "term-CLAUDE", "session_anchor_ref": "anchor-CLAUDE"},
             self.token,
         )
         self.assertEqual(200, claim_status)
         self.assertEqual(message["message_id"], claimed["message"]["message_id"])
         self.assertEqual("PROCESSING", claimed["message"]["delivery_state"])
 
+    def test_master_message_bound_claim_rejects_wrong_owner_and_records_exact_anchor(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        created, _ = self.server.store.create_master_message("GCS", {
+            "idempotency_key": "bound-owner", "title": "Bound work", "instruction": "bounded fixture",
+        })
+        terminal = {"terminal_id": "term-owner", "session_anchor_ref": "anchor-owner",
+                    "project_id": "GCS", "provider": "CLAUDE", "mode": "MASTER", "state": "LIVE"}
+        host = Mock()
+        host.list_sessions.return_value = [terminal]
+        host.get.return_value = terminal
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        status, rejected = self.request("POST", "/v1/projects/GCS/master-messages/claim",
+                                        {"provider": "CLAUDE"}, self.token)
+        self.assertEqual(409, status)
+        self.assertEqual("MASTER_MESSAGE_OWNER_REQUIRED", rejected["error_code"])
+        request = {"provider": "CLAUDE", "terminal_id": "term-owner",
+                   "session_anchor_ref": "wrong-anchor", "message_id": created["message_id"]}
+        status, rejected = self.request("POST", "/v1/projects/GCS/master-messages/claim", request, self.token)
+        self.assertEqual(409, status)
+        self.assertEqual("MASTER_MESSAGE_OWNER_MISMATCH", rejected["error_code"])
+        request["session_anchor_ref"] = "anchor-owner"
+        status, accepted = self.request("POST", "/v1/projects/GCS/master-messages/claim", request, self.token)
+        self.assertEqual(200, status)
+        self.assertEqual("anchor-owner", accepted["message"]["owner_session_anchor_ref"])
+
     def test_master_message_queue_http_lifecycle(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        host = Mock()
+        host.list_sessions.return_value = [
+            {"terminal_id": "term-" + p, "session_anchor_ref": "anchor-" + p,
+             "project_id": "GCS", "provider": p, "mode": "MASTER", "state": "LIVE"}
+            for p in ("CLAUDE", "CODEX")]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        self.server._wake_live_master_sessions = Mock(return_value=0)
         create_status, created = self.request(
             "POST",
             "/v1/projects/GCS/master-messages",
@@ -18367,7 +18421,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         claim_status, claimed = self.request(
             "POST",
             "/v1/projects/GCS/master-messages/claim",
-            {"provider": "CLAUDE"},
+            {"provider": "CLAUDE", "terminal_id": "term-CLAUDE", "session_anchor_ref": "anchor-CLAUDE"},
             self.token,
         )
         self.assertEqual(200, claim_status)
@@ -18378,7 +18432,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         empty_claim_status, empty_claim = self.request(
             "POST",
             "/v1/projects/GCS/master-messages/claim",
-            {"provider": "CODEX"},
+            {"provider": "CODEX", "terminal_id": "term-CODEX", "session_anchor_ref": "anchor-CODEX"},
             self.token,
         )
         self.assertEqual(200, empty_claim_status)
@@ -18429,6 +18483,14 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
     def test_master_message_renew_lease_route(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        host = Mock()
+        host.list_sessions.return_value = [
+            {"terminal_id": "term-" + p, "session_anchor_ref": "anchor-" + p,
+             "project_id": "GCS", "provider": p, "mode": "MASTER", "state": "LIVE"}
+            for p in ("CLAUDE", "CODEX")]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        self.server._wake_live_master_sessions = Mock(return_value=0)
         self.request(
             "POST",
             "/v1/projects/GCS/master-messages",
@@ -18442,7 +18504,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         _, claimed = self.request(
             "POST",
             "/v1/projects/GCS/master-messages/claim",
-            {"provider": "CLAUDE"},
+            {"provider": "CLAUDE", "terminal_id": "term-CLAUDE", "session_anchor_ref": "anchor-CLAUDE"},
             self.token,
         )
         message_id = claimed["message"]["message_id"]
@@ -18728,7 +18790,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(2, woken)
-        self.assertEqual({"term-a", "term-b"}, {tid for tid, _ in emitted})
+        # Actionable notifications are delivered through the provider adapter,
+        # not forged as display-only terminal output. Durable inboxes below
+        # prove that both peers were notified.
+        self.assertEqual([], emitted)
         for terminal_id in ("term-a", "term-b"):
             inbox = self.server.session_bus.inbox(fake_host, terminal_id=terminal_id)
             messages = inbox.get("messages") or inbox.get("inbox") or []

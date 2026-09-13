@@ -869,6 +869,14 @@ class SessionBus:
         tid = _text(terminal_id, "terminal_id", required=True, limit=80)
         requested_message_id = _text(message_id, "message_id", limit=80)
         with self._lock:
+            # Reconnect, hook, and periodic recovery may race. Reserve the
+            # recipient turn under the same lock as the message claim.
+            if any(str(item.get("recipient_anchor_ref") or item.get("session_anchor_ref") or "") == anchor
+                   and item.get("kind") in ACTIONABLE_KINDS
+                   and item.get("delivery_state") in {"CLAIMED", "DISPATCHED"}
+                   and item.get("lifecycle_state") in {"ACCEPTED", "STARTED"}
+                   for item in self._messages.values()):
+                return None
             candidate_ids = (
                 [requested_message_id]
                 if requested_message_id

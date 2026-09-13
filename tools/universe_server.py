@@ -21674,6 +21674,8 @@ class UniverseStore:
         project_id: str,
         *,
         provider: str,
+        session_anchor_ref: str = "",
+        message_id: str = "",
         lease_ttl_seconds: int = MASTER_MESSAGE_LEASE_TTL_SECONDS,
     ) -> dict[str, Any] | None:
         """Claim the oldest QUEUED item for this project, safe under any
@@ -21702,10 +21704,11 @@ class UniverseStore:
                 FROM project_master_message
                 WHERE project_id = ?
                   AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                  AND (? = '' OR message_id = ?)
                 ORDER BY created_at, rowid
                 LIMIT 8
                 """,
-                (project["project_id"],),
+                (project["project_id"], message_id, message_id),
             ).fetchall()
         for row in candidates:
             claimed = self._transition_master_message(
@@ -21714,6 +21717,7 @@ class UniverseStore:
                 delivery_state="PROCESSING",
                 updates={
                     "provider": provider,
+                    "owner_session_anchor_ref": session_anchor_ref,
                     "started_at": utc_now(),
                     "lease_expires_at": utc_after(lease_ttl_seconds),
                 },
@@ -21759,7 +21763,9 @@ class UniverseStore:
             if project_id is None:
                 rows = connection.execute(
                     """
-                    SELECT message_id,
+                    SELECT message_id, project_id,
+                           json_extract(message_json, '$.owner_session_anchor_ref') AS owner_anchor,
+                           json_extract(message_json, '$.provider') AS provider,
                            json_extract(message_json, '$.lease_expires_at') AS lease
                     FROM project_master_message
                     WHERE json_extract(message_json, '$.delivery_state') = 'PROCESSING'
@@ -21770,7 +21776,9 @@ class UniverseStore:
             else:
                 rows = connection.execute(
                     """
-                    SELECT message_id,
+                    SELECT message_id, project_id,
+                           json_extract(message_json, '$.owner_session_anchor_ref') AS owner_anchor,
+                           json_extract(message_json, '$.provider') AS provider,
                            json_extract(message_json, '$.lease_expires_at') AS lease
                     FROM project_master_message
                     WHERE project_id = ?
@@ -21781,12 +21789,32 @@ class UniverseStore:
                 ).fetchall()
         reclaimed: list[str] = []
         for row in rows:
+            owner_anchor = str(row["owner_anchor"] or "")
+            if owner_anchor:
+                # A bound Master keeps ownership while its exact session is
+                # live, including a long tool call or a user-input wait. The
+                # Supervisor owns liveness; activity rank is irrelevant.
+                with self._connection() as connection:
+                    owner = connection.execute(
+                        "SELECT 1 FROM session_record WHERE session_anchor_ref = ? "
+                        "AND node = ? AND provider = ? AND mode = 'MASTER' AND state = 'LIVE' LIMIT 1",
+                        (owner_anchor, row["project_id"], row["provider"]),
+                    ).fetchone()
+                if owner is not None:
+                    self._transition_master_message(
+                        row["message_id"], expected_states={"PROCESSING"},
+                        delivery_state="PROCESSING",
+                        updates={"lease_expires_at": utc_after(MASTER_MESSAGE_LEASE_TTL_SECONDS)},
+                        required=False, field_equals=("lease_expires_at", row["lease"]),
+                    )
+                    continue
             transitioned = self._transition_master_message(
                 row["message_id"],
                 expected_states={"PROCESSING"},
                 delivery_state="QUEUED",
                 updates={
                     "provider": None,
+                    "owner_session_anchor_ref": None,
                     "started_at": None,
                     "lease_expires_at": None,
                     "reclaimed_at": now,
@@ -28326,7 +28354,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self.enqueue_conductor_message(message_id)
         for delegation_id in self.store.recover_conductor_delegations():
             self.enqueue_conductor_delegation(delegation_id)
-        self._session_bus_recovery_last_run = self.run_session_bus_recovery_once()
+        # Bind/listen before attempting provider delivery; startup recovery
+        # must not hold service readiness behind a stalled provider.
+        self._session_bus_recovery_last_run = {"status": "RECOVERY_SCHEDULED"}
+        self._session_bus_recovery_worker = threading.Thread(
+            target=self._session_bus_recovery_loop,
+            name="universe-session-bus-recovery", daemon=True,
+        )
+        self._session_bus_recovery_worker.start()
+
+    def _session_bus_recovery_loop(self) -> None:
+        # Provider discovery, idle saves and resident reconciliation can block
+        # for minutes. Queue transport must make progress independently.
+        while not self._supervisor_maintenance_stop.wait(5.0):
+            try:
+                self.run_session_bus_recovery_once()
+            except Exception as error:
+                self._session_bus_recovery_last_run = {
+                    "status": "RECOVERY_FAILED", "error_code": type(error).__name__,
+                    "detail": str(error), "observed_at": utc_now(),
+                }
 
     def _is_current_live_pty_session(self, session: Mapping[str, Any]) -> bool:
         """Verify currentness through the Mode Anchor and exact live PTY join."""
@@ -28905,7 +28952,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         )
         results["provider_activity"] = self.tail_bound_provider_sessions()
-        results["session_bus_recovery"] = self.run_session_bus_recovery_once()
+        results["session_bus_recovery"] = self._session_bus_recovery_last_run
         results["conductor_operating_loop"] = self.run_conductor_operating_loop_once()
         reconcile_runtime = getattr(self.conductor_runtime, "reconcile", None)
         if callable(reconcile_runtime):
@@ -33041,7 +33088,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "edges": sorted(edges.values(), key=lambda item: item["id"]),
         }
 
-    def _live_pty_session_anchors(self) -> dict[str, str]:
+    def _live_pty_session_anchors(self) -> dict[str, str] | None:
         """Return only exact live PTY-to-Session-Anchor bindings.
 
         PTY liveness may restore Supervisor host state, but it never selects a
@@ -33051,7 +33098,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         try:
             terminals = self._session_anchor_terminal_host().list_sessions()
         except TerminalHostError:
-            return {}
+            return None
         bindings: dict[str, str] = {}
         for terminal in terminals:
             if str(terminal.get("state") or "").upper() != "LIVE":
@@ -34846,13 +34893,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                     if not isinstance(session, Mapping):
                         continue
-                    if str(session.get("currentness") or "CURRENT").upper() == "CURRENT":
-                        selected = (terminal, session)
-                        break
+                    # Activity recency elects a display/default session, not a
+                    # consumer of an exact-addressed instruction. Every live
+                    # bound Master may claim work, including UNKNOWN/STALE peers.
+                    selected = (terminal, session)
+                    break
                 posted_message_id = str(message.get("message_id") or "").strip()
                 if selected is None:
                     unavailable = {
-                        "status": "CURRENT_TERMINAL_UNAVAILABLE",
+                        "status": "BOUND_TERMINAL_UNAVAILABLE",
                         "message_id": posted_message_id,
                     }
                     dispatches.append(unavailable)
@@ -34860,7 +34909,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     continue
                 terminal, session = selected
                 if (str(terminal.get("provider") or "").upper() != str(session.get("provider") or "").upper()
-                    or (target_anchor and str(session.get("session_anchor_ref") or "") != target_anchor)):
+                    or str(terminal.get("mode") or "").upper() != str(session.get("mode") or "").upper()
+                    or (session.get("node") and str(terminal.get("project_id") or "") != str(session["node"]))
+                    or (target_map.get("project_id") and str(terminal.get("project_id") or "") != str(target_map["project_id"]))
+                    or (target_map.get("mode") and str(terminal.get("mode") or "").upper() != str(target_map["mode"]).upper())
+                    or (target_anchor and str(session.get("session_anchor_ref") or "") != target_anchor)
+                    or (str(terminal.get("active_session_anchor_ref") or terminal.get("session_anchor_ref") or "")
+                        and str(terminal.get("active_session_anchor_ref") or terminal.get("session_anchor_ref")) != str(session.get("session_anchor_ref") or ""))):
                     mismatch = {"status": "SESSION_IDENTITY_MISMATCH", "error_code": "SESSION_IDENTITY_MISMATCH",
                                 "detail": "Live terminal and Supervisor provider/anchor disagree; reconcile exact Host binding before retry",
                                 "message_id": posted_message_id}
@@ -35113,7 +35168,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     notify="HEADER",
                     body=(
                         f"Master queue has work waiting ({reason}). Claim it: "
-                        f"POST /v1/projects/{project_id}/master-messages/claim."
+                        f"POST /v1/projects/{project_id}/master-messages/claim with JSON "
+                        + json.dumps({"provider": terminal.get("provider"),
+                                      "terminal_id": terminal.get("terminal_id"),
+                                      "session_anchor_ref": terminal.get("session_anchor_ref")})
+                        + ". Keep these exact owner coordinates on the claim."
                     ),
                 )
             except SessionBusError:
@@ -39757,6 +39816,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     body_text = (f"universe_dispatch_ref: {bus_dispatch_ref}\n"
                                  f"instruction_ref: session-bus:{message_id}\n"
                                  f"{delivery['body_text']}")
+                body_text += (
+                    f"\n[Session Bus reply transport for {provider}] "
+                    "Use the Universe Session Bus HTTP API, not Claude-only universe_channel MCP tools. "
+                    f"After finishing, POST /v1/session-bus/messages/{message_id}/reply with JSON "
+                    + json.dumps({"terminal_id": terminal_id, "session_anchor_ref": session_anchor_ref,
+                                  "body_text": "<actual result summary>", "outcome": "COMPLETED"})
+                    + ". Use outcome FAILED with the real error if blocked. Resolve the current Universe endpoint "
+                    "and authentication from .ai/skills/common/resolve_universe_endpoint.py "
+                    "(installed Runtime endpoint resolver); never print credentials."
+                )
                 submit_prompt = getattr(self.terminal_host, "submit_prompt", None)
                 if not callable(submit_prompt):
                     raise TerminalHostError(
@@ -39794,6 +39863,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     session_anchor_ref=session_anchor_ref,
                     observer_source_id=str(observer_source["source_id"]),
                     bus_dispatch_ref=bus_dispatch_ref,
+                    delivery_channel="SESSION_BUS_HTTP",
                 )
             except (SessionBusError, TerminalHostError, UnicodeError) as error:
                 self.session_bus.release_instruction_claim(
@@ -41861,6 +41931,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 lambda: self._goal_scheduler_worker.join(timeout=5),
             )
         self._supervisor_maintenance_stop.set()
+        recovery_worker = getattr(self, "_session_bus_recovery_worker", None)
+        if recovery_worker is not None and recovery_worker.is_alive():
+            close_step("session_bus_recovery_worker", lambda: recovery_worker.join(timeout=5))
         if self._supervisor_maintenance_worker.is_alive():
             close_step(
                 "supervisor_maintenance_worker",
@@ -46333,8 +46406,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 return
             if parts is not None and parts[1] == "/master-messages/claim":
                 provider = _required_text((body or {}).get("provider"), "provider")
+                owner_anchor = str((body or {}).get("session_anchor_ref") or "").strip()
+                if not owner_anchor:
+                    raise UniverseError("MASTER_MESSAGE_OWNER_REQUIRED",
+                        "claim requires terminal_id and session_anchor_ref from the receiving Master session", 409)
+                if owner_anchor:
+                    owner_tid = _required_text((body or {}).get("terminal_id"), "terminal_id")
+                    owners = match_live_terminals(
+                        self.server._session_anchor_terminal_host(),
+                        project_id=parts[0], mode="MASTER", provider=provider,
+                    )
+                    if not any(str(item.get("terminal_id") or "") == owner_tid
+                               and str(item.get("session_anchor_ref") or "") == owner_anchor
+                               for item in owners):
+                        raise UniverseError("MASTER_MESSAGE_OWNER_MISMATCH",
+                                            "claim owner must match the live project Master binding", 409)
                 claimed = self.server.store.claim_master_message(
-                    parts[0], provider=provider
+                    parts[0], provider=provider, session_anchor_ref=owner_anchor,
+                    message_id=str((body or {}).get("message_id") or "").strip(),
                 )
                 self._send(
                     HTTPStatus.OK,
@@ -48611,6 +48700,23 @@ def perform_session_ref_inject(
             provider_session_ref=normalized_ref,
         )
     )
+    # Validate against the live Host before registration can mutate a stale
+    # Supervisor row. Inherited child-session coordinates must not rebind a
+    # live Codex terminal as Claude/Grok, even if its projection was stale.
+    if terminal_host is not None and explicit_session_id:
+        observed_terminals = terminal_host.list_sessions()
+        if isinstance(observed_terminals, (list, tuple)):
+            for observed_terminal in observed_terminals:
+                if not isinstance(observed_terminal, Mapping):
+                    continue
+                if (str(observed_terminal.get("state") or "").upper() != "LIVE"
+                        or str(observed_terminal.get("supervisor_session_id") or "") != explicit_session_id):
+                    continue
+                if (str(observed_terminal.get("provider") or "").upper() != normalized_provider
+                        or str(observed_terminal.get("project_id") or "") != normalized_node
+                        or str(observed_terminal.get("mode") or "").upper() != normalized_mode):
+                    raise UniverseError("SESSION_HOOK_HOST_IDENTITY_MISMATCH",
+                        "hook provider/project/mode differs from the exact live terminal", 409)
     # A provider may not expose its own conversation id until after the first
     # interactive turn.  A SessionStart hook still identifies the durable
     # Supervisor session, so retain its current provider ref instead of
@@ -48819,7 +48925,8 @@ def perform_session_ref_inject(
         session_supervisor.sweep_stale_live_sessions(
             live_session_anchors={
                 effective_session_id: str(session.get("session_anchor_ref") or "")
-            }
+            },
+            inventory_complete=False,
         )
         session = session_supervisor.get_session(effective_session_id)
     return {
@@ -49621,6 +49728,15 @@ def main() -> int:
             return 0
 
         if args.command == "serve":
+            from universe_service_control import ServiceInstanceLock
+            # Acquire before hydration or provider IO. Keep the OS-owned lock
+            # for this process lifetime; a crash releases it automatically.
+            try:
+                service_instance_lock = ServiceInstanceLock(args.database)
+            except RuntimeError as error:
+                raise UniverseError("UNIVERSE_SERVICE_ALREADY_RUNNING", str(error), 409) from error
+            import atexit
+            atexit.register(service_instance_lock.close)
             # Strip AI-session markers from this process so PTY children
             # don't inherit them and show "transcript saving is off" warnings.
             for _env_key in (

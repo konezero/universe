@@ -594,7 +594,7 @@ class SupervisedTerminalHost:
                     elif isinstance(observed, Mapping) and observed.get("status") in {"ACCEPTED", "DUPLICATE"}:
                         on_result(dict(observed))
                         return
-                    time.sleep(0.2)
+                    time.sleep(1.0)
             threading.Thread(
                 target=poll_result,
                 name=f"universe-channel-result-{terminal_id}",

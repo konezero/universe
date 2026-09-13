@@ -67,9 +67,24 @@ def _session_lookup() -> tuple[str, str] | None:
 
 
 def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] | None:
+    # ACK/final-result writes are idempotent by message and exact payload at
+    # the Host. Retry transient connection failures without duplicating work.
+    # Poll consumes an event, so it must never be transparently replayed here.
+    for attempt in range(3):
+        result = _post_once(path, payload, token)
+        if (path != CHANNEL_RESULT_PATH or not isinstance(result, Mapping)
+                or result.get("error_code") not in {"CHANNEL_TCP_REQUEST_FAILED", "CHANNEL_HTTP_REQUEST_FAILED"}
+                or attempt == 2):
+            return result
+        time.sleep(0.25 * (attempt + 1))
+    return result
+
+
+def _post_once(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] | None:
     endpoint = _ENDPOINT
     if endpoint is None or not token:
-        return None
+        return {"status": "ERROR", "error_code": "CHANNEL_CONNECTION_UNINITIALIZED",
+                "operation": path, "detail": "Channel endpoint or session token is unavailable"}
     if endpoint.startswith("tcp://"):
         actions = {
             CHANNEL_EXCHANGE_PATH: "channel_exchange",
@@ -99,13 +114,18 @@ def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] |
                     if len(response) > 128 * 1024:
                         return None
             decoded = json.loads(response.split(b"\n", 1)[0])
-        except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-            return None
+        except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as error:
+            return {"status": "ERROR", "error_code": "CHANNEL_TCP_REQUEST_FAILED",
+                    "operation": action, "endpoint": endpoint,
+                    "detail": f"{type(error).__name__}: {error}"}
         if isinstance(decoded, Mapping) and decoded.get("status") == "ERROR":
             return {"status": "ERROR", "error_code": decoded.get("error_code"),
                     "detail": decoded.get("detail"), "operation": action}
         channel = decoded.get("channel") if isinstance(decoded, Mapping) else None
-        return dict(channel) if isinstance(channel, Mapping) else None
+        return dict(channel) if isinstance(channel, Mapping) else {
+            "status": "ERROR", "error_code": "CHANNEL_RESPONSE_INVALID",
+            "operation": action, "endpoint": endpoint,
+            "detail": "Host response does not contain a channel result"}
     body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint}{path}",
@@ -129,8 +149,10 @@ def _post(path: str, payload: Mapping[str, Any], token: str) -> dict[str, Any] |
         return {"status": "ERROR", "http_status": error.code, "operation": path,
                 "error_code": detail.get("error_code") or detail.get("error") or "CHANNEL_HTTP_ERROR",
                 "detail": detail.get("detail") or detail.get("reason") or "Channel request rejected"}
-    except (urllib.error.URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError):
-        return None
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError) as error:
+        return {"status": "ERROR", "error_code": "CHANNEL_HTTP_REQUEST_FAILED",
+                "operation": path, "endpoint": endpoint,
+                "detail": f"{type(error).__name__}: {error}"}
     return dict(decoded) if isinstance(decoded, Mapping) else None
 
 
@@ -176,7 +198,7 @@ def _emit_channel(event: Mapping[str, Any]) -> None:
 
 
 def _poll_loop() -> None:
-    while not _STOP.wait(0.05):
+    while not _STOP.wait(0.5):
         token = _SESSION_TOKEN
         if not token:
             time.sleep(0.1)
@@ -200,6 +222,14 @@ def handle_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
     global _POLL_THREAD
     method = message.get("method")
     message_id = message.get("id")
+    provider = str(os.environ.get("UNIVERSE_PROVIDER") or "CLAUDE").upper()
+    if provider != "CLAUDE" and method in {"tools/list", "tools/call"}:
+        result = {"tools": []} if method == "tools/list" else {
+            "isError": True,
+            "content": [{"type": "text", "text": "Use the Universe Session Bus HTTP reply route; this MCP channel is Claude-only."}],
+            "structuredContent": {"status": "ERROR", "error_code": "CHANNEL_PROVIDER_UNSUPPORTED"},
+        }
+        return {"jsonrpc": "2.0", "id": message_id, "result": result}
     if method == "initialize":
         register()
         result = {
@@ -301,7 +331,10 @@ def handle_message(message: Mapping[str, Any]) -> dict[str, Any] | None:
                 "transport": "CLAUDE_CODE_CHANNEL",
                 "connection": "CONNECTED" if _SESSION_TOKEN else "PENDING",
                 "delivery": "INBOUND_CHANNEL_EVENTS",
-                "writable": False,
+                "writable": bool(_SESSION_TOKEN),
+                "reply_supported": bool(_SESSION_TOKEN),
+                "ack_supported": bool(_SESSION_TOKEN and _ACK_SUPPORTED),
+                "write_scope": "RESULTS_FOR_RECEIVED_MESSAGES_ONLY",
             }
             result = {
                 "content": [

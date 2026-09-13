@@ -2503,6 +2503,22 @@ class TerminalHost:
                     return
             time.sleep(0.025)
 
+    @staticmethod
+    def _prompt_composer_contains(session: TerminalSession, text: str) -> bool:
+        """Inspect only the active input area, never the earlier transcript."""
+        plain = _ANSI_ESCAPE_RE.sub(b"", bytes(session.screen_snapshot or b"")).decode("utf-8", "replace")
+        lines = plain.splitlines()
+        provider = str(session.provider).upper()
+        starts = [i for i, line in enumerate(lines)
+                  if (provider == "CODEX" and line.lstrip().startswith("›"))
+                  or (provider == "GROK" and re.search(r"[│┃]\s*>", line))]
+        if not starts:
+            return False
+        composer = "".join(lines[starts[-1]:])
+        compact = re.sub(r"[\s│┃]", "", composer)
+        expected = re.sub(r"\s", "", text)[:80]
+        return bool(expected and expected in compact)
+
     def submit_prompt(
         self,
         terminal_id: str,
@@ -2520,12 +2536,16 @@ class TerminalHost:
             else agent_prompt_paste_bytes(text)
         )
         baseline_output_sequence = session.output_cursor
-        self.write(
-            terminal_id,
-            payload,
-            audit_context=audit_context,
-            prompt_submit=False,
-        )
+        # A retry may find its previous paste still in the composer. Submit
+        # those bytes again; never concatenate another copy of the instruction.
+        already_composed = self._prompt_composer_contains(session, text)
+        if not already_composed:
+            self.write(
+                terminal_id,
+                payload,
+                audit_context=audit_context,
+                prompt_submit=False,
+            )
         settle_seconds = agent_prompt_settle_seconds(len(payload))
         if provider in {"CODEX", "GROK"}:
             self._wait_tui_composer_ready(
@@ -2541,7 +2561,13 @@ class TerminalHost:
             audit_context=audit_context,
             prompt_submit=True,
         )
-        return self.wait_prompt_delivery(terminal_id)
+        result = self.wait_prompt_delivery(terminal_id)
+        # Echo/cursor repaint can advance output without submitting the input.
+        # A prompt still present in the active composer is not delivery evidence.
+        if result == AGENT_PROMPT_DELIVERED and self._prompt_composer_contains(session, text):
+            session.prompt_delivery = AGENT_PROMPT_STALLED
+            return AGENT_PROMPT_STALLED
+        return result
 
 
     @classmethod
@@ -2995,6 +3021,27 @@ class TerminalHost:
             session.pump_thread = thread
         thread.start()
 
+    def _submit_session_bootstrap(self, session: TerminalSession) -> None:
+        """Use the same composer-settle and effect verification as bus turns."""
+        status = "unknown"
+        detail = ""
+        try:
+            status = self.submit_prompt(
+                session.terminal_id,
+                session.bootstrap_input.rstrip(b"\r").decode("utf-8"),
+                audit_context={"source": "SUPERVISOR_SESSION_BOOTSTRAP"},
+            )
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"
+        session.bootstrap_delivered = status == "delivered"
+        self.record_audit_event(
+            "SESSION_BOOTSTRAP_DELIVERY",
+            terminal=session.public(),
+            context={"source": "SUPERVISOR_SESSION_BOOTSTRAP"},
+            details={"status": status, "detail": detail,
+                     "content_persisted": False},
+        )
+
     def _pump_session(self, session: TerminalSession) -> None:
         # --dangerously-load-development-channels gates the MCP channel server
         # behind an interactive "Yes, I am using this for local development"
@@ -3023,8 +3070,7 @@ class TerminalHost:
             session.bootstrap_input and not session.bootstrap_delivered
         )
         bootstrap_tail = b""
-        awaiting_codex_bootstrap_submit = False
-        codex_bootstrap_submit_tail = b""
+        next_idle_liveness_probe = 0.0
         next_managed_sample = time.time() + self._managed_sample_interval
         while not session.pump_stop.is_set() and session.state == "LIVE":
             backend = session.backend
@@ -3059,66 +3105,24 @@ class TerminalHost:
                 self._mark_backend_exit(session, str(error))
                 break
             if not chunk:
-                if self._backend_is_alive(backend) is False:
-                    self._mark_backend_exit(session)
-                    break
+                if now >= next_idle_liveness_probe:
+                    next_idle_liveness_probe = now + 1.0
+                    if self._backend_is_alive(backend) is False:
+                        self._mark_backend_exit(session)
+                        break
                 continue
             if awaiting_bootstrap:
-                bootstrap_tail += chunk
-                if provider_cli_ready_for_bootstrap(
-                    session.provider, bootstrap_tail
-                ):
-                    is_codex = str(session.provider or "").strip().upper() == "CODEX"
-                    bootstrap_input = session.bootstrap_input
-                    prompt_input = (
-                        bootstrap_input[:-1]
-                        if is_codex and bootstrap_input.endswith(b"\r")
-                        else bootstrap_input
-                    )
-                    try:
-                        backend.write(prompt_input)
-                    except Exception:  # noqa: BLE001 - lifecycle retry remains active
-                        pass
-                    else:
-                        awaiting_bootstrap = False
-                        awaiting_codex_bootstrap_submit = is_codex
-                        session.bootstrap_delivered = not is_codex
-                        self.record_audit_event(
-                            "SESSION_BOOTSTRAP_INPUT_WRITTEN",
-                            terminal=session.public(),
-                            context={
-                                "source": "SUPERVISOR_SESSION_BOOTSTRAP",
-                                "access_surface": "SUPERVISOR",
-                            },
-                            details={
-                                "byte_count": len(prompt_input),
-                                "content_persisted": False,
-                                "submit_deferred_to_stream_tail": is_codex,
-                            },
-                        )
-                elif len(bootstrap_tail) > 16384:
-                    bootstrap_tail = bootstrap_tail[-8192:]
-            if awaiting_codex_bootstrap_submit:
-                codex_bootstrap_submit_tail = (
-                    codex_bootstrap_submit_tail + chunk
-                )[-16384:]
-                if codex_bootstrap_prompt_visible(codex_bootstrap_submit_tail):
-                    try:
-                        backend.write(b"\r")
-                    except Exception:  # noqa: BLE001 - retry on the next PTY chunk
-                        pass
-                    else:
-                        awaiting_codex_bootstrap_submit = False
-                        session.bootstrap_delivered = True
-                        self.record_audit_event(
-                            "INPUT_CONTROL_WRITTEN",
-                            terminal=session.public(),
-                            context={
-                                "source": "SUPERVISOR_SESSION_BOOTSTRAP_TAIL",
-                                "access_surface": "SUPERVISOR",
-                            },
-                            details=_input_control_metadata(b"\r"),
-                        )
+                bootstrap_tail = (bootstrap_tail + chunk)[-16384:]
+                if provider_cli_ready_for_bootstrap(session.provider, bootstrap_tail):
+                    awaiting_bootstrap = False
+                    # Keep the output pump running while the common submitter
+                    # waits for composer commit and verifies the resulting turn.
+                    threading.Thread(
+                        target=self._submit_session_bootstrap,
+                        args=(session,),
+                        name=f"term-bootstrap-{session.terminal_id}",
+                        daemon=True,
+                    ).start()
             if awaiting_channel_confirm:
                 # Keep a window wide enough to hold the whole confirmation
                 # screen (box borders, ANSI, the warning paragraph, the menu).

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from universe_service_control import (  # noqa: E402
+    ServiceInstanceLock,
     load_state,
     pid_is_running,
     probe_health,
@@ -23,8 +24,47 @@ from universe_service_control import (  # noqa: E402
 
 
 class UniverseServiceControlTests(unittest.TestCase):
+    def test_database_owner_lock_blocks_second_instance_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "bus.sqlite3"
+            owner = ServiceInstanceLock(database)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "ALREADY_RUNNING"):
+                    ServiceInstanceLock(database)
+            finally:
+                owner.close()
+            successor = ServiceInstanceLock(database)
+            successor.close()
+
+    def test_start_does_not_duplicate_live_unready_server(self) -> None:
+        with mock.patch("universe_service_control.service_status",
+                        return_value={"status": "UNRESPONSIVE", "pid_running": True}), \
+             mock.patch("universe_service_control.subprocess.Popen") as popen:
+            result = start_service()
+        self.assertEqual("START_IN_PROGRESS", result["status"])
+        popen.assert_not_called()
+
     def test_stop_grace_window_covers_resident_provider_cleanup(self) -> None:
         self.assertEqual(20.0, stop_service.__kwdefaults__["timeout_seconds"])
+
+    def test_removed_state_file_does_not_prove_previous_process_exited(self) -> None:
+        with mock.patch("universe_service_control.service_status", side_effect=[
+                {"pid": 42, "pid_running": True}, {"pid_running": False}]), \
+             mock.patch("universe_service_control.load_state", return_value={}), \
+             mock.patch("universe_service_control.request_graceful_shutdown",
+                        return_value={"status": "SERVICE_SHUTDOWN_ACCEPTED"}), \
+             mock.patch("universe_service_control.pid_is_running", return_value=True):
+            self.assertEqual("STOP_TIMEOUT", stop_service(timeout_seconds=0)["status"])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows process access boundary")
+    def test_inaccessible_elevated_process_is_not_treated_as_exited(self) -> None:
+        kernel = mock.MagicMock()
+        kernel.OpenProcess.return_value = 0
+        kernel.GetLastError.return_value = 5
+        with mock.patch("universe_service_control.ctypes.windll.kernel32", kernel):
+            self.assertTrue(pid_is_running(42))
+            kernel.GetLastError.return_value = 87
+            self.assertFalse(pid_is_running(42))
 
     def test_missing_state_is_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

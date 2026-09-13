@@ -463,6 +463,11 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual("NEW", state.observe_provider_session("GROK", "grok-1"))
         anchored = state.observe_current_anchor("MASTER-CURRENT-GCS")
         self.assertIsNotNone(anchored)
+        # Provider replacement requires observed absence, not an unobserved
+        # global sweep incidentally demoting another Host.
+        with self.assertRaises(SessionSupervisorError):
+            state.observe_provider_session("CODEX", "codex-1")
+        supervisor.sweep_stale_live_sessions(live_session_anchors={})
         self.assertEqual(
             "REPLACED", state.observe_provider_session("CODEX", "codex-1")
         )

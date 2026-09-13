@@ -294,6 +294,17 @@ class ReconnectionHostClient:
         self.reused_existing = True
 
     def request(self, action: str, **fields: Any) -> dict[str, Any]:
+        retryable = action in {"channel_result_get", "channel_push"}
+        for attempt in range(3 if retryable else 1):
+            try:
+                return self._request_once(action, **fields)
+            except ReconnectionHostError as error:
+                if not retryable or attempt == 2 or "Host IPC failed:" not in str(error):
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+        raise ReconnectionHostError("Host IPC retry exhausted")
+
+    def _request_once(self, action: str, **fields: Any) -> dict[str, Any]:
         endpoint = self.state.endpoint
         if not endpoint.startswith("tcp://"):
             raise ReconnectionHostError("Host endpoint transport is unsupported")
@@ -1077,25 +1088,21 @@ class ReconnectionPty:
     def read(self, timeout: float = 0.0) -> bytes:
         if self._closed:
             return b""
-        deadline = time.monotonic() + max(0.0, timeout)
-        while True:
-            try:
-                response = self.client.request(
-                    "read",
-                    supervisor_id=self.supervisor_id,
-                    after_cursor=self._cursor,
-                )
-            except ReconnectionHostError:
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(min(0.025, max(0.0, deadline - time.monotonic())))
-                continue
-            output = response["output"]
-            self._cursor = int(output["next_cursor"])
-            data = base64.b64decode(output["data_base64"])
-            if data or time.monotonic() >= deadline:
-                return data
-            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        # The v1 Host uses one TCP connection per request. A 20ms inner poll
+        # exhausted Windows ephemeral ports with several idle Masters. One
+        # request per requested read interval preserves the cursor and latency.
+        started = time.monotonic()
+        response = self.client.request(
+            "read", supervisor_id=self.supervisor_id, after_cursor=self._cursor,
+        )
+        output = response["output"]
+        self._cursor = int(output["next_cursor"])
+        data = base64.b64decode(output["data_base64"])
+        if not data:
+            remaining = max(0.0, float(timeout) - (time.monotonic() - started))
+            if remaining:
+                time.sleep(remaining)
+        return data
 
     def resize(self, cols: int, rows: int) -> None:
         self.client.request(

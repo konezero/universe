@@ -17,6 +17,7 @@ from universe_app.session_bus import SessionBus, SessionBusError
 from claude_channel_broker import ClaudeChannelBroker, session_lookup_path
 
 
+@patch.dict("os.environ", {"UNIVERSE_PROVIDER": "CLAUDE"})
 class ChannelDispatchRepairTests(unittest.TestCase):
     def setUp(self):
         self.terminal = {'terminal_id': 't', 'session_anchor_ref': 'a',
@@ -127,6 +128,61 @@ class ChannelDispatchRepairTests(unittest.TestCase):
                 self.host.write.assert_not_called()
             finally:
                 broker.close()
+
+    def test_parallel_recovery_reserves_one_turn_per_anchor(self):
+        import threading
+        other = self.bus.deliver_to_terminal(self.host, terminal=self.terminal,
+            source={}, to={"session_anchor_ref": "a"}, kind="INSTRUCTION", notify="NONE", body="other")
+        barrier = threading.Barrier(2)
+        claims = []
+        def claim(mid):
+            barrier.wait()
+            claims.append(self.bus.claim_instruction(self.host, terminal_id="t", session_anchor_ref="a", message_id=mid))
+        workers = [threading.Thread(target=claim, args=(mid,)) for mid in (self.mid, other["message_id"])]
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(timeout=5)
+        self.assertEqual(2, len(claims))
+        self.assertEqual(1, sum(item is not None for item in claims))
+        self.assertEqual(1, sum(item["delivery_state"] == "PENDING" for item in self.bus._messages.values()))
+
+    def test_only_idempotent_channel_results_retry_connection_failures(self):
+        failure = {"status": "ERROR", "error_code": "CHANNEL_TCP_REQUEST_FAILED"}
+        payload = {"message_id": "m", "kind": "ACK", "phase": "STARTED"}
+        with patch.object(mcp, "_post_once", side_effect=[failure, {"status": "ACKNOWLEDGED"}]) as post, \
+             patch.object(mcp.time, "sleep"):
+            result = mcp._post(mcp.CHANNEL_RESULT_PATH, payload, "token")
+        self.assertEqual("ACKNOWLEDGED", result["status"])
+        self.assertEqual(2, post.call_count)
+        self.assertEqual(post.call_args_list[0], post.call_args_list[1])
+        with patch.object(mcp, "_post_once", return_value=failure) as post:
+            self.assertEqual(failure, mcp._post(mcp.CHANNEL_POLL_PATH, {}, "token"))
+        post.assert_called_once()
+
+    def test_channel_tcp_failure_retains_origin(self):
+        with patch.object(mcp, "_ENDPOINT", "tcp://127.0.0.1:1"), \
+             patch.object(mcp.socket, "create_connection", side_effect=TimeoutError("probe timeout")):
+            result = mcp._post(mcp.CHANNEL_RESULT_PATH, {}, "token")
+        self.assertEqual("CHANNEL_TCP_REQUEST_FAILED", result["error_code"])
+        self.assertEqual("channel_result", result["operation"])
+        self.assertIn("TimeoutError", result["detail"])
+
+    def test_connected_channel_reports_reply_and_ack_capabilities(self):
+        with patch.object(mcp, "_SESSION_TOKEN", "token"), patch.object(mcp, "_ACK_SUPPORTED", True):
+            response = mcp.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "universe_channel_status", "arguments": {}}})
+        status = response["result"]["structuredContent"]
+        self.assertTrue(status["reply_supported"])
+        self.assertTrue(status["ack_supported"])
+
+    def test_claude_channel_tools_are_not_exposed_to_other_providers(self):
+        for provider in ("CODEX", "GROK"):
+            with self.subTest(provider=provider), patch.dict("os.environ", {"UNIVERSE_PROVIDER": provider}):
+                listed = mcp.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+                self.assertEqual([], listed["result"]["tools"])
+                called = mcp.handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "universe_channel_reply", "arguments": {}}})
+                self.assertTrue(called["result"]["isError"])
+                self.assertIn("CHANNEL_PROVIDER_UNSUPPORTED", str(called))
 
     def test_rust_channel_error_is_not_collapsed_to_unavailable(self):
         client = Mock()

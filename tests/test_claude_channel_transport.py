@@ -39,6 +39,7 @@ class FakePty:
         return
 
 
+@patch.dict("os.environ", {"UNIVERSE_PROVIDER": "CLAUDE"})
 class ClaudeChannelBrokerTests(unittest.TestCase):
     def test_stdio_entrypoint_starts_and_answers_initialize_and_ping(self) -> None:
         environment = dict(os.environ)
@@ -246,6 +247,7 @@ class ClaudeChannelBrokerTests(unittest.TestCase):
         self.assertEqual(1, len(observed))
 
 
+@patch.dict("os.environ", {"UNIVERSE_PROVIDER": "CLAUDE"})
 class ClaudeChannelMcpToolTests(unittest.TestCase):
     def test_initialize_negotiates_tool_discovery_and_reply(self) -> None:
         initialized = handle_message(
@@ -302,7 +304,8 @@ class ClaudeChannelMcpToolTests(unittest.TestCase):
         status = response["result"]["structuredContent"]
         self.assertEqual("universe_channel", status["server"])
         self.assertEqual("CLAUDE_CODE_CHANNEL", status["transport"])
-        self.assertFalse(status["writable"])
+        self.assertEqual(bool(claude_channel_mcp._SESSION_TOKEN), status["writable"])
+        self.assertEqual(status["writable"], status["reply_supported"])
 
     def test_reply_tool_posts_result_to_authenticated_broker(self) -> None:
         listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -332,6 +335,7 @@ class ClaudeChannelMcpToolTests(unittest.TestCase):
         self.assertEqual("/v1/claude-channel/result", post.call_args.args[0])
 
 
+@patch.dict("os.environ", {"UNIVERSE_PROVIDER": "CLAUDE"})
 class ClaudeChannelTerminalHostTests(unittest.TestCase):
     def test_claude_terminal_keeps_pty_and_adds_channel_transport(self) -> None:
         directory = tempfile.TemporaryDirectory()

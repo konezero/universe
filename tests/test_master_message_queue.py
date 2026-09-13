@@ -231,6 +231,39 @@ class MasterMessageQueueTests(unittest.TestCase):
         self.assertIn("lease_expires_at", claimed)
         self.assertGreater(claimed["lease_expires_at"], claimed["started_at"])
 
+    def test_targeted_resume_does_not_claim_an_unrelated_queued_item(self) -> None:
+        self.register_project("ALPHA")
+        first, _ = self.store.create_master_message("ALPHA", self.message_request())
+        second, _ = self.store.create_master_message("ALPHA", self.message_request(idempotency_key="second"))
+        self.assertIsNone(self.store.claim_master_message("ALPHA", provider="CODEX", message_id="missing"))
+        resumed = self.store.claim_master_message("ALPHA", provider="CODEX", message_id=second["message_id"])
+        self.assertEqual(second["message_id"], resumed["message_id"])
+        self.assertEqual("QUEUED", self.store.get_master_message(first["message_id"])["delivery_state"])
+
+    def test_live_exact_owner_retains_expired_claim_until_disconnected(self) -> None:
+        from session_supervisor import SessionSupervisorStore
+        supervisor = SessionSupervisorStore(self.root / "universe.sqlite3")
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            for rank in ("CURRENT", "STALE", "UNKNOWN"):
+                with self.subTest(provider=provider, rank=rank):
+                    pid = provider + rank
+                    self.register_project(pid)
+                    session, _ = supervisor.register_session({
+                        "node": pid, "mode": "MASTER", "provider": provider,
+                        "provider_session_ref": "provider-" + pid,
+                        "state": "LIVE", "currentness": rank,
+                    })
+                    message, _ = self.store.create_master_message(pid, self.message_request())
+                    self.store.claim_master_message(pid, provider=provider,
+                        session_anchor_ref=session["session_anchor_ref"], lease_ttl_seconds=-1)
+                    self.assertEqual([], self.store.reclaim_expired_master_messages(pid))
+                    self.assertIsNone(self.store.claim_master_message(pid, provider="CODEX"))
+                    self.store.renew_master_message_lease(message["message_id"], lease_ttl_seconds=-1)
+                    with self.store._connection() as connection:
+                        connection.execute("UPDATE session_record SET state = 'DISCONNECTED' WHERE session_id = ?",
+                                           (session["session_id"],))
+                    self.assertEqual([message["message_id"]], self.store.reclaim_expired_master_messages(pid))
+
     def test_expired_lease_is_reclaimed_and_becomes_claimable_again(self) -> None:
         """The claiming session crashed mid-task (never called complete/fail).
         Once its lease lapses, a DIFFERENT instance's claim attempt must be

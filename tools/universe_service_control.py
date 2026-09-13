@@ -136,7 +136,8 @@ def pid_is_running(pid: int) -> bool:
             pid,
         )
         if not handle:
-            return False
+            # Access denied is not proof that an elevated service has exited.
+            return kernel32.GetLastError() == 5
         try:
             exit_code = ctypes.c_uint32()
             if not kernel32.GetExitCodeProcess(
@@ -285,13 +286,40 @@ def stop_service(
     after = service_status(path)
     return {
         "schema": "universe.local-service-control.v1",
-        "status": "STOPPED" if not after.get("pid_running") else "STOP_TIMEOUT",
+        "status": "STOPPED" if not pid_is_running(pid_int) else "STOP_TIMEOUT",
         "state_file": str(path),
         "previous": before,
         "current": after,
         "shutdown_receipt": receipt,
         "destructive_fallback_performed": False,
     }
+
+
+class ServiceInstanceLock:
+    """One service process owns a database, including its startup interval."""
+
+    def __init__(self, database_path: Path) -> None:
+        self.path = database_path.expanduser().resolve().with_suffix(".service.lock")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        try:
+            if self.path.stat().st_size == 0:
+                self.handle.write(b"0")
+                self.handle.flush()
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.close()
+            raise RuntimeError("UNIVERSE_SERVICE_ALREADY_RUNNING: database owner exists") from None
+
+    def close(self) -> None:
+        if not self.handle.closed:
+            self.handle.close()
 
 
 def start_service(
@@ -315,6 +343,12 @@ def start_service(
         return {
             "schema": "universe.local-service-control.v1",
             "status": "ALREADY_RUNNING",
+            "current": current,
+        }
+    if current.get("pid_running"):
+        return {
+            "schema": "universe.local-service-control.v1",
+            "status": "START_IN_PROGRESS",
             "current": current,
         }
     python = python_executable or sys.executable
@@ -387,7 +421,7 @@ def restart_service(
     working_directory: Path | None = None,
 ) -> dict[str, Any]:
     path = state_path or default_state_path()
-    previous_state = load_state(path)
+    previous_state = load_state(path) or {}
     previous_endpoint = str(previous_state.get("endpoint") or "")
     previous_port = (
         urlsplit(previous_endpoint).port

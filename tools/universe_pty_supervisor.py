@@ -461,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, payload)
@@ -518,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 state = supervisor.host.channel_state(channel_parts[3])
             except TerminalHostError as error:
-                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail})
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_state": state})
             return
@@ -530,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = supervisor.host.channel_result(channel_parts[3], channel_parts[6])
             except TerminalHostError as error:
-                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                self._send(HTTPStatus.NOT_FOUND, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail})
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_result": result})
             return
@@ -541,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(
@@ -773,7 +773,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
@@ -785,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(
@@ -798,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = supervisor.host.push_channel(terminal_id, body)
             except TerminalHostError as error:
-                self._send(HTTPStatus.CONFLICT, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code})
+                self._send(HTTPStatus.CONFLICT, {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail})
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "channel_result": result})
             return
@@ -815,7 +815,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.CONFLICT,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
@@ -862,7 +862,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.CONFLICT,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
@@ -878,7 +878,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.CONFLICT,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
@@ -905,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
             except TerminalHostError as error:
                 self._send(
                     HTTPStatus.NOT_FOUND,
-                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code},
+                    {"schema": API_SCHEMA, "status": "ERROR", "error_code": error.code, "detail": error.detail},
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, **result})
