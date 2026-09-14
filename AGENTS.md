@@ -1,5 +1,10 @@
 # universe Agent Router
 
+Current user policy: Execution Guard records evidence without issuing permits.
+Apply the project-owned Execution Evidence Policy below when the installed
+managed block still describes permit issuance. Shared-source migration details:
+`docs/agents-execution-evidence-audit.md`.
+
 <!-- ai-career-project-runtime-overlay:start -->
 ## Managed ai-career Runtime Binding
 
@@ -189,40 +194,41 @@ Execution Assignment: UNASSIGNED
 
 Playwright and browser-test screenshots must use `.artifacts/ui/` as their explicit output directory. Do not write test captures into the repository root.
 
-## Evidence-First Change Rule
+## Execution Evidence Policy
 
-For an incident, unexpected error, or behavior whose root cause is not yet
-confirmed, do not patch the first plausible location. `Proceed`, `fix it`, or
-other urgency language authorizes investigation and completion; it does not
-turn an unverified hypothesis into a source-change target.
+The user explicitly changed Execution Guard to evidence recording (2026-09-14).
+This policy supersedes legacy permit-issuance wording in the installed managed
+block during the common Runtime migration. Guard records attempts, validation
+findings and actual outcomes; it does not issue, renew or consume execution
+permission. Audit ids are lookup references, never authority.
 
-Before a non-trivial mutation, establish and record the relevant evidence:
+Reuse existing user authorization within its scope. The actual Host, file gateway
+or Action owner still checks identity, scope, exact target, preconditions and
+idempotency at execution. Do not invent permission, bypass denied authentication,
+or infer persistent automation grants from this policy. Missing adapters and
+logging failures are technical problems, not requests for user reapproval.
 
-1. Observe the live symptom, state projection, and available logs or history.
-2. Trace the complete ownership boundary and state transition across UI, API,
-   gateway, service, Supervisor, Host, and provider as applicable.
-3. Distinguish a confirmed cause from hypotheses and from downstream symptoms.
-4. Patch only the confirmed owner. If evidence is insufficient, improve
-   structured diagnostics at a shared boundary rather than scattering
-   speculative workflow-specific handling.
+For service.restart, use `tools/universe_service_execution.py execute` with the
+observed PID, stable request id and existing instruction/run reference. This path
+records evidence without a separate bind/check/consume sequence. Acceptance is
+not completion; query service.status with the same operation id. See
+`docs/service-restart-execution.md` for the current contract and migration state.
 
-Errors must retain structured origin data at their shared boundary: operation,
-endpoint or resource identifier when applicable, transport/status, stable error
-code, and detail. Do not hardcode endpoint strings into individual workflow
-catch blocks merely to improve a toast. Validate the exact failure path and its
-adjacent regressions after every change.
+## Work and Verification
 
-Do not create diagnostic spaghetti to compensate for an unconfirmed incident.
-Add observability only at the narrowest shared ownership boundary, with one
-typed error contract and one correlation identifier propagated across layers.
-Do not add per-screen, per-provider, or per-workflow catch-and-rewrite logic
-when the same failure can cross a common client, API, gateway, Supervisor, or
-Host boundary. If no such boundary exists, first introduce the smallest shared
-abstraction and migrate the affected paths together with regression coverage.
+Carry the bounded request through implementation and relevant verification.
+Routine choices and retries of isolated affected tests need no second approval.
+Stop expanding verification once the required checks pass unless new evidence
+justifies more. A local test is safe to run only when its write/cleanup resources
+are isolated or authorized; never assume a temporary database isolates processes.
 
-Never present an inference, memory, or plausible explanation as an observed
-fact. Before answering a technical question or changing source, cite the
-available direct evidence in the work record and state its limits. When the
-cause, behavior, or ownership is not established, say `UNKNOWN` / `not yet
-determined`, name the missing evidence, and investigate it before proposing a
-fix. Do not guess to appear decisive.
+For incidents, inspect the observed failure and trace the implicated ownership
+boundary before patching. Distinguish facts from hypotheses. If evidence is
+insufficient, add diagnostics at the narrowest shared boundary; avoid speculative
+per-screen/provider catch-and-rewrite handling. Preserve operation, resource,
+transport/status, stable code, detail and correlation id across that boundary.
+Validate the actual failure and adjacent regressions after changing behavior.
+For ordinary implementation or text edits, inspect the affected code and contracts
+at the depth needed for that change; a full UI-to-provider trace is not mandatory.
+State the evidence and its limits when explaining behavior. UNKNOWN means missing
+evidence, not an obligation to stop unrelated authorized work.

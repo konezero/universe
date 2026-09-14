@@ -1,11 +1,11 @@
 from pathlib import Path
-import copy
+from contextlib import closing
 import json
 import sys
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from universe_service_execution import ServiceExecution, LifecycleError
 
@@ -18,76 +18,78 @@ class ServiceExecutionTests(unittest.TestCase):
         self.state_path = self.root / "server.json"
         self.state = {"pid": 1234, "endpoint": "http://127.0.0.1:12345", "token": "test-private-token"}
         self.state_path.write_text(json.dumps(self.state), encoding="utf-8")
-        self.host = ServiceExecution(self.root, "session-test", state_path=self.state_path)
-        self.anchor = {"session_id": "session-test", "frame_id": "current", "anchor_id": "anchor-1", "source_commit": "commit-1"}
-        patch = mock.patch.object(self.host, "_anchor", return_value=self.anchor)
-        patch.start()
-        self.addCleanup(patch.stop)
-        self.proposal = self.host.prepare()
-        self.approval = {"status": "APPROVED", "proposal_id": self.proposal["proposal_id"], "action_id": "service.restart", "target": str(self.state_path), "expected_pid": 1234, "instruction_ref": "conversation:user-restart"}
+        self.host = ServiceExecution(self.root, state_path=self.state_path)
+        self.request = {"request_id": "restart-audit-1234", "expected_pid": 1234}
 
-    def permit(self):
-        binding = self.host.bind(self.proposal, self.approval)
-        return self.host.check(binding["binding_id"])
+    def records(self):
+        with closing(sqlite3.connect(self.host.ledger)) as db:
+            return [json.loads(r[0]) for r in db.execute("SELECT record_json FROM execution_event ORDER BY rowid")]
 
-    def test_requires_separate_exact_lifecycle_binding(self):
-        with self.assertRaisesRegex(LifecycleError, "binding is required"):
-            self.host.check("source-work-receipt")
-        for change in ({"expected_pid": 42}, {"instruction_ref": "UNKNOWN"}, {"target": str(self.root)}, {"status": "PENDING"}):
-            with self.assertRaises(LifecycleError):
-                self.host.bind(self.proposal, {**self.approval, **change})
-
-    def test_one_time_permit_dispatches_exact_proposal_without_leaking_token(self):
-        permit = self.permit()
-        self.assertEqual("EXECUTION_GUARD_PERMITTED", permit["status"])
+    def test_executes_without_session_or_receipt_and_records_observed_phases(self):
         with mock.patch.object(self.host, "_dispatch", return_value={"status": "ACCEPTED"}) as dispatch:
-            self.host.execute(permit["receipt_id"])
-            dispatch.assert_called_once_with(self.proposal, self.state["token"], permit["receipt_id"])
-            with self.assertRaisesRegex(LifecycleError, "consumed"):
-                self.host.execute(permit["receipt_id"])
-            self.assertEqual(1, dispatch.call_count)
-        self.assertNotIn(self.state["token"], json.dumps(self.proposal))
-        self.assertNotIn(self.state["token"], self.host.ledger.read_bytes().decode("latin1"))
+            result = self.host.execute(self.request, instruction_ref="conversation:user-restart")
+        self.assertEqual("LIFECYCLE_ACTION_DISPATCHED", result["status"])
+        self.assertNotIn("receipt_id", result)
+        self.assertEqual(["ATTEMPTED", "VALIDATED", "DISPATCHED"], [r["phase"] for r in self.records()])
+        self.assertNotIn(self.state["token"], json.dumps(self.records()))
+        self.assertEqual(self.request, dispatch.call_args.args[1]["request"])
+        with closing(sqlite3.connect(self.host.ledger)) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='permit'").fetchone())
 
-    def test_expired_permit_cannot_dispatch(self):
-        permit = self.permit()
-        with mock.patch("universe_service_execution.time.time", return_value=permit["expires_at"] + 1), mock.patch.object(self.host, "_dispatch") as dispatch:
-            with self.assertRaises(LifecycleError):
-                self.host.execute(permit["receipt_id"])
-            dispatch.assert_not_called()
-
-    def test_target_and_anchor_are_rechecked_at_execution(self):
-        permit = self.permit()
+    def test_target_pid_change_is_rejected_and_logged(self):
         with mock.patch.object(self.host, "_dispatch") as dispatch:
-            self.anchor["anchor_id"] = "changed-anchor"
-            with self.assertRaises(LifecycleError):
-                self.host.execute(permit["receipt_id"])
-            self.anchor["anchor_id"] = "anchor-1"
-            self.state_path.write_text(json.dumps({**self.state, "pid": 42}), encoding="utf-8")
-            with self.assertRaises(LifecycleError):
-                self.host.execute(permit["receipt_id"])
-            dispatch.assert_not_called()
+            with self.assertRaisesRegex(LifecycleError, "instance changed"):
+                self.host.execute({**self.request, "expected_pid": 42}, instruction_ref="user:restart")
+        dispatch.assert_not_called()
+        self.assertEqual("REJECTED", self.records()[-1]["phase"])
+        self.assertEqual("LIFECYCLE_INSTANCE_CHANGED", self.records()[-1]["error_code"])
 
-    def test_modified_command_and_external_endpoint_rejected(self):
-        proposal = copy.deepcopy(self.proposal)
-        proposal["request"]["expected_pid"] = 42
-        with self.assertRaises(LifecycleError):
-            self.host.bind(proposal, self.approval)
+    def test_arbitrary_command_endpoint_and_receipt_substitution_rejected(self):
+        for extra in ({"command": "anything"}, {"endpoint": "http://elsewhere"}, {"receipt_id": "old-permit"}):
+            with self.assertRaises(LifecycleError):
+                self.host.execute({**self.request, **extra}, instruction_ref="user:restart")
         self.state_path.write_text(json.dumps({**self.state, "endpoint": "http://example.com:12345"}), encoding="utf-8")
         with self.assertRaises(LifecycleError):
-            self.host.prepare()
+            self.host.execute(self.request, instruction_ref="user:restart")
 
-    def test_exact_http_action_and_no_redirect_transport(self):
+    def test_uncertain_dispatch_is_not_success_and_not_retried(self):
+        with mock.patch.object(self.host, "_dispatch", side_effect=LifecycleError("LIFECYCLE_DISPATCH_UNCERTAIN", "connection lost")) as dispatch:
+            with self.assertRaises(LifecycleError):
+                self.host.execute(self.request, instruction_ref="automation:existing-run")
+        self.assertEqual(1, dispatch.call_count)
+        self.assertEqual("UNCONFIRMED", self.records()[-1]["phase"])
+        self.assertNotIn("SUCCEEDED", [r["phase"] for r in self.records()])
+
+    def test_attempt_record_failure_does_not_dispatch(self):
+        with mock.patch.object(self.host, "_record", side_effect=sqlite3.OperationalError("disk full")), mock.patch.object(self.host, "_dispatch") as dispatch:
+            with self.assertRaisesRegex(LifecycleError, "record the execution attempt"):
+                self.host.execute(self.request, instruction_ref="user:restart")
+        dispatch.assert_not_called()
+
+    def test_post_dispatch_audit_failure_preserves_actual_acceptance(self):
+        original = self.host._record
+        def record(**kwargs):
+            if kwargs["phase"] == "DISPATCHED":
+                raise sqlite3.OperationalError("disk full")
+            return original(**kwargs)
+        with mock.patch.object(self.host, "_record", side_effect=record), mock.patch.object(self.host, "_dispatch", return_value={"status": "ACCEPTED"}) as dispatch:
+            result = self.host.execute(self.request, instruction_ref="user:restart")
+        self.assertEqual("ACCEPTED", result["result"]["status"])
+        self.assertEqual("EXECUTION_AUDIT_FAILED", result["audit"]["status"])
+        self.assertEqual(1, dispatch.call_count)
+
+    def test_exact_http_action_without_redirect_or_token_in_result(self):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"status":"ACCEPTED"}'
+        body = {"action_id": "service.restart", "request": self.request}
         with mock.patch("universe_service_execution.build_opener") as opener:
             opener.return_value.open.return_value = response
-            result = self.host._dispatch(self.proposal, "private-token", "receipt")
+            result = self.host._dispatch(self.state, body)
             request = opener.return_value.open.call_args.args[0]
             self.assertEqual("http://127.0.0.1:12345/v1/actions", request.full_url)
-            self.assertEqual({"action_id": "service.restart", "request": self.proposal["request"]}, json.loads(request.data))
-            self.assertEqual("Bearer private-token", request.headers["Authorization"])
-            self.assertNotIn("private-token", json.dumps(result))
+            self.assertEqual(body, json.loads(request.data))
+            self.assertEqual("Bearer test-private-token", request.headers["Authorization"])
+            self.assertNotIn("test-private-token", json.dumps(result))
 
 
 if __name__ == "__main__":

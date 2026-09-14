@@ -1,6 +1,6 @@
 # Shared project goal and plan drafts
 
-Status: implemented and validated on a fixture HTTP server; production activation pending.
+Status: implemented, fixture-validated and production Actions active; real Provider editing remains untested.
 
 Fleet opens a project description/goal/plan editor above the node/Todo canvas. It is not a modal: the conversation dock remains available. New-project entry no longer requests a forecast or a technology route. Existing projects can have scoped drafts; unattached drafts remain drafts and do not register a project, write source files, adopt nodes or execute work.
 
@@ -39,10 +39,10 @@ The test server used a temporary database. No real LLM request or production dra
 - Connect accepted drafts to project materialization/registration, with the required source/lifecycle authority path.
 - Link structured plan items to node and detailed Todo references; the current fields are project-level text.
 - Validate a real LLM editing the shared draft. The server version and draft Actions are now active.
-- Use the strict Universe lifecycle Host adapter described in service-restart-execution.md for agent-issued restart; a product control token alone is insufficient.
+- Use the Universe lifecycle Host adapter in service-restart-execution.md for an already authorized agent restart. It records execution evidence without issuing a permission receipt.
 
 ## Test isolation incident
 
 The reused MemoryCandidateApiTests fixture originally supplied only its database path, so service cleanup used the default production remote gateway/connector paths. Browser teardown attempted to stop/remove that gateway; the production API subsequently reported gateway and connector OFFLINE, while its startup resume record says REMOTE_ACCESS_STARTED. The local server remained responsive. The persisted connector configuration has no temporary-directory paths.
 
-The fixture now explicitly supplies temporary service, gateway, connector-state and connector-configuration paths; a regression asserts that each belongs to the fixture root. The subsequent receipt-aware service restart restored the saved production remote connection. Both gateway and connector now report READY. The fixture isolation fix and restoration were verified separately; real Provider draft editing remains untested.
+The fixture now explicitly supplies temporary service, gateway, connector-state and connector-configuration paths; a regression asserts that each belongs to the fixture root. The subsequent authorized service restart restored the saved production remote connection. Both gateway and connector now report READY. The fixture isolation fix and restoration were verified separately; real Provider draft editing remains untested.
