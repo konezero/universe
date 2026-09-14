@@ -15,13 +15,13 @@ Runtime Workspace: `.ai/`
 
 ## Agent Entry Order
 
-1. `REPOSITORY_MANIFEST.md`
-2. `AGENTS.md`
-3. `.ai/START_HERE.md`
-4. `.ai/core/README.md`
-5. `.ai/runtime/project_instance/boot_command_entry.md`
-6. `.ai/runtime/state/project_runtime.sqlite3` Registry snapshot and Mode Current Anchor; use them
-7. `.ai/runtime/session_store/` bound to that Current Anchor; create only if absent
+Follow `AGENTS.md` for reserved commands and Mode intent before normal entry.
+At first ordinary entry read this manifest and `.ai/START_HERE.md` once.
+Reuse unchanged context; read the Boot command entry for Runtime operations
+and `.ai/core/README.md` only to locate a relevant contract.
+Runtime operations use the Registry snapshot and Mode Current Anchor in
+`.ai/runtime/state/project_runtime.sqlite3`, then the bound session SQL.
+Create that SQL only if absent. Read-only source work need not prepare a session.
 
 Standalone and Universe-attached Hosts use that same store. Do not walk git
 for live Mode. `session.md` and `current_anchor_frame.md` are companion refs only.
@@ -40,7 +40,7 @@ Task Assignment Entry: `.ai/skills/common/task-assignment/SKILL.md`
 Execution Binding Entry: `.ai/skills/common/execution-binding/SKILL.md`
 
 Task Frame Entry: `.ai/skills/common/task-frame/SKILL.md`
-Default Debate Entry: `.ai/skills/common/task-frame-debate/SKILL.md`
+Requested Debate / Worker Review: `.ai/skills/common/task-frame-debate/SKILL.md`
 Task Worker Contract: `.ai/runtime/reference_runtime/TASK_WORKER_HOST_CONTRACT.md`
 Common Agent Policy: `.ai/agents/common/README.md`
 Worker Policy Pack: `.ai/agents/common/worker-policy-pack.json`

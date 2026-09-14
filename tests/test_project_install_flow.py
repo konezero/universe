@@ -68,6 +68,9 @@ class ProjectInstallFlowTests(unittest.TestCase):
         )
         self.assertEqual("PROJECT_INSTALL_READY_FOR_BOOT", receipt["status"])
         self.assertEqual("READY_FOR_BOOT", receipt["state"])
+        self.assertEqual("INSTALLED", receipt["repository_runtime"])
+        self.assertEqual("NOT_RUN", receipt["validation"]["result"])
+        self.assertFalse((self.project / ".ai/runtime/project_instance/validation").exists())
         self.assertEqual(UNIVERSE_ATTACHED, observed["install_mode"])
         self.assertEqual(self.commit, receipt["source_commit"])
         self.assertEqual("local project\n", (self.project / "README.md").read_text())
@@ -163,8 +166,7 @@ class ProjectInstallFlowTests(unittest.TestCase):
 
     def _materialize_runtime(self) -> None:
         base = self.project / ".ai" / "runtime" / "project_instance"
-        validation = base / "validation"
-        validation.mkdir(parents=True)
+        base.mkdir(parents=True)
         manifest = {
             "schema": "ai-career.project-runtime-installation.v1",
             "installation": {"project": "demo"},
@@ -175,7 +177,6 @@ class ProjectInstallFlowTests(unittest.TestCase):
         )
         (base / "VERSION_MANIFEST.md").write_text("version\n", encoding="utf-8")
         (base / "project_anchor.md").write_text("anchor\n", encoding="utf-8")
-        (validation / "latest.md").write_text("PASS\n", encoding="utf-8")
 
     def _adapter_result(self, request: dict[str, Any]) -> dict[str, Any]:
         managed = [
@@ -184,13 +185,12 @@ class ProjectInstallFlowTests(unittest.TestCase):
                 Path(".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"),
                 Path(".ai/runtime/project_instance/VERSION_MANIFEST.md"),
                 Path(".ai/runtime/project_instance/project_anchor.md"),
-                Path(".ai/runtime/project_instance/validation/latest.md"),
             )
         ]
         return {
             "schema": "universe.project-install-result.v1",
             "result": "PASS",
-            "repository_runtime": "VERIFIED",
+            "repository_runtime": "INSTALLED",
             "target": request["target"],
             "operation": request["operation"],
             "install_mode": request["install_mode"],

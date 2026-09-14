@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan and verify fresh-project Runtime installation through an adapter.
+"""Plan and record fresh-project Runtime installation through an adapter.
 
 Universe owns the plan and postconditions. The caller-supplied lifecycle
 adapter is the only component allowed to materialize Runtime files.
@@ -35,7 +35,6 @@ REQUIRED_INSTALL_ARTIFACTS = (
     INSTALLATION_MANIFEST,
     Path(".ai/runtime/project_instance/VERSION_MANIFEST.md"),
     Path(".ai/runtime/project_instance/project_anchor.md"),
-    Path(".ai/runtime/project_instance/validation/latest.md"),
 )
 PLAN_FIELDS = (
     "schema",
@@ -206,7 +205,8 @@ def apply_project_install_flow(
         "preserved_file_count": len(normalized_plan["preservation"]["files"]),
         "managed_path_count": len(managed_paths),
         "adapter_status": "PASS",
-        "repository_runtime": "VERIFIED",
+        "repository_runtime": "INSTALLED",
+        "validation": {"result": "NOT_RUN", "reason": "INSTALLATION_DOES_NOT_RUN_VALIDATION"},
         "boot_handoff": "READY_FOR_BOOT",
     }
 
@@ -303,10 +303,10 @@ def _validate_adapter_result(response: Mapping[str, Any], plan: Mapping[str, Any
             "PROJECT_INSTALL_ADAPTER_FAILED",
             "lifecycle adapter did not return PASS",
         )
-    if response.get("repository_runtime") != "VERIFIED":
+    if response.get("repository_runtime") not in {"INSTALLED", "VERIFIED"}:
         raise ProjectInstallFlowError(
-            "PROJECT_INSTALL_RUNTIME_UNVERIFIED",
-            "lifecycle adapter did not verify the repository Runtime",
+            "PROJECT_INSTALL_RUNTIME_NOT_APPLIED",
+            "lifecycle adapter did not report installed Runtime files",
         )
     if response.get("target") != plan["target_root"]:
         raise ProjectInstallFlowError(
@@ -336,16 +336,6 @@ def _validate_adapter_result(response: Mapping[str, Any], plan: Mapping[str, Any
                 "PROJECT_INSTALL_LIVE_SOURCE_MISMATCH",
                 f"lifecycle adapter {field} does not match the plan",
             )
-    validation = response.get("validate")
-    if (
-        isinstance(validation, Mapping)
-        and "source_commit" in validation
-        and validation["source_commit"] != plan["source"]["commit"]
-    ):
-        raise ProjectInstallFlowError(
-            "PROJECT_INSTALL_LIVE_SOURCE_MISMATCH",
-            "lifecycle validation source commit does not match the plan",
-        )
     boot_handoff = response.get("boot_handoff")
     if (
         not isinstance(boot_handoff, Mapping)
