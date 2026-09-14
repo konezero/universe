@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import codecs
+import hashlib
 import json
 import os
 import queue
 import sqlite3
 import re
 import secrets
+import tempfile
 import uuid
 import threading
 import time
@@ -613,6 +615,13 @@ class TerminalSession:
             "session_anchor_ref": self.session_anchor_ref,
             "managed_shell_identity_file": self.managed_shell_identity_file,
             "backend_owner": self.backend_owner,
+            # True when this create() call reattached an already-running
+            # Host-owned CLI process instead of starting a new one -- a
+            # persona/system-prompt argv built for THIS call was never
+            # actually delivered to that process in that case
+            # ([[persona-conductor-automation-plan]] P1, 2026-09-14
+            # Conductor finding: "create 반환은 기존 Host 재사용일 수도").
+            "host_reused_existing": bool(getattr(self.backend, "reused_existing", False)),
             "reconnection_host_id": self.reconnection_host_id,
             "host_session_ref": self.reconnection_host_id,
             "host_runtime_versions": dict(self.host_runtime_versions),
@@ -1320,6 +1329,7 @@ class TerminalHost:
         cols: int = 120,
         rows: int = 32,
         audit_context: Mapping[str, Any] | None = None,
+        persona_prompt: str = "",
     ) -> dict[str, Any]:
         project = str(project_id or "").strip()
         requested_mode = str(mode or "").strip().upper()
@@ -1480,6 +1490,7 @@ class TerminalHost:
                 host_turn_observation=self._reconnection_registry is not None,
                 mode=requested_mode,
                 project_id=project,
+                persona_prompt=persona_prompt,
             )
         session = TerminalSession(
             terminal_id=terminal_id,
@@ -2539,6 +2550,135 @@ class TerminalHost:
         except ReconnectionHostError as error:
             raise TerminalHostError(error.code, str(error)) from error
 
+    def deliver_persona_native_queue(
+        self,
+        terminal_id: str,
+        persona_text: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        """Deliver one exact Codex persona body through the authenticated Host queue.
+
+        Codex's interactive command line cannot safely carry arbitrary quotes,
+        newlines, or non-ASCII text through the managed Windows shell.  The
+        Rust Session Host already owns a native ``codex queue`` adapter for
+        bounded turns; wait only for its exact provider-thread binding, then
+        make one at-most-once offer.  The adapter itself records acceptance or
+        an unknown outcome and never falls back to PTY input.
+        """
+
+        session = self.get(terminal_id)
+        if str(session.provider or "").strip().upper() != "CODEX":
+            raise TerminalHostError(
+                "PERSONA_NATIVE_QUEUE_PROVIDER_INVALID",
+                "the native persona queue is only available for Codex",
+            )
+        text = str(persona_text or "")
+        if not text:
+            raise TerminalHostError(
+                "PERSONA_NATIVE_QUEUE_TEXT_REQUIRED",
+                "persona text is required",
+            )
+        framed = native_queue_persona_text(text)
+        message_id = "persona-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:48]
+        try:
+            timeout = max(0.5, min(float(timeout_seconds), 60.0))
+        except (TypeError, ValueError):
+            timeout = 20.0
+        deadline = time.monotonic() + timeout
+        last_reason = "provider Session Host binding is not ready"
+        while time.monotonic() < deadline:
+            session = self.get(terminal_id)
+            if session.state != "LIVE":
+                raise TerminalHostError(
+                    "PERSONA_NATIVE_QUEUE_TERMINAL_NOT_LIVE",
+                    "Codex terminal exited before its provider thread bound",
+                )
+            backend = session.backend
+            if isinstance(backend, ReconnectionPty):
+                try:
+                    status = backend.client.status()
+                except ReconnectionHostError as error:
+                    last_reason = str(error)
+                    time.sleep(0.2)
+                    continue
+                provider_ref = str(status.get("provider_session_ref") or "").strip()
+                turn_state = status.get("turn_delivery") or {}
+                if provider_ref and bool(turn_state.get("native_queue_available")):
+                    accepted = self.offer_turn(
+                        terminal_id,
+                        {
+                            "message_id": message_id,
+                            "text": framed,
+                            "session_anchor_ref": session.session_anchor_ref,
+                            "provider": "CODEX",
+                            "provider_session_ref": provider_ref,
+                        },
+                    )
+                    # ``turn_offer`` only proves that the surviving Host
+                    # reserved the message in its durable ledger.  Applied
+                    # evidence requires the native adapter's exact receipt
+                    # (NATIVE_QUEUED + queued_submission_id), so wait for that
+                    # outcome without ever retrying the offer.
+                    queue_deadline = time.monotonic() + timeout
+                    last_delivery: Mapping[str, Any] | None = None
+                    while time.monotonic() < queue_deadline:
+                        current = self.get(terminal_id)
+                        if current.state != "LIVE":
+                            raise TerminalHostError(
+                                "PERSONA_NATIVE_QUEUE_UNCONFIRMED",
+                                "Codex terminal exited before the native queue receipt arrived",
+                            )
+                        current_backend = current.backend
+                        if not isinstance(current_backend, ReconnectionPty):
+                            raise TerminalHostError(
+                                "PERSONA_NATIVE_QUEUE_UNCONFIRMED",
+                                "Rust Session Host disappeared before the native queue receipt arrived",
+                            )
+                        try:
+                            current_status = current_backend.client.status()
+                        except ReconnectionHostError as error:
+                            raise TerminalHostError(error.code, str(error)) from error
+                        current_turn = current_status.get("turn_delivery") or {}
+                        for candidate in current_turn.get("messages") or []:
+                            if str(candidate.get("message_id") or "") == message_id:
+                                last_delivery = candidate
+                                break
+                        phase = str((last_delivery or {}).get("phase") or "")
+                        if phase == "NATIVE_QUEUED" and str(
+                            (last_delivery or {}).get("queued_submission_id") or ""
+                        ).strip():
+                            return {
+                                "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
+                                "message_id": message_id,
+                                "provider_session_ref": provider_ref,
+                                "persona_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                                "host_delivery": accepted,
+                                "delivery": dict(last_delivery),
+                            }
+                        if phase == "NATIVE_UNCONFIRMED":
+                            detail = str(
+                                (last_delivery or {}).get("detail")
+                                or "native queue acceptance is unknown"
+                            )
+                            raise TerminalHostError(
+                                "PERSONA_NATIVE_QUEUE_UNCONFIRMED", detail
+                            )
+                        time.sleep(0.1)
+                    raise TerminalHostError(
+                        "PERSONA_NATIVE_QUEUE_UNCONFIRMED",
+                        "native queue acceptance did not arrive before the bounded wait expired",
+                    )
+                last_reason = "Codex Host has no exact provider thread/native queue binding yet"
+            else:
+                last_reason = "terminal is not owned by a Rust Session Host"
+                break
+            time.sleep(0.2)
+        raise TerminalHostError(
+            "PERSONA_NATIVE_QUEUE_UNAVAILABLE",
+            last_reason,
+        )
+
     def turn_delivery_status(self, terminal_id: str) -> dict[str, Any]:
         session = self.get(terminal_id)
         if not isinstance(session.backend, ReconnectionPty):
@@ -3284,6 +3424,136 @@ def resume_argv(provider: str, resume_session_ref: str) -> list[str]:
     return []
 
 
+def _persona_prompt_cache_dir() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "Universe" / "persona-prompt-cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def persona_delivery_supported(provider: str, persona_text: str) -> tuple[bool, str]:
+    """Can this provider's real launch path deliver persona_text unmodified?
+
+    ([[persona-conductor-automation-plan]] P1, 2026-09-14 Conductor finding:
+    "provider별 지원 상태를 공개 경로에서 일관되게 표현하라, --help에 없다는
+    것만으로 불가능을 단정하지 말라, 본문을 평탄화해 실행하거나 applied로
+    찍지 말라"). Investigated beyond --help: CLAUDE's file flag was
+    empirically confirmed; CODEX's `-c key=value` was checked against a real
+    populated ~/.codex/config.toml (no instructions-file key) and an `@file`
+    indirection probe (`-c developer_instructions=@path`, accepted only as a
+    literal string per Codex's documented "TOML or literal" value parsing,
+    not a real file-read mechanism). The Rust Session Host's native queue is
+    the supported exact-text fallback for Codex; GROK's only file-based option,
+    `--agent-profile`, exists solely under the non-interactive `grok agent`
+    subcommand (a different execution model entirely), not the interactive
+    launch this codebase uses.
+
+    Returns (True, "") when the text can cross this provider's launch argv
+    exactly as written. For Codex text that requires the native queue this
+    argv-only helper returns (False, reason); the server must use
+    ``persona_delivery_mode`` and the Rust Host queue before recording applied
+    evidence. It must never flatten/mutate the text or mark an unsupported
+    transport as applied.
+    """
+
+    name = str(provider or "").strip().upper()
+    text = str(persona_text or "")
+    if name == "CLAUDE":
+        return True, ""
+    if name == "CODEX":
+        mode, reason = persona_delivery_mode(name, text)
+        if mode == "INLINE_ARG":
+            return True, ""
+        return False, reason
+    if name == "GROK":
+        if re.search(r"[\r\n]", text):
+            return False, (
+                "GROK has no supported exact persona delivery path for a body "
+                "containing a newline"
+            )
+        if '"' in text:
+            return False, (
+                "GROK has no supported exact persona delivery path for a body "
+                "containing a literal quote"
+            )
+        return True, ""
+    return False, f"unrecognized provider {name!r}"
+
+
+def persona_delivery_mode(provider: str, persona_text: str) -> tuple[str, str]:
+    """Select the exact provider transport for one persona body.
+
+    ``INLINE_ARG`` is limited to the managed Windows command line.  Codex's
+    Rust Session Host exposes a native ``codex queue --thread --message``
+    adapter; it accepts the original UTF-8 text without shell parsing, so any
+    body that is unsafe for one inline argument is deliberately routed there.
+    The mode is a transport capability, not an authority grant.
+    """
+
+    name = str(provider or "").strip().upper()
+    text = str(persona_text or "")
+    if name == "CLAUDE":
+        return "INLINE_FILE", ""
+    if name == "CODEX":
+        if not text.isascii() or re.search(r"[\r\n\"]", text):
+            return (
+                "NATIVE_QUEUE",
+                "Codex exact persona text requires the Rust Host native queue "
+                "because it contains Unicode, a newline, or a literal quote",
+            )
+        return "INLINE_ARG", ""
+    if name == "GROK":
+        if re.search(r"[\r\n\"]", text):
+            return "UNSUPPORTED", "Grok interactive Host has no exact file/native queue persona transport"
+        return "INLINE_ARG", ""
+    return "UNSUPPORTED", f"unrecognized provider {name!r}"
+
+
+def native_queue_persona_text(persona_text: str) -> str:
+    """Frame an exact persona body for one bounded Codex queue turn.
+
+    The body is embedded unchanged between fixed framing lines.  The framing
+    prevents the natural-language assignment from being mistaken for a new
+    task or permission while preserving every original code point.
+    """
+
+    text = str(persona_text or "")
+    return (
+        "Universe persona assignment context. This is natural-language framing, "
+        "not a permission grant or a task. Preserve it for this Session Anchor, "
+        "do not call tools, and wait for the operator after acknowledging it.\n"
+        "--- PERSONA BODY BEGIN ---\n"
+        + text
+        + "\n--- PERSONA BODY END ---"
+    )
+
+
+def _write_persona_prompt_cache_file(persona_text: str) -> Path:
+    """Write an exact, unmodified persona body to a content-addressed cache file.
+
+    Scope/ownership/lifecycle contract ([[persona-conductor-automation-plan]]
+    P1, 2026-09-14 Conductor finding): files live under a Universe-owned
+    cache directory (%LOCALAPPDATA%/Universe/persona-prompt-cache), named by
+    the SHA-256 of their exact content -- write-once, read-many, never
+    mutated in place. A file is safe to reuse across every launch that
+    resolves the same persona body (including across different Anchors and
+    provider sessions) and is not tied to any single terminal's lifetime, so
+    no per-terminal cleanup is required or attempted; it is regenerable from
+    persona_revision_snapshot at any time, so deleting it is always safe too
+    (no active garbage collection is implemented -- file count is bounded by
+    the number of distinct persona bodies ever created, not by launches).
+    """
+
+    digest = hashlib.sha256(persona_text.encode("utf-8")).hexdigest()[:40]
+    path = _persona_prompt_cache_dir() / f"{digest}.md"
+    if not path.exists():
+        # newline="" disables Python's universal-newline translation on
+        # write (Windows default would otherwise turn a bare \n into \r\n),
+        # so the file holds the persona body byte-for-byte.
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(persona_text)
+    return path
+
+
 def startup_argv(
     provider: str,
     resume_session_ref: str,
@@ -3296,12 +3566,36 @@ def startup_argv(
     host_turn_observation: bool = False,
     mode: str = "",
     project_id: str = "",
+    persona_prompt: str = "",
 ) -> list[str]:
     """Build one interactive CLI command without changing its supervisor anchor.
 
     Model and effort are per-terminal launch preferences.  They are not written
     back into the project default, and a later provider session id only enriches
     the supervisor session created for this PTY.
+
+    ``persona_prompt`` (optional) is the natural-language body of the persona
+    currently ACTIVE-assigned to this launch's Session Anchor
+    ([[persona-conductor-automation-plan]] P1). It is additive framing, never
+    a permission grant.
+
+    Provider support for delivering the EXACT original persona text (no
+    newline/quote/backslash mutation) differs and is verified per provider,
+    not assumed uniform (2026-09-14 Conductor finding):
+      - CLAUDE: `--append-system-prompt-file <path>` (confirmed present via
+        `claude --help`'s --bare description and an empirical accept-check;
+        combines with the separate inline `--append-system-prompt` used for
+        MASTER framing). The file carries the persona body byte-for-byte --
+        no flattening, no escaping, no argv exposure of the content at all.
+      - CODEX: the managed command line remains limited to ASCII text without
+        newlines or quotes. Bodies outside that subset are left out of argv
+        and delivered through the Rust Session Host's native
+        ``codex queue --thread --message`` transport after the provider
+        session binds. The queue receives the original body unchanged.
+      - GROK: no equivalent exact-text transport was found for the
+        interactive launch this codebase uses; unsupported bodies remain
+        omitted and are recorded as unsupported. See
+        ``persona_delivery_mode`` for the per-provider decision.
     """
     name = str(provider or "").strip().upper()
     model = str(model_ref or "").strip()
@@ -3314,22 +3608,48 @@ def startup_argv(
         argv.extend(["-c", "notify=" + json.dumps(notify)])
     if name in {"GROK", "CLAUDE", "CODEX"} and model:
         argv.extend(("--model", model))
-    if str(mode or "").strip().upper() == "MASTER":
-        master_prompt = MASTER_APPEND_SYSTEM_PROMPT.replace(
+    master_prompt = (
+        MASTER_APPEND_SYSTEM_PROMPT.replace(
             "PROJECT_ID", str(project_id or "").strip() or "the-project"
         )
-        if name == "CLAUDE":
+        if str(mode or "").strip().upper() == "MASTER"
+        else ""
+    )
+    # Preserve the stored revision byte-for-byte.  In particular, leading or
+    # trailing whitespace is part of the persona body and must reach the file
+    # or native queue unchanged; only the provider/mode coordinates above are
+    # normalized.
+    persona_text = str(persona_prompt or "")
+    if name == "CLAUDE":
+        # MASTER framing (no special characters by design) stays inline;
+        # the persona body -- arbitrary user prose -- goes through the
+        # file flag untouched, so both can be set independently without
+        # ever concatenating persona content into an argv string.
+        if master_prompt:
             argv.extend(("--append-system-prompt", master_prompt))
-        elif name == "CODEX":
-            # Codex accepts per-launch TOML overrides.  Keep the framing as
-            # additive developer instructions rather than replacing its built-in
-            # instructions with model_instructions_file. The managed Windows
-            # cmd boundary rejects literal quotes, while Codex treats an
-            # unparseable config value as a string, so pass the prompt as one
-            # unquoted argv value.
-            argv.extend(("--config", f"developer_instructions={master_prompt}"))
-        elif name == "GROK":
-            argv.extend(("--rules", master_prompt))
+        if persona_text:
+            persona_file = _write_persona_prompt_cache_file(persona_text)
+            argv.extend(("--append-system-prompt-file", str(persona_file)))
+    elif name in {"CODEX", "GROK"}:
+        # Only text that is safe for one managed Windows command-line value is
+        # included here. Codex's NATIVE_QUEUE mode is delivered later through
+        # the authenticated Rust Host; Grok's unsupported text remains out of
+        # argv and is recorded as unsupported by the server.
+        prompt_fragments = []
+        if master_prompt:
+            prompt_fragments.append(master_prompt)
+        delivery_mode, _delivery_reason = persona_delivery_mode(name, persona_text)
+        if persona_text and delivery_mode == "INLINE_ARG":
+            prompt_fragments.append(
+                "Assigned persona (natural-language framing, not a permission grant): "
+                + persona_text
+            )
+        if prompt_fragments:
+            combined_prompt = " ".join(prompt_fragments)
+            if name == "CODEX":
+                argv.extend(("--config", f"developer_instructions={combined_prompt}"))
+            else:
+                argv.extend(("--rules", combined_prompt))
     if selected_effort != "AUTO":
         if name == "GROK":
             argv.extend(("--reasoning-effort", selected_effort.lower()))

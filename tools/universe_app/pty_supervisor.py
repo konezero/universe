@@ -666,6 +666,46 @@ class SupervisedTerminalHost:
         return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/turn-delivery-status",
                                   payload={}).get("turn_delivery") or {})
 
+    def deliver_persona_native_queue(
+        self,
+        terminal_id: str,
+        persona_text: str,
+        *,
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        """Deliver one exact Codex persona through the supervisor-owned Host.
+
+        The standalone supervisor keeps the Rust Host and its provider-thread
+        binding in the same process as the terminal.  Keep the potentially
+        bounded receipt wait there; this side only transports the original
+        Unicode/quote/newline body as JSON over the authenticated local link.
+        """
+
+        try:
+            bounded_timeout = max(0.5, min(float(timeout_seconds), 60.0))
+        except (TypeError, ValueError):
+            bounded_timeout = 20.0
+        result = self._request(
+            "POST",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/persona-native-queue",
+            payload={
+                "persona_text": str(persona_text),
+                "timeout_seconds": bounded_timeout,
+            },
+            # The Host waits once for binding and once for the native queue
+            # receipt; leave a small transport margin without changing the
+            # Host's bounded timeout.
+            timeout=(bounded_timeout * 2.0) + 10.0,
+            audit_source="UNIVERSE_PERSONA_NATIVE_QUEUE",
+        )
+        delivery = result.get("persona_delivery")
+        if not isinstance(delivery, Mapping):
+            raise TerminalHostError(
+                "PERSONA_NATIVE_QUEUE_RESULT_INVALID",
+                "supervisor did not return a persona delivery result",
+            )
+        return dict(delivery)
+
     def submit_prompt(
         self,
         terminal_id: str,

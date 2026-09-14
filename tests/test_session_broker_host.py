@@ -16,6 +16,7 @@ if str(TOOLS) not in sys.path:
 
 from session_broker_host import (  # noqa: E402
     SessionBrokerClient,
+    SessionBrokerError,
     SessionBrokerService,
     _BrokerHTTPServer,
 )
@@ -85,6 +86,16 @@ class SessionBrokerServiceTests(unittest.TestCase):
             second_database = host_type.call_args_list[1].args[3]
             self.assertNotEqual(first_database, second_database)
             self.assertEqual(first_database.parent, second_database.parent)
+
+    def test_meeting_descriptor_suppresses_persistent_mode_greeting(self) -> None:
+        with TemporaryDirectory() as directory, patch(
+            "session_broker_host.ResidentModeSessionHost"
+        ) as host_type:
+            service = SessionBrokerService(Path(directory) / "broker.sqlite3")
+            descriptor = _descriptor()
+            descriptor["meeting_session"] = True
+            service._default_host(descriptor)
+            self.assertTrue(host_type.call_args.kwargs["suppress_mode_greeting"])
 
     def test_broker_owns_and_reuses_resumed_provider_host(self) -> None:
         with TemporaryDirectory() as directory:

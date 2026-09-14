@@ -50,6 +50,37 @@ class SessionBrokerError(RuntimeError):
         self.status = status
 
 
+def _provider_error_detail(error: BaseException) -> str:
+    """Return bounded, secret-free provider failure context for diagnostics."""
+
+    detail = str(error).strip()
+    diagnostic = getattr(error, "diagnostic", None)
+    if isinstance(diagnostic, Mapping):
+        safe = {
+            str(key): value
+            for key, value in diagnostic.items()
+            if str(key)
+            not in {
+                "token",
+                "credential",
+                "credential_ref",
+                "authorization",
+                "password",
+                "secret",
+            }
+        }
+        if safe:
+            detail = f"{detail}; diagnostic={json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)}"
+    # Provider errors are evidence, not a transcript.  Keep the bounded
+    # operation context while preventing accidental credential propagation.
+    detail = re.sub(
+        r"(?i)(token|credential|authorization|password|secret)(\s*[:=]\s*)[^,;\s]+",
+        r"\1\2[REDACTED]",
+        detail,
+    )
+    return detail[:1000]
+
+
 def _required(value: Any, field: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -91,6 +122,7 @@ class SessionBrokerService:
             ),
             session_node=str(descriptor.get("node") or descriptor.get("project_id")),
             target_kind="PROVIDER_SESSION",
+            suppress_mode_greeting=bool(descriptor.get("meeting_session")),
         )
 
     @staticmethod
@@ -105,6 +137,7 @@ class SessionBrokerService:
                 "mode",
                 "repository_root",
                 "model_ref",
+                "meeting_session",
             )
         )
 
@@ -172,7 +205,7 @@ class SessionBrokerService:
             code = str(
                 getattr(error, "code", None) or str(error) or type(error).__name__
             ).upper()
-            raise SessionBrokerError(code, str(error), 409) from error
+            raise SessionBrokerError(code, _provider_error_detail(error), 409) from error
         return {
             "schema": SESSION_BROKER_SCHEMA,
             "status": "SESSION_BROKER_TURN_COMPLETED",
@@ -211,7 +244,7 @@ class SessionBrokerService:
                 code = str(
                     getattr(error, "code", None) or str(error) or type(error).__name__
                 ).upper()
-                raise SessionBrokerError(code, str(error), 409) from error
+                raise SessionBrokerError(code, _provider_error_detail(error), 409) from error
             descriptor["provider"] = provider
             descriptor["provider_session_ref"] = provider_ref
             fingerprint = self._fingerprint(descriptor)

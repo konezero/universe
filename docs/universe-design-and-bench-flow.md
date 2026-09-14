@@ -602,3 +602,21 @@ keeps canonical `model_ref` and adds a bounded `execution_context` with
 turn and Skill binding; a Worker cannot redefine them. Older observations remain
 readable with `UNKNOWN` defaults, while new observations carry explicit context
 into the Project queue and Universe Bench DB.
+
+## Fleet execution visibility direction — 2026-09-14
+
+See [Fleet execution visibility](fleet-execution-visibility-design.md) for the
+user-requested goal-to-execution observation direction: TODO-bound executions,
+participating Workers and roles, current/historical attempts, and results with
+verification evidence. A project-level terminal match is not a work assignment.
+This is a design/BACKLOG addition, not an implementation or execution dispatch.
+
+## Persona-assigned Conductor automation — 2026-09-14
+
+The user and conversational Conductor continue to define the project's major
+shape through brainstorming. A separate CONDUCTOR session receives an editable
+natural-language persona and runs within that shape, organizing design meetings
+when needed, assigning work, and reviewing evidence. Major goal/scope changes
+return to the user and conversational Conductor. See
+[implementation plan](persona-conductor-automation-plan.md). This uses persona
+assignment rather than a fixed AUTOMATION Mode or role enum.

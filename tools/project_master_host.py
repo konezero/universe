@@ -5344,6 +5344,7 @@ class ResidentModeSessionHost:
         actor_label: str,
         session_node: str | None = None,
         target_kind: str = "PROJECT_MASTER",
+        suppress_mode_greeting: bool = False,
         session_supervisor: SessionSupervisorStore | None = None,
         supervisor_endpoint: str = "http://127.0.0.1:1",
         continuity_coordinator: ContinuitySaver | None = None,
@@ -5362,6 +5363,11 @@ class ResidentModeSessionHost:
         self.actor_label = _text(actor_label, "actor_label")
         self.session_node = _text(session_node or self.target_id, "session_node")
         self.target_kind = _text(target_kind, "target_kind").upper()
+        # Fresh meeting reviewers receive a bounded artifact prompt.  Their
+        # first turn must not prepend the persistent MASTER-mode greeting,
+        # which asks a provider to perform repository/session setup and can
+        # divert an otherwise read-only candidate turn into tool work.
+        self.suppress_mode_greeting = bool(suppress_mode_greeting)
         self.session_supervisor = session_supervisor
         self._supervisor_endpoint = _normalize_supervisor_endpoint(
             supervisor_endpoint
@@ -5412,6 +5418,8 @@ class ResidentModeSessionHost:
                 effort=effort,
                 session_action=normalized_action,
             )
+            if self.suppress_mode_greeting:
+                setattr(active, "_greeting_pending", False)
             return self._connection_status(active=active)
 
     def status(self) -> dict[str, Any]:
@@ -5709,6 +5717,15 @@ class ResidentModeSessionHost:
         if not force_new_session:
             # Validate before closing a provider or launching its replacement.
             self.store.assert_provider_session_ownership(provider)
+        stored_coordinate = self.store.last_provider_session()
+        stored_provider = (
+            str(stored_coordinate.get("provider") or "").upper()
+            if isinstance(stored_coordinate, Mapping)
+            else ""
+        )
+        provider_switch_requires_new_anchor = bool(
+            stored_provider and stored_provider != provider
+        )
         if model is not None or effort is not None:
             self._profile_provider = provider
             if model is not None:
@@ -5761,10 +5778,11 @@ class ResidentModeSessionHost:
             close = getattr(previous, "close", None)
             if callable(close):
                 close()
-        if force_new_session:
+        if force_new_session or provider_switch_requires_new_anchor:
             # NEW owns a fresh Supervisor Session Anchor before the provider
-            # reports its vendor session id. The provider observation binds to
-            # this slot instead of rewriting the previous default session.
+            # reports its vendor session id. A provider switch also owns a
+            # fresh Anchor; a live session may never be rebound across
+            # providers, even after its adapter has been closed.
             self.store.ensure_supervisor_session(provider, new_session=True)
         if self._custom_provider_factory is None:
             active = self._default_provider(

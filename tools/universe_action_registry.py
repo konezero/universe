@@ -155,6 +155,24 @@ SESSION_RESUME_REQUEST_SCHEMA = "universe.session-resume-action-request.v1"
 SESSION_RESUME_RESULT_SCHEMA = "universe.session-resume-receipt.v1"
 SESSION_RESUME_ACTION_SURFACE = "session.resume"
 
+# Persona Conductor automation is a bounded, durable work loop.  State and
+# queue Actions remain local mutations; the judge Action is the one explicit
+# provider boundary and must use the server-owned Task Frame Host.
+PERSONA_AUTOMATION_ACTION_IDS = (
+    "persona.automation.start",
+    "persona.automation.pause",
+    "persona.automation.resume",
+    "persona.automation.stop",
+    "persona.automation.status",
+    "persona.automation.tick",
+    "persona.automation.plan",
+    "persona.automation.judge",
+    "persona.automation.decide",
+    "persona.automation.dispatch",
+    "persona.automation.review",
+    "persona.automation.complete",
+)
+
 LEGACY_CLI_TERMINAL_HTTP_SURFACE = "/v1/terminals"
 LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE = "/v1/conductor-session/prepare"
 LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE = (
@@ -606,9 +624,19 @@ def build_default_action_registry(
     rag_archive_candidate_handler: ActionHandler | None = None,
     rag_memory_retention_handler: ActionHandler | None = None,
     rag_memory_relate_handler: ActionHandler | None = None,
+    persona_create_handler: ActionHandler | None = None,
+    persona_read_handler: ActionHandler | None = None,
+    persona_list_handler: ActionHandler | None = None,
+    persona_update_handler: ActionHandler | None = None,
+    persona_archive_handler: ActionHandler | None = None,
+    persona_restore_handler: ActionHandler | None = None,
+    persona_assign_handler: ActionHandler | None = None,
+    persona_assignment_read_handler: ActionHandler | None = None,
+    persona_unassign_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
+    persona_automation_handlers: Mapping[str, ActionHandler] | None = None,
     work_surface_handlers: Mapping[str, ActionHandler] | None = None,
 ) -> ActionRegistry:
     """Build the currently modeled mutating surface registry.
@@ -691,6 +719,96 @@ def build_default_action_registry(
         rag_memory_relate_handler,
         surfaces=("rag.memory-relate",),
     )
+    _PERSONA_STATEMENT = (
+        "Natural-language persona: no fixed role enum, a stable id with a "
+        "free-text title/responsibility body a human or an LLM can write the "
+        "same way, revisioned, assignable to one exact Session Anchor at a "
+        "time. Assignment never grants authority; it only shapes that "
+        "session's own launch framing."
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.create",
+            request_schema_ref="universe.persona-create-request.v1",
+            result_schema_ref="universe.persona-create-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"statement": _PERSONA_STATEMENT},
+        ),
+        persona_create_handler, surfaces=("persona.create",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.read",
+            request_schema_ref="universe.persona-read-request.v1",
+            result_schema_ref="universe.persona-read-result.v1",
+            side_effect_class="READ_ONLY",
+        ),
+        persona_read_handler, surfaces=("persona.read",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.list",
+            request_schema_ref="universe.persona-list-request.v1",
+            result_schema_ref="universe.persona-list-result.v1",
+            side_effect_class="READ_ONLY",
+        ),
+        persona_list_handler, surfaces=("persona.list",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.update",
+            request_schema_ref="universe.persona-update-request.v1",
+            result_schema_ref="universe.persona-update-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+        ),
+        persona_update_handler, surfaces=("persona.update",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.archive",
+            request_schema_ref="universe.persona-archive-request.v1",
+            result_schema_ref="universe.persona-state-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+        ),
+        persona_archive_handler, surfaces=("persona.archive",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.restore",
+            request_schema_ref="universe.persona-restore-request.v1",
+            result_schema_ref="universe.persona-state-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+        ),
+        persona_restore_handler, surfaces=("persona.restore",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.assign",
+            request_schema_ref="universe.persona-assign-request.v1",
+            result_schema_ref="universe.persona-assign-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"statement": _PERSONA_STATEMENT},
+        ),
+        persona_assign_handler, surfaces=("persona.assign",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.assignment-read",
+            request_schema_ref="universe.persona-assignment-read-request.v1",
+            result_schema_ref="universe.persona-assignment-read-result.v1",
+            side_effect_class="READ_ONLY",
+        ),
+        persona_assignment_read_handler, surfaces=("persona.assignment-read",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.unassign",
+            request_schema_ref="universe.persona-unassign-request.v1",
+            result_schema_ref="universe.persona-unassign-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+        ),
+        persona_unassign_handler, surfaces=("persona.unassign",),
+    )
     registry.register(
         ActionContract(
             action_id="rag.archive-candidate",
@@ -752,6 +870,44 @@ def build_default_action_registry(
     registry.register_legacy_surface(LEGACY_CLI_TERMINAL_HTTP_SURFACE)
     registry.register_legacy_surface(LEGACY_CONDUCTOR_SESSION_PREPARE_HTTP_SURFACE)
     registry.register_legacy_surface(LEGACY_PROJECT_MASTER_SESSION_PREPARE_HTTP_SURFACE)
+
+    automation_handlers = dict(persona_automation_handlers or {})
+    automation_specs = {
+        "persona.automation.start": ("LOCAL_DATABASE_MUTATION", "start"),
+        "persona.automation.pause": ("LOCAL_DATABASE_MUTATION", "pause"),
+        "persona.automation.resume": ("LOCAL_DATABASE_MUTATION", "resume"),
+        "persona.automation.stop": ("LOCAL_DATABASE_MUTATION", "stop"),
+        "persona.automation.status": ("READ_ONLY", "status"),
+        "persona.automation.tick": ("LOCAL_DATABASE_MUTATION", "tick"),
+        "persona.automation.plan": ("LOCAL_DATABASE_MUTATION", "plan"),
+        "persona.automation.judge": ("LOCAL_DATABASE_MUTATION", "judge"),
+        "persona.automation.decide": ("LOCAL_DATABASE_MUTATION", "decision"),
+        "persona.automation.dispatch": ("LOCAL_DATABASE_MUTATION", "dispatch"),
+        "persona.automation.review": ("LOCAL_DATABASE_MUTATION", "review"),
+        "persona.automation.complete": ("LOCAL_DATABASE_MUTATION", "complete"),
+    }
+    for action_id in PERSONA_AUTOMATION_ACTION_IDS:
+        side_effect, operation = automation_specs[action_id]
+        registry.register(
+            ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id.replace('.', '-')}-request.v1",
+                result_schema_ref="universe.persona-automation.v1",
+                side_effect_class=side_effect,
+                metadata={
+                    "operation": operation,
+                    "provider_invocation": (
+                        "TASK_FRAME_RUNTIME_CODEX_LUNA"
+                        if operation == "judge"
+                        else "FORBIDDEN"
+                    ),
+                    "queue_gateway": "MASTER_QUEUE" if operation == "dispatch" else "NONE",
+                    "durable": True,
+                },
+            ),
+            automation_handlers.get(action_id),
+            surfaces=(action_id,),
+        )
 
     supplied_handlers = dict(work_surface_handlers or {})
     for action_id in ("service.status", "service.restart"):
@@ -892,6 +1048,7 @@ __all__ = [
     "SESSION_RESUME_ACTION_SURFACE",
     "SESSION_RESUME_REQUEST_SCHEMA",
     "SESSION_RESUME_RESULT_SCHEMA",
+    "PERSONA_AUTOMATION_ACTION_IDS",
     "RegisteredAction",
     "SENSITIVE_CREDENTIAL_FIELDS",
     "SERVER_RESOLVED_CALLER_FIELDS",

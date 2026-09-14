@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from provider_model_catalog import ProviderModelCatalogStore, empty_catalog  # noqa: E402
+from host_profile import HostProfileStore  # noqa: E402
 from universe_memory import (  # noqa: E402
     MemoryError,
     consolidate_memory_candidates,
@@ -155,6 +157,10 @@ class ConductorDelegationMigrationTests(unittest.TestCase):
     def test_legacy_delegation_table_accepts_cancellation_requested(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database_path = Path(temp) / "legacy-universe.sqlite3"
+            host_profile_path = Path(temp) / "legacy-host.json"
+            catalog_path = Path(temp) / "legacy-provider-models.json"
+            catalog_path.write_text(json.dumps(empty_catalog()), encoding="utf-8")
+            host_profile = HostProfileStore(host_profile_path)
             with closing(sqlite3.connect(database_path)) as connection:
                 connection.execute(
                     """
@@ -180,8 +186,18 @@ class ConductorDelegationMigrationTests(unittest.TestCase):
                 server = create_server(
                     database_path=database_path,
                     token="legacy-test-token",
+                    service_state_path=Path(temp) / "legacy-server.json",
+                    remote_gateway_state_path=Path(temp) / "legacy-remote-gateway.json",
+                    remote_connector_state_path=Path(temp) / "legacy-remote-connector.json",
+                    remote_connector_config_path=Path(temp) / "legacy-remote-connector-config.json",
+                    host_profile=host_profile,
+                    provider_model_catalog=ProviderModelCatalogStore(
+                        path=catalog_path,
+                        host_profile=host_profile,
+                    ),
                     auto_start_project_masters=False,
                     auto_start_conductor_runtime=False,
+                    auto_start_goal_scheduler=False,
                 )
                 thread = threading.Thread(
                     target=server.serve_forever,
@@ -314,9 +330,17 @@ class MemoryCandidateApiTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
-        catalog_path = root / "provider-models.json"
-        catalog_path.write_text(json.dumps(available_catalog()), encoding="utf-8")
+        root = Path(self.temp.name).resolve()
+        self.fixture_root = root
+        self.database_path = root / "universe.sqlite3"
+        self.service_state_path = root / "server.json"
+        self.host_profile_path = root / "host.json"
+        self.remote_gateway_state_path = root / "remote-gateway.json"
+        self.remote_connector_state_path = root / "remote-connector.json"
+        self.remote_connector_config_path = root / "remote-connector-config.json"
+        self.catalog_path = root / "provider-models.json"
+        self.catalog_path.write_text(json.dumps(available_catalog()), encoding="utf-8")
+        self.host_profile = HostProfileStore(self.host_profile_path)
         self.release = threading.Event()
         self.executor_started = threading.Event()
 
@@ -329,15 +353,20 @@ class MemoryCandidateApiTests(unittest.TestCase):
             }
 
         self.server = create_server(
-            database_path=root / "universe.sqlite3",
+            database_path=self.database_path,
             token="candidate-test-token",
-            service_state_path=root / "server.json",
-            remote_gateway_state_path=root / "remote-gateway.json",
-            remote_connector_state_path=root / "remote-connector.json",
-            remote_connector_config_path=root / "remote-connector-config.json",
+            service_state_path=self.service_state_path,
+            remote_gateway_state_path=self.remote_gateway_state_path,
+            remote_connector_state_path=self.remote_connector_state_path,
+            remote_connector_config_path=self.remote_connector_config_path,
             auto_start_project_masters=False,
             auto_start_conductor_runtime=False,
-            provider_model_catalog=ProviderModelCatalogStore(path=catalog_path),
+            host_profile=self.host_profile,
+            provider_model_catalog=ProviderModelCatalogStore(
+                path=self.catalog_path,
+                host_profile=self.host_profile,
+            ),
+            auto_start_goal_scheduler=False,
             conductor_delegation_executor=delegation_executor,
         )
         host, port = self.server.server_address[:2]
@@ -358,11 +387,89 @@ class MemoryCandidateApiTests(unittest.TestCase):
                 "project_root": str(root / "TEST"),
             }
         )
+        host, port = self.server.server_address[:2]
+        self.fixture_coordinates = {
+            "owner_pid": os.getpid(),
+            "endpoint": self.endpoint,
+            "host": str(host),
+            "port": int(port),
+            "database_path": str(self.database_path),
+            "service_state_path": str(self.service_state_path),
+        }
+        self._assert_fixture_coordinates()
+
+    def _assert_fixture_coordinates(self) -> None:
+        root = self.fixture_root
+        paths = {
+            "database": self.database_path,
+            "service state": self.service_state_path,
+            "host profile": self.host_profile_path,
+            "provider catalog": self.catalog_path,
+            "remote gateway state": self.remote_gateway_state_path,
+            "remote connector state": self.remote_connector_state_path,
+            "remote connector config": self.remote_connector_config_path,
+        }
+        for label, path in paths.items():
+            resolved = path.expanduser().resolve()
+            if resolved == root or root not in resolved.parents:
+                raise AssertionError(
+                    "fixture resource escaped its temporary root "
+                    f"({label}={resolved}, root={root}, "
+                    f"owner_pid={os.getpid()})"
+                )
+        if self.server.store.database_path != self.database_path:
+            raise AssertionError(
+                "fixture store/database ownership mismatch "
+                f"(store={self.server.store.database_path}, "
+                f"expected={self.database_path}, owner_pid={os.getpid()})"
+            )
+        if self.server.service_state_path != self.service_state_path:
+            raise AssertionError(
+                "fixture service-state ownership mismatch "
+                f"(service={self.server.service_state_path}, "
+                f"expected={self.service_state_path}, owner_pid={os.getpid()})"
+            )
+        if self.server.host_profile.path != self.host_profile_path:
+            raise AssertionError(
+                "fixture host-profile ownership mismatch "
+                f"(service={self.server.host_profile.path}, "
+                f"expected={self.host_profile_path}, owner_pid={os.getpid()})"
+            )
+        if self.server.provider_model_catalog.path != self.catalog_path:
+            raise AssertionError(
+                "fixture provider-catalog ownership mismatch "
+                f"(service={self.server.provider_model_catalog.path}, "
+                f"expected={self.catalog_path}, owner_pid={os.getpid()})"
+            )
+        host, port = self.server.server_address[:2]
+        if str(host) not in {"127.0.0.1", "::1", "localhost"} or int(port) <= 0:
+            raise AssertionError(
+                "fixture endpoint is not an owned loopback socket "
+                f"(endpoint={self.endpoint}, owner_pid={os.getpid()})"
+            )
+
+    def test_fixture_service_coordinates_are_temp_owned(self) -> None:
+        self._assert_fixture_coordinates()
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(os.getpid(), self.fixture_coordinates["owner_pid"])
 
     def tearDown(self) -> None:
         self.release.set()
         self.server.shutdown()
         self.server.server_close()
+        shutdown_errors = list(getattr(self.server, "_shutdown_errors", []))
+        self.thread.join(timeout=5)
+        if self.thread.is_alive() or shutdown_errors:
+            coordinates = self.fixture_coordinates
+            raise AssertionError(
+                "fixture service cleanup did not complete; "
+                f"thread_alive={self.thread.is_alive()} "
+                f"shutdown_errors={shutdown_errors!r} "
+                f"cleanup owner pid={coordinates['owner_pid']} "
+                f"endpoint={coordinates['endpoint']} "
+                f"database_path={coordinates['database_path']} "
+                f"service_state_path={coordinates['service_state_path']}"
+            )
         self.temp.cleanup()
 
     def request(self, method: str, path: str, body: dict | None = None):

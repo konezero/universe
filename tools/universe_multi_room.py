@@ -3288,6 +3288,16 @@ class MultiRoomMeetingCoordinator:
                         )
                         error_detail = " ".join(str(error).split())[:240]
                         failure_reason = f"PROVIDER_ERROR:{error_code}:{error_detail}"
+                        provider_result = {
+                            "status": "FAILED",
+                            "reason": failure_reason,
+                            "error_code": error_code,
+                            "error_detail": error_detail,
+                            "operation_id": turn.get("provider_event_id"),
+                            "operation_correlation": turn.get("provider_event_id"),
+                            "result_status": "UNAVAILABLE",
+                            "result_receipt_ref": None,
+                        }
                     if attempt_number < bounded_attempts:
                         self.store.record_control_event(
                             room["room_id"],
@@ -3304,32 +3314,70 @@ class MultiRoomMeetingCoordinator:
                 if interrupted_reason is not None:
                     status = "INTERRUPTED"
                     reason = interrupted_reason
-                    turns.append(
-                        {
-                            "turn_number": turn_number,
-                            "binding_id": binding["binding_id"],
-                            "status": "INTERRUPTED",
-                            "reason": reason,
-                            "attempt_count": attempt_count,
-                            "input_event_id": turn["delta"].get("room_event_id"),
-                            "output_event_id": None,
+                    interrupted_turn = {
+                        "turn_number": turn_number,
+                        "binding_id": binding["binding_id"],
+                        "status": "INTERRUPTED",
+                        "reason": reason,
+                        "attempt_count": attempt_count,
+                        "input_event_id": turn["delta"].get("room_event_id"),
+                        "output_event_id": None,
+                    }
+                    if isinstance(provider_result, Mapping):
+                        provider_error = {
+                            key: provider_result.get(key)
+                            for key in (
+                                "error_code",
+                                "error_detail",
+                                "operation_id",
+                                "operation_correlation",
+                                "input_event_id",
+                                "run_id",
+                                "turn_number",
+                                "binding_id",
+                                "input_digest",
+                                "result_status",
+                                "result_receipt_ref",
+                            )
+                            if provider_result.get(key) is not None
                         }
-                    )
+                        if provider_error:
+                            interrupted_turn["provider_error"] = provider_error
+                    turns.append(interrupted_turn)
                     break
                 if failure_reason is not None or provider_result is None:
                     turn_failure_reason = failure_reason or "PROVIDER_RESULT_MISSING"
-                    turns.append(
-                        {
-                            "turn_number": turn_number,
-                            "binding_id": binding["binding_id"],
-                            "phase": phase,
-                            "status": "FAILED",
-                            "reason": turn_failure_reason,
-                            "attempt_count": attempt_count,
-                            "input_event_id": turn["delta"].get("room_event_id"),
-                            "output_event_id": None,
+                    failed_turn = {
+                        "turn_number": turn_number,
+                        "binding_id": binding["binding_id"],
+                        "phase": phase,
+                        "status": "FAILED",
+                        "reason": turn_failure_reason,
+                        "attempt_count": attempt_count,
+                        "input_event_id": turn["delta"].get("room_event_id"),
+                        "output_event_id": None,
+                    }
+                    if isinstance(provider_result, Mapping):
+                        provider_error = {
+                            key: provider_result.get(key)
+                            for key in (
+                                "error_code",
+                                "error_detail",
+                                "operation_id",
+                                "operation_correlation",
+                                "input_event_id",
+                                "run_id",
+                                "turn_number",
+                                "binding_id",
+                                "input_digest",
+                                "result_status",
+                                "result_receipt_ref",
+                            )
+                            if provider_result.get(key) is not None
                         }
-                    )
+                        if provider_error:
+                            failed_turn["provider_error"] = provider_error
+                    turns.append(failed_turn)
                     if meeting_protocol == "INDEPENDENT_PROPOSAL_REVIEW":
                         continue
                     status = "FAILED"

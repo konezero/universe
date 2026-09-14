@@ -8828,6 +8828,23 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .rag-relate-row input, .rag-relate-row select { flex: 1 1 auto; min-width: 120px; }
 .rag-memory-group > summary { cursor: pointer; padding: 12px 0; }
 
+.persona-root { display: flex; flex-direction: column; gap: 20px; padding: 16px; max-width: 720px; }
+.persona-root section { border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+.persona-root h3 { margin: 0 0 8px; font-size: 14px; }
+.persona-hint { color: var(--text-dim, #9a9a95); font-size: 12px; margin: 4px 0; }
+.persona-create input, .persona-create textarea,
+.persona-edit-form input, .persona-edit-form textarea { width: 100%; box-sizing: border-box; margin: 4px 0; }
+.persona-assign { display: flex; flex-direction: column; gap: 6px; }
+.persona-assign label { font-size: 11px; color: var(--text-dim, #9a9a95); margin-top: 6px; }
+.persona-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin: 8px 0; }
+.persona-card-archived { opacity: 0.6; }
+.persona-card h4 { margin: 0 0 6px; font-size: 13px; }
+.persona-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.persona-edit-form { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
+.persona-automation-summary { display: flex; flex-direction: column; gap: 6px; }
+.persona-automation-summary input, .persona-automation-summary textarea { width: 100%; box-sizing: border-box; margin: 3px 0; }
+.persona-automation-controls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+
 .rag-daily-summary { border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 16px; }
 .rag-daily-summary small { display: block; margin: 8px 0; }
 

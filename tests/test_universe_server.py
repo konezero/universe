@@ -41,6 +41,7 @@ from project_master_host import (  # noqa: E402
 from project_seed_assets import materialize_project_seed_assets  # noqa: E402
 from universe_app.terminal_host import TerminalHostError  # noqa: E402
 from universe_app.session_bus import SessionBusError  # noqa: E402
+from session_broker_host import SessionBrokerError  # noqa: E402
 from universe_server import (  # noqa: E402
     ConductorPermissionBridge,
     ConnectionCapabilities,
@@ -3410,6 +3411,55 @@ class UniverseLocalServiceTests(unittest.TestCase):
             injected["supervisor_session"]["provider_session_ref"],
         )
 
+    def test_session_hook_cannot_rebind_live_parent_to_unowned_child_ref(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        existing, _ = self.server.session_supervisor.register_session(
+            {
+                "session_id": "session-hook-parent-isolation-001",
+                "node": "GCS",
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-parent-session-001",
+                "state": "LIVE",
+                "currentness": "CURRENT",
+            }
+        )
+
+        status, response = self.request(
+            "POST",
+            "/v1/sessions/inject",
+            {
+                "project_id": "GCS",
+                "node": "GCS",
+                "mode": "MASTER",
+                "room_type": "PROJECT",
+                "slot_role": "MASTER",
+                "provider": "CODEX",
+                "provider_session_ref": "codex-child-session-001",
+                "supervisor_session_id": existing["session_id"],
+                "state": "LIVE",
+                "hook_observation": {
+                    "schema": "universe.hook-session-observation.v1",
+                    "trigger": "session_start",
+                    "observed_at": "2026-09-15T00:00:00Z",
+                },
+            },
+            self.token,
+        )
+
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual(
+            "PROVIDER_SESSION_REBIND_REQUIRES_CAS",
+            response.get("error_code"),
+        )
+        after = self.server.session_supervisor.get_session(existing["session_id"])
+        self.assertEqual(
+            "codex-parent-session-001", after["provider_session_ref"]
+        )
+        self.assertEqual(existing["row_version"], after["row_version"])
+        self.assertEqual(existing["binding_history"], after["binding_history"])
+
     def test_session_runtime_attachment_is_exact_idempotent_and_redacts_token(
         self,
     ) -> None:
@@ -3823,6 +3873,107 @@ class UniverseLocalServiceTests(unittest.TestCase):
         reconcile(server)
         self.assertEqual("RECEIVED",bus.acknowledge_instruction.call_args.kwargs["phase"])
         bridge.offer_turn.assert_not_called()
+
+    def test_persona_native_queue_reconcile_requires_exact_provider_phase_and_is_restart_safe(self):
+        from types import SimpleNamespace
+        from universe_app.host_turn_projection import reconcile
+
+        terminal = {
+            "terminal_id": "term-persona-reconcile",
+            "session_anchor_ref": "anchor-persona-reconcile",
+            "state": "LIVE",
+            "provider": "CODEX",
+        }
+        host = self._fake_master_host([terminal])
+        bridge = Mock()
+        bridge.turn_delivery_status.return_value = {
+            "messages": [
+                {"message_id": "persona-queued", "phase": "NATIVE_QUEUED"},
+                {"message_id": "other-message", "phase": "STARTED"},
+            ]
+        }
+        store = Mock()
+        store.read_persona_assignment.return_value = {
+            "state": "ACTIVE",
+            "persona_id": "persona-1",
+            "persona_revision": 2,
+            "assignment_revision": 7,
+            "queued_provider": "CODEX",
+            "queued_message_id": "persona-queued",
+        }
+        server = SimpleNamespace(
+            terminal_host=bridge,
+            store=store,
+            session_bus=Mock(),
+            _session_anchor_terminal_host=lambda: host,
+        )
+        server.session_bus.inbox.return_value = {"messages": []}
+
+        # Receipt alone is not applied.
+        result = reconcile(server)
+        self.assertEqual([], result["persona_applied"])
+        store.record_persona_applied.assert_not_called()
+
+        # A provider phase for the exact queued message promotes it once;
+        # a later recovery pass can safely observe the same ledger entry.
+        bridge.turn_delivery_status.return_value = {
+            "messages": [{"message_id": "persona-queued", "phase": "PROMPT_SUBMITTED"}]
+        }
+        store.record_persona_applied.return_value = True
+        result = reconcile(server)
+        self.assertEqual(["persona-queued"], result["persona_applied"])
+        store.record_persona_applied.assert_called_once_with(
+            "anchor-persona-reconcile",
+            "term-persona-reconcile",
+            "persona-1",
+            2,
+            7,
+            phase="PROMPT_SUBMITTED",
+            message_id="persona-queued",
+        )
+
+        # Reconcile after the provider advances the same turn records the
+        # phase progression once, while a duplicate restart observation is a
+        # no-op in the projection result.
+        store.read_persona_assignment.return_value = {
+            "state": "ACTIVE",
+            "persona_id": "persona-1",
+            "persona_revision": 2,
+            "assignment_revision": 7,
+            "queued_provider": "CODEX",
+            "queued_message_id": "persona-queued",
+            "applied_at": "2026-09-15T00:00:00Z",
+            "applied_phase": "PROMPT_SUBMITTED",
+        }
+        bridge.turn_delivery_status.return_value = {
+            "messages": [{"message_id": "persona-queued", "phase": "STARTED"}]
+        }
+        store.read_persona_assignment.side_effect = [
+            {
+                "state": "ACTIVE",
+                "persona_id": "persona-1",
+                "persona_revision": 2,
+                "assignment_revision": 7,
+                "queued_provider": "CODEX",
+                "queued_message_id": "persona-queued",
+                "applied_at": "2026-09-15T00:00:00Z",
+                "applied_phase": "PROMPT_SUBMITTED",
+            },
+            {
+                "state": "ACTIVE",
+                "persona_id": "persona-1",
+                "persona_revision": 2,
+                "assignment_revision": 7,
+                "queued_provider": "CODEX",
+                "queued_message_id": "persona-queued",
+                "applied_at": "2026-09-15T00:00:00Z",
+                "applied_phase": "STARTED",
+            },
+        ]
+        result = reconcile(server)
+        self.assertEqual(["persona-queued"], result["persona_applied"])
+        result = reconcile(server)
+        self.assertEqual([], result["persona_applied"])
 
     def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
         terminal = {
@@ -6759,6 +6910,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             resume_attachment_authorized=True,
             cols=120,
             rows=32,
+            persona_prompt="",
         )
 
     def test_cli_terminal_rebinds_only_the_exact_compatible_host_ref(self) -> None:
@@ -7733,6 +7885,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             resume_attachment_authorized=False,
             cols=120,
             rows=32,
+            persona_prompt="",
         )
 
     def test_conductor_prepare_rejects_model_from_another_provider(self) -> None:
@@ -12140,6 +12293,47 @@ class UniverseLocalServiceTests(unittest.TestCase):
             result["output_warning"],
         )
         self.assertEqual(2, turn.call_count)
+
+    def test_meeting_provider_adapter_preserves_provider_failure_evidence(self) -> None:
+        failure = SessionBrokerError(
+            "CODEX_TURN_FAILED",
+            "CODEX_TURN_FAILED; diagnostic={\"turn_id\": \"turn-7\", \"turn_status\": \"interrupted\"}",
+            409,
+        )
+        with patch.object(
+            self.server,
+            "resolve_provider_chat_session",
+            return_value={
+                "provider": "CODEX",
+                "provider_session_ref": "provider-session-1",
+            },
+        ), patch.object(self.server.session_broker, "turn", side_effect=failure):
+            result = self.server._invoke_multi_room_meeting_provider(
+                {
+                    "binding_id": "bind-provider-1",
+                    "provider": "CODEX",
+                    "provider_session_ref": "provider-session-1",
+                    "metadata": {"provider_chat_key": "provider_chat_verified"},
+                },
+                {
+                    "run_id": "meeting-adapter-failure",
+                    "turn_number": 2,
+                    "delta": {
+                        "room_event_id": "event-7",
+                        "body_text": "Feature intent",
+                    },
+                },
+            )
+
+        self.assertEqual("FAILED", result["status"])
+        self.assertEqual("CODEX_TURN_FAILED", result["error_code"])
+        self.assertIn("turn_status", result["error_detail"])
+        self.assertEqual(
+            "feature-meeting:meeting-adapter-failure:2:bind-provider-1",
+            result["operation_id"],
+        )
+        self.assertEqual("event-7", result["input_event_id"])
+        self.assertEqual("UNAVAILABLE", result["result_status"])
 
     def test_meeting_room_finding_http_records_and_collects_source_links(self) -> None:
         created = self.server.multi_rooms.create_meeting_room(

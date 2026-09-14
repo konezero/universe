@@ -210,6 +210,7 @@ from universe_action_registry import (
     build_default_action_registry,
     find_forbidden_caller_fields,
 )
+from persona_automation import PersonaAutomationError, PersonaAutomationStore
 from universe_remote_gateway import (
     GatewayError,
     default_gateway_state_path,
@@ -305,6 +306,8 @@ from universe_app.session_bus import (
 from universe_app.terminal_host import (
     TerminalHost,
     TerminalHostError,
+    persona_delivery_mode,
+    persona_delivery_supported,
     scan_managed_shell_identities,
 )
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
@@ -7320,6 +7323,94 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS project_memory_relation_source
                 ON project_memory_relation(memory_id, relation, target_memory_id);
 
+                -- Natural-language persona: stable id, title, free-text
+                -- responsibility body, revision, provenance, retention state.
+                -- Global (not project-scoped) -- a persona is written once and
+                -- assigned into any project's Session Anchor via
+                -- session_persona_assignment below ([[persona-conductor-automation-plan]]).
+                CREATE TABLE IF NOT EXISTS persona_definition (
+                    persona_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('ACTIVE', 'ARCHIVED')) DEFAULT 'ACTIVE',
+                    origin_ref TEXT NOT NULL,
+                    actor_ref TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS persona_definition_state
+                ON persona_definition(state, updated_at);
+
+                -- Immutable content snapshot for every revision a persona
+                -- ever reached (2026-09-14 Conductor finding: a later
+                -- persona.update must not retroactively change what an
+                -- EXISTING assignment pinned at an earlier revision resolves
+                -- to). Written once per revision bump (create/update/
+                -- archive/restore), never updated afterward.
+                CREATE TABLE IF NOT EXISTS persona_revision_snapshot (
+                    persona_id TEXT NOT NULL
+                        REFERENCES persona_definition(persona_id)
+                        ON DELETE CASCADE,
+                    revision INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(persona_id, revision)
+                );
+
+                -- One active persona assignment per exact Session Anchor. The
+                -- persona_revision pinned here is the revision that was live
+                -- at assignment time; a later persona edit does not silently
+                -- change a running assignment. Assignment survives Host
+                -- restart/Resume because it lives in this table, not in any
+                -- in-memory terminal/session state.
+                CREATE TABLE IF NOT EXISTS session_persona_assignment (
+                    session_anchor_ref TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    persona_id TEXT NOT NULL
+                        REFERENCES persona_definition(persona_id),
+                    persona_revision INTEGER NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    assignment_revision INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL
+                        CHECK(state IN ('ACTIVE', 'UNASSIGNED')) DEFAULT 'ACTIVE',
+                    applied_at TEXT,
+                    applied_terminal_id TEXT,
+                    applied_persona_revision INTEGER,
+                    applied_assignment_revision INTEGER,
+                    -- Distinct from applied_*: a launch whose selected exact
+                    -- text transport was unavailable or did not produce an
+                    -- acceptance receipt records why here instead of
+                    -- silently flattening the body and claiming applied_at
+                    -- (2026-09-14 Conductor finding).
+                    unsupported_at TEXT,
+                    unsupported_terminal_id TEXT,
+                    unsupported_provider TEXT,
+                    unsupported_reason TEXT,
+                    actor_ref TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS session_persona_assignment_project
+                ON session_persona_assignment(project_id, state, updated_at);
+
+                -- Whole-request idempotency store for persona.* Actions,
+                -- mirroring project_memory_relate_action's request_id +
+                -- canonical request_json binding.
+                CREATE TABLE IF NOT EXISTS persona_action_request (
+                    request_id TEXT PRIMARY KEY,
+                    request_json TEXT NOT NULL,
+                    actor_ref TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_candidate_review (
                     review_id TEXT PRIMARY KEY,
                     candidate_id TEXT NOT NULL
@@ -7920,6 +8011,34 @@ class UniverseStore:
                     connection.execute(
                         f"ALTER TABLE skill_run_observation "
                         f"ADD COLUMN {column} {definition}"
+                    )
+            # Native queue acceptance is a durable receipt, not proof that a
+            # provider has submitted or started the turn.  Keep that receipt
+            # separate from applied_* so a restart/reconcile can advance the
+            # exact assignment only after Host reports PROMPT_SUBMITTED or
+            # STARTED.  These columns are nullable for databases created by
+            # older releases and are deliberately additive.
+            persona_assignment_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(session_persona_assignment)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "queued_at": "TEXT",
+                "queued_terminal_id": "TEXT",
+                "queued_provider": "TEXT",
+                "queued_message_id": "TEXT",
+                "queued_submission_id": "TEXT",
+                "queued_phase": "TEXT",
+                "queued_persona_revision": "INTEGER",
+                "queued_assignment_revision": "INTEGER",
+                "applied_phase": "TEXT",
+                "applied_message_id": "TEXT",
+            }.items():
+                if column not in persona_assignment_columns:
+                    connection.execute(
+                        f"ALTER TABLE session_persona_assignment ADD COLUMN {column} {definition}"
                     )
             ensure_project_work_model_schema(connection)
             backfill_template_instances(
@@ -19545,6 +19664,579 @@ class UniverseStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    # -- Persona definitions and Session Anchor assignment ------------------
+    # Natural-language persona CRUD + exact-Anchor assignment
+    # ([[persona-conductor-automation-plan]] P1). Persona bodies are opinion/
+    # judgment text, not a permission grant: assignment never creates
+    # authority, it only shapes the natural-language framing appended to a
+    # session's own CLI launch (see startup_argv persona_prompt).
+
+    def _persona_idempotent(
+        self, request_id_raw: Any, value: Mapping[str, Any], actor: Mapping[str, Any],
+        do_write: Callable[[Any], dict[str, Any]],
+    ) -> dict[str, Any]:
+        request_id = str(request_id_raw or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            raise UniverseError(
+                "PERSONA_REQUEST_INVALID",
+                "request_id must be 8-100 ASCII letters, digits, underscores or hyphens",
+            )
+        request_json = _canonical_json(value)
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT request_json, result_json FROM persona_action_request WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_json"] != request_json:
+                    raise UniverseError(
+                        "PERSONA_REQUEST_CONFLICT",
+                        "request_id already identifies a different command",
+                        HTTPStatus.CONFLICT,
+                    )
+                result = json.loads(existing["result_json"])
+                result["replayed"] = True
+                return result
+            result = do_write(connection)
+            result["replayed"] = False
+            connection.execute(
+                "INSERT INTO persona_action_request(request_id, request_json, actor_ref, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (request_id, request_json, str(actor.get("actor_ref") or ""), _canonical_json(result), now),
+            )
+        return result
+
+    @staticmethod
+    def _persona_row(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "schema": "universe.persona.v1",
+            "persona_id": row["persona_id"],
+            "title": row["title"],
+            "body": row["body"],
+            "revision": row["revision"],
+            "state": row["state"],
+            "origin_ref": row["origin_ref"],
+            "actor_ref": row["actor_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _snapshot_persona_revision(
+        connection: sqlite3.Connection, persona_id: str, revision: int,
+        title: str, body: str, now: str,
+    ) -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO persona_revision_snapshot"
+            "(persona_id, revision, title, body, created_at) VALUES (?, ?, ?, ?, ?)",
+            (persona_id, revision, title, body, now),
+        )
+
+    def create_persona(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        title = _required_text(value.get("title"), "title")
+        if len(title) > 200:
+            raise UniverseError("PERSONA_INVALID", "title is too long")
+        body = _required_text(value.get("body"), "body")
+        if len(body) > 4000:
+            raise UniverseError("PERSONA_INVALID", "body is too long")
+        origin_ref = str(value.get("origin_ref") or "").strip() or str(actor.get("actor_ref") or "")
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = utc_now()
+            persona_id = "persona_" + uuid.uuid4().hex[:24]
+            connection.execute(
+                "INSERT INTO persona_definition"
+                "(persona_id, title, body, revision, state, origin_ref, actor_ref, created_at, updated_at) "
+                "VALUES (?, ?, ?, 1, 'ACTIVE', ?, ?, ?, ?)",
+                (persona_id, title, body, origin_ref, str(actor.get("actor_ref") or ""), now, now),
+            )
+            self._snapshot_persona_revision(connection, persona_id, 1, title, body, now)
+            row = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (persona_id,)
+            ).fetchone()
+            return {
+                "schema": "universe.persona-create-result.v1",
+                "status": "PERSONA_CREATED",
+                "persona": self._persona_row(row),
+            }
+
+        return self._persona_idempotent(value.get("request_id"), value, actor, write)
+
+    def get_persona(self, persona_id: str) -> dict[str, Any]:
+        normalized = _identifier(persona_id, "persona_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (normalized,)
+            ).fetchone()
+        if row is None:
+            raise UniverseError("PERSONA_NOT_FOUND", "persona does not exist", HTTPStatus.NOT_FOUND)
+        return self._persona_row(row)
+
+    def list_personas(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM persona_definition"
+        params: tuple[Any, ...] = ()
+        if not include_archived:
+            query += " WHERE state = 'ACTIVE'"
+        query += " ORDER BY updated_at DESC, persona_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._persona_row(row) for row in rows]
+
+    def update_persona(self, persona_id: str, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = _identifier(persona_id, "persona_id")
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("PERSONA_REVISION_INVALID", "expected_revision must be a positive integer")
+        title = value.get("title")
+        body = value.get("body")
+        if title is not None:
+            title = _required_text(title, "title")
+            if len(title) > 200:
+                raise UniverseError("PERSONA_INVALID", "title is too long")
+        if body is not None:
+            body = _required_text(body, "body")
+            if len(body) > 4000:
+                raise UniverseError("PERSONA_INVALID", "body is too long")
+        if title is None and body is None:
+            raise UniverseError("PERSONA_INVALID", "update requires title and/or body")
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = utc_now()
+            row = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (normalized,)
+            ).fetchone()
+            if row is None:
+                raise UniverseError("PERSONA_NOT_FOUND", "persona does not exist", HTTPStatus.NOT_FOUND)
+            if row["revision"] != expected_revision:
+                raise UniverseError(
+                    "PERSONA_REVISION_CONFLICT",
+                    f"persona revision changed; current revision is {row['revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            new_title = title if title is not None else row["title"]
+            new_body = body if body is not None else row["body"]
+            connection.execute(
+                "UPDATE persona_definition SET title = ?, body = ?, revision = revision + 1, "
+                "actor_ref = ?, updated_at = ? WHERE persona_id = ?",
+                (new_title, new_body, str(actor.get("actor_ref") or ""), now, normalized),
+            )
+            self._snapshot_persona_revision(connection, normalized, row["revision"] + 1, new_title, new_body, now)
+            updated = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (normalized,)
+            ).fetchone()
+            return {
+                "schema": "universe.persona-update-result.v1",
+                "status": "PERSONA_UPDATED",
+                "persona": self._persona_row(updated),
+            }
+
+        return self._persona_idempotent(value.get("request_id"), value, actor, write)
+
+    def _set_persona_state(
+        self, persona_id: str, value: Mapping[str, Any], actor: Mapping[str, Any],
+        *, target_state: str, status: str,
+    ) -> dict[str, Any]:
+        normalized = _identifier(persona_id, "persona_id")
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("PERSONA_REVISION_INVALID", "expected_revision must be a positive integer")
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = utc_now()
+            row = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (normalized,)
+            ).fetchone()
+            if row is None:
+                raise UniverseError("PERSONA_NOT_FOUND", "persona does not exist", HTTPStatus.NOT_FOUND)
+            if row["revision"] != expected_revision:
+                raise UniverseError(
+                    "PERSONA_REVISION_CONFLICT",
+                    f"persona revision changed; current revision is {row['revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                "UPDATE persona_definition SET state = ?, revision = revision + 1, actor_ref = ?, "
+                "updated_at = ? WHERE persona_id = ?",
+                (target_state, str(actor.get("actor_ref") or ""), now, normalized),
+            )
+            self._snapshot_persona_revision(connection, normalized, row["revision"] + 1, row["title"], row["body"], now)
+            updated = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (normalized,)
+            ).fetchone()
+            return {"schema": "universe.persona-state-result.v1", "status": status, "persona": self._persona_row(updated)}
+
+        return self._persona_idempotent(value.get("request_id"), value, actor, write)
+
+    def archive_persona(self, persona_id: str, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        return self._set_persona_state(persona_id, value, actor, target_state="ARCHIVED", status="PERSONA_ARCHIVED")
+
+    def restore_persona(self, persona_id: str, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        return self._set_persona_state(persona_id, value, actor, target_state="ACTIVE", status="PERSONA_RESTORED")
+
+    @staticmethod
+    def _assignment_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        applied_at = row["applied_at"]
+        queued_at = row["queued_at"]
+        unsupported_at = row["unsupported_at"]
+        if applied_at:
+            delivery_status = "APPLIED"
+        elif queued_at:
+            delivery_status = "NATIVE_QUEUED"
+        elif unsupported_at:
+            delivery_status = "UNSUPPORTED"
+        else:
+            delivery_status = "PENDING"
+        return {
+            "schema": "universe.persona-assignment.v1",
+            "session_anchor_ref": row["session_anchor_ref"],
+            "project_id": row["project_id"],
+            "persona_id": row["persona_id"],
+            "persona_revision": row["persona_revision"],
+            "scope": row["scope"],
+            "assignment_revision": row["assignment_revision"],
+            "state": row["state"],
+            "applied_at": applied_at,
+            "applied_terminal_id": row["applied_terminal_id"],
+            "applied_persona_revision": row["applied_persona_revision"],
+            "applied_assignment_revision": row["applied_assignment_revision"],
+            "applied_phase": row["applied_phase"],
+            "applied_message_id": row["applied_message_id"],
+            "queued_at": queued_at,
+            "queued_terminal_id": row["queued_terminal_id"],
+            "queued_provider": row["queued_provider"],
+            "queued_message_id": row["queued_message_id"],
+            "queued_submission_id": row["queued_submission_id"],
+            "queued_phase": row["queued_phase"],
+            "queued_persona_revision": row["queued_persona_revision"],
+            "queued_assignment_revision": row["queued_assignment_revision"],
+            "delivery_status": delivery_status,
+            "unsupported_at": row["unsupported_at"],
+            "unsupported_terminal_id": row["unsupported_terminal_id"],
+            "unsupported_provider": row["unsupported_provider"],
+            "unsupported_reason": row["unsupported_reason"],
+            "actor_ref": row["actor_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def read_persona_assignment(self, session_anchor_ref: str) -> dict[str, Any] | None:
+        anchor = _required_text(session_anchor_ref, "session_anchor_ref")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+        return self._assignment_row(row)
+
+    def assign_persona(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        anchor = _required_text(value.get("session_anchor_ref"), "session_anchor_ref")
+        project_id = _project_id(value.get("project_id"))
+        self.get_project(project_id)
+        persona_id = _identifier(value.get("persona_id"), "persona_id")
+        expected_persona_revision = value.get("expected_persona_revision")
+        if type(expected_persona_revision) is not int or isinstance(expected_persona_revision, bool) or expected_persona_revision < 1:
+            raise UniverseError("PERSONA_REVISION_INVALID", "expected_persona_revision must be a positive integer")
+        expected_assignment_revision = value.get("expected_assignment_revision", 0)
+        if type(expected_assignment_revision) is not int or isinstance(expected_assignment_revision, bool) or expected_assignment_revision < 0:
+            raise UniverseError("PERSONA_ASSIGNMENT_INVALID", "expected_assignment_revision must be a nonnegative integer")
+        scope = str(value.get("scope") or "")
+        if len(scope) > 400:
+            raise UniverseError("PERSONA_ASSIGNMENT_INVALID", "scope is too long")
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = utc_now()
+            persona_row = connection.execute(
+                "SELECT * FROM persona_definition WHERE persona_id = ?", (persona_id,)
+            ).fetchone()
+            if persona_row is None:
+                raise UniverseError("PERSONA_NOT_FOUND", "persona does not exist", HTTPStatus.NOT_FOUND)
+            if persona_row["state"] != "ACTIVE":
+                raise UniverseError("PERSONA_ARCHIVED", "an archived persona cannot be assigned", HTTPStatus.CONFLICT)
+            if persona_row["revision"] != expected_persona_revision:
+                raise UniverseError(
+                    "PERSONA_REVISION_CONFLICT",
+                    f"persona revision changed; current revision is {persona_row['revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+            current_revision = existing["assignment_revision"] if existing is not None else 0
+            if current_revision != expected_assignment_revision:
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_REVISION_CONFLICT",
+                    f"assignment revision changed; current revision is {current_revision}",
+                    HTTPStatus.CONFLICT,
+                )
+            actor_ref = str(actor.get("actor_ref") or "")
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO session_persona_assignment"
+                    "(session_anchor_ref, project_id, persona_id, persona_revision, scope, assignment_revision, "
+                    "state, applied_at, applied_terminal_id, applied_persona_revision, applied_assignment_revision, "
+                    "unsupported_at, unsupported_terminal_id, unsupported_provider, unsupported_reason, "
+                    "actor_ref, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 1, 'ACTIVE', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
+                    (anchor, project_id, persona_id, expected_persona_revision, scope, actor_ref, now, now),
+                )
+            else:
+                # A fresh assignment_revision means nothing has been applied
+                # under THIS state yet -- clear any evidence a prior
+                # assignment left behind so it can never be read as if it
+                # belonged to the persona/revision just assigned here
+                # (2026-09-14 Conductor finding).
+                connection.execute(
+                    "UPDATE session_persona_assignment SET project_id = ?, persona_id = ?, persona_revision = ?, "
+                    "scope = ?, assignment_revision = assignment_revision + 1, state = 'ACTIVE', "
+                    "applied_at = NULL, applied_terminal_id = NULL, applied_persona_revision = NULL, "
+                    "applied_assignment_revision = NULL, applied_phase = NULL, applied_message_id = NULL, "
+                    "queued_at = NULL, queued_terminal_id = NULL, queued_provider = NULL, "
+                    "queued_message_id = NULL, queued_submission_id = NULL, queued_phase = NULL, "
+                    "queued_persona_revision = NULL, queued_assignment_revision = NULL, "
+                    "unsupported_at = NULL, unsupported_terminal_id = NULL, "
+                    "unsupported_provider = NULL, unsupported_reason = NULL, "
+                    "actor_ref = ?, updated_at = ? WHERE session_anchor_ref = ?",
+                    (project_id, persona_id, expected_persona_revision, scope, actor_ref, now, anchor),
+                )
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+            return {
+                "schema": "universe.persona-assign-result.v1",
+                "status": "PERSONA_ASSIGNED",
+                "assignment": self._assignment_row(row),
+            }
+
+        return self._persona_idempotent(value.get("request_id"), value, actor, write)
+
+    def unassign_persona(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        anchor = _required_text(value.get("session_anchor_ref"), "session_anchor_ref")
+        expected_assignment_revision = value.get("expected_assignment_revision")
+        if type(expected_assignment_revision) is not int or isinstance(expected_assignment_revision, bool) or expected_assignment_revision < 1:
+            raise UniverseError("PERSONA_ASSIGNMENT_INVALID", "expected_assignment_revision must be a positive integer")
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            now = utc_now()
+            existing = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+            if existing is None:
+                raise UniverseError("PERSONA_ASSIGNMENT_NOT_FOUND", "no assignment exists for this Anchor", HTTPStatus.NOT_FOUND)
+            if existing["assignment_revision"] != expected_assignment_revision:
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_REVISION_CONFLICT",
+                    f"assignment revision changed; current revision is {existing['assignment_revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                "UPDATE session_persona_assignment SET state = 'UNASSIGNED', assignment_revision = assignment_revision + 1, "
+                    "applied_at = NULL, applied_terminal_id = NULL, applied_persona_revision = NULL, "
+                "applied_assignment_revision = NULL, applied_phase = NULL, applied_message_id = NULL, "
+                "queued_at = NULL, queued_terminal_id = NULL, queued_provider = NULL, "
+                "queued_message_id = NULL, queued_submission_id = NULL, queued_phase = NULL, "
+                "queued_persona_revision = NULL, queued_assignment_revision = NULL, "
+                "unsupported_at = NULL, unsupported_terminal_id = NULL, unsupported_provider = NULL, "
+                "unsupported_reason = NULL, "
+                "actor_ref = ?, updated_at = ? WHERE session_anchor_ref = ?",
+                (str(actor.get("actor_ref") or ""), now, anchor),
+            )
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+            return {
+                "schema": "universe.persona-unassign-result.v1",
+                "status": "PERSONA_UNASSIGNED",
+                "assignment": self._assignment_row(row),
+            }
+
+        return self._persona_idempotent(value.get("request_id"), value, actor, write)
+
+    def resolve_active_persona_prompt(self, session_anchor_ref: str) -> tuple[str, dict[str, Any]] | None:
+        """Look up the ACTIVE persona body PINNED at assignment time for a launch's Anchor.
+
+        Returns (body_text, assignment_row) or None when no ACTIVE assignment
+        exists. Called by the terminal-create HTTP path just before spawning a
+        CLI so the persona's natural-language framing can be appended to that
+        launch's argv -- the real "applies to the session" boundary, not a UI
+        badge or DB row alone.
+
+        Reads persona_revision_snapshot at the assignment's pinned
+        (persona_id, persona_revision), NEVER persona_definition's current
+        body -- a persona.update after this assignment was made must not
+        retroactively change what this already-pinned assignment resolves to
+        (2026-09-14 Conductor finding).
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ? AND state = 'ACTIVE'",
+                (anchor,),
+            ).fetchone()
+            if row is None:
+                return None
+            snapshot = connection.execute(
+                "SELECT * FROM persona_revision_snapshot WHERE persona_id = ? AND revision = ?",
+                (row["persona_id"], row["persona_revision"]),
+            ).fetchone()
+        if snapshot is None:
+            return None
+        return str(snapshot["body"]), self._assignment_row(row)
+
+    def record_persona_applied(
+        self, session_anchor_ref: str, terminal_id: str, persona_id: str,
+        persona_revision: int, assignment_revision: int, *,
+        phase: str = "PROVIDER_APPLIED", message_id: str = "",
+    ) -> bool:
+        """Stamp evidence that a launch actually included this EXACT assignment's prompt.
+
+        CAS-guarded on (session_anchor_ref, state='ACTIVE', persona_id,
+        persona_revision, assignment_revision) all at once: if the
+        assignment was reassigned or unassigned between resolve and this
+        call, the row no longer matches and this is a no-op that returns
+        False, rather than silently attaching this launch's evidence to
+        whatever assignment happens to occupy the anchor now (2026-09-14
+        Conductor finding). Returns True only if the stamp actually landed.
+            A returned Host reuse is not itself proof of a fresh launch -- the
+            caller decides whether to call this only for a genuinely new spawn.
+            A native queue receipt is deliberately not sufficient: queue
+            callers must pass its message_id only after Host reports
+            PROMPT_SUBMITTED or STARTED. Inline launch callers omit message_id.
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return False
+        phase_value = str(phase or "PROVIDER_APPLIED").strip() or "PROVIDER_APPLIED"
+        message_value = str(message_id or "").strip()
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ? "
+                "AND state = 'ACTIVE' AND persona_id = ? AND persona_revision = ? "
+                "AND assignment_revision = ?",
+                (anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision)),
+            ).fetchone()
+            if row is None:
+                return False
+            # A repeated reconcile is idempotent.  A queue-backed stamp must
+            # still identify the exact durable Host message; a bare call may
+            # never promote NATIVE_QUEUED to APPLIED.
+            if message_value:
+                if row["queued_message_id"] != message_value:
+                    return False
+            elif row["queued_message_id"]:
+                return False
+            if row["applied_at"]:
+                if message_value and row["applied_message_id"] not in {None, "", message_value}:
+                    return False
+                connection.execute(
+                    "UPDATE session_persona_assignment SET applied_phase = ?, applied_message_id = COALESCE(NULLIF(?, ''), applied_message_id), updated_at = ? "
+                    "WHERE session_anchor_ref = ? AND state = 'ACTIVE' AND persona_id = ? "
+                    "AND persona_revision = ? AND assignment_revision = ?",
+                    (phase_value, message_value, now, anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision)),
+                )
+                return True
+            cursor = connection.execute(
+                "UPDATE session_persona_assignment SET applied_at = ?, applied_terminal_id = ?, "
+                "applied_persona_revision = ?, applied_assignment_revision = ?, applied_phase = ?, "
+                "applied_message_id = ?, unsupported_at = NULL, unsupported_terminal_id = NULL, "
+                "unsupported_provider = NULL, unsupported_reason = NULL "
+                "WHERE session_anchor_ref = ? AND state = 'ACTIVE' AND persona_id = ? "
+                "AND persona_revision = ? AND assignment_revision = ?",
+                (
+                    now, str(terminal_id or ""), int(persona_revision), int(assignment_revision),
+                    phase_value, message_value or None,
+                    anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def record_persona_queued(
+        self, session_anchor_ref: str, terminal_id: str, persona_id: str,
+        persona_revision: int, assignment_revision: int, provider: str,
+        message_id: str, queued_submission_id: str, phase: str = "NATIVE_QUEUED",
+    ) -> bool:
+        """Record only the Host's native-queue acceptance receipt.
+
+        NATIVE_QUEUED is an accepted offer in the Host ledger.  It does not
+        mean that a provider prompt was submitted or that a turn started.
+        The exact message and assignment revisions make this idempotent and
+        prevent a delayed queue response from crossing a reassignment race.
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        message_value = str(message_id or "").strip()
+        if not anchor or not message_value:
+            return False
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ? "
+                "AND state = 'ACTIVE' AND persona_id = ? AND persona_revision = ? "
+                "AND assignment_revision = ?",
+                (anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision)),
+            ).fetchone()
+            if row is None or row["applied_at"] or row["unsupported_at"]:
+                return False
+            if row["queued_message_id"]:
+                return row["queued_message_id"] == message_value
+            cursor = connection.execute(
+                "UPDATE session_persona_assignment SET queued_at = ?, queued_terminal_id = ?, "
+                "queued_provider = ?, queued_message_id = ?, queued_submission_id = ?, queued_phase = ?, "
+                "queued_persona_revision = ?, queued_assignment_revision = ? "
+                "WHERE session_anchor_ref = ? AND state = 'ACTIVE' AND persona_id = ? "
+                "AND persona_revision = ? AND assignment_revision = ? AND applied_at IS NULL "
+                "AND unsupported_at IS NULL AND queued_message_id IS NULL",
+                (
+                    now, str(terminal_id or ""), str(provider or ""), message_value,
+                    str(queued_submission_id or ""), str(phase or "NATIVE_QUEUED"),
+                    int(persona_revision), int(assignment_revision),
+                    anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def record_persona_delivery_unsupported(
+        self, session_anchor_ref: str, terminal_id: str, persona_id: str,
+        persona_revision: int, assignment_revision: int, provider: str, reason: str,
+    ) -> bool:
+        """Stamp evidence that a launch could NOT deliver this exact assignment's prompt.
+
+        Same CAS shape as record_persona_applied (bound to the exact
+        assignment resolved before spawn), but for the opposite outcome:
+        the selected exact-text transport was unavailable or did not produce
+        an acceptance receipt. Writes to the separate unsupported_* columns,
+        never applied_at -- the two are mutually exclusive facts about the same
+        launch attempt
+        (2026-09-14 Conductor finding: do not flatten-and-mark-applied).
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return False
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE session_persona_assignment SET unsupported_at = ?, unsupported_terminal_id = ?, "
+                "unsupported_provider = ?, unsupported_reason = ?, queued_at = NULL, queued_terminal_id = NULL, "
+                "queued_provider = NULL, queued_message_id = NULL, queued_submission_id = NULL, "
+                "queued_phase = NULL, queued_persona_revision = NULL, queued_assignment_revision = NULL "
+                "WHERE session_anchor_ref = ? AND state = 'ACTIVE' AND persona_id = ? "
+                "AND persona_revision = ? AND assignment_revision = ? AND applied_at IS NULL "
+                "AND queued_at IS NULL",
+                (
+                    now, str(terminal_id or ""), str(provider or ""), str(reason or ""),
+                    anchor, str(persona_id or ""), int(persona_revision), int(assignment_revision),
+                ),
+            )
+            return cursor.rowcount == 1
+
     def propose_memory_links(
         self, project_id: str, *, limit: int = 20
     ) -> dict[str, Any]:
@@ -22831,6 +23523,12 @@ class UniverseStore:
         # Store the result and DONE atomically. Bus publication can be retried
         # after a crash without rerunning the Master work.
         message = self.get_master_message(message_id)
+        if message.get("delivery_state") == "FAILED":
+            raise UniverseError(
+                "MASTER_MESSAGE_STATE_CONFLICT",
+                "Master message is not in a processing state",
+                409,
+            )
         if message.get("provider") != provider:
             raise UniverseError("MASTER_MESSAGE_OWNER_MISMATCH", "provider does not own this claim", 409)
         body_text, result_ref = str(body_text or ""), str(result_ref or "")
@@ -22843,12 +23541,14 @@ class UniverseStore:
             raise UniverseError("MASTER_RESULT_CONFLICT", "completion payload differs from recorded result", 409)
         metadata = message.get("metadata") or {}
         anchor = str(metadata.get("reply_anchor_ref") or "").strip()
+        terminal_id = str(metadata.get("reply_terminal_id") or "").strip()
         updates = {"provider": provider, "result_ref": result_ref,
                    "completed_at": utc_now(), "completion_request": request}
         if anchor:
             updates["completion_result"] = {
                 "message_id": "msg_" + hashlib.sha256(("master-result:" + message_id).encode()).hexdigest()[:32],
                 "recipient_anchor_ref": anchor,
+                "recipient_terminal_id": terminal_id,
                 "body_text": "[Master completed: " + message_id + "]\n" +
                     (body_text.strip() or "Result summary was not supplied.") +
                     ("\nEvidence: " + result_ref if result_ref else ""),
@@ -29122,6 +29822,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
         self.todo_actions = TodoActions(store)
+        # Persona automation is a separate durable run projection.  It reuses
+        # the Universe database but remains distinct from Goal scheduling and
+        # from persona assignment itself.
+        self.persona_automation = PersonaAutomationStore(store.database_path)
         self.action_registry = build_default_action_registry(
             self._handle_feature_goal_start_action,
             rag_adopt_handler=self._handle_rag_adopt_action,
@@ -29130,9 +29834,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             rag_archive_candidate_handler=self._handle_rag_archive_candidate_action,
             rag_memory_retention_handler=self._handle_rag_memory_retention_action,
             rag_memory_relate_handler=self._handle_rag_memory_relate_action,
+            persona_create_handler=self._handle_persona_create_action,
+            persona_read_handler=self._handle_persona_read_action,
+            persona_list_handler=self._handle_persona_list_action,
+            persona_update_handler=self._handle_persona_update_action,
+            persona_archive_handler=self._handle_persona_archive_action,
+            persona_restore_handler=self._handle_persona_restore_action,
+            persona_assign_handler=self._handle_persona_assign_action,
+            persona_assignment_read_handler=self._handle_persona_assignment_read_action,
+            persona_unassign_handler=self._handle_persona_unassign_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
+            persona_automation_handlers={
+                action_id: self._handle_persona_automation_action
+                for action_id in (
+                    "persona.automation.start",
+                    "persona.automation.pause",
+                    "persona.automation.resume",
+                    "persona.automation.stop",
+                    "persona.automation.status",
+                    "persona.automation.tick",
+                    "persona.automation.plan",
+                    "persona.automation.judge",
+                    "persona.automation.decide",
+                    "persona.automation.dispatch",
+                    "persona.automation.review",
+                    "persona.automation.complete",
+                )
+            },
             # Shared operator commands resolve identity at the authenticated transport.
             # Legacy supervised automation keeps its separate Anchor-bound contract.
             work_surface_handlers={
@@ -29235,6 +29965,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             pass
         self._request_worker_lock = threading.Lock()
         self._active_request_workers = 0
+        self._active_request_sockets: set[socket.socket] = set()
         self._request_workers_idle = threading.Event()
         self._request_workers_idle.set()
         super().__init__(address, UniverseRequestHandler)
@@ -29548,12 +30279,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         with self._request_worker_lock:
             self._active_request_workers += 1
+            self._active_request_sockets.add(request)
             self._request_workers_idle.clear()
         try:
             super().process_request_thread(request, client_address)
         finally:
             with self._request_worker_lock:
                 self._active_request_workers -= 1
+                self._active_request_sockets.discard(request)
                 if self._active_request_workers == 0:
                     self._request_workers_idle.set()
 
@@ -29561,6 +30294,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """Wait until all request handlers have released their local resources."""
 
         return self._request_workers_idle.wait(timeout)
+
+    def close_active_request_sockets(self) -> int:
+        """Interrupt client sockets that outlived their owning request."""
+
+        with self._request_worker_lock:
+            sockets = list(self._active_request_sockets)
+        for request in sockets:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+        return len(sockets)
 
     def _loopback_endpoint_url(self) -> str:
         host, port = self.server_address[:2]
@@ -30062,6 +30811,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "MEMORY_SYNC_SELECTED_PERSISTED",
                 "SESSION_NEW_COMPLETED",
                 "TODO_RECORDED",
+                "PERSONA_AUTOMATION_RUN_STARTED",
+                "PERSONA_AUTOMATION_WORK_DISPATCHED",
             }
             else HTTPStatus.OK
         )
@@ -30558,6 +31309,967 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             value,
             actor,
         )
+
+    @staticmethod
+    def _persona_actor(context: Mapping[str, Any]) -> Mapping[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "Persona Actions require a server-resolved USER",
+                HTTPStatus.FORBIDDEN,
+            )
+        return actor
+
+    def _handle_persona_create_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_create",
+            required=frozenset({"title", "body", "request_id"}),
+            optional=frozenset({"origin_ref"}),
+        )
+        return self.store.create_persona(value, actor)
+
+    def _handle_persona_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        self._persona_actor(context)
+        value = _exact_object_fields(request, field="persona_read", required=frozenset({"persona_id"}))
+        return {"schema": "universe.persona-read-result.v1", "status": "PERSONA_READ",
+                "persona": self.store.get_persona(value["persona_id"])}
+
+    def _handle_persona_list_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        self._persona_actor(context)
+        value = _exact_object_fields(request, field="persona_list", required=frozenset(), optional=frozenset({"include_archived"}))
+        include_archived = bool(value.get("include_archived", False))
+        return {"schema": "universe.persona-list-result.v1", "status": "PERSONA_LISTED",
+                "personas": self.store.list_personas(include_archived=include_archived)}
+
+    def _handle_persona_update_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_update",
+            required=frozenset({"persona_id", "expected_revision", "request_id"}),
+            optional=frozenset({"title", "body"}),
+        )
+        return self.store.update_persona(value["persona_id"], value, actor)
+
+    def _handle_persona_archive_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_archive",
+            required=frozenset({"persona_id", "expected_revision", "request_id"}),
+        )
+        return self.store.archive_persona(value["persona_id"], value, actor)
+
+    def _handle_persona_restore_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_restore",
+            required=frozenset({"persona_id", "expected_revision", "request_id"}),
+        )
+        return self.store.restore_persona(value["persona_id"], value, actor)
+
+    def _validate_persona_assignment_anchor(self, project_id: str, session_anchor_ref: str) -> None:
+        """A persona assigns to a real, project-owned Session Anchor only.
+
+        UniverseStore.assign_persona cannot see this -- session_anchor_ref
+        identity lives in SessionSupervisor's own registry, a different
+        store. Reject an Anchor this project's session registry has never
+        recorded, and reject one recorded under a DIFFERENT project, rather
+        than trusting whatever string the caller supplies (2026-09-14
+        Conductor finding: previously only project_id existence was checked).
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        project = str(project_id or "").strip()
+        matches = [
+            session for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("session_anchor_ref") or "").strip() == anchor
+        ]
+        if not matches:
+            raise UniverseError(
+                "PERSONA_ASSIGNMENT_ANCHOR_NOT_FOUND",
+                "session_anchor_ref is not a registered Session Anchor",
+                HTTPStatus.NOT_FOUND,
+            )
+        owning_projects = {
+            str(session.get("current_project_id") or session.get("node") or "").casefold()
+            for session in matches
+        }
+        if project.casefold() not in owning_projects:
+            raise UniverseError(
+                "PERSONA_ASSIGNMENT_ANCHOR_PROJECT_MISMATCH",
+                "session_anchor_ref belongs to a different project",
+                HTTPStatus.CONFLICT,
+            )
+
+    def _validate_persona_automation_anchor(self, project_id: str, session_anchor_ref: str) -> None:
+        """Automation runs may only be owned by a project CONDUCTOR Anchor."""
+
+        self._validate_persona_assignment_anchor(project_id, session_anchor_ref)
+        anchor = str(session_anchor_ref or "").strip()
+        sessions = [
+            session for session in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(session.get("session_anchor_ref") or "").strip() == anchor
+        ]
+        modes = {
+            str(session.get("mode") or session.get("current_mode") or "").strip().upper()
+            for session in sessions
+        }
+        if "CONDUCTOR" not in modes:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_CONDUCTOR_REQUIRED",
+                "persona automation requires a registered CONDUCTOR Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+
+    def _persona_automation_reply_terminal(self, session_anchor_ref: str) -> str:
+        """Resolve the live terminal that receives a Master result.
+
+        The Session Anchor is the durable owner coordinate.  A terminal is
+        only included when the Supervisor can prove the exact live binding;
+        an empty value remains explicit evidence that terminal delivery is
+        unresolved rather than a guessed coordinate.
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return ""
+        sessions = [
+            item for item in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(item.get("session_anchor_ref") or "").strip() == anchor
+        ]
+        if len(sessions) != 1:
+            return ""
+        supervisor_session_id = str(sessions[0].get("session_id") or "").strip()
+        if not supervisor_session_id:
+            return ""
+        try:
+            terminals = self._session_anchor_terminal_host().list_sessions()
+        except (SessionBusError, TerminalHostError, UniverseError):
+            return ""
+        matches = [
+            item for item in terminals
+            if str(item.get("supervisor_session_id") or "").strip() == supervisor_session_id
+            and str(item.get("active_session_anchor_ref") or item.get("session_anchor_ref") or "").strip() == anchor
+        ]
+        return str(matches[0].get("terminal_id") or "").strip() if len(matches) == 1 else ""
+
+    def _handle_persona_assign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_assign",
+            required=frozenset({
+                "session_anchor_ref", "project_id", "persona_id",
+                "expected_persona_revision", "request_id",
+            }),
+            optional=frozenset({"expected_assignment_revision", "scope"}),
+        )
+        self._validate_persona_assignment_anchor(value["project_id"], value["session_anchor_ref"])
+        return self.store.assign_persona(value, actor)
+
+    def _handle_persona_assignment_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        self._persona_actor(context)
+        value = _exact_object_fields(request, field="persona_assignment_read", required=frozenset({"session_anchor_ref"}))
+        assignment = self.store.read_persona_assignment(value["session_anchor_ref"])
+        return {"schema": "universe.persona-assignment-read-result.v1", "status": "PERSONA_ASSIGNMENT_READ",
+                "assignment": assignment}
+
+    def _handle_persona_unassign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="persona_unassign",
+            required=frozenset({"session_anchor_ref", "expected_assignment_revision", "request_id"}),
+        )
+        return self.store.unassign_persona(value, actor)
+
+    def _persona_automation_plan(
+        self, value: Mapping[str, Any], *, record: bool = True
+    ) -> dict[str, Any]:
+        """Prepare a durable, evidence-backed Conductor decision.
+
+        Planning must not turn list order into authority.  A Goal and its
+        revision must be explicitly pinned by the run or this request, and a
+        Todo is eligible only when it belongs to that Goal and project.  Scope
+        and owner checks are returned as evidence so an unresolved selection
+        remains WAIT rather than being silently handed to Master.  This
+        method never invokes a provider; the existing Work Plan meeting route
+        is exposed as an explicit follow-up with its own result/review gate.
+        """
+
+        run = self.persona_automation.get_run(value["run_id"])
+        project_id = str(run["project_id"])
+        requested_goal = str(value.get("goal_id") or "").strip()
+        run_goal_ref = str(run.get("goal_ref") or "").strip()
+        requested_version = str(
+            value.get("goal_version") or run.get("goal_version") or ""
+        ).strip()
+        requested_scope_ref = str(value.get("scope_ref") or "").strip()
+        requested_owner = str(value.get("work_owner_ref") or "").strip()
+        run_owner = str(run.get("session_anchor_ref") or "").strip()
+        requested_next = str(value.get("next_condition") or "").strip()
+
+        goals = self.store.list_project_goals(project_id)
+        goals_by_id = {
+            str(goal.get("goal_id") or ""): goal
+            for goal in goals
+            if str(goal.get("goal_id") or "").strip()
+        }
+        pinned_goal_id = requested_goal or run_goal_ref
+        if requested_goal and run_goal_ref and requested_goal != run_goal_ref:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_GOAL_SELECTION_CONFLICT",
+                "goal_id does not match the Goal pinned on the automation run",
+                409,
+            )
+        selected_goal = goals_by_id.get(pinned_goal_id) if pinned_goal_id else None
+        if pinned_goal_id and selected_goal is None:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_GOAL_NOT_FOUND",
+                "the selected Goal is not part of the run project",
+                404,
+            )
+
+        goal_revision = str(selected_goal.get("revision")) if selected_goal else ""
+        goal_version_match = bool(
+            selected_goal and requested_version and requested_version == goal_revision
+        )
+        goal_selection_status = (
+            "PINNED_AND_VERSION_MATCHED"
+            if selected_goal and goal_version_match
+            else "GOAL_VERSION_REQUIRED"
+            if selected_goal
+            else "GOAL_SELECTION_REQUIRED"
+        )
+
+        todos = [
+            todo
+            for todo in self.store.list_todos()
+            if str(todo.get("project_id") or "") == project_id
+        ]
+
+        def work_plan_summary(goal: Mapping[str, Any]) -> dict[str, Any]:
+            try:
+                surface = self.store.goal_work_plan_surface(str(goal["goal_id"]))
+            except UniverseError as error:
+                return {
+                    "goal_id": goal.get("goal_id"),
+                    "goal_revision": goal.get("revision"),
+                    "goal_state": goal.get("state"),
+                    "surface_status": "UNAVAILABLE",
+                    "surface_error": error.code,
+                    "feature_goal_derivation": None,
+                    "candidate_count": 0,
+                    "adoption": None,
+                    "application": None,
+                }
+            return {
+                "goal_id": goal["goal_id"],
+                "goal_revision": goal.get("revision"),
+                "goal_state": goal.get("state"),
+                "surface_status": "READY",
+                "feature_goal_derivation": surface.get("feature_goal_derivation"),
+                "candidate_count": len(surface.get("candidates") or []),
+                "adoption": surface.get("adoption"),
+                "application": surface.get("application"),
+            }
+
+        # Keep all non-DONE goals visible for a Conductor selection, but only
+        # the explicitly pinned Goal may influence the decision below.
+        goal_candidates = [
+            goal for goal in goals if str(goal.get("state") or "").upper() != "DONE"
+        ]
+        work_plans = [work_plan_summary(goal) for goal in goal_candidates]
+
+        scope_text = str(run.get("scope") or "").strip()
+        scope_tokens = {
+            token
+            for token in re.split(r"[^A-Za-z0-9_.:-]+", scope_text)
+            if token
+        }
+        scope_matches = set()
+        if selected_goal:
+            scope_matches.update(
+                {
+                    str(selected_goal.get("goal_id") or ""),
+                    str(selected_goal.get("node_ref") or ""),
+                    project_id,
+                }
+            )
+        scope_alignment = "UNPROVEN"
+        if requested_scope_ref and requested_scope_ref in scope_matches:
+            scope_alignment = "EXPLICIT_REF_MATCHED"
+        elif requested_scope_ref and requested_scope_ref not in scope_matches:
+            scope_alignment = "MISMATCH"
+        elif (
+            selected_goal
+            and run_goal_ref == str(selected_goal.get("goal_id") or "")
+            and goal_version_match
+            and scope_tokens.intersection(scope_matches)
+        ):
+            scope_alignment = "RUN_GOAL_PINNED"
+        elif scope_tokens.intersection(scope_matches):
+            scope_alignment = "EXACT_REF_IN_SCOPE_TEXT"
+
+        owner_ref = requested_owner or run_owner
+        owner_alignment = (
+            "RUN_ANCHOR_BOUND"
+            if owner_ref and owner_ref == run_owner
+            else "MISMATCH"
+            if requested_owner
+            else "UNPROVEN"
+        )
+        selection_evidence = {
+            "status": goal_selection_status,
+            "requested_goal_id": requested_goal or None,
+            "run_goal_ref": run_goal_ref or None,
+            "selected_goal_id": selected_goal.get("goal_id") if selected_goal else None,
+            "selected_goal_version": goal_revision or None,
+            "requested_goal_version": requested_version or None,
+            "goal_version_match": goal_version_match,
+            "run_scope": scope_text,
+            "scope_ref": requested_scope_ref or None,
+            "scope_alignment": scope_alignment,
+            "work_owner_ref": owner_ref or None,
+            "work_owner_alignment": owner_alignment,
+        }
+
+        selected_todos = [
+            todo
+            for todo in todos
+            if selected_goal
+            and str(todo.get("goal_id") or "") == str(selected_goal.get("goal_id") or "")
+            and str(todo.get("project_id") or "") == project_id
+        ]
+        blocked_todos = [
+            todo for todo in selected_todos if str(todo.get("state") or "").upper() == "BLOCKED"
+        ]
+        executable_todos = [
+            todo
+            for todo in selected_todos
+            if str(todo.get("state") or "").upper() in {"IN_PROGRESS", "READY"}
+        ]
+        backlog_todos = [
+            todo for todo in selected_todos if str(todo.get("state") or "").upper() == "BACKLOG"
+        ]
+        executable_todos.sort(
+            key=lambda todo: (
+                0 if str(todo.get("state") or "").upper() == "IN_PROGRESS" else 1,
+                {"P0": 0, "P1": 1, "P2": 2, "P3": 3}.get(
+                    str(todo.get("priority") or "P3").upper(), 4
+                ),
+                int(todo.get("sort_order") or 0),
+                str(todo.get("todo_id") or ""),
+            )
+        )
+
+        evidence_refs = [
+            f"universe://projects/{project_id}/goals",
+            f"universe://projects/{project_id}/todos",
+            f"universe://projects/{project_id}/persona-automation/{run['run_id']}/plan",
+        ]
+        if selected_goal:
+            evidence_refs.extend(
+                [
+                    f"universe://goals/{selected_goal['goal_id']}",
+                    f"universe://goals/{selected_goal['goal_id']}/revision/{goal_revision}",
+                ]
+            )
+
+        decision_kind = "WAIT"
+        rationale = "An explicit Goal, revision, scope, and work-owner alignment is required before selecting work."
+        target: dict[str, Any] | None = {"selection": selection_evidence}
+        next_condition = requested_next or "Conductor pins a Goal, goal_version, scope_ref, and work owner for this run."
+        meeting: dict[str, Any] | None = None
+
+        selection_ready = bool(
+            selected_goal
+            and goal_version_match
+            and scope_alignment in {"EXPLICIT_REF_MATCHED", "RUN_GOAL_PINNED", "EXACT_REF_IN_SCOPE_TEXT"}
+            and owner_alignment == "RUN_ANCHOR_BOUND"
+        )
+        selected_plan = next(
+            (item for item in work_plans if item.get("goal_id") == (selected_goal or {}).get("goal_id")),
+            None,
+        )
+
+        if not selected_goal or not goal_version_match:
+            decision_kind = "WAIT"
+            rationale = "No Goal selection with an exact current goal_version is pinned to this run."
+        elif not selection_ready:
+            decision_kind = "WAIT"
+            rationale = "Goal selection exists, but scope or work-owner alignment is not proven for this run."
+        elif str(selected_goal.get("state") or "").upper() == "BLOCKED":
+            decision_kind = "ESCALATE"
+            target["goal_id"] = selected_goal["goal_id"]
+            target["state"] = "BLOCKED"
+            evidence_refs.append(f"universe://goals/{selected_goal['goal_id']}")
+            rationale = "The selected Goal is BLOCKED; execution cannot be inferred from another project Todo."
+            next_condition = requested_next or "the selected Goal receives an explicit resolution"
+        elif blocked_todos:
+            decision_kind = "ESCALATE"
+            blocked = blocked_todos[0]
+            target.update({"todo_id": blocked.get("todo_id"), "state": "BLOCKED"})
+            evidence_refs.append(f"universe://todos/{blocked['todo_id']}")
+            rationale = "A Todo in the selected Goal is BLOCKED; unrelated project Todos do not satisfy this run."
+            next_condition = requested_next or "the selected Goal Todo receives an explicit resolution"
+        else:
+            planning_gap = bool(
+                selected_plan
+                and selected_plan.get("goal_state") == "DESIGNING"
+                and selected_plan.get("feature_goal_derivation")
+                and not selected_plan.get("adoption")
+                and not selected_plan.get("candidate_count")
+            )
+            if planning_gap:
+                meeting_preconditions: dict[str, Any] = {
+                    "goal_is_designing": True,
+                    "feature_goal_provenance": True,
+                    "work_plan_not_adopted": True,
+                    "work_plan_candidate_absent": True,
+                    "meeting_room": "UNKNOWN",
+                    "verified_model_bindings": 0,
+                }
+                derivation = selected_plan.get("feature_goal_derivation") or {}
+                try:
+                    feature = self.store.get_feature_node(str(derivation.get("feature_id") or ""))
+                    room_id = str(feature.get("meeting_room_id") or "").strip()
+                    meeting_preconditions["meeting_room"] = bool(room_id)
+                    verified_bindings = []
+                    if room_id:
+                        verified_bindings = [
+                            item
+                            for item in self.multi_rooms.list_bindings(room_id)
+                            if item.get("slot_role") == "MODEL"
+                            and str(item.get("provider") or "").upper() in {"CODEX", "CLAUDE"}
+                            and item.get("provider_session_ref")
+                            and isinstance(item.get("metadata"), Mapping)
+                            and str(item["metadata"].get("provider_chat_key") or "").strip()
+                        ]
+                    meeting_preconditions["verified_model_bindings"] = len(verified_bindings)
+                except (UniverseError, AttributeError, TypeError):
+                    room_id = ""
+                meeting_ready = bool(
+                    meeting_preconditions["meeting_room"]
+                    and int(meeting_preconditions["verified_model_bindings"]) >= 2
+                )
+                target["goal_id"] = selected_goal["goal_id"]
+                evidence_refs.append(f"universe://goals/{selected_goal['goal_id']}/work-plans")
+                if meeting_ready:
+                    decision_kind = "MEETING"
+                    rationale = "The selected Goal has a verified design gap; the existing Work Plan meeting route is ready for an explicit invocation."
+                    next_condition = requested_next or "the meeting result produces reviewable Work Plan candidates"
+                    meeting = {
+                        "route": f"/v1/goals/{selected_goal['goal_id']}/work-plan-runs",
+                        "method": "POST",
+                        "goal_id": selected_goal["goal_id"],
+                        "request_body": {
+                            # Work-plan run IDs cross the Goal route's strict
+                            # identifier boundary; keep the meeting correlation
+                            # deterministic without introducing a colon.
+                            "run_id": f"persona_work_plan_{run['run_id']}",
+                            "max_turns": 4,
+                        },
+                        "preconditions": meeting_preconditions,
+                        "provider_invocation": "NONE_UNTIL_EXPLICIT_ROUTE_CALL",
+                        "result_contract": "GOAL_WORK_PLAN_CANDIDATES_READY",
+                        "review_gate": "adopt a candidate and apply it only after explicit review",
+                        "review_routes": {
+                            "adopt": f"/v1/goals/{selected_goal['goal_id']}/work-plan-adoptions",
+                            "apply": f"/v1/goals/{selected_goal['goal_id']}/work-plan-applications",
+                        },
+                        "task_frame_transition": "DEFERRED_UNTIL_REVIEWED_RESULT",
+                    }
+                else:
+                    decision_kind = "WAIT"
+                    rationale = "The selected Goal needs a Work Plan meeting, but its room/provider prerequisites are not verified."
+                    next_condition = requested_next or "a verified MEETING room with at least two bound model sessions"
+                    target["meeting_preconditions"] = meeting_preconditions
+            elif executable_todos:
+                decision_kind = "EXECUTE"
+                todo = executable_todos[0]
+                target.update(
+                    {
+                        "todo_id": todo.get("todo_id"),
+                        "goal_id": todo.get("goal_id"),
+                        "state": todo.get("state"),
+                        "selection": selection_evidence,
+                        "ownership": {
+                            "project_id": todo.get("project_id"),
+                            "goal_id": todo.get("goal_id"),
+                            "source_kind": todo.get("source_kind"),
+                            "owner_ref": owner_ref,
+                        },
+                    }
+                )
+                evidence_refs.append(f"universe://todos/{todo['todo_id']}")
+                rationale = "The selected Goal and exact revision/scope/owner checks identify one executable Todo; it can be handed to Master."
+                next_condition = requested_next or "Master result is returned to the bound reply coordinates and receives an acceptance review"
+            elif backlog_todos:
+                decision_kind = "WAIT"
+                rationale = "The selected Goal has only BACKLOG Todos; a READY or IN_PROGRESS selection is required before dispatch."
+                next_condition = requested_next or "a selected Todo is explicitly moved to READY or IN_PROGRESS"
+            else:
+                decision_kind = "WAIT"
+                rationale = "The selected Goal has no executable Todo or unresolved verified Work Plan route."
+                next_condition = requested_next or "the selected Goal surface changes or a reviewable planning result is recorded"
+
+        decision_value = {
+            "run_id": value["run_id"],
+            "owner_ref": value["owner_ref"],
+            "decision_id": value["decision_id"],
+            "kind": decision_kind,
+            "rationale": rationale,
+            "evidence_refs": evidence_refs,
+            "target": target,
+            "next_condition": next_condition,
+        }
+        if meeting is not None:
+            decision_value["meeting"] = meeting
+        result = (
+            self.persona_automation.record_decision(decision_value)
+            if record
+            else {
+                "schema": "universe.persona-automation.v1",
+                "status": "PERSONA_AUTOMATION_PLAN_PREPARED",
+                "run": run,
+                "decision": {
+                    "decision_id": value["decision_id"],
+                    "kind": decision_kind,
+                    "rationale": rationale,
+                    "evidence_refs": evidence_refs,
+                    "target": target,
+                    "next_condition": next_condition,
+                    "meeting": meeting,
+                    "invocation": None,
+                },
+            }
+        )
+        result["planning_context"] = {
+            "project_id": project_id,
+            "run_scope": scope_text,
+            "run_goal_ref": run_goal_ref or None,
+            "requested_goal_id": requested_goal or None,
+            "selected_goal": selected_goal,
+            "selection": selection_evidence,
+            "goals": goal_candidates,
+            "todos": todos,
+            "selected_goal_todos": selected_todos,
+            "work_plans": work_plans,
+            "decision_basis": {
+                "selected_goal_todo_count": len(selected_todos),
+                "executable_todo_count": len(executable_todos),
+                "backlog_todo_count": len(backlog_todos),
+                "blocked_todo_count": len(blocked_todos),
+            },
+            "provider_invocation": (
+                "NONE" if record else "PENDING_EXPLICIT_CODEX_JUDGEMENT"
+            ),
+            "next_route": meeting.get("route") if meeting else ("MASTER_QUEUE" if decision_kind == "EXECUTE" else "CONDUCTOR_REVIEW"),
+            "meeting": meeting,
+        }
+        return result
+
+    def _persona_automation_judge(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Obtain and validate one bounded Codex/Luna automation judgment."""
+
+        run_id = _required_text(value.get("run_id"), "run_id")
+        owner_ref = _required_text(value.get("owner_ref"), "owner_ref")
+        decision_id = _required_text(value.get("decision_id"), "decision_id")
+        run = self.persona_automation.get_run(run_id)
+        if str(run.get("session_anchor_ref") or "") != owner_ref:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_OWNER_MISMATCH",
+                "owner_ref must equal the run Session Anchor",
+                409,
+            )
+        existing = self.persona_automation.get_decision(run_id, decision_id)
+        if existing is not None and isinstance(existing.get("invocation"), Mapping):
+            return {
+                "schema": "universe.persona-automation.v1",
+                "status": "PERSONA_AUTOMATION_JUDGEMENT_REPLAYED",
+                "run": run,
+                "decision": existing,
+                "provider_invocation": dict(existing["invocation"]),
+                "meeting": run.get("current_meeting"),
+            }
+
+        plan_value = {
+            "run_id": run_id,
+            "owner_ref": owner_ref,
+            "decision_id": decision_id,
+        }
+        for field in (
+            "goal_id",
+            "goal_version",
+            "scope_ref",
+            "work_owner_ref",
+            "next_condition",
+        ):
+            if field in value:
+                plan_value[field] = value[field]
+        planned = self._persona_automation_plan(plan_value, record=False)
+        planning_context = dict(planned.get("planning_context") or {})
+        server_candidate = dict(planned.get("decision") or {})
+        selected_goal = planning_context.get("selected_goal")
+        selected_goal_todos = planning_context.get("selected_goal_todos") or []
+        selected_work_plan = next(
+            (
+                item
+                for item in (planning_context.get("work_plans") or [])
+                if isinstance(item, Mapping)
+                and item.get("goal_id") == (selected_goal or {}).get("goal_id")
+            ),
+            None,
+        )
+        input_context = {
+            "schema": "universe.persona-automation-judge-context.v1",
+            "run": {
+                "run_id": run_id,
+                "project_id": run.get("project_id"),
+                "session_anchor_ref": owner_ref,
+                "scope": run.get("scope"),
+                "instruction": run.get("instruction"),
+                "goal_ref": run.get("goal_ref"),
+                "goal_version": run.get("goal_version"),
+            },
+            "selection": planning_context.get("selection"),
+            "selected_goal": selected_goal,
+            "selected_goal_todos": selected_goal_todos,
+            "selected_work_plan": selected_work_plan,
+            "server_candidate": server_candidate,
+            "decision_basis": planning_context.get("decision_basis"),
+            "constraints": [
+                "Use only the supplied Goal, Todo, scope, and Work Plan evidence.",
+                "Return WAIT when the evidence does not prove a safe action.",
+                "EXECUTE may target only one supplied READY or IN_PROGRESS Todo.",
+                "MEETING may target only the supplied design-gap Goal.",
+                "Do not create authority, dispatch work, adopt a Work Plan, or claim execution.",
+            ],
+        }
+        if len(_canonical_json(input_context)) > 30000:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_JUDGEMENT_INPUT_TOO_LARGE",
+                "judgment evidence exceeds the bounded input limit",
+                413,
+            )
+
+        provider = str(value.get("provider") or "CODEX").strip().upper()
+        if provider != "CODEX":
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_PROVIDER_FORBIDDEN",
+                "persona automation judgment is restricted to the configured Codex Luna path",
+                409,
+            )
+        capability = self.runtime_host.provider_capability(provider)
+        model = str(capability.get("model") or "").strip()
+        if capability.get("status") != "AVAILABLE" or model.casefold() != "gpt-5.6-luna":
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_LUNA_UNAVAILABLE",
+                "the bounded judgment requires an available gpt-5.6-luna Host capability",
+                503,
+            )
+
+        invocation_id = f"persona-judge:{run_id}:{decision_id}"
+        frame_id = f"persona-judge:{run_id}:{decision_id}"
+        turn_id = "judge"
+        source_ref = (
+            f"universe://projects/{run['project_id']}/persona-automation/"
+            f"{run_id}/decisions/{decision_id}"
+        )
+        input_digest = _json_sha256(input_context)
+        invocation = {
+            "invocation_id": invocation_id,
+            "provider": provider,
+            "model_ref": f"provider://{provider}/model/{quote(model, safe='')}",
+            "owner_ref": owner_ref,
+            "session_anchor_ref": owner_ref,
+            "run_id": run_id,
+            "decision_id": decision_id,
+            "frame_id": frame_id,
+            "turn_id": turn_id,
+            "source_ref": source_ref,
+            "input_digest": input_digest,
+            "status": "PENDING",
+        }
+        self.persona_automation.record_invocation_attempt(
+            {
+                "run_id": run_id,
+                "owner_ref": owner_ref,
+                "decision_id": decision_id,
+                "invocation": invocation,
+            }
+        )
+
+        output_contract = {
+            "schema": "universe.persona-automation-judge-output.v1",
+            "format": "STRUCTURED_JSON",
+            "required": [
+                "kind",
+                "rationale",
+                "evidence_refs",
+                "target",
+                "next_condition",
+            ],
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "kind",
+                    "rationale",
+                    "evidence_refs",
+                    "target",
+                    "next_condition",
+                ],
+                "properties": {
+                    "kind": {"type": "string", "minLength": 3, "maxLength": 12},
+                    "rationale": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "evidence_refs": {
+                        "type": "array",
+                        "maxItems": 24,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                    },
+                    "target": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "todo_id": {"type": "string", "maxLength": 160},
+                            "goal_id": {"type": "string", "maxLength": 160},
+                            "state": {"type": "string", "maxLength": 32},
+                        },
+                    },
+                    "next_condition": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+            },
+            "instruction": (
+                "Return one JSON object. Choose exactly one kind from EXECUTE, MEETING, "
+                "ESCALATE, WAIT. The server will reject a target outside the supplied "
+                "evidence. Keep rationale concise and cite only supplied evidence_refs."
+            ),
+        }
+        try:
+            runtime_binding = self._persona_automation_runtime_binding(run)
+            provider_result = self.runtime_host.invoke_structured_task(
+                runtime_binding=runtime_binding,
+                provider=provider,
+                invocation_id=invocation_id,
+                frame_id=frame_id,
+                turn_id=turn_id,
+                source_ref=source_ref,
+                instruction=output_contract["instruction"],
+                context_pack=input_context,
+                output_contract=output_contract,
+            )
+        except RuntimeHostError as error:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_FAILED",
+                f"{error.code}: {error.detail}",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from error
+
+        returned = provider_result.get("structured_result")
+        if not isinstance(returned, Mapping):
+            raise UniverseError(
+                "PERSONA_AUTOMATION_JUDGEMENT_INVALID",
+                "Codex returned no structured automation judgment",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        kind = str(returned.get("kind") or "").strip().upper()
+        rationale = str(returned.get("rationale") or "").strip()
+        provider_evidence = returned.get("evidence_refs")
+        target = returned.get("target")
+        next_condition = str(returned.get("next_condition") or "").strip()
+        if (
+            kind not in {"EXECUTE", "MEETING", "ESCALATE", "WAIT"}
+            or not rationale
+            or not next_condition
+            or not isinstance(provider_evidence, list)
+            or not provider_evidence
+            or any(not isinstance(item, str) or not item.strip() for item in provider_evidence)
+            or not isinstance(target, Mapping)
+        ):
+            raise UniverseError(
+                "PERSONA_AUTOMATION_JUDGEMENT_INVALID",
+                "Codex judgment failed the server decision contract",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        target = dict(target)
+        executable_ids = {
+            str(item.get("todo_id") or "")
+            for item in selected_goal_todos
+            if str(item.get("state") or "").upper() in {"READY", "IN_PROGRESS"}
+        }
+        selected_goal_id = str((selected_goal or {}).get("goal_id") or "")
+        if kind == "EXECUTE" and str(target.get("todo_id") or "") not in executable_ids:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_JUDGEMENT_TARGET_INVALID",
+                "EXECUTE must target one supplied READY or IN_PROGRESS Todo",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        if kind == "MEETING" and (
+            str(target.get("goal_id") or "") != selected_goal_id
+            or server_candidate.get("kind") != "MEETING"
+        ):
+            raise UniverseError(
+                "PERSONA_AUTOMATION_JUDGEMENT_TARGET_INVALID",
+                "MEETING must target the supplied verified design-gap Goal",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        if kind in {"ESCALATE", "WAIT"} and target.get("goal_id"):
+            if str(target.get("goal_id")) != selected_goal_id:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_JUDGEMENT_TARGET_INVALID",
+                    "the judgment target is outside the selected Goal",
+                    HTTPStatus.BAD_GATEWAY,
+                )
+
+        receipt = str(provider_result.get("result_receipt_ref") or "").strip()
+        if not receipt:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_RECEIPT_MISSING",
+                "Codex result has no Runtime Host receipt",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        invocation.update(
+            {
+                "status": "COMPLETED",
+                "model_ref": provider_result.get("model_ref") or invocation["model_ref"],
+                "result_receipt_ref": receipt,
+                "worker_id": provider_result.get("worker_id"),
+                "worker_run_ref": provider_result.get("worker_run_ref"),
+                "task_frame_result_status": provider_result.get("task_frame_result_status"),
+                "terminal_result_verified": provider_result.get("terminal_result_verified") is True,
+                "result_digest": _json_sha256(returned),
+            }
+        )
+        evidence_refs = list(dict.fromkeys(
+            [str(item) for item in (server_candidate.get("evidence_refs") or [])]
+            + [f"provider-result:{receipt}"]
+            + [str(item).strip() for item in provider_evidence]
+        ))[:48]
+        meeting_result = None
+        if kind == "MEETING":
+            meeting = server_candidate.get("meeting")
+            meeting_request = dict((meeting or {}).get("request_body") or {})
+            meeting_request["max_turns"] = min(
+                max(1, int(value.get("max_turns") or meeting_request.get("max_turns") or 4)),
+                4,
+            )
+            try:
+                meeting_result = self.run_goal_work_plan_meeting(
+                    selected_goal_id, meeting_request
+                )
+            except UniverseError as error:
+                meeting_result = {
+                    "status": "GOAL_WORK_PLAN_MEETING_FAILED",
+                    "error_code": error.code,
+                    "detail": error.detail,
+                }
+            if isinstance(meeting_result, Mapping):
+                evidence_refs.append(
+                    f"meeting-result:{meeting_result.get('status', 'UNKNOWN')}"
+                )
+        invocation["meeting_result_status"] = (
+            meeting_result.get("status") if isinstance(meeting_result, Mapping) else None
+        )
+        decision_value = {
+            "run_id": run_id,
+            "owner_ref": owner_ref,
+            "decision_id": decision_id,
+            "kind": kind,
+            "rationale": rationale,
+            "evidence_refs": evidence_refs,
+            "target": target,
+            "next_condition": next_condition,
+            "invocation": invocation,
+        }
+        if meeting_result is not None:
+            decision_value["meeting"] = meeting_result
+        recorded = self.persona_automation.record_decision(decision_value)
+        recorded["status"] = "PERSONA_AUTOMATION_JUDGEMENT_RECORDED"
+        recorded["provider_invocation"] = invocation
+        recorded["provider_result"] = dict(returned)
+        recorded["planning_context"] = planning_context
+        recorded["planning_context"]["provider_invocation"] = invocation
+        recorded["meeting"] = meeting_result
+        return recorded
+
+    def _handle_persona_automation_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Dispatch one bounded persona automation operation.
+
+        The Action registry supplies the operation through its server-resolved
+        context.  All mutations remain USER Actions, while the run's lease
+        owner is an exact Session Anchor recorded in the durable run.
+        """
+
+        self._persona_actor(context)
+        action_id = str(context.get("action_id") or "").strip()
+        try:
+            if action_id == "persona.automation.start":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_start",
+                    required=frozenset({"project_id", "session_anchor_ref", "scope", "instruction", "request_id"}),
+                    optional=frozenset({"idempotency_key", "goal_ref", "goal_version", "budget"}),
+                )
+                project_id = _identifier(value["project_id"], "project_id")
+                anchor = _required_text(value["session_anchor_ref"], "session_anchor_ref")
+                self._validate_persona_automation_anchor(project_id, anchor)
+                assignment = self.store.read_persona_assignment(anchor)
+                return self.persona_automation.start_run(value, assignment or {})
+            if action_id == "persona.automation.pause":
+                value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
+                return self.persona_automation.pause_run(value)
+            if action_id == "persona.automation.resume":
+                value = _exact_object_fields(request, field="persona_automation_resume", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision"}))
+                return self.persona_automation.resume_run(value)
+            if action_id == "persona.automation.stop":
+                value = _exact_object_fields(request, field="persona_automation_stop", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
+                return self.persona_automation.stop_run(value)
+            if action_id == "persona.automation.status":
+                value = _exact_object_fields(request, field="persona_automation_status", required=frozenset(), optional=frozenset({"run_id", "project_id"}))
+                if value.get("run_id"):
+                    result = self.persona_automation.get_run(value["run_id"])
+                    result["events"] = self.persona_automation.events(value["run_id"], 30)
+                    return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_STATUS_COLLECTED", "run": result}
+                if value.get("project_id"):
+                    return self.persona_automation.surface(_identifier(value["project_id"], "project_id"))
+                raise PersonaAutomationError("PERSONA_AUTOMATION_STATUS_TARGET_REQUIRED", "run_id or project_id is required")
+            if action_id == "persona.automation.tick":
+                value = _exact_object_fields(request, field="persona_automation_tick", required=frozenset({"run_id", "owner_ref", "tick_id"}), optional=frozenset({"lease_seconds", "cursor"}))
+                return self.persona_automation.claim_tick(value)
+            if action_id == "persona.automation.decide":
+                value = _exact_object_fields(request, field="persona_automation_decide", required=frozenset({"run_id", "owner_ref", "decision_id", "kind", "rationale", "evidence_refs"}), optional=frozenset({"target", "next_condition", "meeting", "invocation"}))
+                return self.persona_automation.record_decision(value)
+            if action_id == "persona.automation.plan":
+                value = _exact_object_fields(request, field="persona_automation_plan", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition"}))
+                return self._persona_automation_plan(value)
+            if action_id == "persona.automation.judge":
+                value = _exact_object_fields(request, field="persona_automation_judge", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"provider", "goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "max_turns"}))
+                return self._persona_automation_judge(value)
+            if action_id == "persona.automation.dispatch":
+                value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}), optional=frozenset({"reply_anchor_ref", "reply_terminal_id"}))
+                run = self.persona_automation.get_run(value["run_id"])
+                expected_anchor = str(run.get("session_anchor_ref") or "").strip()
+                requested_anchor = str(value.get("reply_anchor_ref") or expected_anchor).strip()
+                if requested_anchor != expected_anchor:
+                    raise PersonaAutomationError("PERSONA_AUTOMATION_REPLY_ANCHOR_MISMATCH", "reply_anchor_ref must equal the run Session Anchor", 409)
+                value = {**value, "reply_anchor_ref": requested_anchor, "reply_terminal_id": str(value.get("reply_terminal_id") or self._persona_automation_reply_terminal(expected_anchor)).strip()}
+                return self.persona_automation.dispatch_work(value, self.store.create_master_message)
+            if action_id == "persona.automation.review":
+                value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id", "source_reply_anchor_ref", "source_reply_terminal_id"}))
+                return self.persona_automation.record_review(value)
+            if action_id == "persona.automation.complete":
+                value = _exact_object_fields(request, field="persona_automation_complete", required=frozenset({"run_id", "request_id", "complete"}), optional=frozenset({"expected_revision"}))
+                return self.persona_automation.complete_run(value)
+            raise PersonaAutomationError("PERSONA_AUTOMATION_ACTION_UNKNOWN", "unsupported persona automation action", 404)
+        except PersonaAutomationError as error:
+            try:
+                status = HTTPStatus(error.status)
+            except ValueError:
+                status = HTTPStatus.BAD_REQUEST
+            raise UniverseError(error.code, error.detail, status) from error
 
     def _handle_rag_archive_candidate_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
@@ -31081,6 +32793,75 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "reason": f"{type(error).__name__}: {error}{cleanup_error or ''}",
                 }
                 return None
+
+    def _persona_automation_runtime_binding(
+        self, run: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve a Task Frame Runtime bound to the run's Conductor Anchor.
+
+        The ordinary detached Conductor binding is reusable only when its
+        origin Anchor is exactly the run owner.  Otherwise attach the
+        run-owned Conductor session through the existing session-runtime
+        route; this keeps the user Conductor and an automation run from
+        silently sharing a frame coordinate.
+        """
+
+        project_id = _identifier(run.get("project_id"), "run.project_id")
+        anchor = _required_text(
+            run.get("session_anchor_ref"), "run.session_anchor_ref"
+        )
+        self._validate_persona_automation_anchor(project_id, anchor)
+        with self._planning_binding_lock:
+            planning = (
+                dict(self._planning_binding)
+                if self._planning_binding is not None
+                else None
+            )
+        if planning is not None and planning.get("origin_anchor_ref") == anchor:
+            return planning
+
+        sessions = [
+            item
+            for item in self.session_supervisor.list_sessions(include_hidden=True)
+            if str(item.get("session_anchor_ref") or "").strip() == anchor
+            and str(item.get("mode") or item.get("current_mode") or "")
+            .strip()
+            .upper()
+            == "CONDUCTOR"
+        ]
+        if len(sessions) != 1:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_RUNTIME_ANCHOR_UNAVAILABLE",
+                "the run owner Anchor does not resolve to one Conductor session",
+                HTTPStatus.CONFLICT,
+            )
+        session = dict(sessions[0])
+        session.setdefault("project_id", project_id)
+        attachment = self.ensure_session_runtime_attachment(session)
+        session_id = _required_text(
+            session.get("session_id"), "session.session_id"
+        )
+        with self._session_runtime_lock:
+            binding = self._session_runtime_bindings.get(session_id)
+            if binding is not None:
+                resolved = dict(binding)
+            else:
+                resolved = {}
+        if resolved.get("origin_anchor_ref") != anchor:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_RUNTIME_ANCHOR_MISMATCH",
+                "the attached Runtime does not preserve the run Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+        # Keep the non-secret attachment evidence available to callers while
+        # retaining the token only inside the process-local Runtime binding.
+        if not attachment or attachment.get("session_anchor_ref") != anchor:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_RUNTIME_ATTACHMENT_INVALID",
+                "run-owned Runtime attachment evidence is invalid",
+                HTTPStatus.CONFLICT,
+            )
+        return resolved
 
     def planning_binding_status(self) -> dict[str, Any]:
         with self._planning_binding_lock:
@@ -35821,6 +37602,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if notice is not None:
                 response["pending_work_notice"] = notice
             return response
+        # Real session-instruction application boundary, not a UI badge/DB row
+        # alone ([[persona-conductor-automation-plan]] P1): the ACTIVE persona
+        # assigned to this exact Session Anchor is resolved just before spawn
+        # and folded into this launch's own argv.
+        persona_resolution = self.store.resolve_active_persona_prompt(spawn_anchor_ref)
+        persona_prompt = persona_resolution[0] if persona_resolution else ""
         try:
             terminal = self.terminal_host.create(
                 project_id=project_id,
@@ -35835,6 +37622,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 resume_attachment_authorized=resume_attachment_authorized,
                 cols=int(payload.get("cols") or 120),
                 rows=int(payload.get("rows") or 32),
+                persona_prompt=persona_prompt,
             )
         except TerminalHostError as error:
             status = (
@@ -35843,6 +37631,130 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 else HTTPStatus.CONFLICT
             )
             raise UniverseError(error.code, error.detail, status) from error
+        if persona_resolution and not terminal.get("host_reused_existing"):
+            # Only a genuinely fresh CLI launch may receive this assignment;
+            # a reattach to an already-running Host process did not.  For
+            # Codex bodies that cannot cross one managed argv value, the
+            # Rust Host native queue is the exact-text delivery boundary.
+            resolved_provider = str(terminal.get("provider") or provider or "").strip().upper()
+            delivery_mode, delivery_reason = persona_delivery_mode(
+                resolved_provider, persona_prompt
+            )
+            delivered, unsupported_reason = persona_delivery_supported(
+                resolved_provider, persona_prompt
+            )
+            persona_delivery: dict[str, Any] = {
+                "mode": delivery_mode,
+                "status": "PENDING" if delivery_mode == "NATIVE_QUEUE" else "NOT_REQUIRED",
+            }
+            if delivered:
+                stamped = self.store.record_persona_applied(
+                    spawn_anchor_ref,
+                    terminal.get("terminal_id", ""),
+                    persona_resolution[1]["persona_id"],
+                    persona_resolution[1]["persona_revision"],
+                    persona_resolution[1]["assignment_revision"],
+                )
+                persona_delivery["status"] = (
+                    "APPLIED_INLINE_FILE"
+                    if delivery_mode == "INLINE_FILE"
+                    else "APPLIED_INLINE_ARG"
+                ) if stamped else "NOT_RUN"
+                if not stamped:
+                    persona_delivery["reason"] = (
+                        "assignment changed before application evidence could be recorded"
+                    )
+            elif delivery_mode == "NATIVE_QUEUE":
+                try:
+                    deliver_persona = getattr(
+                        self.terminal_host, "deliver_persona_native_queue", None
+                    )
+                    if not callable(deliver_persona):
+                        raise TerminalHostError(
+                            "PERSONA_NATIVE_QUEUE_UNAVAILABLE",
+                            "the configured Terminal Host has no native Codex queue adapter",
+                        )
+                    queue_result = deliver_persona(
+                        terminal.get("terminal_id", ""), persona_prompt
+                    )
+                    delivery_receipt = queue_result.get("delivery") or {}
+                    queued_message_id = str(
+                        queue_result.get("message_id")
+                        or delivery_receipt.get("message_id")
+                        or ""
+                    )
+                    queued_submission_id = str(
+                        delivery_receipt.get("queued_submission_id")
+                        or queue_result.get("queued_submission_id")
+                        or ""
+                    )
+                    queued_phase = str(
+                        delivery_receipt.get("phase")
+                        or queue_result.get("phase")
+                        or "NATIVE_QUEUED"
+                    )
+                    queued = self.store.record_persona_queued(
+                        spawn_anchor_ref,
+                        terminal.get("terminal_id", ""),
+                        persona_resolution[1]["persona_id"],
+                        persona_resolution[1]["persona_revision"],
+                        persona_resolution[1]["assignment_revision"],
+                        resolved_provider,
+                        queued_message_id,
+                        queued_submission_id,
+                        queued_phase,
+                    )
+                    persona_delivery.update(
+                        {
+                            # Queue receipt is a durable acceptance boundary;
+                            # actual provider application is filled later by
+                            # Host-turn reconciliation at PROMPT_SUBMITTED or
+                            # STARTED.  Never call this APPLIED on receipt.
+                            "status": "NATIVE_QUEUED" if queued else "NOT_RUN",
+                            "queue": queue_result,
+                            "application": "PENDING_PROVIDER_PHASE" if queued else "NOT_RUN",
+                        }
+                    )
+                    if not queued:
+                        persona_delivery["reason"] = (
+                            "assignment changed before native queue evidence could be recorded"
+                        )
+                except TerminalHostError as error:
+                    # A native queue offer that was never accepted is not
+                    # application evidence.  Preserve the exact reason in the
+                    # existing typed unsupported projection rather than
+                    # claiming a provider result that did not occur.
+                    unsupported_reason = (
+                        f"NATIVE_QUEUE_NOT_APPLIED: {error.code}: {error.detail}"
+                    )
+                    self.store.record_persona_delivery_unsupported(
+                        spawn_anchor_ref,
+                        terminal.get("terminal_id", ""),
+                        persona_resolution[1]["persona_id"],
+                        persona_resolution[1]["persona_revision"],
+                        persona_resolution[1]["assignment_revision"],
+                        resolved_provider,
+                        unsupported_reason,
+                    )
+                    persona_delivery.update(
+                        {"status": "NOT_RUN", "reason": unsupported_reason}
+                    )
+            else:
+                # This provider's real launch path could not carry the persona
+                # text unmodified. startup_argv left it OUT of argv rather
+                # than flattening it, so record the typed unsupported result.
+                self.store.record_persona_delivery_unsupported(
+                    spawn_anchor_ref,
+                    terminal.get("terminal_id", ""),
+                    persona_resolution[1]["persona_id"],
+                    persona_resolution[1]["persona_revision"],
+                    persona_resolution[1]["assignment_revision"],
+                    resolved_provider,
+                    unsupported_reason or delivery_reason,
+                )
+                persona_delivery["status"] = "UNSUPPORTED"
+                persona_delivery["reason"] = unsupported_reason or delivery_reason
+            terminal["persona_delivery"] = persona_delivery
         return {
             "schema": API_SCHEMA,
             "status": "CLI_TERMINAL_CREATED",
@@ -36223,15 +38135,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return dispatches
 
     def _publish_master_completion_results(self) -> dict[str, Any]:
-        published, errors = [], []
+        published, handoffs, errors = [], [], []
         for message in self.store.master_completion_results():
             try:
                 result = self.session_bus.publish_master_completion(message)
                 published.append(result["message_id"])
+                handoff = self.session_bus.reconcile_master_completion_handoff(message)
+                if handoff.get("message_ids"):
+                    handoffs.extend(handoff["message_ids"])
+                if handoff.get("errors"):
+                    errors.extend(
+                        {
+                            "operation": "RECONCILE_MASTER_HANDOFF",
+                            "message_id": message["message_id"],
+                            **error,
+                        }
+                        for error in handoff["errors"]
+                    )
             except (SessionBusError, sqlite3.Error) as error:
                 errors.append({"operation": "PUBLISH_MASTER_RESULT", "message_id": message["message_id"],
                                "error_code": getattr(error, "code", type(error).__name__), "detail": str(error)})
-        return {"message_ids": published, "errors": errors}
+        return {
+            "message_ids": published,
+            "handoff_message_ids": handoffs,
+            "errors": errors,
+        }
 
     def run_conductor_operating_loop_once(
         self, *, max_messages: int = 32
@@ -39502,6 +41430,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "current_anchor_ref": "UNKNOWN",
                 "alias": f"{provider} independent meeting reviewer",
                 "model_ref": setting.get("model_ref") or "UNKNOWN",
+                "meeting_session": True,
             }
             try:
                 resident = self.session_broker.create_session(descriptor)
@@ -39602,6 +41531,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "repository_root": metadata.get("repository_root"),
                 "current_anchor_ref": "UNKNOWN",
                 "model_ref": metadata.get("model_ref") or "UNKNOWN",
+                "meeting_session": True,
             }
         else:
             descriptor = self.resolve_provider_chat_session(chat_key)
@@ -39650,6 +41580,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "status": "FAILED",
                 "reason": error.code,
                 "provider_event_id": provider_event_id,
+                "error_code": error.code,
+                "error_detail": str(error.detail or error)[:1000],
+                "operation_id": provider_event_id,
+                "operation_correlation": provider_event_id,
+                "input_event_id": (
+                    turn.get("delta", {}).get("room_event_id")
+                    if isinstance(turn.get("delta"), Mapping)
+                    else None
+                ),
+                "run_id": turn.get("run_id"),
+                "turn_number": turn.get("turn_number"),
+                "binding_id": binding.get("binding_id"),
+                "input_digest": _json_sha256(
+                    {
+                        "run_id": turn.get("run_id"),
+                        "turn_number": turn.get("turn_number"),
+                        "binding_id": binding.get("binding_id"),
+                        "input_event_id": (
+                            turn.get("delta", {}).get("room_event_id")
+                            if isinstance(turn.get("delta"), Mapping)
+                            else None
+                        ),
+                        "delta_body_digest": _json_sha256(delta_body),
+                    }
+                ),
+                "result_status": "UNAVAILABLE",
+                "result_receipt_ref": None,
             }
         body_text = str(completed.get("body") or "")
 
@@ -39668,7 +41625,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 parsed = json.loads(candidate_text)
             except json.JSONDecodeError:
                 return "JSON_INVALID"
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("route"), dict):
+            if not isinstance(parsed, dict):
+                return "JSON_SHAPE_INVALID"
+            if isinstance(parsed.get("route"), list):
+                try:
+                    self._parse_goal_work_plan_output(candidate_text)
+                except UniverseError as error:
+                    return error.code
+                return None
+            if not isinstance(parsed.get("route"), dict):
                 return "JSON_SHAPE_INVALID"
             try:
                 self._parse_expected_path_candidate_output(
@@ -39699,6 +41664,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "status": "FAILED",
                     "reason": error.code,
                     "provider_event_id": provider_event_id,
+                    "error_code": error.code,
+                    "error_detail": str(error.detail or error)[:1000],
+                    "operation_id": provider_event_id,
+                    "operation_correlation": provider_event_id,
+                    "input_event_id": (
+                        turn.get("delta", {}).get("room_event_id")
+                        if isinstance(turn.get("delta"), Mapping)
+                        else None
+                    ),
+                    "run_id": turn.get("run_id"),
+                    "turn_number": turn.get("turn_number"),
+                    "binding_id": binding.get("binding_id"),
+                    "input_digest": _json_sha256(
+                        {
+                            "run_id": turn.get("run_id"),
+                            "turn_number": turn.get("turn_number"),
+                            "binding_id": binding.get("binding_id"),
+                            "input_event_id": (
+                                turn.get("delta", {}).get("room_event_id")
+                                if isinstance(turn.get("delta"), Mapping)
+                                else None
+                            ),
+                            "delta_body_digest": _json_sha256(delta_body),
+                        }
+                    ),
+                    "result_status": "UNAVAILABLE",
+                    "result_receipt_ref": None,
                 }
             body_text = str(completed.get("body") or "")
             validation_error = candidate_error(body_text)
@@ -40130,6 +42122,136 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             parsed = json.loads(text)
         except json.JSONDecodeError as error:
             raise UniverseError("GOAL_WORK_PLAN_JSON_INVALID", "provider Work Plan output must be one JSON object") from error
+        if isinstance(parsed, dict) and isinstance(parsed.get("route"), list):
+            title = _required_text(parsed.get("title"), "goal_work_plan.title")
+            summary = _required_text(parsed.get("summary"), "goal_work_plan.summary")
+            route_items = parsed["route"]
+            if not 1 <= len(route_items) <= 24:
+                raise UniverseError(
+                    "GOAL_WORK_PLAN_TODOS_INVALID",
+                    "reviewed route requires 1 to 24 bounded steps",
+                )
+            todos: list[dict[str, str]] = []
+            for index, raw_item in enumerate(route_items):
+                if not isinstance(raw_item, Mapping):
+                    raise UniverseError(
+                        "REQUEST_INVALID",
+                        f"goal_work_plan.route[{index}] must be an object",
+                    )
+                item_title = _required_text(
+                    raw_item.get("title") or raw_item.get("step"),
+                    "route.title",
+                )
+                detail = _required_text(
+                    raw_item.get("description")
+                    or raw_item.get("summary")
+                    or raw_item.get("detail"),
+                    "route.description",
+                )
+                acceptance = _required_text(
+                    raw_item.get("acceptance")
+                    or "Review this bounded route step against the selected Goal.",
+                    "route.acceptance",
+                )
+                todos.append(
+                    {
+                        "title": item_title[:160],
+                        "detail": detail[:3000],
+                        "acceptance": acceptance[:1000],
+                        "priority": "AUTO",
+                    }
+                )
+            milestones = [
+                {
+                    "title": "Reviewed implementation route",
+                    "description": summary[:4000],
+                    "todos": todos[index : index + 8],
+                }
+                for index in range(0, len(todos), 8)
+            ]
+            if len(milestones) > 6:
+                raise UniverseError(
+                    "GOAL_WORK_PLAN_MILESTONES_INVALID",
+                    "reviewed route produced too many bounded milestones",
+                )
+            parsed = {"title": title, "summary": summary, "milestones": milestones}
+        # The bounded Work Plan meeting reuses the existing independent
+        # proposal protocol, whose provider contract is an Expected Path
+        # candidate (`route`).  Convert that reviewed route into a durable
+        # Work Plan shape before validation so the meeting result can be
+        # reviewed/adopted without inventing execution authority.
+        if isinstance(parsed, dict) and isinstance(parsed.get("route"), dict):
+            candidate = UniverseHTTPServer._parse_expected_path_candidate_output(
+                text,
+                fallback_title="Feature Meeting Work Plan candidate",
+            )
+            route = candidate["route"]
+            steps_by_id = {
+                str(step["step_id"]): step
+                for step in route.get("steps", [])
+                if isinstance(step, Mapping)
+            }
+            raw_phases = [
+                phase
+                for phase in route.get("implementation_phases", [])
+                if isinstance(phase, Mapping)
+            ]
+            phase_groups: list[tuple[str, list[Mapping[str, Any]]]] = []
+            assigned: set[str] = set()
+            for phase_index, phase in enumerate(raw_phases, start=1):
+                phase_title = str(phase.get("title") or f"Implementation phase {phase_index}").strip()
+                phase_steps = [
+                    steps_by_id[step_id]
+                    for step_id in phase.get("step_ids", [])
+                    if isinstance(step_id, str) and step_id in steps_by_id
+                ]
+                if phase_steps:
+                    phase_groups.append((phase_title, phase_steps))
+                    assigned.update(str(step["step_id"]) for step in phase_steps)
+            unassigned = [
+                step for step_id, step in steps_by_id.items() if step_id not in assigned
+            ]
+            if unassigned:
+                phase_groups.append(("Unphased implementation steps", unassigned))
+            if not phase_groups:
+                phase_groups = [("Implementation route", list(steps_by_id.values()))]
+            acceptance = "; ".join(
+                str(item).strip()
+                for item in route.get("acceptance_conditions", [])
+                if str(item).strip()
+            ) or "Review the bounded route against the selected Goal and specification."
+            milestones: list[dict[str, Any]] = []
+            for phase_title, phase_steps in phase_groups:
+                for chunk_index in range(0, len(phase_steps), 8):
+                    chunk = phase_steps[chunk_index : chunk_index + 8]
+                    suffix = (
+                        f" ({chunk_index // 8 + 1})" if len(phase_steps) > 8 else ""
+                    )
+                    milestones.append(
+                        {
+                            "title": (phase_title + suffix)[:160],
+                            "description": candidate["summary"][:4000],
+                            "todos": [
+                                {
+                                    "title": str(step["title"])[:160],
+                                    "detail": str(step["summary"])[:3000],
+                                    "acceptance": acceptance[:1000],
+                                    "priority": "AUTO",
+                                }
+                                for step in chunk
+                            ],
+                        }
+                    )
+            if not milestones:
+                raise UniverseError(
+                    "GOAL_WORK_PLAN_MILESTONES_INVALID",
+                    "reviewed route contained no implementation steps",
+                )
+            parsed = {
+                "title": candidate["title"],
+                "summary": candidate["summary"],
+                "milestones": milestones,
+            }
         return normalize_goal_work_plan(parsed)
 
     def run_goal_work_plan_meeting(self, goal_id: str, value: Any) -> dict[str, Any]:
@@ -40145,7 +42267,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         path = next((item for item in feature["expected_paths"] if item["expected_path_id"] == derivation["expected_path_id"]), None)
         if path is None: raise UniverseError("FEATURE_ADOPTED_PATH_INVALID", "Goal provenance Expected Path is unavailable", HTTPStatus.CONFLICT)
         artifact = self.multi_rooms.get_artifact(room_id, path["artifact_id"])
-        bindings=[item for item in self.multi_rooms.list_bindings(room_id) if item.get("slot_role")=="MODEL" and item.get("provider") and item.get("provider_session_ref") and isinstance(item.get("metadata"),Mapping) and str(item["metadata"].get("provider_chat_key") or "").strip()]
+        bindings=[item for item in self.multi_rooms.list_bindings(room_id) if item.get("slot_role")=="MODEL" and str(item.get("provider") or "").upper() in {"CODEX", "CLAUDE"} and item.get("provider_session_ref") and isinstance(item.get("metadata"),Mapping) and str(item["metadata"].get("provider_chat_key") or "").strip()]
         if len(bindings)<2: raise UniverseError("GOAL_WORK_PLAN_MODELS_REQUIRED", "Work Plan generation requires at least two verified provider sessions", HTTPStatus.CONFLICT)
         run_id=_required_text(request.get("run_id") or "goal_work_plan_"+secrets.token_hex(12),"run_id")
         raw_turns=request.get("max_turns",len(bindings)*2)
@@ -43397,12 +45519,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             close_step("rendezvous_service", self.rendezvous_service.stop)
             self.rendezvous_service = None
         if not self.wait_for_request_workers():
-            self._shutdown_errors.append(
-                {
-                    "component": "request_workers",
-                    "error": "TimeoutError: request handlers did not finish before shutdown",
-                }
-            )
+            self.close_active_request_sockets()
+            if not self.wait_for_request_workers(timeout=5):
+                self._shutdown_errors.append(
+                    {
+                        "component": "request_workers",
+                        "error": "TimeoutError: request handlers did not finish before shutdown",
+                    }
+                )
         close_step("http_server", super().server_close)
         close_step(
             "remote_connector",
@@ -43428,6 +45552,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 class UniverseRequestHandler(BaseHTTPRequestHandler):
     server: UniverseHTTPServer
     server_version = "UniverseLocal/1"
+
+    def handle(self) -> None:
+        """Treat a browser closing an in-flight request as normal teardown."""
+
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -44375,6 +46507,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         "execution_assignment_created": False,
                     },
                 )
+            except UniverseError as error:
+                self._send_error(error)
+            return
+        project_persona_automation = re.fullmatch(
+            r"/v1/projects/([^/]+)/persona-automation", path
+        )
+        if project_persona_automation is not None:
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.persona_automation.surface(
+                        unquote(project_persona_automation.group(1))
+                    ),
+                )
+            except PersonaAutomationError as error:
+                try:
+                    status = HTTPStatus(error.status)
+                except ValueError:
+                    status = HTTPStatus.BAD_REQUEST
+                self._send_error(UniverseError(error.code, error.detail, status))
             except UniverseError as error:
                 self._send_error(error)
             return

@@ -118,6 +118,75 @@ class WindowsNativeCliTests(unittest.TestCase):
         self.assertFalse(observed["shell"])
         self.assertEqual("1", observed["env"]["UNIVERSE_TEST"])
 
+    def test_direct_provider_child_does_not_inherit_parent_host_coordinates(self) -> None:
+        observed: dict[str, object] = {}
+        sentinel = object()
+
+        def opener(command: list[str], **kwargs: object):
+            observed.update(kwargs)
+            return sentinel
+
+        parent_coordinates = {
+            "UNIVERSE_SUPERVISOR_SESSION_ID": "session-parent",
+            "UNIVERSE_SESSION_ANCHOR_REF": "anchor-parent",
+            "UNIVERSE_SESSION_ANCHOR": "anchor-parent",
+            "UNIVERSE_ANCHOR_REF": "anchor-parent",
+            "UNIVERSE_TERMINAL_ID": "term-parent",
+            "UNIVERSE_HOST_ID": "host-parent",
+            "UNIVERSE_SESSION_HOST_ID": "host-parent",
+            "UNIVERSE_MANAGED_SHELL": "1",
+            "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": "C:\\parent.json",
+            "UNIVERSE_SESSION_INBOX_CLI": "C:\\parent-inbox.exe",
+        }
+        with patch.dict("windows_native_cli.os.environ", parent_coordinates, clear=False):
+            process = open_native_cli(
+                NativeCliRequest(
+                    executable=Path(sys.executable),
+                    arguments=("app-server", "--listen", "stdio://"),
+                    cwd=ROOT,
+                    environment={"UNIVERSE_TEST": "1"},
+                ),
+                opener=opener,
+            )
+
+        self.assertIs(sentinel, process)
+        child_environment = observed["env"]
+        self.assertIsInstance(child_environment, dict)
+        for key in parent_coordinates:
+            self.assertNotIn(key, child_environment)
+        self.assertEqual("1", child_environment["UNIVERSE_TEST"])
+
+    def test_one_shot_native_child_does_not_inherit_parent_host_coordinates(self) -> None:
+        observed: dict[str, object] = {}
+
+        def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            observed.update(kwargs)
+            return subprocess.CompletedProcess(command, 0, b"ok", b"")
+
+        parent_coordinates = {
+            "UNIVERSE_SUPERVISOR_SESSION_ID": "session-parent",
+            "UNIVERSE_SESSION_ANCHOR_REF": "anchor-parent",
+            "UNIVERSE_TERMINAL_ID": "term-parent",
+            "UNIVERSE_HOST_ID": "host-parent",
+            "UNIVERSE_MANAGED_SHELL": "1",
+        }
+        with patch.dict("windows_native_cli.os.environ", parent_coordinates, clear=False):
+            result = run_native_cli(
+                NativeCliRequest(
+                    executable=Path(sys.executable),
+                    arguments=("--version",),
+                    environment={"UNIVERSE_TEST": "1"},
+                ),
+                runner=runner,
+            )
+
+        self.assertEqual("COMPLETED", result.status)
+        child_environment = observed["env"]
+        self.assertIsInstance(child_environment, dict)
+        for key in parent_coordinates:
+            self.assertNotIn(key, child_environment)
+        self.assertEqual("1", child_environment["UNIVERSE_TEST"])
+
     def test_shell_entrypoints_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             command = Path(temp) / "unsafe.cmd"

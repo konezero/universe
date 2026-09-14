@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -91,6 +92,59 @@ class PtySupervisorTests(unittest.TestCase):
             offer.assert_called_once_with("term_one",payload)
             status.assert_called_once_with("term_one")
             write.assert_not_called()
+
+    def test_persona_native_queue_http_preserves_exact_body_and_timeout(self) -> None:
+        persona = '한글 🚀 with a "quote"\r\nsecond line\\path'
+        delivery = {
+            "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
+            "message_id": "persona-test",
+            "delivery": {"phase": "NATIVE_QUEUED", "queued_submission_id": "q-1"},
+        }
+        with patch.object(
+            self.server.supervisor.host,
+            "deliver_persona_native_queue",
+            return_value=delivery,
+        ) as deliver:
+            status, payload = self.request(
+                "POST",
+                "/v1/terminals/term_one/persona-native-queue",
+                {"persona_text": persona, "timeout_seconds": 12.5},
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual(delivery, payload["persona_delivery"])
+        deliver.assert_called_once_with(
+            "term_one", persona, timeout_seconds=12.5
+        )
+
+    def test_supervised_host_persona_native_queue_uses_bounded_receipt_timeout(self) -> None:
+        host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)
+        delivery = {
+            "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
+            "message_id": "persona-test",
+        }
+        with patch.object(
+            host,
+            "_request",
+            return_value={"persona_delivery": delivery},
+        ) as request:
+            result = host.deliver_persona_native_queue(
+                "term-supervised",
+                '한글\nwith a "quote"',
+                timeout_seconds=12.5,
+            )
+
+        self.assertEqual(delivery, result)
+        request.assert_called_once_with(
+            "POST",
+            "/v1/terminals/term-supervised/persona-native-queue",
+            payload={
+                "persona_text": '한글\nwith a "quote"',
+                "timeout_seconds": 12.5,
+            },
+            timeout=35.0,
+            audit_source="UNIVERSE_PERSONA_NATIVE_QUEUE",
+        )
 
     def test_supervisor_polls_orphan_reclaim_without_ui_clients(self) -> None:
         observed = threading.Event()
@@ -411,6 +465,83 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual(201, status)
         self.assertEqual("host-stale", create.call_args.kwargs["replace_host_session_ref"])
         self.assertTrue(create.call_args.kwargs["resume_attachment_authorized"])
+
+    def test_create_forwards_persona_prompt_across_the_http_boundary(self) -> None:
+        # 2026-09-14 Conductor finding: universe_server.py resolves an ACTIVE
+        # persona assignment and passes persona_prompt into
+        # TerminalHost.create(), but the production path is
+        # SupervisedTerminalHost -> HTTP -> this Supervisor process's own
+        # TerminalHost, and this handler silently dropped persona_prompt from
+        # the request body. A unit test on startup_argv() alone cannot catch
+        # a field lost at this serialization boundary -- only a real HTTP
+        # round trip through this Server can.
+        with patch.object(
+            self.server.supervisor.host,
+            "create",
+            return_value={"terminal_id": "term-persona-forward"},
+        ) as create:
+            status, _payload = self.request(
+                "POST",
+                "/v1/terminals",
+                {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "cwd": str(ROOT),
+                    "provider": "CLAUDE",
+                    "session_anchor_ref": TEST_ANCHOR,
+                    "persona_prompt": "이 문자열이 Supervisor HTTP 경계를 반드시 통과해야 한다.",
+                },
+            )
+        self.assertEqual(201, status)
+        self.assertEqual(
+            "이 문자열이 Supervisor HTTP 경계를 반드시 통과해야 한다.",
+            create.call_args.kwargs["persona_prompt"],
+        )
+
+    def test_create_persona_prompt_reaches_real_spawn_argv_through_http(self) -> None:
+        # Same boundary, but with the REAL (unmocked) TerminalHost.create()
+        # this Server owns, proving the text lands in the actual CLI argv
+        # the child process would receive -- not just a kwarg forwarded to a
+        # mock.
+        captured_argv: list[list[str]] = []
+
+        def capturing_spawn(_executable, _cwd, _cols, _rows, argv, _environment):
+            captured_argv.append(list(argv))
+            return FakePty()
+
+        with patch.object(self.server.supervisor.host, "_spawn", capturing_spawn), patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ):
+            status, payload = self.request(
+                "POST",
+                "/v1/terminals",
+                {
+                    "project_id": "universe",
+                    "mode": "CONDUCTOR",
+                    "cwd": str(ROOT),
+                    "provider": "CLAUDE",
+                    "session_anchor_ref": "session_anchor_persona_argv_http",
+                    "persona_prompt": "실 spawn argv까지 도달해야 하는 페르소나 본문.",
+                },
+            )
+        self.assertEqual(201, status)
+        self.assertEqual(1, len(captured_argv))
+        # The managed-shell launch path hands _spawn one already-quoted
+        # Windows command-line string (not a list); capturing_spawn's
+        # list(argv) call then explodes it into characters. Either shape is
+        # fine here -- join back to a string and check substrings.
+        combined = "".join(captured_argv[0])
+        # CLAUDE carries the persona body through --append-system-prompt-file
+        # (an exact file, never inline argv text) -- read that real file back
+        # through the real HTTP+spawn boundary rather than looking for the
+        # text inline.
+        self.assertIn("--append-system-prompt-file", combined)
+        match = re.search(r"--append-system-prompt-file ([^\s\"]+\.md)", combined)
+        self.assertIsNotNone(match, combined)
+        with open(match.group(1), encoding="utf-8", newline="") as handle:
+            file_text = handle.read()
+        self.assertEqual("실 spawn argv까지 도달해야 하는 페르소나 본문.", file_text)
+        self.server.supervisor.host.close(payload["terminal"]["terminal_id"])
 
     def test_create_list_and_read_survives_client_disconnect_model(self) -> None:
         status, created = self.request(

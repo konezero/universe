@@ -578,6 +578,89 @@ class TerminalHostTests(unittest.TestCase):
             self.assertEqual("TERMINAL_TERMINATED", terminated["status"])
             self.assertTrue(client.shutdown_called)
 
+    def test_reconcile_replays_backlog_produced_while_python_host_was_down(self) -> None:
+        # The Rust Host's PTY keeps running across a Python `universe_server.py`
+        # restart. The reattach path in reconcile_reconnection_hosts() must pull
+        # everything the Host buffered meanwhile (after_cursor default 0) and
+        # feed it back through _record_output so the rebuilt screen_snapshot
+        # reflects the terminal's real current state -- not a blank screen --
+        # without the browser needing a manual refresh.
+        registry = FakeReconnectionRegistry()
+        backlog = b"line-during-outage-1\r\nline-during-outage-2\r\n"
+
+        class BacklogClient(FakeReconnectionClient):
+            def __init__(self, anchor_ref: str) -> None:
+                super().__init__(anchor_ref)
+                self.pending = backlog
+
+            def request(self, action: str, **fields):
+                if action == "read":
+                    after_cursor = int(fields.get("after_cursor", 0))
+                    data = self.pending
+                    self.pending = b""
+                    next_cursor = after_cursor + len(data)
+                    return {
+                        "host": self._host(),
+                        "output": {
+                            "data_base64": base64.b64encode(data).decode("ascii"),
+                            "start_cursor": after_cursor,
+                            "next_cursor": next_cursor,
+                            "truncated": False,
+                        },
+                    }
+                return super().request(action, **fields)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="cmd.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["/c", "echo", "RUST_HOST_MARKER"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ), patch(
+            "universe_app.windows_process.process_is_alive", return_value=True
+        ), patch(
+            "universe_app.windows_process.process_start_time", return_value=123.5
+        ):
+            root = Path(tmp)
+            audit_path = root / "audit.sqlite3"
+            first = TerminalHost(audit_database_path=audit_path, reconnection_registry=registry)
+            created = first.create(
+                project_id="universe", mode="MASTER", cwd=tmp,
+                session_anchor_ref="anchor-backlog-replay", provider="CODEX",
+                supervisor_session_id="provider-session",
+            )
+            tid = created["terminal_id"]
+            first_session = first.get(tid)
+            first_session.pump_stop.set()
+            if first_session.pump_thread is not None:
+                first_session.pump_thread.join(timeout=1)
+                first_session.pump_thread = None
+
+            # Swap in the backlog-aware fake to represent the Rust Host having
+            # kept producing output while this (simulated) Python process was down.
+            registry.clients["anchor-backlog-replay"] = BacklogClient("anchor-backlog-replay")
+
+            second = TerminalHost(audit_database_path=audit_path, reconnection_registry=registry)
+            reconciled = second.reconcile_reconnection_hosts()
+            self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
+
+            deadline = time.time() + 2
+            snapshot = b""
+            while time.time() < deadline:
+                snapshot = bytes(second.get(tid).screen_snapshot)
+                if b"line-during-outage-1" in snapshot:
+                    break
+                time.sleep(0.05)
+            self.assertIn(b"line-during-outage-1", snapshot)
+            self.assertIn(b"line-during-outage-2", snapshot)
+
+            waiter = second.subscribe(tid)
+            replayed = waiter.get(timeout=0.5)
+            self.assertIn(b"line-during-outage-1", replayed)
+            second.close(tid)
+
     def test_rust_detach_preserves_identity_and_reconnect_repairs_missing_identity(self) -> None:
         registry = FakeReconnectionRegistry()
         with tempfile.TemporaryDirectory() as tmp, patch(

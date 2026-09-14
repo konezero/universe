@@ -652,6 +652,7 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     cols=int(body.get("cols") or 120),
                     rows=int(body.get("rows") or 32),
+                    persona_prompt=str(body.get("persona_prompt") or ""),
                     audit_context=self._audit_context("PTY_SUPERVISOR_CREATE"),
                 )
             except TerminalHostError as error:
@@ -834,6 +835,30 @@ class Handler(BaseHTTPRequestHandler):
                            "error_code":error.code, "detail":error.detail})
                 return
             self._send(HTTPStatus.OK, {"schema":API_SCHEMA, "status":"OK", "turn_delivery":result})
+            return
+        if path.startswith("/v1/terminals/") and path.endswith("/persona-native-queue") and path.count("/") == 4:
+            terminal_id = path.split("/")[3]
+            try:
+                result = supervisor.host.deliver_persona_native_queue(
+                    terminal_id,
+                    str(body.get("persona_text") or ""),
+                    timeout_seconds=body.get("timeout_seconds", 20.0),
+                )
+            except TerminalHostError as error:
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "ERROR",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    },
+                )
+                return
+            self._send(
+                HTTPStatus.OK,
+                {"schema": API_SCHEMA, "status": "OK", "persona_delivery": result},
+            )
             return
         if path.startswith("/v1/terminals/") and path.endswith("/submit-prompt"):
             terminal_id = path.split("/")[3]

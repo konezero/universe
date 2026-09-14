@@ -449,6 +449,229 @@ class UniverseRuntimeHost:
         result["model_ref"] = _text_or(response.get("model_ref"), "UNKNOWN")
         return result
 
+    def invoke_structured_task(
+        self,
+        *,
+        runtime_binding: Mapping[str, Any],
+        provider: str,
+        invocation_id: str,
+        frame_id: str,
+        turn_id: str,
+        source_ref: str,
+        instruction: str,
+        context_pack: Mapping[str, Any],
+        output_contract: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Run one bounded structured turn through the existing Task Frame Host.
+
+        Persona automation uses this narrow adapter so a provider judgment has
+        the same frame creation, turn claim, result packet, and ephemeral
+        session boundary as the other Runtime Host paths.  The adapter never
+        grants repository mutation scope and always closes the transient frame.
+        """
+
+        normalized_provider = _required_text(provider, "provider").upper()
+        endpoint = _loopback_endpoint(runtime_binding.get("endpoint"), "endpoint")
+        token = _required_text(runtime_binding.get("token"), "token")
+        session_id = _required_text(runtime_binding.get("session_id"), "session_id")
+        invocation = _required_text(invocation_id, "invocation_id")
+        frame = _required_text(frame_id, "frame_id")
+        turn = _required_text(turn_id, "turn_id")
+        source = _required_text(source_ref, "source_ref")
+        prompt = _required_text(instruction, "instruction")
+        context = _mapping(context_pack, "context_pack")
+        contract = _mapping(output_contract, "output_contract")
+        capability = self.provider_capability(normalized_provider)
+        if capability["status"] != "AVAILABLE":
+            raise RuntimeHostError(
+                "WORKER_PROVIDER_UNAVAILABLE",
+                capability.get("reason", "selected provider is unavailable"),
+            )
+        model = _capability_model(capability)
+        execution_plan = {
+            "profile_id": "task-frame-debate-v1",
+            "requested_shape": "DEBATE",
+            "resolved_shape": "DEBATE",
+            "model_mode": "EXPLICIT",
+            "frame_id": frame,
+            "origin_anchor_ref": _required_text(
+                runtime_binding.get("origin_anchor_ref"), "origin_anchor_ref"
+            ),
+            "origin_session_id": session_id,
+            "origin_frame_id": _required_text(
+                runtime_binding.get("origin_frame_id"), "origin_frame_id"
+            ),
+            "task_summary_ref": source,
+            "source_ref": source,
+            "candidate_source_ref": "NONE",
+            "source_review_result": None,
+            "parent_actor_ref": _required_text(
+                runtime_binding.get("parent_actor_ref"), "parent_actor_ref"
+            ),
+            "commander_surface": "universe-ui",
+            "execution_assignment_ref": "UNASSIGNED",
+            "host_worker_capability": "AVAILABLE",
+            "repository_write_scope": "NONE",
+            "mutation_scope": {"operations": [], "targets": []},
+            "fallback_reason": "NONE",
+            "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
+            "turns": [
+                {
+                    "turn_id": turn,
+                    "role": "BOSS",
+                    "worker_slot_ref": "persona-automation-judge-slot",
+                    "provider": normalized_provider,
+                    "model": model,
+                    # The Worker dispatcher accepts AUTO/LOW/MEDIUM/HIGH/MAX.
+                    # Keep the Task Frame declaration in that transport's
+                    # vocabulary so the selected Codex/Luna turn can start.
+                    "reasoning_effort": "MEDIUM",
+                }
+            ],
+        }
+        proposal = self._build_task_frame_proposal(
+            execution_plan, prefix="persona-automation-judge-proposal-"
+        )
+        approval = {
+            "status": "APPROVED",
+            "proposal_id": proposal.get("proposal_id"),
+            "plan_digest": proposal.get("plan_digest"),
+            "commander_surface": "universe-ui",
+            "evidence_ref": source,
+        }
+        created = False
+        try:
+            created_result = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/create",
+                {
+                    "session_id": session_id,
+                    "profile": str(PLANNING_PROFILE),
+                    "frame": {
+                        "frame_id": frame,
+                        "origin_anchor_ref": execution_plan["origin_anchor_ref"],
+                        "origin_session_id": session_id,
+                        "origin_frame_id": execution_plan["origin_frame_id"],
+                        "task_summary_ref": source,
+                        "source_ref": source,
+                        "execution_assignment_ref": "UNASSIGNED",
+                        "task_frame_execution_proposal": proposal,
+                        "task_frame_execution_approval": approval,
+                        "parent_instruction": {
+                            "instruction_id": f"instruction:{invocation}",
+                            "user_instruction_raw": prompt,
+                            "constraints": [
+                                "READ_ONLY",
+                                "NO_REPOSITORY_ACCESS",
+                                "NO_SOURCE_MUTATION",
+                                "NO_SUBAGENTS",
+                                "STRUCTURED_JSON_ONLY",
+                            ],
+                            "expected_output": contract,
+                            "repository_write_scope": "NONE",
+                            "mutation_scope": {"operations": [], "targets": []},
+                        },
+                        "parent_observation": {
+                            "status": "MATCHED",
+                            "evidence_ref": _required_text(
+                                runtime_binding.get("parent_evidence_ref"),
+                                "parent_evidence_ref",
+                            ),
+                        },
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if created_result.get("status") != "TASK_FRAME_HOST_ACTIVE":
+                raise RuntimeHostError(
+                    "TASK_FRAME_CREATE_FAILED",
+                    _text_or(created_result.get("status"), "Task Frame create failed"),
+                )
+            created = True
+            declared = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame,
+                    "operation": {
+                        "operation": "declare_turns",
+                        "turns": [{"turn_id": turn, "role": "BOSS"}],
+                        "observed_at": _utc_now(),
+                    },
+                },
+            )
+            if (
+                declared.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(declared.get("output"), Mapping)
+                or declared["output"].get("status") != "TASK_TURNS_DECLARED"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_TURN_DECLARATION_FAILED",
+                    "Task Frame turn declaration failed",
+                )
+            result = self.invoke_structured(
+                {
+                    "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
+                    "invocation_id": invocation,
+                    "provider": normalized_provider,
+                    "endpoint": endpoint,
+                    "token": token,
+                    "session_id": session_id,
+                    "frame_id": frame,
+                    "turn_id": turn,
+                    "invoker_actor_ref": execution_plan["parent_actor_ref"],
+                    "repository_write_scope": "NONE",
+                    "mutation_scope": {"operations": [], "targets": []},
+                    "context_pack": context,
+                    "output_contract": contract,
+                    "result_mode": "STRUCTURED_JSON",
+                }
+            )
+            packet = self._post_runtime(
+                endpoint,
+                token,
+                "/v1/task-frame/operation",
+                {
+                    "session_id": session_id,
+                    "frame_id": frame,
+                    "operation": {"operation": "build_result_packet"},
+                },
+            )
+            if (
+                packet.get("status") != "TASK_FRAME_OPERATION_APPLIED"
+                or not isinstance(packet.get("output"), Mapping)
+                or packet["output"].get("status") != "RESULT_PACKET_BUILT"
+            ):
+                raise RuntimeHostError(
+                    "TASK_FRAME_RESULT_PACKET_FAILED",
+                    "Task Frame Result Packet was not built",
+                )
+            result.update(
+                {
+                    "invocation_id": invocation,
+                    "frame_id": frame,
+                    "turn_id": turn,
+                    "source_ref": source,
+                    "input_digest": _digest(context),
+                    "model_ref": _text_or(result.get("model_ref"), _model_ref(normalized_provider, model)),
+                }
+            )
+            return result
+        finally:
+            if created:
+                try:
+                    self._post_runtime(
+                        endpoint,
+                        token,
+                        "/v1/task-frame/close",
+                        {"session_id": session_id, "frame_id": frame},
+                    )
+                except RuntimeHostError:
+                    pass
+
     def build_planning_proposal(
         self,
         *,

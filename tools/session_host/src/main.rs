@@ -21,6 +21,8 @@ const RESPONSE_SCHEMA: &str = "universe.reconnection-host-response.v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const OUTPUT_CAPACITY_BYTES: usize = 256 * 1024;
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
+const STATE_WRITE_RETRIES: usize = 40;
+const STATE_WRITE_RETRY_DELAY_MS: u64 = 10;
 
 #[derive(Debug)]
 struct Config {
@@ -688,11 +690,49 @@ fn atomic_write_state(path: &Path, state: &HostSnapshot) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp-{}", process::id()));
     let mut bytes = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
+    let mut last_error = None;
+    // The Python Supervisor periodically reads this record while reconciling
+    // Host-owned sessions. Windows can briefly reject remove/rename while
+    // that read handle is open; preserve the receipt ledger instead of
+    // converting a transient sharing violation into NATIVE_UNCONFIRMED.
+    for attempt in 0..STATE_WRITE_RETRIES {
+        if let Err(error) = fs::write(&temporary, &bytes) {
+            if retryable_state_write_error(&error) && attempt + 1 < STATE_WRITE_RETRIES {
+                thread::sleep(Duration::from_millis(STATE_WRITE_RETRY_DELAY_MS));
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        if path.exists() {
+            if let Err(error) = fs::remove_file(path) {
+                let retry = retryable_state_write_error(&error);
+                if retry && attempt + 1 < STATE_WRITE_RETRIES {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(STATE_WRITE_RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(error.to_string());
+            }
+        }
+        match fs::rename(&temporary, path) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_state_write_error(&error) && attempt + 1 < STATE_WRITE_RETRIES => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(STATE_WRITE_RETRY_DELAY_MS));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
-    fs::rename(&temporary, path).map_err(|error| error.to_string())
+    Err(last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "state write retries exhausted".to_owned()))
+}
+
+fn retryable_state_write_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+    )
 }
 
 fn success(state: &HostSnapshot) -> HostResponse {
@@ -1325,6 +1365,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_write_retry_policy_is_bounded_to_sharing_errors() {
+        assert_eq!(STATE_WRITE_RETRIES, 40);
+        assert_eq!(STATE_WRITE_RETRY_DELAY_MS, 10);
+        assert!(retryable_state_write_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "sharing violation",
+        )));
+        assert!(retryable_state_write_error(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "would block",
+        )));
+        assert!(!retryable_state_write_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing parent",
+        )));
+    }
 
     fn snapshot() -> HostSnapshot {
         HostSnapshot {

@@ -214,6 +214,7 @@ const elements = {
   activity: document.querySelector("#activity-panel"),
   benchPanel: document.querySelector("#bench-panel"),
   memoryPanel: document.querySelector("#memory-panel"),
+  personaPanel: document.querySelector("#persona-panel"),
   futurePanel: document.querySelector("#future-panel"),
   dispatchForm: document.querySelector("#dispatch-form"),
   dispatchSubmit: document.querySelector("#dispatch-submit"),
@@ -5551,6 +5552,7 @@ function restoreBenchPanel() {
 const PROJECT_SCREENS = {
   activity: { panelId: "activity-panel", title: "Activity", kicker: "Timeline", render: () => renderActivity() },
   memory: { panelId: "memory-panel", title: "메모 · RAG", kicker: "자동화와 검토", render: () => renderMemory() },
+  persona: { panelId: "persona-panel", title: "페르소나", kicker: "정의와 세션 배정", render: () => renderPersona() },
 };
 
 function restoreProjectPanels() {
@@ -5614,7 +5616,7 @@ function showBenchScreen() {
 
 /** Open inspector tab (Memory / Future / Bench / Activity / Details). */
 function openInspectorSurface(tab) {
-  if (tab === "memory" || tab === "activity") return showProjectScreen(tab);
+  if (tab === "memory" || tab === "activity" || tab === "persona") return showProjectScreen(tab);
   restoreBenchPanel();
   const allowed = new Set(["details", "activity", "bench", "memory", "future"]);
   if (!allowed.has(tab)) tab = "details";
@@ -10633,6 +10635,14 @@ function closeAllProviderSessionStreams() {
   for (const key of Object.keys(state.providerSessionStreams)) {
     closeProviderSessionStream(key);
   }
+}
+
+function closeConductorRoomStream() {
+  const source = state.conductorRoomStream;
+  if (!source) return;
+  source.close();
+  state.conductorRoomStream = null;
+  state.conductorRoomStreamState = "IDLE";
 }
 
 function syncProviderSessionSubscriptions() {
@@ -17800,6 +17810,379 @@ function renderMemory() {
   });
 }
 
+const PERSONA_EXAMPLE_BODY = (
+  "한 프로젝트를 이끌어가는 노련한 프로젝트 팀장. 사용자와 대화 컨덕터가 정한 목표와 큰 골격을 이해하고 유지한다. " +
+  "목표 달성에 필요한 미구현 작업과 설계의 빈틈을 찾는다. 필요하면 각기 다른 관점의 책임을 가진 참여자로 회의를 " +
+  "구성하고, 결과가 목표·제약에 맞는지 검토한다. 실행 가능한 작업은 적절한 Master에게 범위와 완료조건을 명확히 " +
+  "배정한다. 결과를 근거로 검토해 부족하면 보완하고 충족하면 다음 일을 이어간다. 큰 골격·목표·범위의 변경은 근거와 " +
+  "대안을 사용자와 대화 컨덕터에게 올린다. 검증하지 않은 내용을 완료로 포장하지 않으며, 반복해서 진전이 없으면 " +
+  "접근을 바꾸거나 필요한 결정을 요청한다."
+);
+
+function personaSessionLabel(terminal) {
+  const project = String(terminal?.project_id || "").trim();
+  const mode = String(terminal?.mode || "").trim().toUpperCase();
+  const provider = String(terminal?.provider || "").trim().toUpperCase();
+  const coordinate = mode ? `${project} ${mode}` : project;
+  return provider && provider !== "AUTO" ? `${coordinate} · ${provider}` : coordinate;
+}
+
+async function renderPersona() {
+  const panel = elements.personaPanel;
+  if (!panel) return;
+  panel.replaceChildren(node("p", "", "불러오는 중…"));
+
+  let personas = [];
+  let terminals = [];
+  let automation = { run: null, runs: [] };
+  const projectId = String(state.selectedProject?.project_id || "universe").trim();
+  try {
+    const [personaResp, terminalResp, automationResp] = await Promise.all([
+      invokeServerAction("persona.list", { include_archived: true }),
+      api("/v1/terminals").catch(() => ({ terminals: [] })),
+      api(`/v1/projects/${encodeURIComponent(projectId)}/persona-automation`).catch(() => ({ run: null, runs: [] })),
+    ]);
+    personas = personaResp.personas || [];
+    terminals = (terminalResp.terminals || []).filter((t) => t.session_anchor_ref);
+    automation = automationResp || automation;
+  } catch (error) {
+    panel.replaceChildren(node("p", "memory-action-error", error.message));
+    return;
+  }
+
+  const root = node("div", "persona-root");
+  panel.replaceChildren(root);
+
+  // -- Create form -------------------------------------------------------
+  const createSection = node("section", "persona-create");
+  createSection.append(node("h3", "", "새 페르소나"));
+  createSection.append(node("p", "persona-hint",
+    "이름과 자연어 책임·판단·한계를 적는다. 고정 직무 목록이 아니다 — 아래는 편집 가능한 예시다."));
+  const titleInput = document.createElement("input");
+  titleInput.type = "text";
+  titleInput.placeholder = "예: 한 프로젝트를 이끌어가는 노련한 프로젝트 팀장";
+  titleInput.maxLength = 200;
+  const bodyInput = document.createElement("textarea");
+  bodyInput.rows = 5;
+  bodyInput.placeholder = PERSONA_EXAMPLE_BODY;
+  bodyInput.maxLength = 4000;
+  const createButton = node("button", "", "만들기");
+  createButton.type = "button";
+  const createError = node("p", "memory-action-error");
+  createButton.addEventListener("click", async () => {
+    const title = titleInput.value.trim();
+    const body = bodyInput.value.trim();
+    if (!title || !body) {
+      createError.textContent = "제목과 본문을 모두 입력하세요.";
+      return;
+    }
+    createButton.disabled = true;
+    try {
+      await invokeServerAction("persona.create", {
+        title, body, request_id: crypto.randomUUID(),
+      });
+      titleInput.value = ""; bodyInput.value = ""; createError.textContent = "";
+      renderPersona();
+    } catch (error) {
+      createError.textContent = error.message;
+    } finally {
+      createButton.disabled = false;
+    }
+  });
+  createSection.append(titleInput, bodyInput, createButton, createError);
+  root.append(createSection);
+
+  // -- Session assignment --------------------------------------------------
+  const assignSection = node("section", "persona-assign");
+  assignSection.append(node("h3", "", "세션 배정"));
+  const activePersonas = personas.filter((p) => p.state === "ACTIVE");
+  if (!terminals.length) {
+    assignSection.append(node("p", "persona-hint", "배정할 수 있는 실행 중 세션이 없습니다."));
+  } else if (!activePersonas.length) {
+    assignSection.append(node("p", "persona-hint", "먼저 활성 페르소나를 하나 이상 만드세요."));
+  } else {
+    const sessionSelect = document.createElement("select");
+    for (const terminal of terminals) {
+      const option = document.createElement("option");
+      option.value = terminal.session_anchor_ref;
+      option.textContent = personaSessionLabel(terminal);
+      sessionSelect.append(option);
+    }
+    const personaSelect = document.createElement("select");
+    for (const persona of activePersonas) {
+      const option = document.createElement("option");
+      option.value = persona.persona_id;
+      option.textContent = `${persona.title} (rev ${persona.revision})`;
+      personaSelect.append(option);
+    }
+    const status = node("p", "persona-hint", "");
+    const assignButton = node("button", "", "배정");
+    const unassignButton = node("button", "", "해제");
+    assignButton.type = "button"; unassignButton.type = "button";
+    let currentAssignment = null;
+
+    const refreshAssignmentStatus = async () => {
+      const anchor = sessionSelect.value;
+      if (!anchor) return;
+      try {
+        const read = await invokeServerAction("persona.assignment-read", { session_anchor_ref: anchor });
+        currentAssignment = read.assignment;
+        if (currentAssignment && currentAssignment.state === "ACTIVE") {
+          const owner = personas.find((p) => p.persona_id === currentAssignment.persona_id);
+          let applyStatus;
+          if (currentAssignment.queued_at && !currentAssignment.applied_at) {
+            const queuedPhase = String(currentAssignment.queued_phase || "NATIVE_QUEUED");
+            applyStatus = `Codex queue 접수됨 (${queuedPhase}, message ${currentAssignment.queued_message_id || "?"}); provider 적용 대기`;
+          } else if (currentAssignment.applied_at) {
+            applyStatus = `적용 확인 (${currentAssignment.applied_phase || "PROVIDER_APPLIED"}) ${currentAssignment.applied_at} (terminal ${currentAssignment.applied_terminal_id})`;
+          } else if (currentAssignment.unsupported_at) {
+            const unsupportedReason = String(currentAssignment.unsupported_reason || "");
+            const nativeQueueNotApplied = unsupportedReason.startsWith("NATIVE_QUEUE_NOT_APPLIED:");
+            applyStatus = nativeQueueNotApplied
+              ? `Codex native queue 접수가 확인되지 않아 NOT_RUN으로 남았습니다 `
+                + `(${currentAssignment.unsupported_at}, terminal ${currentAssignment.unsupported_terminal_id}): `
+                + unsupportedReason
+              : `이 provider(${currentAssignment.unsupported_provider})는 원문을 그대로 전달할 수 없어 `
+                + `미적용으로 남았습니다 (${currentAssignment.unsupported_at}, terminal ${currentAssignment.unsupported_terminal_id}): `
+                + unsupportedReason;
+          } else {
+            applyStatus = "미적용 — 이미 실행 중인 세션에는 반영되지 않으며, 이 Anchor로 새 세션을 시작해야 실제 지침에 적용됩니다.";
+          }
+          status.textContent = `배정 저장됨: ${owner ? owner.title : currentAssignment.persona_id} `
+            + `(persona rev ${currentAssignment.persona_revision}, assignment rev ${currentAssignment.assignment_revision}) — `
+            + applyStatus;
+          unassignButton.disabled = false;
+        } else {
+          status.textContent = "현재 배정 없음.";
+          unassignButton.disabled = true;
+        }
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    };
+    sessionSelect.addEventListener("change", refreshAssignmentStatus);
+    refreshAssignmentStatus();
+
+    assignButton.addEventListener("click", async () => {
+      const anchor = sessionSelect.value;
+      const terminal = terminals.find((t) => t.session_anchor_ref === anchor);
+      const persona = activePersonas.find((p) => p.persona_id === personaSelect.value);
+      if (!anchor || !terminal || !persona) return;
+      assignButton.disabled = true;
+      try {
+        await invokeServerAction("persona.assign", {
+          session_anchor_ref: anchor,
+          project_id: terminal.project_id,
+          persona_id: persona.persona_id,
+          expected_persona_revision: persona.revision,
+          expected_assignment_revision: (currentAssignment && currentAssignment.state === "ACTIVE") ? currentAssignment.assignment_revision : 0,
+          request_id: crypto.randomUUID(),
+        });
+        await refreshAssignmentStatus();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        assignButton.disabled = false;
+      }
+    });
+    unassignButton.addEventListener("click", async () => {
+      if (!currentAssignment) return;
+      unassignButton.disabled = true;
+      try {
+        await invokeServerAction("persona.unassign", {
+          session_anchor_ref: sessionSelect.value,
+          expected_assignment_revision: currentAssignment.assignment_revision,
+          request_id: crypto.randomUUID(),
+        });
+        await refreshAssignmentStatus();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        unassignButton.disabled = false;
+      }
+    });
+
+    assignSection.append(
+      node("label", "", "대상 세션"), sessionSelect,
+      node("label", "", "페르소나"), personaSelect,
+      assignButton, unassignButton, status,
+    );
+  }
+  root.append(assignSection);
+
+  // -- Bounded Persona Conductor automation -----------------------------
+  const automationSection = node("section", "persona-automation");
+  automationSection.append(node("h3", "", "전용 컨덕터 자동화"));
+  automationSection.append(node("p", "persona-hint",
+    "배정과 실행은 분리되어 있습니다. 이 화면은 영속 run 상태를 표시하고, Master queue 접수와 결과 검토를 따로 기록합니다."));
+  const run = automation.run;
+  const runSummary = node("div", "persona-automation-summary");
+  if (run) {
+    const decision = run.current_decision || {};
+    const assignment = run.current_assignment || {};
+    const review = run.current_review || {};
+    runSummary.append(
+      node("p", "", `상태: ${run.state} · run ${run.run_id} · revision ${run.revision}`),
+      node("p", "", `페르소나: ${run.persona_id} rev ${run.persona_revision} · Anchor: ${run.session_anchor_ref}`),
+      node("p", "", `현재 판단: ${decision.kind || "없음"}${decision.rationale ? ` — ${decision.rationale}` : ""}`),
+      node("p", "", `현재 배정: ${assignment.message_id || "없음"}${assignment.title ? ` — ${assignment.title}` : ""}`),
+      node("p", "", `마지막 검토: ${review.outcome || "없음"} · acceptance: ${review.acceptance_status || "UNKNOWN"}${review.result_ref ? ` — ${review.result_ref}` : ""}`),
+      node("p", "", `다음 조건: ${run.next_condition || "없음"} · quota: ${run.quota_state || "UNKNOWN"}`),
+    );
+    const controlError = node("p", "memory-action-error");
+    const controls = node("div", "persona-automation-controls");
+    const invokeRunControl = async (actionId, extra = {}) => {
+      try {
+        await invokeServerAction(actionId, { run_id: run.run_id, request_id: crypto.randomUUID(), expected_revision: run.revision, ...extra });
+        await renderPersona();
+      } catch (error) {
+        controlError.textContent = error.message;
+      }
+    };
+    if (["RUNNING", "WAITING"].includes(run.state)) {
+      const pause = node("button", "", "일시정지");
+      pause.type = "button";
+      pause.addEventListener("click", () => invokeRunControl("persona.automation.pause", { reason: "operator_pause" }));
+      controls.append(pause);
+    }
+    if (run.state === "PAUSED") {
+      const resume = node("button", "", "재개");
+      resume.type = "button";
+      resume.addEventListener("click", () => invokeRunControl("persona.automation.resume"));
+      controls.append(resume);
+    }
+    if (["RUNNING", "WAITING", "PAUSED"].includes(run.state)) {
+      const stop = node("button", "", "정지");
+      stop.type = "button";
+      stop.addEventListener("click", () => invokeRunControl("persona.automation.stop", { reason: "operator_stop" }));
+      controls.append(stop);
+    }
+    runSummary.append(controls, controlError);
+  } else {
+    runSummary.append(node("p", "persona-hint", `프로젝트 ${projectId}에 실행 중인 run이 없습니다.`));
+    const conductor = terminals.find((terminal) =>
+      String(terminal.mode || "").toUpperCase() === "CONDUCTOR" &&
+      String(terminal.project_id || "").trim() === projectId
+    );
+    let conductorAssignment = null;
+    if (conductor?.session_anchor_ref) {
+      try {
+        const assignmentResp = await invokeServerAction("persona.assignment-read", { session_anchor_ref: conductor.session_anchor_ref });
+        conductorAssignment = assignmentResp.assignment;
+      } catch (_) {
+        conductorAssignment = null;
+      }
+    }
+    if (conductorAssignment?.state === "ACTIVE") {
+      const scopeInput = document.createElement("input");
+      scopeInput.placeholder = "이번 bounded 작업의 범위";
+      const instructionInput = document.createElement("textarea");
+      instructionInput.rows = 3;
+      instructionInput.placeholder = "컨덕터가 읽을 실행 지시와 완료조건";
+      const startButton = node("button", "", "자동화 시작");
+      const startError = node("p", "memory-action-error");
+      startButton.type = "button";
+      startButton.addEventListener("click", async () => {
+        if (!scopeInput.value.trim() || !instructionInput.value.trim()) {
+          startError.textContent = "범위와 지시를 모두 입력하세요.";
+          return;
+        }
+        startButton.disabled = true;
+        try {
+          await invokeServerAction("persona.automation.start", {
+            project_id: projectId,
+            session_anchor_ref: conductorAssignment.session_anchor_ref,
+            scope: scopeInput.value.trim(),
+            instruction: instructionInput.value.trim(),
+            request_id: crypto.randomUUID(),
+          });
+          await renderPersona();
+        } catch (error) {
+          startError.textContent = error.message;
+        } finally {
+          startButton.disabled = false;
+        }
+      });
+      runSummary.append(
+        node("p", "persona-hint", `활성 배정: ${conductorAssignment.persona_id} (assignment rev ${conductorAssignment.assignment_revision})`),
+        scopeInput, instructionInput, startButton, startError,
+      );
+    } else {
+      runSummary.append(node("p", "persona-hint", "CONDUCTOR 세션에 활성 페르소나를 먼저 배정하세요."));
+    }
+  }
+  automationSection.append(runSummary);
+  root.append(automationSection);
+
+  // -- Persona list ---------------------------------------------------
+  const listSection = node("section", "persona-list");
+  listSection.append(node("h3", "", "페르소나 목록"));
+  if (!personas.length) {
+    listSection.append(node("p", "persona-hint", "아직 만든 페르소나가 없습니다."));
+  }
+  for (const persona of personas) {
+    const card = node("div", "persona-card" + (persona.state === "ARCHIVED" ? " persona-card-archived" : ""));
+    card.append(node("h4", "", `${persona.title} (rev ${persona.revision}, ${persona.state})`));
+    const bodyView = node("p", "persona-body", persona.body);
+    card.append(bodyView);
+
+    const editButton = node("button", "", "편집");
+    const archiveButton = node("button", "", persona.state === "ACTIVE" ? "보관" : "복원");
+    editButton.type = "button"; archiveButton.type = "button";
+    const cardError = node("p", "memory-action-error");
+
+    editButton.addEventListener("click", () => {
+      if (card.querySelector(".persona-edit-form")) return;
+      const form = node("div", "persona-edit-form");
+      const editTitle = document.createElement("input");
+      editTitle.type = "text"; editTitle.value = persona.title; editTitle.maxLength = 200;
+      const editBody = document.createElement("textarea");
+      editBody.rows = 5; editBody.value = persona.body; editBody.maxLength = 4000;
+      const saveButton = node("button", "", "저장");
+      saveButton.type = "button";
+      saveButton.addEventListener("click", async () => {
+        saveButton.disabled = true;
+        try {
+          await invokeServerAction("persona.update", {
+            persona_id: persona.persona_id,
+            expected_revision: persona.revision,
+            title: editTitle.value.trim(),
+            body: editBody.value.trim(),
+            request_id: crypto.randomUUID(),
+          });
+          renderPersona();
+        } catch (error) {
+          cardError.textContent = error.message;
+        } finally {
+          saveButton.disabled = false;
+        }
+      });
+      form.append(editTitle, editBody, saveButton);
+      card.append(form);
+    });
+
+    archiveButton.addEventListener("click", async () => {
+      archiveButton.disabled = true;
+      try {
+        await invokeServerAction(persona.state === "ACTIVE" ? "persona.archive" : "persona.restore", {
+          persona_id: persona.persona_id,
+          expected_revision: persona.revision,
+          request_id: crypto.randomUUID(),
+        });
+        renderPersona();
+      } catch (error) {
+        cardError.textContent = error.message;
+      } finally {
+        archiveButton.disabled = false;
+      }
+    });
+
+    card.append(editButton, archiveButton, cardError);
+    listSection.append(card);
+  }
+  root.append(listSection);
+}
+
 function renderMemoryLegacy() {
   if (!elements.memoryPanel) return;
   elements.memoryPanel.replaceChildren();
@@ -18903,7 +19286,7 @@ function bindEvents() {
       const nav = elements.primaryNav?.querySelector(`[data-primary-view="${view}"]`);
       if (nav) nav.click();
       else if (view === "bench") showBenchScreen();
-      else if (view === "activity" || view === "memory") showProjectScreen(view);
+      else if (view === "activity" || view === "memory" || view === "persona") showProjectScreen(view);
       else if (["future", "details"].includes(view)) openInspectorSurface("details");
       else if (view === "map" || view === "universe") {
         showGraphView(state.selectedProject ? "semantic" : "universe");
@@ -18961,7 +19344,7 @@ function bindEvents() {
         return;
       }
       // Project-context panels live only in the inspector.
-      if (["memory", "future", "activity", "details"].includes(view)) {
+      if (["memory", "persona", "future", "activity", "details"].includes(view)) {
         openInspectorSurface(view);
         return;
       }
@@ -19062,7 +19445,7 @@ function bindGoalPlanEvents() {
       openRoomIndex().catch((error) => toast(error.message, true));
     }
     else if (view === "bench") showBenchScreen();
-    else if (view === "activity" || view === "memory") showProjectScreen(view);
+    else if (view === "activity" || view === "memory" || view === "persona") showProjectScreen(view);
     else if (["details", "future"].includes(view)) openInspectorSurface("details");
   };
   elements.utilityRail?.addEventListener("click", handleWorkspaceNav);
@@ -19530,7 +19913,10 @@ refreshLawStrip = function () {
 bindEvents();
 // Establish the home layout before slow data requests can outlast the splash.
 renderGoalPlan();
-window.addEventListener("beforeunload", closeAllProviderSessionStreams);
+window.addEventListener("beforeunload", () => {
+  closeAllProviderSessionStreams();
+  closeConductorRoomStream();
+});
 
 let bootSplashCleared = false;
 function clearBootSplash() {

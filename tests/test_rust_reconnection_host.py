@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -579,6 +580,143 @@ class RustReconnectionHostTests(unittest.TestCase):
                     while process_is_alive(host_pid) and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertFalse(process_is_alive(host_pid))
+
+    def test_production_terminal_host_replays_exact_marker_backlog_after_reattach(self) -> None:
+        # Real cargo-built Rust Host, real ConPTY-spawned child, real cursor
+        # protocol (no fake client). A deterministic counting process feeds
+        # numbered markers; after simulating the Python host going away
+        # mid-stream (the PTY keeps running under the Rust Host, exactly like
+        # a `universe_server.py` restart), a brand-new TerminalHost reattaches
+        # and its own output backlog is checked for the exact set 1..N with
+        # no gap and no duplicate -- a quantitative replacement for the
+        # earlier fake-client unit test's assertIn-only claim.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            terminal_cwd = root / "terminal-cwd"
+            terminal_cwd.mkdir()
+            audit_path = root / "universe.sqlite3"
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            anchor_ref = "anchor-marker-backlog"
+            marker_count = 150
+            emitter = root / "emit_markers.py"
+            emitter.write_text(
+                "import sys, time\n"
+                f"for i in range(1, {marker_count} + 1):\n"
+                "    sys.stdout.write('MARK-%d\\n' % i)\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.02)\n",
+                encoding="utf-8",
+            )
+            host_pid: int | None = None
+            terminal_id = ""
+            second: TerminalHost | None = None
+
+            def read_all_markers(host: TerminalHost) -> list[int]:
+                collected: list[int] = []
+                before_cursor: int | None = None
+                while True:
+                    page = host.history(terminal_id, before_cursor=before_cursor, limit=100)
+                    data = b"".join(
+                        base64.b64decode(chunk["data_base64"])
+                        for chunk in page["chunks"]
+                    )
+                    collected = [int(m) for m in re.findall(rb"MARK-(\d+)", data)] + collected
+                    if not page.get("has_more"):
+                        break
+                    before_cursor = page["next_before_cursor"]
+                return collected
+
+            try:
+                with patch(
+                    "universe_app.terminal_host.resolve_cli_executable",
+                    return_value=sys.executable,
+                ), patch(
+                    "universe_app.terminal_host.startup_argv",
+                    return_value=["-u", str(emitter)],
+                ):
+                    first = TerminalHost(
+                        audit_database_path=audit_path,
+                        reconnection_registry=registry,
+                    )
+                    created = first.create(
+                        project_id="universe",
+                        mode="MASTER",
+                        cwd=str(terminal_cwd),
+                        session_anchor_ref=anchor_ref,
+                        provider="CODEX",
+                        supervisor_session_id="provider-session",
+                    )
+                terminal_id = str(created["terminal_id"])
+                host_pid = registry.discover(anchor_ref).state.pid
+
+                # Let the first Host observe some live markers, then detach it
+                # mid-stream -- the emitter keeps running under the real Host.
+                deadline = time.monotonic() + 10
+                last_seen_before_detach = 0
+                while time.monotonic() < deadline and last_seen_before_detach < 20:
+                    nums = read_all_markers(first)
+                    if nums:
+                        last_seen_before_detach = max(nums)
+                    time.sleep(0.05)
+                self.assertGreaterEqual(
+                    last_seen_before_detach, 5,
+                    "first Host never observed live marker output",
+                )
+
+                first_session = first.get(terminal_id)
+                first_session.pump_stop.set()
+                if first_session.pump_thread is not None:
+                    first_session.pump_thread.join(timeout=2)
+                    first_session.pump_thread = None
+
+                # Reattach as a brand-new process/object, exactly what
+                # reconcile_reconnection_hosts() does after a real restart.
+                second = TerminalHost(
+                    audit_database_path=audit_path,
+                    reconnection_registry=registry,
+                )
+                reconciled = second.reconcile_reconnection_hosts()
+                self.assertEqual("TERMINAL_REATTACHED", reconciled[0]["status"])
+
+                deadline = time.monotonic() + max(5.0, marker_count * 0.02 + 8)
+                final_markers: list[int] = []
+                while time.monotonic() < deadline:
+                    final_markers = read_all_markers(second)
+                    if final_markers and final_markers[-1] >= marker_count:
+                        break
+                    time.sleep(0.1)
+
+                self.assertEqual(
+                    list(range(1, marker_count + 1)),
+                    final_markers,
+                    "the brand-new session owner's own backlog must contain "
+                    "1..N exactly once each, in order -- any gap or repeat "
+                    "here is a real missing/duplicate-output defect",
+                )
+            finally:
+                if second is not None and terminal_id:
+                    try:
+                        second.close(terminal_id)
+                    except Exception:
+                        pass
+                try:
+                    client = registry.discover(anchor_ref)
+                    client.request("attach", supervisor_id="marker-backlog-cleanup")
+                    try:
+                        client.request(
+                            "write",
+                            supervisor_id="marker-backlog-cleanup",
+                            input_base64=base64.b64encode(b"\x1b[1;1R").decode("ascii"),
+                        )
+                    finally:
+                        client.shutdown()
+                        registry.reap_launched_process(anchor_ref)
+                except Exception:
+                    pass
+                if host_pid is not None:
+                    deadline = time.monotonic() + 5
+                    while process_is_alive(host_pid) and time.monotonic() < deadline:
+                        time.sleep(0.05)
 
 
 if __name__ == "__main__":

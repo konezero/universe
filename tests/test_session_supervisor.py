@@ -394,6 +394,21 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         )
         self.assertNotEqual(acquired["lease_token"], "")
 
+    def test_live_same_provider_rebind_without_owned_process_requires_cas(self) -> None:
+        first, _ = self.store.register_session({**self.session(), "state": "LIVE"})
+        replacement = {
+            **self.session(),
+            "state": "STARTING",
+            "provider_session_ref": "codex-child-session",
+        }
+        with self.assertRaises(SessionSupervisorError) as caught:
+            self.store.register_session(replacement)
+        self.assertEqual("PROVIDER_SESSION_REBIND_REQUIRES_CAS", caught.exception.code)
+        after = self.store.get_session(first["session_id"])
+        self.assertEqual("provider-session-1", after["provider_session_ref"])
+        self.assertEqual(first["row_version"], after["row_version"])
+        self.assertEqual(first["binding_history"], after["binding_history"])
+
     def test_cross_provider_rebind_cannot_steal_live_owned_session(self) -> None:
         first, _ = self.store.register_session(self.session())
         self.store.acquire_lease(first["session_id"], self.process())

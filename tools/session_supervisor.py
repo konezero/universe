@@ -1074,6 +1074,32 @@ class SessionSupervisorStore:
                     or material["provider_session_ref"]
                     != session["provider_session_ref"]
                 )
+                same_provider_rebind = (
+                    material["provider"] == session["provider"]
+                    and bool(material["provider_session_ref"])
+                    and bool(session["provider_session_ref"])
+                    and material["provider_session_ref"]
+                    != session["provider_session_ref"]
+                )
+                if (
+                    same_provider_rebind
+                    and str(material["state"]).upper() == "LIVE"
+                    and not self._owned_process_is_exact(
+                        connection, session["session_id"]
+                    )
+                ):
+                    # A hook/register payload is observational input.  It may
+                    # establish the first provider ref for a pre-bound Host,
+                    # but it cannot replace a live same-provider identity.
+                    # Controlled replacement must use bind_provider_session,
+                    # which carries the row-version CAS and identity-owner
+                    # checks.  This protects a parent Host when a child
+                    # process accidentally inherited its environment.
+                    raise SessionSupervisorError(
+                        "PROVIDER_SESSION_REBIND_REQUIRES_CAS",
+                        "live same-provider session ref changes require the CAS bind route",
+                        status=409,
+                    )
                 location_changed = any(
                     (
                         material.get("current_project_id") != session["project_id"],

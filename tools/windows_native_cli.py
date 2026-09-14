@@ -13,6 +13,27 @@ from typing import Callable, Mapping
 NATIVE_CLI_CONTRACT = "universe.windows-native-cli.v1"
 DEFAULT_MAX_OUTPUT_CHARS = 200_000
 
+# These coordinates identify the currently attached Universe Host.  A provider
+# process launched directly by a resident adapter is a new child session; it
+# must not inherit the parent's Host/terminal identity through os.environ.  A
+# PTY-backed TerminalHost supplies a fresh, explicit set of these values after
+# this boundary, so removing them here only affects direct native provider
+# children.
+INHERITED_UNIVERSE_COORDINATE_ENV = frozenset(
+    {
+        "UNIVERSE_SUPERVISOR_SESSION_ID",
+        "UNIVERSE_SESSION_ANCHOR_REF",
+        "UNIVERSE_SESSION_ANCHOR",
+        "UNIVERSE_ANCHOR_REF",
+        "UNIVERSE_TERMINAL_ID",
+        "UNIVERSE_HOST_ID",
+        "UNIVERSE_SESSION_HOST_ID",
+        "UNIVERSE_MANAGED_SHELL",
+        "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE",
+        "UNIVERSE_SESSION_INBOX_CLI",
+    }
+)
+
 
 class NativeCliError(ValueError):
     pass
@@ -85,15 +106,31 @@ def _bounded(value: str, maximum: int) -> tuple[str, bool]:
     return value[:maximum], True
 
 
+def _child_environment(request: NativeCliRequest) -> dict[str, str]:
+    """Build an environment that cannot inherit a parent Host identity.
+
+    Both one-shot and persistent native provider adapters create a fresh
+    process.  Passing the resident terminal's ``UNIVERSE_*`` coordinates into
+    either process lets a SessionStart hook register the child as the parent.
+    PTY-backed children do not use this module and receive an explicit child
+    coordinate from ``TerminalHost`` instead.
+    """
+
+    environment = dict(os.environ)
+    if request.environment is not None:
+        environment.update(request.environment)
+    for key in INHERITED_UNIVERSE_COORDINATE_ENV:
+        environment.pop(key, None)
+    return environment
+
+
 def run_native_cli(
     request: NativeCliRequest,
     *,
     runner: Runner = subprocess.run,
 ) -> NativeCliResult:
     normalized = _validated_request(request)
-    environment = dict(os.environ)
-    if normalized.environment is not None:
-        environment.update(normalized.environment)
+    environment = _child_environment(normalized)
     command = [str(normalized.executable), *normalized.arguments]
     stdin_handle = None
     started = time.monotonic()
@@ -175,9 +212,7 @@ def open_native_cli(
     opener: ProcessOpener = subprocess.Popen,
 ) -> subprocess.Popen[str]:
     normalized = _validated_request(request)
-    environment = dict(os.environ)
-    if normalized.environment is not None:
-        environment.update(normalized.environment)
+    environment = _child_environment(normalized)
     command = [str(normalized.executable), *normalized.arguments]
     return opener(  # nosec B603
         command,

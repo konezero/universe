@@ -1848,7 +1848,12 @@ class CodexAppServerSession:
                 if turn_status in {"UNKNOWN", "inProgress"}:
                     raise AgentSessionError("CODEX_TURN_TIMED_OUT")
             if turn_status != "completed":
-                raise AgentSessionError("CODEX_TURN_FAILED")
+                failure = AgentSessionError("CODEX_TURN_FAILED")
+                failure.diagnostic = {
+                    "turn_id": turn_id,
+                    "turn_status": str(turn_status or "UNKNOWN"),
+                }
+                raise failure
         finally:
             self._active_delta = None
             if turn_id:
