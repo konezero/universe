@@ -56,6 +56,7 @@ from legacy_executor_classifier import (
 )
 from release_runtime import ReleaseRuntime, ReleaseRuntimeError
 from session_supervisor import SessionSupervisorError, SessionSupervisorStore
+from universe_todo_actions import TodoActions, TodoActionError
 from session_anchor_transport import (
     SessionAnchorTransport,
     SessionAnchorTransportError,
@@ -7287,6 +7288,38 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS memory_candidate_relation_target
                 ON memory_candidate_relation(target_candidate_id, relation, candidate_id);
 
+                -- Project-scoped, typed relation between two SAVED memories
+                -- (project_memory), mirroring memory_candidate_relation's
+                -- shape for the post-adoption side. Replaces a UI-hardcoded
+                -- topic/relation table: any project's memories work the same
+                -- way with no source change. relation reads
+                -- "memory_id <relation> target_memory_id", e.g. a COMPLEMENTS
+                -- edge names the representative as its target.
+                CREATE TABLE IF NOT EXISTS project_memory_relation (
+                    relation_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    memory_id TEXT NOT NULL
+                        REFERENCES project_memory(memory_id)
+                        ON DELETE CASCADE,
+                    target_memory_id TEXT NOT NULL
+                        REFERENCES project_memory(memory_id)
+                        ON DELETE CASCADE,
+                    relation TEXT NOT NULL
+                        CHECK(relation IN ('COMPLEMENTS', 'SUPERSEDES', 'CONFLICTS_WITH', 'DUPLICATE_OF')),
+                    note TEXT NOT NULL,
+                    actor_ref TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(memory_id, target_memory_id, relation)
+                );
+
+                CREATE INDEX IF NOT EXISTS project_memory_relation_target
+                ON project_memory_relation(target_memory_id, relation, memory_id);
+
+                CREATE INDEX IF NOT EXISTS project_memory_relation_source
+                ON project_memory_relation(memory_id, relation, target_memory_id);
+
                 CREATE TABLE IF NOT EXISTS memory_candidate_review (
                     review_id TEXT PRIMARY KEY,
                     candidate_id TEXT NOT NULL
@@ -7523,6 +7556,13 @@ class UniverseStore:
                     "ALTER TABLE project_todo ADD COLUMN milestone_id TEXT "
                     "REFERENCES project_milestone(milestone_id) ON DELETE SET NULL"
                 )
+            if "blocked_reason" not in todo_columns:
+                # A Todo's own BLOCKED state previously carried no reason at
+                # all (confirmed: no such field existed anywhere). A narrow,
+                # dedicated write path (set_todo_blocked_reason) owns this
+                # column so it is never silently wiped by an unrelated
+                # todo.update full-body edit.
+                connection.execute("ALTER TABLE project_todo ADD COLUMN blocked_reason TEXT")
             goal_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(project_goal)").fetchall()
@@ -7550,6 +7590,36 @@ class UniverseStore:
                     "ALTER TABLE memory_candidate ADD COLUMN revision "
                     "INTEGER NOT NULL DEFAULT 1"
                 )
+            memory_relation_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(project_memory_relation)"
+                ).fetchall()
+            }
+            if memory_relation_columns and "revision" not in memory_relation_columns:
+                connection.execute(
+                    "ALTER TABLE project_memory_relation ADD COLUMN revision "
+                    "INTEGER NOT NULL DEFAULT 1"
+                )
+            # Whole-request idempotency for rag.memory-relate: a request_id
+            # binds the FULL semantic payload (relation AND knowledge
+            # together), the same pattern todo_state_action uses. Without
+            # this, replaying only the relation half of a mixed request could
+            # silently re-apply a changed knowledge half every time (the
+            # 2026-09-14 Conductor probe finding) — memory_digest alone
+            # cannot guard this because it never changes when knowledge is
+            # updated.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_memory_relate_action (
+                    request_id TEXT PRIMARY KEY,
+                    request_json TEXT NOT NULL,
+                    actor_ref TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS project_goal_universe_order "
                 "ON project_goal(universe_goal_id, sort_order, updated_at, goal_id)"
@@ -10898,7 +10968,7 @@ class UniverseStore:
             ).fetchall()
             todo_rows = connection.execute(
                 "SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, "
-                "title, detail, priority, state, source_kind, sort_order, revision, created_at, updated_at "
+                "title, detail, priority, state, source_kind, sort_order, revision, created_at, updated_at, blocked_reason "
                 "FROM project_todo WHERE universe_goal_id IS NOT NULL "
                 "ORDER BY sort_order, updated_at, todo_id"
             ).fetchall()
@@ -14013,7 +14083,7 @@ class UniverseStore:
                 """
                 SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
-                       created_at, updated_at
+                       created_at, updated_at, blocked_reason
                 FROM project_todo
                 ORDER BY
                     CASE state
@@ -14041,7 +14111,7 @@ class UniverseStore:
                 """
                 SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
-                       created_at, updated_at
+                       created_at, updated_at, blocked_reason
                 FROM project_todo
                 WHERE todo_id = ?
                 """,
@@ -14095,6 +14165,49 @@ class UniverseStore:
                     normalized_id,
                     todo["revision"],
                 ),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_blocked_reason(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow, dedicated write for a Todo's own BLOCKED reason/next action.
+
+        Deliberately separate from ``update_todo`` (a full-body replace) so an
+        unrelated title/detail/priority edit can never silently wipe this
+        field. Both Fleet and the flat Todo list read it from the same
+        ``blocked_reason`` column via ``_todo_row``, so the two screens are
+        structurally guaranteed to agree. Free text only: there is no
+        structured taxonomy to infer from, and none is invented here.
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision", "blocked_reason"}:
+            raise UniverseError(
+                "TODO_BLOCKED_REASON_REQUEST_INVALID",
+                "expected_revision and blocked_reason are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        reason = value.get("blocked_reason")
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise UniverseError("TODO_BLOCKED_REASON_INVALID", "blocked_reason must be a string or null")
+            reason = reason.strip() or None
+            if reason is not None and len(reason) > 2000:
+                raise UniverseError("TODO_BLOCKED_REASON_INVALID", "blocked_reason is too long")
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET blocked_reason = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ?",
+                (reason, now, normalized_id, expected_revision),
             )
         if cursor.rowcount != 1:
             current = self.get_todo(normalized_id)
@@ -18831,12 +18944,31 @@ class UniverseStore:
             ).fetchall()
             from universe_memory import memory_retention
             retention = {json.loads(row["memory_json"])["memory_id"]: memory_retention(connection, json.loads(row["memory_json"])["memory_id"]) for row in rows}
+            memory_ids = list(retention.keys())
+            relations_by_memory: dict[str, list[dict[str, Any]]] = {mid: [] for mid in memory_ids}
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                relation_rows = connection.execute(
+                    f"""
+                    SELECT relation_id, memory_id, target_memory_id, relation, note, actor_ref, created_at, revision
+                    FROM project_memory_relation
+                    WHERE project_id = ? AND (memory_id IN ({placeholders}) OR target_memory_id IN ({placeholders}))
+                    ORDER BY created_at, relation_id
+                    """,
+                    (project["project_id"], *memory_ids, *memory_ids),
+                ).fetchall()
+                for relation_row in relation_rows:
+                    entry = dict(relation_row)
+                    for key in (entry["memory_id"], entry["target_memory_id"]):
+                        if key in relations_by_memory:
+                            relations_by_memory[key].append(entry)
         items = []
         for row in rows:
             item = json.loads(row["memory_json"])
             item["created_at"] = row["created_at"]
             item["updated_at"] = row["updated_at"]
             item["retention"] = retention[item["memory_id"]]
+            item["relations"] = relations_by_memory.get(item["memory_id"], [])
             items.append(item)
         return items
 
@@ -19040,6 +19172,7 @@ class UniverseStore:
         item["created_at"] = row["created_at"]
         item["updated_at"] = row["updated_at"]
         item["retention"] = retention
+        item["relations"] = self.list_memory_relations(project["project_id"], normalized)
         return item
 
     def set_memory_retention(self, project_id, memory_id, value, actor):
@@ -19104,6 +19237,313 @@ class UniverseStore:
                 ),
             )
         return current
+
+    def record_memory_relation(
+        self, project_id: str, memory_id: str, value: Any, actor: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Project-scoped, typed knowledge classification/relation write.
+
+        Replaces a UI-hardcoded topic/relation table: any project's memories
+        gain the same capability through this one governed path, no source
+        change per memory.
+
+        Whole-request idempotency: ``request_id`` binds the FULL semantic
+        payload (relation AND knowledge together), the same pattern
+        ``TodoActions.change_state`` uses for ``todo_state_action``. This is
+        required because ``memory_digest`` never changes when ``knowledge``
+        is updated, so it cannot by itself guard a mixed relation+knowledge
+        request from silently re-applying a changed knowledge half under a
+        "replayed" relation half (the 2026-09-14 Conductor probe finding).
+        A request_id reused with a DIFFERENT payload is rejected (409); reused
+        with the SAME payload returns the original result untouched, with no
+        further DB writes attempted.
+
+        ``knowledge`` (optional) sets the memory's own topic/kind/
+        applicability classification. ``relation``/``target_memory_id``
+        (optional, both-or-neither) record a directed typed edge to another
+        memory in the same project ("memory_id <relation> target_memory_id"
+        — e.g. a COMPLEMENTS edge names its representative as the target).
+        Source and target are both digest- and retention-checked inside the
+        same write transaction. An existing edge may be intentionally revised
+        (new note) under a fresh request_id, guarded by
+        ``expected_relation_revision`` (0 means "no edge expected yet"); the
+        prior note is preserved in the project_event history rather than
+        silently lost.
+        """
+
+        normalized_project = _project_id(project_id)
+        self.get_project(normalized_project)
+        normalized_memory_id = _identifier(memory_id, "memory_id")
+        request_id = str(value.get("request_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            raise UniverseError(
+                "MEMORY_RELATE_REQUEST_INVALID",
+                "request_id must be 8-100 ASCII letters, digits, underscores or hyphens",
+            )
+        target_memory_id_raw = value.get("target_memory_id")
+        relation = value.get("relation")
+        knowledge = value.get("knowledge")
+        if bool(target_memory_id_raw) != bool(relation):
+            raise UniverseError(
+                "MEMORY_RELATION_INVALID",
+                "relation and target_memory_id must be supplied together",
+            )
+        if not target_memory_id_raw and knowledge is None:
+            raise UniverseError(
+                "MEMORY_RELATION_INVALID",
+                "at least one of knowledge or relation+target_memory_id is required",
+            )
+        note = value.get("note")
+        if target_memory_id_raw or knowledge is not None:
+            note = _required_text(note, "note")
+        request_json = _canonical_json(value)
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing_request = connection.execute(
+                "SELECT request_json, result_json FROM project_memory_relate_action WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing_request is not None:
+                if existing_request["request_json"] != request_json:
+                    raise UniverseError(
+                        "MEMORY_RELATE_REQUEST_CONFLICT",
+                        "request_id already identifies a different command",
+                        HTTPStatus.CONFLICT,
+                    )
+                result = json.loads(existing_request["result_json"])
+                result["replayed"] = True
+                return result
+
+            memory_row = connection.execute(
+                "SELECT memory_json FROM project_memory WHERE project_id = ? AND memory_id = ?",
+                (normalized_project, normalized_memory_id),
+            ).fetchone()
+            if memory_row is None:
+                raise UniverseError("MEMORY_NOT_FOUND", "project memory does not exist", HTTPStatus.NOT_FOUND)
+            memory_json = json.loads(memory_row["memory_json"])
+            if value.get("expected_memory_digest") != memory_json["memory_digest"]:
+                raise UniverseError(
+                    "MEMORY_DIGEST_CONFLICT",
+                    "Memory content changed; re-read before relating",
+                    HTTPStatus.CONFLICT,
+                )
+            from universe_memory import memory_retention
+
+            source_retention = memory_retention(connection, normalized_memory_id)
+            if source_retention["decision"] == "IGNORE":
+                raise UniverseError(
+                    "MEMORY_IGNORED", "Restore the memory before relating", HTTPStatus.CONFLICT
+                )
+
+            relation_row: dict[str, Any] | None = None
+            relation_changed = False
+            if target_memory_id_raw:
+                target_memory_id = _identifier(target_memory_id_raw, "target_memory_id")
+                if target_memory_id == normalized_memory_id:
+                    raise UniverseError(
+                        "MEMORY_RELATION_SELF_REFERENCE",
+                        "a memory cannot relate to itself",
+                    )
+                target_row = connection.execute(
+                    "SELECT memory_json FROM project_memory WHERE project_id = ? AND memory_id = ?",
+                    (normalized_project, target_memory_id),
+                ).fetchone()
+                if target_row is None:
+                    raise UniverseError(
+                        "MEMORY_RELATION_TARGET_NOT_FOUND",
+                        "target_memory_id does not exist in this project",
+                        HTTPStatus.NOT_FOUND,
+                    )
+                target_json = json.loads(target_row["memory_json"])
+                if value.get("expected_target_memory_digest") != target_json["memory_digest"]:
+                    raise UniverseError(
+                        "MEMORY_RELATION_TARGET_DIGEST_CONFLICT",
+                        "target memory content changed; re-read before relating",
+                        HTTPStatus.CONFLICT,
+                    )
+                target_retention = memory_retention(connection, target_memory_id)
+                if target_retention["decision"] == "IGNORE":
+                    raise UniverseError(
+                        "MEMORY_RELATION_TARGET_IGNORED",
+                        "restore the target memory before relating to it",
+                        HTTPStatus.CONFLICT,
+                    )
+                expected_relation_revision = value.get("expected_relation_revision", 0)
+                if type(expected_relation_revision) is not int or expected_relation_revision < 0:
+                    raise UniverseError(
+                        "MEMORY_RELATION_INVALID",
+                        "expected_relation_revision must be a nonnegative integer",
+                    )
+                existing = connection.execute(
+                    """
+                    SELECT * FROM project_memory_relation
+                    WHERE memory_id = ? AND target_memory_id = ? AND relation = ?
+                    """,
+                    (normalized_memory_id, target_memory_id, relation),
+                ).fetchone()
+                if existing is None:
+                    if expected_relation_revision != 0:
+                        raise UniverseError(
+                            "MEMORY_RELATION_REVISION_CONFLICT",
+                            "expected an existing relation revision, but none exists yet",
+                            HTTPStatus.CONFLICT,
+                        )
+                    relation_id = "memrel_" + hashlib.sha256(
+                        f"{normalized_memory_id}:{target_memory_id}:{relation}:{request_id}".encode()
+                    ).hexdigest()[:24]
+                    connection.execute(
+                        """
+                        INSERT INTO project_memory_relation
+                            (relation_id, project_id, memory_id, target_memory_id, relation, note, actor_ref, created_at, revision)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        (
+                            relation_id,
+                            normalized_project,
+                            normalized_memory_id,
+                            target_memory_id,
+                            relation,
+                            note,
+                            str(actor.get("actor_ref") or ""),
+                            now,
+                        ),
+                    )
+                    relation_row = {
+                        "relation_id": relation_id, "project_id": normalized_project,
+                        "memory_id": normalized_memory_id, "target_memory_id": target_memory_id,
+                        "relation": relation, "note": note,
+                        "actor_ref": str(actor.get("actor_ref") or ""), "created_at": now, "revision": 1,
+                    }
+                    relation_changed = True
+                else:
+                    if existing["revision"] != expected_relation_revision:
+                        raise UniverseError(
+                            "MEMORY_RELATION_REVISION_CONFLICT",
+                            f"relation revision changed; current revision is {existing['revision']}",
+                            HTTPStatus.CONFLICT,
+                        )
+                    relation_changed = existing["note"] != note
+                    if relation_changed:
+                        connection.execute(
+                            """
+                            INSERT INTO project_event(event_id, project_id, event_type, payload_json, created_at)
+                            VALUES (?, ?, 'MEMORY_RELATION_REVISED', ?, ?)
+                            """,
+                            (
+                                "event_" + uuid.uuid4().hex,
+                                normalized_project,
+                                _canonical_json({
+                                    "relation_id": existing["relation_id"], "previous_note": existing["note"],
+                                    "new_note": note, "previous_revision": existing["revision"],
+                                    "actor_ref": str(actor.get("actor_ref") or ""), "request_id": request_id,
+                                }),
+                                now,
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE project_memory_relation
+                            SET note = ?, actor_ref = ?, created_at = ?, revision = revision + 1
+                            WHERE relation_id = ?
+                            """,
+                            (note, str(actor.get("actor_ref") or ""), now, existing["relation_id"]),
+                        )
+                    relation_row = {
+                        "relation_id": existing["relation_id"], "project_id": normalized_project,
+                        "memory_id": normalized_memory_id, "target_memory_id": target_memory_id,
+                        "relation": relation, "note": note,
+                        "actor_ref": str(actor.get("actor_ref") or ""), "created_at": now,
+                        "revision": existing["revision"] + (1 if relation_changed else 0),
+                    }
+
+            knowledge_changed = False
+            if knowledge is not None:
+                kinds = {
+                    "USER_IDEA", "USER_REQUIREMENT", "USER_DECISION",
+                    "REUSABLE_PROCEDURE", "REUSABLE_EXPERIENCE",
+                }
+                if (
+                    not isinstance(knowledge, Mapping)
+                    or set(knowledge) != {"kind", "topic", "applicability"}
+                    or knowledge.get("kind") not in kinds
+                ):
+                    raise UniverseError(
+                        "MEMORY_KNOWLEDGE_INVALID",
+                        "knowledge requires kind, topic and applicability",
+                    )
+                topic = _required_text(knowledge.get("topic"), "knowledge.topic")
+                if len(topic) > 100:
+                    raise UniverseError("MEMORY_KNOWLEDGE_INVALID", "knowledge.topic is too long")
+                applicability = _required_text(knowledge.get("applicability"), "knowledge.applicability")
+                if len(applicability) > 400:
+                    raise UniverseError("MEMORY_KNOWLEDGE_INVALID", "knowledge.applicability is too long")
+                new_knowledge = {"kind": knowledge["kind"], "topic": topic, "applicability": applicability}
+                knowledge_changed = memory_json.get("knowledge") != new_knowledge
+                if knowledge_changed:
+                    connection.execute(
+                        """
+                        INSERT INTO project_event(event_id, project_id, event_type, payload_json, created_at)
+                        VALUES (?, ?, 'MEMORY_KNOWLEDGE_REVISED', ?, ?)
+                        """,
+                        (
+                            "event_" + uuid.uuid4().hex,
+                            normalized_project,
+                            _canonical_json({
+                                "memory_id": normalized_memory_id,
+                                "previous_knowledge": memory_json.get("knowledge"),
+                                "new_knowledge": new_knowledge,
+                                "actor_ref": str(actor.get("actor_ref") or ""), "request_id": request_id,
+                            }),
+                            now,
+                        ),
+                    )
+                    memory_json["knowledge"] = new_knowledge
+                    memory_json["updated_at"] = now
+                    connection.execute(
+                        "UPDATE project_memory SET memory_json = ?, updated_at = ? WHERE project_id = ? AND memory_id = ?",
+                        (_canonical_json(memory_json), now, normalized_project, normalized_memory_id),
+                    )
+
+            result = {
+                "schema": "universe.rag-memory-relate-result.v1",
+                "status": (
+                    "MEMORY_RELATION_RECORDED" if relation_changed
+                    else "MEMORY_KNOWLEDGE_RECORDED" if knowledge_changed
+                    else "MEMORY_RELATE_NO_CHANGE"
+                ),
+                "relation": relation_row,
+                "relation_changed": relation_changed,
+                "knowledge_changed": knowledge_changed,
+                "replayed": False,
+            }
+            connection.execute(
+                """
+                INSERT INTO project_memory_relate_action(request_id, request_json, actor_ref, result_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (request_id, request_json, str(actor.get("actor_ref") or ""), _canonical_json(result), now),
+            )
+        updated = self.get_project_memory(normalized_project, normalized_memory_id)
+        result["memory"] = updated
+        return result
+
+    def list_memory_relations(self, project_id: str, memory_id: str) -> list[dict[str, Any]]:
+        """Both directions: edges this memory names, and edges naming it as target."""
+
+        normalized_project = _project_id(project_id)
+        normalized_memory = _identifier(memory_id, "memory_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT relation_id, memory_id, target_memory_id, relation, note, actor_ref, created_at, revision
+                FROM project_memory_relation
+                WHERE project_id = ? AND (memory_id = ? OR target_memory_id = ?)
+                ORDER BY created_at, relation_id
+                """,
+                (normalized_project, normalized_memory, normalized_memory),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def propose_memory_links(
         self, project_id: str, *, limit: int = 20
@@ -22173,6 +22613,22 @@ class UniverseStore:
         message["created_at"] = row["created_at"]
         return message
 
+    def find_master_claim_for_wake(self, project_id: str, provider: str,
+                                   anchor: str, created_at: str) -> dict[str, Any] | None:
+        """Read exact queue-claim evidence without a UI-list pagination limit."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT message_json FROM project_master_message
+                   WHERE project_id = ?
+                     AND json_extract(message_json, '$.provider') = ?
+                     AND json_extract(message_json, '$.owner_session_anchor_ref') = ?
+                     AND json_extract(message_json, '$.started_at') >= ?
+                     AND json_extract(message_json, '$.delivery_state') IN ('PROCESSING', 'DONE', 'FAILED')
+                   ORDER BY created_at, rowid LIMIT 1""",
+                (project_id, provider, anchor, created_at),
+            ).fetchone()
+        return json.loads(row["message_json"]) if row is not None else None
+
     def has_queued_master_message(self, project_id: str) -> bool:
         """Cheap existence check reused by the session-ready wake retry
         (see UniverseHTTPServer._wake_master_queue_on_session_ready) and by
@@ -22369,18 +22825,51 @@ class UniverseStore:
         )
 
     def complete_master_message(
-        self, message_id: str, *, provider: str, result_ref: str = ""
+        self, message_id: str, *, provider: str, result_ref: str = "",
+        body_text: str = "",
     ) -> dict[str, Any]:
-        return self._transition_master_message(
-            message_id,
-            expected_states={"PROCESSING"},
-            delivery_state="DONE",
-            updates={
-                "provider": provider,
-                "result_ref": str(result_ref or ""),
-                "completed_at": utc_now(),
-            },
-        )
+        # Store the result and DONE atomically. Bus publication can be retried
+        # after a crash without rerunning the Master work.
+        message = self.get_master_message(message_id)
+        if message.get("provider") != provider:
+            raise UniverseError("MASTER_MESSAGE_OWNER_MISMATCH", "provider does not own this claim", 409)
+        body_text, result_ref = str(body_text or ""), str(result_ref or "")
+        if len(body_text.encode("utf-8")) > 24 * 1024 or len(result_ref.encode("utf-8")) > 2048:
+            raise UniverseError("MASTER_RESULT_TOO_LARGE", "result body or reference exceeds limit", 413)
+        request = {"provider": provider, "body_text": body_text, "result_ref": result_ref}
+        if message.get("delivery_state") == "DONE":
+            if message.get("completion_request") == request:
+                return message
+            raise UniverseError("MASTER_RESULT_CONFLICT", "completion payload differs from recorded result", 409)
+        metadata = message.get("metadata") or {}
+        anchor = str(metadata.get("reply_anchor_ref") or "").strip()
+        updates = {"provider": provider, "result_ref": result_ref,
+                   "completed_at": utc_now(), "completion_request": request}
+        if anchor:
+            updates["completion_result"] = {
+                "message_id": "msg_" + hashlib.sha256(("master-result:" + message_id).encode()).hexdigest()[:32],
+                "recipient_anchor_ref": anchor,
+                "body_text": "[Master completed: " + message_id + "]\n" +
+                    (body_text.strip() or "Result summary was not supplied.") +
+                    ("\nEvidence: " + result_ref if result_ref else ""),
+            }
+        try:
+            return self._transition_master_message(
+                message_id, expected_states={"PROCESSING"}, delivery_state="DONE", updates=updates)
+        except UniverseError as error:
+            if error.code != "MASTER_MESSAGE_STATE_CONFLICT":
+                raise
+            current = self.get_master_message(message_id)
+            if current.get("delivery_state") == "DONE" and current.get("completion_request") == request:
+                return current
+            raise
+
+    def master_completion_results(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("""SELECT message_json FROM project_master_message
+                WHERE json_extract(message_json, '$.delivery_state') = 'DONE'
+                  AND json_type(message_json, '$.completion_result') = 'object'""").fetchall()
+        return [json.loads(row["message_json"]) for row in rows]
 
     def _transition_master_message(
         self,
@@ -28034,6 +28523,7 @@ class UniverseStore:
             "revision": row["revision"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "blocked_reason": row["blocked_reason"] if "blocked_reason" in row.keys() else None,
         }
 
     @staticmethod
@@ -28631,6 +29121,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             failure_evidence_database=store.database_path,
         )
         self.mode_contract = dict(mode_contract or unknown_universe_mode_contract())
+        self.todo_actions = TodoActions(store)
         self.action_registry = build_default_action_registry(
             self._handle_feature_goal_start_action,
             rag_adopt_handler=self._handle_rag_adopt_action,
@@ -28638,12 +29129,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             memory_batch_run_handler=self._handle_memory_batch_run_action,
             rag_archive_candidate_handler=self._handle_rag_archive_candidate_action,
             rag_memory_retention_handler=self._handle_rag_memory_retention_action,
+            rag_memory_relate_handler=self._handle_rag_memory_relate_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
-            # Only create/replace Actions are on the generic /v1/actions surface.
-            # Todo lifecycle transitions stay on the anchor-aware receipt gateway
-            # (/v1/todo-action-mutation-receipts) - see docs/action-ir-work-surface.md.
+            # Shared operator commands resolve identity at the authenticated transport.
+            # Legacy supervised automation keeps its separate Anchor-bound contract.
             work_surface_handlers={
                 "project.draft.read": self._handle_project_draft_read_action,
                 "project.draft.list": self._handle_project_draft_list_action,
@@ -28653,6 +29144,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
+                "todo.read": self._handle_todo_read_action,
+                "todo.list": self._handle_todo_list_action,
+                "todo.state": self._handle_todo_state_action,
             },
         )
         self._planning_binding: dict[str, Any] | None = None
@@ -30027,6 +30521,44 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return {"schema": "universe.rag-memory-retention-result.v1", "status": "MEMORY_RETENTION_RECORDED" if changed else "MEMORY_RETENTION_REPLAYED",
                 "memory": memory, "effects": {"deleted": False, "retrieval": memory["retention"]["decision"]}}
 
+    def _handle_rag_memory_relate_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "Memory relation/classification requires a server-resolved USER",
+                HTTPStatus.FORBIDDEN,
+            )
+        value = _exact_object_fields(
+            request,
+            field="rag_memory_relate",
+            required=frozenset({"project_id", "memory_id", "expected_memory_digest", "request_id"}),
+            optional=frozenset({
+                "relation", "target_memory_id", "expected_target_memory_digest",
+                "expected_relation_revision", "note", "knowledge",
+            }),
+        )
+        if "relation" in value and value["relation"] not in (
+            "COMPLEMENTS", "SUPERSEDES", "CONFLICTS_WITH", "DUPLICATE_OF",
+        ):
+            raise UniverseError(
+                "MEMORY_RELATION_INVALID",
+                "relation must be COMPLEMENTS, SUPERSEDES, CONFLICTS_WITH or DUPLICATE_OF",
+            )
+        if "target_memory_id" in value and "expected_target_memory_digest" not in value:
+            raise UniverseError(
+                "MEMORY_RELATION_INVALID",
+                "expected_target_memory_digest is required together with target_memory_id",
+            )
+        return self.store.record_memory_relation(
+            _identifier(value["project_id"], "project_id"),
+            _identifier(value["memory_id"], "memory_id"),
+            value,
+            actor,
+        )
+
     def _handle_rag_archive_candidate_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -30230,6 +30762,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "feature_created": created,
         }
 
+    def _todo_action(self, handler, request, *args):
+        try:
+            return handler(request, *args)
+        except TodoActionError as error:
+            raise UniverseError(error.code, error.detail, error.status) from error
+
+    def _handle_todo_read_action(self, request, context):
+        return self._todo_action(self.todo_actions.read, request)
+
+    def _handle_todo_list_action(self, request, context):
+        return self._todo_action(self.todo_actions.list, request)
+
+    def _handle_todo_state_action(self, request, context):
+        return self._todo_action(self.todo_actions.change_state, request, context.get("actor"))
+
     def _handle_todo_create_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -30268,19 +30815,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(
                 "REQUEST_INVALID", "todo_update_action.todo must be an object"
             )
-        # Lifecycle state transitions never route through the generic Action
-        # surface: they need a Session-Anchor-bound todo-action-mutation-receipt
-        # (POST /v1/todo-action-mutation-receipts + consume). todo.update carries
-        # the plain-PATCH fields only; a state that differs from the current
-        # Todo is rejected, and an absent/equal state is pinned to current.
+        # Metadata updates preserve lifecycle state. Operator transitions use
+        # todo.state; supervised reports retain their Anchor-bound domain gateway.
+        # Pin absent/equal state to current before the Store revision check.
         current = self.store.get_todo(todo_id)
         merged = dict(todo_body)
         requested_state = merged.get("state")
         if requested_state is not None and requested_state != current["state"]:
             raise UniverseError(
                 "ACTION_TODO_LIFECYCLE_VIA_RECEIPT",
-                "todo.update cannot change lifecycle state; use the "
-                "receipt-bound /v1/todos/{todo_id}/actions path",
+                "todo.update cannot change lifecycle state; use todo.state "
+                "with the current revision and completion evidence",
                 HTTPStatus.BAD_REQUEST,
             )
         merged["state"] = current["state"]
@@ -34589,7 +35134,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         provider_filter = str(raw.get("provider") or "").strip().upper()
         expand = bool(project_filter or mode_filter or provider_filter)
         listed = self.list_cli_terminals()
-        terminals = listed.get("terminals") or []
+        terminals = [item for item in (listed.get("terminals") or [])
+                     if str(item.get("state") or "").upper() == "LIVE"]
+        open_session_ids = {str(item.get("supervisor_session_id") or "").strip()
+                            for item in terminals if item.get("supervisor_session_id")}
         hosts = listed.get("hosts") or []
         open_host_refs = {
             str(
@@ -34733,7 +35281,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             key=lambda session: str(session.get("last_seen_at") or ""),
             reverse=True,
         )
-        for session in pool:
+        for original in pool:
+            session = dict(original)
+            session_id = str(session.get("universe_session_id") or session.get("session_id") or "").strip()
+            if session_id in open_session_ids:
+                continue
+            # Provider identity survives Host death in the Supervisor session
+            # ledger. Join only the exact session and matching project/mode.
+            try:
+                supervised = self.session_supervisor.get_session(session_id)
+            except SessionSupervisorError:
+                supervised = {}
+            if (str(supervised.get("current_project_id") or supervised.get("project_id") or supervised.get("node") or "").casefold()
+                    == str(session.get("project_id") or session.get("node") or "").casefold()
+                    and str(supervised.get("mode") or "").upper() == str(session.get("mode") or "").upper()
+                    and str(supervised.get("provider") or "").upper() in {"CODEX", "CLAUDE", "GROK"}):
+                session["provider"] = str(supervised["provider"]).upper()
+                if supervised.get("session_anchor_ref"):
+                    session["session_anchor_ref"] = supervised["session_anchor_ref"]
             # The managed-shell identity fallback is only trusted for a live
             # reconnection host (re-attach). A dead session's stale identity
             # file must not stamp a provider the anchor-session record lacks.
@@ -35418,9 +35983,80 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except TerminalHostError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
 
+    def _recover_claude_channel_results(self) -> dict[str, Any]:
+        """Restore the result projection lost when the web process restarted.
+
+        A live push callback is an optimization; the surviving Host owns the
+        authoritative result. Reconciliation never submits or replays work.
+        """
+        reader = getattr(self.terminal_host, "channel_result", None)
+        recovered, errors = [], []
+        if not callable(reader):
+            return {"recovered_message_ids": recovered, "errors": errors}
+        host = self._session_anchor_terminal_host()
+        for terminal in host.list_sessions():
+            if terminal.get("provider") != "CLAUDE" or terminal.get("state") != "LIVE":
+                continue
+            tid = str(terminal.get("terminal_id") or "")
+            anchor = str(terminal.get("session_anchor_ref") or terminal.get("active_session_anchor_ref") or "")
+            if not tid or not anchor:
+                continue
+            messages = self.session_bus.inbox(host, session_anchor_ref=anchor, projection="ACTIVITY")["messages"]
+            for message in messages:
+                if (message.get("lifecycle_state") != "STARTED"
+                        or (message.get("lifecycle") or {}).get("delivery_channel") != "CLAUDE_CODE_CHANNEL"):
+                    continue
+                mid = str(message["message_id"])
+                try:
+                    result = reader(tid, mid)
+                    if (result.get("kind") != "RESULT"
+                            or result.get("status") not in {"ACCEPTED", "DUPLICATE"}):
+                        continue
+                    if (result.get("message_id") != mid or result.get("session_anchor_ref") != anchor
+                            or result.get("outcome") not in {"COMPLETED", "FAILED"}):
+                        raise SessionBusError("BUS_CHANNEL_RESULT_COORDINATE_INVALID",
+                                              "Host result does not match the exact message/anchor/outcome", 409)
+                    self.session_bus.reply(
+                        mid, terminal_id=tid, session_anchor_ref=anchor,
+                        body_text=str(result.get("body_text") or ""),
+                        result_ref=str(result.get("result_ref") or "") or f"claude-channel://{tid}/{mid}",
+                        outcome=result["outcome"], host=host,
+                    )
+                    recovered.append(mid)
+                except (SessionBusError, TerminalHostError) as error:
+                    errors.append({"operation": "RECOVER_CLAUDE_CHANNEL_RESULT", "terminal_id": tid,
+                                   "message_id": mid, "error_code": error.code, "detail": error.detail})
+        return {"recovered_message_ids": recovered, "errors": errors}
+
+    def _recover_claimed_master_queue_wakes(self) -> dict[str, Any]:
+        """Close delivered queue notifications using durable claim evidence only."""
+        closed, errors = [], []
+        host = self._session_anchor_terminal_host()
+        for terminal in host.list_sessions():
+            if terminal.get("mode") != "MASTER" or terminal.get("state") != "LIVE":
+                continue
+            anchor = str(terminal.get("session_anchor_ref") or terminal.get("active_session_anchor_ref") or "")
+            if not anchor:
+                continue
+            rows = self.session_bus.inbox(host, session_anchor_ref=anchor, projection="ACTIVITY")["messages"]
+            for message in rows:
+                if message.get("lifecycle_state") != "STARTED":
+                    continue
+                try:
+                    if self._complete_claimed_master_queue_wake(message):
+                        closed.append(message["message_id"])
+                except (SessionBusError, UniverseError) as error:
+                    errors.append({"operation": "RECOVER_MASTER_QUEUE_WAKE", "message_id": message["message_id"],
+                                   "error_code": error.code, "detail": str(error)})
+        return {"completed_message_ids": closed, "errors": errors}
+
     def run_session_bus_recovery_once(self) -> dict[str, Any]:
         """Rehydrate retryable bus work and bind it to current live TUIs."""
 
+        from universe_app.host_turn_projection import reconcile as reconcile_host_turns
+        host_turns = reconcile_host_turns(self)
+        queue_wakes = self._recover_claimed_master_queue_wakes()
+        channel_results = self._recover_claude_channel_results()
         recovered = self.session_bus.recover_pending_deliveries()
         dispatches = self._dispatch_live_posted_session_instructions(recovered)
         pending_ids = [
@@ -35437,6 +36073,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "schema": "universe.session-bus-recovery.v1",
             "status": "READY" if not pending_ids else "RECOVERY_PENDING",
             "recovered_message_ids": recovered.get("recovered_message_ids", []),
+            "queue_wakes": queue_wakes,
+            "channel_results": channel_results,
+            "host_turns": host_turns,
             "pending_message_ids": pending_ids,
             "dispatches": dispatches,
         }
@@ -35583,6 +36222,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.session_bus.record_dispatch_attempt(failure["message_id"], failure)
         return dispatches
 
+    def _publish_master_completion_results(self) -> dict[str, Any]:
+        published, errors = [], []
+        for message in self.store.master_completion_results():
+            try:
+                result = self.session_bus.publish_master_completion(message)
+                published.append(result["message_id"])
+            except (SessionBusError, sqlite3.Error) as error:
+                errors.append({"operation": "PUBLISH_MASTER_RESULT", "message_id": message["message_id"],
+                               "error_code": getattr(error, "code", type(error).__name__), "detail": str(error)})
+        return {"message_ids": published, "errors": errors}
+
     def run_conductor_operating_loop_once(
         self, *, max_messages: int = 32
     ) -> dict[str, Any]:
@@ -35595,10 +36245,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         provider adapter accepts the resulting instruction.
         """
 
+        completion_results = self._publish_master_completion_results()
         limit = max(1, min(int(max_messages), 128))
         result: dict[str, Any] = {
             "schema": "universe.conductor-operating-loop.v1",
             "status": "OK",
+            "master_completion_results": completion_results,
             "reclaimed_master_message_ids": [],
             "forwarded_result_ids": [],
             "dispatched_instruction_ids": [],
@@ -35662,7 +36314,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     continue
                 reports = self.session_bus.inbox(
                     host,
-                    terminal_id=terminal_id,
+                    session_anchor_ref=anchor,
                     projection="RESULTS",
                 )["messages"]
             except (SessionBusError, SessionSupervisorError, TerminalHostError) as error:
@@ -35707,7 +36359,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             try:
                 pending = self.session_bus.inbox(
                     host,
-                    terminal_id=terminal_id,
+                    session_anchor_ref=anchor,
                     projection="INBOX",
                 )["messages"]
             except (SessionBusError, TerminalHostError) as error:
@@ -35750,6 +36402,55 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             result["status"] = "PARTIAL"
         result["observed_at"] = utc_now()
         return result
+
+    def _complete_claimed_master_queue_wake(self, message: Mapping[str, Any]) -> bool:
+        """A queue wake requests a claim, not completion of the claimed work.
+
+        Only the server's exact claim evidence can close this notification.
+        Ordinary provider work still requires its authoritative reply. Legacy
+        wakes are recognized by the complete server-generated envelope/body;
+        neither elapsed time nor a terminal's display is completion evidence.
+        """
+        source = message.get("from") or {}
+        target = message.get("to") or {}
+        if (message.get("lifecycle_state") != "STARTED"
+                or message.get("kind") != "INSTRUCTION"
+                or source.get("mode") != "SYSTEM"
+                or any(source.get(k) for k in ("provider", "terminal_id", "session_anchor_ref"))
+                or target.get("mode") != "MASTER"):
+            return False
+        project_id = str(target.get("project_id") or "")
+        anchor = str(message.get("recipient_anchor_ref") or "")
+        terminal_id = str(message.get("terminal_id") or "")
+        provider = str(target.get("provider") or "")
+        if not all((project_id, anchor, terminal_id, provider)) or source.get("project_id") != project_id:
+            return False
+        if (message.get("provenance") or {}).get("system_event") != "MASTER_QUEUE_WAKE":
+            # Compatibility with persisted wakes created before the typed marker.
+            body = str(message.get("body_text") or "")
+            prefix = re.fullmatch(
+                r"Master queue has work waiting \([^\r\n]*\)\. Claim it: POST "
+                + re.escape(f"/v1/projects/{project_id}/master-messages/claim")
+                + r" with JSON (\{[^\r\n]*\})\. Keep these exact owner coordinates on the claim\.", body)
+            if source.get("node_ref") or prefix is None:
+                return False
+            try:
+                coordinates = json.loads(prefix.group(1))
+            except (ValueError, TypeError):
+                return False
+            if coordinates != {"provider": provider, "terminal_id": terminal_id,
+                               "session_anchor_ref": anchor}:
+                return False
+        claim = self.store.find_master_claim_for_wake(
+            project_id, provider, anchor, str(message.get("created_at") or "~"))
+        if claim is None:
+            return False
+        self.session_bus.transition(
+            str(message["message_id"]), state="COMPLETED",
+            terminal_id=terminal_id, session_anchor_ref=anchor,
+            result_ref=f"universe://projects/{project_id}/master-messages/{claim['message_id']}#claimed",
+        )
+        return True
 
     def _wake_live_master_sessions(self, project_id: str, *, reason: str) -> int:
         """Best-effort nudge: tell every live Master session for this
@@ -35801,13 +36502,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     },
                     kind="INSTRUCTION",
                     notify="HEADER",
+                    system_event="MASTER_QUEUE_WAKE",
                     body=(
                         f"Master queue has work waiting ({reason}). Claim it: "
                         f"POST /v1/projects/{project_id}/master-messages/claim with JSON "
                         + json.dumps({"provider": terminal.get("provider"),
                                       "terminal_id": terminal.get("terminal_id"),
                                       "session_anchor_ref": terminal.get("session_anchor_ref")})
-                        + ". Keep these exact owner coordinates on the claim."
+                        + ". Keep these exact owner coordinates on the claim. "
+                        + "Finish with POST /v1/master-messages/{message_id}/complete including provider, "
+                        + "body_text (actual result summary), and optional result_ref. "
+                        + "The server publishes this result to the recorded reply Anchor; do not send a second coordination reply."
                     ),
                 )
             except SessionBusError:
@@ -40304,6 +41009,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 for item in active_messages
                 if str(item.get("kind") or "").upper() in {"INSTRUCTION", "COORDINATION"}
                 and str(item.get("lifecycle_state") or "").upper() == "STARTED"
+                and not self._complete_claimed_master_queue_wake(item)
             ]
             if started_ids:
                 return {
@@ -40482,7 +41188,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
 
         if rust_host_interactive and provider in {"CODEX", "GROK"}:
-            bus_dispatch_ref = "dispatch_" + secrets.token_hex(16) if provider == "CODEX" else ""
+            bus_dispatch_ref = "dispatch_" + message_id.removeprefix("msg_") if provider == "CODEX" else ""
             try:
                 observer_source = self._register_exact_provider_observer_source(
                     provider=provider,
@@ -40523,44 +41229,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "and authentication from .ai/skills/common/resolve_universe_endpoint.py "
                     "(installed Runtime endpoint resolver); never print credentials."
                 )
-                submit_prompt = getattr(self.terminal_host, "submit_prompt", None)
-                if not callable(submit_prompt):
-                    raise TerminalHostError(
-                        "AGENT_PROMPT_SUBMISSION_UNAVAILABLE",
-                        "terminal Host does not expose verified prompt submission",
-                    )
-                prompt_delivery = str(
-                    submit_prompt(
-                        terminal_id,
-                        body_text,
-                        audit_context={
-                            "source": "SESSION_BUS",
-                            "message_id": message_id,
-                            "session_anchor_ref": session_anchor_ref,
-                        },
-                    )
-                    or ""
-                ).lower()
-                if prompt_delivery != "delivered":
-                    self.session_bus.release_instruction_claim(
-                        terminal_id=terminal_id,
-                        message_id=message_id,
-                        session_anchor_ref=session_anchor_ref,
-                    )
-                    return {
-                        "status": "AGENT_PROMPT_" + (prompt_delivery or "UNKNOWN").upper(),
-                        "delivery_mode": "RUST_HOST_INPUT",
-                        "provider": provider,
-                        "message_id": message_id,
-                        "session_anchor_ref": session_anchor_ref,
-                    }
+                offer_turn = getattr(self.terminal_host, "offer_turn", None)
+                if not callable(offer_turn):
+                    raise TerminalHostError("HOST_TURN_DELIVERY_UNAVAILABLE", "Host must support turn delivery")
+                host_delivery = offer_turn(terminal_id, {
+                    "message_id": message_id, "text": body_text,
+                    "session_anchor_ref": session_anchor_ref, "provider": provider,
+                    "provider_session_ref": provider_session_ref,
+                })
+                if host_delivery.get("capability") != "HOST_TURN_DELIVERY_V1":
+                    raise TerminalHostError("HOST_TURN_DELIVERY_UNAVAILABLE", "Host capability not observed")
+                # Host acceptance is transport ownership, not proof that a model started.
+                prompt_delivery = "host_accepted"
                 completed = self.session_bus.complete_instruction_claim(
                     terminal_id=terminal_id,
                     message_id=str(delivery["message_id"]),
                     session_anchor_ref=session_anchor_ref,
                     observer_source_id=str(observer_source["source_id"]),
                     bus_dispatch_ref=bus_dispatch_ref,
-                    delivery_channel="SESSION_BUS_HTTP",
+                    delivery_channel="HOST_TURN_DELIVERY",
                 )
             except (SessionBusError, TerminalHostError, UnicodeError) as error:
                 self.session_bus.release_instruction_claim(
@@ -40568,11 +41255,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     message_id=str(claim.get("message_id") or ""),
                     session_anchor_ref=session_anchor_ref,
                 )
-                return {"status": "DELIVERY_FAILED", "detail": str(error)}
+                return {"status": "DELIVERY_FAILED", "detail": str(error), "error_code": getattr(error, "code", "HOST_DELIVERY_FAILED"), "operation": "HOST_TURN_OFFER", "terminal_id": terminal_id, "message_id": message_id}
             return {
                 "status": "DISPATCHED",
                 "delivery_mode": "RUST_HOST_INPUT",
                 "prompt_delivery": prompt_delivery,
+                "host_turn_state": host_delivery.get("state"),
                 "provider": provider,
                 "observer_source_id": observer_source["source_id"],
                 "message_id": completed["message_id"],
@@ -44718,6 +45406,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     field="action",
                     required=frozenset({"action_id", "request"}),
                 )
+                # Normalize before transport-specific gates and dispatch alike.
+                action_envelope["action_id"] = _required_text(action_envelope["action_id"], "action.action_id")
+                if action_envelope["action_id"] == "todo.state":
+                    commander = self._direct_commander_context(source="HTTP_ACTION")
+                    if not commander["authenticated"]:
+                        raise UniverseError("TODO_OPERATOR_REQUIRED", "Todo state requires the existing operator transport", HTTPStatus.FORBIDDEN)
                 if action_envelope["action_id"] == "service.restart":
                     if not self._authorize_local_operator() or not self._authorize_service_control():
                         return
@@ -46261,6 +46955,22 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     {
                         "schema": API_SCHEMA,
                         "status": "TODO_RECORDED",
+                        "todo": todo,
+                        "task_frame_created": False,
+                        "execution_assignment_created": False,
+                    },
+                )
+                return
+            todo_blocked_reason = re.fullmatch(r"/v1/todos/([^/]+)/blocked-reason", path)
+            if todo_blocked_reason is not None:
+                todo = self.server.store.set_todo_blocked_reason(
+                    unquote(todo_blocked_reason.group(1)), body
+                )
+                self._send(
+                    HTTPStatus.OK,
+                    {
+                        "schema": API_SCHEMA,
+                        "status": "TODO_BLOCKED_REASON_RECORDED",
                         "todo": todo,
                         "task_frame_created": False,
                         "execution_assignment_created": False,
@@ -47965,12 +48675,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         message_id,
                         provider=provider,
                         result_ref=str((body or {}).get("result_ref") or ""),
+                        body_text=str((body or {}).get("body_text") or ""),
                     )
+                    result_delivery = self.server._publish_master_completion_results()
                     self._send(
                         HTTPStatus.OK,
                         {
                             "schema": API_SCHEMA,
                             "status": "MASTER_MESSAGE_COMPLETED",
+                            "result_delivery": result_delivery,
                             "message": message,
                         },
                     )
@@ -48075,7 +48788,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if todo_id is None:
                 self._not_found()
                 return
-            todo = self.server.store.update_todo(todo_id, body)
+            todo = self.server.execute_action(TODO_UPDATE_ACTION_ID, {"todo_id": todo_id, "todo": body}, source="LEGACY_TODO_PATCH")["todo"]
             self._send(
                 HTTPStatus.OK,
                 {
@@ -50284,6 +50997,14 @@ def parser() -> argparse.ArgumentParser:
     inject_session.add_argument("--token", default="")
     inject_session.add_argument("--state-file", type=Path, default=default_state_path())
 
+    action = commands.add_parser("action", help="Discover or invoke typed server Actions without private session lookup")
+    action_input = action.add_mutually_exclusive_group(required=True)
+    action_input.add_argument("--catalog", action="store_true")
+    action_input.add_argument("--request-file", type=Path)
+    action.add_argument("--endpoint", default="")
+    action.add_argument("--token", default="")
+    action.add_argument("--state-file", type=Path, default=default_state_path())
+
     register = commands.add_parser("register")
     register.add_argument("--project-id", required=True)
     register.add_argument("--project-root", type=Path, required=True)
@@ -50627,6 +51348,16 @@ def main() -> int:
                     token=token,
                     args=args,
                 )
+            elif args.command == "action":
+                if args.catalog:
+                    status, result = request_json(endpoint=endpoint, token=token, method="GET", path="/v1/actions")
+                else:
+                    try:
+                        envelope = json.loads(args.request_file.read_text(encoding="utf-8-sig"))
+                    except (UnicodeError, json.JSONDecodeError) as error:
+                        raise UniverseError("ACTION_REQUEST_INVALID", "Action request file must contain UTF-8 JSON") from error
+                    envelope = _exact_object_fields(envelope, field="action", required=frozenset({"action_id", "request"}))
+                    status, result = request_json(endpoint=endpoint, token=token, method="POST", path="/v1/actions", payload=envelope)
             elif args.command == "register":
                 status, result = request_json(
                     endpoint=endpoint,

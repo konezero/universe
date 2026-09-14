@@ -63,6 +63,13 @@ SESSION_MARKER_ENVIRONMENT = (
 class ReconnectionHostError(RuntimeError):
     """Raised when discovery, validation, or authenticated IPC fails."""
 
+    def __init__(self, detail: str, *, code: str = "HOST_REQUEST_FAILED", operation: str = "", resource: str = "") -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.operation = operation
+        self.resource = resource
+
 
 class ReconnectionHostRuntimeStopped(ReconnectionHostError):
     """An exact authenticated Host remains, but its owned runtime exited."""
@@ -328,7 +335,7 @@ class ReconnectionHostClient:
                     if len(response) > MAX_RESPONSE_BYTES:
                         raise ReconnectionHostError("Host response exceeds size limit")
         except OSError as error:
-            raise ReconnectionHostError(f"Host IPC failed: {error}") from error
+            raise ReconnectionHostError(f"Host IPC failed: {error}", code="HOST_IPC_FAILED", operation=action, resource=self.state.host_id) from error
         try:
             payload = json.loads(response.split(b"\n", 1)[0])
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -338,7 +345,7 @@ class ReconnectionHostClient:
         if payload.get("status") != "OK":
             code = payload.get("error_code", "HOST_REQUEST_FAILED")
             detail = payload.get("detail", "Host request failed")
-            raise ReconnectionHostError(f"{code}: {detail}")
+            raise ReconnectionHostError(f"{code}: {detail}", code=str(code), operation=action, resource=self.state.host_id)
         return payload
 
     def status(self) -> dict[str, Any]:
@@ -1045,6 +1052,14 @@ class ReconnectionPty:
             supervisor_id=self.supervisor_id,
             input_base64=base64.b64encode(bytes(data)).decode("ascii"),
         )
+
+    def offer_turn(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self.client.request("turn_offer", supervisor_id=self.supervisor_id,
+                                        channel=dict(payload)).get("channel") or {})
+
+    def turn_delivery_status(self) -> dict[str, Any]:
+        return dict(self.client.request("turn_delivery_status", supervisor_id=self.supervisor_id,
+                                        channel={}).get("channel") or {})
 
     def channel_state(self) -> str:
         result = self.client.request(

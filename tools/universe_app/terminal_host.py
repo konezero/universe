@@ -590,6 +590,7 @@ class TerminalSession:
     permission_sequence: int = 0
     explicit_working_started_at: float | None = None
     hook_status: str | None = None
+    host_turn_state: dict[str, Any] = field(default_factory=dict)
     prompt_delivery: str = ""
     provider_cli: str = ""
     provider_cli_process: str = ""
@@ -652,6 +653,7 @@ class TerminalSession:
             "channel_registered": self.channel_is_registered(),
             "output_sequence": self.output_cursor,
             "prompt_delivery": self.prompt_delivery,
+            "host_turn_state": dict(self.host_turn_state),
             "prompt_activity": {
                 "generation": self.prompt_generation,
                 "working_sequence": self.working_sequence,
@@ -1475,6 +1477,7 @@ class TerminalHost:
                 claude_session_id=fresh_claude_session_id,
                 grok_session_id=fresh_grok_session_id,
                 claude_channel_enabled=channel_enabled,
+                host_turn_observation=self._reconnection_registry is not None,
                 mode=requested_mode,
                 project_id=project,
             )
@@ -1523,6 +1526,8 @@ class TerminalHost:
             # times and contend on the same runtime state. Isolate this Host to
             # its native hook path; other Claude compatibility surfaces remain.
             child_environment["GROK_CLAUDE_HOOKS_ENABLED"] = "0"
+        if resolved_provider == "CODEX":
+            child_environment["UNIVERSE_CODEX_QUEUE_EXECUTABLE"] = executable
         reserved_environment = frozenset(child_environment)
         for key, value in dict(provider_environment or {}).items():
             normalized_key = str(key)
@@ -2519,6 +2524,30 @@ class TerminalHost:
         expected = re.sub(r"\s", "", text)[:80]
         return bool(expected and expected in compact)
 
+    def offer_turn(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        if not isinstance(session.backend, ReconnectionPty):
+            raise TerminalHostError("HOST_TURN_DELIVERY_UNAVAILABLE", "a surviving Rust Host is required")
+        if payload.get("session_anchor_ref") != session.session_anchor_ref:
+            raise TerminalHostError("HOST_TURN_ANCHOR_MISMATCH", "delivery anchor does not match terminal")
+        try:
+            if str(session.provider).upper() == "CODEX":
+                observed = session.backend.client.status().get("turn_delivery") or {}
+                if not observed.get("native_queue_available"):
+                    raise TerminalHostError("HOST_NATIVE_QUEUE_UPGRADE_REQUIRED", "Codex native queue requires a newly launched Host; existing PTY delivery will not be used")
+            return session.backend.offer_turn(payload)
+        except ReconnectionHostError as error:
+            raise TerminalHostError(error.code, str(error)) from error
+
+    def turn_delivery_status(self, terminal_id: str) -> dict[str, Any]:
+        session = self.get(terminal_id)
+        if not isinstance(session.backend, ReconnectionPty):
+            return {"capability":"UNAVAILABLE"}
+        try:
+            return session.backend.turn_delivery_status()
+        except ReconnectionHostError as error:
+            raise TerminalHostError(error.code, str(error)) from error
+
     def submit_prompt(
         self,
         terminal_id: str,
@@ -2887,9 +2916,19 @@ class TerminalHost:
             session.protocol_state = "UNKNOWN"
             return
         try:
-            session.host_runtime_versions = backend.runtime_versions
-            session.host_compatibility = backend.compatibility
-            session.protocol_state = backend.protocol_state
+            if isinstance(backend, ReconnectionPty):
+                observed = backend.client.status()
+                session.host_runtime_versions = runtime_version_snapshot(observed)
+                session.host_compatibility = evaluate_runtime_compatibility(observed)
+                session.protocol_state = str(observed.get("protocol_state") or "UNKNOWN")
+                turn = observed.get("turn_delivery") or {}
+                session.host_turn_state = {key: turn.get(key) for key in
+                    ("capability", "native_queue_available", "state", "revision", "turn_id", "last_event", "input_active")}
+                session.host_turn_state["latest_delivery"] = (turn.get("messages") or [None])[-1]
+            else:
+                session.host_runtime_versions = backend.runtime_versions
+                session.host_compatibility = backend.compatibility
+                session.protocol_state = backend.protocol_state
         except ReconnectionHostError:
             session.host_compatibility = "INCOMPATIBLE"
             session.protocol_state = "UNKNOWN"
@@ -3254,6 +3293,7 @@ def startup_argv(
     claude_session_id: str = "",
     grok_session_id: str = "",
     claude_channel_enabled: bool = False,
+    host_turn_observation: bool = False,
     mode: str = "",
     project_id: str = "",
 ) -> list[str]:
@@ -3267,6 +3307,11 @@ def startup_argv(
     model = str(model_ref or "").strip()
     selected_effort = str(effort or "AUTO").strip().upper() or "AUTO"
     argv: list[str] = []
+    if name == "CODEX" and host_turn_observation:
+        import sys
+        notify = [sys.executable, str(Path(__file__).resolve().parents[1] / "universe_host_turn_hook.py"),
+                  "--provider", "CODEX", "--notify-json"]
+        argv.extend(["-c", "notify=" + json.dumps(notify)])
     if name in {"GROK", "CLAUDE", "CODEX"} and model:
         argv.extend(("--model", model))
     if str(mode or "").strip().upper() == "MASTER":

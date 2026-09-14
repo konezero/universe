@@ -78,6 +78,20 @@ class PtySupervisorTests(unittest.TestCase):
         self.server.server_close()
         self.audit_dir.cleanup()
 
+    def test_turn_http_forwards_payload_without_writing_terminal(self) -> None:
+        payload={"message_id":"msg_one","text":"hello","session_anchor_ref":TEST_ANCHOR}
+        receipt={"capability":"HOST_TURN_DELIVERY_V1","state":"STARTING","messages":[]}
+        host=self.server.supervisor.host
+        with patch.object(host,"offer_turn",return_value=receipt) as offer, patch.object(host,"turn_delivery_status",return_value=receipt) as status, patch.object(host,"write") as write:
+            for suffix, body in [("offer-turn",payload),("turn-delivery-status",{})]:
+                request=urllib.request.Request(self.base+"/v1/terminals/term_one/"+suffix,
+                    data=json.dumps(body).encode(),headers={"Authorization":"Bearer sup-token","Content-Type":"application/json"},method="POST")
+                with urllib.request.urlopen(request,timeout=3) as response:
+                    self.assertEqual(receipt,json.load(response)["turn_delivery"])
+            offer.assert_called_once_with("term_one",payload)
+            status.assert_called_once_with("term_one")
+            write.assert_not_called()
+
     def test_supervisor_polls_orphan_reclaim_without_ui_clients(self) -> None:
         observed = threading.Event()
 

@@ -139,6 +139,10 @@ def reconnection_registry_from_environment(
     else:
         host_root = TOOLS / "session_host" / "target"
         candidates = (
+            host_root / "release" / "universe-session-host-v3.exe",
+            host_root / "debug" / "universe-session-host-v3.exe",
+            host_root / "release" / "universe-session-host-v2.exe",
+            host_root / "debug" / "universe-session-host-v2.exe",
             host_root / "release" / "universe-session-host.exe",
             host_root / "debug" / "universe-session-host.exe",
         )
@@ -819,6 +823,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK"})
+            return
+        if path.startswith("/v1/terminals/") and path.endswith(("/offer-turn", "/turn-delivery-status")):
+            terminal_id = path.split("/")[3]
+            try:
+                result = (supervisor.host.offer_turn(terminal_id, body) if path.endswith("/offer-turn")
+                          else supervisor.host.turn_delivery_status(terminal_id))
+            except TerminalHostError as error:
+                self._send(HTTPStatus.CONFLICT, {"schema": API_SCHEMA, "status":"ERROR",
+                           "error_code":error.code, "detail":error.detail})
+                return
+            self._send(HTTPStatus.OK, {"schema":API_SCHEMA, "status":"OK", "turn_delivery":result})
             return
         if path.startswith("/v1/terminals/") and path.endswith("/submit-prompt"):
             terminal_id = path.split("/")[3]

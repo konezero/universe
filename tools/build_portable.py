@@ -243,7 +243,7 @@ def build_session_host(cargo_executable: str | Path = "cargo") -> Path:
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise RuntimeError(f"Rust Reconnection Host build failed: {detail}")
-    binary = SESSION_HOST_MANIFEST.parent / "target" / "release" / SESSION_HOST_BINARY_NAME
+    binary = SESSION_HOST_MANIFEST.parent / "target" / "release" / "universe-session-host-v3.exe"
     if not binary.is_file():
         raise FileNotFoundError(f"release Host binary is missing after build: {binary}")
     return binary

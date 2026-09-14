@@ -1399,7 +1399,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "title": "Confirm broker contract and examples",
             "detail": "Review the request and response examples.",
             "priority": "P0",
-            "state": "IN_PROGRESS",
+            "state": "READY",
             "source_kind": project_todo["source_kind"],
             "sort_order": project_todo["sort_order"],
             "revision": project_todo["revision"],
@@ -3637,9 +3637,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 or {**value, "source_id": "source-codex-native-001"}
             )
         )
-        self.server.terminal_host.submit_prompt = Mock(
+        self.server.terminal_host.offer_turn = Mock(
             side_effect=lambda *_args, **_kwargs: (
-                call_order.append("submit") or "delivered"
+                call_order.append("submit") or {"capability":"HOST_TURN_DELIVERY_V1","state":"WORKING","messages":[]}
             )
         )
         self.server._provider_chat_key_for_session_instruction = Mock(
@@ -3682,8 +3682,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             f"instruction_ref: session-bus:{posted['message_id']}\n"
             "Continue through the visible Rust Host session."
         )
-        self.server.terminal_host.submit_prompt.assert_called_once()
-        submit_args = self.server.terminal_host.submit_prompt.call_args.args
+        self.server.terminal_host.offer_turn.assert_called_once()
+        submit_args = list(self.server.terminal_host.offer_turn.call_args.args)
+        submit_args[1] = submit_args[1]["text"]
         self.assertEqual(terminal["terminal_id"], submit_args[0])
         self.assertTrue(submit_args[1].startswith("universe_dispatch_ref: dispatch_"))
         self.assertIn(expected_body, submit_args[1])
@@ -3696,8 +3697,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
             source_id="source-codex-native-001",
         )
         self.assertEqual("SESSION_BUS_RESULT_DEFERRED_TO_REPLY_CHANNEL", deferred["status"])
-        self.assertEqual("SESSION_BUS_HTTP", deferred["delivery_channel"])
-        self.assertEqual("SESSION_BUS", self.server.terminal_host.submit_prompt.call_args.kwargs["audit_context"]["source"])
+        self.assertEqual("HOST_TURN_DELIVERY", deferred["delivery_channel"])
+        self.assertEqual(posted["message_id"], self.server.terminal_host.offer_turn.call_args.args[1]["message_id"])
         self.server.terminal_host.write.assert_not_called()
         self.server.provider_sessions.submit_channel.assert_not_called()
 
@@ -3714,7 +3715,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         self.server.terminal_host.find_live = Mock(return_value=terminal)
         self.server.terminal_host.get = Mock(return_value=terminal)
-        self.server.terminal_host.submit_prompt = Mock(return_value="delivered")
+        self.server.terminal_host.offer_turn = Mock(return_value="delivered")
         self.server.store.discover_provider_session_sources = Mock(return_value=[])
         posted = self.server.session_bus.deliver_to_terminal(
             self.server.terminal_host,
@@ -3740,7 +3741,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         self.assertEqual("PROVIDER_OBSERVER_SOURCE_UNAVAILABLE", dispatched["status"])
         self.assertEqual("PROVIDER_OBSERVER_SOURCE_UNAVAILABLE", dispatched["error_code"])
-        self.server.terminal_host.submit_prompt.assert_not_called()
+        self.server.terminal_host.offer_turn.assert_not_called()
         pending = self.server.session_bus.inbox(
             self.server._session_anchor_terminal_host(),
             terminal_id=terminal["terminal_id"],
@@ -3749,7 +3750,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PENDING", pending[0]["delivery_state"])
         self.assertEqual("QUEUED", pending[0]["lifecycle_state"])
 
-    def test_interactive_rust_host_stalled_prompt_returns_claim_to_pending(self) -> None:
+    def test_interactive_rust_host_accepted_waiting_prompt_never_requeues(self) -> None:
         terminal = {
             "terminal_id": "term-rust-host-stalled-001",
             "project_id": "GCS",
@@ -3775,7 +3776,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server.store.register_provider_session_source = Mock(
             return_value={"source_id": "source-codex-stalled-001"}
         )
-        self.server.terminal_host.submit_prompt = Mock(return_value="stalled")
+        self.server.terminal_host.offer_turn = Mock(return_value={"capability":"HOST_TURN_DELIVERY_V1","state":"STARTING","messages":[]})
         posted = self.server.session_bus.deliver_to_terminal(
             self.server.terminal_host,
             terminal=terminal,
@@ -3798,14 +3799,30 @@ class UniverseLocalServiceTests(unittest.TestCase):
             trigger="TURN_IDLE",
         )
 
-        self.assertEqual("AGENT_PROMPT_STALLED", dispatched["status"])
+        self.assertEqual("DISPATCHED", dispatched["status"])
+        self.assertEqual("host_accepted", dispatched["prompt_delivery"])
         pending = self.server.session_bus.inbox(
             self.server._session_anchor_terminal_host(),
             terminal_id=terminal["terminal_id"],
         )["messages"]
-        self.assertEqual("PENDING", pending[0]["delivery_state"])
-        self.assertEqual("QUEUED", pending[0]["lifecycle_state"])
+        self.assertEqual("DISPATCHED", pending[0]["delivery_state"])
+        self.assertEqual("STARTED", pending[0]["lifecycle_state"])
         self.assertEqual(posted["message_id"], pending[0]["message_id"])
+
+    def test_host_prompt_hook_receipt_does_not_claim_model_running(self):
+        from types import SimpleNamespace
+        from universe_app.host_turn_projection import reconcile
+        terminal={"terminal_id":"term-hook", "session_anchor_ref":"anchor-hook", "state":"LIVE", "provider":"CODEX"}
+        host=self._fake_master_host([terminal])
+        bus=Mock()
+        bus.inbox.return_value={"messages":[{"message_id":"msg_one","lifecycle_state":"STARTED",
+            "lifecycle":{"delivery_channel":"HOST_TURN_DELIVERY","execution_phase":"DISPATCHED"}}]}
+        bridge=Mock()
+        bridge.turn_delivery_status.return_value={"messages":[{"message_id":"msg_one","phase":"PROMPT_SUBMITTED"}]}
+        server=SimpleNamespace(terminal_host=bridge,session_bus=bus,_session_anchor_terminal_host=lambda:host)
+        reconcile(server)
+        self.assertEqual("RECEIVED",bus.acknowledge_instruction.call_args.kwargs["phase"])
+        bridge.offer_turn.assert_not_called()
 
     def test_claude_channel_pending_does_not_fall_back_to_pty(self) -> None:
         terminal = {
@@ -7497,6 +7514,29 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
         self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
+
+    def test_resume_keeps_closed_terminal_and_resolves_durable_provider(self) -> None:
+        supervised, _ = self.server.session_supervisor.register_session({
+            "session_id": "session_resume_closed", "node": "GCS", "project_id": "GCS",
+            "mode": "MASTER", "provider": "CODEX", "provider_session_ref": "codex-app-server:existing-thread",
+            "state": "DISCONNECTED", "currentness": "CURRENT"})
+        terminal = {"terminal_id": "term_old", "state": "CLOSED", "supervisor_session_id": supervised["session_id"],
+                    "session_anchor_ref": "runtime-anchor", "host_session_ref": "old-host"}
+        self.server.list_cli_terminals = lambda: {"terminals": [terminal], "hosts": []}
+        self.server._managed_shell_identities = lambda: {}
+        self.server.list_all_project_anchor_sessions = lambda: [{
+            "session_id": supervised["session_id"], "session_anchor_ref": "canonical-anchor", "project_id": "GCS",
+            "mode": "MASTER", "provider": "UNKNOWN", "currentness": "CURRENT", "last_seen_at": "2026-09-14T01:00:00Z"}]
+        listed = self.server.list_resumable_sessions()
+        self.assertEqual([supervised["session_id"]], [row["session_id"] for row in listed["resume"]])
+        self.assertEqual("CODEX", listed["resume"][0]["provider"])
+        self.assertEqual(supervised["session_anchor_ref"], listed["resume"][0]["session_anchor_ref"])
+        # The same live session is excluded even when runtime and canonical
+        # anchors differ; Host termination must be the transition to RESUME.
+        terminal["state"] = "LIVE"
+        self.assertEqual([], self.server.list_resumable_sessions()["resume"])
+        terminal["state"] = "EXITED"
+        self.assertEqual(1, len(self.server.list_resumable_sessions()["resume"]))
 
     def test_reattach_row_provider_falls_back_to_managed_shell_identity(self) -> None:
         # After a server restart the anchor-session projection can lose provider
@@ -18537,6 +18577,84 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 pass
 
         return FakeMasterHost(terminals)
+
+    def test_claude_result_recovery_after_web_callback_loss(self) -> None:
+        terminal = {"terminal_id": "term-survived", "project_id": "GCS", "mode": "MASTER",
+                    "provider": "CLAUDE", "state": "LIVE", "session_anchor_ref": "anchor-survived"}
+        host = self._fake_master_host([terminal])
+        row = self.server.session_bus.deliver_to_terminal(
+            host, terminal=terminal, source={"project_id": "GCS", "mode": "CONDUCTOR",
+                "provider": "CODEX", "session_anchor_ref": "anchor-origin"},
+            to={"project_id": "GCS", "mode": "MASTER"}, kind="INSTRUCTION", notify="UI", body="work")
+        mid = row["message_id"]
+        self.server.session_bus.transition(mid, state="ACCEPTED", terminal_id="term-survived",
+                                           session_anchor_ref="anchor-survived")
+        self.server.session_bus.complete_instruction_claim(terminal_id="term-survived", message_id=mid,
+            session_anchor_ref="anchor-survived", delivery_channel="CLAUDE_CODE_CHANNEL")
+        transport = Mock()
+        result = {"kind": "RESULT", "status": "ACCEPTED", "message_id": mid,
+                  "session_anchor_ref": "anchor-survived", "outcome": "COMPLETED", "body_text": "actual Host result"}
+        transport.channel_result.return_value = {**result, "session_anchor_ref": "wrong-anchor"}
+        with patch.object(self.server, "terminal_host", transport), patch.object(
+                self.server, "_session_anchor_terminal_host", return_value=host):
+            rejected = self.server._recover_claude_channel_results()
+            self.assertEqual([], rejected["recovered_message_ids"])
+            self.assertEqual("BUS_CHANNEL_RESULT_COORDINATE_INVALID", rejected["errors"][0]["error_code"])
+            transport.channel_result.return_value = {"status": "PENDING"}
+            self.assertEqual([], self.server._recover_claude_channel_results()["recovered_message_ids"])
+            transport.channel_result.return_value = result
+            recovered = self.server._recover_claude_channel_results()
+            self.assertEqual([mid], recovered["recovered_message_ids"])
+            self.assertEqual([], self.server._recover_claude_channel_results()["recovered_message_ids"])
+        transport.push_channel.assert_not_called()
+        rows = self.server.session_bus.inbox(host, session_anchor_ref="anchor-survived", projection="ACTIVITY")["messages"]
+        self.assertEqual("REPLIED", next(m for m in rows if m["message_id"] == mid)["lifecycle_state"])
+
+    def test_master_queue_claim_completes_only_matching_system_wake(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration(), self.token)
+        terminal = {"terminal_id": "term-wake", "project_id": "GCS", "mode": "MASTER",
+                    "provider": "CLAUDE", "state": "LIVE", "session_anchor_ref": "anchor-wake"}
+        host = self._fake_master_host([terminal])
+        def wake(body, marker="MASTER_QUEUE_WAKE"):
+            row = self.server.session_bus.deliver_to_terminal(
+                host, terminal=terminal,
+                source={"project_id": "GCS", "mode": "SYSTEM", "provider": "",
+                        "terminal_id": "", "session_anchor_ref": "", "node_ref": ""},
+                to={"project_id": "GCS", "mode": "MASTER"}, kind="INSTRUCTION",
+                notify="UI", body=body, system_event=marker)
+            for state in ("ACCEPTED", "STARTED"):
+                row = self.server.session_bus.transition(row["message_id"], state=state,
+                    terminal_id="term-wake", session_anchor_ref="anchor-wake")
+            row["terminal_id"] = "term-wake"
+            return row
+        typed = wake("Claim the queue")
+        legacy = wake('Master queue has work waiting (new work queued). Claim it: '
+            'POST /v1/projects/GCS/master-messages/claim with JSON '
+            '{"provider": "CLAUDE", "terminal_id": "term-wake", '
+            '"session_anchor_ref": "anchor-wake"}. Keep these exact owner coordinates on the claim.', "")
+        ordinary = wake("Implement remaining Fleet and RAG work", "")
+        self.assertFalse(self.server._complete_claimed_master_queue_wake(typed))
+        self.server.store.create_master_message("GCS", {
+            "idempotency_key": "wake-proof", "title": "Fleet and RAG", "instruction": "Continue"})
+        claim = self.server.store.claim_master_message("GCS", provider="CLAUDE",
+                                                       session_anchor_ref="anchor-wake")
+        wrong_owner = dict(typed, recipient_anchor_ref="different-anchor")
+        self.assertFalse(self.server._complete_claimed_master_queue_wake(wrong_owner))
+        newer_wake = dict(typed, created_at="9999-01-01T00:00:00Z")
+        self.assertFalse(self.server._complete_claimed_master_queue_wake(newer_wake))
+        self.assertFalse(self.server._complete_claimed_master_queue_wake(ordinary))
+        # The periodic recovery path must close these even if no next instruction arrives.
+        with patch.object(self.server, "_session_anchor_terminal_host", return_value=host):
+            recovered = self.server._recover_claimed_master_queue_wakes()
+            self.assertEqual({typed["message_id"], legacy["message_id"]}, set(recovered["completed_message_ids"]))
+            self.assertEqual([], recovered["errors"])
+            self.assertEqual([], self.server._recover_claimed_master_queue_wakes()["completed_message_ids"])
+        self.assertEqual("PROCESSING", self.server.store.get_master_message(claim["message_id"])["delivery_state"])
+        rows = self.server.session_bus.inbox(host, terminal_id="term-wake", projection="ACTIVITY")["messages"]
+        states = {row["message_id"]: row["lifecycle_state"] for row in rows}
+        self.assertEqual("COMPLETED", states[typed["message_id"]])
+        self.assertEqual("COMPLETED", states[legacy["message_id"]])
+        self.assertEqual("STARTED", states[ordinary["message_id"]])
 
     def test_wake_master_queue_on_session_ready_skips_when_queue_empty(self) -> None:
         """todo_cb7441b2fc3847f6b21427116baceb06 test matrix: empty queue."""

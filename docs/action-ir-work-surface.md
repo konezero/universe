@@ -1,83 +1,131 @@
-# Action IR work-surface — scope decision
+# Action IR work surface
 
-Status: DECIDED 2026-09-07 (Codex MASTER review `msg_108348ba950aa385`,
-master-messages `master_msg_639d0cff` slices 1-2, `master_msg_742041f6` slice 3).
+Status: source contract updated 2026-09-14. Discover the running server's actual
+coverage with `GET /v1/actions` or `python tools/universe_server.py action --catalog`.
+A source declaration alone does not prove that an older running server supports it.
 
-## Product target versus current coverage — 2026-09-13
+## Shared human and LLM commands
 
-[Shared human/LLM authoring](universe-design-and-bench-flow.md#shared-human-and-llm-authoring)
-is the product requirement: every UI input must be accessible to both the human
-and LLM over the same draft/object, validation, revision, and update semantics.
-This includes project description, goals, plans, node details, and Todo details.
-LLM updates must appear in the open UI, and subsequent LLM reads must include
-human edits. Stale writes must report a conflict instead of silently replacing
-newer edits. Direct manual input remains supported.
+[Shared authoring](universe-design-and-bench-flow.md#shared-human-and-llm-authoring)
+requires human and LLM clients to use the same objects, validation and revision
+rules. The Todo work-map UI now uses `todo.create`, `todo.update`, and `todo.state`.
+The native CLI sends the same Action envelope through the existing HTTP transport.
+Project/plan drafts and complete form synchronization still have separate coverage;
+this Todo slice does not mark the entire UI requirement complete.
 
-The three implemented work-surface Actions below are partial coverage, not proof
-of that experience. Project/plan draft operations and synchronized form-state
-coverage are still to be specified and implemented. Existing specialized
-lifecycle/receipt routes remain applicable; this target does not declare every
-operation implemented on `/v1/actions` or bypass its underlying validation.
+| Action | Input and behavior |
+| --- | --- |
+| `feature.create` | Create a feature node; server assigns the USER actor. |
+| `todo.create` | Create a Todo using the existing Store contract. |
+| `todo.update` | Full metadata replacement with revision checking. An unchanged `state` may be supplied; changing state is rejected. |
+| `todo.read` | `{ "todo_id": "..." }`; return the current Todo including its revision. |
+| `todo.list` | Required `project_id` (null selects Universe scope); optional `node_ref`, `include_done` (false), `offset` (0), and `limit` (100, maximum 200). Return matching rows, total and pagination. |
+| `todo.state` | Apply a revision-checked operator command with durable request replay and completion evidence. |
 
-## What is on `POST /v1/actions`
+`todo.read/list/state` expose their exact JSON input schemas in each catalog
+contract's `metadata.request_schema`. Unknown fields are rejected. Errors retain
+stable `error_code`, detail and HTTP status. Common caller-owned actor, context,
+session and credential fields remain forbidden by the Action registry.
 
-The typed Action front door carries **create / full-replace** work-surface
-mutations only:
+## Todo lifecycle command
 
-| Action          | wraps                              | notes |
-|-----------------|------------------------------------|-------|
-| `feature.create`| `UniverseStore.create_feature_node`| server injects `created_by_role=USER` |
-| `todo.create`   | `UniverseStore.create_todo`        | |
-| `todo.update`   | `UniverseStore.update_todo`        | plain-PATCH fields, revision-guarded (explicit `409`); **`state` is not accepted** |
+The native entry accepts a UTF-8 JSON file, including a BOM:
 
-`ActionContract` still enforces `actor_context_resolution=SERVER_SIDE`, the
-forbidden caller-context fields, and `credential_handling=CREDENTIAL_REF_ONLY`
-(inline secrets rejected, only an opaque `credential_ref` passes). The typed
-Action is a front door — it does not replace Execution Guard, Task Proposal,
-Commander approval, or the guarded/receipt-bound Store mutations underneath.
+```text
+python tools/universe_server.py action --catalog
+python tools/universe_server.py action --request-file C:/Temp/todo-state.json
+```
 
-Legacy `POST /v1/todos`, `PATCH /v1/todos/{id}`, and
-`POST /v1/projects/{id}/feature-nodes` are unchanged and remain first-class.
+The endpoint and service credential come from the existing local server-state
+file. Use `--state-file` for a different host profile; never put a secret in the
+request file or command arguments. Read with `todo.read` before constructing a
+new state command:
 
-## What is NOT on `/v1/actions`
+```json
+{
+  "action_id": "todo.state",
+  "request": {
+    "todo_id": "<observed Todo id>",
+    "project_id": "universe",
+    "expected_revision": 3,
+    "request_id": "<unique stable request id>",
+    "state": "DONE",
+    "validation": {
+      "status": "PASSED",
+      "evidence_ref": "<actual validation record or result reference>"
+    }
+  }
+}
+```
 
-### Lifecycle state transitions
-`todo.state` (and any DONE/BLOCKED/… move) route **only** through the
-anchor-aware receipt gateway: `POST /v1/todo-action-mutation-receipts`
-(`normalize_todo_action_mutation_request`) → `.../consume`, or the
-`POST /v1/todos/{id}/actions` surface. Those require a Session-Anchor-bound
-caller identity (`provider` / `provider_session_ref` / `session_id` /
-`session_anchor_ref` / `instruction_ref`), which `ActionContract` deliberately
-forbids callers from supplying. `todo.update` on `/v1/actions` rejects a `state`
-that differs from the current Todo (`ACTION_TODO_LIFECYCLE_VIA_RECEIPT`) and
-pins `state` to current otherwise.
+- Valid states are BACKLOG, READY, IN_PROGRESS, BLOCKED and DONE. DONE requires
+  PASSED validation and a nonempty evidence reference. The caller verifies that
+  evidence; the server validates and records the supplied attestation.
+- `project_id` must exactly match the current Todo scope; use null for a Universe
+  Todo. `expected_revision` is an integer of at least 1.
+- Request IDs contain 8–100 ASCII letters, digits, underscores or hyphens. Retry
+  an uncertain request with its original ID **and complete original input**.
+- A single SQLite transaction checks request identity, scope and revision, then
+  writes the state, immutable result and project history event. A failed ledger
+  or event write rolls back the state as well. Replaying identical input returns
+  its original result with `replayed: true`, including after server restart.
+- Reusing an ID for different input returns `TODO_STATE_REQUEST_CONFLICT` (409).
+  A new command with an old revision returns `TODO_REVISION_CONFLICT` (409).
+  Wrong project scope returns `TODO_SCOPE_CONFLICT` (409). Missing completion
+  validation returns `TODO_COMPLETION_VALIDATION_REQUIRED` (409). No new write
+  occurs on those failures.
+- Read again after replay to display the latest object: the immutable command
+  result can precede a later command. A command that keeps the same state records
+  a result without increasing the Todo revision.
+- Existing DONE/BLOCKED result propagation remains idempotent. A temporary
+  propagation storage failure returns applied state plus
+  `result_propagation.status=PENDING`; replay retries propagation without
+  reapplying state. This creates review candidates, not automatic RAG adoption.
+- The UI requires completion evidence and confirmation, retains uncertain input
+  in session storage, and shows **이전 요청 확인** until that original request is
+  resolved. State and metadata have separate save buttons.
 
-**Conductor adapter / runtime**: use the receipt gateway for lifecycle
-transitions. Do not fall back to generic `/v1/actions`.
+## Operator and execution-session ownership
 
-### Fine-grained partial Actions
-`todo.priority`, `todo.reorder`, `todo.bind_node`, `todo.bind_goal`,
-`todo.move_project` are **not implemented**. `todo.update` (full-replace +
-revision guard) covers them for any caller that can `GET` the current Todo,
-so separate Actions are not yet justified. `TODO_ACTION_IDS` keeps the full
-vocabulary; only `IMPLEMENTED_WORK_SURFACE_ACTION_IDS` are registered as
-discoverable contracts — the pending ones report `UNCOVERED`, never available.
+This is a Todo **operator command** on the existing loopback/direct-commander
+transport. It does not choose an execution session, dispatch work, grant an
+assignment or create a Task Frame. Provider/Worker bridge headers cannot be
+relabeled as operator input (`TODO_OPERATOR_REQUIRED`). The server resolves the
+actor; clients never supply an actor or reconstruct a Session Anchor.
 
-## Future work (not implemented)
+The existing supervised execution-report flow retains its Anchor-aware domain
+receipt gateway (`/v1/todo-action-mutation-receipts` then `/consume`, or
+`/v1/todos/{id}/actions`). A Worker completion report remains that execution
+contract. An authorized human or LLM operator updating the work map uses
+`todo.state`. These domain contracts are distinct from Execution Guard evidence
+recording. Generic `todo.update` and legacy `PATCH /v1/todos/{id}` both reject
+lifecycle changes with `ACTION_TODO_LIFECYCLE_VIA_RECEIPT` (the retained legacy
+error code); the error directs operator clients to `todo.state`.
 
-- **(d) Action-driven lifecycle**: if needed, do not add `session_ref` to the
-  Action request. The server should resolve `session_id` / anchor / provider
-  from the authenticated Action transport credential/connection and inject
-  them into the existing prepare/consume flow. Without that binding, callers
-  use the legacy receipt route.
-- **`todo.archive` / `todo.restore` / `todo.delete`**: no dedicated Store
-  methods exist. Settle the data model, restore semantics, revision, and audit
-  trail first, then a separate slice.
-- **Action-only adapter**: an adapter that can only `invoke_action` (no Todo
-  read/get Action, no `GET`) cannot obtain the `current + revision` that
-  full-replace `todo.update` needs. That is when a partial + atomic
-  `todo.update` variant becomes justified.
+Public `/v1/sessions` and `/v1/supervisor/sessions` responses are display
+projections. They do not expose raw `provider_session_ref` or `session_id`
+fields. Absence of those fields is **not evidence of an unbound session**.
+Todo commands require neither those projections nor private SQL lookup. If a
+session-dependent action lacks an executable resolver/contract, report that
+specific capability as unavailable instead of inferring binding from an
+unrelated list response.
 
+## Remaining coverage
+
+`todo.priority`, `todo.reorder`, `todo.bind_node`, `todo.bind_goal`, and
+`todo.move_project` remain unregistered dedicated Actions. Read the current Todo
+and use revision-checked `todo.update` for supported metadata changes.
+`todo.archive`, `todo.restore`, and `todo.delete` are also pending dedicated
+contracts. Legacy delete remains available in the work-map UI. Registration and
+handler-backed coverage must be distinguished from the full vocabulary.
+
+## Verification
+
+`tests/test_universe_todo_actions.py` exercises the HTTP contract, native CLI,
+missing completion evidence, private/caller fields, project scope, stale writes,
+concurrent requests, durable replay, atomic rollback and propagation recovery.
+`tests/test_todo_actions_ui.js` covers shared Actions and uncertain request replay.
+Existing supervised lifecycle tests remain applicable to their separate gateway.
 
 ## Web service lifecycle Actions — 2026-09-14
 
@@ -89,4 +137,4 @@ Handler-backed `service.status` and `service.restart` are now implemented in sou
 - Control tokens are passed to the replacement server only through its environment, never operation records or command arguments. Regular CLI restart semantics are unchanged.
 - Settings → Service exposes restart/result lookup. An uncertain transport response retains the request id in session storage for reconnection; a definite validation/authorization failure clears it. The operation remains queryable after page reload. An interrupted helper is reported as unconfirmed rather than successful.
 
-The Action does not create authorization. An agent Host reuses its existing user instruction or implemented automation authorization and calls `tools/universe_service_execution.py execute`. The Host records attempt/validation/dispatch evidence without a separate bind, permit or consume step; the service still authenticates the operator and validates its target. See [service-restart-execution.md](service-restart-execution.md) for the callable contract and completion evidence. The common recorder is not a generic COMMAND executor. Todo lifecycle receipts described above are their separate domain transition contract and are not Execution Guard permits.
+The Action does not create authorization. An agent Host reuses its existing user instruction or implemented automation authorization and calls `tools/universe_service_execution.py execute`. The Host records attempt/validation/dispatch evidence without a separate bind, permit or consume step; the service still authenticates the operator and validates its target. See [service-restart-execution.md](service-restart-execution.md) for the callable contract and completion evidence. The common recorder is not a generic COMMAND executor. Supervised Todo lifecycle receipts are a separate domain transition contract and are not Execution Guard permits.

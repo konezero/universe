@@ -43,6 +43,8 @@ FEATURE_CREATE_RESULT_SCHEMA = "universe.feature-create-receipt.v1"
 TODO_CREATE_ACTION_ID = "todo.create"
 TODO_UPDATE_ACTION_ID = "todo.update"
 TODO_STATE_ACTION_ID = "todo.state"
+TODO_READ_ACTION_ID = "todo.read"
+TODO_LIST_ACTION_ID = "todo.list"
 TODO_PRIORITY_ACTION_ID = "todo.priority"
 TODO_BIND_NODE_ACTION_ID = "todo.bind_node"
 TODO_BIND_GOAL_ACTION_ID = "todo.bind_goal"
@@ -55,6 +57,8 @@ TODO_DELETE_ACTION_ID = "todo.delete"
 TODO_ACTION_IDS = (
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
+    TODO_READ_ACTION_ID,
+    TODO_LIST_ACTION_ID,
     TODO_STATE_ACTION_ID,
     TODO_PRIORITY_ACTION_ID,
     TODO_BIND_NODE_ACTION_ID,
@@ -75,9 +79,11 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     FEATURE_CREATE_ACTION_ID,
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
+    TODO_READ_ACTION_ID,
+    TODO_LIST_ACTION_ID,
+    TODO_STATE_ACTION_ID,
 )
 PENDING_WORK_SURFACE_ACTION_IDS = (
-    TODO_STATE_ACTION_ID,
     TODO_PRIORITY_ACTION_ID,
     TODO_BIND_NODE_ACTION_ID,
     TODO_BIND_GOAL_ACTION_ID,
@@ -599,6 +605,7 @@ def build_default_action_registry(
     memory_batch_run_handler: ActionHandler | None = None,
     rag_archive_candidate_handler: ActionHandler | None = None,
     rag_memory_retention_handler: ActionHandler | None = None,
+    rag_memory_relate_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
@@ -666,6 +673,23 @@ def build_default_action_registry(
         ActionContract(action_id="rag.memory-retention", request_schema_ref="universe.rag-memory-retention-request.v1",
                        result_schema_ref="universe.rag-memory-retention-result.v1", side_effect_class="GOVERNED_KNOWLEDGE_WRITE"),
         rag_memory_retention_handler, surfaces=("rag.memory-retention",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="rag.memory-relate",
+            request_schema_ref="universe.rag-memory-relate-request.v1",
+            result_schema_ref="universe.rag-memory-relate-result.v1",
+            side_effect_class="GOVERNED_KNOWLEDGE_WRITE",
+            metadata={
+                "statement": (
+                    "Project-scoped, typed memory topic/relation storage — replaces "
+                    "hardcoded UI topic/relation tables with server-owned data any "
+                    "project's memories can use without a source change."
+                )
+            },
+        ),
+        rag_memory_relate_handler,
+        surfaces=("rag.memory-relate",),
     )
     registry.register(
         ActionContract(
@@ -785,12 +809,28 @@ def build_default_action_registry(
             supplied_handlers.get(action_id),
             surfaces=(action_id,),
         )
+    from universe_todo_actions import REQUEST_SCHEMAS
+    for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
+        registry.register(
+            ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id}-request.v1",
+                result_schema_ref=f"universe.todo-{action_id.split('.')[1]}-action.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION" if action_id == TODO_STATE_ACTION_ID else "READ_ONLY",
+                metadata={
+                    "request_schema": REQUEST_SCHEMAS[action_id],
+                    "session_selection": "NOT_REQUIRED",
+                    "authentication": "OPERATOR_TRANSPORT" if action_id == TODO_STATE_ACTION_ID else "LOCAL_READ",
+                    "replay": "SAME_REQUEST_ID_AND_CONTENT" if action_id == TODO_STATE_ACTION_ID else "READ_ONLY",
+                    "errors": ["TODO_ACTION_REQUEST_INVALID", "TODO_NOT_FOUND", "TODO_SCOPE_CONFLICT", "TODO_REVISION_CONFLICT", "TODO_STATE_REQUEST_CONFLICT", "TODO_COMPLETION_VALIDATION_REQUIRED", "TODO_OPERATOR_REQUIRED"],
+                },
+            ), supplied_handlers.get(action_id), surfaces=(action_id,),
+        )
     # The HTTP surfaces these Actions front remain first-class legacy routes.
     registry.register_legacy_surface("/v1/todos")
     registry.register_legacy_surface("/v1/todos/{todo_id}")
     registry.register_legacy_surface("/v1/projects/{project_id}/feature-nodes")
-    # Lifecycle transitions never route through /v1/actions; they use the
-    # anchor-aware receipt gateway.
+    # Existing supervised automation still uses its Anchor-aware domain gateway.
     registry.register_legacy_surface("/v1/todo-action-mutation-receipts")
     registry.register_legacy_surface("/v1/todos/{todo_id}/actions")
     return registry
@@ -866,6 +906,8 @@ __all__ = [
     "TODO_REORDER_ACTION_ID",
     "TODO_RESTORE_ACTION_ID",
     "TODO_STATE_ACTION_ID",
+    "TODO_READ_ACTION_ID",
+    "TODO_LIST_ACTION_ID",
     "TODO_UPDATE_ACTION_ID",
     "UNCOVERED",
     "UnknownActionError",

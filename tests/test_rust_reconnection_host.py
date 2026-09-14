@@ -78,7 +78,7 @@ class RustReconnectionHostTests(unittest.TestCase):
             text=True,
             timeout=180,
         )
-        cls.binary = MANIFEST.parent / "target" / "debug" / "universe-session-host.exe"
+        cls.binary = MANIFEST.parent / "target" / "debug" / "universe-session-host-v3.exe"
 
     def run_supervisor(
         self,
@@ -117,6 +117,85 @@ class RustReconnectionHostTests(unittest.TestCase):
                 f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
             )
         return json.loads(completed.stdout)
+
+    def test_host_turn_delivery_survives_supervisor_rebind_and_never_rewrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            registry=ReconnectionHostRegistry(root/"registry",self.binary)
+            client=registry.launch("anchor-turn-fixture",cwd=root,shell_args=("/Q",))
+            try:
+                client.bind_provider_session("GROK","fixture-session")
+                first=ReconnectionPty(client,supervisor_id="supervisor-first")
+                first.write(b"\x1b[1;1R")  # Answer ConPTY startup cursor query, as the real Host adapter does.
+                payload={"message_id":"msg_fixture","text":"echo HOST_TURN_PROBE", "provider":"GROK","provider_session_ref":"fixture-session"}
+                result=first.offer_turn(payload)
+                self.assertEqual("QUEUED",result["messages"][0]["phase"])
+                self.assertEqual(0,result["messages"][0]["body_writes"])
+                # Stop never drains. A post-turn CLI notification does.
+                def event(kind,stamp,**extra):
+                    return client.request("turn_observe",channel={"provider":"GROK","provider_session_ref":"fixture-session",
+                        "event":kind,"observed_at_ms":stamp,"turn_id":"turn-one",**extra})
+                event("STOPPING",1)
+                self.assertEqual(0,first.turn_delivery_status()["messages"][0]["body_writes"])
+                event("IDLE",2)
+                result=first.turn_delivery_status()
+                self.assertEqual("AWAITING_START",result["messages"][0]["phase"])
+                self.assertEqual(1,result["messages"][0]["body_writes"])
+                self.assertEqual(1,result["messages"][0]["submit_writes"])
+                second=ReconnectionPty(client,supervisor_id="supervisor-replacement")
+                result=second.offer_turn(payload)
+                self.assertEqual(1,result["messages"][0]["body_writes"])
+                event("IDLE",3)
+                self.assertEqual("STARTING",second.turn_delivery_status()["state"])
+                event("PROMPT_SUBMITTED",4,message_id="msg_fixture")
+                self.assertEqual("PROMPT_SUBMITTED",second.turn_delivery_status()["messages"][0]["phase"])
+                with self.assertRaises(ReconnectionHostError):
+                    client.request("turn_observe",channel={"provider":"GROK","provider_session_ref":"foreign","event":"IDLE","observed_at_ms":5})
+                deadline=time.monotonic()+3
+                output=b""
+                while time.monotonic()<deadline and b"HOST_TURN_PROBE" not in output:
+                    output+=second.read(timeout=0.1)
+                self.assertIn(b"HOST_TURN_PROBE",output)
+                self.assertNotIn("text",result["messages"][0])
+            finally:
+                client.shutdown()
+                registry.reap_launched_process("anchor-turn-fixture")
+
+    def test_native_queue_uses_exact_argv_and_never_writes_terminal(self):
+        # Isolated Python executable stands in for the provider queue command.
+        # It only records arguments; no model/provider session is invoked.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"queue").write_text("import sys,json\nfrom pathlib import Path\np=Path('calls.jsonl')\nwith p.open('a',encoding='utf-8') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nprint('Queued message 01a09fb1-d574-7643-beaa-00d78db9e190 for thread '+sys.argv[2]+'.')\n",encoding="utf-8")
+            registry=ReconnectionHostRegistry(root/"registry",self.binary)
+            client=registry.launch("anchor-native-fixture",cwd=root,shell_args=("/Q",),environment={"UNIVERSE_CODEX_QUEUE_EXECUTABLE":sys.executable})
+            try:
+                sid="01a09ad0-7edc-75d0-8357-2dca0f074e8a"
+                client.bind_provider_session("CODEX",sid)
+                first=ReconnectionPty(client,supervisor_id="native-first")
+                text='first line\n한글 "quoted" $literal'
+                payload={"message_id":"msg_native_fixture","text":text,"provider":"CODEX","provider_session_ref":sid}
+                first.offer_turn(payload)
+                deadline=time.monotonic()+5
+                while time.monotonic()<deadline:
+                    delivery=first.turn_delivery_status()["messages"][0]
+                    if delivery["phase"]=="NATIVE_QUEUED": break
+                    time.sleep(0.025)
+                self.assertEqual("NATIVE_QUEUED",delivery["phase"],delivery)
+                self.assertEqual(0,delivery["body_writes"]+delivery["submit_writes"])
+                self.assertEqual(1,delivery["queue_calls"])
+                self.assertEqual("01a09fb1-d574-7643-beaa-00d78db9e190",delivery["queued_submission_id"])
+                second=ReconnectionPty(client,supervisor_id="native-rebound")
+                second.offer_turn(payload)
+                self.assertEqual(1,second.turn_delivery_status()["messages"][0]["queue_calls"])
+                calls=(root/"calls.jsonl").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(1,len(calls))
+                self.assertEqual(["--thread",sid,"--message",text],json.loads(calls[0]))
+                with self.assertRaises(ReconnectionHostError):
+                    second.offer_turn({**payload,"text":"changed"})
+                self.assertNotIn("text",delivery)
+            finally:
+                client.shutdown();registry.reap_launched_process("anchor-native-fixture")
 
     def test_anchor_state_filename_does_not_expose_anchor_text(self) -> None:
         registry = ReconnectionHostRegistry(Path("registry"), self.binary)

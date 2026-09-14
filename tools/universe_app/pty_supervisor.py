@@ -122,6 +122,10 @@ def _reconnection_host_binary_available() -> bool:
     return any(
         path.is_file()
         for path in (
+            host_root / "release" / "universe-session-host-v3.exe",
+            host_root / "debug" / "universe-session-host-v3.exe",
+            host_root / "release" / "universe-session-host-v2.exe",
+            host_root / "debug" / "universe-session-host-v2.exe",
             host_root / "release" / "universe-session-host.exe",
             host_root / "debug" / "universe-session-host.exe",
         )
@@ -559,6 +563,14 @@ class SupervisedTerminalHost:
         )
         return str(payload.get("channel_state") or "UNAVAILABLE")
 
+    def channel_result(self, terminal_id: str, message_id: str) -> dict[str, Any]:
+        """Read a Host-owned result; never resend the instruction."""
+        result = self._request(
+            "GET",
+            f"/v1/terminals/{quote(terminal_id, safe='')}/channel/results/{quote(message_id, safe='')}",
+        ).get("channel_result")
+        return dict(result) if isinstance(result, Mapping) else {}
+
     def push_channel(
         self,
         terminal_id: str,
@@ -645,6 +657,14 @@ class SupervisedTerminalHost:
             time.sleep(0.05)
         status = str(self.get(terminal_id).public().get("prompt_delivery") or "")
         return status if status and status != AGENT_PROMPT_PENDING else AGENT_PROMPT_STALLED
+
+    def offer_turn(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/offer-turn",
+                                  payload=dict(payload)).get("turn_delivery") or {})
+
+    def turn_delivery_status(self, terminal_id: str) -> dict[str, Any]:
+        return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/turn-delivery-status",
+                                  payload={}).get("turn_delivery") or {})
 
     def submit_prompt(
         self,

@@ -611,6 +611,10 @@ function renderTerminalDock() {
     tabs.append(gridBtn);
   }
   applyTerminalGridLayout();
+  for (const session of sessions) {
+    const surface = (state.terminalSurfaces || {})[session.terminal_id];
+    if (surface) refreshTerminalInjectionBox(surface, session);
+  }
 }
 
 function setTerminalGrid(on) {
@@ -1401,14 +1405,103 @@ function fitTerminalToContainer(term, element, fitAddon) {
   return true;
 }
 
+// One read-only staging slot per terminal. Rendering never sends PTY bytes.
+function terminalInjectionProjection(session, messages) {
+  const host = session.host_turn_state || {};
+  const receipt = host.latest_delivery || {};
+  const anchor = session.session_anchor_ref || session.active_session_anchor_ref;
+  const rows = (messages || []).filter(m =>
+    (m.recipient_anchor_ref || m.session_anchor_ref) === anchor &&
+    ["INSTRUCTION", "COORDINATION"].includes(m.kind));
+  const pending = rows.filter(m => ["QUEUED", "ACCEPTED", "STARTED"].includes(m.lifecycle_state));
+  const message = rows.find(m => m.message_id === receipt.message_id) || pending[0];
+  if (!message) return { status: "대기", body: "", detail: "자동 메시지가 들어오면 여기에 표시됩니다." };
+  const same = message.message_id === receipt.message_id;
+  const phase = same ? receipt.phase : "";
+  const lifecycle = message.lifecycle || {};
+  const dispatchError = lifecycle.dispatch_attempt?.error_code;
+  const failed = dispatchError || lifecycle.failed_at || message.lifecycle_state === "FAILED" ||
+    ["WRITE_UNCERTAIN", "INPUT_UNCONFIRMED", "SUBMIT_UNCONFIRMED", "NATIVE_UNCONFIRMED"].includes(phase);
+  const acknowledged = ["PROMPT_SUBMITTED", "STARTED"].includes(phase) || lifecycle.execution_phase === "RUNNING";
+  const finished = ["DONE", "COMPLETED", "REPLIED"].includes(message.lifecycle_state);
+  let status = "대기";
+  if (failed) status = "실패 · 확인 필요";
+  else if (finished) status = "처리됨";
+  else if (phase === "NATIVE_QUEUED") status = "CLI 큐 접수 · 실행 대기";
+  else if (phase === "NATIVE_SUBMITTING") status = "CLI 큐 전달 중";
+  else if (acknowledged) status = phase === "STARTED" || lifecycle.execution_phase === "RUNNING" ? "작업 중" : "접수됨";
+  else if (phase === "AWAITING_START" || lifecycle.execution_phase === "DISPATCHED") status = "제출 확인 중";
+  let detail = failed ? ((same && receipt.detail) || lifecycle.dispatch_attempt?.detail || "처리 실패가 기록되었습니다. 자동으로 재전송하지 않습니다.")
+    : acknowledged || finished ? "접수된 본문은 비웠습니다." : "Host가 전달합니다. 이 박스는 직접 편집할 수 없습니다.";
+  // A write receipt is not a submit acknowledgement, even on older Hosts.
+  if (!failed && phase === "AWAITING_START" && receipt.submit_write_attempted_at_ms &&
+      Date.now() - Number(receipt.submit_write_attempted_at_ms) >= 30000) {
+    status = "제출 확인 지연";
+    detail = "Enter 전송 기록은 있지만 실제 접수 확인이 없습니다. 재전송하지 않습니다.";
+  }
+  return { status, detail, messageId: message.message_id,
+    body: !failed && (acknowledged || finished) ? "" : String(message.body_text || "") };
+}
+
+function paintTerminalInjectionBox(surface, projection) {
+  surface.injectionStatus.textContent = projection.status;
+  surface.injectionBody.value = projection.body;
+  surface.injectionDetail.textContent = projection.detail;
+  surface.injectionBox.dataset.messageId = projection.messageId || "";
+  surface.injectionBox.dataset.status = projection.status;
+}
+
+async function refreshTerminalInjectionBox(surface, session) {
+  if (surface.injectionDisposed || surface.element.hidden || surface.injectionLoading) return;
+  const anchor = session.session_anchor_ref || session.active_session_anchor_ref;
+  if (!anchor) {
+    paintTerminalInjectionBox(surface, {status:"연결 대기",body:"",detail:"세션 연결 정보가 필요합니다."});
+    return;
+  }
+  // No new poll loop: use the existing terminal catalog refresh and tab selection.
+  if (surface.injectionAnchor === anchor && Date.now() - (surface.injectionLoadedAt || 0) < 4000) {
+    paintTerminalInjectionBox(surface, terminalInjectionProjection(session, surface.injectionMessages));
+    return;
+  }
+  surface.injectionLoading = true;
+  try {
+    const payload = await api("/v1/session-bus/inbox?projection=ACTIVITY&session_anchor_ref=" + encodeURIComponent(anchor));
+    if (surface.injectionDisposed) return;
+    surface.injectionAnchor = anchor;
+    surface.injectionLoadedAt = Date.now();
+    surface.injectionMessages = payload.messages || [];
+    paintTerminalInjectionBox(surface, terminalInjectionProjection(session, surface.injectionMessages));
+  } catch (error) {
+    if (!surface.injectionDisposed) {
+      surface.injectionStatus.textContent = "조회 실패";
+      surface.injectionDetail.textContent = error.message || "메시지 상태를 확인할 수 없습니다.";
+    }
+  } finally { surface.injectionLoading = false; }
+}
+
 function ensureTerminalSurface(session) {
   if (!elements.terminalStage || typeof Terminal !== "function") return;
   state.terminalSurfaces = state.terminalSurfaces || {};
   let surface = state.terminalSurfaces[session.terminal_id];
-  if (surface) return surface;
+  if (surface) { refreshTerminalInjectionBox(surface, session); return surface; }
   const element = node("div", "terminal-pane");
   element.dataset.terminalId = session.terminal_id;
   elements.terminalStage.append(element);
+  const injectionBox = node("section", "terminal-injection-box");
+  injectionBox.setAttribute("aria-label", "자동 주입 전용 박스");
+  const injectionHeader = node("div", "terminal-injection-header");
+  const injectionStatus = node("span", "terminal-injection-status", "대기");
+  injectionStatus.setAttribute("role", "status");
+  injectionHeader.append(node("strong", "", "자동 주입"), injectionStatus);
+  const injectionBody = node("textarea", "terminal-injection-body");
+  injectionBody.readOnly = true;
+  injectionBody.rows = 2;
+  injectionBody.setAttribute("aria-label", "자동 주입 메시지");
+  injectionBody.placeholder = "자동 메시지 대기 중";
+  const injectionDetail = node("small", "terminal-injection-detail", "메시지 상태 확인 중");
+  injectionBox.append(injectionHeader, injectionBody, injectionDetail);
+  const viewport = node("div", "terminal-viewport");
+  element.append(injectionBox, viewport);
   const fitAddon = (
     typeof window.FitAddon?.FitAddon === "function"
       ? new window.FitAddon.FitAddon()
@@ -1445,7 +1538,7 @@ function ensureTerminalSurface(session) {
     vtExtensions: { kittyKeyboard: true },
     theme: termTheme,
   });
-  term.open(element);
+  term.open(viewport);
   installGuardedLinkProviderRegistration(term);
   if (fitAddon) {
     try { term.loadAddon(fitAddon); } catch (_error) { /* optional addon */ }
@@ -1454,13 +1547,13 @@ function ensureTerminalSurface(session) {
   // When the running TUI turns on mouse tracking, xterm forwards the click as
   // a mouse report and does NOT move focus on its own — so pointerdown here
   // (capture, before xterm consumes it) keeps typing working after any click.
-  element.addEventListener(
+  viewport.addEventListener(
     "pointerdown",
     () => { try { term.focus(); } catch (_error) { /* pane not ready */ } },
     true
   );
   const refreshAfterLayout = () => {
-    return fitTerminalToContainer(term, element, fitAddon);
+    return fitTerminalToContainer(term, viewport, fitAddon);
   };
   // Keep the initial PTY geometry while its bounded replay is painted. A
   // replay contains cursor-positioned TUI bytes from the old geometry; fitting
@@ -1654,6 +1747,7 @@ function ensureTerminalSurface(session) {
   resizeObserver.observe(element);
   surface = {
     terminalId: session.terminal_id,
+    viewport, injectionBox, injectionStatus, injectionBody, injectionDetail,
     provider: String(session.provider || "").trim().toUpperCase(),
     element,
     term,
@@ -1688,7 +1782,7 @@ function ensureTerminalSurface(session) {
     webglFailedSinceRecovery: false,
   };
   attachTerminalWebgl(surface);
-  attachTerminalMouseWheelHandler(term, element, () => surface);
+  attachTerminalMouseWheelHandler(term, viewport, () => surface);
   term.onScroll((viewportY) => {
     if (viewportY > 2 || surface.rebuildingHistory) return;
     loadOlderTerminalHistory(surface, session).catch((error) =>
@@ -1697,6 +1791,7 @@ function ensureTerminalSurface(session) {
   });
   state.terminalSurfaces[session.terminal_id] = surface;
   connectSocket();
+  refreshTerminalInjectionBox(surface, session);
   return surface;
 }
 
@@ -1847,6 +1942,7 @@ async function stopTerminalSession(terminalId) {
 function disposeTerminalSurface(terminalId) {
   const surface = (state.terminalSurfaces || {})[terminalId];
   if (surface) {
+    surface.injectionDisposed = true;
     try { surface.resizeObserver?.disconnect(); } catch (_e) { /* ok */ }
     try { surface.disposeSocket?.(); } catch (_e) { /* already closed */ }
     disposeTerminalRenderQueue(surface);
@@ -2101,6 +2197,33 @@ function hideReattachBanner() {
   renderReattachBanner();
 }
 
+function resumeListIdentity(session) {
+  return JSON.stringify([String(session.project_id || ""), String(session.session_id || session.universe_session_id || session.session_anchor_ref || "")]);
+}
+
+function excludedResumeSessionIds() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("universe.resume.excluded.v1") || "[]");
+    return new Set(Array.isArray(saved) ? saved.filter((value) => typeof value === "string") : []);
+  } catch (_error) {
+    return new Set();
+  }
+}
+
+function setResumeSessionExcluded(session, excluded) {
+  const ids = excludedResumeSessionIds();
+  const key = resumeListIdentity(session);
+  if (excluded) ids.add(key);
+  else ids.delete(key);
+  try {
+    localStorage.setItem("universe.resume.excluded.v1", JSON.stringify([...ids]));
+  } catch (_error) {
+    toast("재개 목록 설정을 저장하지 못했습니다", true);
+    return;
+  }
+  renderTerminalNewMenu();
+}
+
 function renderTerminalNewMenu() {
   const menu = document.querySelector("#terminal-new-menu");
   if (!menu) return;
@@ -2148,12 +2271,73 @@ function renderTerminalNewMenu() {
     item.append(terminate);
     menu.append(item);
   }
+  const excludedIds = excludedResumeSessionIds();
+  const sessions = state.resumableSessions?.resume || [];
+  const excludedCount = sessions.filter((session) => excludedIds.has(resumeListIdentity(session))).length;
+  for (const session of sessions) {
+    const excluded = excludedIds.has(resumeListIdentity(session));
+    if (excluded && !state.showExcludedResumeSessions) continue;
+    const row = document.createElement("div");
+    row.className = "terminal-resume-row";
+    row.dataset.excluded = String(excluded);
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "terminal-new-menu-item";
+    item.setAttribute("role", "menuitem");
+    item.textContent = `${excluded ? "제외됨" : "Resume"} ${session.label || session.session_id}`;
+    item.title = excluded ? "목록에 복원한 뒤 재개할 수 있습니다" : "기존 대화를 새 Host에서 이어서 열기";
+    item.dataset.sessionId = session.session_id || "";
+    item.disabled = excluded;
+    item.addEventListener("click", () => {
+      closeTerminalNewMenu();
+      resumeRecordedSession(session).catch((error) => toast(error.message, true));
+    });
+    const exclude = document.createElement("button");
+    exclude.type = "button";
+    exclude.className = "terminal-resume-exclude";
+    exclude.textContent = excluded ? "복원" : "목록 제외";
+    exclude.title = excluded ? "재개 목록에 다시 표시" : "세션 기록을 보존하고 이 브라우저의 재개 목록에서 숨기기";
+    exclude.setAttribute("aria-label", `${session.label || session.session_id} ${exclude.textContent}`);
+    exclude.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setResumeSessionExcluded(session, !excluded);
+    });
+    row.append(item, exclude);
+    menu.append(row);
+  }
+  if (excludedCount) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "terminal-new-menu-item";
+    toggle.textContent = state.showExcludedResumeSessions ? "제외 항목 숨기기" : `제외 항목 보기 (${excludedCount})`;
+    toggle.setAttribute("aria-pressed", String(Boolean(state.showExcludedResumeSessions)));
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.showExcludedResumeSessions = !state.showExcludedResumeSessions;
+      renderTerminalNewMenu();
+    });
+    menu.append(toggle);
+  }
+
+  if (menu.matches(":popover-open")) positionTerminalNewMenu(menu, document.querySelector("#terminal-new-session"));
+}
+
+function positionTerminalNewMenu(menu, button) {
+  if (!button) return;
+    const anchor = button.getBoundingClientRect();
+    const box = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchor.right - box.width, window.innerWidth - box.width - 8));
+    const top = anchor.bottom + box.height + 6 <= window.innerHeight - 8
+      ? anchor.bottom + 6 : Math.max(8, anchor.top - box.height - 6);
+    menu.style.setProperty("--terminal-menu-left", `${left}px`);
+    menu.style.setProperty("--terminal-menu-top", `${top}px`);
 }
 
 function closeTerminalNewMenu() {
   const menu = document.querySelector("#terminal-new-menu");
   const button = document.querySelector("#terminal-new-session");
   if (!menu) return;
+  if (menu.matches(":popover-open")) menu.hidePopover();
   menu.hidden = true;
   menu.classList.add("hidden");
   if (button) button.setAttribute("aria-expanded", "false");
@@ -2167,7 +2351,23 @@ function toggleTerminalNewMenu() {
   const open = menu.hidden;
   menu.hidden = !open;
   menu.classList.toggle("hidden", !open);
+  if (open) {
+    menu.showPopover();
+    positionTerminalNewMenu(menu, button);
+  } else if (menu.matches(":popover-open")) {
+    menu.hidePopover();
+  }
   if (button) button.setAttribute("aria-expanded", String(open));
+}
+
+async function resumeRecordedSession(session) {
+  const projectId = String(session.project_id || "").trim();
+  const project = (state.projects || []).find((item) => item.project_id === projectId);
+  if (!project?.project_root) throw new Error("등록된 프로젝트 경로가 필요합니다");
+  await createTerminalTab({ project, nodeId: projectId, mode: session.mode, effort: "AUTO" }, session);
+  await loadResumableSessions();
+  renderReattachBanner();
+  renderTerminalNewMenu();
 }
 
 async function reattachLiveHost(host) {

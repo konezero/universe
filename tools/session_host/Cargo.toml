@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "universe-session-host-v3"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.22"
 portable-pty = "0.9"

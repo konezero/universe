@@ -1,3 +1,5 @@
+mod turn_delivery;
+mod native_queue;
 use base64::Engine;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,8 @@ struct HostSnapshot {
     channel_enabled: bool,
     channel_registered: bool,
     auth_token: String,
+    #[serde(serialize_with = "turn_delivery::serialize_recent")]
+    turn_delivery: turn_delivery::TurnDelivery,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +142,7 @@ struct PublicSnapshot {
     handle_kinds: [&'static str; 3],
     channel_enabled: bool,
     channel_registered: bool,
+    turn_delivery: turn_delivery::TurnDelivery,
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +377,7 @@ struct TerminalRuntime {
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child>>,
     output: Arc<Mutex<OutputBuffer>>,
+    native_queue: Option<native_queue::NativeQueue>,
 }
 
 impl TerminalRuntime {
@@ -434,6 +440,8 @@ impl TerminalRuntime {
                 writer: Mutex::new(writer),
                 child: Mutex::new(child),
                 output,
+                native_queue: config.environment.iter().find(|(k,_)| k=="UNIVERSE_CODEX_QUEUE_EXECUTABLE")
+                    .map(|(_,v)| native_queue::NativeQueue { executable: PathBuf::from(v), cwd: config.cwd.clone(), environment: config.environment.clone() }),
             },
             child_pid,
             child_started_at_unix_ms,
@@ -457,6 +465,23 @@ impl TerminalRuntime {
             .write_all(input)
             .and_then(|_| writer.flush())
             .map_err(|error| error.to_string())
+    }
+
+    fn deliver_turn(&self, delivery: &mut turn_delivery::TurnDelivery) {
+        let baseline = self.output.lock().map(|o| o.next_cursor).unwrap_or(0);
+        delivery.drain_with_settle(|bytes| self.write(bytes), || {
+            let start = std::time::Instant::now();
+            let mut gate = turn_delivery::InputSettle::new(baseline);
+            loop {
+                let elapsed = start.elapsed().as_millis() as u64;
+                let cursor = match self.output.lock() {
+                    Ok(output) => output.next_cursor,
+                    Err(_) => return Err(json!({"reason":"OUTPUT_LOCK_FAILED"})),
+                };
+                if let Some(result) = gate.observe(cursor, elapsed) { return result; }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
     }
 
     fn read_after(&self, cursor: u64) -> Result<OutputChunk, String> {
@@ -523,6 +548,7 @@ impl From<&HostSnapshot> for PublicSnapshot {
             handle_kinds: value.handle_kinds,
             channel_enabled: value.channel_enabled,
             channel_registered: value.channel_registered,
+            turn_delivery: value.turn_delivery.clone(),
         }
     }
 }
@@ -807,6 +833,34 @@ fn apply_request(
         return failure("HOST_UNAUTHORIZED", "invalid host token");
     }
     match request.action.as_str() {
+        "turn_observe" => {
+            let payload=request.channel.unwrap_or_else(||json!({}));
+            if state.provider.as_deref()!=payload["provider"].as_str()
+                || state.provider_session_ref.as_deref()!=payload["provider_session_ref"].as_str() {
+                return failure("HOST_TURN_BINDING_MISMATCH", "hook must match the bound provider session");
+            }
+            if let Err((code,detail))=state.turn_delivery.observe(&payload) { return failure(code,detail); }
+            if let Some(terminal)=terminal { terminal.deliver_turn(&mut state.turn_delivery); }
+            success(state)
+        }
+        "turn_offer" | "turn_delivery_status" => {
+            if let Err(response)=require_attached_supervisor(state,&request) { return *response; }
+            let payload=request.channel.unwrap_or_else(||json!({}));
+            if request.action=="turn_offer" {
+                if state.provider.as_deref()!=payload["provider"].as_str()
+                    || state.provider_session_ref.as_deref()!=payload["provider_session_ref"].as_str() {
+                    return failure("HOST_TURN_BINDING_MISMATCH", "delivery must match the bound provider session");
+                }
+                let mut payload=payload;
+                payload["_transport"]=json!(if state.provider.as_deref()==Some("CODEX") { "CODEX_NATIVE_QUEUE" } else { "PTY_INPUT" });
+                if state.provider.as_deref()==Some("CODEX") && terminal.and_then(|t|t.native_queue.as_ref()).is_none() {
+                    return failure("HOST_NATIVE_QUEUE_UNAVAILABLE", "launch a Host with the bound native Codex executable; PTY fallback is disabled");
+                }
+                if let Err((code,detail))=state.turn_delivery.offer(&payload) { return failure(code,detail); }
+                if let Some(terminal)=terminal { terminal.deliver_turn(&mut state.turn_delivery); }
+            }
+            channel_success(state,serde_json::to_value(&state.turn_delivery).unwrap())
+        }
         "status" => success(state),
         "bind_provider_session" => {
             let provider = request.provider.unwrap_or_default().trim().to_ascii_uppercase();
@@ -959,6 +1013,11 @@ fn apply_request(
             let Some(terminal) = terminal else {
                 return failure("HOST_TERMINAL_UNAVAILABLE", "terminal is unavailable");
             };
+            // Focus notifications and terminal cursor reports do not create a user draft.
+            let control_only = input == b"\x1b[I" || input == b"\x1b[O"
+                || (input.starts_with(b"\x1b[") && input.ends_with(b"R")
+                    && input[2..input.len()-1].iter().all(|b|b.is_ascii_digit() || *b==b';'));
+            if !control_only { state.turn_delivery.user_input(); }
             match terminal.write(&input) {
                 Ok(()) => success(state),
                 Err(error) => failure("HOST_INPUT_WRITE_FAILED", error),
@@ -1079,6 +1138,8 @@ fn handle_connection(
             return;
         }
     };
+    let before_turn_revision = state.turn_delivery.revision;
+    state.turn_delivery.expire_submit(now_unix_ms());
     let before_generation = state.attachment_generation;
     let before_session_binding_generation = state.session_binding_generation;
     let before_provider = state.provider.clone();
@@ -1102,7 +1163,8 @@ fn handle_connection(
         channel.as_deref(),
     );
     if response.status == "OK"
-        && (before_generation != state.attachment_generation
+        && (before_turn_revision != state.turn_delivery.revision
+            || before_generation != state.attachment_generation
             || before_session_binding_generation != state.session_binding_generation
             || before_provider != state.provider
             || before_provider_session_ref != state.provider_session_ref
@@ -1118,7 +1180,33 @@ fn handle_connection(
         write_response(stream, &failure("HOST_STATE_WRITE_FAILED", error));
         return;
     }
+    let dispatch_native = response.status == "OK" && state.provider.as_deref()==Some("CODEX");
     write_response(stream, &response);
+    drop(state);
+    if dispatch_native {
+        if let Some(adapter)=&terminal.native_queue {
+            loop {
+                let job = {
+                    let Ok(mut state)=shared.lock() else { return; };
+                    if state.runtime_state != "LIVE" { return; }
+                    let thread=state.provider_session_ref.clone().unwrap_or_default();
+                    let Some((mid,text))=state.turn_delivery.reserve_native() else { return; };
+                    if let Err(error)=atomic_write_state(&state_file,&state) {
+                        state.turn_delivery.finish_native(&mid,Err(format!("Host reservation evidence failed: {error}")));
+                        return;
+                    }
+                    (mid,text,thread)
+                };
+                let result=adapter.submit(&job.2,&job.1);
+                if let Ok(mut state)=shared.lock() {
+                    state.turn_delivery.finish_native(&job.0,result);
+                    if let Err(error)=atomic_write_state(&state_file,&state) {
+                        state.turn_delivery.finish_native(&job.0,Err(format!("Host queue outcome evidence failed: {error}")));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn serve(config: Config) -> Result<(), String> {
@@ -1176,6 +1264,7 @@ fn serve(config: Config) -> Result<(), String> {
         channel_enabled,
         channel_registered: false,
         auth_token: config.token,
+        turn_delivery: turn_delivery::TurnDelivery { native_queue_available: terminal.native_queue.is_some(), ..Default::default() },
     };
     atomic_write_state(&config.state_file, &state)?;
     if let (Some(path), Some(bootstrap)) = (
@@ -1269,6 +1358,7 @@ mod tests {
             channel_enabled: false,
             channel_registered: false,
             auth_token: "token".to_owned(),
+            turn_delivery: Default::default(),
         }
     }
 

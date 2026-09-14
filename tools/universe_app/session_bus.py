@@ -682,6 +682,45 @@ class SessionBus:
             payload["body_text"] = body
         return payload
 
+    def publish_master_completion(self, master: Mapping[str, Any]) -> dict[str, Any]:
+        """Import a durable Master completion once, even while its recipient is offline.
+
+        This internal route only accepts the server's committed result envelope.
+        The ordinary Conductor loop owns forwarding and Host delivery.
+        """
+        result = master.get("completion_result") or {}
+        mid = str(result.get("message_id") or "")
+        anchor = str(result.get("recipient_anchor_ref") or "")
+        body = str(result.get("body_text") or "")
+        if master.get("delivery_state") != "DONE" or not mid or not anchor or not body:
+            raise SessionBusError("BUS_MASTER_RESULT_INVALID", "committed completion result required", 409)
+        if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+            raise SessionBusError("BUS_BODY_TOO_LARGE", "completion result exceeds limit", 413)
+        with self._lock:
+            existing = self._messages.get(mid)
+            if existing:
+                if (existing.get("body_text") != body or existing.get("recipient_anchor_ref") != anchor
+                        or existing.get("thread_id") != master["message_id"]):
+                    raise SessionBusError("BUS_MASTER_RESULT_CONFLICT", "completion identity has different content", 409)
+                return self._public_message(existing, headers_only=False)
+            now = str(master.get("completed_at") or utc_now())
+            message = {"message_id": mid, "_terminal_id": "", "thread_id": master["message_id"],
+                "room_id": "", "kind": "RESULT", "from": {
+                    "project_id": master["project_id"], "mode": "MASTER", "provider": master.get("provider") or "",
+                    "session_anchor_ref": master.get("owner_session_anchor_ref") or "", "terminal_id": ""},
+                "to": {"session_anchor_ref": anchor, "terminal_id": ""},
+                "body_text": body, "bytes": len(body.encode("utf-8")), "created_at": now,
+                "delivery_state": "UNREAD", "session_anchor_ref": anchor, "recipient_anchor_ref": anchor,
+                "source_anchor_ref": master.get("owner_session_anchor_ref") or "",
+                "in_reply_to": master["message_id"], "lifecycle_state": "COMPLETED",
+                "lifecycle": {"completed_at": now, "result_ref": master.get("result_ref") or ""},
+                "updated_at": now, "provenance": {"kind": "SESSION_BUS_RESULT", "source_master_message_id": master["message_id"]}}
+            # Commit before exposing in memory; a failed write must remain retryable.
+            self._persist_message("", message)
+            self._messages[mid] = message
+            self._inbox.setdefault("anchor:" + anchor, []).append(mid)
+            return self._public_message(message, headers_only=False)
+
     def post(self, host: Any, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
         to_raw = payload.get("to") if isinstance(payload.get("to"), Mapping) else {}
@@ -751,6 +790,7 @@ class SessionBus:
         room_id: str = "",
         thread_id: str = "",
         projection_state: str = "",
+        system_event: str = "",
     ) -> dict[str, Any]:
         return self._deliver(
             host,
@@ -763,6 +803,7 @@ class SessionBus:
             room_id=room_id,
             thread_id=thread_id,
             projection_state=projection_state,
+            system_event=system_event,
         )
 
     def _deliver(
@@ -778,6 +819,7 @@ class SessionBus:
         room_id: str,
         thread_id: str,
         projection_state: str,
+        system_event: str = "",
     ) -> dict[str, Any]:
         terminal_id = str(terminal.get("terminal_id") or "").strip()
         recipient_anchor = _terminal_anchor(terminal) or str(
@@ -829,7 +871,8 @@ class SessionBus:
                 ),
             },
             "updated_at": utc_now(),
-            "provenance": _instruction_provenance(source, kind),
+            "provenance": {**_instruction_provenance(source, kind),
+                           **({"system_event": system_event} if system_event else {})},
         }
         inbox_key = terminal_id or ("anchor:" + recipient_anchor)
         with self._lock:

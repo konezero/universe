@@ -8,6 +8,16 @@ const state = {
   todos: [],
   goals: [],
   unassignedTodos: [],
+  /** Raw Feature Node records (any state, incl. ARCHIVED) for the selected
+   *  project — the unified_graph drops ARCHIVED nodes at graft time, so the
+   *  Fleet "폐기 표시" toggle needs this separate read-only list to reveal them. */
+  projectFeatures: [],
+  /** Fleet 완료/폐기 필터: a display preference, not project data — persisted
+   *  per-browser via localStorage so a refresh restores the chosen toggle. */
+  fleetFilters: loadFleetFilters(),
+  /** Fleet Todo 상세의 결과(완료 근거) 캐시 — todo_id -> last todo.state action, or null when none exists. */
+  homeTodoResultCache: {},
+  homeTodoResultPending: new Set(),
   expandedGoals: {},
   selectedProject: null,
   projection: null,
@@ -4313,6 +4323,55 @@ function setGoalPlanLayout() {
 // Fleet: an execution board — every project todo placed in a lane by its
 // lifecycle_state, with its owner node and (where the projection knows) its
 // ship. Data from state.goals + state.projection (ships / node.work).
+// Fleet 완료/폐기 필터: a per-browser UI preference (not project data), so
+// localStorage is the correct store — it never touches Todo/node state.
+function loadFleetFilters() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("universe.fleet.filters") || "null");
+    return {
+      showDone: Boolean(raw?.showDone),
+      showDiscarded: Boolean(raw?.showDiscarded),
+    };
+  } catch {
+    return { showDone: false, showDiscarded: false };
+  }
+}
+function saveFleetFilters() {
+  try {
+    localStorage.setItem("universe.fleet.filters", JSON.stringify(state.fleetFilters));
+  } catch {
+    // best-effort only; a blocked/private store must not break the toggle
+  }
+}
+function fleetShowDone() {
+  return Boolean(state.fleetFilters?.showDone);
+}
+function fleetShowDiscarded() {
+  return Boolean(state.fleetFilters?.showDiscarded);
+}
+function bindFleetFilterControls() {
+  const doneBox = document.querySelector("#fleet-filter-done");
+  const discardedBox = document.querySelector("#fleet-filter-discarded");
+  if (doneBox && !doneBox.dataset.bound) {
+    doneBox.dataset.bound = "1";
+    doneBox.addEventListener("change", () => {
+      state.fleetFilters.showDone = doneBox.checked;
+      saveFleetFilters();
+      renderIntegratedHome();
+    });
+  }
+  if (discardedBox && !discardedBox.dataset.bound) {
+    discardedBox.dataset.bound = "1";
+    discardedBox.addEventListener("change", () => {
+      state.fleetFilters.showDiscarded = discardedBox.checked;
+      saveFleetFilters();
+      renderIntegratedHome();
+    });
+  }
+  if (doneBox) doneBox.checked = fleetShowDone();
+  if (discardedBox) discardedBox.checked = fleetShowDiscarded();
+}
+
 const FLEET_LANES = [
   { id: "planned", label: "Planned", states: ["BACKLOG", "PLANNED"] },
   { id: "ready", label: "Ready", states: ["READY"] },
@@ -4629,6 +4688,32 @@ function homeAllTodos() {
   return out;
 }
 
+// A node whose every attached Todo is DONE (and it has at least one) is a
+// completed Fleet item — the officially published DONE state, not a guess.
+function homeNodeFullyDone(graphNode) {
+  const todos = homeNodeTodos(graphNode);
+  return (
+    todos.length > 0 &&
+    todos.every((t) => String(t.state || "").toUpperCase() === "DONE")
+  );
+}
+
+// ARCHIVED Feature Nodes (폐기) never graft into unified_graph (see
+// graft_feature_nodes in universe_node_graph.py), so revealing them for the
+// "폐기 표시" toggle needs the raw Feature Node list fetched separately
+// (state.projectFeatures, read-only — see refreshProjectRooms).
+function homeArchivedFeatureNodes() {
+  return (state.projectFeatures || [])
+    .filter((f) => String(f?.state || "").toUpperCase() === "ARCHIVED")
+    .map((f) => ({
+      node_id: `feat:${f.feature_id}`,
+      kind: "FEATURE",
+      state: "ARCHIVED",
+      title: String(f.intent_text || f.feature_id || "").slice(0, 80) || f.feature_id,
+      data: {},
+    }));
+}
+
 function homeNodes() {
   const graph = state.projection?.unified_graph?.nodes || [];
   const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
@@ -4646,6 +4731,15 @@ function homeNodes() {
       out.push(n);
     }
   }
+  let visible = fleetShowDone() ? out : out.filter((n) => !homeNodeFullyDone(n));
+  if (fleetShowDiscarded()) {
+    for (const archived of homeArchivedFeatureNodes()) {
+      if (!seen.has(archived.node_id)) {
+        seen.add(archived.node_id);
+        visible.push(archived);
+      }
+    }
+  }
   // Surface nodes that carry work first (running > any todos > none).
   const rank = (graphNode) => {
     const todos = homeNodeTodos(graphNode);
@@ -4655,11 +4749,20 @@ function homeNodes() {
     );
     return hot ? 3 : todos.length ? 2 : 1;
   };
-  return out.sort((a, b) => {
+  return visible.sort((a, b) => {
     const d = rank(b) - rank(a);
     if (d) return d;
     return String(a.title || a.node_id).localeCompare(String(b.title || b.node_id));
   });
+}
+
+// Todos to actually list/board for a node: DONE items hide behind the Fleet
+// "완료 표시" toggle (default off) so the working set stays uncluttered.
+function homeVisibleNodeTodos(node) {
+  const all = homeNodeTodos(node);
+  return fleetShowDone()
+    ? all
+    : all.filter((t) => String(t.state || "").toUpperCase() !== "DONE");
 }
 
 // A todo belongs to a node when its node_ref names that node (features carry
@@ -4687,6 +4790,63 @@ function homeSelectedTodo(nodeTodos) {
 
 function homeTodoBlocked(todo) {
   return String(todo?.state || "").toUpperCase() === "BLOCKED";
+}
+
+// Todo 레벨 BLOCKED 사유: a Todo's own BLOCKED state previously carried no
+// stored reason anywhere (confirmed — the field did not exist). A narrow,
+// dedicated write path (POST /v1/todos/{id}/blocked-reason, never folded
+// into the full-body todo.update replace) owns blocked_reason; both Fleet
+// and the flat Todo list call this SAME function, so they cannot disagree.
+// No data means an explicit "미기록" — never a guessed reason.
+// Fleet reads Todos from state.goals/state.universeGoals/state.unassignedTodos
+// (a separate cache from state.todos, the flat list's own source) — a write
+// must patch every array a Todo can appear in, or the screen that didn't
+// initiate the save would re-render with stale data.
+function patchTodoEverywhere(updated) {
+  const replaceIn = (list) => {
+    if (!Array.isArray(list)) return;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i]?.todo_id === updated.todo_id) list[i] = updated;
+    }
+  };
+  replaceIn(state.todos);
+  replaceIn(state.unassignedTodos);
+  for (const goal of [...(state.goals || []), ...(state.universeGoals || [])]) {
+    replaceIn(goal.todos);
+    for (const milestone of goal.milestones || []) replaceIn(milestone.todos);
+  }
+}
+
+function renderTodoBlockedReason(todo, onSaved) {
+  if (!homeTodoBlocked(todo)) return null;
+  const sec = node("div", "todo-blocked-reason");
+  sec.append(node("strong", "", "차단 사유"));
+  const current = String(todo.blocked_reason || "").trim();
+  sec.append(node("p", "context-copy", current || "미기록"));
+  const input = node("input", "");
+  input.type = "text";
+  input.placeholder = "차단 사유·다음 행동";
+  input.value = current;
+  const saveBtn = node("button", "secondary-button compact-action", "저장");
+  saveBtn.type = "button";
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    try {
+      const result = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}/blocked-reason`, {
+        method: "POST",
+        body: { expected_revision: todo.revision, blocked_reason: input.value },
+      });
+      patchTodoEverywhere(result.todo);
+      toast("차단 사유를 저장했습니다.");
+      onSaved();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+  sec.append(input, saveBtn);
+  return sec;
 }
 
 // The session executing this todo, if any (its Goal's automation Task Frame).
@@ -4721,6 +4881,7 @@ function homeChev() {
 function renderIntegratedHome() {
   const root = document.querySelector("#home-view");
   if (!root) return;
+  bindFleetFilterControls();
   const project = state.selectedProject;
   renderHomeProjects();
   if (!project) {
@@ -4736,13 +4897,14 @@ function renderIntegratedHome() {
   const selNode = homeSelectedNode();
   state.homeNodeId = selNode?.node_id || null;
   const nodeTodos = homeNodeTodos(selNode);
-  const selTodo = homeSelectedTodo(nodeTodos);
+  const visibleTodos = homeVisibleNodeTodos(selNode);
+  const selTodo = homeSelectedTodo(visibleTodos);
   state.homeTodoId = selTodo?.todo_id || null;
 
   renderHomeNodes(selNode);
-  renderHomeTodos(selNode, nodeTodos, selTodo);
+  renderHomeTodos(selNode, visibleTodos, selTodo);
   renderHomeDetail(selNode, selTodo);
-  renderHomeKanban(selNode, nodeTodos, selTodo);
+  renderHomeKanban(selNode, visibleTodos, selTodo);
   renderHomeWorkSummary(nodeTodos);
   renderHomeMobileBar(project, selNode, selTodo);
   // Draw after layout settles; the retry budget resets each render.
@@ -4887,12 +5049,20 @@ function renderHomeNodes(selNode) {
 
     const statusRow = node("div", "home-card-meta");
     const kind = String(graphNode.kind || "").toUpperCase();
+    const archived = String(graphNode.state || "").toUpperCase() === "ARCHIVED";
     const adopted = String(graphNode.state || "").toUpperCase() === "ADOPTED";
     if (kind === "FEATURE") {
-      const stateChip = node("span", "home-chip", adopted ? "채택됨" : "제안됨");
+      const stateChip = node(
+        "span",
+        "home-chip",
+        archived ? "폐기됨" : adopted ? "채택됨" : "제안됨"
+      );
       if (adopted) {
         stateChip.style.borderColor = "#5c6b3f";
         stateChip.style.color = "#8a9b6f";
+      } else if (archived) {
+        stateChip.style.borderColor = "#6b4a4a";
+        stateChip.style.color = "#a87f7f";
       }
       statusRow.append(stateChip);
     } else if (kind) {
@@ -4931,7 +5101,7 @@ function renderHomeNodes(selNode) {
       rows.push(meta);
     }
     // 폐기 — proposed feature nodes can be archived (drops out of the graft).
-    if (kind === "FEATURE" && !adopted && !todos.length) {
+    if (kind === "FEATURE" && !adopted && !archived && !todos.length) {
       const archiveRow = node("div", "");
       const archiveBtn = node("button", "home-node-archive", "폐기");
       archiveBtn.type = "button";
@@ -5041,6 +5211,13 @@ function renderHomeDetail(selNode, selTodo) {
   add("Executor", executor ? executor.label : "unassigned", executor ? "#7fb0a7" : "#8a8a86");
   el.append(grid);
 
+  const blockedReason = renderTodoBlockedReason(selTodo, () => renderIntegratedHome());
+  if (blockedReason) {
+    const sec = node("section", "home-detail-section");
+    sec.append(blockedReason);
+    el.append(sec);
+  }
+
   const rooms = typeof roomsForSelectedNode === "function"
     ? roomsForSelectedNode({ id: selNode?.node_id, data: selNode?.data })
     : [];
@@ -5058,11 +5235,126 @@ function renderHomeDetail(selNode, selTodo) {
     el.append(sec);
   }
 
+  const resultSection = renderHomeTodoResult(selTodo);
+  if (resultSection) el.append(resultSection);
+
+  // Fleet↔Todo-list lineage consistency: the flat Todo list already surfaces
+  // Task Frame/Host ownership and the Goal automation gate (with the exact
+  // BLOCKED/WAITING reason + next action the server computes), but Fleet's
+  // own Todo detail silently omitted both — reuse the same projections here
+  // instead of re-deriving them, so the two screens never disagree.
+  if (typeof renderTodoOwnership === "function") {
+    const ownership = renderTodoOwnership(selTodo);
+    if (ownership) {
+      const sec = node("section", "home-detail-section");
+      sec.append(node("h4", "", "Task Frame"), ownership);
+      el.append(sec);
+    }
+  }
+  if (typeof renderTodoAutomationControl === "function") {
+    const automation = renderTodoAutomationControl(selTodo);
+    if (automation) {
+      const sec = node("section", "home-detail-section");
+      sec.append(node("h4", "", "Goal 자동화"), automation);
+      el.append(sec);
+    }
+  }
+
   const openSess = node("button", "home-nav", "세션 창 열기");
   openSess.type = "button";
   openSess.style.borderColor = "#43454c";
   openSess.addEventListener("click", () => openFleetCardSession(selTodo));
   el.append(openSess);
+}
+
+// Fleet Todo 상세 -> 결과 연결: a DONE/BLOCKED todo's completion evidence
+// already exists (todo.state action history) but was not shown in Fleet.
+// Read-only fetch, cached per (todo_id, revision); never mutates the
+// Todo/action record. Keying by revision means a state change that bumps
+// the Todo's revision naturally invalidates the old cache entry instead of
+// showing a stale result, and two fetches for different revisions of the
+// same Todo can never overwrite each other's cache slot.
+function homeTodoResultCacheKey(todo) {
+  const id = String(todo?.todo_id || "");
+  if (!id) return "";
+  const revision = todo?.revision;
+  return `${id}:${Number.isFinite(revision) ? revision : "unknown"}`;
+}
+
+async function ensureHomeTodoResult(todo) {
+  const key = homeTodoResultCacheKey(todo);
+  const alreadyCached = Object.prototype.hasOwnProperty.call(state.homeTodoResultCache, key);
+  if (!key || alreadyCached || state.homeTodoResultPending.has(key)) return;
+  state.homeTodoResultPending.add(key);
+  try {
+    const history = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}/actions`);
+    const actions = history?.history?.actions || [];
+    const last = actions[actions.length - 1] || null;
+    // A successful fetch that found no action is a real, distinct outcome
+    // from a failed fetch — never collapse the two into the same cache shape.
+    state.homeTodoResultCache[key] = { ok: true, action: last ? last.action : null };
+  } catch (error) {
+    state.homeTodoResultCache[key] = {
+      ok: false,
+      message: error?.message || "알 수 없는 오류",
+    };
+  } finally {
+    state.homeTodoResultPending.delete(key);
+    if (state.homeTodoId === todo.todo_id) renderIntegratedHome();
+  }
+}
+
+// A failed fetch's cache entry is a terminal "give up" state until the user
+// asks again — clear it and re-fetch, rather than retrying automatically
+// and risking a request storm.
+function retryHomeTodoResult(todo) {
+  const key = homeTodoResultCacheKey(todo);
+  if (key) delete state.homeTodoResultCache[key];
+  ensureHomeTodoResult(todo);
+  renderIntegratedHome();
+}
+
+function renderHomeTodoResult(selTodo) {
+  const uppercaseState = String(selTodo?.state || "").toUpperCase();
+  if (!["DONE", "BLOCKED"].includes(uppercaseState)) return null;
+  const key = homeTodoResultCacheKey(selTodo);
+  const cached = state.homeTodoResultCache[key];
+  const sec = node("section", "home-detail-section");
+  sec.append(node("h4", "", "결과"));
+  if (cached === undefined) {
+    ensureHomeTodoResult(selTodo);
+    sec.append(node("div", "goal-plan-empty", "불러오는 중…"));
+    return sec;
+  }
+  if (!cached.ok) {
+    sec.append(node("div", "goal-plan-empty", `결과를 불러오지 못했습니다: ${cached.message}`));
+    const retry = node("button", "home-nav", "다시 시도");
+    retry.type = "button";
+    retry.addEventListener("click", () => retryHomeTodoResult(selTodo));
+    sec.append(retry);
+    return sec;
+  }
+  const action = cached.action;
+  const evidenceRef = action?.validation?.evidence_ref;
+  if (!action || !evidenceRef) {
+    sec.append(node("div", "goal-plan-empty", "기록된 완료 근거가 없습니다."));
+    return sec;
+  }
+  const grid = node("div", "home-todo-detail-grid");
+  // provider성공/검증통과/제품완료 구분: each row reuses an existing, already
+  // recorded signal — never a guess. "Provider 실행" has no reliable signal
+  // in the current data model (session_state is liveness, not a completion
+  // result), so it is shown as UNKNOWN rather than inferred from the other two.
+  grid.append(node("span", "k", "제품 완료"), node("span", "", action.outcome || uppercaseState));
+  const validationStatus = action.validation?.status;
+  grid.append(
+    node("span", "k", "검증 통과"),
+    node("span", "", validationStatus === "PASSED" ? "통과" : (validationStatus || "UNKNOWN"))
+  );
+  grid.append(node("span", "k", "Provider 실행"), node("span", "", "UNKNOWN — 기록된 신호 없음"));
+  grid.append(node("span", "k", "근거"), node("span", "", evidenceRef));
+  sec.append(grid);
+  return sec;
 }
 
 function renderHomeKanban(selNode, nodeTodos, selTodo) {
@@ -8971,8 +9263,9 @@ async function refreshProjectRooms() {
   const rooms = roomResult.rooms || [];
   // Annotate MEETING rooms with the feature node they explore, so the Fleet
   // board can badge a card whose owner node is that feature.
+  const features = featureResult.features || [];
   const featureByRoom = new Map(
-    (featureResult.features || [])
+    features
       .filter((feature) => feature.meeting_room_id)
       .map((feature) => [feature.meeting_room_id, feature.feature_id])
   );
@@ -8981,6 +9274,9 @@ async function refreshProjectRooms() {
     if (featureId) room.feature_id = featureId;
   }
   state.projectRooms = rooms;
+  // Raw Feature Node list (any state, incl. ARCHIVED) for the Fleet "폐기
+  // 표시" toggle — unified_graph itself never carries ARCHIVED nodes.
+  state.projectFeatures = features;
   return state.projectRooms;
 }
 
@@ -14395,6 +14691,18 @@ function todoAutomationControlProjection(todo) {
       enabled,
     };
   }
+  // The server already computes exactly why a Goal cannot proceed (reasons[]
+  // + next_action) for states like BLOCKED_GOAL_NOT_PLAN_ELIGIBLE — surface
+  // that instead of collapsing it to a generic "gate is not bypassed" string.
+  if (surface.diagnostic?.reasons?.length) {
+    return {
+      code: surface.diagnostic.code || operation,
+      label: todoAutomationNextStepLabels[operation] || (surface.automation_state || operation).replaceAll("_", " "),
+      detail: surface.diagnostic.reasons.join("; ") + (surface.diagnostic.next_action ? ` — ${surface.diagnostic.next_action}` : ""),
+      actionable: false,
+      enabled: false,
+    };
+  }
   return {
     code: operation,
     label: todoAutomationNextStepLabels[operation] || operation.replaceAll("_", " "),
@@ -14921,14 +15229,46 @@ function renderTodos() {
       todo.state,
       "todo-item-state"
     );
-    const save = node("button", "secondary-button todo-save", "Save");
+    const evidence = node("input", "todo-completion-evidence");
+    evidence.placeholder = "완료 근거 또는 결과 링크";
+    evidence.maxLength = 1000;
+    evidence.setAttribute("aria-label", "완료 근거");
+    const validationLabel = node("label", "todo-completion-validation", "완료 조건 확인");
+    const validated = node("input", "");
+    validated.type = "checkbox";
+    validated.setAttribute("aria-label", "완료 조건 확인");
+    validationLabel.prepend(validated);
+    const applyState = node("button", "secondary-button todo-state-save", "상태 적용");
+    applyState.type = "button";
+    applyState.addEventListener("click", async () => {
+      applyState.disabled = true;
+      try { await updateTodoState(todo, todoState.value, evidence.value, validated.checked); }
+      finally { applyState.disabled = false; showCompletion(); }
+    });
+    const showCompletion = () => {
+      const pending = pendingTodoState(todo);
+      if (pending) {
+        todoState.value = pending.state;
+        evidence.value = pending.validation?.evidence_ref || "";
+        validated.checked = pending.validation?.status === "PASSED";
+      }
+      todoState.disabled = evidence.disabled = validated.disabled = Boolean(pending);
+      applyState.textContent = pending ? "이전 요청 확인" : "상태 적용";
+      applyState.title = pending ? "응답을 확인하지 못한 요청을 같은 요청 번호로 다시 확인합니다." : "";
+      const completing = todoState.value === "DONE";
+      evidence.hidden = !completing;
+      validationLabel.hidden = !completing;
+    };
+    todoState.addEventListener("change", showCompletion);
+    showCompletion();
+    const save = node("button", "secondary-button todo-save", "내용 저장");
     save.type = "button";
     save.addEventListener("click", () =>
       updateTodo(todo, {
         title: title.value,
         detail: detail.value,
         priority: priority.value,
-        state: todoState.value,
+        state: todo.state,
       })
     );
     const remove = node("button", "icon-button compact todo-delete", "\u00d7");
@@ -14936,12 +15276,14 @@ function renderTodos() {
     remove.title = "Delete Todo";
     remove.setAttribute("aria-label", remove.title);
     remove.addEventListener("click", () => deleteTodo(todo));
-    controls.append(priority, todoState, save, remove);
+    controls.append(priority, save, todoState, evidence, validationLabel, applyState, remove);
     const ownership = renderTodoOwnership(todo);
     const automationControl = renderTodoAutomationControl(todo);
+    const blockedReason = renderTodoBlockedReason(todo, () => renderTodos());
     item.append(header);
     if (ownership) item.append(ownership);
     if (automationControl) item.append(automationControl);
+    if (blockedReason) item.append(blockedReason);
     item.append(title, detail, controls);
     elements.todoList.append(item);
   }
@@ -14976,7 +15318,7 @@ async function submitTodo(event) {
     body.node_ref = elements.todoNode.value;
   }
   try {
-    const result = await api("/v1/todos", { method: "POST", body });
+    const result = await invokeServerAction("todo.create", { todo: body });
     state.todos = [result.todo, ...state.todos];
     elements.todoTitle.value = "";
     elements.todoDetail.value = "";
@@ -15012,10 +15354,7 @@ async function updateTodo(todo, changes) {
   if (body.node_ref === null) delete body.node_ref;
   if (body.universe_goal_id === null) delete body.universe_goal_id;
   try {
-    const result = await api(`/v1/todos/${encodeURIComponent(todo.todo_id)}`, {
-      method: "PATCH",
-      body,
-    });
+    const result = await invokeServerAction("todo.update", { todo_id: todo.todo_id, todo: body });
     state.todos = state.todos.map((item) =>
       item.todo_id === todo.todo_id ? result.todo : item
     );
@@ -15025,6 +15364,49 @@ async function updateTodo(todo, changes) {
     drawGraph();
     toast("Todo updated");
   } catch (error) {
+    elements.todoFormError.textContent = error.message;
+  }
+}
+
+function pendingTodoState(todo) {
+  const storageKey = `universe.todo.state.${todo.todo_id}`;
+  try { return JSON.parse(sessionStorage.getItem(storageKey) || "null"); }
+  catch { sessionStorage.removeItem(storageKey); return null; }
+}
+
+async function updateTodoState(todo, desiredState, evidence, validated) {
+  const storageKey = `universe.todo.state.${todo.todo_id}`;
+  try {
+    let request = pendingTodoState(todo);
+    if (!request) {
+      if (desiredState === "DONE" && (!validated || !String(evidence).trim())) {
+        throw new Error("완료 근거를 입력하고 완료 조건을 확인해 주세요.");
+      }
+      request = {
+        todo_id: todo.todo_id,
+        project_id: todo.project_id ?? null,
+        expected_revision: todo.revision,
+        request_id: crypto.randomUUID(),
+        state: desiredState,
+      };
+      if (desiredState === "DONE") {
+        request.validation = { status: "PASSED", evidence_ref: String(evidence).trim() };
+      }
+      sessionStorage.setItem(storageKey, JSON.stringify(request));
+    }
+    // An uncertain request is retried with its original identity, even after refresh.
+    const result = await invokeServerAction("todo.state", request);
+    const current = await invokeServerAction("todo.read", { todo_id: todo.todo_id });
+    if (result.result_propagation?.status !== "PENDING") sessionStorage.removeItem(storageKey);
+    state.todos = state.todos.map((item) => item.todo_id === todo.todo_id ? current.todo : item);
+    renderProjects(); renderTodos(); renderDetails(); drawGraph();
+    elements.todoFormError.textContent = "";
+    toast(result.result_propagation?.status === "PENDING" ? "상태 저장됨 · 결과 전달 대기" : "Todo 상태 저장됨");
+  } catch (error) {
+    // Definite schema/scope/revision failures did not apply. Transport/5xx stays uncertain.
+    if (typeof error.status === "number" && error.status >= 400 && error.status < 500) {
+      sessionStorage.removeItem(storageKey);
+    }
     elements.todoFormError.textContent = error.message;
   }
 }
@@ -16996,6 +17378,147 @@ function groupRagReviewCandidates(candidates) {
 
 const RAG_KNOWLEDGE_KINDS = {USER_IDEA: "사용자 구상", USER_REQUIREMENT: "사용자 요구", USER_DECISION: "사용자 결정", REUSABLE_PROCEDURE: "재사용 절차", REUSABLE_EXPERIENCE: "재사용 경험"};
 
+// 2026-09-14: memory topic/relation classification is server-owned data
+// (rag.memory-relate -> knowledge.topic + project_memory_relation), not a
+// UI-hardcoded table — any project's memories work the same way with no
+// source change. RAG_RELATION_LABELS is just vocabulary, not content.
+const RAG_RELATION_LABELS = {
+  COMPLEMENTS: "보완", SUPERSEDES: "대체", CONFLICTS_WITH: "충돌", DUPLICATE_OF: "중복",
+};
+
+// One relation-note line per typed edge touching this memory (either
+// direction), resolved against the sibling memories already loaded for this
+// screen. Never merges text — each memory's own claim stays separate.
+function memoryRelationNotes(item, memoryById) {
+  const relations = item.relations || [];
+  const notes = [];
+  for (const r of relations) {
+    const label = RAG_RELATION_LABELS[r.relation] || r.relation;
+    if (r.memory_id === item.memory_id) {
+      const target = memoryById.get(r.target_memory_id);
+      const targetLabel = target ? (target.title || target.memory_id) : r.target_memory_id;
+      notes.push(`${label} → ${targetLabel}: ${r.note}`);
+    } else {
+      const source = memoryById.get(r.memory_id);
+      const sourceLabel = source ? (source.title || source.memory_id) : r.memory_id;
+      notes.push(`대표 — "${sourceLabel}"에서 이 항목을 ${label}(으)로 지목: ${r.note}`);
+    }
+  }
+  return notes;
+}
+
+// 대표 변경·관계 수정 UI: a saved memory's own topic classification, and its
+// typed relation to any other saved memory in the same project, both write
+// through rag.memory-relate — never a hardcoded id table. "Changing the
+// representative" for a topic is done by re-pointing each COMPLEMENTS edge
+// that currently targets the old representative at the new one, one edit at
+// a time; there is no separate bulk-swap operation.
+function renderMemoryRelateEditor(item, memoryById, projectId, onSaved) {
+  const wrap = node("details", "rag-relate-editor");
+  wrap.append(node("summary", "", "주제 · 관계 편집"));
+  const body = node("div", "rag-relate-form");
+
+  const topicRow = node("div", "rag-relate-row");
+  const topicInput = node("input", "");
+  topicInput.type = "text";
+  topicInput.placeholder = "주제 (예: Universe 비전 · 통합 노드그래프)";
+  topicInput.value = item.knowledge?.topic || "";
+  const kindSelect = node("select", "");
+  for (const [key, label] of Object.entries(RAG_KNOWLEDGE_KINDS)) kindSelect.append(new Option(label, key));
+  kindSelect.value = item.knowledge?.kind || "USER_DECISION";
+  const applInput = node("input", "");
+  applInput.type = "text";
+  applInput.placeholder = "적용 조건";
+  applInput.value = item.knowledge?.applicability || "";
+  const topicNoteInput = node("input", "");
+  topicNoteInput.type = "text";
+  topicNoteInput.placeholder = "분류 사유(필수)";
+  const topicSaveBtn = node("button", "secondary-button compact-action", "주제 저장");
+  topicSaveBtn.type = "button";
+  topicSaveBtn.addEventListener("click", async () => {
+    if (!topicInput.value.trim() || !applInput.value.trim() || !topicNoteInput.value.trim()) {
+      toast("주제·적용 조건·사유를 모두 입력하세요.", true);
+      return;
+    }
+    topicSaveBtn.disabled = true;
+    try {
+      await invokeServerAction("rag.memory-relate", {
+        project_id: projectId,
+        memory_id: item.memory_id,
+        expected_memory_digest: item.memory_digest,
+        request_id: crypto.randomUUID(),
+        note: topicNoteInput.value.trim(),
+        knowledge: { kind: kindSelect.value, topic: topicInput.value.trim(), applicability: applInput.value.trim() },
+      });
+      toast("주제를 저장했습니다.");
+      onSaved();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      topicSaveBtn.disabled = false;
+    }
+  });
+  topicRow.append(topicInput, kindSelect, applInput, topicNoteInput, topicSaveBtn);
+  body.append(node("small", "", "주제 분류"), topicRow);
+
+  const relationRow = node("div", "rag-relate-row");
+  const targetSelect = node("select", "");
+  targetSelect.append(new Option("관계 대상 메모 선택…", ""));
+  for (const [id, other] of memoryById) {
+    if (id === item.memory_id) continue;
+    targetSelect.append(new Option(shortLabel(other.title || id, 60), id));
+  }
+  const relationSelect = node("select", "");
+  for (const rel of ["COMPLEMENTS", "SUPERSEDES", "CONFLICTS_WITH", "DUPLICATE_OF"]) {
+    relationSelect.append(new Option(RAG_RELATION_LABELS[rel] || rel, rel));
+  }
+  const relationNoteInput = node("input", "");
+  relationNoteInput.type = "text";
+  relationNoteInput.placeholder = "관계 근거(필수)";
+  const relationSaveBtn = node("button", "secondary-button compact-action", "관계 저장");
+  relationSaveBtn.type = "button";
+  relationSaveBtn.addEventListener("click", async () => {
+    const targetId = targetSelect.value;
+    if (!targetId) {
+      toast("관계 대상 메모를 선택하세요.", true);
+      return;
+    }
+    if (!relationNoteInput.value.trim()) {
+      toast("관계 근거를 입력하세요.", true);
+      return;
+    }
+    const target = memoryById.get(targetId);
+    const existingRelation = (item.relations || []).find(
+      (r) => r.memory_id === item.memory_id && r.target_memory_id === targetId && r.relation === relationSelect.value
+    );
+    relationSaveBtn.disabled = true;
+    try {
+      await invokeServerAction("rag.memory-relate", {
+        project_id: projectId,
+        memory_id: item.memory_id,
+        expected_memory_digest: item.memory_digest,
+        request_id: crypto.randomUUID(),
+        relation: relationSelect.value,
+        target_memory_id: targetId,
+        expected_target_memory_digest: target.memory_digest,
+        expected_relation_revision: existingRelation ? existingRelation.revision : 0,
+        note: relationNoteInput.value.trim(),
+      });
+      toast(existingRelation ? "관계를 수정했습니다." : "관계를 추가했습니다.");
+      onSaved();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      relationSaveBtn.disabled = false;
+    }
+  });
+  relationRow.append(targetSelect, relationSelect, relationNoteInput, relationSaveBtn);
+  body.append(node("small", "", "관계 추가·수정 (같은 대상·관계로 다시 저장하면 근거를 갱신합니다)"), relationRow);
+
+  wrap.append(body);
+  return wrap;
+}
+
 function ragTopicFor(item) {
   const explicit = String(item.knowledge?.topic || "").normalize("NFC").trim().replace(/\s+/g, " ");
   if (explicit) return {name: explicit, inferred: false};
@@ -17192,6 +17715,7 @@ function renderMemory() {
     search.type = "search"; search.placeholder = "메모 제목·내용 검색"; search.setAttribute("aria-label", "메모 검색");
     lists.append(search);
     const groups = node("div", "rag-memory-groups"); lists.append(groups);
+    const memoryById = new Map(knowledge.memories.map(item => [item.memory_id, item]));
     const draw = () => {
       groups.replaceChildren();
       const query = search.value?.trim().toLowerCase() || "";
@@ -17221,11 +17745,16 @@ function renderMemory() {
           summary.append(node("strong", "", claim.text), node("small", "knowledge-badge", kind + " · " + claim.entries.length + "기록"));
           details.append(summary);
           if (representative.item.knowledge?.applicability) details.append(node("p", "context-copy", "적용 조건: " + representative.item.knowledge.applicability));
+          const relationNotes = [...new Set(
+            claim.entries.flatMap(({item}) => memoryRelationNotes(item, memoryById))
+          )];
+          for (const relationNote of relationNotes) details.append(node("p", "rag-relation-note", relationNote));
           details.append(node("p", "context-copy", "출처·검토 이력 — 최근 수집 순 (현재 유효성 순서 아님)"));
           for (const {item, candidate} of claim.entries) {
             const date = Date.parse(item.created_at || "");
             details.append(node("small", "", "수집: " + (Number.isFinite(date) ? new Date(date).toLocaleString("ko-KR") : "시각 미확인")));
             appendRow(details, item, candidate);
+            if (!candidate) details.append(renderMemoryRelateEditor(item, memoryById, projectId, () => renderMemory()));
           }
           section.append(details);
         }

@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import socket
 import sqlite3
 import sys
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -84,7 +86,7 @@ def bind_rust_host_identity(
     )
     binary = Path(
         str(environment.get("UNIVERSE_RECONNECTION_HOST_BINARY") or "").strip()
-        or (Path(__file__).resolve().parent / "session_host" / "target" / "release" / "universe-session-host.exe")
+        or (Path(__file__).resolve().parent / "session_host" / "target" / "release" / "universe-session-host-v2.exe")
     )
     try:
         client = ReconnectionHostRegistry(registry_root, binary).discover_by_host_id(host_id)
@@ -1436,46 +1438,57 @@ def _codex_hook_block(python_exe: str, script_path: str) -> str:
 
 
 def _codex_bus_hook_block(python_exe: str, script_path: str) -> str:
-    import subprocess
-    hook_script = str(Path(script_path).with_name("universe_session_bus_hook.py"))
-    command = subprocess.list2cmdline([python_exe, hook_script, "--provider", "CODEX"])
+    command = subprocess.list2cmdline([python_exe, str(Path(script_path).with_name("universe_host_turn_hook.py")), "--provider", "CODEX"])
     return "".join(
         f"\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\n"
-        f'type = "command"\ncommand = {json.dumps(command)}\ntimeout = 8\n'
-        for event in ("Stop",)
+        f'type = "command"\ncommand = {json.dumps(command)}\ntimeout = 3\n'
+        for event in ("UserPromptSubmit", "Stop", "PermissionRequest", "Interrupt", "SessionEnd")
     )
 
 
 def _bus_stop_hook_payload(python_exe: str, script_path: str, provider: str) -> dict[str, Any]:
-    import subprocess
-    command = subprocess.list2cmdline([
-        Path(python_exe).as_posix(),
-        Path(script_path).with_name("universe_session_bus_hook.py").as_posix(),
-        "--provider", provider,
-    ])
-    block: dict[str, Any] = {"hooks": [{"type": "command", "command": command, "timeout": 8}]}
+    command = subprocess.list2cmdline([Path(python_exe).as_posix(),
+        Path(script_path).with_name("universe_host_turn_hook.py").as_posix(), "--provider", provider])
+    events = ("UserPromptSubmit", "Stop", "Notification", "SessionEnd")
+    hooks = {event:[{"hooks":[{"type":"command", "command":command, "timeout":3}]}] for event in events}
     if provider == "GROK":
-        block["matcher"] = "end_turn"
-    return {"hooks": {"Stop": [block]}}
+        for event in ("StopFailure", "StopCancelled"):
+            hooks[event] = [{"hooks":[{"type":"command", "command":command, "timeout":3}]}]
+    hooks["Notification"][0]["matcher"] = "idle_prompt|permission_prompt|elicitation_dialog|elicitation_url_dialog"
+    if provider == "CLAUDE":
+        hooks["PermissionRequest"] = [{"hooks":[{"type":"command", "command":command, "timeout":3}]}]
+    return {"hooks": hooks}
 
 
 def merge_bus_stop_hook(existing: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
-    """Replace only our Stop handler; preserve unrelated hooks/settings."""
+    """Migrate only Universe lifecycle handlers, preserving all other handlers."""
     from copy import deepcopy
-    merged = deepcopy(existing)
-    hooks = merged.setdefault("hooks", {})
-    if not isinstance(hooks, dict) or not isinstance(hooks.get("Stop", []), list):
-        raise ValueError("hooks.Stop must be an array")
-    blocks = []
-    for block in hooks.get("Stop", []):
-        if not isinstance(block, dict) or not isinstance(block.get("hooks"), list):
-            raise ValueError("Stop entries must contain a hooks array")
-        handlers = block["hooks"]
-        kept = [h for h in handlers if "universe_session_bus_hook.py" not in str(h.get("command") or "")]
-        if len(kept) == len(handlers) or kept:
-            blocks.append({**block, "hooks": kept})
-    hooks["Stop"] = blocks + deepcopy(desired["hooks"]["Stop"])
+    merged=deepcopy(existing)
+    hooks=merged.setdefault("hooks",{})
+    if not isinstance(hooks,dict): raise ValueError("hooks must be an object")
+    for event in set(hooks) | set(desired["hooks"]):
+        blocks=[]
+        for block in hooks.get(event,[]):
+            if not isinstance(block,dict) or not isinstance(block.get("hooks"),list):
+                raise ValueError("hook entries must contain a hooks array")
+            kept=[h for h in block["hooks"] if not any(marker in str(h.get("command") or "")
+                for marker in ("universe_session_bus_hook.py", "universe_host_turn_hook.py"))]
+            if kept: blocks.append({**block,"hooks":kept})
+        hooks[event]=blocks+deepcopy(desired["hooks"].get(event,[]))
     return merged
+
+
+def merge_codex_turn_hooks(existing: str, python_exe: str, script_path: str) -> str:
+    # Remove exact Universe-owned hook table groups only. Other TOML tables stay byte-identical.
+    pattern=r"(?ms)^\[\[hooks\.[^.\]\n]+\]\].*?(?=^\[(?!\[hooks\.[^.\]\n]+\.hooks\]\])|\Z)"
+    def keep(match):
+        group=match.group(0)
+        if not any(marker in group for marker in ("universe_session_bus_hook.py","universe_host_turn_hook.py")): return group
+        parts=re.split(r"(?m)(?=^\[\[hooks\.[^.\]\n]+\.hooks\]\])",group)
+        kept=[part for part in parts[1:] if not any(marker in part for marker in
+              ("universe_session_bus_hook.py","universe_host_turn_hook.py"))]
+        return parts[0]+"".join(kept) if kept else ""
+    return re.sub(pattern,keep,existing).rstrip()+"\n"+_codex_bus_hook_block(python_exe,script_path)
 
 
 def _write_bus_stop_hook(path: Path, python_exe: str, script_path: str, provider: str) -> dict[str, Any]:
@@ -1787,12 +1800,11 @@ def setup_provider_hooks(
                 with config_path.open("a", encoding="utf-8") as f:
                     f.write(_codex_hook_block(py, sp))
                 results["CODEX"] = {"status": "WRITTEN", "path": str(config_path)}
-            if "universe_session_bus_hook.py" not in existing:
-                with config_path.open("a", encoding="utf-8") as f:
-                    f.write(_codex_bus_hook_block(py, sp))
-                results["CODEX"]["bus_hooks"] = "WRITTEN"
-            else:
-                results["CODEX"]["bus_hooks"] = "ALREADY_PRESENT"
+            current = config_path.read_text(encoding="utf-8")
+            merged = merge_codex_turn_hooks(current, py, sp)
+            if merged != current:
+                config_path.write_text(merged, encoding="utf-8")
+            results["CODEX"]["bus_hooks"] = "HOST_LIFECYCLE"
         except OSError as e:
             results["CODEX"] = {"status": "ERROR", "detail": str(e)}
 
