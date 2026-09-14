@@ -1419,6 +1419,10 @@ function terminalInjectionProjection(session, messages) {
   const same = message.message_id === receipt.message_id;
   const phase = same ? receipt.phase : "";
   const lifecycle = message.lifecycle || {};
+  const deliveryChannel = String(lifecycle.delivery_channel || "").toUpperCase();
+  const awaitingAuthoritativeReply =
+    deliveryChannel === "CLAUDE_CODE_CHANNEL" &&
+    lifecycle.awaits_authoritative_reply === true;
   const dispatchError = lifecycle.dispatch_attempt?.error_code;
   const failed = dispatchError || lifecycle.failed_at || message.lifecycle_state === "FAILED" ||
     ["WRITE_UNCERTAIN", "INPUT_UNCONFIRMED", "SUBMIT_UNCONFIRMED", "NATIVE_UNCONFIRMED"].includes(phase);
@@ -1427,19 +1431,30 @@ function terminalInjectionProjection(session, messages) {
   let status = "대기";
   if (failed) status = "실패 · 확인 필요";
   else if (finished) status = "처리됨";
+  else if (awaitingAuthoritativeReply) status = "Claude 채널 전달됨 · 응답 대기";
   else if (phase === "NATIVE_QUEUED") status = "CLI 큐 접수 · 실행 대기";
   else if (phase === "NATIVE_SUBMITTING") status = "CLI 큐 전달 중";
   else if (acknowledged) status = phase === "STARTED" || lifecycle.execution_phase === "RUNNING" ? "작업 중" : "접수됨";
   else if (phase === "AWAITING_START" || lifecycle.execution_phase === "DISPATCHED") status = "제출 확인 중";
   let detail = failed ? ((same && receipt.detail) || lifecycle.dispatch_attempt?.detail || "처리 실패가 기록되었습니다. 자동으로 재전송하지 않습니다.")
-    : acknowledged || finished ? "접수된 본문은 비웠습니다." : "Host가 전달합니다. 이 박스는 직접 편집할 수 없습니다.";
+    : finished ? "접수된 본문은 비웠습니다."
+    : awaitingAuthoritativeReply ? "Claude 채널의 최종 결과가 이 메시지에 기록될 때까지 기다립니다. 자동 재전송하지 않습니다."
+    : acknowledged ? "접수된 본문은 비웠습니다." : "Host가 전달합니다. 이 박스는 직접 편집할 수 없습니다.";
   // A write receipt is not a submit acknowledgement, even on older Hosts.
   if (!failed && phase === "AWAITING_START" && receipt.submit_write_attempted_at_ms &&
       Date.now() - Number(receipt.submit_write_attempted_at_ms) >= 30000) {
     status = "제출 확인 지연";
     detail = "Enter 전송 기록은 있지만 실제 접수 확인이 없습니다. 재전송하지 않습니다.";
   }
-  return { status, detail, messageId: message.message_id,
+  const statusCode = failed ? "FAILED"
+    : finished ? "COMPLETED"
+    : awaitingAuthoritativeReply ? "AWAITING_AUTHORITATIVE_REPLY"
+    : acknowledged ? "WORKING"
+    : phase === "NATIVE_QUEUED" ? "NATIVE_QUEUED"
+    : phase === "NATIVE_SUBMITTING" ? "NATIVE_SUBMITTING"
+    : phase === "AWAITING_START" || lifecycle.execution_phase === "DISPATCHED" ? "DISPATCHED"
+    : "PENDING";
+  return { status, statusCode, detail, messageId: message.message_id,
     body: !failed && (acknowledged || finished) ? "" : String(message.body_text || "") };
 }
 
@@ -1449,6 +1464,7 @@ function paintTerminalInjectionBox(surface, projection) {
   surface.injectionDetail.textContent = projection.detail;
   surface.injectionBox.dataset.messageId = projection.messageId || "";
   surface.injectionBox.dataset.status = projection.status;
+  surface.injectionBox.dataset.statusCode = projection.statusCode || "";
 }
 
 async function refreshTerminalInjectionBox(surface, session) {

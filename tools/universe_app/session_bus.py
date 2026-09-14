@@ -691,6 +691,7 @@ class SessionBus:
         result = master.get("completion_result") or {}
         mid = str(result.get("message_id") or "")
         anchor = str(result.get("recipient_anchor_ref") or "")
+        terminal_id = str(result.get("recipient_terminal_id") or "")
         body = str(result.get("body_text") or "")
         if master.get("delivery_state") != "DONE" or not mid or not anchor or not body:
             raise SessionBusError("BUS_MASTER_RESULT_INVALID", "committed completion result required", 409)
@@ -700,26 +701,131 @@ class SessionBus:
             existing = self._messages.get(mid)
             if existing:
                 if (existing.get("body_text") != body or existing.get("recipient_anchor_ref") != anchor
+                        or str(existing.get("recipient_terminal_id") or (existing.get("to") or {}).get("terminal_id") or existing.get("_terminal_id") or "") != terminal_id
                         or existing.get("thread_id") != master["message_id"]):
                     raise SessionBusError("BUS_MASTER_RESULT_CONFLICT", "completion identity has different content", 409)
                 return self._public_message(existing, headers_only=False)
             now = str(master.get("completed_at") or utc_now())
-            message = {"message_id": mid, "_terminal_id": "", "thread_id": master["message_id"],
+            message = {"message_id": mid, "_terminal_id": terminal_id, "thread_id": master["message_id"],
                 "room_id": "", "kind": "RESULT", "from": {
                     "project_id": master["project_id"], "mode": "MASTER", "provider": master.get("provider") or "",
                     "session_anchor_ref": master.get("owner_session_anchor_ref") or "", "terminal_id": ""},
-                "to": {"session_anchor_ref": anchor, "terminal_id": ""},
+                "to": {"session_anchor_ref": anchor, "terminal_id": terminal_id},
                 "body_text": body, "bytes": len(body.encode("utf-8")), "created_at": now,
                 "delivery_state": "UNREAD", "session_anchor_ref": anchor, "recipient_anchor_ref": anchor,
+                "recipient_terminal_id": terminal_id,
                 "source_anchor_ref": master.get("owner_session_anchor_ref") or "",
                 "in_reply_to": master["message_id"], "lifecycle_state": "COMPLETED",
                 "lifecycle": {"completed_at": now, "result_ref": master.get("result_ref") or ""},
                 "updated_at": now, "provenance": {"kind": "SESSION_BUS_RESULT", "source_master_message_id": master["message_id"]}}
             # Commit before exposing in memory; a failed write must remain retryable.
-            self._persist_message("", message)
+            self._persist_message(terminal_id, message)
             self._messages[mid] = message
             self._inbox.setdefault("anchor:" + anchor, []).append(mid)
             return self._public_message(message, headers_only=False)
+
+    def reconcile_master_completion_handoff(
+        self, master: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Close the exact channel handoff proven by a Master completion.
+
+        A coordination message can be the transport-level handoff that caused
+        a provider to claim a durable Master queue item. The provider may
+        complete that queue item through the Master endpoint without sending a
+        second Session Bus reply. In that case the channel result is empty by
+        design, but leaving the handoff in ``STARTED`` incorrectly blocks the
+        next turn with ``SESSION_BUSY``. Correlate only the exact durable
+        thread, owner Anchor, provider channel and actionable message; never
+        close an unrelated or merely similar instruction.
+        """
+        master_id = str(master.get("message_id") or "").strip()
+        owner_anchor = str(master.get("owner_session_anchor_ref") or "").strip()
+        provider = str(master.get("provider") or "").strip().upper()
+        project_id = str(master.get("project_id") or "").strip()
+        if not (master_id and owner_anchor and provider and project_id):
+            return {"status": "NOT_APPLICABLE", "message_ids": [], "errors": []}
+        if str(master.get("delivery_state") or "").upper() != "DONE":
+            return {"status": "MASTER_NOT_COMPLETE", "message_ids": [], "errors": []}
+        completion = master.get("completion_result")
+        if not isinstance(completion, Mapping) or not str(
+            completion.get("message_id") or ""
+        ).strip() or not str(completion.get("body_text") or "").strip():
+            return {"status": "MASTER_RESULT_MISSING", "message_ids": [], "errors": []}
+
+        result_ref = (
+            f"universe://projects/{project_id}/master-messages/{master_id}#completed"
+        )
+        candidates: list[tuple[str, str]] = []
+        with self._lock:
+            for message in self._messages.values():
+                if (
+                    str(message.get("thread_id") or "") != master_id
+                    or str(message.get("recipient_anchor_ref") or "") != owner_anchor
+                    or str(message.get("kind") or "").upper() not in ACTIONABLE_KINDS
+                    or _message_lifecycle(message) != "STARTED"
+                ):
+                    continue
+                lifecycle = message.get("lifecycle") or {}
+                if (
+                    str(lifecycle.get("delivery_channel") or "").upper()
+                    != "CLAUDE_CODE_CHANNEL"
+                    or not lifecycle.get("awaits_authoritative_reply")
+                ):
+                    continue
+                source = message.get("from") if isinstance(message.get("from"), Mapping) else {}
+                if str(source.get("provider") or "").upper() != "CODEX":
+                    continue
+                target = message.get("to") if isinstance(message.get("to"), Mapping) else {}
+                if str(target.get("provider") or "").upper() != provider:
+                    continue
+                candidates.append(
+                    (
+                        str(message.get("message_id") or ""),
+                        str(message.get("_terminal_id") or ""),
+                    )
+                )
+
+        closed: list[str] = []
+        errors: list[dict[str, Any]] = []
+        for message_id, terminal_id in candidates:
+            if not message_id:
+                continue
+            try:
+                self.transition(
+                    message_id,
+                    state="COMPLETED",
+                    terminal_id=terminal_id,
+                    session_anchor_ref=owner_anchor,
+                    result_ref=result_ref,
+                )
+                closed.append(message_id)
+            except SessionBusError as error:
+                # A concurrent authoritative channel reply may have already
+                # closed this exact handoff. Preserve that idempotent result;
+                # report other conflicts for diagnosis instead of rewriting it.
+                with self._lock:
+                    current = self._messages.get(message_id)
+                    current_state = (
+                        _message_lifecycle(current) if current is not None else ""
+                    )
+                if current_state in {"COMPLETED", "FAILED", "REPLIED", "DONE"}:
+                    continue
+                errors.append(
+                    {
+                        "message_id": message_id,
+                        "error_code": error.code,
+                        "detail": error.detail,
+                    }
+                )
+        status = "HANDOFF_COMPLETED" if closed else "NO_CORRELATED_HANDOFF"
+        if errors:
+            status = "PARTIAL"
+        return {
+            "status": status,
+            "master_message_id": master_id,
+            "message_ids": closed,
+            "errors": errors,
+        }
 
     def post(self, host: Any, value: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
@@ -1383,7 +1489,18 @@ class SessionBus:
                 execution_phase = str(
                     (message.get("lifecycle") or {}).get("execution_phase") or ""
                 ).upper()
-                if lifecycle == "STARTED" and execution_phase == "DISPATCHED":
+                awaits_reply = bool(
+                    (message.get("lifecycle") or {}).get(
+                        "awaits_authoritative_reply"
+                    )
+                )
+                if lifecycle == "STARTED" and awaits_reply:
+                    # The adapter accepted the message, but the transport's
+                    # own final reply is still authoritative. Expose that
+                    # distinction to the UI so a waiting Claude channel is
+                    # not mistaken for a missing or replayable delivery.
+                    work_state = "AWAITING_AUTHORITATIVE_REPLY"
+                elif lifecycle == "STARTED" and execution_phase == "DISPATCHED":
                     # Adapter delivered the instruction but the provider has not
                     # acknowledged starting it (e.g. still queued inside the CLI).
                     work_state = "DISPATCHED"

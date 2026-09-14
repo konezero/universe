@@ -10,6 +10,10 @@ assert.equal(project(session,[{...message,recipient_anchor_ref:"anchor-b"}]).bod
 session.host_turn_state.latest_delivery.phase="PROMPT_SUBMITTED";
 assert.equal(project(session,[message]).body,"");
 assert.equal(project(session,[message]).status,"접수됨");
+const claudeMessage={...message,message_id:"m2",lifecycle:{delivery_channel:"CLAUDE_CODE_CHANNEL",awaits_authoritative_reply:true,execution_phase:"DISPATCHED"}};
+const claudeProjection=project(session,[claudeMessage]);
+assert.equal(claudeProjection.statusCode,"AWAITING_AUTHORITATIVE_REPLY");
+assert.equal(claudeProjection.body,message.body_text);
 session.host_turn_state.latest_delivery.phase="SUBMIT_UNCONFIRMED";
 assert.equal(project(session,[message]).body,message.body_text,"uncertainty retains original body");
 assert.equal(project(session,[message]).status,"실패 · 확인 필요");

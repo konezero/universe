@@ -52,6 +52,64 @@ class MasterCompletionDeliveryTests(unittest.TestCase):
         again = SessionBus(database_path=self.bus_path)
         again.publish_master_completion(done)
         self.assertEqual(1, len(again._messages))
+
+    def test_master_completion_closes_only_matching_claude_handoff(self):
+        self.complete()
+        terminal = {
+            "terminal_id": "claude-terminal",
+            "session_anchor_ref": "anchor-m",
+            "project_id": "probe",
+            "mode": "MASTER",
+            "provider": "CLAUDE",
+            "state": "LIVE",
+        }
+        handoff = self.bus.deliver_to_terminal(
+            Mock(),
+            terminal=terminal,
+            source={"project_id": "probe", "mode": "CONDUCTOR", "provider": "CODEX"},
+            to={"project_id": "probe", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="COORDINATION",
+            notify="NONE",
+            body="handoff through the Master queue",
+            thread_id=self.mid,
+        )
+        self.bus.transition(
+            handoff["message_id"], state="ACCEPTED",
+            terminal_id=terminal["terminal_id"], session_anchor_ref="anchor-m",
+        )
+        self.bus.complete_instruction_claim(
+            terminal_id=terminal["terminal_id"], message_id=handoff["message_id"],
+            session_anchor_ref="anchor-m", delivery_channel="CLAUDE_CODE_CHANNEL",
+        )
+        unrelated = self.bus.deliver_to_terminal(
+            Mock(),
+            terminal=terminal,
+            source={"project_id": "probe", "mode": "CONDUCTOR", "provider": "CODEX"},
+            to={"project_id": "probe", "mode": "MASTER", "provider": "CLAUDE"},
+            kind="COORDINATION",
+            notify="NONE",
+            body="unrelated handoff must remain pending",
+            thread_id="different-master-message",
+        )
+        self.bus.transition(
+            unrelated["message_id"], state="ACCEPTED",
+            terminal_id=terminal["terminal_id"], session_anchor_ref="anchor-m",
+        )
+        self.bus.complete_instruction_claim(
+            terminal_id=terminal["terminal_id"], message_id=unrelated["message_id"],
+            session_anchor_ref="anchor-m", delivery_channel="CLAUDE_CODE_CHANNEL",
+        )
+        server = Mock(store=self.store, session_bus=self.bus)
+        published = UniverseHTTPServer._publish_master_completion_results(server)
+        self.assertIn(handoff["message_id"], published["handoff_message_ids"])
+        current = self.bus._messages[handoff["message_id"]]
+        self.assertEqual("COMPLETED", current["lifecycle_state"])
+        self.assertEqual(
+            f"universe://projects/probe/master-messages/{self.mid}#completed",
+            current["lifecycle"]["result_ref"],
+        )
+        self.assertEqual("STARTED", self.bus._messages[unrelated["message_id"]]["lifecycle_state"])
+        self.assertEqual([], UniverseHTTPServer._publish_master_completion_results(server)["handoff_message_ids"])
     def test_offline_anchor_rebind_forward_and_consume_without_reply_loop(self):
         result = self.bus.publish_master_completion(self.complete())
         terminal = {"terminal_id": "new-terminal", "session_anchor_ref": "anchor-c", "state": "LIVE",

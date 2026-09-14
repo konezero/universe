@@ -324,6 +324,74 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual("WORKING", inbox["messages"][0]["work_state"])
 
+    def test_claude_channel_waiting_state_and_master_completion_handoff(self) -> None:
+        terminal = self.host.create(
+            project_id="universe",
+            mode="MASTER",
+            cwd=str(ROOT),
+            session_anchor_ref=_test_anchor("claude-channel"),
+            provider="CLAUDE",
+        )
+        anchor = terminal["session_anchor_ref"]
+        master = {
+            "message_id": "master_msg_channel_handoff",
+            "project_id": "universe",
+            "provider": "CLAUDE",
+            "owner_session_anchor_ref": anchor,
+            "delivery_state": "DONE",
+            "completion_result": {
+                "message_id": "msg_master_channel_result",
+                "body_text": "Master completion evidence",
+            },
+        }
+        message = self.host.bus.deliver_to_terminal(
+            self.host,
+            terminal=terminal,
+            source={
+                "project_id": "universe",
+                "mode": "CONDUCTOR",
+                "provider": "CODEX",
+                "session_anchor_ref": _test_anchor("conductor"),
+            },
+            to={
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+            },
+            kind="COORDINATION",
+            notify="NONE",
+            body="Complete the handoff through the Master queue.",
+            thread_id=master["message_id"],
+        )
+        self.host.bus.transition(
+            message["message_id"], state="ACCEPTED", terminal_id=terminal["terminal_id"],
+            session_anchor_ref=anchor,
+        )
+        self.host.bus.complete_instruction_claim(
+            terminal_id=terminal["terminal_id"],
+            message_id=message["message_id"],
+            session_anchor_ref=anchor,
+            delivery_channel="CLAUDE_CODE_CHANNEL",
+        )
+        activity = self.host.bus.inbox(
+            self.host, session_anchor_ref=anchor, projection="ACTIVITY"
+        )["messages"]
+        self.assertEqual("AWAITING_AUTHORITATIVE_REPLY", activity[0]["work_state"])
+
+        reconciled = self.host.bus.reconcile_master_completion_handoff(master)
+        self.assertEqual("HANDOFF_COMPLETED", reconciled["status"])
+        self.assertEqual([message["message_id"]], reconciled["message_ids"])
+        self.assertEqual(
+            "COMPLETED",
+            self.host.bus.inbox(
+                self.host, session_anchor_ref=anchor, projection="ACTIVITY"
+            )["messages"][0]["lifecycle_state"],
+        )
+        self.assertEqual(
+            "NO_CORRELATED_HANDOFF",
+            self.host.bus.reconcile_master_completion_handoff(master)["status"],
+        )
+
     def test_queued_instruction_can_transfer_to_live_rust_host(self) -> None:
         source_anchor = _test_anchor("t1")
         posted = self.host.bus.post(
