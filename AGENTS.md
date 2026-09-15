@@ -123,24 +123,6 @@ Current Authority and Execution Assignment: resolve from the active Runtime.
 
 Playwright and browser-test screenshots must use `.artifacts/ui/` as their explicit output directory. Do not write test captures into the repository root.
 
-## Authoritative State and Fallback Prohibition
-
-For reliability-critical identity, ownership, binding, lifecycle, Resume, dispatch,
-queue, and durable-state paths, use only the contract's declared authoritative
-source. Do not fill missing or conflicting values from secondary caches, project
-scans, stale projections, heuristics, defaults, legacy stores, or another screen's
-state. Once an authoritative path exists, compatibility fallback on that path is
-prohibited. Missing or conflicting authoritative evidence must fail closed with a
-typed error, typed incompatible state, or UNKNOWN as defined by the contract.
-
-When an existing fallback is discovered, report it to the user immediately. Name
-the exact code path and trigger, the sources being mixed, the possible impact,
-the authoritative source, and the observed evidence. Do not silently preserve,
-introduce, or broaden a fallback for availability. A fallback is permitted only
-when an explicit project contract defines its exact scope, authority order,
-expiry or removal condition, visible degraded-state behavior, and verification;
-otherwise treat it as a defect.
-
 ## Execution Evidence Policy
 
 The user explicitly changed Execution Guard to evidence recording (2026-09-14).
