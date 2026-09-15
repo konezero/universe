@@ -53,6 +53,33 @@ test("terminal attention projection preserves quota, failure, waiting and unknow
   assert.equal(context.terminalAttentionProjection({ provider: "GROK", host_turn_state: "WORKING" }).state, "QUOTA_BLOCKED");
   assert.equal(context.terminalAttentionProjection({ provider: "CODEX", host_turn_state: "FAILED" }).state, "FAILED");
   assert.equal(context.terminalAttentionProjection({ provider: "CODEX", host_turn_state: "WAITING_INPUT" }).state, "WAITING_INPUT");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    host_turn_state: {
+      state: "WORKING",
+      last_event: "PROMPT_SUBMITTED",
+      latest_delivery: { phase: "NATIVE_QUEUED", error_code: null },
+    },
+  }).state, "WORKING");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    host_turn_state: {
+      state: "IDLE",
+      last_event: "TERMINAL_REATTACHED",
+      latest_delivery: null,
+    },
+  }).state, "RECOVERED");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    host_turn_state: {
+      state: "IDLE",
+      last_event: "IDLE",
+      latest_delivery: { phase: "NATIVE_UNCONFIRMED", error_code: "HOST_TURN_BINDING_MISMATCH" },
+    },
+  }).state, "FAILED");
   assert.equal(context.terminalAttentionProjection({ provider: "CODEX" }).state, "UNKNOWN");
 });
 

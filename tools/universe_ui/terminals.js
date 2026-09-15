@@ -579,24 +579,47 @@ function terminalAttentionProjection(session) {
   if (["EXHAUSTED", "BLOCKED", "QUOTA_EXHAUSTED"].includes(quota)) {
     return { state: "QUOTA_BLOCKED", detail: quota };
   }
-  const turn = String(session?.host_turn_state || session?.turn_state || "").toUpperCase();
-  const delivery = String(session?.prompt_delivery || session?.latest_delivery || "").toUpperCase();
+  // The live terminal API exposes host_turn_state as an object.  Older
+  // projections and focused tests may still provide the state as a string,
+  // so normalize both shapes without inventing a fallback source.
+  const hostTurn = session?.host_turn_state;
+  const turn = String(
+    (hostTurn && typeof hostTurn === "object" ? hostTurn.state : hostTurn) ||
+    session?.turn_state ||
+    ""
+  ).toUpperCase();
+  const turnEvent = String(
+    hostTurn && typeof hostTurn === "object" ? hostTurn.last_event || "" : ""
+  ).toUpperCase();
+  const latestDelivery = hostTurn && typeof hostTurn === "object"
+    ? hostTurn.latest_delivery || {}
+    : {};
+  const delivery = String(
+    session?.prompt_delivery || latestDelivery.phase || session?.latest_delivery || ""
+  ).toUpperCase();
+  const deliveryError = String(latestDelivery.error_code || "").trim();
   const lifecycle = String(session?.state || "").toUpperCase();
-  if (["FAILED", "ERROR"].includes(turn) || ["FAILED", "ERROR"].includes(lifecycle)) {
-    return { state: "FAILED", detail: turn || lifecycle };
+  if (deliveryError || ["FAILED", "ERROR"].includes(turn) || ["FAILED", "ERROR"].includes(lifecycle)) {
+    return { state: "FAILED", detail: deliveryError || turn || lifecycle };
   }
   if (["DISCONNECTED", "OFFLINE", "STOPPED"].includes(lifecycle) || session?.provider_cli_alive === false) {
     return { state: "DISCONNECTED", detail: lifecycle || "CLI_UNAVAILABLE" };
   }
-  if (["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turn)) {
-    return { state: "WAITING_INPUT", detail: turn };
+  if (["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turn) ||
+      ["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turnEvent)) {
+    return { state: "WAITING_INPUT", detail: turn || turnEvent };
   }
   if (["WORKING", "STARTED", "PROMPT_SUBMITTED", "NATIVE_QUEUED", "DELIVERED"].includes(turn) ||
-      ["SUBMITTED", "DELIVERED"].includes(delivery)) {
-    return { state: "WORKING", detail: turn || delivery };
+      ["PROMPT_SUBMITTED", "STARTED"].includes(turnEvent) ||
+      ["NATIVE_QUEUED", "NATIVE_SUBMITTING", "PROMPT_SUBMITTED", "STARTED", "SUBMITTED", "DELIVERED"].includes(delivery)) {
+    return { state: "WORKING", detail: turn || turnEvent || delivery };
   }
   if (["COMPLETED", "DONE"].includes(turn) || ["COMPLETED", "DONE"].includes(lifecycle)) {
     return { state: "COMPLETED", detail: turn || lifecycle };
+  }
+  if (["RECOVERED", "RESUMED", "REATTACHED", "TERMINAL_REATTACHED"].includes(turnEvent) ||
+      session?.host_reused_existing === true || session?.location_rebound === true) {
+    return { state: "RECOVERED", detail: turnEvent || "HOST_REUSED_EXISTING" };
   }
   return { state: "UNKNOWN", detail: "HOST_TURN_STATE_UNAVAILABLE" };
 }
