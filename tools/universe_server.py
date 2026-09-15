@@ -194,6 +194,7 @@ from universe_action_registry import (
     FEATURE_GOAL_START_ACTION_ID,
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
+    TODO_BIND_GOAL_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -14334,6 +14335,57 @@ class UniverseStore:
                 "UPDATE project_todo SET blocked_reason = ?, revision = revision + 1, updated_at = ? "
                 "WHERE todo_id = ? AND revision = ?",
                 (reason, now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_goal_binding(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow, dedicated write for a Todo's own goal_id (bind or unbind).
+
+        Same shape as set_todo_blocked_reason: separate from update_todo's
+        full-body replace so an unrelated title/detail/priority edit can
+        never silently move a Todo to a different Goal, and so this one
+        operation can be a single typed Action
+        (todo.bind_goal -- registered but previously handler-less, per
+        docs/action-ir-work-surface.md's slice-3 decision; this closes that
+        specific gap) instead of requiring a full PATCH body. A non-null
+        goal_id must reference a real Goal in THIS todo's own project --
+        cross-project binding is rejected, not silently allowed.
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision", "goal_id"}:
+            raise UniverseError(
+                "TODO_GOAL_BINDING_REQUEST_INVALID",
+                "expected_revision and goal_id are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        goal_id = value.get("goal_id")
+        normalized_goal_id: str | None = None
+        if goal_id is not None:
+            normalized_goal_id = _identifier(goal_id, "goal_id")
+            goal = self.get_goal(normalized_goal_id)
+            todo = self.get_todo(normalized_id)
+            if todo["project_id"] is not None and goal["project_id"] != todo["project_id"]:
+                raise UniverseError(
+                    "TODO_GOAL_BINDING_PROJECT_MISMATCH",
+                    "goal_id belongs to a different project than this todo",
+                    HTTPStatus.CONFLICT,
+                )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET goal_id = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ?",
+                (normalized_goal_id, now, normalized_id, expected_revision),
             )
         if cursor.rowcount != 1:
             current = self.get_todo(normalized_id)
@@ -29915,6 +29967,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
+                TODO_BIND_GOAL_ACTION_ID: self._handle_todo_bind_goal_action,
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
@@ -32696,6 +32749,44 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).result_schema_ref,
             "status": "TODO_UPDATED",
             "action_id": TODO_UPDATE_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_bind_goal_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.bind_goal: the previously registered-but-handlerless Action.
+
+        docs/action-ir-work-surface.md's slice-3 decision left 8 fine-grained
+        todo.* Actions declared (discoverable in the registry) but unbound,
+        pending a real caller need. This is one of the 8
+        (PENDING_WORK_SURFACE_ACTION_IDS) -- Persona automation's P3 judge/
+        meeting loop produces Work-Plan candidate Todos that, once a human
+        or LLM reviewer adopts one, need to be linked to the Goal that
+        justified them; until now that link required a full todo.update
+        PATCH body (title/detail/priority/etc. all resent) just to change
+        one field, or the raw legacy route. This is a narrow, single-purpose
+        typed Action for exactly that link, sharing set_todo_goal_binding's
+        CAS with the Fleet/Todo-list UI's own write path so both stay
+        structurally consistent (2026-09-15).
+        """
+        action = _exact_object_fields(
+            request,
+            field="todo_bind_goal_action",
+            required=frozenset({"todo_id", "expected_revision"}),
+            optional=frozenset({"goal_id"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_goal_binding(todo_id, {
+            "expected_revision": action["expected_revision"],
+            "goal_id": action.get("goal_id"),
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_BIND_GOAL_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_GOAL_BOUND" if action.get("goal_id") is not None else "TODO_GOAL_UNBOUND",
+            "action_id": TODO_BIND_GOAL_ACTION_ID,
             "todo": todo,
         }
 

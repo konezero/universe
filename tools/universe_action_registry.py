@@ -82,11 +82,11 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     TODO_READ_ACTION_ID,
     TODO_LIST_ACTION_ID,
     TODO_STATE_ACTION_ID,
+    TODO_BIND_GOAL_ACTION_ID,
 )
 PENDING_WORK_SURFACE_ACTION_IDS = (
     TODO_PRIORITY_ACTION_ID,
     TODO_BIND_NODE_ACTION_ID,
-    TODO_BIND_GOAL_ACTION_ID,
     TODO_MOVE_PROJECT_ACTION_ID,
     TODO_REORDER_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
@@ -1025,9 +1025,15 @@ def build_default_action_registry(
                           "fields": ["title", "domain", "description", "goal", "target_users", "scenarios", "structure", "capabilities", "validation", "constraints", "project_root"]},
             ), supplied_handlers[action_id], surfaces=(action_id,))
     # Only handler-backed work-surface Actions are registered as discoverable
-    # contracts. The pending todo.* Actions are intentionally left unregistered
-    # (coverage reports them UNCOVERED, never available) until they have both a
-    # handler and a receipt-aware path - see docs/action-ir-work-surface.md.
+    # contracts. The remaining pending todo.* Actions are intentionally left
+    # unregistered (coverage reports them UNCOVERED, never available) until
+    # they have both a handler and a receipt-aware path where one is needed
+    # - see docs/action-ir-work-surface.md. todo.bind_goal moved out of that
+    # pending set on 2026-09-15: like todo.update, it is a metadata edit
+    # (goal_id only, CAS-guarded), not a lifecycle transition, so it needs
+    # no receipt path of its own - it reuses UniverseStore.set_todo_goal_
+    # binding, the same narrow-write shape as the existing blocked_reason
+    # field.
     implemented_specs = (
         (
             FEATURE_CREATE_ACTION_ID,
@@ -1043,6 +1049,11 @@ def build_default_action_registry(
             TODO_UPDATE_ACTION_ID,
             "universe.todo-update-action-request.v1",
             "universe.todo-update-receipt.v1",
+        ),
+        (
+            TODO_BIND_GOAL_ACTION_ID,
+            "universe.todo-bind-goal-action-request.v1",
+            "universe.todo-bind-goal-receipt.v1",
         ),
     )
     for action_id, request_schema, result_schema in implemented_specs:
