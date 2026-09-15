@@ -10993,6 +10993,59 @@ class UniverseStore:
                 )
         return event, True
 
+    def _record_master_message_lifecycle_event(
+        self,
+        message: Mapping[str, Any],
+        *,
+        outcome: str,
+        detail: str = "",
+        result_ref: str = "",
+        error_code: str = "",
+    ) -> None:
+        """Durable Activity record for one Master-dispatched work item's
+        terminal transition (2026-09-15 Fleet/Activity collaboration:
+        smallest useful producer for "execution lifecycle" and "Action/
+        result failure" together -- a master-message complete/fail already
+        carries an id, an owner, and either a result or a code+reason, and
+        happens exactly once per real transition, not on lease-renewal
+        polling. Uses the same generic payload vocabulary (outcome/state,
+        error_code, detail/reason, evidence via result_ref, correlation via
+        message_id) the existing Activity UI already reads.
+        """
+
+        project_id = str(message.get("project_id") or "").strip()
+        message_id = str(message.get("message_id") or "").strip()
+        if not project_id or not message_id:
+            return
+        payload: dict[str, Any] = {
+            "schema": "universe.master-message-lifecycle-event.v1",
+            "message_id": message_id,
+            "outcome": outcome,
+            "provider": message.get("provider"),
+        }
+        title = message.get("title")
+        if title:
+            payload["title"] = title
+        if detail:
+            payload["detail"] = str(detail)[:2000]
+        if result_ref:
+            payload["evidence_ref"] = result_ref
+        if error_code:
+            payload["error_code"] = error_code
+        owner_anchor = message.get("owner_session_anchor_ref")
+        if owner_anchor:
+            payload["session_anchor_ref"] = owner_anchor
+        event_id = "master_msg_lifecycle_" + _json_sha256(
+            {"project_id": project_id, "message_id": message_id, "outcome": outcome}
+        )[:24]
+        try:
+            self.append_event(
+                project_id,
+                {"event_id": event_id, "event_type": "MASTER_MESSAGE_LIFECYCLE", "payload": payload},
+            )
+        except UniverseError:
+            pass
+
     def register_provider_session_source(
         self, value: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -24164,18 +24217,24 @@ class UniverseStore:
         return reclaimed
 
     def fail_master_message(self, message_id: str, *, code: str, reason: str) -> None:
-        self._transition_master_message(
+        failure_code = _required_text(code, "failure.code")[:160]
+        failure_reason = _required_text(reason, "failure.reason")[:1000]
+        failed = self._transition_master_message(
             message_id,
             expected_states={"QUEUED", "PROCESSING"},
             delivery_state="FAILED",
             updates={
-                "failure": {
-                    "code": _required_text(code, "failure.code")[:160],
-                    "reason": _required_text(reason, "failure.reason")[:1000],
-                },
+                "failure": {"code": failure_code, "reason": failure_reason},
                 "completed_at": utc_now(),
             },
         )
+        # Smallest useful "Action/result failure" producer (2026-09-15
+        # Fleet/Activity collaboration): a Master-dispatched work item's
+        # explicit failure is a real, one-time work change, not polling
+        # noise -- the same code/reason vocabulary the Activity UI already
+        # reads generically (payload.error_code / payload.reason).
+        if isinstance(failed, Mapping):
+            self._record_master_message_lifecycle_event(failed, outcome="FAILED", detail=failure_reason, error_code=failure_code)
 
     def complete_master_message(
         self, message_id: str, *, provider: str, result_ref: str = "",
@@ -24246,7 +24305,7 @@ class UniverseStore:
                     ("\nEvidence: " + result_ref if result_ref else ""),
             }
         try:
-            return self._transition_master_message(
+            completed = self._transition_master_message(
                 message_id, expected_states={"PROCESSING"}, delivery_state="DONE", updates=updates)
         except UniverseError as error:
             if error.code != "MASTER_MESSAGE_STATE_CONFLICT":
@@ -24255,6 +24314,12 @@ class UniverseStore:
             if current.get("delivery_state") == "DONE" and current.get("completion_request") == request:
                 return current
             raise
+        else:
+            if isinstance(completed, Mapping):
+                self._record_master_message_lifecycle_event(
+                    completed, outcome="DONE", detail=body_text, result_ref=result_ref,
+                )
+            return completed
 
     def master_completion_results(self) -> list[dict[str, Any]]:
         with self._connection() as connection:
@@ -32216,6 +32281,104 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             status="CONFIRMED", detail="",
         )
 
+    def _record_assignment_event(
+        self,
+        *,
+        project_id: str,
+        session_anchor_ref: str,
+        persona_id: str | None,
+        node_ref: str | None,
+        state: str,
+        assignment_revision: Any,
+        from_state: str | None = None,
+    ) -> None:
+        """Durable Activity record for one committed assignment change.
+
+        2026-09-15 Fleet/Activity collaboration (activity-fleet-collab-
+        20260915): the smallest useful producer for "assignment/handoff" --
+        Activity is the authoritative work-change view and had no signal at
+        all for persona assign/unassign/handoff. Uses the same payload
+        vocabulary the existing Activity UI already reads generically
+        (state/from_state, node_ref, session_anchor_ref, correlation) rather
+        than inventing per-event-type UI branches. event_id is deterministic
+        on (project, anchor, assignment_revision, state, node_ref) so a
+        retried write of the same committed change is a no-op, never a
+        duplicate row -- best-effort like every other producer here, never
+        allowed to fail the assignment write it follows.
+        """
+
+        payload: dict[str, Any] = {
+            "schema": "universe.persona-assignment-event.v1",
+            "session_anchor_ref": session_anchor_ref,
+            "state": state,
+            "assignment_revision": assignment_revision,
+        }
+        if persona_id:
+            payload["persona_id"] = persona_id
+        if node_ref:
+            payload["node_ref"] = node_ref
+        if from_state:
+            payload["from_state"] = from_state
+        event_id = "persona_assignment_" + _json_sha256(
+            {
+                "project_id": project_id,
+                "session_anchor_ref": session_anchor_ref,
+                "assignment_revision": assignment_revision,
+                "state": state,
+                "node_ref": node_ref,
+            }
+        )[:24]
+        try:
+            self.store.append_event(
+                project_id,
+                {"event_id": event_id, "event_type": "PERSONA_ASSIGNMENT_CHANGED", "payload": payload},
+            )
+        except UniverseError:
+            pass
+
+    def _record_quota_stop_event(
+        self,
+        *,
+        project_id: str,
+        session_anchor_ref: str,
+        provider: str,
+        resets_at: float | int | None,
+        notice: str,
+    ) -> None:
+        """Durable Activity record for a provider-quota dispatch stop
+        (2026-09-15 Fleet/Activity collaboration: smallest useful producer
+        for "quota stop"). event_id is deterministic on (project, anchor,
+        provider, resets_at) -- this branch can be re-entered on every
+        SESSION_START/TURN_IDLE/RECONNECT dispatch attempt while EXHAUSTED
+        stays true for the same reset window, and append_event's own
+        idempotency (identical event_id + identical payload = no-op) is
+        exactly what keeps that from becoming polling noise: only a NEW
+        reset window (a real state change) produces a new row.
+        """
+
+        payload = {
+            "schema": "universe.provider-quota-stop-event.v1",
+            "session_anchor_ref": session_anchor_ref,
+            "provider": provider,
+            "state": "QUOTA_EXHAUSTED",
+            "resets_at": resets_at,
+        }
+        if notice:
+            payload["detail"] = notice[:500]
+        event_id = "quota_stop_" + _json_sha256(
+            {
+                "project_id": project_id, "session_anchor_ref": session_anchor_ref,
+                "provider": provider, "resets_at": resets_at,
+            }
+        )[:24]
+        try:
+            self.store.append_event(
+                project_id,
+                {"event_id": event_id, "event_type": "PROVIDER_QUOTA_STOP", "payload": payload},
+            )
+        except UniverseError:
+            pass
+
     def _validate_persona_assignment_node_ref(
         self, project_id: str, node_ref: str | None
     ) -> str | None:
@@ -32340,14 +32503,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     HTTPStatus.CONFLICT,
                 )
         result = self.store.assign_persona({**value, "node_ref": node_ref}, actor)
+        assignment = result.get("assignment") or {}
+        self._record_assignment_event(
+            project_id=project_id, session_anchor_ref=value["session_anchor_ref"],
+            persona_id=value.get("persona_id"), node_ref=node_ref, state="ACTIVE",
+            assignment_revision=assignment.get("assignment_revision"),
+        )
+        handoff_cleared = result.get("handoff_cleared")
+        if handoff_cleared is not None:
+            self._record_assignment_event(
+                project_id=project_id, session_anchor_ref=handoff_cleared["session_anchor_ref"],
+                persona_id=None, node_ref=None, state="UNASSIGNED",
+                assignment_revision=handoff_cleared["assignment_revision"], from_state="ACTIVE",
+            )
         if node_ref is not None:
-            assignment = result.get("assignment") or {}
             self._sync_node_projection(
                 session_anchor_ref=value["session_anchor_ref"], project_id=project_id,
                 state="ACTIVE", assignment_revision=assignment.get("assignment_revision"),
                 node_ref=node_ref,
             )
-            handoff_cleared = result.get("handoff_cleared")
             if handoff_cleared is not None:
                 self._sync_node_projection(
                     session_anchor_ref=handoff_cleared["session_anchor_ref"], project_id=project_id,
@@ -32379,6 +32553,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         result = self.store.unassign_persona(value, actor)
         assignment = result.get("assignment") or {}
+        self._record_assignment_event(
+            project_id=str(assignment.get("project_id") or ""),
+            session_anchor_ref=value["session_anchor_ref"], persona_id=assignment.get("persona_id"),
+            node_ref=None, state="UNASSIGNED",
+            assignment_revision=assignment.get("assignment_revision"), from_state="ACTIVE",
+        )
         if assignment.get("node_ref") is not None:
             self._sync_node_projection(
                 session_anchor_ref=value["session_anchor_ref"],
@@ -44313,6 +44493,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if quota and quota.get("state") == "EXHAUSTED":
                 reset = next((w.get("resets_at") for w in quota.get("windows", []) if isinstance(w.get("resets_at"), (int, float))), None)
                 if reset is None or time.time() < reset + 5:
+                    self._record_quota_stop_event(
+                        project_id=project_id, session_anchor_ref=session_anchor_ref,
+                        provider=provider, resets_at=reset, notice=str(quota.get("notice") or ""),
+                    )
                     return {"status": "WAITING_QUOTA", "resets_at": reset,
                             "detail": str(quota.get("notice") or ""), "session_anchor_ref": session_anchor_ref}
         try:

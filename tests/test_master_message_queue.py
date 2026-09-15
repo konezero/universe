@@ -220,6 +220,53 @@ class MasterMessageQueueTests(unittest.TestCase):
             )
         self.assertEqual("MASTER_MESSAGE_STATE_CONFLICT", ctx.exception.code)
 
+    # -- Activity project_event producers (2026-09-15 Fleet/Activity
+    # collaboration: "execution lifecycle" + "Action/result failure") -----
+
+    def test_complete_records_a_durable_activity_event(self) -> None:
+        project = self.register_project("ALPHA")
+        self.store.create_master_message(project["project_id"], self.message_request())
+        claimed = self.store.claim_master_message(project["project_id"], provider="CLAUDE")
+        self.store.complete_master_message(
+            claimed["message_id"], provider="CLAUDE", result_ref="artifact://seed/1",
+            body_text="done",
+        )
+        events = self.store.list_events(project["project_id"])
+        lifecycle = [e for e in events if e["event_type"] == "MASTER_MESSAGE_LIFECYCLE"]
+        self.assertEqual(1, len(lifecycle))
+        payload = lifecycle[0]["payload"]
+        self.assertEqual(claimed["message_id"], payload["message_id"])
+        self.assertEqual("DONE", payload["outcome"])
+        self.assertEqual("artifact://seed/1", payload["evidence_ref"])
+
+    def test_fail_records_a_durable_activity_event_with_code_and_reason(self) -> None:
+        project = self.register_project("ALPHA")
+        created, _ = self.store.create_master_message(project["project_id"], self.message_request())
+        self.store.fail_master_message(
+            created["message_id"], code="BLOCKED", reason="no live Master session"
+        )
+        events = self.store.list_events(project["project_id"])
+        lifecycle = [e for e in events if e["event_type"] == "MASTER_MESSAGE_LIFECYCLE"]
+        self.assertEqual(1, len(lifecycle))
+        payload = lifecycle[0]["payload"]
+        self.assertEqual("FAILED", payload["outcome"])
+        self.assertEqual("BLOCKED", payload["error_code"])
+        self.assertEqual("no live Master session", payload["detail"])
+
+    def test_lease_renewal_does_not_record_an_activity_event(self) -> None:
+        # Renewal is a keep-alive on an unchanged state (PROCESSING ->
+        # PROCESSING), not a real work change -- must never become polling
+        # noise in Activity.
+        project = self.register_project("ALPHA")
+        self.store.create_master_message(project["project_id"], self.message_request())
+        claimed = self.store.claim_master_message(project["project_id"], provider="CLAUDE")
+        self.store.renew_master_message_lease(claimed["message_id"])
+        self.store.renew_master_message_lease(claimed["message_id"])
+        events = self.store.list_events(project["project_id"])
+        self.assertEqual(
+            [], [e for e in events if e["event_type"] == "MASTER_MESSAGE_LIFECYCLE"]
+        )
+
     # -- lease timeout / reclaim ------------------------------------------
 
     def test_claim_sets_a_lease_expiry_in_the_future(self) -> None:

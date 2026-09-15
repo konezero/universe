@@ -674,6 +674,92 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual("RECORDED", current["status"])
         self.assertEqual("CONFIRMED", current["assignment"]["host_sync_status"])
 
+    # -- Activity project_event producer (2026-09-15 Fleet/Activity
+    # collaboration: smallest useful producer for "assignment/handoff") ---
+
+    def test_assign_records_a_durable_activity_event(self):
+        anchor = self.register("MASTER", "node-master-activity-event-assign")
+        persona = self.make_persona()
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assigned)
+        events = self.server.store.list_events("TEST")
+        matching = [
+            e for e in events
+            if e["event_type"] == "PERSONA_ASSIGNMENT_CHANGED"
+            and e["payload"].get("session_anchor_ref") == anchor
+        ]
+        self.assertEqual(1, len(matching))
+        payload = matching[0]["payload"]
+        self.assertEqual("ACTIVE", payload["state"])
+        self.assertEqual(persona["persona_id"], payload["persona_id"])
+        self.assertEqual(
+            assigned["assignment"]["assignment_revision"], payload["assignment_revision"]
+        )
+
+    def test_unassign_records_a_durable_activity_event(self):
+        anchor = self.register("MASTER", "node-master-activity-event-unassign")
+        persona = self.make_persona()
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assigned)
+        status, unassigned = self.act("persona.unassign", {
+            "session_anchor_ref": anchor,
+            "expected_assignment_revision": assigned["assignment"]["assignment_revision"],
+        })
+        self.assertEqual(200, status, unassigned)
+        events = self.server.store.list_events("TEST")
+        matching = [
+            e for e in events
+            if e["event_type"] == "PERSONA_ASSIGNMENT_CHANGED"
+            and e["payload"].get("session_anchor_ref") == anchor
+            and e["payload"].get("state") == "UNASSIGNED"
+        ]
+        self.assertEqual(1, len(matching))
+        self.assertEqual("ACTIVE", matching[0]["payload"]["from_state"])
+
+    def test_handoff_records_activity_events_for_both_the_old_and_new_owner(self):
+        node_ref = self.make_feature_node("activity-event-handoff-node")
+        persona = self.make_persona()
+        old_anchor = self.register("MASTER", "node-master-activity-event-handoff-old")
+        new_anchor = self.register("MASTER", "node-master-activity-event-handoff-new")
+        status, first = self.act("persona.assign", {
+            "session_anchor_ref": old_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, first)
+        status, handoff = self.act("persona.assign", {
+            "session_anchor_ref": new_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+            "handoff_from": {
+                "session_anchor_ref": old_anchor,
+                "expected_assignment_revision": first["assignment"]["assignment_revision"],
+            },
+        })
+        self.assertEqual(200, status, handoff)
+        events = self.server.store.list_events("TEST")
+        new_owner_events = [
+            e for e in events
+            if e["event_type"] == "PERSONA_ASSIGNMENT_CHANGED"
+            and e["payload"].get("session_anchor_ref") == new_anchor
+            and e["payload"].get("state") == "ACTIVE"
+        ]
+        old_owner_events = [
+            e for e in events
+            if e["event_type"] == "PERSONA_ASSIGNMENT_CHANGED"
+            and e["payload"].get("session_anchor_ref") == old_anchor
+            and e["payload"].get("state") == "UNASSIGNED"
+        ]
+        self.assertEqual(1, len(new_owner_events))
+        self.assertEqual(1, len(old_owner_events))
+        self.assertEqual(node_ref, new_owner_events[0]["payload"]["node_ref"])
+
 
 if __name__ == "__main__":
     unittest.main()
