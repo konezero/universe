@@ -880,3 +880,76 @@ retire the Actions dialog and move Git history to the event ledger, expand event
 production for automation/assignment/recovery, add contextual Fleet/terminal
 navigation, and verify the full browser flow. These are implementation gaps, not
 alternate product contracts.
+
+
+## 14. Persona finish acceptance slice (2026-09-16)
+
+This slice keeps the existing Persona and Fleet contracts separate. Persona
+text is a revisioned user-level context; it does not become a developer/system
+instruction, an authority grant, or proof that the provider followed the text.
+The server pins `persona_id`, `persona_revision`, Session Anchor, node, Todo and
+assignment revision before delivery. The assignment projection now reports
+saved, queued, prompt-submitted/started, applied, unsupported, offline and
+error phases independently; `NATIVE_QUEUED` is only an authenticated Host queue
+receipt and is never relabeled as applied or content-compliant.
+
+A Worker created by the typed `fleet.worker-session-start` Action receives its
+selected Worker or Reviewer Persona through the same assignment gateway. Exact
+Codex late-Worker bodies use the authenticated Rust Host native queue, including
+Unicode, newline and quote content; the receipt records the deterministic
+message/submission identifiers and leaves `applied_at` empty until the Host
+observes the same message at a provider phase. A late Claude binding without a
+safe exact route remains `UNSUPPORTED` with its reason. Grok is unsupported and
+was not called. Existing Rust Hosts and their Session Anchors were preserved;
+Rust validation used an isolated cargo target directory (`32/32` tests passed).
+
+Node Master automation remains node-scoped and CAS-bound. The live throwaway
+feature node run recorded `RUNNING -> PAUSED -> RUNNING -> STOPPED`, and a
+post-recovery `persona.automation.status` read returned `STOPPED`, revision 4.
+The governed Web restart operation `v4` ended with `SERVICE_RESTART_UNCONFIRMED`
+and `STOP_TIMEOUT`; this is retained as a failure boundary. The supported
+server start recovery returned READY at `http://127.0.0.1:54124` (PID 42552)
+while the PTY supervisor PID 51456 and all user Conductor/Claude/Codex Host
+anchors remained live. This does not claim that the failed restart succeeded.
+
+Typed Persona collaboration uses exact project/node/Todo/Task Frame/file scope,
+participant anchors, evidence, proposal version, CAS responses and next action.
+The live throwaway case reached `NEEDS_REVISION` with evidence
+`msg_8f65c06a6f893493`; no source mutation or silent assignment change occurred.
+Typed orphan queue cancel/reissue preserves the old message and owner revision,
+records Activity, and binds the reissued item to the current owner. The live
+throwaway reissue evidence is in `.artifacts/persona-live-orphan-reissue.json`
+(and its deterministic replay in the sibling `-replay.json` artifact); the
+wake path claimed the cleanup item before orphan cancellation, so it was failed
+explicitly with `ORPHAN_ACCEPTANCE_CLEANUP` and no provider task was executed.
+
+The browser Team panel now shows the node Master Persona, Worker/Reviewer
+Persona delivery phase, exact Todo, Host sync, automation state, collaboration
+result and orphan controls from authoritative projections. Browser evidence is
+in `.artifacts/ui/persona-fleet-target-live.png` and
+`.artifacts/ui/persona-fleet-target-ended-current.png`; the latter shows six
+ended Worker/Reviewer rows, zero active rows, and direct Master execution.
+
+Bounded provider evidence remains distinct: Worker result
+`msg_8f65c06a6f893493` is a result body separate from delivery/CLI-running;
+prior durable CODEX Luna acceptance includes independent Reviewer PASS
+`msg_a41cc8780db65074` in `.artifacts/fleet-acceptance-evidence-20260916.json`.
+A fresh reviewer dispatch `msg_09bc385cb40ff84e` remained STARTED without a
+result and was cancelled with `BOUNDED_PROVIDER_REVIEW_TIMEOUT`; it is recorded
+as NOT_RUN rather than converted to PASS. The existing design MEETING candidate
+remains WAITING for explicit adoption, and no Grok call was made.
+
+The five Persona TODOs are updated through `todo.update` with this evidence.
+They remain `IN_PROGRESS` where their declared operational acceptance still
+needs a real provider phase/Resume proof or an adoption/review result; the
+unrelated Grok limitation is not used as a reason to keep an implementation
+slice open. The Fleet visibility TODO remains DONE with its existing validated
+artifact. Broader Persona P1/P2/P3/P4 acceptance is not closed by a queue
+receipt, a fixture, or this document update.
+
+Controlled source reload v5 (persona-web-reload-20260916-v5) used the observed
+PID 42552 and completed with PID 42980; the service operation reported
+`COMPLETED` and `preserves_pty_supervisor: true`. The resolver still reports the
+same local endpoint and the authoritative terminal projection retains the three
+user Host anchors (Conductor, Claude Master and this Codex Master) as LIVE.
+No throwaway terminal remained live after cleanup.

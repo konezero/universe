@@ -683,6 +683,8 @@ def build_default_action_registry(
     fleet_worker_unassign_handler: ActionHandler | None = None,
     fleet_worker_assignments_list_handler: ActionHandler | None = None,
     fleet_worker_session_start_handler: ActionHandler | None = None,
+    persona_coordination_handler: ActionHandler | None = None,
+    master_message_orphan_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
@@ -935,6 +937,64 @@ def build_default_action_registry(
         ),
         fleet_worker_session_start_handler, surfaces=("fleet.worker-session-start",),
     )
+    # Persona collaboration is a typed Session Bus/Task Frame coordination
+    # projection.  It records exact scope and participant anchors but never
+    # grants authority or mutates assignments.
+    coordination_specs = {
+        "persona.collaboration.open": ("LOCAL_DATABASE_MUTATION", "open", ["project_id", "node_ref", "participant_anchors", "initiator_anchor_ref", "file_scope", "evidence", "proposal", "request_id"], ["todo_id", "task_frame_id"]),
+        "persona.collaboration.propose": ("LOCAL_DATABASE_MUTATION", "propose", ["coordination_id", "proposer_anchor_ref", "expected_proposal_version", "proposal", "evidence", "request_id"], []),
+        "persona.collaboration.respond": ("LOCAL_DATABASE_MUTATION", "respond", ["coordination_id", "responder_anchor_ref", "expected_proposal_version", "outcome", "evidence", "request_id"], []),
+        "persona.collaboration.read": ("READ_ONLY", "read", [], ["coordination_id", "project_id", "node_ref"]),
+    }
+    for action_id, (side_effect, operation, required_fields, optional_fields) in coordination_specs.items():
+        registry.register(
+            ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id.replace('.', '-')}-request.v1",
+                result_schema_ref="universe.persona-coordination.v1",
+                side_effect_class=side_effect,
+                metadata={
+                    "operation": operation,
+                    "transport": "SESSION_BUS_COORDINATION",
+                    "authority": "COORDINATION_ONLY",
+                    "request_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": required_fields,
+                        "properties": {field: {} for field in (*required_fields, *optional_fields)},
+                    },
+                },
+            ),
+            persona_coordination_handler,
+            surfaces=(action_id,),
+        )
+    orphan_specs = {
+        "master-message.orphan-cancel": ("cancel", ["project_id", "message_id", "actor_anchor_ref", "expected_owner_session_anchor_ref", "expected_owner_assignment_revision", "request_id", "reason"], []),
+        "master-message.orphan-reissue": ("reissue", ["project_id", "message_id", "actor_anchor_ref", "expected_owner_session_anchor_ref", "expected_owner_assignment_revision", "current_owner_session_anchor_ref", "current_owner_assignment_revision", "request_id", "reason"], ["idempotency_key"]),
+    }
+    for action_id, (operation, required_fields, optional_fields) in orphan_specs.items():
+        registry.register(
+            ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id.replace('.', '-')}-request.v1",
+                result_schema_ref="universe.project-master-message.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION",
+                metadata={
+                    "operation": operation,
+                    "gateway": "UniverseStore",
+                    "cas": "QUEUED + stamped owner anchor/revision + current owner revision",
+                    "authority": "NODE_MASTER_OR_CONDUCTOR",
+                    "request_schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": required_fields,
+                        "properties": {field: {} for field in (*required_fields, *optional_fields)},
+                    },
+                },
+            ),
+            master_message_orphan_handler,
+            surfaces=(action_id,),
+        )
     registry.register(
         ActionContract(
             action_id="rag.archive-candidate",

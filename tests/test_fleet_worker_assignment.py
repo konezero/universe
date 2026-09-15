@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -432,6 +432,93 @@ class FleetWorkerSessionStartTests(unittest.TestCase):
         # role, never a distinct session mode/authority.
         self.assertEqual("WORKER", result["terminal"]["mode"])
         self.assertEqual("REVIEWER", result["assignment"]["worker_role"])
+
+    def test_session_start_pins_selected_persona_to_worker_anchor_and_keeps_queue_receipt_pending(self):
+        master = self.register("MASTER", "fleet-worker-pilot-persona-master")
+        todo_id = self.make_todo("Worker persona delivery")
+        status, persona_result = self.act("persona.create", {
+            "title": "Worker persona",
+            "body": 'Exact worker framing with a quote "and a newline\nmarker".',
+            "request_id": "fleet-worker-persona-test-create",
+        })
+        self.assertEqual(200, status, persona_result)
+        persona = persona_result["persona"]
+        fake_host = self.fake_worker_host()
+        fake_host.deliver_persona_native_queue.return_value = {
+            "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
+            "message_id": "worker-persona-message",
+            "delivery": {
+                "message_id": "worker-persona-message",
+                "phase": "NATIVE_QUEUED",
+                "queued_submission_id": "worker-persona-submission",
+            },
+        }
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            status, result = self.act("fleet.worker-session-start", {
+                "project_id": "TEST", "todo_id": todo_id,
+                "worker_role": "IMPLEMENTER",
+                "assigned_by_session_anchor_ref": master,
+                "provider": "CODEX", "persona_id": persona["persona_id"],
+            })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual(200, status, result)
+        self.assertEqual("NATIVE_QUEUED", result["persona_delivery"]["status"])
+        self.assertEqual("PENDING_PROVIDER_PHASE", result["persona_delivery"]["application"])
+        worker_anchor = result["assignment"]["session_anchor_ref"]
+        self.assertEqual(worker_anchor, result["persona_assignment"]["session_anchor_ref"])
+        self.assertEqual(persona["persona_id"], result["persona_assignment"]["persona_id"])
+        fake_host.deliver_persona_native_queue.assert_called_once_with(
+            "term_worker_pilot", persona["body"]
+        )
+        persisted = self.server.store.read_persona_assignment(worker_anchor)
+        self.assertEqual("NATIVE_QUEUED", persisted["delivery_status"])
+        self.assertIsNone(persisted["applied_at"])
+        self.assertEqual("worker-persona-message", persisted["queued_message_id"])
+
+    def test_session_start_cleans_persona_assignment_when_late_delivery_binding_fails(self):
+        master = self.register("MASTER", "fleet-worker-pilot-persona-cleanup-master")
+        todo_id = self.make_todo("Worker persona cleanup")
+        status, persona_result = self.act("persona.create", {
+            "title": "Worker cleanup persona",
+            "body": "The late delivery binding will fail in this fixture.",
+            "request_id": "fleet-worker-persona-cleanup-create",
+        })
+        self.assertEqual(200, status, persona_result)
+        persona = persona_result["persona"]
+        before = {
+            row["session_anchor_ref"]
+            for row in self.server.store.list_persona_assignments("TEST")
+        }
+        fake_host = self.fake_worker_host()
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            with patch.object(
+                self.server,
+                "_deliver_persona_to_existing_terminal",
+                side_effect=RuntimeError("late delivery binding failure"),
+            ):
+                status, result = self.act("fleet.worker-session-start", {
+                    "project_id": "TEST", "todo_id": todo_id,
+                    "worker_role": "IMPLEMENTER",
+                    "assigned_by_session_anchor_ref": master,
+                    "provider": "CODEX", "persona_id": persona["persona_id"],
+                })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual(500, status, result)
+        status, listed = self.act("fleet.worker-assignments-list", {
+            "project_id": "TEST", "todo_id": todo_id,
+        })
+        self.assertEqual(200, status, listed)
+        self.assertEqual([], [row for row in listed["assignments"] if row["state"] == "ACTIVE"])
+        after = self.server.store.list_persona_assignments("TEST")
+        new_rows = [row for row in after if row["session_anchor_ref"] not in before]
+        self.assertEqual(1, len(new_rows))
+        self.assertEqual("UNASSIGNED", new_rows[0]["state"])
 
     def test_session_start_rejects_a_non_master_assigner(self):
         not_master = self.register("CONDUCTOR", "fleet-worker-pilot-non-master")

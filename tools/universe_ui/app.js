@@ -44,6 +44,12 @@ const state = {
   personaLibraryStatus: "UNKNOWN",
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
   fleetWorkerAssignmentsByNode: {},
+  /** Authoritative node-scoped Persona automation projections. */
+  fleetAutomationByNode: {},
+  /** Last typed coordination projection read for a node. */
+  fleetCoordinationByNode: {},
+  /** Authoritative queued Master items whose stamped owner is orphaned. */
+  fleetOrphanMessagesByNode: {},
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
@@ -5140,6 +5146,260 @@ async function ensureFleetWorkerAssignments(featureId) {
   }
 }
 
+// Node Master automation is read and controlled through the same typed
+// persona.automation Actions that an LLM uses.  The projection is keyed by
+// the exact node and owning Anchor; project-wide status is never substituted.
+async function ensureFleetAutomation(featureId, owner) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const anchor = String(owner?.session_anchor_ref || "").trim();
+  if (!projectId || !featureId || !anchor) return;
+  state.fleetAutomationByNode = state.fleetAutomationByNode || {};
+  const existing = state.fleetAutomationByNode[featureId];
+  if (existing && existing.projectId === projectId && existing.anchor === anchor && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetAutomationByNode[featureId] = { projectId, anchor, status: "LOADING", run: null, error: "" };
+  try {
+    const result = await invokeServerAction("persona.automation.status", {
+      project_id: projectId, node_ref: featureId, session_anchor_ref: anchor,
+    });
+    state.fleetAutomationByNode[featureId] = {
+      projectId, anchor, status: "READY", run: result.run || result.last_run || null, error: "",
+    };
+  } catch (error) {
+    state.fleetAutomationByNode[featureId] = { projectId, anchor, status: "ERROR", run: null, error: error.message };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId && typeof renderIntegratedHome === "function") renderIntegratedHome();
+}
+
+function fleetAutomationRequestId(featureId, operation) {
+  return `fleet-node-automation:${String(state.selectedProject?.project_id || "")}:${featureId}:${operation}:${crypto.randomUUID()}`;
+}
+
+async function mutateFleetAutomation(featureId, owner, operation, run) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const anchor = String(owner?.session_anchor_ref || "").trim();
+  if (!projectId || !anchor) throw new Error("A current node Master Anchor is required.");
+  if (operation === "start") {
+    await invokeServerAction("persona.automation.start", {
+      project_id: projectId, session_anchor_ref: anchor,
+      scope: `node:${featureId}`, instruction: `Bounded automation for node ${featureId}; stop at the next review gate.`,
+      request_id: fleetAutomationRequestId(featureId, "start"),
+      idempotency_key: fleetAutomationRequestId(featureId, "start"),
+    });
+  } else {
+    if (!run?.run_id) throw new Error("No authoritative automation run is available.");
+    await invokeServerAction(`persona.automation.${operation}`, {
+      run_id: run.run_id, request_id: fleetAutomationRequestId(featureId, operation),
+      expected_revision: run.revision,
+      ...(operation === "pause" || operation === "stop" ? { reason: `Fleet node control: ${operation}` } : {}),
+    });
+  }
+  delete (state.fleetAutomationByNode || {})[featureId];
+  await ensureFleetAutomation(featureId, owner);
+}
+
+function renderFleetAutomationControls(featureId, owner) {
+  const wrap = node("div", "fleet-node-automation");
+  if (!owner) {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "Automation: UNASSIGNED (bind a Master first)"));
+    return wrap;
+  }
+  const projection = (state.fleetAutomationByNode || {})[featureId];
+  if (!projection || projection.status === "LOADING") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "Automation: loading authoritative node run..."));
+    void ensureFleetAutomation(featureId, owner);
+    return wrap;
+  }
+  if (projection.status === "ERROR") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", `Automation: ERROR · ${projection.error || "read failed"}`));
+    return wrap;
+  }
+  const run = projection.run;
+  const stateLabel = String(run?.state || "IDLE").toUpperCase();
+  wrap.append(node("p", "fleet-node-team-status", `Automation: ${stateLabel}${run?.next_condition ? ` · next ${run.next_condition}` : ""}`));
+  if (run?.current_review) wrap.append(node("p", "fleet-node-team-status", `Review: ${run.current_review.outcome || "PENDING"} · ${run.current_review.acceptance_status || "NOT_RUN"}`));
+  const controls = node("div", "fleet-node-team-controls");
+  const button = (label, op, disabled = false) => {
+    const b = node("button", "secondary-button compact-action", label);
+    b.type = "button"; b.disabled = disabled;
+    b.addEventListener("click", () => {
+      b.disabled = true;
+      mutateFleetAutomation(featureId, owner, op, run)
+        .catch((error) => toast(error.message, true))
+        .finally(() => { b.disabled = false; });
+    });
+    return b;
+  };
+  if (!run || ["COMPLETED", "STOPPED", "FAILED"].includes(stateLabel)) controls.append(button("Start bounded run", "start"));
+  if (run && ["RUNNING", "WAITING"].includes(stateLabel)) controls.append(button("Pause", "pause"));
+  if (run && stateLabel === "PAUSED") controls.append(button("Resume", "resume"));
+  if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Stop", "stop"));
+  wrap.append(controls);
+  return wrap;
+}
+
+async function ensureFleetCoordination(featureId) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || !featureId) return;
+  state.fleetCoordinationByNode = state.fleetCoordinationByNode || {};
+  const existing = state.fleetCoordinationByNode[featureId];
+  if (existing && existing.projectId === projectId && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetCoordinationByNode[featureId] = { projectId, status: "LOADING", rows: [], error: "" };
+  try {
+    const result = await invokeServerAction("persona.collaboration.read", { project_id: projectId, node_ref: featureId });
+    state.fleetCoordinationByNode[featureId] = { projectId, status: "READY", rows: result.coordinations || [], error: "" };
+  } catch (error) {
+    state.fleetCoordinationByNode[featureId] = { projectId, status: "ERROR", rows: [], error: error.message };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId && typeof renderIntegratedHome === "function") renderIntegratedHome();
+}
+
+function renderFleetCoordinationPanel(featureId, owner) {
+  const wrap = node("div", "fleet-node-collaboration");
+  const projection = (state.fleetCoordinationByNode || {})[featureId];
+  wrap.append(node("strong", "", "Coordination"));
+  if (!projection || projection.status === "LOADING") {
+    wrap.append(node("small", "", "Loading typed Session Bus coordination..."));
+    void ensureFleetCoordination(featureId);
+    return wrap;
+  }
+  if (projection.status === "ERROR") {
+    wrap.append(node("small", "", `ERROR: ${projection.error || "coordination read failed"}`));
+    return wrap;
+  }
+  if (!projection.rows.length) wrap.append(node("small", "", "No coordination record for this exact node."));
+  for (const row of projection.rows.slice(0, 3)) {
+    wrap.append(node("p", "fleet-node-team-status", `${row.state || "UNKNOWN"} · v${row.proposal_version || "?"} · ${row.next_action || "WAIT"}`));
+    if (row.escalation) wrap.append(node("small", "", `Escalated: ${row.escalation.reason || "unresolved"}`));
+  }
+  if (owner) {
+    const start = node("button", "secondary-button compact-action", "Open scoped coordination");
+    start.type = "button";
+    start.addEventListener("click", async () => {
+      const todo = (state.todos || []).find((item) => String(item.node_ref || "") === String(featureId || ""));
+      const workers = fleetWorkerAssignments(featureId).active.map((item) => String(item.session_anchor_ref || "")).filter(Boolean);
+      const participants = [...new Set([owner.session_anchor_ref, ...workers])];
+      if (!todo || participants.length < 2) { toast("An exact node Todo and at least one Worker/Reviewer participant are required.", true); return; }
+      const fileScope = window.prompt("Exact relative file/resource scope (comma separated)", `node/${featureId}`);
+      if (!fileScope || !fileScope.trim()) return;
+      try {
+        await invokeServerAction("persona.collaboration.open", {
+          project_id: String(state.selectedProject?.project_id || ""), node_ref: featureId,
+          todo_id: todo.todo_id, participant_anchors: participants,
+          initiator_anchor_ref: owner.session_anchor_ref,
+          file_scope: fileScope.split(",").map((item) => item.trim()).filter(Boolean),
+          evidence: [`todo:${todo.todo_id}`],
+          proposal: { outcome: "WAIT", scope: fileScope.trim(), scope_kind: "NODE_BOUNDED" },
+          request_id: crypto.randomUUID(),
+        });
+        delete (state.fleetCoordinationByNode || {})[featureId];
+        await ensureFleetCoordination(featureId);
+      } catch (error) { toast(error.message, true); }
+    });
+    wrap.append(start);
+  }
+  return wrap;
+}
+
+async function ensureFleetOrphanMessages(featureId) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || !featureId) return;
+  state.fleetOrphanMessagesByNode = state.fleetOrphanMessagesByNode || {};
+  const existing = state.fleetOrphanMessagesByNode[featureId];
+  if (existing && existing.projectId === projectId && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetOrphanMessagesByNode[featureId] = { projectId, status: "LOADING", rows: [], error: "" };
+  try {
+    const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/master-messages`);
+    const rows = (result.messages || []).filter((item) =>
+      String(item.node_ref || "").trim() === String(featureId || "").trim() &&
+      String(item.delivery_state || "").toUpperCase() === "QUEUED"
+    );
+    state.fleetOrphanMessagesByNode[featureId] = { projectId, status: "READY", rows, error: "" };
+  } catch (error) {
+    state.fleetOrphanMessagesByNode[featureId] = { projectId, status: "ERROR", rows: [], error: error.message };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId && typeof renderIntegratedHome === "function") renderIntegratedHome();
+}
+
+function renderFleetOrphanQueue(featureId, owner) {
+  const wrap = node("div", "fleet-node-orphan-queue");
+  const projection = (state.fleetOrphanMessagesByNode || {})[featureId];
+  wrap.append(node("strong", "", "Orphan node queue"));
+  if (!owner) {
+    wrap.append(node("small", "", "UNKNOWN: a current Master owner is required before orphan actions are available."));
+    return wrap;
+  }
+  if (!projection || projection.status === "LOADING") {
+    wrap.append(node("small", "", "Loading authoritative Master queue..."));
+    void ensureFleetOrphanMessages(featureId);
+    return wrap;
+  }
+  if (projection.status === "ERROR") {
+    wrap.append(node("small", "", `ERROR: ${projection.error || "queue read failed"}`));
+    return wrap;
+  }
+  const ownerAnchor = String(owner?.session_anchor_ref || "").trim();
+  const ownerRevision = Number(owner?.assignment_revision || 0);
+  const orphanRows = projection.rows.filter((item) =>
+    String(item.node_owner_session_anchor_ref || "") !== ownerAnchor ||
+    Number(item.node_owner_assignment_revision || 0) !== ownerRevision
+  );
+  if (!orphanRows.length) {
+    wrap.append(node("small", "", "No queued item has an orphaned owner stamp."));
+    return wrap;
+  }
+  for (const item of orphanRows.slice(0, 5)) {
+    const row = node("div", "fleet-node-orphan-row");
+    row.append(node("span", "", `${item.title || item.message_id} / old ${item.node_owner_session_anchor_ref || "NONE"} rev ${item.node_owner_assignment_revision || "?"}`));
+    const controls = node("div", "fleet-node-team-controls");
+    const cancel = node("button", "secondary-button compact-action", "Cancel orphan");
+    cancel.type = "button";
+    cancel.addEventListener("click", async () => {
+      cancel.disabled = true;
+      try {
+        await invokeServerAction("master-message.orphan-cancel", {
+          project_id: String(state.selectedProject?.project_id || ""),
+          message_id: item.message_id,
+          actor_anchor_ref: ownerAnchor,
+          expected_owner_session_anchor_ref: item.node_owner_session_anchor_ref,
+          expected_owner_assignment_revision: Number(item.node_owner_assignment_revision),
+          request_id: crypto.randomUUID(),
+          reason: "Fleet node owner stamp is orphaned; explicit cancellation requested.",
+        });
+        delete (state.fleetOrphanMessagesByNode || {})[featureId];
+        await ensureFleetOrphanMessages(featureId);
+      } catch (error) { toast(error.message, true); } finally { cancel.disabled = false; }
+    });
+    controls.append(cancel);
+    if (ownerAnchor && ownerRevision > 0) {
+      const reissue = node("button", "secondary-button compact-action", "Reissue to current Master");
+      reissue.type = "button";
+      reissue.addEventListener("click", async () => {
+        reissue.disabled = true;
+        try {
+          await invokeServerAction("master-message.orphan-reissue", {
+            project_id: String(state.selectedProject?.project_id || ""),
+            message_id: item.message_id,
+            actor_anchor_ref: ownerAnchor,
+            expected_owner_session_anchor_ref: item.node_owner_session_anchor_ref,
+            expected_owner_assignment_revision: Number(item.node_owner_assignment_revision),
+            current_owner_session_anchor_ref: ownerAnchor,
+            current_owner_assignment_revision: ownerRevision,
+            request_id: crypto.randomUUID(),
+            idempotency_key: `fleet-orphan-reissue:${item.message_id}:${ownerAnchor}:${ownerRevision}`,
+            reason: "Fleet node owner changed; reissue explicitly to the current owner.",
+          });
+          delete (state.fleetOrphanMessagesByNode || {})[featureId];
+          await ensureFleetOrphanMessages(featureId);
+        } catch (error) { toast(error.message, true); } finally { reissue.disabled = false; }
+      });
+      controls.append(reissue);
+    }
+    row.append(controls);
+    wrap.append(row);
+  }
+  return wrap;
+}
+
 function assignFleetWorker(featureId, { todoId, workerRole, sessionAnchorRef, assignedBy, personaId }) {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   if (!projectId || !featureId || !todoId || !workerRole || !sessionAnchorRef || !assignedBy) {
@@ -5209,6 +5469,9 @@ async function startFleetWorkerSession(featureId, {
   // assignment list and terminal projection before rendering the new row.
   delete (state.fleetWorkerAssignmentsByNode || {})[featureId];
   await ensureFleetWorkerAssignments(featureId);
+  // Worker Persona delivery is projected by the same authoritative
+  // session_persona_assignment Action as node Master Persona delivery.
+  await loadPersonaProjectProjection(projectId);
   if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
   return result;
 }
@@ -5335,9 +5598,12 @@ function renderFleetNodeTeamControls(graphNode) {
   const ownerLine = node("p", "fleet-node-team-status");
   if (owner) {
     const ownerLive = fleetAuthoritativeTerminals().some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
+    const hostSync = String(owner.host_sync_status || owner.host_sync?.status || "UNKNOWN").toUpperCase();
+    const delivery = String(owner.delivery_status || "SAVED").toUpperCase() === "PENDING" ? "SAVED" : String(owner.delivery_status || "SAVED").toUpperCase();
+    const deliveryPhase = owner.applied_phase || owner.queued_phase || "";
     ownerLine.append(
       node("span", "fleet-node-role", "Master"),
-      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${owner.session_anchor_ref} / ${ownerLive ? "LIVE" : "OFFLINE"}`),
+      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${owner.session_anchor_ref} / ${ownerLive ? "LIVE" : "OFFLINE"} / Persona ${delivery}${deliveryPhase ? ` (${deliveryPhase})` : ""} / Host sync ${hostSync}`),
     );
   } else {
     ownerLine.append(node("span", "fleet-node-role", "Master"), document.createTextNode(" UNASSIGNED"));
@@ -5399,6 +5665,9 @@ function renderFleetNodeTeamControls(graphNode) {
   section.append(controls);
 
   section.append(renderFleetNodeWorkerRoster(featureId, owner));
+  section.append(renderFleetAutomationControls(featureId, owner));
+  section.append(renderFleetCoordinationPanel(featureId, owner));
+  section.append(renderFleetOrphanQueue(featureId, owner));
   return section;
 }
 
@@ -5434,10 +5703,20 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
         String(item.project_id || "") === String(state.selectedProject?.project_id || "")
       );
       const liveState = fleetWorkerTerminalState(terminal);
+      const personaAssignment = (state.personaAssignments || []).find((item) =>
+        String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || "") &&
+        String(item.state || "").toUpperCase() === "ACTIVE"
+      );
+      const personaDelivery = String(personaAssignment?.delivery_status || "UNKNOWN").toUpperCase() === "PENDING"
+        ? "SAVED"
+        : String(personaAssignment?.delivery_status || "UNKNOWN").toUpperCase();
+      const personaPhase = personaAssignment?.applied_phase || personaAssignment?.queued_phase || "";
+      const personaHostSync = String(personaAssignment?.host_sync_status || "UNKNOWN").toUpperCase();
       row.append(
         node("span", "fleet-node-role", assignment.worker_role === "REVIEWER" ? "Reviewer" : "Worker"),
         document.createTextNode(
           ` ${persona?.title || assignment.persona_id || "No Persona"} / ${assignment.session_anchor_ref} / ${liveState}`
+          + ` / Persona ${personaDelivery}${personaPhase ? ` (${personaPhase})` : ""} / Host sync ${personaHostSync}`
           + ` / Todo ${assignment.todo_id || assignment.task_frame_id || "UNKNOWN"} / rev ${assignment.assignment_revision}`
         ),
       );

@@ -745,10 +745,18 @@ class PersonaAutomationStore:
             rows = connection.execute("SELECT event_id, event_type, idempotency_key, payload_json, created_at FROM persona_automation_event WHERE run_id = ? ORDER BY created_at DESC, event_id DESC LIMIT ?", (run_id, limit)).fetchall()
             return [{"event_id": row["event_id"], "event_type": row["event_type"], "idempotency_key": row["idempotency_key"], "payload": _load(row["payload_json"], {}), "created_at": row["created_at"]} for row in rows]
 
-    def surface(self, project_id: str) -> dict[str, Any]:
+    def surface(self, project_id: str, *, node_ref: str | None = None, session_anchor_ref: str | None = None) -> dict[str, Any]:
         project_id = _text(project_id, "project_id")
         with self._connection() as connection:
-            rows = connection.execute("SELECT * FROM persona_automation_run WHERE project_id = ? ORDER BY updated_at DESC, run_id DESC LIMIT 25", (project_id,)).fetchall()
+            clauses = ["project_id = ?"]
+            params: list[Any] = [project_id]
+            if node_ref is not None:
+                clauses.append("node_ref IS ?")
+                params.append(str(node_ref).strip() or None)
+            if session_anchor_ref is not None:
+                clauses.append("session_anchor_ref = ?")
+                params.append(str(session_anchor_ref).strip())
+            rows = connection.execute("SELECT * FROM persona_automation_run WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC, run_id DESC LIMIT 25", tuple(params)).fetchall()
             runs = [self._row(row) for row in rows]
             active_states = {"RUNNING", "WAITING", "PAUSED"}
             current = next((run for run in runs if run["state"] in active_states), None)

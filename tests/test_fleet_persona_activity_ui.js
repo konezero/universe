@@ -161,6 +161,26 @@ test("Fleet Worker session-start controls use the typed Action and authoritative
   assert.match(fleet, /Todo scope \(no authoritative Task Frame\)/);
 });
 
+test("Fleet node automation, coordination and orphan controls stay on typed authoritative routes", () => {
+  const start = appSource.indexOf("async function ensureFleetAutomation(featureId, owner)");
+  const end = appSource.indexOf("function assignFleetWorker", start);
+  assert.ok(start >= 0 && end > start);
+  const controls = appSource.slice(start, end);
+  assert.match(controls, /persona\.automation\.status/);
+  assert.match(controls, /node_ref: featureId/);
+  assert.match(controls, /session_anchor_ref: anchor/);
+  assert.match(controls, /operation === "pause"/);
+  assert.match(controls, /stateLabel === "PAUSED"/);
+  assert.match(controls, /operation === "stop"/);
+  assert.match(controls, /persona\.collaboration\.open/);
+  assert.match(controls, /persona\.collaboration\.read/);
+  assert.match(controls, /master-message\.orphan-cancel/);
+  assert.match(controls, /master-message\.orphan-reissue/);
+  assert.match(controls, /expected_owner_assignment_revision/);
+  assert.match(controls, /current_owner_assignment_revision/);
+  assert.match(controls, /delivery_state.*QUEUED/);
+});
+
 test("Fleet project selection renders the core projection before slow optional observers", () => {
   const start = appSource.indexOf("async function selectProject(");
   const end = appSource.indexOf("function mergeGovernanceProposalInbox", start);

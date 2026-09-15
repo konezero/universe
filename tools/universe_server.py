@@ -218,6 +218,7 @@ from universe_action_registry import (
     utf8_sha256,
 )
 from persona_automation import PersonaAutomationError, PersonaAutomationStore
+from persona_coordination import PersonaCoordinationError, PersonaCoordinationStore
 from universe_remote_gateway import (
     GatewayError,
     default_gateway_state_path,
@@ -410,7 +411,7 @@ CAPABILITY_PROFILE_SCHEMA = "universe.connection-capabilities.v1"
 PROJECT_ROOM_MESSAGE_SCHEMA = "universe.project-room-message.v1"
 PROJECT_MASTER_MESSAGE_SCHEMA = "universe.project-master-message.v1"
 PROJECT_MASTER_MESSAGE_STATES = frozenset(
-    {"QUEUED", "PROCESSING", "DONE", "FAILED"}
+    {"QUEUED", "PROCESSING", "DONE", "FAILED", "CANCELLED"}
 )
 # A claimed-but-abandoned item (the claiming session crashed or disconnected
 # before calling complete/fail) must not block that item forever - it is
@@ -24320,6 +24321,200 @@ class UniverseStore:
                 return None
         return None
 
+    def cancel_orphan_master_message(
+        self,
+        project_id: str,
+        message_id: str,
+        *,
+        actor_anchor_ref: str,
+        expected_owner_session_anchor_ref: str,
+        expected_owner_assignment_revision: int,
+        request_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Cancel one queued node item whose stamped owner is no longer current.
+
+        The old owner/revision and the QUEUED state are all part of one guarded
+        UPDATE.  A reassignment racing this operation therefore cannot be
+        silently cancelled or transferred by a stale caller.
+        """
+
+        project_id = _project_id(project_id)
+        message_id = _required_text(message_id, "message_id")
+        actor_anchor_ref = _required_text(actor_anchor_ref, "actor_anchor_ref")
+        expected_owner_session_anchor_ref = _required_text(
+            expected_owner_session_anchor_ref, "expected_owner_session_anchor_ref"
+        )
+        if type(expected_owner_assignment_revision) is not int or expected_owner_assignment_revision < 1:
+            raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_INVALID", "expected_owner_assignment_revision must be a positive integer", HTTPStatus.BAD_REQUEST)
+        request_id = _required_text(request_id, "request_id")
+        reason = _required_text(reason, "reason")[:1000]
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT message_json FROM project_master_message WHERE project_id = ? AND message_id = ?",
+                (project_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError("MASTER_MESSAGE_NOT_FOUND", "Master message is not registered", HTTPStatus.NOT_FOUND)
+            message = json.loads(row["message_json"])
+            if message.get("delivery_state") == "CANCELLED":
+                recorded = message.get("orphan_cancellation") or {}
+                if recorded.get("request_id") == request_id:
+                    return message
+                raise UniverseError("MASTER_MESSAGE_STATE_CONFLICT", "Master message has already been cancelled", HTTPStatus.CONFLICT)
+            if message.get("delivery_state") != "QUEUED" or not message.get("node_ref"):
+                raise UniverseError("MASTER_MESSAGE_ORPHAN_REQUIRED", "only a queued node-scoped item can be cancelled as orphan", HTTPStatus.CONFLICT)
+            if (
+                message.get("node_owner_session_anchor_ref") != expected_owner_session_anchor_ref
+                or int(message.get("node_owner_assignment_revision") or -1) != expected_owner_assignment_revision
+            ):
+                raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_CONFLICT", "the queued item's stamped owner coordinates changed", HTTPStatus.CONFLICT)
+            current = connection.execute(
+                "SELECT session_anchor_ref, assignment_revision FROM session_persona_assignment WHERE project_id = ? AND node_ref = ? AND state = 'ACTIVE'",
+                (project_id, message["node_ref"]),
+            ).fetchone()
+            if current is not None and (
+                current["session_anchor_ref"] == expected_owner_session_anchor_ref
+                and int(current["assignment_revision"]) == expected_owner_assignment_revision
+            ):
+                raise UniverseError("MASTER_MESSAGE_NOT_ORPHANED", "the stamped node owner is still current", HTTPStatus.CONFLICT)
+            now = utc_now()
+            message.update({
+                "delivery_state": "CANCELLED",
+                "updated_at": now,
+                "completed_at": now,
+                "orphan_cancellation": {
+                    "request_id": request_id,
+                    "actor_session_anchor_ref": actor_anchor_ref,
+                    "expected_owner_session_anchor_ref": expected_owner_session_anchor_ref,
+                    "expected_owner_assignment_revision": expected_owner_assignment_revision,
+                    "reason": reason,
+                },
+            })
+            cursor = connection.execute(
+                """UPDATE project_master_message SET message_json = ?
+                   WHERE project_id = ? AND message_id = ?
+                     AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                     AND json_extract(message_json, '$.node_owner_session_anchor_ref') = ?
+                     AND json_extract(message_json, '$.node_owner_assignment_revision') = ?""",
+                (_canonical_json(message), project_id, message_id,
+                 expected_owner_session_anchor_ref, expected_owner_assignment_revision),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError("MASTER_MESSAGE_STATE_CONFLICT", "queued item changed before orphan cancellation", HTTPStatus.CONFLICT)
+        self._record_master_message_lifecycle_event(message, outcome="CANCELLED", detail=reason, error_code="MASTER_MESSAGE_ORPHAN_CANCELLED")
+        return message
+
+    def reissue_orphan_master_message(
+        self,
+        project_id: str,
+        message_id: str,
+        *,
+        actor_anchor_ref: str,
+        expected_owner_session_anchor_ref: str,
+        expected_owner_assignment_revision: int,
+        current_owner_session_anchor_ref: str,
+        current_owner_assignment_revision: int,
+        idempotency_key: str,
+        request_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Atomically cancel an orphan and queue the same work for its current owner."""
+
+        project_id = _project_id(project_id)
+        message_id = _required_text(message_id, "message_id")
+        actor_anchor_ref = _required_text(actor_anchor_ref, "actor_anchor_ref")
+        expected_owner_session_anchor_ref = _required_text(expected_owner_session_anchor_ref, "expected_owner_session_anchor_ref")
+        current_owner_session_anchor_ref = _required_text(current_owner_session_anchor_ref, "current_owner_session_anchor_ref")
+        idempotency_key = _required_text(idempotency_key, "idempotency_key")
+        request_id = _required_text(request_id, "request_id")
+        reason = _required_text(reason, "reason")[:1000]
+        if type(expected_owner_assignment_revision) is not int or expected_owner_assignment_revision < 1:
+            raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_INVALID", "expected_owner_assignment_revision must be a positive integer")
+        if type(current_owner_assignment_revision) is not int or current_owner_assignment_revision < 1:
+            raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_INVALID", "current_owner_assignment_revision must be a positive integer")
+        if current_owner_session_anchor_ref == expected_owner_session_anchor_ref and current_owner_assignment_revision == expected_owner_assignment_revision:
+            raise UniverseError("MASTER_MESSAGE_REISSUE_OWNER_UNCHANGED", "reissue must name a current owner different from the orphan stamp", HTTPStatus.CONFLICT)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT message_json FROM project_master_message WHERE project_id = ? AND message_id = ?",
+                (project_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise UniverseError("MASTER_MESSAGE_NOT_FOUND", "Master message is not registered", HTTPStatus.NOT_FOUND)
+            old = json.loads(row["message_json"])
+            if old.get("delivery_state") == "CANCELLED" and (old.get("orphan_reissue") or {}).get("request_id") == request_id:
+                new_id = str((old.get("orphan_reissue") or {}).get("new_message_id") or "")
+                return {"old_message": old, "message": self.get_master_message(new_id) if new_id else None, "status": "MASTER_MESSAGE_REISSUE_REPLAYED"}
+            if old.get("delivery_state") != "QUEUED" or not old.get("node_ref"):
+                raise UniverseError("MASTER_MESSAGE_ORPHAN_REQUIRED", "only a queued node-scoped item can be reissued as orphan", HTTPStatus.CONFLICT)
+            if (
+                old.get("node_owner_session_anchor_ref") != expected_owner_session_anchor_ref
+                or int(old.get("node_owner_assignment_revision") or -1) != expected_owner_assignment_revision
+            ):
+                raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_CONFLICT", "the queued item's stamped owner coordinates changed", HTTPStatus.CONFLICT)
+            current = connection.execute(
+                "SELECT session_anchor_ref, assignment_revision FROM session_persona_assignment WHERE project_id = ? AND node_ref = ? AND state = 'ACTIVE'",
+                (project_id, old["node_ref"]),
+            ).fetchone()
+            if current is None or current["session_anchor_ref"] != current_owner_session_anchor_ref or int(current["assignment_revision"]) != current_owner_assignment_revision:
+                raise UniverseError("MASTER_MESSAGE_CURRENT_OWNER_MISMATCH", "current node owner coordinates are stale or unavailable", HTTPStatus.CONFLICT)
+            existing = connection.execute(
+                "SELECT message_json FROM project_master_message WHERE project_id = ? AND idempotency_key = ?",
+                (project_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                existing_message = json.loads(existing["message_json"])
+                if existing_message.get("metadata", {}).get("reissued_from_message_id") != message_id:
+                    raise UniverseError("MASTER_MESSAGE_IDEMPOTENCY_CONFLICT", "idempotency_key already refers to another Master message", HTTPStatus.CONFLICT)
+                return {"old_message": old, "message": existing_message, "status": "MASTER_MESSAGE_REISSUE_REPLAYED"}
+            now = utc_now()
+            new = normalize_master_message(project_id, {
+                "title": old["title"],
+                "instruction": old["instruction"],
+                "node_ref": old["node_ref"],
+                "idempotency_key": idempotency_key,
+                "metadata": {
+                    **(old.get("metadata") or {}),
+                    "reissued_from_message_id": message_id,
+                    "reissue_request_id": request_id,
+                },
+            })
+            new["node_owner_session_anchor_ref"] = current_owner_session_anchor_ref
+            new["node_owner_assignment_revision"] = current_owner_assignment_revision
+            new["reissued_from_message_id"] = message_id
+            new["reissue_reason"] = reason
+            old.update({
+                "delivery_state": "CANCELLED",
+                "updated_at": now,
+                "completed_at": now,
+                "orphan_reissue": {
+                    "request_id": request_id,
+                    "actor_session_anchor_ref": actor_anchor_ref,
+                    "new_message_id": new["message_id"],
+                    "current_owner_session_anchor_ref": current_owner_session_anchor_ref,
+                    "current_owner_assignment_revision": current_owner_assignment_revision,
+                    "reason": reason,
+                },
+            })
+            cursor = connection.execute(
+                """UPDATE project_master_message SET message_json = ?
+                   WHERE project_id = ? AND message_id = ?
+                     AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                     AND json_extract(message_json, '$.node_owner_session_anchor_ref') = ?
+                     AND json_extract(message_json, '$.node_owner_assignment_revision') = ?""",
+                (_canonical_json(old), project_id, message_id,
+                 expected_owner_session_anchor_ref, expected_owner_assignment_revision),
+            )
+            if cursor.rowcount != 1:
+                raise UniverseError("MASTER_MESSAGE_STATE_CONFLICT", "queued item changed before orphan reissue", HTTPStatus.CONFLICT)
+            connection.execute(
+                "INSERT INTO project_master_message(message_id, project_id, idempotency_key, message_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (new["message_id"], project_id, idempotency_key, _canonical_json(new), new["created_at"]),
+            )
+        self._record_master_message_lifecycle_event(old, outcome="CANCELLED", detail=reason, error_code="MASTER_MESSAGE_ORPHAN_REISSUED")
+        return {"status": "MASTER_MESSAGE_ORPHAN_REISSUED", "old_message": old, "message": new}
+
     def renew_master_message_lease(
         self,
         message_id: str,
@@ -30798,6 +30993,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         # the Universe database but remains distinct from Goal scheduling and
         # from persona assignment itself.
         self.persona_automation = PersonaAutomationStore(store.database_path)
+        # Coordination is a durable negotiation projection.  It never grants
+        # execution authority or mutates a Worker assignment; those remain on
+        # their existing typed gateways.
+        self.persona_coordination = PersonaCoordinationStore(store.database_path)
         self.action_registry = build_default_action_registry(
             self._handle_feature_goal_start_action,
             rag_adopt_handler=self._handle_rag_adopt_action,
@@ -30820,6 +31019,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             fleet_worker_unassign_handler=self._handle_fleet_worker_unassign_action,
             fleet_worker_assignments_list_handler=self._handle_fleet_worker_assignments_list_action,
             fleet_worker_session_start_handler=self._handle_fleet_worker_session_start_action,
+            persona_coordination_handler=self._handle_persona_coordination_action,
+            master_message_orphan_handler=self._handle_master_message_orphan_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
@@ -33083,13 +33284,210 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._record_worker_assignment_event(
             project_id=project_id, outcome="ASSIGNED", assignment=assignment,
         )
+        # A Worker terminal is deliberately created before its Fleet row: the
+        # Host must mint the exact Session Anchor that the assignment records.
+        # That means the selected Worker Persona cannot be folded into the
+        # pre-spawn Master-only launch path above.  Bind the Persona to this
+        # newly minted Anchor through the same typed persona.assign contract,
+        # then use the Host's exact-text transport.  The two durable rows are
+        # intentionally separate: task_worker_assignment says *who* is
+        # assigned, while session_persona_assignment records the pinned
+        # revision and provider delivery phase for that Anchor.  A delivery
+        # receipt remains NATIVE_QUEUED/PENDING_PROVIDER_PHASE until Host
+        # reconciliation reports provider submission or start.
+        persona_assignment = None
+        persona_delivery = {"status": "NOT_REQUIRED", "application": "NOT_REQUIRED"}
+        if persona_id:
+            existing_persona_assignment = self.store.read_persona_assignment(worker_anchor)
+            expected_persona_assignment_revision = int(
+                (existing_persona_assignment or {}).get("assignment_revision") or 0
+            )
+            try:
+                persona_result = self._handle_persona_assign_action(
+                    {
+                        "session_anchor_ref": worker_anchor,
+                        "project_id": project_id,
+                        "persona_id": persona_id,
+                        "expected_persona_revision": int(persona.get("revision") or 0),
+                        "expected_assignment_revision": expected_persona_assignment_revision,
+                        "scope": f"FLEET_{worker_role}",
+                        "request_id": f"fleet-worker-persona-{assignment.get('assignment_id')}",
+                    },
+                    context,
+                )
+                persona_assignment = persona_result.get("assignment")
+                persona_delivery = self._deliver_persona_to_existing_terminal(
+                    project_id=project_id,
+                    terminal=terminal,
+                    session_anchor_ref=worker_anchor,
+                )
+            except Exception:
+                # A Persona binding is part of the requested Worker launch.
+                # If the typed assignment cannot be committed, close the
+                # just-created terminal and end the just-created assignment
+                # so a failed request cannot leave an unowned live Worker
+                # behind.  Preserve the original error.
+                if persona_assignment is not None:
+                    try:
+                        self._handle_persona_unassign_action(
+                            {
+                                "session_anchor_ref": worker_anchor,
+                                "expected_assignment_revision": int(
+                                    persona_assignment.get("assignment_revision") or 1
+                                ),
+                                "request_id": (
+                                    "fleet-worker-persona-cleanup-"
+                                    + str(assignment.get("assignment_id") or "")
+                                ),
+                            },
+                            context,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self.close_cli_terminal(str(terminal.get("terminal_id") or ""))
+                except Exception:
+                    pass
+                try:
+                    ended = self.store.end_task_worker_assignment(
+                        {
+                            "assignment_id": assignment.get("assignment_id"),
+                            "expected_assignment_revision": int(assignment.get("assignment_revision") or 1),
+                            "reason": "PERSONA_BINDING_FAILED",
+                        },
+                        self._persona_actor(context),
+                    )
+                    self._record_worker_assignment_event(
+                        project_id=project_id, outcome="ENDED", assignment=ended.get("assignment") or {},
+                    )
+                except Exception:
+                    pass
+                raise
+            terminal["persona_delivery"] = persona_delivery
         return {
             "schema": "universe.fleet-worker-session-start-result.v1",
             "status": "FLEET_WORKER_SESSION_STARTED",
             "terminal_status": created.get("status"),
             "terminal": terminal,
             "assignment": assignment,
+            "persona_assignment": persona_assignment,
+            "persona_delivery": persona_delivery,
         }
+
+    def _deliver_persona_to_existing_terminal(
+        self,
+        *,
+        project_id: str,
+        terminal: Mapping[str, Any],
+        session_anchor_ref: str,
+    ) -> dict[str, Any]:
+        """Deliver a Persona assigned after a Worker Host minted its Anchor.
+
+        ``create_cli_terminal`` can carry a Persona before a fresh process is
+        spawned only when the assignment already exists for the spawn Anchor.
+        Worker assignment intentionally learns that Anchor from the Host, so
+        this late path must preserve the same phase vocabulary without
+        pretending a queue offer is provider application.  Codex uses the
+        authenticated native queue; Claude's exact inline-file transport is a
+        pre-spawn capability and is therefore reported UNSUPPORTED here rather
+        than flattened into PTY input.  The pinned revision remains durable
+        for Resume even when delivery is unavailable.
+        """
+
+        resolution = self.store.resolve_active_persona_prompt(session_anchor_ref)
+        if resolution is None:
+            return {
+                "status": "ERROR",
+                "application": "NOT_RUN",
+                "reason": "active Persona assignment could not be resolved for the Worker Anchor",
+            }
+        persona_text, assignment = resolution
+        terminal_id = str(terminal.get("terminal_id") or "").strip()
+        provider = str(terminal.get("provider") or "").strip().upper()
+        mode, mode_reason = persona_delivery_mode(provider, persona_text)
+        # The Worker process is already running by the time its Host has
+        # minted the Anchor.  Codex's native queue is therefore the exact
+        # transport even for an ASCII body that could have fit an argv value
+        # during a pre-spawn launch; do not mark such a late assignment as
+        # unsupported merely because INLINE_ARG is unavailable after spawn.
+        if provider == "CODEX":
+            mode = "NATIVE_QUEUE"
+            mode_reason = "late Worker Persona delivery uses the authenticated Codex native queue"
+        common = {
+            "mode": mode,
+            "persona_id": assignment.get("persona_id"),
+            "persona_revision": assignment.get("persona_revision"),
+            "assignment_revision": assignment.get("assignment_revision"),
+        }
+        if mode != "NATIVE_QUEUE":
+            reason = (
+                "late Worker binding cannot use the provider's pre-spawn exact transport"
+                if provider in {"CLAUDE", "CODEX"}
+                else mode_reason
+            )
+            self.store.record_persona_delivery_unsupported(
+                session_anchor_ref,
+                terminal_id,
+                str(assignment.get("persona_id") or ""),
+                int(assignment.get("persona_revision") or 0),
+                int(assignment.get("assignment_revision") or 0),
+                provider,
+                reason,
+            )
+            return {**common, "status": "UNSUPPORTED", "application": "NOT_RUN", "reason": reason}
+
+        try:
+            deliver_persona = getattr(self.terminal_host, "deliver_persona_native_queue", None)
+            if not callable(deliver_persona):
+                raise TerminalHostError(
+                    "PERSONA_NATIVE_QUEUE_UNAVAILABLE",
+                    "the configured Terminal Host has no native Codex queue adapter",
+                )
+            queue_result = deliver_persona(terminal_id, persona_text)
+            delivery_receipt = queue_result.get("delivery") or {}
+            queued_message_id = str(
+                queue_result.get("message_id") or delivery_receipt.get("message_id") or ""
+            )
+            queued_submission_id = str(
+                delivery_receipt.get("queued_submission_id")
+                or queue_result.get("queued_submission_id")
+                or ""
+            )
+            queued_phase = str(
+                delivery_receipt.get("phase")
+                or queue_result.get("phase")
+                or "NATIVE_QUEUED"
+            )
+            queued = self.store.record_persona_queued(
+                session_anchor_ref,
+                terminal_id,
+                str(assignment.get("persona_id") or ""),
+                int(assignment.get("persona_revision") or 0),
+                int(assignment.get("assignment_revision") or 0),
+                provider,
+                queued_message_id,
+                queued_submission_id,
+                queued_phase,
+            )
+            return {
+                **common,
+                "status": "NATIVE_QUEUED" if queued else "NOT_RUN",
+                "application": "PENDING_PROVIDER_PHASE" if queued else "NOT_RUN",
+                "queue": queue_result,
+                **({} if queued else {"reason": "assignment changed before queue evidence could be recorded"}),
+            }
+        except TerminalHostError as error:
+            reason = f"NATIVE_QUEUE_NOT_APPLIED: {error.code}: {error.detail}"
+            self.store.record_persona_delivery_unsupported(
+                session_anchor_ref,
+                terminal_id,
+                str(assignment.get("persona_id") or ""),
+                int(assignment.get("persona_revision") or 0),
+                int(assignment.get("assignment_revision") or 0),
+                provider,
+                reason,
+            )
+            return {**common, "status": "UNSUPPORTED", "application": "NOT_RUN", "reason": reason}
 
     def _record_worker_assignment_event(
         self, *, project_id: str, outcome: str, assignment: Mapping[str, Any]
@@ -33894,13 +34292,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_stop", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
                 return self.persona_automation.stop_run(value)
             if action_id == "persona.automation.status":
-                value = _exact_object_fields(request, field="persona_automation_status", required=frozenset(), optional=frozenset({"run_id", "project_id"}))
+                value = _exact_object_fields(request, field="persona_automation_status", required=frozenset(), optional=frozenset({"run_id", "project_id", "node_ref", "session_anchor_ref"}))
                 if value.get("run_id"):
                     result = self.persona_automation.get_run(value["run_id"])
                     result["events"] = self.persona_automation.events(value["run_id"], 30)
                     return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_STATUS_COLLECTED", "run": result}
                 if value.get("project_id"):
-                    return self.persona_automation.surface(_identifier(value["project_id"], "project_id"))
+                    return self.persona_automation.surface(
+                        _identifier(value["project_id"], "project_id"),
+                        node_ref=value.get("node_ref"),
+                        session_anchor_ref=value.get("session_anchor_ref"),
+                    )
                 raise PersonaAutomationError("PERSONA_AUTOMATION_STATUS_TARGET_REQUIRED", "run_id or project_id is required")
             if action_id == "persona.automation.tick":
                 value = _exact_object_fields(request, field="persona_automation_tick", required=frozenset({"run_id", "owner_ref", "tick_id"}), optional=frozenset({"lease_seconds", "cursor"}))
@@ -33936,6 +34338,159 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             except ValueError:
                 status = HTTPStatus.BAD_REQUEST
             raise UniverseError(error.code, error.detail, status) from error
+
+    def _post_persona_coordination_bus(
+        self, record: Mapping[str, Any], *, extra_targets: Sequence[str] = ()
+    ) -> list[dict[str, Any]]:
+        """Deliver one exact coordination envelope to each live participant.
+
+        Delivery is evidence only.  A missing/offline terminal is retained as
+        an explicit status and never becomes an inferred agreement.
+        """
+
+        participants = list(record.get("participant_anchors") or [])
+        targets = list(dict.fromkeys([str(item).strip() for item in participants + list(extra_targets) if str(item).strip()]))
+        host = self._session_anchor_terminal_host()
+        body = _canonical_json({
+            "schema": "universe.persona-coordination-message.v1",
+            "coordination_id": record.get("coordination_id"),
+            "state": record.get("state"),
+            "proposal_version": record.get("proposal_version"),
+            "node_ref": record.get("node_ref"),
+            "todo_id": record.get("todo_id"),
+            "task_frame_id": record.get("task_frame_id"),
+            "file_scope": record.get("file_scope") or [],
+            "participants": participants,
+            "evidence": record.get("evidence") or [],
+            "proposal": record.get("proposal") or {},
+            "responses": record.get("responses") or {},
+            "next_action": record.get("next_action"),
+            "escalation": record.get("escalation"),
+        })
+        deliveries: list[dict[str, Any]] = []
+        for anchor in targets:
+            matches = [
+                item for item in host.list_sessions()
+                if str(item.get("session_anchor_ref") or item.get("active_session_anchor_ref") or "").strip() == anchor
+                and str(item.get("project_id") or "").strip() == str(record.get("project_id") or "").strip()
+                and str(item.get("state") or "").upper() == "LIVE"
+            ]
+            if len(matches) != 1:
+                deliveries.append({"anchor_ref": anchor, "status": "OFFLINE" if not matches else "ERROR", "detail": "exact live Session Anchor terminal unavailable"})
+                continue
+            terminal_id = str(matches[0].get("terminal_id") or "").strip()
+            try:
+                posted = self.session_bus.post(
+                    host,
+                    {
+                        "to": {"terminal_id": terminal_id, "session_anchor_ref": anchor},
+                        "from": {"session_anchor_ref": record.get("initiator_anchor_ref")},
+                        "kind": "COORDINATION",
+                        "subtype": "PERSONA_RESOURCE_CONFLICT",
+                        "notify": "NONE",
+                        "project_id": record.get("project_id"),
+                        "node_ref": record.get("node_ref"),
+                        "task_frame_ref": record.get("task_frame_id") or "",
+                        "thread_id": record.get("coordination_id"),
+                        "idempotency_key": f"persona-coordination:{record.get('coordination_id')}:{record.get('proposal_version')}:{anchor}",
+                        "body_text": body,
+                    },
+                )
+                messages = posted.get("messages") if isinstance(posted, Mapping) else None
+                message = messages[0] if isinstance(messages, list) and messages else posted
+                deliveries.append({"anchor_ref": anchor, "terminal_id": terminal_id, "status": "QUEUED", "message_id": message.get("message_id") if isinstance(message, Mapping) else None})
+            except (SessionBusError, TerminalHostError, UniverseError) as error:
+                deliveries.append({"anchor_ref": anchor, "terminal_id": terminal_id, "status": "ERROR", "error_code": getattr(error, "code", "BUS_DELIVERY_FAILED"), "detail": str(error)})
+        return deliveries
+
+    def _handle_persona_coordination_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._persona_actor(context)
+        action_id = str(context.get("action_id") or "").strip()
+        try:
+            if action_id == "persona.collaboration.open":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_collaboration_open",
+                    required=frozenset({"project_id", "node_ref", "participant_anchors", "initiator_anchor_ref", "file_scope", "evidence", "proposal", "request_id"}),
+                    optional=frozenset({"todo_id", "task_frame_id"}),
+                )
+                project_id = _identifier(value["project_id"], "project_id")
+                node_ref = self._validate_persona_assignment_node_ref(project_id, value["node_ref"])
+                self.store.get_feature_node(node_ref)
+                scope = self._validate_fleet_worker_scope_filters({"project_id": project_id, "node_ref": node_ref, "todo_id": value.get("todo_id"), "task_frame_id": value.get("task_frame_id")})
+                anchors = list(value["participant_anchors"])
+                if value["initiator_anchor_ref"] not in anchors:
+                    anchors.append(value["initiator_anchor_ref"])
+                for anchor in anchors:
+                    self._validate_persona_assignment_anchor(project_id, anchor)
+                coordination, created = self.persona_coordination.create({**value, "project_id": project_id, "node_ref": node_ref, "todo_id": scope.get("todo_id"), "task_frame_id": scope.get("task_frame_id"), "participant_anchors": anchors})
+                deliveries = self._post_persona_coordination_bus(coordination) if created else []
+                result = self.persona_coordination.record_deliveries(coordination["coordination_id"], deliveries) if deliveries else coordination
+                if created:
+                    self.store.append_event(project_id, {"event_id": "persona_coordination_" + _json_sha256({"coordination_id": result["coordination_id"], "state": result["state"]})[:24], "event_type": "PERSONA_COORDINATION", "payload": {"coordination_id": result["coordination_id"], "state": result["state"], "node_ref": result["node_ref"], "todo_id": result.get("todo_id"), "task_frame_id": result.get("task_frame_id"), "participants": result["participant_anchors"], "file_scope": result["file_scope"], "next_action": result["next_action"], "delivery": deliveries}})
+                return {"schema": "universe.persona-coordination.v1", "status": "PERSONA_COORDINATION_OPENED" if created else "PERSONA_COORDINATION_REPLAYED", "coordination": result}
+            if action_id == "persona.collaboration.propose":
+                value = _exact_object_fields(request, field="persona_collaboration_propose", required=frozenset({"coordination_id", "proposer_anchor_ref", "expected_proposal_version", "proposal", "evidence", "request_id"}), optional=frozenset())
+                current = self.persona_coordination.get(value["coordination_id"])
+                self._validate_persona_assignment_anchor(current["project_id"], value["proposer_anchor_ref"])
+                result = self.persona_coordination.propose(value)
+                deliveries = self._post_persona_coordination_bus(result)
+                result = self.persona_coordination.record_deliveries(result["coordination_id"], deliveries)
+                return {"schema": "universe.persona-coordination.v1", "status": "PERSONA_COORDINATION_PROPOSED", "coordination": result}
+            if action_id == "persona.collaboration.respond":
+                value = _exact_object_fields(request, field="persona_collaboration_respond", required=frozenset({"coordination_id", "responder_anchor_ref", "expected_proposal_version", "outcome", "evidence", "request_id"}), optional=frozenset())
+                current = self.persona_coordination.get(value["coordination_id"])
+                self._validate_persona_assignment_anchor(current["project_id"], value["responder_anchor_ref"])
+                result = self.persona_coordination.respond(value)
+                extra_targets: list[str] = []
+                if result["state"] == "ESCALATED":
+                    for session in self.session_supervisor.list_sessions(include_hidden=True):
+                        if str(session.get("project_id") or "") == result["project_id"] and "CONDUCTOR" in self._anchor_modes(str(session.get("session_anchor_ref") or "")):
+                            extra_targets.append(str(session.get("session_anchor_ref") or ""))
+                deliveries = self._post_persona_coordination_bus(result, extra_targets=extra_targets)
+                result = self.persona_coordination.record_deliveries(result["coordination_id"], deliveries)
+                self.store.append_event(result["project_id"], {"event_id": "persona_coordination_" + _json_sha256({"coordination_id": result["coordination_id"], "state": result["state"], "proposal_version": result["proposal_version"], "responses": result["responses"]})[:24], "event_type": "PERSONA_COORDINATION", "payload": {"coordination_id": result["coordination_id"], "state": result["state"], "node_ref": result["node_ref"], "todo_id": result.get("todo_id"), "task_frame_id": result.get("task_frame_id"), "participants": result["participant_anchors"], "file_scope": result["file_scope"], "next_action": result["next_action"], "escalation": result.get("escalation"), "delivery": deliveries}})
+                return {"schema": "universe.persona-coordination.v1", "status": "PERSONA_COORDINATION_RESPONSE_RECORDED", "coordination": result}
+            if action_id == "persona.collaboration.read":
+                value = _exact_object_fields(request, field="persona_collaboration_read", required=frozenset(), optional=frozenset({"coordination_id", "project_id", "node_ref"}))
+                if value.get("coordination_id"):
+                    result = self.persona_coordination.get(value["coordination_id"])
+                    return {"schema": "universe.persona-coordination.v1", "status": "PERSONA_COORDINATION_READ", "coordination": result}
+                project_id = _identifier(value.get("project_id"), "project_id")
+                return {"schema": "universe.persona-coordination.v1", "status": "PERSONA_COORDINATION_LISTED", "project_id": project_id, "coordinations": self.persona_coordination.list(project_id, node_ref=value.get("node_ref"))}
+            raise PersonaCoordinationError("PERSONA_COORDINATION_ACTION_UNKNOWN", "unsupported Persona collaboration Action", 404)
+        except PersonaCoordinationError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus(error.status)) from error
+
+    def _handle_master_message_orphan_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        del actor
+        action_id = str(context.get("action_id") or "").strip()
+        required = {"project_id", "message_id", "actor_anchor_ref", "expected_owner_session_anchor_ref", "expected_owner_assignment_revision", "request_id", "reason"}
+        optional = {"current_owner_session_anchor_ref", "current_owner_assignment_revision", "idempotency_key"}
+        value = _exact_object_fields(request, field="master_message_orphan", required=frozenset(required), optional=frozenset(optional))
+        project_id = _identifier(value["project_id"], "project_id")
+        actor_anchor = _required_text(value["actor_anchor_ref"], "actor_anchor_ref")
+        self._validate_persona_assignment_anchor(project_id, actor_anchor)
+        modes = self._anchor_modes(actor_anchor)
+        if not (modes & {"MASTER", "CONDUCTOR"}):
+            raise UniverseError("MASTER_MESSAGE_ORPHAN_ACTOR_INVALID", "orphan queue operations require a project Master or Conductor Anchor", HTTPStatus.FORBIDDEN)
+        if action_id == "master-message.orphan-cancel":
+            message = self.store.cancel_orphan_master_message(project_id, value["message_id"], actor_anchor_ref=actor_anchor, expected_owner_session_anchor_ref=value["expected_owner_session_anchor_ref"], expected_owner_assignment_revision=value["expected_owner_assignment_revision"], request_id=value["request_id"], reason=value["reason"])
+            return {"schema": API_SCHEMA, "status": "MASTER_MESSAGE_ORPHAN_CANCELLED", "message": message}
+        if action_id == "master-message.orphan-reissue":
+            current_owner = _required_text(value.get("current_owner_session_anchor_ref"), "current_owner_session_anchor_ref")
+            current_revision = value.get("current_owner_assignment_revision")
+            if type(current_revision) is not int or current_revision < 1:
+                raise UniverseError("MASTER_MESSAGE_OWNER_REVISION_INVALID", "current_owner_assignment_revision must be a positive integer", HTTPStatus.BAD_REQUEST)
+            result = self.store.reissue_orphan_master_message(project_id, value["message_id"], actor_anchor_ref=actor_anchor, expected_owner_session_anchor_ref=value["expected_owner_session_anchor_ref"], expected_owner_assignment_revision=value["expected_owner_assignment_revision"], current_owner_session_anchor_ref=current_owner, current_owner_assignment_revision=current_revision, idempotency_key=value.get("idempotency_key") or value["request_id"], request_id=value["request_id"], reason=value["reason"])
+            self._wake_live_master_sessions(project_id, reason="orphan queue item reissued")
+            return {"schema": API_SCHEMA, **result}
+        raise UniverseError("MASTER_MESSAGE_ORPHAN_ACTION_UNKNOWN", "unsupported orphan Master message Action", HTTPStatus.NOT_FOUND)
 
     def _handle_rag_archive_candidate_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
