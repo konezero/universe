@@ -824,3 +824,48 @@ was repeated when the first evidence-label storage attempt rejected a
 `NOT_RUN` marker. This is bounded isolated acceptance only. P1 and operational
 Host-wide acceptance remain `IN_PROGRESS`/`NOT_RUN`, Grok was `NOT_CALLED`, and
 the existing user Host was preserved.
+
+## 13. Product surface responsibility decision — 2026-09-15
+
+The Persona screen is the **Persona Library**, not the operational organization
+screen. It registers, versions, archives and restores reusable Master, Worker and
+Reviewer definitions. A definition may describe responsibility, decision rules,
+skills, provider/model preferences, budget and escalation conditions. Persona
+text remains natural-language behavior context and creates no authority.
+
+Fleet owns operational organization:
+
+1. A Feature Node receives one active Master Persona and exact Master Session
+   Anchor. The assignment is visible on the node.
+2. Fleet creates a new session already scoped to the selected project/node, or
+   binds a server-declared eligible existing session. Cross-project, ambiguous
+   and inferred fallback matches are forbidden.
+3. The node Master selects bounded Worker or Reviewer Personas, skills,
+   provider/model/effort, and the exact Todo or Task Frame for each execution.
+   Multiple Worker/Reviewer sessions may coexist; active Master ownership remains
+   singular and uses the existing explicit handoff contract.
+4. Fleet opens an assigned session's exact terminal tab; the terminal's node
+   label returns to the exact Fleet node. `UNASSIGNED` is an explicit state.
+
+The terminal dock is the execution surface. Each tab displays the authoritative
+Session Anchor, node, role/Persona, Todo or Task Frame, and Host/provider state.
+Working, waiting for input, approval required, quota blocked, failed, completed
+and disconnected are tab states with text labels. ACP-originated user-attention
+state is also shown on its owning tab. The separate terminal-header Actions
+inbox is retired. Selected-terminal cancel, stop, reconnect and handoff remain
+contextual session controls.
+
+Activity is the immutable project execution history. Commit/push, test and
+validation, Todo transition, session lifecycle, assignment/handoff, command or
+typed Action result, failure, quota stop and recovery belong there with exact
+node -> Todo -> Task Frame -> Session Anchor lineage. Activity is supplied by one
+authoritative server projection with cursor/order; the browser must not merge
+fallback sources into apparent truth. Activity records what happened, Fleet
+shows what should happen next, and the terminal shows what is executing now.
+
+Implementation remains pending for the complete surface move: the current
+Persona page still contains assignment controls, the Actions dialog still mixes
+active reply/approval with Git history, and the dedicated Activity renderer still
+merges room messages and Master handoffs rather than consuming the complete
+project event projection. These are implementation gaps, not alternate product
+contracts.

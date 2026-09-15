@@ -1,7 +1,7 @@
 # Universe UI — feature inventory & placement
 
 Where every action/feature lives in the shell IA
-(`rag/universe-shell-ia-and-galaxy-view`). Product intent reconciled 2026-09-13.
+(`rag/universe-shell-ia-and-galaxy-view`). Product intent reconciled 2026-09-15.
 Historical implementation checkmarks below are dated observations, not proof
 that the current product satisfies the target.
 
@@ -28,11 +28,12 @@ Shell regions:
 
 | view | current | target | notes |
 |---|---|---|---|
-| **Fleet** | `showGoalPlanView` + integrated project/node/Todo/kanban home | Goal/program description -> plan -> existing nodes -> detailed Todos -> kanban | Goal/plan presentation and complete node coverage remain gaps |
+| **Fleet** | `showGoalPlanView` + integrated project/node/Todo/kanban home | Goal/program description -> plan -> existing nodes -> detailed Todos -> kanban, plus node team/session assignment | Fleet is the operating surface: bind one Master Persona to a Feature Node, create or bind Master/Worker sessions, and open their terminal tabs |
 | **Galaxy** | `showGraphView("semantic")` -> `buildUnifiedGalaxyGraph` | Graph and the sole prediction/future-path display | Existing prediction UI elsewhere must be aligned |
-| **Activity** | `showGraphView("timeline")` / inspector Activity tab | ⏳ needs its own centre view (immutable event log) | today it is a graph mode + an inspector tab |
+| **Activity** | dedicated centre screen, but `renderActivity()` currently merges only room messages and Master handoffs | Immutable project event projection for session, command, file, test, commit, push, failure and recovery, each linked to node/Todo/Task Frame/Session lineage | Commit/push history moves here; the UI must consume one authoritative server projection rather than merge fallback sources |
 | **Docs** | `showGraphView("documents")` | ⏳ ok as a graph mode; could be a list/reader | |
 | **Memory** | inspector tab (`openInspectorSurface`) | ⏳ dedicated screen like Bench, OR keep as inspector | RAG memory list + candidates + batch stages |
+| **Persona** | definition CRUD and session/node assignment are mixed in one screen | Persona Library only: reusable Master/Worker/Reviewer definitions, skills, model preferences, budget/escalation rules, versions and archive state | Operational assignment moves to Fleet; Persona describes behavior and never creates authority |
 | **Bench** | ✅ dedicated centre screen (`showBenchScreen`) | ✅ done | |
 | **Rooms** | `openProviderSettings` (settings → rooms tab) | ⏳ own view — meeting/boss rooms are primary surfaces | currently buried in Settings |
 | **+ Project** | `openFreshProjectWizard` / `#fresh-project-dialog` | Shared draft in the upper work area with conversation available | Human, LLM, and direct-entry paths; see §4 |
@@ -67,7 +68,7 @@ Shell regions:
 | `session-observatory-dialog` | (was topbar ◎) → rail? Settings? | **decide**: fold into the context panel's SESSIONS section, or keep as a dialog reachable from there |
 | `session-bus-dialog` | conductor inbox | keep |
 | `session-summary-dialog` | session card → summary / resume | keep |
-| `action-inbox-dialog` | "Actions" button (terminal dock header) | keep |
+| `action-inbox-dialog` | current terminal dock "Actions" button | **remove** — ACP-era approval/activity inbox is redundant once user-attention state is projected on the owning terminal tab; migrate Git history to Activity |
 | `release-dialog` | (was topbar ▦) | keep, launch from Settings or a Docs/Delivery view |
 
 ## 4. Fresh-project flow ("+ Project")
@@ -116,10 +117,28 @@ Board) + the conversation/terminal layer.
 
 - Right column (default) OR bottom (`body.terminal-bottom`, "▼/▶" toggle) — ✅ done.
 - Modes: single / tabs / **grid** (all sessions) — ✅ grid done.
-- ⏳ hover-peek popover on a Fleet card's session badge → liveness + last PTY
-  lines. Blocked: needs `task_frame_id → terminal_id / liveness` in the
-  projection or a small endpoint.
-- ⏳ click a Fleet card's session badge → open that PTY in the dock. Same link gap.
+- Every tab represents one exact Session Anchor and displays its authoritative
+  node, role/Persona, Todo or Task Frame, and Host/provider state. Required
+  labels include working, waiting for input, approval required, quota blocked,
+  failed, completed, disconnected and unassigned; color is supplemental only.
+- User-attention state appears on the owning terminal tab. There is no separate
+  terminal-header Actions inbox. Clicking the marked tab opens the real waiting
+  terminal position. Current-turn cancel, stop, reconnect and handoff remain
+  controls of the selected terminal and belong in its contextual overflow menu.
+- Fleet is the primary assignment entry. A Feature Node offers **New session**
+  and **Bind existing session**. New-session input is pre-bound to the selected
+  project/node; existing-session choices are server-declared eligible sessions,
+  never cross-project or inferred fallback matches.
+- A Feature Node has one active Master owner and may have multiple Worker or
+  Reviewer execution sessions. The node's Master Persona selects bounded Worker
+  Personas, skills, provider/model/effort and Todo/Task Frame assignments. Persona
+  text describes behavior; the node/Todo/Task Frame binding limits authority.
+- The Persona view is the reusable Persona Library. Session and node assignment
+  controls move to Fleet. The terminal shows the applied Persona and binding but
+  is not the primary organization editor.
+- Fleet session badges and terminal tabs are bidirectional: Fleet opens the exact
+  terminal; the terminal's node label opens the exact Fleet node. Missing binding
+  is shown as `UNASSIGNED` and is never guessed.
 
 ## 8. Per-view context panel (2nd column)
 
@@ -147,9 +166,13 @@ The mode tree itself moves into the Fleet context panel's "scope" section.
 
 ## Open decisions for the user
 
-1. **Activity** & **Memory** & **Rooms** — dedicated centre views, or keep as
-   inspector tabs / graph modes? (Bench got its own screen; these three are the
-   same question.)
+Activity is no longer open: it is a dedicated centre view backed by an immutable,
+node-linked project event projection. Persona is a reusable registration library;
+operational session assignment belongs to Fleet. The terminal-header Actions inbox
+is retired in favor of status on each exact terminal tab.
+
+1. **Memory** & **Rooms** — dedicated centre views, or keep as inspector tabs /
+   graph modes?
 2. **Session observatory** — fold into the Fleet context panel's SESSIONS
    section, or keep the dialog?
 3. **Conductor greeting + metrics** — keep a status strip, or drop entirely?
