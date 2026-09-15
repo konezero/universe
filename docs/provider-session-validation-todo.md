@@ -36,12 +36,29 @@ terminate/rebind a resident Provider session.
 
 ## P1 - Grok bounded-session CLI probe
 
-- [ ] Run a real Grok CLI bounded Worker session after provider quota resets.
-- [ ] Capture provider session and Universe coordinate state before and after the run.
-- [ ] Verify the bounded run does not persist a resumable session reference or replace the Node/Mode connection coordinate.
-- [ ] Verify close terminates the bounded provider process and leaves no resident-session binding.
+- [x] Run a real Grok CLI bounded Worker session after provider quota resets.
+- [x] Capture provider session and Universe coordinate state before and after the run.
+- [x] Verify the bounded run does not persist a resumable session reference or replace the Node/Mode connection coordinate.
+- [x] Verify close terminates the bounded provider process and leaves no resident-session binding.
 
 Acceptance evidence must come from the actual Grok CLI process. Structural and contract tests alone do not complete this item.
+
+Acceptance completed on 2026-09-16 with a real `grok-4.5` ACP process and
+`ephemeral=True`. The bounded Worker returned the exact requested marker. Its
+provider session id was not sent to the Universe session observer, no Universe
+terminal or resident binding was created, and the existing Grok Project Master
+kept the same live Session Anchor, Host and provider-session coordinate before
+and after the run. `close()` terminated the bounded child process. The created
+provider history entry was then removed through the supported
+`grok sessions delete` command. Redacted evidence is stored at
+`.ai/runtime/tmp/grok-persona-acceptance-20260916/grok-bounded-worker-acceptance.json`.
+
+This acceptance is separate from the resident Grok TUI Host-turn probe. That
+probe used `HOST_TURN_DELIVERY` and produced the exact in-thread Session Bus
+reply; its evidence is stored beside the bounded result in
+`grok-host-turn-roundtrip-evidence.json`. Grok does not expose the Codex native
+queue contract, so this documentation does not label the PTY Host-turn path a
+native provider queue.
 
 ## P2 - Claude MCP bootstrap file cleanup
 
