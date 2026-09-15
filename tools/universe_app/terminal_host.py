@@ -1631,6 +1631,16 @@ class TerminalHost:
                 session.host_runtime_versions = session.backend.runtime_versions
                 session.host_compatibility = session.backend.compatibility
                 session.protocol_state = session.backend.protocol_state
+                # A provider Resume arrives with a server-verified provider
+                # session coordinate. Seal that identity on the newly attached
+                # Rust Host before the first provider command or queued turn can
+                # run. Fresh sessions still bind through their provider-native
+                # SessionStart hook once the provider creates an identity.
+                if session.resume_attachment_authorized and session.resume_session_ref:
+                    session.backend.client.bind_provider_session(
+                        resolved_provider, session.resume_session_ref
+                    )
+                    session.backend.client.bind_mode(requested_mode)
             else:
                 session.backend = self._spawn(
                     shell_executable,

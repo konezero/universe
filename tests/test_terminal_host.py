@@ -79,6 +79,12 @@ class FakeReconnectionClient:
         self.executions: list[bytes] = []
         self.writes: list[bytes] = []
         self.shutdown_called = False
+        self.provider: str | None = None
+        self.provider_session_ref: str | None = None
+        self.mode: str | None = None
+        self.session_binding_generation = 0
+        self.binding_calls: list[tuple[str, str]] = []
+        self.event_order: list[str] = []
 
     def _host(self) -> dict[str, object]:
         return {
@@ -98,6 +104,10 @@ class FakeReconnectionClient:
             "supervisor_version": "UniverseSupervisor/1",
             "host_version": "UniverseSessionHost/1",
             "pty_version": "UniverseConPty/1",
+            "provider": self.provider,
+            "provider_session_ref": self.provider_session_ref,
+            "mode": self.mode,
+            "session_binding_generation": self.session_binding_generation,
         }
 
     def request(self, action: str, **fields):
@@ -109,6 +119,7 @@ class FakeReconnectionClient:
             self.attached_supervisor_id = None
             return {"host": self._host()}
         if action == "execute":
+            self.event_order.append("execute")
             self.executions.append(base64.b64decode(fields["input_base64"]))
             return {"host": self._host()}
         if action == "write":
@@ -137,6 +148,21 @@ class FakeReconnectionClient:
         return {"host": self._host()}
 
     def status(self):
+        return self._host()
+
+    def bind_provider_session(self, provider: str, provider_session_ref: str):
+        self.provider = provider
+        self.provider_session_ref = provider_session_ref
+        self.session_binding_generation += 1
+        self.binding_calls.append(("provider", provider_session_ref))
+        self.event_order.append("bind_provider")
+        return self._host()
+
+    def bind_mode(self, mode: str):
+        self.mode = mode
+        self.session_binding_generation += 1
+        self.binding_calls.append(("mode", mode))
+        self.event_order.append("bind_mode")
         return self._host()
 
     def shutdown(self) -> None:
@@ -339,6 +365,39 @@ class TerminalHostTests(unittest.TestCase):
         self.assertIsNone(
             _DEV_CHANNEL_PROMPT_RE.search(b"local production environment")
         )
+
+    def test_authorized_resume_binds_host_before_provider_command(self) -> None:
+        registry = FakeReconnectionRegistry()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable", return_value="codex.exe"
+        ), patch(
+            "universe_app.terminal_host.startup_argv",
+            return_value=["resume", "provider-thread"],
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4242, started_at=123.5),
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-resume-binding",
+                provider="CODEX",
+                resume_session_ref="provider-thread",
+                resume_attachment_authorized=True,
+            )
+
+        client = registry.clients["anchor-resume-binding"]
+        self.assertEqual(
+            [("provider", "provider-thread"), ("mode", "MASTER")],
+            client.binding_calls,
+        )
+        self.assertEqual("CODEX", client.provider)
+        self.assertEqual("provider-thread", client.provider_session_ref)
+        self.assertEqual("MASTER", client.mode)
+        self.assertEqual(["bind_provider", "bind_mode", "execute"], client.event_order)
+        self.assertEqual(1, len(client.executions))
 
     def test_rust_hosted_claude_auto_confirms_the_dev_channel_prompt(self) -> None:
         registry = FakeReconnectionRegistry()
