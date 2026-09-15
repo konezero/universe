@@ -33,3 +33,8 @@ assert.equal(project(session,[message]).body,message.body_text);
 session.host_turn_state.latest_delivery.phase="NATIVE_UNCONFIRMED";
 assert.equal(project(session,[message]).status,"실패 · 확인 필요");
 assert.equal(project(session,[message]).body,message.body_text);
+
+const waiting={...claudeMessage,lifecycle:{...claudeMessage.lifecycle,quota_wait:{state:"WAITING_QUOTA",resets_at:1789458000}}};
+assert.equal(project(session,[waiting]).statusCode,"WAITING_QUOTA");
+assert.equal(project(session,[waiting]).body,waiting.body_text);
+assert.equal(project(session,[{...waiting,lifecycle_state:"COMPLETED"}]).body,"");

@@ -1313,6 +1313,68 @@ class SessionBus:
             self._persist_message(tid, result)
             return self._public_message(instruction, headers_only=False)
 
+    def recover_claude_quota(self, *, session_anchor_ref: str, observation: Mapping[str, Any], idle: bool, now_epoch: float) -> list[str]:
+        """Keep the original work, retry one distinct channel attempt per error.
+
+        The caller supplies an exact-session provider error, never a global
+        account snapshot. A deadline permits one attempt, not AVAILABLE.
+        """
+        if observation.get("state") != "EXHAUSTED" or observation.get("source") != "claude-transcript-api-error":
+            return []
+        try:
+            from datetime import datetime
+            observed = datetime.fromisoformat(str(observation["observed_at"]).replace("Z", "+00:00")).timestamp()
+            evidence = str(observation["evidence_id"])
+        except (KeyError, ValueError):
+            return []
+        reset = next((w.get("resets_at") for w in observation.get("windows", []) if isinstance(w.get("resets_at"), (int, float))), None)
+        resumed = []
+        with self._lock:
+            for message in self._messages.values():
+                life = message.setdefault("lifecycle", {})
+                if (message.get("recipient_anchor_ref") != session_anchor_ref
+                        or _message_lifecycle(message) != "STARTED"
+                        or life.get("delivery_channel") != "CLAUDE_CODE_CHANNEL"):
+                    continue
+                try:
+                    started = datetime.fromisoformat(str(life.get("started_at") or message["created_at"]).replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                wait = life.get("quota_wait") or {}
+                if observed < max(started, float(wait.get("resumed_at_epoch") or 0)) or wait.get("resumed_evidence_id") == evidence:
+                    continue
+                changed = wait.get("evidence_id") != evidence
+                if changed:
+                    wait = {"provider": "CLAUDE", "state": "WAITING_QUOTA", "evidence_id": evidence,
+                            "observed_at": observation["observed_at"], "resets_at": reset,
+                            "provider_session_ref": observation.get("provider_session_ref"),
+                            "detail": str(observation.get("notice") or "")}
+                    life["quota_wait"] = wait
+                if reset is not None and now_epoch >= reset + 5 and idle:
+                    # New transport id bypasses Host dedup only for this exact
+                    # exhausted attempt; the Bus id and original body survive.
+                    transport_id = "msg_" + hashlib.sha256((message["message_id"] + evidence).encode()).hexdigest()[:24]
+                    life.setdefault("channel_attempt_history", []).append({"channel_message_id": life.get("channel_message_id", message["message_id"]), "quota_evidence_id": evidence})
+                    life["channel_message_id"] = transport_id
+                    wait.update(state="RESUME_PENDING", resumed_evidence_id=evidence, resumed_at_epoch=now_epoch)
+                    life["awaits_authoritative_reply"] = False
+                    life["execution_phase"] = "QUOTA_RESUME_PENDING"
+                    life.pop("dispatch_attempt", None)
+                    message["delivery_state"] = "PENDING"
+                    message["lifecycle_state"] = "QUEUED"
+                    resumed.append(message["message_id"])
+                    changed = True
+                if not changed:
+                    continue
+                message["updated_at"] = utc_now()
+                self._persist_message(str(message.get("_terminal_id") or ""), message)
+        return resumed
+
+    def current_channel_attempt(self, message_id: str, channel_message_id: str) -> bool:
+        with self._lock:
+            message = self._messages.get(message_id) or {}
+            return (message.get("lifecycle", {}).get("channel_message_id") or message_id) == channel_message_id
+
     def recover_pending_deliveries(self) -> dict[str, Any]:
         """Requeue interrupted actionable claims and expose all retryable work.
 
@@ -1511,7 +1573,9 @@ class SessionBus:
                         "awaits_authoritative_reply"
                     )
                 )
-                if lifecycle == "STARTED" and awaits_reply:
+                if lifecycle == "STARTED" and (message.get("lifecycle", {}).get("quota_wait") or {}).get("state") == "WAITING_QUOTA":
+                    work_state = "WAITING_QUOTA"
+                elif lifecycle == "STARTED" and awaits_reply:
                     # The adapter accepted the message, but the transport's
                     # own final reply is still authoritative. Expose that
                     # distinction to the UI so a waiting Claude channel is
@@ -1885,6 +1949,7 @@ class SessionBus:
         host: Any | None = None,
         conflict_on_changed: bool = False,
         action_request_digest: str = "",
+        channel_message_id: str = "",
     ) -> dict[str, Any]:
         mid = _text(message_id, "message_id", required=True, limit=80)
         body = "" if body_text is None else str(body_text)
@@ -1905,6 +1970,8 @@ class SessionBus:
                 raise SessionBusError(
                     "BUS_MESSAGE_NOT_FOUND", "message does not exist", 404
                 )
+            if channel_message_id and (original.get("lifecycle", {}).get("channel_message_id") or mid) != channel_message_id:
+                raise SessionBusError("BUS_CHANNEL_ATTEMPT_STALE", "Channel result belongs to a previous quota attempt", 409)
             stored_tid = str(original.get("_terminal_id") or "")
             stored_anchor = str(original.get("recipient_anchor_ref") or "")
             anchor_matches = bool(

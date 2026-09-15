@@ -1423,6 +1423,14 @@ function terminalInjectionProjection(session, messages) {
   const awaitingAuthoritativeReply =
     deliveryChannel === "CLAUDE_CODE_CHANNEL" &&
     lifecycle.awaits_authoritative_reply === true;
+  const quota = lifecycle.quota_wait;
+  if (quota?.state === "WAITING_QUOTA" && ["QUEUED", "ACCEPTED", "STARTED"].includes(message.lifecycle_state)) {
+    const reset = Number(quota.resets_at);
+    return { status: "\uCFFC\uD0C0 \uB300\uAE30", statusCode: "WAITING_QUOTA", messageId: message.message_id,
+      body: String(message.body_text || ""),
+      detail: reset > 0 ? `${new Date(reset * 1000).toLocaleString()} \uC774\uD6C4 Host \uB300\uAE30 \uC2DC \uC6D0 \uC791\uC5C5\uC744 \uD55C \uBC88 \uC7AC\uAC1C\uD569\uB2C8\uB2E4.`
+        : "\uCD08\uAE30\uD654 \uC2DC\uAC01 \uBBF8\uD655\uC778: \uC790\uB3D9 \uC7AC\uC2DC\uB3C4 \uC5C6\uC774 \uC791\uC5C5\uC744 \uBCF4\uC874\uD569\uB2C8\uB2E4." };
+  }
   const dispatchError = lifecycle.dispatch_attempt?.error_code;
   const failed = dispatchError || lifecycle.failed_at || message.lifecycle_state === "FAILED" ||
     ["WRITE_UNCERTAIN", "INPUT_UNCONFIRMED", "SUBMIT_UNCONFIRMED", "NATIVE_UNCONFIRMED"].includes(phase);

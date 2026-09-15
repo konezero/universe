@@ -7,15 +7,14 @@ CLI writes a transcript, and some of them record their rate-limit state there:
 * Codex ``~/.codex/sessions/**/rollout-*.jsonl`` -- a ``token_count`` event
   carries ``rate_limits.primary`` / ``.secondary`` with ``used_percent``,
   ``window_minutes`` and an epoch ``resets_at``.  Full data.
-* Claude ``~/.claude/projects/**/*.jsonl`` -- only a coarse ``system`` notice
-  ("Approaching your 5-hour usage limit"): a WARNING flag, no percentage.
+* Claude ``~/.claude/projects/**/*.jsonl`` -- system warnings and structured
+  assistant API errors with an explicit session reset clock; no percentage.
 * Grok ``~/.grok/logs/unified.jsonl`` -- the CLI logs a "billing: fetched
   credits config" line every ~30 s with ``creditUsagePercent`` and the weekly
   ``currentPeriod``. The freshest of the three.
 
-Quota is account-level, so the *newest* transcript for a provider is as good a
-source as any specific session's -- we never need to map a terminal to its
-transcript.  Reads are tail-only (last ~96 KiB) so a 40 MB transcript costs
+The account display uses the newest transcript. Work recovery must instead
+correlate the exact Supervisor provider session to its transcript.  Reads are tail-only (last ~96 KiB) so a 40 MB transcript costs
 nothing.
 """
 
@@ -181,54 +180,92 @@ def codex_quota_from_transcript(
     return None
 
 
+def _claude_reset_epoch(content: str, observed_at: str) -> int | None:
+    """Parse an explicit CLI clock + IANA zone; never guess the host timezone.
+
+    A clock-only reset is supported only for a session limit. Weekly/date
+    formats remain observable but cannot authorize a guessed retry time.
+    """
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    match = re.search(r"session limit.*?resets (\d{1,2})(?::(\d{2}))?\s*(am|pm) \(([^)]+)\)\s*$", content, re.I)
+    if not match:
+        return None
+    try:
+        hour, minute = int(match[1]), int(match[2] or 0)
+        if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+            return None
+        stamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            return None
+        local = stamp.astimezone(ZoneInfo(match[4]))
+        reset = local.replace(hour=hour % 12 + (12 if match[3].lower() == "pm" else 0), minute=minute, second=0, microsecond=0)
+        if reset <= local:
+            reset += timedelta(days=1)
+        return int(reset.timestamp())
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+
+
 def claude_quota_from_transcript(
     path: Path, *, max_age_seconds: float = 3600.0
 ) -> dict[str, Any] | None:
-    """Claude CLI only records a coarse 'approaching limit' system notice."""
-
+    """Read provider error records, not arbitrary assistant/user discussion."""
+    import hashlib
     if _stale(path, max_age_seconds=max_age_seconds):
         return None
     for line in reversed(_tail_lines(path)):
-        if '"type":"system"' not in line and '"type": "system"' not in line:
-            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("type") != "system":
+        if not isinstance(entry, dict):
             continue
-        content = str(entry.get("content") or "")
-        if "usage limit" not in content.lower():
+        api_error = entry.get("type") == "assistant" and entry.get("isApiErrorMessage") is True
+        if api_error:
+            message = entry.get("message") or {}
+            parts = message.get("content", []) if isinstance(message, dict) else []
+            content = " ".join(str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("type") == "text") if isinstance(parts, list) else ""
+            if not re.search(r"you(?:'|’)?ve hit your (?:session|weekly|usage) limit", content, re.I):
+                continue
+        elif entry.get("type") == "system":
+            content = str(entry.get("content") or "")
+            if "usage limit" not in content.lower():
+                continue
+        else:
             continue
-        # A notice is only meaningful while it is recent — a 5-hour window may
-        # well have reset since an old one was written.
         stamp = entry.get("timestamp")
-        if isinstance(stamp, str):
-            try:
-                age = time.time() - datetime.fromisoformat(
-                    stamp.replace("Z", "+00:00")
-                ).timestamp()
-                if age > max_age_seconds:
-                    return None
-            except ValueError:
-                pass
-        match = _CLAUDE_LIMIT_NOTICE.search(content)
-        window_name = "USAGE_LIMIT"
-        if match:
-            window_name = (
-                match.group("window").upper().replace("-", "_").replace(" ", "_")
-            )
-        reached = "reached" in content.lower() or "hit" in content.lower()
+        try:
+            observed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if observed.tzinfo is None or not -60 <= time.time() - observed.timestamp() <= max_age_seconds:
+                continue
+        except ValueError:
+            continue
+        reached = api_error or "reached" in content.lower() or "hit" in content.lower()
+        reset = _claude_reset_epoch(content, str(stamp)) if api_error else None
+        window = {"name": "SESSION" if "session limit" in content.lower() else "5_HOUR" if "5-hour" in content.lower() else "USAGE_LIMIT"}
+        if reset is not None:
+            window["resets_at"] = reset
         return {
-            "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
-            "provider": "CLAUDE",
-            "source": "claude-transcript-notice",
-            "state": "EXHAUSTED" if reached else "WARNING",
-            "windows": [{"name": window_name}],
-            "notice": content[:200],
-            "observed_at": entry.get("timestamp") or _observed_at(path),
+            "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA, "provider": "CLAUDE",
+            "source": "claude-transcript-api-error" if api_error else "claude-transcript-notice",
+            "state": "EXHAUSTED" if reached else "WARNING", "windows": [window],
+            "notice": content[:200], "observed_at": stamp,
+            "provider_session_ref": path.stem,
+            "evidence_id": hashlib.sha256((path.stem + str(stamp) + content).encode("utf-8")).hexdigest(),
         }
     return None
+
+
+def claude_session_quota(provider_session_ref: str) -> dict[str, Any] | None:
+    # Exact session correlation for work recovery; newest account transcript
+    # alone must never suspend a different session's in-flight operation.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", provider_session_ref):
+        return None
+    paths = list((_provider_home("CLAUDE") / "projects").glob("*/" + provider_session_ref + ".jsonl"))
+    if len(paths) != 1:
+        return None
+    return claude_quota_from_transcript(paths[0], max_age_seconds=24 * 3600)
 
 
 def grok_quota_from_billing_log(

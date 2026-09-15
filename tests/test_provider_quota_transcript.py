@@ -313,3 +313,31 @@ def _recent_iso() -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeApiErrorQuotaTests(unittest.TestCase):
+    def parse(self, *, text="You've hit your session limit \u00b7 resets 4:40pm (Asia/Seoul)", flagged=True):
+        from unittest.mock import patch
+        from datetime import datetime
+        now = datetime.fromisoformat("2026-09-15T05:44:06+00:00").timestamp()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exact-session.jsonl"
+            _write(path, [{"type": "assistant", "isApiErrorMessage": flagged,
+                          "timestamp": "2026-09-15T05:44:06Z", "message": {"content": [{"type": "text", "text": text}]}}])
+            with patch("universe_app.provider_quota_transcript.time.time", return_value=now):
+                return claude_quota_from_transcript(path)
+
+    def test_actual_cli_error_and_explicit_reset(self):
+        from datetime import datetime
+        value = self.parse()
+        self.assertEqual(value["state"], "EXHAUSTED")
+        self.assertEqual(value["provider_session_ref"], "exact-session")
+        self.assertEqual(value["windows"][0]["resets_at"], datetime.fromisoformat("2026-09-15T16:40:00+09:00").timestamp())
+        self.assertNotIn("used_percent", value["windows"][0])
+
+    def test_chat_text_is_not_provider_error(self):
+        self.assertIsNone(self.parse(flagged=False))
+
+    def test_unknown_zone_and_weekly_clock_do_not_guess(self):
+        for text in ["You've hit your session limit - resets 4:40pm (Unknown/Zone)", "You've hit your weekly limit - resets 4:40pm (Asia/Seoul)"]:
+            self.assertNotIn("resets_at", self.parse(text=text)["windows"][0])

@@ -33004,7 +33004,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(error.code, error.detail, status) from error
 
     def _handle_service_status_action(self, request, context):
-        return self._service_action(request, context)
+        result = self._service_action(request, context)
+        result["session_bus_recovery"] = getattr(self, "_session_bus_recovery_last_run", {"status": "UNKNOWN"})
+        return result
 
     def _handle_service_restart_action(self, request, context):
         return self._service_action(request, context, restart=True)
@@ -38625,11 +38627,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     continue
                 mid = str(message["message_id"])
                 try:
-                    result = reader(tid, mid)
+                    attempt_id = str((message.get("lifecycle") or {}).get("channel_message_id") or mid)
+                    result = reader(tid, attempt_id)
                     if (result.get("kind") != "RESULT"
                             or result.get("status") not in {"ACCEPTED", "DUPLICATE"}):
                         continue
-                    if (result.get("message_id") != mid or result.get("session_anchor_ref") != anchor
+                    if (result.get("message_id") != attempt_id or result.get("session_anchor_ref") != anchor
                             or result.get("outcome") not in {"COMPLETED", "FAILED"}):
                         raise SessionBusError("BUS_CHANNEL_RESULT_COORDINATE_INVALID",
                                               "Host result does not match the exact message/anchor/outcome", 409)
@@ -38637,13 +38640,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         mid, terminal_id=tid, session_anchor_ref=anchor,
                         body_text=str(result.get("body_text") or ""),
                         result_ref=str(result.get("result_ref") or "") or f"claude-channel://{tid}/{mid}",
-                        outcome=result["outcome"], host=host,
+                        outcome=result["outcome"], host=host, channel_message_id=attempt_id,
                     )
                     recovered.append(mid)
                 except (SessionBusError, TerminalHostError) as error:
                     errors.append({"operation": "RECOVER_CLAUDE_CHANNEL_RESULT", "terminal_id": tid,
                                    "message_id": mid, "error_code": error.code, "detail": error.detail})
         return {"recovered_message_ids": recovered, "errors": errors}
+
+    def _recover_claude_quota_waits(self) -> dict[str, Any]:
+        from universe_app.provider_quota_transcript import claude_session_quota
+        resumed, errors = [], []
+        for terminal in self._session_anchor_terminal_host().list_sessions():
+            if terminal.get("provider") != "CLAUDE" or terminal.get("state") != "LIVE":
+                continue
+            tid = str(terminal.get("terminal_id") or "")
+            anchor = str(terminal.get("active_session_anchor_ref") or terminal.get("session_anchor_ref") or "")
+            try:
+                value = self.session_supervisor.get_session(str(terminal.get("supervisor_session_id") or ""))
+                session = value.public() if hasattr(value, "public") else value
+                if session.get("provider") != "CLAUDE" or session.get("session_anchor_ref") != anchor:
+                    continue
+                observation = claude_session_quota(str(session.get("provider_session_ref") or ""))
+                if not observation:
+                    continue
+                turn = terminal.get("host_turn_state") or {}
+                resumed.extend(self.session_bus.recover_claude_quota(
+                    session_anchor_ref=anchor, observation=observation,
+                    idle=turn.get("state") == "IDLE" and turn.get("input_active") is False,
+                    now_epoch=time.time()))
+            except (SessionSupervisorError, SessionBusError, OSError) as error:
+                errors.append({"operation": "RECOVER_CLAUDE_QUOTA", "terminal_id": tid,
+                               "error_code": getattr(error, "code", "QUOTA_OBSERVATION_FAILED"), "detail": str(error)})
+        return {"resumed_message_ids": resumed, "errors": errors}
 
     def _recover_claimed_master_queue_wakes(self) -> dict[str, Any]:
         """Close delivered queue notifications using durable claim evidence only."""
@@ -38674,6 +38703,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         host_turns = reconcile_host_turns(self)
         queue_wakes = self._recover_claimed_master_queue_wakes()
         channel_results = self._recover_claude_channel_results()
+        quota_waits = self._recover_claude_quota_waits()
         recovered = self.session_bus.recover_pending_deliveries()
         dispatches = self._dispatch_live_posted_session_instructions(recovered)
         pending_ids = [
@@ -38692,6 +38722,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "recovered_message_ids": recovered.get("recovered_message_ids", []),
             "queue_wakes": queue_wakes,
             "channel_results": channel_results,
+            "quota_waits": quota_waits,
             "host_turns": host_turns,
             "pending_message_ids": pending_ids,
             "dispatches": dispatches,
@@ -43840,6 +43871,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         terminal_id = str(terminal.get("terminal_id") or "").strip()
         if not terminal_id:
             return {"status": "TERMINAL_UNAVAILABLE"}
+        if provider == "CLAUDE":
+            from universe_app.provider_quota_transcript import claude_session_quota
+            quota = claude_session_quota(provider_session_ref)
+            if quota and quota.get("state") == "EXHAUSTED":
+                reset = next((w.get("resets_at") for w in quota.get("windows", []) if isinstance(w.get("resets_at"), (int, float))), None)
+                if reset is None or time.time() < reset + 5:
+                    return {"status": "WAITING_QUOTA", "resets_at": reset,
+                            "detail": str(quota.get("notice") or ""), "session_anchor_ref": session_anchor_ref}
         try:
             active_messages = self.session_bus.inbox(
                 self._session_anchor_terminal_host(),
@@ -43916,13 +43955,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             else "UNIVERSE_SESSION_BUS"
         )
         message_id = str(claim.get("message_id") or "")
+        channel_message_id = str((claim.get("lifecycle") or {}).get("channel_message_id") or message_id)
+        channel_body = str(delivery["body_text"])
+        if channel_message_id != message_id:
+            channel_body += ("\n[Quota recovery] Continue the original work from its saved progress; do not repeat completed changes. "
+                             "This is one retry after an observed quota reset deadline, not new work. "
+                             f"For the Claude channel reply use message_id={channel_message_id}; "
+                             f"for typed Session Bus reply keep the original message_id={message_id}.")
         channel_payload = {
             "schema": HOST_MESSAGE_CHANNEL_SCHEMA,
-            "message_id": message_id,
+            "message_id": channel_message_id,
             "session_anchor_ref": session_anchor_ref,
-            "content": str(delivery["body_text"]),
+            "content": channel_body,
             "meta": {
-                "message_id": message_id,
+                "message_id": channel_message_id,
                 "session_anchor_ref": session_anchor_ref,
                 "sender_id": sender_id,
                 "kind": str(claim.get("kind") or "INSTRUCTION").upper(),
@@ -43974,6 +44020,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             "Claude Channel result arrived before dispatch completed",
                             409,
                         )
+                    if not self.session_bus.current_channel_attempt(message_id, channel_message_id):
+                        return
                     if result.get("kind") == "ACK":
                         self.session_bus.acknowledge_instruction(
                             message_id, terminal_id=terminal_id, session_anchor_ref=session_anchor_ref,
@@ -43988,6 +44036,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         result_ref=str(result.get("result_ref") or "")
                         or f"claude-channel://{terminal_id}/{message_id}",
                         outcome=str(result.get("outcome") or "COMPLETED"),
+                        channel_message_id=channel_message_id,
                         host=self._session_anchor_terminal_host(),
                     )
                 try:

@@ -1182,3 +1182,119 @@ class SessionBusDurabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeQuotaRecoveryTests(unittest.TestCase):
+    """Real durable Bus, minimal metadata Host; no processes or shared profiles."""
+    def setUp(self):
+        from types import SimpleNamespace
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "bus.sqlite3"
+        self.bus = SessionBus(self.path)
+        self.anchor = "session_anchor_quota"
+        self.tid = "term_quota"
+        self.terminal = {"terminal_id": self.tid, "session_anchor_ref": self.anchor,
+                         "project_id": "test", "provider": "CLAUDE", "mode": "MASTER", "state": "LIVE"}
+        self.host = SimpleNamespace(list_sessions=lambda: [self.terminal], get=lambda tid: self.terminal)
+        posted = self.bus.post(self.host, {"kind": "INSTRUCTION", "to": {"terminal_id": self.tid}, "body_text": "Continue original work", "from": {"project_id": "test", "mode": "CONDUCTOR", "provider": "CODEX"}})
+        self.mid = posted["messages"][0]["message_id"]
+        self.start()
+        from datetime import datetime, timezone
+        self.now = time.time() + 1
+        self.observation = {"state": "EXHAUSTED", "source": "claude-transcript-api-error", "evidence_id": "error1",
+                            "observed_at": datetime.fromtimestamp(self.now, timezone.utc).isoformat(),
+                            "provider_session_ref": "exact", "windows": [{"resets_at": self.now + 60}]}
+
+    def start(self):
+        self.assertIsNotNone(self.bus.claim_instruction(self.host, terminal_id=self.tid, session_anchor_ref=self.anchor, message_id=self.mid))
+        self.bus.complete_instruction_claim(terminal_id=self.tid, session_anchor_ref=self.anchor, message_id=self.mid, delivery_channel="CLAUDE_CODE_CHANNEL")
+
+    def recover(self, offset=0, idle=True, **changes):
+        return self.bus.recover_claude_quota(session_anchor_ref=self.anchor, observation={**self.observation, **changes}, idle=idle, now_epoch=self.now + offset)
+
+    def test_deadline_idle_and_restart_deliver_one_attempt(self):
+        self.assertEqual(self.recover(), [])
+        self.assertEqual(self.bus._messages[self.mid]["lifecycle"]["quota_wait"]["state"], "WAITING_QUOTA")
+        self.bus = SessionBus(self.path)
+        self.assertEqual(self.recover(70, idle=False), [])
+        self.assertEqual(self.recover(70), [self.mid])
+        pending = self.bus.recover_pending_deliveries()["messages"]
+        self.assertEqual([m["message_id"] for m in pending], [self.mid])
+        self.assertEqual(pending[0]["body_text"], "Continue original work")
+        attempt = pending[0]["lifecycle"]["channel_message_id"]
+        self.assertNotEqual(attempt, self.mid)
+        self.bus = SessionBus(self.path)
+        self.start()
+        self.assertEqual(self.recover(80), [])
+        self.assertFalse(self.bus.current_channel_attempt(self.mid, self.mid))
+        with self.assertRaises(SessionBusError) as caught:
+            self.bus.reply(self.mid, session_anchor_ref=self.anchor, body_text="late result", channel_message_id=self.mid)
+        self.assertEqual(caught.exception.code, "BUS_CHANNEL_ATTEMPT_STALE")
+        self.bus.reply(self.mid, session_anchor_ref=self.anchor, body_text="actual result", channel_message_id=attempt)
+        self.assertEqual(self.bus._messages[self.mid]["lifecycle_state"], "REPLIED")
+
+    def test_missing_reset_and_untrusted_source_never_resume(self):
+        self.assertEqual(self.recover(100, source="account-global"), [])
+        self.assertNotIn("quota_wait", self.bus._messages[self.mid]["lifecycle"])
+        self.assertEqual(self.recover(100, windows=[]), [])
+        self.assertEqual(self.bus._messages[self.mid]["lifecycle_state"], "STARTED")
+
+    def test_new_error_waits_again_and_completed_work_never_restarts(self):
+        from datetime import datetime, timezone
+        self.recover(70)
+        self.start()
+        later = datetime.fromtimestamp(self.now + 80, timezone.utc).isoformat()
+        self.assertEqual(self.recover(80, evidence_id="error2", observed_at=later, windows=[{"resets_at":self.now + 200}]), [])
+        self.assertEqual(self.bus._messages[self.mid]["lifecycle"]["quota_wait"]["state"], "WAITING_QUOTA")
+        self.bus.reply(self.mid, session_anchor_ref=self.anchor, body_text="finished manually")
+        self.assertEqual(self.recover(300, evidence_id="error2", observed_at=later), [])
+
+
+    def test_server_exact_session_recovery_and_attempt_result(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from universe_server import UniverseHTTPServer
+        session = {"provider": "CLAUDE", "session_anchor_ref": self.anchor, "provider_session_ref": "exact"}
+        self.terminal.update(supervisor_session_id="session_exact", host_turn_state={"state":"IDLE", "input_active":False})
+        transport = SimpleNamespace(channel_result=Mock(return_value={"status":"PENDING"}))
+        server = SimpleNamespace(session_bus=self.bus, terminal_host=transport,
+            _session_anchor_terminal_host=lambda:self.host,
+            session_supervisor=SimpleNamespace(get_session=lambda sid:session))
+        with patch("universe_app.provider_quota_transcript.claude_session_quota", return_value=self.observation) as reader, patch("universe_server.time.time", return_value=self.now+70):
+            session["session_anchor_ref"] = "wrong"
+            self.assertEqual(UniverseHTTPServer._recover_claude_quota_waits(server)["resumed_message_ids"], [])
+            reader.assert_not_called()
+            session["session_anchor_ref"] = self.anchor
+            self.assertEqual(UniverseHTTPServer._recover_claude_quota_waits(server)["resumed_message_ids"], [self.mid])
+            reader.assert_called_once_with("exact")
+        self.start()
+        attempt = self.bus._messages[self.mid]["lifecycle"]["channel_message_id"]
+        transport.channel_result.return_value={"kind":"RESULT", "status":"ACCEPTED", "message_id":attempt,
+            "session_anchor_ref":self.anchor, "outcome":"COMPLETED", "body_text":"finished original work"}
+        result = UniverseHTTPServer._recover_claude_channel_results(server)
+        self.assertEqual(result["recovered_message_ids"], [self.mid])
+        transport.channel_result.assert_called_once_with(self.tid, attempt)
+        self.assertEqual(UniverseHTTPServer._recover_claude_channel_results(server)["recovered_message_ids"], [])
+
+
+    def test_public_dispatch_uses_attempt_id_and_callback_closes_original(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from universe_server import UniverseHTTPServer
+        self.recover(70)
+        session={"session_id":"session_exact", "session_anchor_ref":self.anchor, "provider":"CLAUDE", "mode":"MASTER", "provider_session_ref":"exact"}
+        transport=SimpleNamespace(channel_state=lambda tid:"READY", push_channel=Mock(return_value={"status":"ACCEPTED"}))
+        server=SimpleNamespace(session_bus=self.bus, terminal_host=transport,
+            _session_anchor_terminal_host=lambda:self.host, _complete_claimed_master_queue_wake=lambda m:False)
+        with patch("universe_app.provider_quota_transcript.claude_session_quota", return_value=self.observation), patch("universe_server.time.time", return_value=self.now+70):
+            result=UniverseHTTPServer._dispatch_pending_session_instruction(server, project_id="test", session=session, trigger="TURN_IDLE", message_id=self.mid, terminal=self.terminal)
+        self.assertEqual(result["status"], "DISPATCHED", result)
+        payload=transport.push_channel.call_args.args[1]
+        self.assertNotEqual(payload["message_id"], self.mid)
+        self.assertEqual(payload["meta"]["message_id"], payload["message_id"])
+        self.assertIn(self.mid, payload["content"])
+        self.assertIn("Continue original work", payload["content"])
+        callback=transport.push_channel.call_args.kwargs["on_result"]
+        callback({"kind":"RESULT", "outcome":"COMPLETED", "body_text":"done"})
+        self.assertEqual(self.bus._messages[self.mid]["lifecycle_state"], "REPLIED")
