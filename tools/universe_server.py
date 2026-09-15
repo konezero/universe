@@ -32393,6 +32393,152 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             for session in sessions
         }
 
+    def _validate_fleet_worker_assignment_lineage(
+        self, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Normalize and verify the complete Fleet Worker lineage.
+
+        The assignment table is deliberately append-only, but a durable row
+        is useful only when its project, node, Todo/Task Frame, and Session
+        Anchors all refer to real objects in the same project.  Do these
+        checks at the Action boundary, where the Session Supervisor and Task
+        Frame lineage stores are both available; the SQLite row then records
+        the already-verified coordinates rather than trusting caller strings.
+        """
+
+        project_id = _identifier(value.get("project_id"), "project_id")
+        self.store.get_project(project_id)
+        worker_anchor = _required_text(value.get("session_anchor_ref"), "session_anchor_ref")
+        assigned_by = _required_text(
+            value.get("assigned_by_session_anchor_ref"),
+            "assigned_by_session_anchor_ref",
+        )
+        self._validate_persona_assignment_anchor(project_id, worker_anchor)
+        self._validate_persona_assignment_anchor(project_id, assigned_by)
+        if "MASTER" not in self._anchor_modes(assigned_by):
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_MASTER_REQUIRED",
+                "assigned_by_session_anchor_ref must be a project Master Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+        if self._anchor_modes(worker_anchor) & {"MASTER", "CONDUCTOR"}:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_WORKER_MODE_INVALID",
+                "session_anchor_ref must identify a Worker/Reviewer session, not Master or Conductor",
+                HTTPStatus.CONFLICT,
+            )
+
+        node_ref = self._validate_persona_assignment_node_ref(
+            project_id, value.get("node_ref")
+        )
+        todo_id = value.get("todo_id")
+        if todo_id is not None:
+            todo_id = _identifier(todo_id, "todo_id")
+            todo = self.store.get_todo(todo_id)
+            if str(todo.get("project_id") or "") != project_id:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_TODO_PROJECT_MISMATCH",
+                    "todo_id belongs to a different project",
+                    HTTPStatus.CONFLICT,
+                )
+            todo_node = str(todo.get("node_ref") or "").strip()
+            if todo_node and node_ref and todo_node != node_ref:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_NODE_TODO_MISMATCH",
+                    "node_ref must match the Todo's node_ref",
+                    HTTPStatus.CONFLICT,
+                )
+            if todo_node and node_ref is None:
+                node_ref = todo_node
+
+        task_frame_id = value.get("task_frame_id")
+        if task_frame_id is not None:
+            task_frame_id = _identifier(task_frame_id, "task_frame_id")
+            try:
+                frame = self.task_frame_lineage.get_task_frame(task_frame_id)
+            except TaskFrameLineageError as error:
+                raise UniverseError(
+                    error.code, error.detail, HTTPStatus(error.status)
+                ) from error
+            for field in ("origin_session_anchor_ref", "target_session_anchor_ref"):
+                frame_anchor = str(frame.get(field) or "").strip()
+                if frame_anchor:
+                    self._validate_persona_assignment_anchor(project_id, frame_anchor)
+            target_anchor = str(frame.get("target_session_anchor_ref") or "").strip()
+            if target_anchor and target_anchor != worker_anchor:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_FRAME_ANCHOR_MISMATCH",
+                    "task_frame target Session Anchor must match session_anchor_ref",
+                    HTTPStatus.CONFLICT,
+                )
+
+        persona_id = value.get("persona_id")
+        if persona_id is not None:
+            persona_id = _identifier(persona_id, "persona_id")
+            persona = self.store.get_persona(persona_id)
+            if str(persona.get("state") or "").upper() != "ACTIVE":
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_PERSONA_UNAVAILABLE",
+                    "persona_id must refer to an active Persona",
+                    HTTPStatus.CONFLICT,
+                )
+
+        return {
+            **dict(value),
+            "project_id": project_id,
+            "node_ref": node_ref,
+            "todo_id": todo_id,
+            "task_frame_id": task_frame_id,
+            "session_anchor_ref": worker_anchor,
+            "assigned_by_session_anchor_ref": assigned_by,
+            "persona_id": persona_id,
+        }
+
+    def _validate_fleet_worker_scope_filters(
+        self, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        project_id = _identifier(value.get("project_id"), "project_id")
+        self.store.get_project(project_id)
+        node_ref = self._validate_persona_assignment_node_ref(
+            project_id, value.get("node_ref")
+        )
+        todo_id = value.get("todo_id")
+        if todo_id is not None:
+            todo_id = _identifier(todo_id, "todo_id")
+            todo = self.store.get_todo(todo_id)
+            if str(todo.get("project_id") or "") != project_id:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_TODO_PROJECT_MISMATCH",
+                    "todo_id belongs to a different project",
+                    HTTPStatus.CONFLICT,
+                )
+            todo_node = str(todo.get("node_ref") or "").strip()
+            if todo_node and node_ref and todo_node != node_ref:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_NODE_TODO_MISMATCH",
+                    "node_ref must match the Todo's node_ref",
+                    HTTPStatus.CONFLICT,
+                )
+        task_frame_id = value.get("task_frame_id")
+        if task_frame_id is not None:
+            task_frame_id = _identifier(task_frame_id, "task_frame_id")
+            try:
+                frame = self.task_frame_lineage.get_task_frame(task_frame_id)
+            except TaskFrameLineageError as error:
+                raise UniverseError(
+                    error.code, error.detail, HTTPStatus(error.status)
+                ) from error
+            for field in ("origin_session_anchor_ref", "target_session_anchor_ref"):
+                frame_anchor = str(frame.get(field) or "").strip()
+                if frame_anchor:
+                    self._validate_persona_assignment_anchor(project_id, frame_anchor)
+        return {
+            "project_id": project_id,
+            "node_ref": node_ref,
+            "todo_id": todo_id,
+            "task_frame_id": task_frame_id,
+        }
+
     def _sync_node_projection(
         self,
         *,
@@ -32788,6 +32934,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             }),
             optional=frozenset({"node_ref", "todo_id", "task_frame_id", "persona_id"}),
         )
+        value = self._validate_fleet_worker_assignment_lineage(value)
         result = self.store.assign_task_worker(value, actor)
         assignment = result.get("assignment") or {}
         self._record_worker_assignment_event(
@@ -32823,6 +32970,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             required=frozenset({"project_id"}),
             optional=frozenset({"todo_id", "task_frame_id", "node_ref"}),
         )
+        value = {
+            **value,
+            **self._validate_fleet_worker_scope_filters(value),
+        }
         assignments = self.store.list_task_worker_assignments(
             value["project_id"], todo_id=value.get("todo_id"),
             task_frame_id=value.get("task_frame_id"), node_ref=value.get("node_ref"),

@@ -42,6 +42,8 @@ const state = {
   /** Reusable Persona Library rows; operational binding never lives here. */
   personaLibrary: null,
   personaLibraryStatus: "UNKNOWN",
+  /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
+  fleetWorkerAssignmentsByNode: {},
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
@@ -1230,6 +1232,7 @@ async function api(path, options = {}) {
       headers,
       body: options.body ? JSON.stringify(options.body) : undefined,
       cache: "no-store",
+      signal: options.signal,
     });
   } catch (error) {
     throw new UniverseApiError({
@@ -1260,6 +1263,20 @@ async function api(path, options = {}) {
     });
   }
   return payload;
+}
+
+// Optional project surfaces must never hold the authoritative Fleet/Todo
+// projection hostage. Abort a read after a bounded interval so a slow or
+// unavailable observer endpoint remains UNKNOWN while the core project view
+// continues to render.
+async function apiWithTimeout(path, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await api(path, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 async function refreshServiceRestartControl() {
@@ -5123,15 +5140,17 @@ async function ensureFleetWorkerAssignments(featureId) {
   }
 }
 
-function assignFleetWorker(featureId, { todoId, workerRole, sessionAnchorRef, assignedBy }) {
+function assignFleetWorker(featureId, { todoId, workerRole, sessionAnchorRef, assignedBy, personaId }) {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   if (!projectId || !featureId || !todoId || !workerRole || !sessionAnchorRef || !assignedBy) {
     return Promise.reject(new Error("project, node, Todo, role, session, and the assigning Master are all required."));
   }
-  return invokeServerAction("fleet.worker-assign", {
+  const request = {
     project_id: projectId, node_ref: featureId, todo_id: todoId, worker_role: workerRole,
     session_anchor_ref: sessionAnchorRef, assigned_by_session_anchor_ref: assignedBy,
-  }).then(async (result) => {
+  };
+  if (personaId) request.persona_id = personaId;
+  return invokeServerAction("fleet.worker-assign", request).then(async (result) => {
     delete (state.fleetWorkerAssignmentsByNode || {})[featureId];
     await ensureFleetWorkerAssignments(featureId);
     return result;
@@ -5154,6 +5173,19 @@ function fleetTerminalLabel(terminal) {
   const provider = String(terminal?.provider || "UNKNOWN").toUpperCase();
   const anchor = String(terminal?.session_anchor_ref || "UNKNOWN");
   return `${provider} / ${anchor}`;
+}
+
+function fleetWorkerTerminalState(terminal) {
+  if (!terminal) return "OFFLINE";
+  if (typeof terminalAttentionProjection === "function") {
+    const attention = terminalAttentionProjection(terminal);
+    if (attention?.state === "DISCONNECTED") return "DISCONNECTED";
+    if (attention?.state === "FAILED") return "FAILED";
+    if (attention?.state === "RECOVERED") return "RECOVERED";
+  }
+  return String(terminal.state || terminal.lifecycle_state || "").toUpperCase() === "LIVE"
+    ? "LIVE"
+    : "OFFLINE";
 }
 
 function bindFleetNodeMaster(featureId, sessionAnchorRef, personaId) {
@@ -5332,12 +5364,15 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
     for (const assignment of worker.active) {
       const row = node("p", "fleet-node-team-status");
       const persona = (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(assignment.persona_id || ""));
-      const terminal = (state.terminals || []).find((item) => String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || ""));
-      const liveState = terminal ? "LIVE" : "OFFLINE";
+      const terminal = (state.terminals || []).find((item) =>
+        String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || "") &&
+        String(item.project_id || "") === String(state.selectedProject?.project_id || "")
+      );
+      const liveState = fleetWorkerTerminalState(terminal);
       row.append(
         node("span", "fleet-node-role", assignment.worker_role === "REVIEWER" ? "Reviewer" : "Worker"),
         document.createTextNode(
-          ` ${persona?.title || assignment.persona_id || "UNKNOWN"} / ${assignment.session_anchor_ref} / ${liveState}`
+          ` ${persona?.title || assignment.persona_id || "No Persona"} / ${assignment.session_anchor_ref} / ${liveState}`
           + ` / Todo ${assignment.todo_id || assignment.task_frame_id || "UNKNOWN"} / rev ${assignment.assignment_revision}`
         ),
       );
@@ -5358,12 +5393,17 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
     const todosForNode = (state.todos || []).filter((todo) => String(todo.node_ref || "") === String(featureId || ""));
     const eligibleSessions = (state.terminals || []).filter((terminal) =>
       String(terminal.project_id || "") === String(state.selectedProject?.project_id || "") &&
-      String(terminal.session_anchor_ref || "").trim()
+      String(terminal.session_anchor_ref || "").trim() &&
+      String(terminal.state || terminal.lifecycle_state || "").toUpperCase() === "LIVE" &&
+      !["MASTER", "CONDUCTOR"].includes(String(terminal.mode || "").toUpperCase())
+    );
+    const activePersonas = (state.personaLibrary || []).filter((item) =>
+      String(item.state || "").toUpperCase() === "ACTIVE"
     );
     if (!todosForNode.length) {
       wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no Todo on this node to bind a Worker to"));
     } else if (!eligibleSessions.length) {
-      wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no live session available to assign"));
+      wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no live Worker/Reviewer session available to assign"));
     } else {
       const assignControls = node("div", "fleet-node-team-controls");
       const todoSelect = document.createElement("select");
@@ -5390,6 +5430,15 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
         option.textContent = fleetTerminalLabel(terminal);
         workerSessionSelect.append(option);
       }
+      const workerPersonaSelect = document.createElement("select");
+      workerPersonaSelect.setAttribute("aria-label", "Persona for Worker/Reviewer");
+      workerPersonaSelect.append(new Option("No Persona", ""));
+      for (const persona of activePersonas) {
+        workerPersonaSelect.append(new Option(
+          `${persona.title || persona.persona_id} (rev ${persona.revision})`,
+          persona.persona_id
+        ));
+      }
       const assignButton = node("button", "", "Assign Worker/Reviewer");
       assignButton.type = "button";
       assignButton.addEventListener("click", () => {
@@ -5397,11 +5446,12 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
         assignFleetWorker(featureId, {
           todoId: todoSelect.value, workerRole: roleSelect.value,
           sessionAnchorRef: workerSessionSelect.value, assignedBy: owner.session_anchor_ref,
+          personaId: workerPersonaSelect.value,
         })
           .catch((error) => toast(error.message, true))
           .finally(() => { assignButton.disabled = false; });
       });
-      assignControls.append(todoSelect, roleSelect, workerSessionSelect, assignButton);
+      assignControls.append(todoSelect, roleSelect, workerSessionSelect, workerPersonaSelect, assignButton);
       wrap.append(assignControls);
     }
   } else {
@@ -6678,6 +6728,8 @@ async function selectProject(
   state.selectedNode = null;
   state.focusedNodeId = null;
   state.inspectorDismissed = !revealInspector;
+  state.goalAutomationSurfaces = {};
+  state.fleetWorkerAssignmentsByNode = {};
   renderProjects();
   loadProjectActivity(projectId);
   const personaProjectionPromise = loadPersonaProjectProjection(projectId);
@@ -6687,6 +6739,54 @@ async function selectProject(
       body: {},
     }).catch((error) => toast(error.message, true));
   }
+  // Start the authoritative project projection and Todo plan before any
+  // optional catalog/observer reads.  The resident service may serialize a
+  // slow semantic-graph or memory request; Fleet must still show real nodes
+  // and exact Todo lineage while those optional surfaces are UNKNOWN.
+  const projectionResultPromise = state.projectionsByProject?.[projectId]
+    ? Promise.resolve({ projection: state.projectionsByProject[projectId] })
+    : project.projection_available === false
+      ? Promise.resolve(null)
+      : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
+          () => null
+        );
+  const fastGoalPlanResultPromise = apiWithTimeout(
+    `/v1/projects/${encodeURIComponent(projectId)}/goals`,
+    {},
+    8000
+  ).catch(() => ({ goals: [], unassigned_todos: [] }));
+  const fastUniverseGoalResultPromise = apiWithTimeout(
+    "/v1/universe-goals",
+    {},
+    8000
+  ).catch(() => ({ goals: [] }));
+  void Promise.all([
+    projectionResultPromise,
+    fastGoalPlanResultPromise,
+    fastUniverseGoalResultPromise,
+  ]).then(([coreProjection, coreGoalPlan, coreUniverseGoals]) => {
+    if (state.selectedProject?.project_id !== projectId) return;
+    state.projection = coreProjection?.projection || null;
+    if (state.projection) {
+      state.projectionsByProject = {
+        ...state.projectionsByProject,
+        [projectId]: state.projection,
+      };
+    }
+    state.goals = coreGoalPlan.goals || [];
+    state.universeGoals = coreUniverseGoals.goals || [];
+    state.unassignedTodos = (coreGoalPlan.unassigned_todos || []).filter(
+      (todo) => todo.state !== "DONE"
+    );
+    elements.workspaceTitle.textContent = project.project_id;
+    elements.workspaceSubtitle.textContent =
+      state.projection?.project?.goal || project.project_root;
+    elements.todoProject.value = projectId;
+    if (elements.todoScopeFilter) elements.todoScopeFilter.value = "PROJECT";
+    renderTodoScopeControls();
+    renderTodos();
+    renderGoalPlan();
+  });
   const [
     projectionResult,
     dispatchResult,
@@ -6714,13 +6814,7 @@ async function selectProject(
     workLoopResult,
     semanticGraphResult,
   ] = await Promise.all([
-    state.projectionsByProject?.[projectId]
-      ? Promise.resolve({ projection: state.projectionsByProject[projectId] })
-      : project.projection_available === false
-        ? Promise.resolve(null)
-        : api(`/v1/projects/${encodeURIComponent(projectId)}/projection`).catch(
-            () => null
-          ),
+    projectionResultPromise,
     api(`/v1/projects/${encodeURIComponent(projectId)}/dispatches`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/release-proposals`),
     api(`/v1/projects/${encodeURIComponent(projectId)}/room/messages`).catch(() => ({ messages: [] })),
@@ -6771,25 +6865,31 @@ async function selectProject(
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-batches/runs`
     ).catch(() => ({ runs: [] })),
-    api(
-      `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`
+    apiWithTimeout(
+      `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`,
+      {},
+      5000
     ).catch(() => ({ candidates: [] })),
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
     ).catch(() => ({ proposals: [] })),
-    api(`/v1/projects/${encodeURIComponent(projectId)}/work-loop`).catch(
-      () => ({
+    apiWithTimeout(
+      `/v1/projects/${encodeURIComponent(projectId)}/work-loop`,
+      {},
+      5000
+    ).catch(() => ({
         predictions: [],
         result_fanouts: [],
         review_candidates: [],
         memory_schedules: [],
         document_automation: null,
         review_inbox: { bundles: [], counts: {} },
-      })
-    ),
-    api(`/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`).catch(
-      () => ({ nodes: [], edges: [], invariants: { projection_only: true } })
-    ),
+      })),
+    apiWithTimeout(
+      `/v1/projects/${encodeURIComponent(projectId)}/semantic-graph`,
+      {},
+      5000
+    ).catch(() => ({ nodes: [], edges: [], invariants: { projection_only: true } })),
   ]);
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
@@ -6830,10 +6930,8 @@ async function selectProject(
   state.workLoop = workLoopResult || null;
   state.semanticGraph = semanticGraphResult || null;
   await personaProjectionPromise;
-  const universeGoalResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
-  const goalPlanResult = await api(
-    `/v1/projects/${encodeURIComponent(projectId)}/goals`
-  ).catch(() => ({ goals: [], unassigned_todos: [] }));
+  const universeGoalResult = await fastUniverseGoalResultPromise;
+  const goalPlanResult = await fastGoalPlanResultPromise;
   state.goals = goalPlanResult.goals || [];
   const automationEntries = await Promise.all(
     state.goals.map(async (goal) => {

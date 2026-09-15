@@ -126,3 +126,29 @@ test("Persona Library source has no operational assignment controls or terminal 
   const index = fs.readFileSync(path.join(__dirname, "../tools/universe_ui/index.html"), "utf8");
   assert.doesNotMatch(index, /action-inbox-(?:button|dialog)/);
 });
+
+test("Fleet Worker controls use live project Worker/Reviewer sessions and active Personas", () => {
+  const start = appSource.indexOf("function renderFleetNodeWorkerRoster(featureId, owner)");
+  const end = appSource.indexOf("function goToNodeMasterBinding", start);
+  assert.ok(start >= 0 && end > start);
+  const roster = appSource.slice(start, end);
+  assert.match(roster, /terminal\.project_id/);
+  assert.match(roster, /terminal\.state \|\| terminal\.lifecycle_state/);
+  assert.match(roster, /\["MASTER", "CONDUCTOR"\]/);
+  assert.match(roster, /activePersonas/);
+  assert.match(roster, /workerPersonaSelect/);
+  assert.match(roster, /personaId: workerPersonaSelect\.value/);
+  assert.match(roster, /UNKNOWN: no live Worker\/Reviewer session available to assign/);
+});
+
+test("Fleet project selection renders the core projection before slow optional observers", () => {
+  const start = appSource.indexOf("async function selectProject(");
+  const end = appSource.indexOf("function mergeGovernanceProposalInbox", start);
+  assert.ok(start >= 0 && end > start);
+  const selection = appSource.slice(start, end);
+  const core = selection.indexOf("const projectionResultPromise");
+  const optional = selection.indexOf("/semantic-graph`", core);
+  assert.ok(core >= 0 && optional > core);
+  assert.match(selection, /apiWithTimeout\(/);
+  assert.match(selection.slice(core, optional), /renderGoalPlan\(\)/);
+});

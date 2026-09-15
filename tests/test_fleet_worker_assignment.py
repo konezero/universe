@@ -174,6 +174,100 @@ class FleetWorkerAssignmentTests(unittest.TestCase):
         self.assertEqual(409, status, twice)
         self.assertEqual("TASK_WORKER_ASSIGNMENT_ALREADY_ENDED", twice["error_code"])
 
+    def test_assignment_binds_an_existing_task_frame_to_its_target_worker_anchor(self):
+        master = self.register("MASTER", "fleet-worker-frame-master")
+        worker = self.register("CODEX", "fleet-worker-frame-worker")
+        todo_id = self.make_todo("Task Frame Worker pilot")
+        frame, created = self.server.task_frame_lineage.create_task_frame(
+            frame_ref="fleet-worker-frame-pilot",
+            origin_session_anchor_ref=master,
+            target_session_anchor_ref=worker,
+        )
+        self.assertTrue(created)
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "todo_id": todo_id,
+            "task_frame_id": frame["frame_ref"], "worker_role": "IMPLEMENTER",
+            "session_anchor_ref": worker, "assigned_by_session_anchor_ref": master,
+        })
+        self.assertEqual(200, status, result)
+        self.assertEqual(todo_id, result["assignment"]["todo_id"])
+        self.assertEqual(frame["frame_ref"], result["assignment"]["task_frame_id"])
+        self.assertEqual(worker, result["assignment"]["session_anchor_ref"])
+
+    def test_nonprogramming_reviewer_fixture_preserves_todo_and_frame_lineage(self):
+        master = self.register("MASTER", "fleet-worker-nonprogramming-master")
+        reviewer = self.register("CODEX", "fleet-worker-nonprogramming-reviewer")
+        todo_id = self.make_todo("Review meeting agenda and accessibility notes")
+        frame, created = self.server.task_frame_lineage.create_task_frame(
+            frame_ref="fleet-worker-nonprogramming-review",
+            origin_session_anchor_ref=master,
+            target_session_anchor_ref=reviewer,
+        )
+        self.assertTrue(created)
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "todo_id": todo_id,
+            "task_frame_id": frame["frame_ref"], "worker_role": "REVIEWER",
+            "session_anchor_ref": reviewer, "assigned_by_session_anchor_ref": master,
+        })
+        self.assertEqual(200, status, result)
+        assignment = result["assignment"]
+        self.assertEqual("REVIEWER", assignment["worker_role"])
+        self.assertEqual(todo_id, assignment["todo_id"])
+        self.assertEqual(frame["frame_ref"], assignment["task_frame_id"])
+
+    def test_assignment_rejects_task_frame_target_anchor_mismatch(self):
+        master = self.register("MASTER", "fleet-worker-frame-mismatch-master")
+        worker = self.register("CODEX", "fleet-worker-frame-mismatch-worker")
+        other_worker = self.register("CODEX", "fleet-worker-frame-mismatch-other")
+        frame, _ = self.server.task_frame_lineage.create_task_frame(
+            frame_ref="fleet-worker-frame-mismatch",
+            origin_session_anchor_ref=master,
+            target_session_anchor_ref=other_worker,
+        )
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "task_frame_id": frame["frame_ref"],
+            "worker_role": "REVIEWER", "session_anchor_ref": worker,
+            "assigned_by_session_anchor_ref": master,
+        })
+        self.assertEqual(409, status, result)
+        self.assertEqual("TASK_WORKER_ASSIGNMENT_FRAME_ANCHOR_MISMATCH", result["error_code"])
+
+    def test_assignment_requires_a_master_assigner_and_worker_mode(self):
+        conductor = self.register("CONDUCTOR", "fleet-worker-invalid-conductor")
+        worker = self.register("CODEX", "fleet-worker-invalid-worker")
+        todo_id = self.make_todo("Invalid assigner")
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "todo_id": todo_id,
+            "worker_role": "IMPLEMENTER", "session_anchor_ref": worker,
+            "assigned_by_session_anchor_ref": conductor,
+        })
+        self.assertEqual(409, status, result)
+        self.assertEqual("TASK_WORKER_ASSIGNMENT_MASTER_REQUIRED", result["error_code"])
+
+        master = self.register("MASTER", "fleet-worker-invalid-master")
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "todo_id": todo_id,
+            "worker_role": "IMPLEMENTER", "session_anchor_ref": master,
+            "assigned_by_session_anchor_ref": master,
+        })
+        self.assertEqual(409, status, result)
+        self.assertEqual("TASK_WORKER_ASSIGNMENT_WORKER_MODE_INVALID", result["error_code"])
+
+    def test_assignment_rejects_node_todo_lineage_mismatch(self):
+        master = self.register("MASTER", "fleet-worker-node-lineage-master")
+        worker = self.register("CODEX", "fleet-worker-node-lineage-worker")
+        todo_id = self.make_todo("Node lineage")
+        status, result = self.act("fleet.worker-assign", {
+            "project_id": "TEST", "todo_id": todo_id, "node_ref": "missing-node",
+            "worker_role": "IMPLEMENTER", "session_anchor_ref": worker,
+            "assigned_by_session_anchor_ref": master,
+        })
+        self.assertGreaterEqual(status, 400)
+        self.assertIn(result["error_code"], {
+            "FEATURE_NOT_FOUND", "PERSONA_ASSIGNMENT_NODE_NOT_FOUND",
+            "FEATURE_NODE_NOT_FOUND", "TASK_WORKER_ASSIGNMENT_NODE_TODO_MISMATCH",
+        })
+
     # -- activity event producer ---------------------------------------------
 
     def test_assign_and_unassign_record_durable_activity_events(self):
