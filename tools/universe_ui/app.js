@@ -5085,6 +5085,71 @@ function fleetNodeAssignmentError() {
   return "PERSONA_ASSIGNMENTS_UNKNOWN";
 }
 
+// Zero-or-more Worker (IMPLEMENTER) / Reviewer bindings per node, read from
+// the authoritative fleet.worker-assignments-list Action (2026-09-16 Fleet
+// execution visibility) -- distinct from the single Master owner above.
+// Cached per node_ref (fetch-once-cache-rerender, same pattern as
+// ensureHomeNodeOwners) since a Fleet screen may show several nodes.
+function fleetWorkerAssignments(featureId) {
+  const entry = (state.fleetWorkerAssignmentsByNode || {})[featureId];
+  if (!entry) return { status: "UNKNOWN", active: [], all: [] };
+  if (entry.status !== "READY") return { status: entry.status, active: [], all: [] };
+  const active = entry.rows.filter((item) => String(item.state || "").toUpperCase() === "ACTIVE");
+  return { status: "READY", active, all: entry.rows };
+}
+
+async function ensureFleetWorkerAssignments(featureId) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || !featureId) return;
+  state.fleetWorkerAssignmentsByNode = state.fleetWorkerAssignmentsByNode || {};
+  const existing = state.fleetWorkerAssignmentsByNode[featureId];
+  if (existing && existing.projectId === projectId && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetWorkerAssignmentsByNode[featureId] = { projectId, status: "LOADING", rows: [] };
+  try {
+    const result = await invokeServerAction("fleet.worker-assignments-list", {
+      project_id: projectId, node_ref: featureId,
+    });
+    state.fleetWorkerAssignmentsByNode[featureId] = {
+      projectId, status: "READY", rows: result.assignments || [],
+    };
+  } catch (error) {
+    state.fleetWorkerAssignmentsByNode[featureId] = {
+      projectId, status: "ERROR", rows: [], error: error.message,
+    };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId) {
+    if (typeof renderNodeModes === "function") renderNodeModes();
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+  }
+}
+
+function assignFleetWorker(featureId, { todoId, workerRole, sessionAnchorRef, assignedBy }) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || !featureId || !todoId || !workerRole || !sessionAnchorRef || !assignedBy) {
+    return Promise.reject(new Error("project, node, Todo, role, session, and the assigning Master are all required."));
+  }
+  return invokeServerAction("fleet.worker-assign", {
+    project_id: projectId, node_ref: featureId, todo_id: todoId, worker_role: workerRole,
+    session_anchor_ref: sessionAnchorRef, assigned_by_session_anchor_ref: assignedBy,
+  }).then(async (result) => {
+    delete (state.fleetWorkerAssignmentsByNode || {})[featureId];
+    await ensureFleetWorkerAssignments(featureId);
+    return result;
+  });
+}
+
+function unassignFleetWorker(featureId, assignment) {
+  return invokeServerAction("fleet.worker-unassign", {
+    task_worker_assignment_id: assignment.assignment_id,
+    expected_assignment_revision: assignment.assignment_revision,
+    reason: "UNASSIGNED_FROM_FLEET",
+  }).then(async (result) => {
+    delete (state.fleetWorkerAssignmentsByNode || {})[featureId];
+    await ensureFleetWorkerAssignments(featureId);
+    return result;
+  });
+}
+
 function fleetTerminalLabel(terminal) {
   const provider = String(terminal?.provider || "UNKNOWN").toUpperCase();
   const anchor = String(terminal?.session_anchor_ref || "UNKNOWN");
@@ -5236,20 +5301,113 @@ function renderFleetNodeTeamControls(graphNode) {
   }
   section.append(controls);
 
-  const secondary = projection.all.filter((item) => {
-    if (String(item.state || "").toUpperCase() !== "ACTIVE") return false;
-    const scope = String(item.scope || item.role || item.session_role || "").toUpperCase();
-    return ["WORKER", "REVIEWER"].includes(scope);
-  });
-  const secondaryLine = node("p", "fleet-node-team-status");
-  if (secondary.length) {
-    secondaryLine.textContent = `Worker/Reviewer: ${secondary.map((item) => `${String(item.scope || item.role).toUpperCase()} / ${item.session_anchor_ref}`).join(", ")}`;
-  } else {
-    secondaryLine.textContent = "Worker/Reviewer: UNKNOWN (no explicit node-scoped assignment)";
-    secondaryLine.classList.add("is-unknown");
-  }
-  section.append(secondaryLine);
+  section.append(renderFleetNodeWorkerRoster(featureId, owner));
   return section;
+}
+
+// 2026-09-16 Fleet execution visibility: the authoritative zero-or-more
+// Worker (IMPLEMENTER) / Reviewer roster for this node, read from
+// fleet.worker-assignments-list -- never inferred from provider/recency,
+// never a project scan. An empty ACTIVE list with a bound Master is shown
+// explicitly as direct Master execution, not silently blank.
+function renderFleetNodeWorkerRoster(featureId, owner) {
+  const wrap = node("div", "fleet-node-worker-roster");
+  const worker = fleetWorkerAssignments(featureId);
+  if (worker.status === "UNKNOWN" || worker.status === "LOADING") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "Worker/Reviewer: loading..."));
+    void ensureFleetWorkerAssignments(featureId);
+    return wrap;
+  }
+  if (worker.status === "ERROR") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "ERROR: worker assignment read failed"));
+    return wrap;
+  }
+  if (!worker.active.length) {
+    const endedCount = worker.all.length;
+    wrap.append(node("p", "fleet-node-team-status",
+      endedCount
+        ? `Worker/Reviewer: none active (${endedCount} ended in history) -- direct Master execution`
+        : "Worker/Reviewer: none -- direct Master execution"));
+  } else {
+    for (const assignment of worker.active) {
+      const row = node("p", "fleet-node-team-status");
+      const persona = (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(assignment.persona_id || ""));
+      const terminal = (state.terminals || []).find((item) => String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || ""));
+      const liveState = terminal ? "LIVE" : "OFFLINE";
+      row.append(
+        node("span", "fleet-node-role", assignment.worker_role === "REVIEWER" ? "Reviewer" : "Worker"),
+        document.createTextNode(
+          ` ${persona?.title || assignment.persona_id || "UNKNOWN"} / ${assignment.session_anchor_ref} / ${liveState}`
+          + ` / Todo ${assignment.todo_id || assignment.task_frame_id || "UNKNOWN"} / rev ${assignment.assignment_revision}`
+        ),
+      );
+      const endButton = node("button", "", "End");
+      endButton.type = "button";
+      endButton.addEventListener("click", () => {
+        endButton.disabled = true;
+        unassignFleetWorker(featureId, assignment)
+          .catch((error) => toast(error.message, true))
+          .finally(() => { endButton.disabled = false; });
+      });
+      row.append(endButton);
+      wrap.append(row);
+    }
+  }
+
+  if (owner) {
+    const todosForNode = (state.todos || []).filter((todo) => String(todo.node_ref || "") === String(featureId || ""));
+    const eligibleSessions = (state.terminals || []).filter((terminal) =>
+      String(terminal.project_id || "") === String(state.selectedProject?.project_id || "") &&
+      String(terminal.session_anchor_ref || "").trim()
+    );
+    if (!todosForNode.length) {
+      wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no Todo on this node to bind a Worker to"));
+    } else if (!eligibleSessions.length) {
+      wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no live session available to assign"));
+    } else {
+      const assignControls = node("div", "fleet-node-team-controls");
+      const todoSelect = document.createElement("select");
+      todoSelect.setAttribute("aria-label", "Todo to bind the Worker/Reviewer to");
+      for (const todo of todosForNode) {
+        const option = document.createElement("option");
+        option.value = todo.todo_id;
+        option.textContent = todo.title || todo.todo_id;
+        todoSelect.append(option);
+      }
+      const roleSelect = document.createElement("select");
+      roleSelect.setAttribute("aria-label", "Worker role");
+      for (const [value, label] of [["IMPLEMENTER", "Worker"], ["REVIEWER", "Reviewer"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        roleSelect.append(option);
+      }
+      const workerSessionSelect = document.createElement("select");
+      workerSessionSelect.setAttribute("aria-label", "Session to assign");
+      for (const terminal of eligibleSessions) {
+        const option = document.createElement("option");
+        option.value = terminal.session_anchor_ref;
+        option.textContent = fleetTerminalLabel(terminal);
+        workerSessionSelect.append(option);
+      }
+      const assignButton = node("button", "", "Assign Worker/Reviewer");
+      assignButton.type = "button";
+      assignButton.addEventListener("click", () => {
+        assignButton.disabled = true;
+        assignFleetWorker(featureId, {
+          todoId: todoSelect.value, workerRole: roleSelect.value,
+          sessionAnchorRef: workerSessionSelect.value, assignedBy: owner.session_anchor_ref,
+        })
+          .catch((error) => toast(error.message, true))
+          .finally(() => { assignButton.disabled = false; });
+      });
+      assignControls.append(todoSelect, roleSelect, workerSessionSelect, assignButton);
+      wrap.append(assignControls);
+    }
+  } else {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: assign a Master before binding a Worker/Reviewer"));
+  }
+  return wrap;
 }
 
 function goToNodeMasterBinding(featureId) {
