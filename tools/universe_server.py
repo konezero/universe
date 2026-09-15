@@ -7423,6 +7423,44 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS session_persona_assignment_project
                 ON session_persona_assignment(project_id, state, updated_at);
 
+                -- Operational team binding: zero-or-more Worker/Reviewer
+                -- Session Anchors a node Master assigns to an exact Todo or
+                -- Task Frame (2026-09-16: Fleet execution visibility --
+                -- distinct from session_persona_assignment, which is a
+                -- single 1:1 node-owner binding keyed by session_anchor_ref;
+                -- a Todo/Task Frame can have MANY Worker/Reviewer
+                -- assignments across retries and history, so this is its
+                -- own append-friendly, CAS-revisioned table rather than a
+                -- second primary key shape bolted onto that one).
+                -- worker_role reuses the existing WORKER_BINDING_ROLES
+                -- vocabulary (IMPLEMENTER for "Worker", REVIEWER for
+                -- "Reviewer") instead of inventing a second role enum.
+                CREATE TABLE IF NOT EXISTS task_worker_assignment (
+                    assignment_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id)
+                        ON DELETE CASCADE,
+                    node_ref TEXT,
+                    todo_id TEXT,
+                    task_frame_id TEXT,
+                    worker_role TEXT NOT NULL CHECK(worker_role IN ('IMPLEMENTER', 'REVIEWER')),
+                    session_anchor_ref TEXT NOT NULL,
+                    persona_id TEXT,
+                    state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'ENDED')) DEFAULT 'ACTIVE',
+                    assignment_revision INTEGER NOT NULL DEFAULT 1,
+                    assigned_by_session_anchor_ref TEXT NOT NULL,
+                    ended_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ended_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS task_worker_assignment_scope
+                ON task_worker_assignment(project_id, todo_id, task_frame_id, state);
+
+                CREATE INDEX IF NOT EXISTS task_worker_assignment_node
+                ON task_worker_assignment(project_id, node_ref, state);
+
                 -- Resume-menu visibility is durable server state. It also
                 -- covers historical provider sessions that predate the
                 -- canonical Session Supervisor ledger, so browser storage is
@@ -20589,6 +20627,176 @@ class UniverseStore:
 
         return self._persona_idempotent(value.get("request_id"), value, actor, write)
 
+    @staticmethod
+    def _task_worker_assignment_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "schema": "universe.task-worker-assignment.v1",
+            "assignment_id": row["assignment_id"],
+            "project_id": row["project_id"],
+            "node_ref": row["node_ref"],
+            "todo_id": row["todo_id"],
+            "task_frame_id": row["task_frame_id"],
+            "worker_role": row["worker_role"],
+            "session_anchor_ref": row["session_anchor_ref"],
+            "persona_id": row["persona_id"],
+            "state": row["state"],
+            "assignment_revision": row["assignment_revision"],
+            "assigned_by_session_anchor_ref": row["assigned_by_session_anchor_ref"],
+            "ended_reason": row["ended_reason"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "ended_at": row["ended_at"],
+        }
+
+    def assign_task_worker(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        """A node Master binds one Worker (IMPLEMENTER) or Reviewer session
+        to an exact Todo and/or Task Frame (2026-09-16: Fleet execution
+        visibility -- "Fleet must own operational teams: one node Master
+        plus zero-or-more Worker/Reviewer assignments tied to exact Todo/
+        Task Frame/Session Anchor and durable revisions").
+
+        Append-only by design: every assign() call inserts a NEW row with
+        its own assignment_id and revision=1, rather than mutating a single
+        slot. This is what makes multiple concurrent Workers on the same
+        Todo (e.g. two IMPLEMENTERs) and durable retry/ended history
+        possible -- both are real acceptance scenarios (2026-09-16), not a
+        UI illusion built on overwritten state. A prior ACTIVE row for the
+        exact same (project, todo_id, task_frame_id, worker_role,
+        session_anchor_ref) tuple is auto-ended first (an idempotent re-
+        assign of the same worker to the same scope, not a duplicate
+        concurrent assignment).
+        """
+
+        project_id = _project_id(value.get("project_id"))
+        self.get_project(project_id)
+        node_ref = value.get("node_ref")
+        todo_id = value.get("todo_id")
+        task_frame_id = value.get("task_frame_id")
+        if not todo_id and not task_frame_id:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_SCOPE_REQUIRED",
+                "at least one of todo_id or task_frame_id is required",
+            )
+        worker_role = _required_text(value.get("worker_role"), "worker_role").upper()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_ROLE_INVALID",
+                "worker_role must be IMPLEMENTER or REVIEWER",
+            )
+        session_anchor_ref = _required_text(value.get("session_anchor_ref"), "session_anchor_ref")
+        assigned_by = _required_text(
+            value.get("assigned_by_session_anchor_ref"), "assigned_by_session_anchor_ref"
+        )
+        persona_id = value.get("persona_id")
+        now = utc_now()
+        assignment_id = "task_worker_" + uuid.uuid4().hex[:24]
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE task_worker_assignment SET state = 'ENDED', assignment_revision = assignment_revision + 1, "
+                "ended_reason = 'REASSIGNED', ended_at = ?, updated_at = ? "
+                "WHERE project_id = ? AND state = 'ACTIVE' AND session_anchor_ref = ? AND worker_role = ? "
+                "AND todo_id IS ? AND task_frame_id IS ?",
+                (now, now, project_id, session_anchor_ref, worker_role, todo_id, task_frame_id),
+            )
+            connection.execute(
+                "INSERT INTO task_worker_assignment("
+                "assignment_id, project_id, node_ref, todo_id, task_frame_id, worker_role, "
+                "session_anchor_ref, persona_id, state, assignment_revision, "
+                "assigned_by_session_anchor_ref, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, ?, ?, ?)",
+                (
+                    assignment_id, project_id, node_ref, todo_id, task_frame_id, worker_role,
+                    session_anchor_ref, persona_id, assigned_by, now, now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM task_worker_assignment WHERE assignment_id = ?", (assignment_id,)
+            ).fetchone()
+        return {
+            "schema": "universe.task-worker-assign-result.v1",
+            "status": "TASK_WORKER_ASSIGNED",
+            "assignment": self._task_worker_assignment_row(row),
+        }
+
+    def end_task_worker_assignment(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
+        assignment_id = _required_text(value.get("assignment_id"), "assignment_id")
+        expected_revision = value.get("expected_assignment_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_INVALID", "expected_assignment_revision must be a positive integer"
+            )
+        reason = str(value.get("reason") or "ENDED")[:200]
+        now = utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM task_worker_assignment WHERE assignment_id = ?", (assignment_id,)
+            ).fetchone()
+            if existing is None:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_NOT_FOUND", "no such assignment", HTTPStatus.NOT_FOUND
+                )
+            if existing["assignment_revision"] != expected_revision:
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_REVISION_CONFLICT",
+                    f"assignment revision changed; current revision is {existing['assignment_revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            if existing["state"] != "ACTIVE":
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_ALREADY_ENDED", "assignment is already ENDED", HTTPStatus.CONFLICT
+                )
+            connection.execute(
+                "UPDATE task_worker_assignment SET state = 'ENDED', assignment_revision = assignment_revision + 1, "
+                "ended_reason = ?, ended_at = ?, updated_at = ? WHERE assignment_id = ?",
+                (reason, now, now, assignment_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM task_worker_assignment WHERE assignment_id = ?", (assignment_id,)
+            ).fetchone()
+        return {
+            "schema": "universe.task-worker-end-result.v1",
+            "status": "TASK_WORKER_ASSIGNMENT_ENDED",
+            "assignment": self._task_worker_assignment_row(row),
+        }
+
+    def list_task_worker_assignments(
+        self,
+        project_id: str,
+        *,
+        todo_id: str | None = None,
+        task_frame_id: str | None = None,
+        node_ref: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Every durable Worker/Reviewer binding for this exact scope --
+        ACTIVE and ENDED (history), never inferred from recency or terminal
+        order. Strictly scoped to the given project (+ todo/task_frame/node
+        filters when supplied) so an unrelated same-project session can
+        never leak into a different Todo's roster (2026-09-16 acceptance:
+        "unrelated same-project session exclusion").
+        """
+
+        project = self.get_project(project_id)
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project["project_id"]]
+        if todo_id is not None:
+            clauses.append("todo_id = ?")
+            params.append(todo_id)
+        if task_frame_id is not None:
+            clauses.append("task_frame_id = ?")
+            params.append(task_frame_id)
+        if node_ref is not None:
+            clauses.append("node_ref = ?")
+            params.append(node_ref)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_worker_assignment WHERE " + " AND ".join(clauses)
+                + " ORDER BY created_at, assignment_id",
+                params,
+            ).fetchall()
+        return [self._task_worker_assignment_row(row) for row in rows]
+
     def resolve_active_persona_prompt(self, session_anchor_ref: str) -> tuple[str, dict[str, Any]] | None:
         """Look up the ACTIVE persona body PINNED at assignment time for a launch's Anchor.
 
@@ -30608,6 +30816,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             persona_assignment_read_handler=self._handle_persona_assignment_read_action,
             persona_assignments_list_handler=self._handle_persona_assignments_list_action,
             persona_unassign_handler=self._handle_persona_unassign_action,
+            fleet_worker_assign_handler=self._handle_fleet_worker_assign_action,
+            fleet_worker_unassign_handler=self._handle_fleet_worker_unassign_action,
+            fleet_worker_assignments_list_handler=self._handle_fleet_worker_assignments_list_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
@@ -32567,6 +32778,99 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 node_ref=None,
             )
         return result
+
+    def _handle_fleet_worker_assign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="fleet_worker_assign",
+            required=frozenset({
+                "project_id", "worker_role", "session_anchor_ref", "assigned_by_session_anchor_ref",
+            }),
+            optional=frozenset({"node_ref", "todo_id", "task_frame_id", "persona_id"}),
+        )
+        result = self.store.assign_task_worker(value, actor)
+        assignment = result.get("assignment") or {}
+        self._record_worker_assignment_event(
+            project_id=str(assignment.get("project_id") or ""), outcome="ASSIGNED", assignment=assignment,
+        )
+        return result
+
+    def _handle_fleet_worker_unassign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        actor = self._persona_actor(context)
+        # "assignment_id" is a global SERVER_RESOLVED_CALLER_FIELDS name
+        # (Execution Guard/Work Receipt authority scope), unrelated to this
+        # row's own identifier -- the wire field is named
+        # task_worker_assignment_id to avoid that system-wide collision;
+        # the store/DB layer keeps assignment_id as its own column name.
+        value = _exact_object_fields(
+            request, field="fleet_worker_unassign",
+            required=frozenset({"task_worker_assignment_id", "expected_assignment_revision"}),
+            optional=frozenset({"reason"}),
+        )
+        result = self.store.end_task_worker_assignment(
+            {**value, "assignment_id": value["task_worker_assignment_id"]}, actor
+        )
+        assignment = result.get("assignment") or {}
+        self._record_worker_assignment_event(
+            project_id=str(assignment.get("project_id") or ""), outcome="ENDED", assignment=assignment,
+        )
+        return result
+
+    def _handle_fleet_worker_assignments_list_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        self._persona_actor(context)
+        value = _exact_object_fields(
+            request, field="fleet_worker_assignments_list",
+            required=frozenset({"project_id"}),
+            optional=frozenset({"todo_id", "task_frame_id", "node_ref"}),
+        )
+        assignments = self.store.list_task_worker_assignments(
+            value["project_id"], todo_id=value.get("todo_id"),
+            task_frame_id=value.get("task_frame_id"), node_ref=value.get("node_ref"),
+        )
+        return {
+            "schema": "universe.fleet-worker-assignments-list-result.v1",
+            "status": "FLEET_WORKER_ASSIGNMENTS_LISTED",
+            "project_id": value["project_id"],
+            "assignments": assignments,
+        }
+
+    def _record_worker_assignment_event(
+        self, *, project_id: str, outcome: str, assignment: Mapping[str, Any]
+    ) -> None:
+        """Durable Activity record for one Worker/Reviewer binding change
+        (2026-09-16 Fleet execution visibility acceptance). Same generic
+        vocabulary as _record_assignment_event/_record_master_message_
+        lifecycle_event: outcome/state, lineage via node_ref/todo_id/
+        task_frame_id/session_anchor_ref, correlation via assignment_id.
+        """
+
+        if not project_id or not assignment.get("assignment_id"):
+            return
+        payload = {
+            "schema": "universe.task-worker-assignment-event.v1",
+            "assignment_id": assignment.get("assignment_id"),
+            "outcome": outcome,
+            "worker_role": assignment.get("worker_role"),
+            "session_anchor_ref": assignment.get("session_anchor_ref"),
+            "assigned_by_session_anchor_ref": assignment.get("assigned_by_session_anchor_ref"),
+        }
+        for key in ("node_ref", "todo_id", "task_frame_id", "ended_reason"):
+            value = assignment.get(key)
+            if value:
+                payload[key] = value
+        event_id = "task_worker_assignment_" + _json_sha256(
+            {
+                "project_id": project_id, "assignment_id": assignment.get("assignment_id"),
+                "outcome": outcome, "assignment_revision": assignment.get("assignment_revision"),
+            }
+        )[:24]
+        try:
+            self.store.append_event(
+                project_id,
+                {"event_id": event_id, "event_type": "TASK_WORKER_ASSIGNMENT_CHANGED", "payload": payload},
+            )
+        except UniverseError:
+            pass
 
     def _persona_automation_plan(
         self, value: Mapping[str, Any], *, record: bool = True

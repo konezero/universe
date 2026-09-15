@@ -679,6 +679,9 @@ def build_default_action_registry(
     persona_assignment_read_handler: ActionHandler | None = None,
     persona_assignments_list_handler: ActionHandler | None = None,
     persona_unassign_handler: ActionHandler | None = None,
+    fleet_worker_assign_handler: ActionHandler | None = None,
+    fleet_worker_unassign_handler: ActionHandler | None = None,
+    fleet_worker_assignments_list_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
@@ -875,6 +878,42 @@ def build_default_action_registry(
             side_effect_class="LOCAL_DATABASE_MUTATION",
         ),
         persona_unassign_handler, surfaces=("persona.unassign",),
+    )
+    _FLEET_WORKER_STATEMENT = (
+        "A node Master's durable Worker (IMPLEMENTER) or Reviewer binding to "
+        "an exact Todo/Task Frame -- append-only per assignment_id so "
+        "multiple concurrent workers and retry/ended history are both real, "
+        "never overwritten state (2026-09-16 Fleet execution visibility)."
+    )
+    registry.register(
+        ActionContract(
+            action_id="fleet.worker-assign",
+            request_schema_ref="universe.fleet-worker-assign-request.v1",
+            result_schema_ref="universe.task-worker-assign-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"statement": _FLEET_WORKER_STATEMENT},
+        ),
+        fleet_worker_assign_handler, surfaces=("fleet.worker-assign",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="fleet.worker-unassign",
+            request_schema_ref="universe.fleet-worker-unassign-request.v1",
+            result_schema_ref="universe.task-worker-end-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={"statement": _FLEET_WORKER_STATEMENT},
+        ),
+        fleet_worker_unassign_handler, surfaces=("fleet.worker-unassign",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="fleet.worker-assignments-list",
+            request_schema_ref="universe.fleet-worker-assignments-list-request.v1",
+            result_schema_ref="universe.fleet-worker-assignments-list-result.v1",
+            side_effect_class="READ_ONLY",
+            metadata={"statement": _FLEET_WORKER_STATEMENT},
+        ),
+        fleet_worker_assignments_list_handler, surfaces=("fleet.worker-assignments-list",),
     )
     registry.register(
         ActionContract(
