@@ -38167,21 +38167,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "visibility": visibility["visibility"],
                 "visibility_revision": visibility["revision"],
             }
-            # Excluded rows have their own collection and limit. They remain
-            # recoverable even when they are older than the provider's compact
-            # Resume row or fall outside the visible menu limit.
+            # Compact each project/Mode/provider slot at its newest archived
+            # session before applying visibility. Hiding that newest row must
+            # not surface an older, identically labelled session in its place.
+            coord = (project_id.casefold(), mode, provider)
+            newest_for_coord = expand or coord not in seen_coord
+            if not expand and newest_for_coord:
+                seen_coord.add(coord)
+            # Excluded rows have their own collection and limit, independent of
+            # the visible menu limit. Older excluded rows remain recoverable,
+            # while only the newest row controls the compact visible slot.
             if visibility["visibility"] == "HIDDEN":
                 if include_hidden:
                     excluded_candidates.append(candidate)
                 continue
-            # Compact the visible default menu to the newest resumable session
-            # for each provider. Multiple providers can legitimately own
-            # distinct Master sessions for the same project and Mode.
-            coord = (project_id.casefold(), mode, provider)
-            if not expand:
-                if coord in seen_coord:
-                    continue
-                seen_coord.add(coord)
+            if not newest_for_coord:
+                continue
             resume_candidates.append(candidate)
         if before:
             resume_candidates = [
