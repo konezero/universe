@@ -7423,6 +7423,20 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS session_persona_assignment_project
                 ON session_persona_assignment(project_id, state, updated_at);
 
+                -- Resume-menu visibility is durable server state. It also
+                -- covers historical provider sessions that predate the
+                -- canonical Session Supervisor ledger, so browser storage is
+                -- never the source of truth for whether a row is excluded.
+                CREATE TABLE IF NOT EXISTS resumable_session_visibility (
+                    project_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    visibility TEXT NOT NULL
+                        CHECK(visibility IN ('VISIBLE', 'HIDDEN')),
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, session_id)
+                );
+
                 -- Whole-request idempotency store for persona.* Actions,
                 -- mirroring project_memory_relate_action's request_id +
                 -- canonical request_json binding.
@@ -10086,6 +10100,126 @@ class UniverseStore:
                 HTTPStatus.NOT_FOUND,
             )
         return self._project_row(row)
+
+    def resumable_session_visibility(
+        self, project_id: str, session_id: str
+    ) -> dict[str, Any]:
+        normalized_project = _project_id(project_id)
+        normalized_session = _required_text(session_id, "session_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT visibility, revision, updated_at
+                FROM resumable_session_visibility
+                WHERE project_id = ? AND session_id = ?
+                """,
+                (normalized_project, normalized_session),
+            ).fetchone()
+        if row is None:
+            return {
+                "project_id": normalized_project,
+                "session_id": normalized_session,
+                "visibility": "VISIBLE",
+                "revision": 0,
+                "updated_at": None,
+            }
+        return {
+            "project_id": normalized_project,
+            "session_id": normalized_session,
+            "visibility": str(row["visibility"]),
+            "revision": int(row["revision"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def resumable_session_visibility_map(
+        self,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT project_id, session_id, visibility, revision, updated_at
+                FROM resumable_session_visibility
+                """
+            ).fetchall()
+        return {
+            (str(row["project_id"]), str(row["session_id"])): {
+                "visibility": str(row["visibility"]),
+                "revision": int(row["revision"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        }
+
+    def set_resumable_session_visibility(
+        self,
+        project_id: str,
+        session_id: str,
+        *,
+        visibility: Any,
+        expected_revision: Any,
+    ) -> dict[str, Any]:
+        normalized_project = _project_id(project_id)
+        normalized_session = _required_text(session_id, "session_id")
+        normalized_visibility = _required_text(visibility, "visibility").upper()
+        if normalized_visibility not in {"VISIBLE", "HIDDEN"}:
+            raise UniverseError(
+                "RESUMABLE_SESSION_VISIBILITY_INVALID",
+                f"unsupported visibility: {normalized_visibility}",
+                HTTPStatus.BAD_REQUEST,
+            )
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise UniverseError(
+                "RESUMABLE_SESSION_VISIBILITY_REVISION_INVALID",
+                "expected_revision must be a non-negative integer",
+                HTTPStatus.BAD_REQUEST,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT visibility, revision
+                FROM resumable_session_visibility
+                WHERE project_id = ? AND session_id = ?
+                """,
+                (normalized_project, normalized_session),
+            ).fetchone()
+            current_revision = int(row["revision"]) if row is not None else 0
+            if current_revision != expected_revision:
+                raise UniverseError(
+                    "RESUMABLE_SESSION_VISIBILITY_CONFLICT",
+                    "resume-list visibility changed",
+                    HTTPStatus.CONFLICT,
+                )
+            next_revision = current_revision + 1
+            connection.execute(
+                """
+                INSERT INTO resumable_session_visibility(
+                    project_id, session_id, visibility, revision, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, session_id) DO UPDATE SET
+                    visibility = excluded.visibility,
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_project,
+                    normalized_session,
+                    normalized_visibility,
+                    next_revision,
+                    now,
+                ),
+            )
+        return {
+            "project_id": normalized_project,
+            "session_id": normalized_session,
+            "visibility": normalized_visibility,
+            "revision": next_revision,
+            "updated_at": now,
+        }
 
     def _project_for_connection(
         self, connection: sqlite3.Connection, project_id: str
@@ -37826,6 +37960,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_filter = str(raw.get("project_id") or "").strip()
         mode_filter = str(raw.get("mode") or "").strip().upper()
         provider_filter = str(raw.get("provider") or "").strip().upper()
+        include_hidden = str(raw.get("include_hidden") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         expand = bool(project_filter or mode_filter or provider_filter)
         listed = self.list_cli_terminals()
         terminals = [item for item in (listed.get("terminals") or [])
@@ -37962,15 +38101,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
             )
         resume_candidates: list[dict[str, Any]] = []
-        seen_coord: set[tuple[str, str]] = set()
-        if expand:
-            pool = list(sessions)
-        else:
-            pool = [
-                session
-                for session in sessions
-                if str(session.get("currentness") or "").upper() == "CURRENT"
-            ]
+        seen_coord: set[tuple[str, str, str]] = set()
+        visibility_by_session = self.store.resumable_session_visibility_map()
+        # A provider session remains resumable after a different provider
+        # becomes the Project/Mode Current Anchor. Compact the full durable
+        # archive below instead of discarding those past provider sessions.
+        pool = list(sessions)
         pool.sort(
             key=lambda session: str(session.get("last_seen_at") or ""),
             reverse=True,
@@ -38007,11 +38143,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if provider_filter and provider != provider_filter:
                 continue
-            coord = (project_id.casefold(), mode)
-            if not expand:
-                if coord in seen_coord:
-                    continue
-                seen_coord.add(coord)
             anchor = str(session.get("session_anchor_ref") or "").strip()
             if (
                 anchor in reattach_anchors
@@ -38019,20 +38150,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 or anchor in incompatible_anchors
             ):
                 continue
+            # Compact the default menu to the newest resumable session for
+            # each provider. Multiple providers can legitimately own distinct
+            # Master sessions for the same project and Mode.
+            coord = (project_id.casefold(), mode, provider)
+            if not expand:
+                if coord in seen_coord:
+                    continue
+                seen_coord.add(coord)
+            visibility = visibility_by_session.get(
+                (project_id, session_id),
+                {"visibility": "VISIBLE", "revision": 0},
+            )
+            if visibility["visibility"] == "HIDDEN" and not include_hidden:
+                continue
             resume_candidates.append(
                 {
                     "kind": "RESUME",
-                    "session_id": str(
-                        session.get("universe_session_id")
-                        or session.get("session_id")
-                        or ""
-                    ),
+                    "session_id": session_id,
                     "session_anchor_ref": anchor,
                     "project_id": project_id,
                     "mode": mode,
                     "provider": provider,
                     "last_seen_at": str(session.get("last_seen_at") or ""),
                     "label": _resumable_label(session),
+                    "visibility": visibility["visibility"],
+                    "visibility_revision": visibility["revision"],
                 }
             )
         if before:
@@ -38049,6 +38192,43 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "resume": resume_candidates[:limit],
             "incompatible": incompatible,
             "resume_truncated": truncated,
+        }
+
+    def set_resumable_session_visibility(
+        self, request: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        value = _exact_object_fields(
+            request,
+            field="resumable_session_visibility",
+            required=frozenset(
+                {"project_id", "session_id", "visibility", "expected_revision"}
+            ),
+        )
+        project_id = _project_id(value["project_id"])
+        session_id = _required_text(value["session_id"], "session_id")
+        exists = any(
+            str(item.get("project_id") or "") == project_id
+            and str(
+                item.get("universe_session_id") or item.get("session_id") or ""
+            ) == session_id
+            for item in self.list_project_anchor_sessions(project_id)["sessions"]
+        )
+        if not exists:
+            raise UniverseError(
+                "RESUMABLE_SESSION_NOT_FOUND",
+                "resume-list session does not exist in the project session archive",
+                HTTPStatus.NOT_FOUND,
+            )
+        result = self.store.set_resumable_session_visibility(
+            project_id,
+            session_id,
+            visibility=value["visibility"],
+            expected_revision=value["expected_revision"],
+        )
+        return {
+            "schema": API_SCHEMA,
+            "status": "RESUMABLE_SESSION_VISIBILITY_UPDATED",
+            **result,
         }
 
     def list_cli_terminal_audit_events(
@@ -48870,6 +49050,12 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                         ),
                         "session_connection": result.get("session_connection"),
                     },
+                )
+                return
+            if path == "/v1/sessions/resumable/visibility":
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.set_resumable_session_visibility(body),
                 )
                 return
             canonical_session_operation = re.fullmatch(

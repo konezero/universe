@@ -7667,6 +7667,99 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
         self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
 
+    def test_resumable_sessions_keep_each_provider_and_persist_visibility(self) -> None:
+        self.server._managed_shell_identities = lambda: {}  # type: ignore[method-assign]
+        terminal_host = Mock()
+        terminal_host.list_sessions.return_value = []
+        terminal_host.list_hosts.return_value = []
+        self.server.terminal_host = terminal_host
+        session_rows = [
+            {
+                "session_anchor_ref": "anchor-codex-new",
+                "universe_session_id": "sess-codex-new",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "PAST",
+                "last_seen_at": "2026-09-15T02:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-claude-new",
+                "universe_session_id": "sess-claude-new",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-15T01:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-codex-old",
+                "universe_session_id": "sess-codex-old",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-14T01:00:00Z",
+            },
+        ]
+        self.server.list_all_project_anchor_sessions = lambda: session_rows  # type: ignore[method-assign]
+        self.server.list_project_anchor_sessions = lambda _project_id: {  # type: ignore[method-assign]
+            "sessions": session_rows
+        }
+
+        listed = self.server.list_resumable_sessions({"limit": 7})
+        self.assertEqual(
+            ["sess-codex-new", "sess-claude-new"],
+            [row["session_id"] for row in listed["resume"]],
+        )
+        self.assertTrue(all(row["visibility"] == "VISIBLE" for row in listed["resume"]))
+
+        status, hidden = self.request(
+            "POST",
+            "/v1/sessions/resumable/visibility",
+            {
+                "project_id": "universe",
+                "session_id": "sess-codex-new",
+                "visibility": "HIDDEN",
+                "expected_revision": 0,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("HIDDEN", hidden["visibility"])
+        self.assertEqual(1, hidden["revision"])
+        self.assertEqual(
+            ["sess-claude-new"],
+            [row["session_id"] for row in self.server.list_resumable_sessions()["resume"]],
+        )
+
+        status, with_hidden = self.request(
+            "GET",
+            "/v1/sessions/resumable?limit=7&include_hidden=true",
+            token=self.token,
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            ["sess-codex-new", "sess-claude-new"],
+            [row["session_id"] for row in with_hidden["resume"]],
+        )
+        self.assertEqual("HIDDEN", with_hidden["resume"][0]["visibility"])
+        self.assertEqual(1, with_hidden["resume"][0]["visibility_revision"])
+
+        status, stale = self.request(
+            "POST",
+            "/v1/sessions/resumable/visibility",
+            {
+                "project_id": "universe",
+                "session_id": "sess-codex-new",
+                "visibility": "VISIBLE",
+                "expected_revision": 0,
+            },
+            self.token,
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("RESUMABLE_SESSION_VISIBILITY_CONFLICT", stale["error_code"])
+
     def test_resume_keeps_closed_terminal_and_resolves_durable_provider(self) -> None:
         supervised, _ = self.server.session_supervisor.register_session({
             "session_id": "session_resume_closed", "node": "GCS", "project_id": "GCS",

@@ -2190,7 +2190,7 @@ function currentReattachHosts() {
 
 async function loadResumableSessions() {
   try {
-    const payload = await api("/v1/sessions/resumable?limit=7");
+    const payload = await api("/v1/sessions/resumable?limit=7&include_hidden=true");
     state.resumableSessions = payload;
     return payload;
   } catch (_error) {
@@ -2221,30 +2221,24 @@ function hideReattachBanner() {
   renderReattachBanner();
 }
 
-function resumeListIdentity(session) {
-  return JSON.stringify([String(session.project_id || ""), String(session.session_id || session.universe_session_id || session.session_anchor_ref || "")]);
+function resumeSessionExcluded(session) {
+  return String(session?.visibility || "VISIBLE").toUpperCase() === "HIDDEN";
 }
 
-function excludedResumeSessionIds() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("universe.resume.excluded.v1") || "[]");
-    return new Set(Array.isArray(saved) ? saved.filter((value) => typeof value === "string") : []);
-  } catch (_error) {
-    return new Set();
-  }
-}
-
-function setResumeSessionExcluded(session, excluded) {
-  const ids = excludedResumeSessionIds();
-  const key = resumeListIdentity(session);
-  if (excluded) ids.add(key);
-  else ids.delete(key);
-  try {
-    localStorage.setItem("universe.resume.excluded.v1", JSON.stringify([...ids]));
-  } catch (_error) {
-    toast("재개 목록 설정을 저장하지 못했습니다", true);
-    return;
-  }
+async function setResumeSessionExcluded(session, excluded) {
+  const sessionId = String(session?.session_id || "").trim();
+  const projectId = String(session?.project_id || "").trim();
+  if (!sessionId || !projectId) throw new Error("재개 세션 식별자가 없습니다");
+  await api("/v1/sessions/resumable/visibility", {
+    method: "POST",
+    body: {
+      project_id: projectId,
+      session_id: sessionId,
+      visibility: excluded ? "HIDDEN" : "VISIBLE",
+      expected_revision: Number(session.visibility_revision || 0),
+    },
+  });
+  await loadResumableSessions();
   renderTerminalNewMenu();
 }
 
@@ -2295,11 +2289,10 @@ function renderTerminalNewMenu() {
     item.append(terminate);
     menu.append(item);
   }
-  const excludedIds = excludedResumeSessionIds();
   const sessions = state.resumableSessions?.resume || [];
-  const excludedCount = sessions.filter((session) => excludedIds.has(resumeListIdentity(session))).length;
+  const excludedCount = sessions.filter(resumeSessionExcluded).length;
   for (const session of sessions) {
-    const excluded = excludedIds.has(resumeListIdentity(session));
+    const excluded = resumeSessionExcluded(session);
     if (excluded && !state.showExcludedResumeSessions) continue;
     const row = document.createElement("div");
     row.className = "terminal-resume-row";
@@ -2324,7 +2317,7 @@ function renderTerminalNewMenu() {
     exclude.setAttribute("aria-label", `${session.label || session.session_id} ${exclude.textContent}`);
     exclude.addEventListener("click", (event) => {
       event.stopPropagation();
-      setResumeSessionExcluded(session, !excluded);
+      setResumeSessionExcluded(session, !excluded).catch((error) => toast(error.message, true));
     });
     row.append(item, exclude);
     menu.append(row);
