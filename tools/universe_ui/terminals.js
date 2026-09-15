@@ -552,6 +552,55 @@ async function loadOlderTerminalHistory(surface, session) {
   }
 }
 
+function terminalPersonaAssignment(session) {
+  const anchor = String(session?.session_anchor_ref || "").trim();
+  if (!anchor) return { state: "UNKNOWN", detail: "SESSION_ANCHOR_MISSING" };
+  if (state.personaAssignmentsStatus !== "READY" || !Array.isArray(state.personaAssignments)) {
+    return { state: "UNKNOWN", detail: "PERSONA_ASSIGNMENTS_UNAVAILABLE" };
+  }
+  const rows = state.personaAssignments.filter((item) =>
+    String(item.session_anchor_ref || "").trim() === anchor &&
+    String(item.state || "").toUpperCase() === "ACTIVE"
+  );
+  if (rows.length > 1) return { state: "ERROR", detail: "MULTIPLE_ACTIVE_ASSIGNMENTS" };
+  if (!rows.length) return { state: "UNASSIGNED", detail: "NO_ACTIVE_ASSIGNMENT" };
+  const row = rows[0];
+  return {
+    state: "ASSIGNED",
+    detail: String(row.persona_id || "UNKNOWN"),
+    personaId: String(row.persona_id || ""),
+    nodeRef: String(row.node_ref || ""),
+    revision: row.assignment_revision,
+  };
+}
+
+function terminalAttentionProjection(session) {
+  const quota = String(providerQuotaStateFor(session?.provider) || "").toUpperCase();
+  if (["EXHAUSTED", "BLOCKED", "QUOTA_EXHAUSTED"].includes(quota)) {
+    return { state: "QUOTA_BLOCKED", detail: quota };
+  }
+  const turn = String(session?.host_turn_state || session?.turn_state || "").toUpperCase();
+  const delivery = String(session?.prompt_delivery || session?.latest_delivery || "").toUpperCase();
+  const lifecycle = String(session?.state || "").toUpperCase();
+  if (["FAILED", "ERROR"].includes(turn) || ["FAILED", "ERROR"].includes(lifecycle)) {
+    return { state: "FAILED", detail: turn || lifecycle };
+  }
+  if (["DISCONNECTED", "OFFLINE", "STOPPED"].includes(lifecycle) || session?.provider_cli_alive === false) {
+    return { state: "DISCONNECTED", detail: lifecycle || "CLI_UNAVAILABLE" };
+  }
+  if (["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turn)) {
+    return { state: "WAITING_INPUT", detail: turn };
+  }
+  if (["WORKING", "STARTED", "PROMPT_SUBMITTED", "NATIVE_QUEUED", "DELIVERED"].includes(turn) ||
+      ["SUBMITTED", "DELIVERED"].includes(delivery)) {
+    return { state: "WORKING", detail: turn || delivery };
+  }
+  if (["COMPLETED", "DONE"].includes(turn) || ["COMPLETED", "DONE"].includes(lifecycle)) {
+    return { state: "COMPLETED", detail: turn || lifecycle };
+  }
+  return { state: "UNKNOWN", detail: "HOST_TURN_STATE_UNAVAILABLE" };
+}
+
 function renderTerminalDock() {
   const tabs = elements.terminalTabs;
   const stage = elements.terminalStage;
@@ -572,6 +621,32 @@ function renderTerminalDock() {
     tab.ariaSelected = String(active);
     tab.dataset.terminalId = session.terminal_id;
     tab.append(node("span", "", terminalLabel(session)));
+    const assignment = terminalPersonaAssignment(session);
+    const ownerChip = node("span", "terminal-tab-owner", assignment.state === "ASSIGNED"
+      ? `Persona ${assignment.detail}`
+      : assignment.state);
+    ownerChip.dataset.state = assignment.state;
+    ownerChip.title = assignment.detail;
+    if (assignment.nodeRef && typeof openFleetNodeFromTerminal === "function") {
+      ownerChip.setAttribute("role", "link");
+      ownerChip.tabIndex = 0;
+      const openFleet = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openFleetNodeFromTerminal(session);
+      };
+      ownerChip.addEventListener("click", openFleet);
+      ownerChip.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") openFleet(event);
+      });
+    }
+    tab.append(ownerChip);
+    const attention = terminalAttentionProjection(session);
+    const attentionChip = node("span", "terminal-attention-chip", attention.state.replaceAll("_", " "));
+    attentionChip.dataset.state = attention.state;
+    attentionChip.title = attention.detail;
+    tab.dataset.attention = attention.state;
+    tab.append(attentionChip);
     const cliName = String(session.provider_cli || "").toUpperCase();
     if (cliName) {
       const chip = node("span", "terminal-status-chip", cliName);
@@ -590,7 +665,7 @@ function renderTerminalDock() {
     if (["delivered", "stalled", "pending", "blocked"].includes(delivery)) {
       tab.append(node("span", "terminal-delivery-chip is-" + delivery, delivery));
     }
-    const close = node("span", "terminal-tab-close", "×");
+    const close = node("span", "terminal-tab-close", "\u00d7");
     close.title = "Close tab";
     close.addEventListener("click", (event) => {
       event.preventDefault();
@@ -605,7 +680,7 @@ function renderTerminalDock() {
     const gridBtn = node("button", "terminal-grid-toggle");
     gridBtn.type = "button";
     gridBtn.title = "Show all sessions in a grid";
-    gridBtn.textContent = state.terminalGrid ? "▦ grid" : "▤ single";
+    gridBtn.textContent = state.terminalGrid ? "\u25a6 grid" : "\u25a4 single";
     gridBtn.classList.toggle("is-active", Boolean(state.terminalGrid));
     gridBtn.addEventListener("click", () => setTerminalGrid(!state.terminalGrid));
     tabs.append(gridBtn);

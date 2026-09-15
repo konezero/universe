@@ -34,6 +34,14 @@ const state = {
   masterHandoffs: [],
   /** Authoritative project work-change events. Read failures stay explicit. */
   projectActivity: { status: "IDLE", events: [], error: "" },
+  /** Durable Persona assignment projection for the selected project. */
+  personaAssignments: null,
+  personaAssignmentsProjectId: null,
+  personaAssignmentsStatus: "UNKNOWN",
+  personaAssignmentsError: "",
+  /** Reusable Persona Library rows; operational binding never lives here. */
+  personaLibrary: null,
+  personaLibraryStatus: "UNKNOWN",
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
@@ -2520,8 +2528,9 @@ async function startNewNodeModeSession(coordinate) {
   }
   const selectedProvider = String(coordinate?.provider || "").trim().toUpperCase();
   if (selectedProvider) coordinate.provider = selectedProvider;
+  let createdSession;
   try {
-    await createTerminalTab(coordinate);
+    createdSession = await createTerminalTab(coordinate);
   } catch (error) {
     throw sessionLaunchError("CREATE_TERMINAL", error);
   }
@@ -2535,6 +2544,7 @@ async function startNewNodeModeSession(coordinate) {
   } catch (error) {
     throw sessionLaunchError("OPEN_TERMINAL_PANEL", error);
   }
+  return createdSession;
 }
 
 function openNodeModeSessionActions(coordinate, session) {
@@ -4083,10 +4093,11 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
       expectedModel: isNew ? undefined : modelRef,
       expectedEffort: isNew ? undefined : effort,
     };
+    let createdSession = null;
     if (isNew) {
       // New sessions must first create the Host-backed CLI surface.  Provider
       // session identity is then observed and bound by the terminal Hook.
-      await startNewNodeModeSession({
+      createdSession = await startNewNodeModeSession({
         ...(pendingCoord || {}),
         project: registeredProject || pendingCoord?.project,
         nodeId: registeredProject?.project_id || pendingCoord?.nodeId || project.projectId,
@@ -4095,6 +4106,15 @@ async function connectSessionSummaryProviderModel(sessionAction = "RESUME") {
         modelRef,
         effort,
       });
+      const fleetBinding = state.pendingFleetNodeBinding;
+      if (fleetBinding && createdSession?.session_anchor_ref) {
+        try {
+          await bindFleetNodeMaster(fleetBinding.featureId, createdSession.session_anchor_ref, fleetBinding.personaId);
+          state.pendingFleetNodeBinding = null;
+        } catch (error) {
+          toast(`Session started but Fleet binding failed: ${error.message}`, true);
+        }
+      }
     } else if (mode === "CONDUCTOR") {
       await callUniverseConductor(options);
     } else {
@@ -5030,66 +5050,239 @@ function homeCard(id, titleText, { selected, blocked, unsel, bodyRows }) {
   return card;
 }
 
-// Fleet↔Persona node-binding entry point (2026-09-15 follow-up): Fleet
-// shows read-only node-owner status (fetched once per project, cached,
-// re-rendered on arrival -- same shape as ensureHomeTodoResult above) and
-// a link into the SAME Persona "노드 담당 Master" editor -- it never
-// duplicates the assign/unassign/handoff write logic, only reads for
-// display and links out for writes. Only FEATURE-kind nodes carry a real
-// feature_node identity (node_id "feat:<feature_id>"); structural/domain
-// graph nodes have no feature_id and are explicitly out of node-binding's
-// supported scope, not silently treated as unassigned.
+// Fleet owns operational node and session binding. Persona Library remains
+// definition-only; every owner shown here comes from the authoritative
+// persona.assignments-list projection for the selected project.
 async function ensureHomeNodeOwners() {
-  const projectId = String(state.selectedProject?.project_id || "");
+  const projectId = String(state.selectedProject?.project_id || "").trim();
   if (!projectId) return;
-  if (state.homeNodeOwnersProjectId === projectId && state.homeNodeOwners) return;
-  if (state.homeNodeOwnersPending === projectId) return;
-  state.homeNodeOwnersPending = projectId;
-  try {
-    const result = await invokeServerAction("persona.assignments-list", { project_id: projectId });
-    if (String(state.selectedProject?.project_id || "") !== projectId) return; // project changed mid-fetch
-    const owners = new Map();
-    for (const assignment of result.assignments || []) {
-      if (assignment.state === "ACTIVE" && assignment.node_ref) owners.set(assignment.node_ref, assignment);
-    }
-    state.homeNodeOwners = owners;
-    state.homeNodeOwnersProjectId = projectId;
-  } catch (_error) {
-    state.homeNodeOwners = null;
-    state.homeNodeOwnersProjectId = null;
-  } finally {
-    if (state.homeNodeOwnersPending === projectId) state.homeNodeOwnersPending = null;
-    if (String(state.selectedProject?.project_id || "") === projectId) renderIntegratedHome();
+  if (state.personaAssignmentsProjectId === projectId &&
+      ["READY", "LOADING"].includes(state.personaAssignmentsStatus)) return;
+  await loadPersonaProjectProjection(projectId).catch(() => undefined);
+}
+
+function fleetAssignmentRows() {
+  if (state.personaAssignmentsStatus !== "READY" || !Array.isArray(state.personaAssignments)) return null;
+  return state.personaAssignments;
+}
+
+function fleetNodeAssignments(featureId) {
+  const rows = fleetAssignmentRows();
+  if (!rows) return { status: "UNKNOWN", active: [], all: [] };
+  const all = rows.filter((assignment) => String(assignment.node_ref || "").trim() === String(featureId || "").trim());
+  const active = all.filter((assignment) => String(assignment.state || "").toUpperCase() === "ACTIVE");
+  return { status: active.length > 1 ? "ERROR" : "READY", active, all };
+}
+
+function fleetNodeOwner(featureId) {
+  const result = fleetNodeAssignments(featureId);
+  return result.active.length === 1 ? result.active[0] : null;
+}
+
+function fleetNodeAssignmentError() {
+  if (state.personaAssignmentsStatus === "ERROR") return state.personaAssignmentsError || "PERSONA_ASSIGNMENTS_READ_FAILED";
+  if (state.personaAssignmentsStatus === "LOADING") return "PERSONA_ASSIGNMENTS_LOADING";
+  return "PERSONA_ASSIGNMENTS_UNKNOWN";
+}
+
+function fleetTerminalLabel(terminal) {
+  const provider = String(terminal?.provider || "UNKNOWN").toUpperCase();
+  const anchor = String(terminal?.session_anchor_ref || "UNKNOWN");
+  return `${provider} / ${anchor}`;
+}
+
+function bindFleetNodeMaster(featureId, sessionAnchorRef, personaId) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const anchor = String(sessionAnchorRef || "").trim();
+  const persona = (state.personaLibrary || []).find((item) =>
+    String(item.persona_id || "") === String(personaId || "") &&
+    String(item.state || "").toUpperCase() === "ACTIVE"
+  );
+  const terminal = (state.terminals || []).find((item) =>
+    String(item.session_anchor_ref || "") === anchor &&
+    String(item.project_id || "") === projectId &&
+    String(item.mode || "").toUpperCase() === "MASTER"
+  );
+  if (!projectId || !featureId || !anchor || !terminal || !persona) {
+    return Promise.reject(new Error("A live project Master and active Persona are required."));
   }
+  const rows = fleetAssignmentRows() || [];
+  const targetExisting = rows.find((item) => String(item.session_anchor_ref || "") === anchor);
+  const currentOwner = fleetNodeOwner(featureId);
+  const request = {
+    session_anchor_ref: anchor,
+    project_id: projectId,
+    persona_id: persona.persona_id,
+    expected_persona_revision: persona.revision,
+    expected_assignment_revision: targetExisting ? targetExisting.assignment_revision : 0,
+    node_ref: featureId,
+    request_id: crypto.randomUUID(),
+  };
+  if (currentOwner && String(currentOwner.session_anchor_ref || "") !== anchor) {
+    request.handoff_from = {
+      session_anchor_ref: currentOwner.session_anchor_ref,
+      expected_assignment_revision: currentOwner.assignment_revision,
+    };
+  }
+  return invokeServerAction("persona.assign", request).then(async (result) => {
+    await loadPersonaProjectProjection(projectId);
+    return result;
+  });
+}
+
+function unbindFleetNodeMaster(featureId) {
+  const owner = fleetNodeOwner(featureId);
+  if (!owner) return Promise.reject(new Error("No authoritative active Master owner is available."));
+  return invokeServerAction("persona.unassign", {
+    session_anchor_ref: owner.session_anchor_ref,
+    expected_assignment_revision: owner.assignment_revision,
+    request_id: crypto.randomUUID(),
+  }).then(async (result) => {
+    await loadPersonaProjectProjection(String(state.selectedProject?.project_id || ""));
+    return result;
+  });
+}
+
+function startFleetNewMasterSession(featureId, personaId) {
+  const project = state.selectedProject;
+  const projectId = String(project?.project_id || "").trim();
+  if (!projectId || !project?.project_root) {
+    toast("This project has no registered root for a new Master session.", true);
+    return;
+  }
+  state.pendingFleetNodeBinding = { projectId, featureId, personaId };
+  openSessionSummaryForNew({ project, nodeId: projectId, mode: "MASTER" });
+}
+
+function renderFleetNodeTeamControls(graphNode) {
+  if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") return null;
+  const featureId = homeNodeRefKey(graphNode.node_id);
+  const section = node("section", "fleet-node-team");
+  section.dataset.nodeRef = featureId;
+  section.append(node("strong", "", "Team"));
+  const projection = fleetNodeAssignments(featureId);
+  if (projection.status === "UNKNOWN" || projection.status === "ERROR") {
+    section.append(node("p", "fleet-node-team-status is-unknown", projection.status === "ERROR"
+      ? "ERROR: MULTIPLE_ACTIVE_MASTERS"
+      : `UNKNOWN: ${fleetNodeAssignmentError()}`));
+    void ensureHomeNodeOwners();
+    return section;
+  }
+  const owner = projection.active[0] || null;
+  const persona = owner && (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(owner.persona_id || ""));
+  const ownerLine = node("p", "fleet-node-team-status");
+  if (owner) {
+    const ownerLive = (state.terminals || []).some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
+    ownerLine.append(
+      node("span", "fleet-node-role", "Master"),
+      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${owner.session_anchor_ref} / ${ownerLive ? "LIVE" : "OFFLINE"}`),
+    );
+  } else {
+    ownerLine.append(node("span", "fleet-node-role", "Master"), document.createTextNode(" UNASSIGNED"));
+  }
+  section.append(ownerLine);
+
+  const controls = node("div", "fleet-node-team-controls");
+  const liveMasters = (state.terminals || []).filter((terminal) =>
+    String(terminal.project_id || "") === String(state.selectedProject?.project_id || "") &&
+    String(terminal.mode || "").toUpperCase() === "MASTER" &&
+    String(terminal.session_anchor_ref || "").trim()
+  );
+  const activePersonas = (state.personaLibrary || []).filter((item) => String(item.state || "").toUpperCase() === "ACTIVE");
+  const sessionSelect = document.createElement("select");
+  sessionSelect.setAttribute("aria-label", "Existing Master session");
+  for (const terminal of liveMasters) {
+    const option = document.createElement("option");
+    option.value = terminal.session_anchor_ref;
+    option.textContent = fleetTerminalLabel(terminal);
+    if (owner && terminal.session_anchor_ref === owner.session_anchor_ref) option.selected = true;
+    sessionSelect.append(option);
+  }
+  if (!liveMasters.length) controls.append(node("span", "fleet-node-team-status is-unknown", "UNKNOWN: no live Master session"));
+  const personaSelect = document.createElement("select");
+  personaSelect.setAttribute("aria-label", "Persona for Master session");
+  for (const item of activePersonas) {
+    const option = document.createElement("option");
+    option.value = item.persona_id;
+    option.textContent = `${item.title || item.persona_id} (rev ${item.revision})`;
+    if (persona?.persona_id === item.persona_id) option.selected = true;
+    personaSelect.append(option);
+  }
+  if (!activePersonas.length) controls.append(node("span", "fleet-node-team-status is-unknown", "UNKNOWN: no active Persona"));
+  const bindButton = node("button", "", "Bind existing session");
+  bindButton.type = "button";
+  bindButton.disabled = !liveMasters.length || !activePersonas.length;
+  bindButton.addEventListener("click", () => {
+    bindButton.disabled = true;
+    bindFleetNodeMaster(featureId, sessionSelect.value, personaSelect.value)
+      .catch((error) => toast(error.message, true))
+      .finally(() => { bindButton.disabled = false; });
+  });
+  const newButton = node("button", "", "New Master session");
+  newButton.type = "button";
+  newButton.disabled = !activePersonas.length;
+  newButton.addEventListener("click", () => startFleetNewMasterSession(featureId, personaSelect.value));
+  controls.append(sessionSelect, personaSelect, bindButton, newButton);
+  if (owner) {
+    const unbindButton = node("button", "", "Unassign Master");
+    unbindButton.type = "button";
+    unbindButton.addEventListener("click", () => {
+      unbindButton.disabled = true;
+      unbindFleetNodeMaster(featureId)
+        .catch((error) => toast(error.message, true))
+        .finally(() => { unbindButton.disabled = false; });
+    });
+    controls.append(unbindButton);
+  }
+  section.append(controls);
+
+  const secondary = projection.all.filter((item) => {
+    if (String(item.state || "").toUpperCase() !== "ACTIVE") return false;
+    const scope = String(item.scope || item.role || item.session_role || "").toUpperCase();
+    return ["WORKER", "REVIEWER"].includes(scope);
+  });
+  const secondaryLine = node("p", "fleet-node-team-status");
+  if (secondary.length) {
+    secondaryLine.textContent = `Worker/Reviewer: ${secondary.map((item) => `${String(item.scope || item.role).toUpperCase()} / ${item.session_anchor_ref}`).join(", ")}`;
+  } else {
+    secondaryLine.textContent = "Worker/Reviewer: UNKNOWN (no explicit node-scoped assignment)";
+    secondaryLine.classList.add("is-unknown");
+  }
+  section.append(secondaryLine);
+  return section;
 }
 
 function goToNodeMasterBinding(featureId) {
-  state.pendingPersonaNodeScrollTarget = featureId || null;
-  showProjectScreen("persona");
+  state.pendingFleetNodeRef = featureId || null;
+  state.homeNodeId = featureId ? `feat:${featureId}` : null;
+  state.homeTodoId = null;
+  state.homeAgentTodoId = null;
+  showGoalPlanView();
+}
+
+function openFleetNodeFromTerminal(session) {
+  const anchor = String(session?.session_anchor_ref || "").trim();
+  if (!anchor || state.personaAssignmentsStatus !== "READY") {
+    toast("UNKNOWN: authoritative Persona assignment projection is unavailable.", true);
+    return;
+  }
+  const rows = state.personaAssignments.filter((item) =>
+    String(item.session_anchor_ref || "") === anchor &&
+    String(item.state || "").toUpperCase() === "ACTIVE" &&
+    String(item.node_ref || "").trim()
+  );
+  if (rows.length !== 1) {
+    toast(rows.length > 1 ? "ERROR: conflicting node assignments." : "UNASSIGNED: this session has no node owner.", true);
+    return;
+  }
+  goToNodeMasterBinding(rows[0].node_ref);
 }
 
 function renderHomeNodeOwnerRow(graphNode) {
-  if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") return null;
-  const featureId = homeNodeRefKey(graphNode.node_id);
+  const controls = renderFleetNodeTeamControls(graphNode);
+  if (!controls) return null;
   void ensureHomeNodeOwners();
-  const row = node("div", "home-card-meta");
-  const owners = state.homeNodeOwners;
-  if (owners === null) {
-    row.append(node("span", "", "담당 Master 조회 실패"));
-  } else if (!owners) {
-    row.append(node("span", "", "담당 Master 확인 중…"));
-  } else {
-    const owner = owners.get(featureId);
-    row.append(node("span", "", owner ? `담당: ${owner.session_anchor_ref}` : "담당 Master 미배정"));
-  }
-  const link = node("button", "home-node-archive", "결속 관리 →");
-  link.type = "button";
-  link.addEventListener("click", (event) => {
-    event.stopPropagation();
-    goToNodeMasterBinding(featureId);
-  });
-  row.append(link);
-  return row;
+  return controls;
 }
 
 function renderHomeNodes(selNode) {
@@ -6272,6 +6465,50 @@ function loadProjectActivity(projectId) {
     });
 }
 
+/**
+ * Read the two durable Persona projections used by the UI. Assignments are
+ * the only source for node/session ownership; Persona definitions are the
+ * reusable library. Read and schema failures stay explicit.
+ */
+async function loadPersonaProjectProjection(projectId, { includeArchived = true } = {}) {
+  const normalizedProjectId = String(projectId || "").trim();
+  if (!normalizedProjectId) return;
+  state.personaAssignmentsStatus = "LOADING";
+  state.personaAssignmentsError = "";
+  state.personaAssignments = null;
+  state.personaAssignmentsProjectId = normalizedProjectId;
+  state.personaLibraryStatus = "LOADING";
+  state.personaLibrary = null;
+  const [assignmentResult, libraryResult] = await Promise.allSettled([
+    invokeServerAction("persona.assignments-list", { project_id: normalizedProjectId }),
+    invokeServerAction("persona.list", { include_archived: includeArchived }),
+  ]);
+  if (assignmentResult.status === "fulfilled") {
+    const assignments = assignmentResult.value?.assignments;
+    if (Array.isArray(assignments)) {
+      state.personaAssignments = assignments;
+      state.personaAssignmentsStatus = "READY";
+    } else {
+      state.personaAssignmentsStatus = "ERROR";
+      state.personaAssignmentsError = "PERSONA_ASSIGNMENTS_SCHEMA_INVALID";
+    }
+  } else {
+    state.personaAssignmentsStatus = "ERROR";
+    state.personaAssignmentsError = assignmentResult.reason?.message || "PERSONA_ASSIGNMENTS_READ_FAILED";
+  }
+  if (libraryResult.status === "fulfilled" && Array.isArray(libraryResult.value?.personas)) {
+    state.personaLibrary = libraryResult.value.personas;
+    state.personaLibraryStatus = "READY";
+  } else {
+    state.personaLibraryStatus = "ERROR";
+  }
+  if (String(state.selectedProject?.project_id || "") === normalizedProjectId) {
+    if (typeof renderNodeModes === "function") renderNodeModes();
+    if (typeof renderTerminalDock === "function") renderTerminalDock();
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+  }
+}
+
 async function selectProject(
   projectId,
   { revealInspector = true, syncAssets = false } = {}
@@ -6285,6 +6522,7 @@ async function selectProject(
   state.inspectorDismissed = !revealInspector;
   renderProjects();
   loadProjectActivity(projectId);
+  const personaProjectionPromise = loadPersonaProjectProjection(projectId);
   if (syncAssets) {
     await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
       method: "POST",
@@ -6433,6 +6671,7 @@ async function selectProject(
   state.featureNodeProposals = featureProposalResult.proposals || [];
   state.workLoop = workLoopResult || null;
   state.semanticGraph = semanticGraphResult || null;
+  await personaProjectionPromise;
   const universeGoalResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   const goalPlanResult = await api(
     `/v1/projects/${encodeURIComponent(projectId)}/goals`
@@ -14068,21 +14307,12 @@ function renderSemanticNodeActivity(graphNode) {
 function activityEventCategory(event) {
   const payload = event?.payload || {};
   const eventType = String(event?.event_type || "EVENT").toUpperCase();
-  const states = [payload.state, payload.status, payload.outcome]
-    .map((value) => String(value || "").toUpperCase())
-    .filter(Boolean);
-  if (
-    eventType.includes("RECOVER") ||
-    eventType.includes("RESUME") ||
-    states.some((value) => ["RECOVERED", "RESUMED", "RESOLVED"].includes(value))
-  ) return "RECOVERY";
-  if (
-    payload.successful === false ||
-    payload.error_code ||
-    states.some((value) =>
-      ["FAILED", "BLOCKED", "ERROR", "TIMED_OUT", "DENIED", "QUOTA_EXHAUSTED"].includes(value)
-    )
-  ) return "ERROR";
+  const states = [payload.state, payload.status, payload.outcome].map((value) => String(value || "").toUpperCase()).filter(Boolean);
+  if (eventType.includes("RECOVER") || eventType.includes("RESUME") || states.some((value) => ["RECOVERED", "RESUMED", "RESOLVED"].includes(value))) return "RECOVERY";
+  if (eventType === "PROVIDER_QUOTA_STOP") return "QUOTA";
+  if (payload.successful === false || payload.error_code || states.some((value) => ["FAILED", "BLOCKED", "ERROR", "TIMED_OUT", "DENIED", "QUOTA_EXHAUSTED"].includes(value))) return "ERROR";
+  if (eventType === "PERSONA_ASSIGNMENT_CHANGED") return "SESSION";
+  if (eventType === "MASTER_MESSAGE_LIFECYCLE") return "CHANGE";
   if (eventType === "TODO_ACTION_APPLIED") return "WORK";
   if (eventType === "TEST_WORK_STATUS") return "VALIDATION";
   if (eventType === "GIT_WORK_STATUS") return "ARTIFACT";
@@ -14094,19 +14324,16 @@ function activityEventCategory(event) {
 function activityEventTitle(event) {
   const payload = event?.payload || {};
   const eventType = String(event?.event_type || "EVENT").toUpperCase();
-  if (eventType === "TODO_ACTION_APPLIED") {
-    return `Todo · ${payload.outcome || payload.state || payload.action_id || "changed"}`;
-  }
+  if (eventType === "TODO_ACTION_APPLIED") return `Todo ${payload.outcome || payload.state || payload.action_id || "changed"}`;
   if (eventType === "TEST_WORK_STATUS") {
     const result = payload.successful === true ? "PASSED" : payload.successful === false ? "FAILED" : "RECORDED";
-    return `Tests · ${payload.tier || "UNKNOWN"} · ${result}`;
+    return `Tests ${payload.tier || "UNKNOWN"} ${result}`;
   }
-  if (eventType === "GIT_WORK_STATUS") {
-    return `${payload.operation || "Git"} · ${payload.state || "OBSERVED"}`;
-  }
-  if (eventType === "HOOK_SESSION_BOUND") {
-    return `Session · ${payload.trigger || "BOUND"} · ${payload.provider || "UNKNOWN"}`;
-  }
+  if (eventType === "GIT_WORK_STATUS") return `${payload.operation || "Git"} ${payload.state || "OBSERVED"}`;
+  if (eventType === "HOOK_SESSION_BOUND") return `Session ${payload.trigger || "BOUND"} ${payload.provider || "UNKNOWN"}`;
+  if (eventType === "PERSONA_ASSIGNMENT_CHANGED") return `Persona assignment ${payload.state || "UNKNOWN"}`;
+  if (eventType === "MASTER_MESSAGE_LIFECYCLE") return `Master message ${payload.outcome || "UNKNOWN"}`;
+  if (eventType === "PROVIDER_QUOTA_STOP") return `Provider quota ${payload.provider || "UNKNOWN"} ${payload.state || "UNKNOWN"}`;
   return eventType.replaceAll("_", " ");
 }
 
@@ -14168,6 +14395,58 @@ function collapseProjectActivity(events) {
   return entries;
 }
 
+function openActivityNode(nodeRef) {
+  const ref = String(nodeRef || "").trim();
+  if (!ref) return;
+  const graphNode = homeNodes().find((item) => String(item.node_id || "") === ref || homeNodeRefKey(item.node_id) === ref);
+  if (!graphNode) { toast(`UNKNOWN: node ${ref} is not in the authoritative Fleet projection.`, true); return; }
+  state.homeNodeId = graphNode.node_id;
+  state.homeTodoId = null;
+  showGoalPlanView();
+  renderIntegratedHome();
+}
+
+function openActivityTodo(todoId) {
+  const id = String(todoId || "").trim();
+  const todo = homeAllTodos().find((item) => String(item.todo_id || "") === id);
+  if (!todo) { toast(`UNKNOWN: todo ${id} is not in the authoritative projection.`, true); return; }
+  state.homeNodeId = todo.node_ref ? `feat:${todo.node_ref}` : null;
+  state.homeTodoId = id;
+  showGoalPlanView();
+  renderIntegratedHome();
+}
+
+function openActivityTaskFrame(taskFrameId) {
+  const id = String(taskFrameId || "").trim();
+  const todo = homeAllTodos().find((item) => String(item.task_frame_id || item.executor?.task_frame_id || "") === id);
+  if (!todo) { toast(`UNKNOWN: task frame ${id} is not in the authoritative projection.`, true); return; }
+  openActivityTodo(todo.todo_id);
+}
+
+function openActivitySession(anchorRef) {
+  const anchor = String(anchorRef || "").trim();
+  const session = (state.terminals || []).find((item) => String(item.session_anchor_ref || "").trim() === anchor);
+  if (!session) { toast(`UNKNOWN: session ${anchor} is not a live terminal projection.`, true); return; }
+  if (typeof selectTerminalTab === "function") selectTerminalTab(session.terminal_id);
+  if (typeof expandConversationLayer === "function") expandConversationLayer();
+}
+
+function renderActivityContextLinks(event) {
+  const payload = event?.payload || {};
+  const nav = node("div", "activity-context-nav");
+  const links = [];
+  if (payload.node_ref) links.push(["Fleet node", () => openActivityNode(payload.node_ref)]);
+  if (payload.todo_id) links.push(["Todo", () => openActivityTodo(payload.todo_id)]);
+  if (payload.task_frame_id) links.push(["Task Frame", () => openActivityTaskFrame(payload.task_frame_id)]);
+  if (payload.session_anchor_ref) links.push(["Session", () => openActivitySession(payload.session_anchor_ref)]);
+  if (!links.length) return null;
+  for (const [label, handler] of links) {
+    const button = node("button", "activity-context-link", label);
+    button.type = "button"; button.addEventListener("click", handler); nav.append(button);
+  }
+  return nav;
+}
+
 function renderProjectActivityRow(entry) {
   const event = entry.event;
   const category = activityEventCategory(event);
@@ -14182,6 +14461,8 @@ function renderProjectActivityRow(entry) {
     copy.append(node("small", "activity-event-detail", detail));
   }
   row.append(copy);
+  const contextLinks = renderActivityContextLinks(event);
+  if (contextLinks) row.append(contextLinks);
   return row;
 }
 
@@ -18009,563 +18290,95 @@ function personaSessionLabel(terminal) {
 async function renderPersona() {
   const panel = elements.personaPanel;
   if (!panel) return;
-  panel.replaceChildren(node("p", "", "불러오는 중…"));
-
-  let personas = [];
-  let terminals = [];
-  let automation = { run: null, runs: [] };
+  panel.replaceChildren(node("p", "", "Loading Persona Library..."));
   const projectId = String(state.selectedProject?.project_id || "universe").trim();
+  let personas;
   try {
-    const [personaResp, terminalResp, automationResp] = await Promise.all([
-      invokeServerAction("persona.list", { include_archived: true }),
-      api("/v1/terminals").catch(() => ({ terminals: [] })),
-      api(`/v1/projects/${encodeURIComponent(projectId)}/persona-automation`).catch(() => ({ run: null, runs: [] })),
-    ]);
-    personas = personaResp.personas || [];
-    terminals = (terminalResp.terminals || []).filter((t) => t.session_anchor_ref);
-    automation = automationResp || automation;
+    const response = await invokeServerAction("persona.list", { include_archived: true });
+    if (!Array.isArray(response?.personas)) throw new Error("PERSONA_LIBRARY_SCHEMA_INVALID");
+    personas = response.personas;
+    state.personaLibrary = personas;
+    state.personaLibraryStatus = "READY";
   } catch (error) {
-    panel.replaceChildren(node("p", "memory-action-error", error.message));
+    state.personaLibrary = null;
+    state.personaLibraryStatus = "ERROR";
+    panel.replaceChildren(node("p", "memory-action-error", `Persona Library unavailable: ${error.message}`));
     return;
   }
 
   const root = node("div", "persona-root");
-  panel.replaceChildren(root);
-
-  // -- Create form -------------------------------------------------------
+  root.append(
+    node("h2", "", "Persona Library"),
+    node("p", "persona-hint", "Reusable Persona definitions live here. Operational ownership and session binding are shown in Fleet."),
+  );
   const createSection = node("section", "persona-create");
-  createSection.append(node("h3", "", "새 페르소나"));
-  createSection.append(node("p", "persona-hint",
-    "이름과 자연어 책임·판단·한계를 적는다. 고정 직무 목록이 아니다 — 아래는 편집 가능한 예시다."));
+  createSection.append(node("h3", "", "Create Persona"));
+  createSection.append(node("p", "persona-hint", "Define the reusable title and instruction body. Optional fields are displayed only when the authoritative Persona record provides them."));
   const titleInput = document.createElement("input");
-  titleInput.type = "text";
-  titleInput.placeholder = "예: 한 프로젝트를 이끌어가는 노련한 프로젝트 팀장";
-  titleInput.maxLength = 200;
+  titleInput.type = "text"; titleInput.placeholder = "Persona title"; titleInput.maxLength = 200;
   const bodyInput = document.createElement("textarea");
-  bodyInput.rows = 5;
-  bodyInput.placeholder = PERSONA_EXAMPLE_BODY;
-  bodyInput.maxLength = 4000;
-  const createButton = node("button", "", "만들기");
+  bodyInput.rows = 5; bodyInput.placeholder = PERSONA_EXAMPLE_BODY; bodyInput.maxLength = 4000;
+  const createButton = node("button", "", "Create");
   createButton.type = "button";
   const createError = node("p", "memory-action-error");
   createButton.addEventListener("click", async () => {
     const title = titleInput.value.trim();
     const body = bodyInput.value.trim();
-    if (!title || !body) {
-      createError.textContent = "제목과 본문을 모두 입력하세요.";
-      return;
-    }
+    if (!title || !body) { createError.textContent = "Title and instruction body are required."; return; }
     createButton.disabled = true;
     try {
-      await invokeServerAction("persona.create", {
-        title, body, request_id: crypto.randomUUID(),
-      });
-      titleInput.value = ""; bodyInput.value = ""; createError.textContent = "";
-      renderPersona();
-    } catch (error) {
-      createError.textContent = error.message;
-    } finally {
-      createButton.disabled = false;
-    }
+      await invokeServerAction("persona.create", { title, body, request_id: crypto.randomUUID() });
+      await renderPersona();
+    } catch (error) { createError.textContent = error.message; }
+    finally { createButton.disabled = false; }
   });
   createSection.append(titleInput, bodyInput, createButton, createError);
   root.append(createSection);
 
-  // -- Session assignment --------------------------------------------------
-  const assignSection = node("section", "persona-assign");
-  assignSection.append(node("h3", "", "세션 배정"));
-  const activePersonas = personas.filter((p) => p.state === "ACTIVE");
-  if (!terminals.length) {
-    assignSection.append(node("p", "persona-hint", "배정할 수 있는 실행 중 세션이 없습니다."));
-  } else if (!activePersonas.length) {
-    assignSection.append(node("p", "persona-hint", "먼저 활성 페르소나를 하나 이상 만드세요."));
-  } else {
-    const sessionSelect = document.createElement("select");
-    for (const terminal of terminals) {
-      const option = document.createElement("option");
-      option.value = terminal.session_anchor_ref;
-      option.textContent = personaSessionLabel(terminal);
-      sessionSelect.append(option);
-    }
-    const personaSelect = document.createElement("select");
-    for (const persona of activePersonas) {
-      const option = document.createElement("option");
-      option.value = persona.persona_id;
-      option.textContent = `${persona.title} (rev ${persona.revision})`;
-      personaSelect.append(option);
-    }
-    const status = node("p", "persona-hint", "");
-    const assignButton = node("button", "", "배정");
-    const unassignButton = node("button", "", "해제");
-    assignButton.type = "button"; unassignButton.type = "button";
-    let currentAssignment = null;
-
-    const refreshAssignmentStatus = async () => {
-      const anchor = sessionSelect.value;
-      if (!anchor) return;
-      try {
-        const read = await invokeServerAction("persona.assignment-read", { session_anchor_ref: anchor });
-        currentAssignment = read.assignment;
-        if (currentAssignment && currentAssignment.state === "ACTIVE") {
-          const owner = personas.find((p) => p.persona_id === currentAssignment.persona_id);
-          let applyStatus;
-          if (currentAssignment.queued_at && !currentAssignment.applied_at) {
-            const queuedPhase = String(currentAssignment.queued_phase || "NATIVE_QUEUED");
-            applyStatus = `Codex queue 접수됨 (${queuedPhase}, message ${currentAssignment.queued_message_id || "?"}); provider 적용 대기`;
-          } else if (currentAssignment.applied_at) {
-            applyStatus = `적용 확인 (${currentAssignment.applied_phase || "PROVIDER_APPLIED"}) ${currentAssignment.applied_at} (terminal ${currentAssignment.applied_terminal_id})`;
-          } else if (currentAssignment.unsupported_at) {
-            const unsupportedReason = String(currentAssignment.unsupported_reason || "");
-            const nativeQueueNotApplied = unsupportedReason.startsWith("NATIVE_QUEUE_NOT_APPLIED:");
-            applyStatus = nativeQueueNotApplied
-              ? `Codex native queue 접수가 확인되지 않아 NOT_RUN으로 남았습니다 `
-                + `(${currentAssignment.unsupported_at}, terminal ${currentAssignment.unsupported_terminal_id}): `
-                + unsupportedReason
-              : `이 provider(${currentAssignment.unsupported_provider})는 원문을 그대로 전달할 수 없어 `
-                + `미적용으로 남았습니다 (${currentAssignment.unsupported_at}, terminal ${currentAssignment.unsupported_terminal_id}): `
-                + unsupportedReason;
-          } else {
-            applyStatus = "미적용 — 이미 실행 중인 세션에는 반영되지 않으며, 이 Anchor로 새 세션을 시작해야 실제 지침에 적용됩니다.";
-          }
-          status.textContent = `배정 저장됨: ${owner ? owner.title : currentAssignment.persona_id} `
-            + `(persona rev ${currentAssignment.persona_revision}, assignment rev ${currentAssignment.assignment_revision}) — `
-            + applyStatus;
-          unassignButton.disabled = false;
-        } else {
-          status.textContent = "현재 배정 없음.";
-          unassignButton.disabled = true;
-        }
-      } catch (error) {
-        status.textContent = error.message;
-      }
-    };
-    sessionSelect.addEventListener("change", refreshAssignmentStatus);
-    refreshAssignmentStatus();
-
-    assignButton.addEventListener("click", async () => {
-      const anchor = sessionSelect.value;
-      const terminal = terminals.find((t) => t.session_anchor_ref === anchor);
-      const persona = activePersonas.find((p) => p.persona_id === personaSelect.value);
-      if (!anchor || !terminal || !persona) return;
-      assignButton.disabled = true;
-      try {
-        await invokeServerAction("persona.assign", {
-          session_anchor_ref: anchor,
-          project_id: terminal.project_id,
-          persona_id: persona.persona_id,
-          expected_persona_revision: persona.revision,
-          expected_assignment_revision: (currentAssignment && currentAssignment.state === "ACTIVE") ? currentAssignment.assignment_revision : 0,
-          request_id: crypto.randomUUID(),
-        });
-        await refreshAssignmentStatus();
-      } catch (error) {
-        status.textContent = error.message;
-      } finally {
-        assignButton.disabled = false;
-      }
-    });
-    unassignButton.addEventListener("click", async () => {
-      if (!currentAssignment) return;
-      unassignButton.disabled = true;
-      try {
-        await invokeServerAction("persona.unassign", {
-          session_anchor_ref: sessionSelect.value,
-          expected_assignment_revision: currentAssignment.assignment_revision,
-          request_id: crypto.randomUUID(),
-        });
-        await refreshAssignmentStatus();
-      } catch (error) {
-        status.textContent = error.message;
-      } finally {
-        unassignButton.disabled = false;
-      }
-    });
-
-    assignSection.append(
-      node("label", "", "대상 세션"), sessionSelect,
-      node("label", "", "페르소나"), personaSelect,
-      assignButton, unassignButton, status,
-    );
-  }
-  root.append(assignSection);
-
-  // -- Node Master binding -------------------------------------------------
-  // 2026-09-15/2026-09-15 follow-up: node-scoped MASTER automation
-  // ownership needs a way for a person to see and change, per feature_node,
-  // which MASTER session owns it -- the same persona.assign/unassign
-  // Actions above, scoped with node_ref (and, for a live handoff between
-  // two different sessions, the optional atomic handoff_from field), not a
-  // new endpoint. Ownership itself comes from persona.assignments-list --
-  // the authoritative durable list for this project (ACTIVE and
-  // UNASSIGNED, live or offline) -- never derived by probing only
-  // currently-live terminals, which would misread an offline owner's node
-  // as unassigned.
-  const nodeSection = node("section", "persona-node-binding");
-  nodeSection.append(node("h3", "", "노드 담당 Master"));
-  nodeSection.append(node("p", "persona-hint",
-    "각 노드(feature_node)를 자동화로 소유할 MASTER 세션을 배정/변경/해제합니다. "
-    + "프로젝트 Conductor(node_ref 없음)의 전체 범위와는 별개입니다. "
-    + "구조/도메인 노드(feature_node가 아닌 그래프 노드)는 이 배정 대상이 아닙니다."));
-  if (state.pendingPersonaNodeScrollTarget) {
-    const backButton = node("button", "", "← Fleet로 돌아가기");
-    backButton.type = "button";
-    backButton.addEventListener("click", () => showGoalPlanView());
-    nodeSection.append(backButton);
-  }
-
-  const renderNodeSectionError = (message, onRetry) => {
-    nodeSection.append(node("p", "memory-action-error", message));
-    const retryButton = node("button", "", "다시 시도");
-    retryButton.type = "button";
-    retryButton.addEventListener("click", onRetry);
-    nodeSection.append(retryButton);
+  const valueOrUnknown = (value) => {
+    if (value === null || value === undefined || value === "") return "UNKNOWN";
+    if (Array.isArray(value)) return value.length ? value.join(", ") : "UNKNOWN";
+    if (typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  };
+  const metadata = (persona) => {
+    const fields = [
+      ["Role", persona.role],
+      ["Skills", persona.skills ?? persona.skill_refs],
+      ["Model", persona.model ?? persona.model_ref],
+      ["Budget", persona.budget ?? persona.budget_policy],
+      ["Escalation", persona.escalation_policy ?? persona.escalation],
+      ["Version", persona.version ?? persona.revision],
+    ];
+    const list = node("dl", "persona-metadata");
+    for (const [label, value] of fields) list.append(node("dt", "", label), node("dd", "", valueOrUnknown(value)));
+    return list;
   };
 
-  let features = null;
-  let allAssignments = null;
-  try {
-    const [featureResp, assignmentsResp] = await Promise.all([
-      api(`/v1/projects/${encodeURIComponent(projectId)}/feature-nodes`),
-      invokeServerAction("persona.assignments-list", { project_id: projectId }),
-    ]);
-    features = featureResp.features || [];
-    allAssignments = assignmentsResp.assignments || [];
-  } catch (error) {
-    // A fetch failure is NOT "no nodes" or "no owner" -- conflating the two
-    // previously made a real communication failure look like an
-    // unassigned node (2026-09-15 Conductor review).
-    renderNodeSectionError(`노드/배정 정보를 불러오지 못했습니다: ${error.message}`, () => renderPersona());
-    features = null;
-  }
-
-  if (features !== null) {
-    const projectMasterTerminals = terminals.filter((t) =>
-      String(t.mode || "").toUpperCase() === "MASTER" &&
-      String(t.project_id || "").trim() === projectId
-    );
-    // The authoritative owner map is built from persona.assignments-list
-    // (every durable row for this project), not from probing only live
-    // terminals -- an ACTIVE, node-scoped assignment whose session is
-    // currently offline is still that node's real owner.
-    const activeNodeAssignments = allAssignments.filter((a) => a.state === "ACTIVE" && a.node_ref);
-    const liveAnchors = new Set(
-      terminals.filter((t) => t.state === "LIVE").map((t) => t.session_anchor_ref)
-    );
-    const nodeOwnerByFeatureId = new Map(activeNodeAssignments.map((a) => [a.node_ref, a]));
-    const ownedNodeByAnchor = new Map(activeNodeAssignments.map((a) => [a.session_anchor_ref, a.node_ref]));
-
-    if (!features.length) {
-      nodeSection.append(node("p", "persona-hint", "이 프로젝트에 노드(feature_node)가 없습니다."));
-    } else if (!projectMasterTerminals.length) {
-      nodeSection.append(node("p", "persona-hint",
-        "이 프로젝트에 배정 가능한 live MASTER 세션이 없습니다. "
-        + "기존 지원 경로(session.new)로 이 프로젝트의 MASTER 세션을 먼저 시작하세요. "
-        + "(이 화면에는 아직 클릭 가능한 세션 생성 진입점이 연결되어 있지 않습니다.)"));
-    } else if (!activePersonas.length) {
-      nodeSection.append(node("p", "persona-hint", "먼저 활성 페르소나를 하나 이상 만드세요."));
-    } else {
-      const table = node("div", "persona-node-table");
-      for (const feature of features) {
-        const row = node("div", "persona-node-row");
-        row.dataset.featureId = feature.feature_id;
-        row.append(node("strong", "", feature.title || feature.feature_id));
-        const assignment = nodeOwnerByFeatureId.get(feature.feature_id) || null;
-        const ownerAnchor = assignment ? assignment.session_anchor_ref : null;
-        const ownerLive = ownerAnchor ? liveAnchors.has(ownerAnchor) : false;
-        const ownerTerminal = ownerAnchor
-          ? terminals.find((t) => t.session_anchor_ref === ownerAnchor) || null
-          : null;
-        const statusLine = node("p", "persona-hint");
-        if (assignment) {
-          const persona = personas.find((p) => p.persona_id === assignment.persona_id);
-          const ownerLabel = ownerTerminal ? personaSessionLabel(ownerTerminal) : ownerAnchor;
-          statusLine.textContent = `담당: ${ownerLabel} ${ownerLive ? "(live)" : "(offline)"} `
-            + `(${persona ? persona.title : assignment.persona_id}, assignment rev ${assignment.assignment_revision})`;
-        } else {
-          statusLine.textContent = "담당 Master 미배정.";
-        }
-        row.append(statusLine);
-        if (assignment) {
-          // Whether the live Rust Host for this Anchor actually confirmed
-          // this exact assignment_revision -- distinct from the DB write
-          // succeeding above. Never conflate SAVED with CONFIRMED
-          // (2026-09-15 Conductor review: "저장됨/Host 확인됨/미확인·미지원·
-          // 오류를 정확히 표시").
-          const hostSyncLine = node("p", "persona-hint");
-          const syncStatus = assignment.host_sync_status || "SAVED";
-          const syncRevisionMatches = assignment.host_sync_assignment_revision === assignment.assignment_revision;
-          const HOST_SYNC_LABELS = {
-            SAVED: "Host 미확인 (저장됨)",
-            CONFIRMED: syncRevisionMatches ? "Host 확인됨" : "Host 확인됨 (이전 revision)",
-            OFFLINE: "Host 오프라인 (미확인)",
-            UNSUPPORTED: "Host 미지원 버전 (미확인)",
-            ERROR: "Host 동기화 오류 (미확인)",
-          };
-          hostSyncLine.textContent = HOST_SYNC_LABELS[syncStatus] || `Host 상태: ${syncStatus}`;
-          if (syncStatus !== "SAVED" && syncStatus !== "CONFIRMED" && assignment.host_sync_detail) {
-            hostSyncLine.title = assignment.host_sync_detail;
-          }
-          row.append(hostSyncLine);
-        }
-        const sessionPicker = document.createElement("select");
-        for (const terminal of projectMasterTerminals) {
-          const option = document.createElement("option");
-          option.value = terminal.session_anchor_ref;
-          const otherNode = ownedNodeByAnchor.get(terminal.session_anchor_ref);
-          const otherNodeTitle = otherNode && otherNode !== feature.feature_id
-            ? features.find((f) => f.feature_id === otherNode)
-            : null;
-          option.textContent = otherNodeTitle
-            ? `${personaSessionLabel(terminal)} -- 현재 다른 노드 담당: ${otherNodeTitle.title || otherNode}`
-            : personaSessionLabel(terminal);
-          if (ownerAnchor && terminal.session_anchor_ref === ownerAnchor) option.selected = true;
-          sessionPicker.append(option);
-        }
-        const nodePersonaPicker = document.createElement("select");
-        for (const persona of activePersonas) {
-          const option = document.createElement("option");
-          option.value = persona.persona_id;
-          option.textContent = `${persona.title} (rev ${persona.revision})`;
-          if (assignment && assignment.persona_id === persona.persona_id) option.selected = true;
-          nodePersonaPicker.append(option);
-        }
-        const nodeError = node("p", "memory-action-error");
-        // renderPersona() rebuilds the whole panel (including a fresh
-        // nodeError element) on every call, including the recovery
-        // re-render right after a failed write below -- setting text on
-        // the OLD element and then immediately discarding it would show
-        // the error for zero frames. Route it through state, keyed by
-        // node, so it survives exactly one rebuild and is then cleared
-        // (2026-09-15 Conductor review: a shown-then-instantly-wiped error
-        // is not a real error path).
-        state.personaNodeErrors = state.personaNodeErrors || {};
-        if (state.personaNodeErrors[feature.feature_id]) {
-          nodeError.textContent = state.personaNodeErrors[feature.feature_id];
-          delete state.personaNodeErrors[feature.feature_id];
-        }
-        const assignNodeButton = node("button", "", assignment ? "다른 세션으로 변경" : "배정");
-        assignNodeButton.type = "button";
-        assignNodeButton.addEventListener("click", async () => {
-          const targetAnchor = sessionPicker.value;
-          const targetTerminal = projectMasterTerminals.find((t) => t.session_anchor_ref === targetAnchor);
-          const persona = activePersonas.find((p) => p.persona_id === nodePersonaPicker.value);
-          if (!targetAnchor || !targetTerminal || !persona) return;
-          if (assignment && targetAnchor === ownerAnchor) return; // already the owner
-          assignNodeButton.disabled = true;
-          try {
-            const targetExisting = allAssignments.find((a) => a.session_anchor_ref === targetAnchor);
-            const targetOtherNode = ownedNodeByAnchor.get(targetAnchor);
-            if (targetOtherNode && targetOtherNode !== feature.feature_id) {
-              const otherTitle = features.find((f) => f.feature_id === targetOtherNode);
-              if (!window.confirm(
-                `${personaSessionLabel(targetTerminal)}은(는) 이미 다른 노드(${otherTitle ? otherTitle.title : targetOtherNode})를 `
-                + "담당하고 있습니다. 이 배정을 진행하면 그 노드의 담당을 잃습니다. 계속할까요?"
-              )) {
-                assignNodeButton.disabled = false;
-                return;
-              }
-            }
-            // node/project/Anchor/revision are server-verified
-            // (tools/universe_server.py::_validate_persona_assignment_node_ref
-            // and the exclusive-owner partial unique index). When a
-            // DIFFERENT Anchor currently owns this node, handoff_from
-            // makes the release-and-assign one atomic server transaction
-            // instead of two separate calls with a real window between
-            // them (2026-09-15 Conductor review).
-            const requestBody = {
-              session_anchor_ref: targetAnchor,
-              project_id: targetTerminal.project_id,
-              persona_id: persona.persona_id,
-              expected_persona_revision: persona.revision,
-              // Any EXISTING row (regardless of state) needs its real
-              // current revision -- only a truly absent row uses 0. Using
-              // 0 for an UNASSIGNED-but-existing row was the exact bug a
-              // release-then-reassign-to-the-same-session hit
-              // (2026-09-15 Conductor review).
-              expected_assignment_revision: targetExisting ? targetExisting.assignment_revision : 0,
-              node_ref: feature.feature_id,
-              request_id: crypto.randomUUID(),
-            };
-            if (assignment && targetAnchor !== ownerAnchor) {
-              requestBody.handoff_from = {
-                session_anchor_ref: ownerAnchor,
-                expected_assignment_revision: assignment.assignment_revision,
-              };
-            }
-            await invokeServerAction("persona.assign", requestBody);
-            await renderPersona();
-          } catch (error) {
-            // A failed write may still have partially landed (e.g. the
-            // error arrived after the write committed) -- re-fetch rather
-            // than leave a stale screen claiming the pre-click state
-            // (2026-09-15 Conductor review: "화면 stale 상태를 복구하지
-            // 않는다"), but keep the error itself visible across that
-            // re-fetch (see state.personaNodeErrors above).
-            state.personaNodeErrors[feature.feature_id] = error.message;
-            await renderPersona();
-          } finally {
-            assignNodeButton.disabled = false;
-          }
-        });
-        row.append(node("label", "", "세션"), sessionPicker, node("label", "", "페르소나"), nodePersonaPicker, assignNodeButton);
-        if (assignment) {
-          const releaseButton = node("button", "", "해제");
-          releaseButton.type = "button";
-          releaseButton.addEventListener("click", async () => {
-            releaseButton.disabled = true;
-            try {
-              await invokeServerAction("persona.unassign", {
-                session_anchor_ref: ownerAnchor,
-                expected_assignment_revision: assignment.assignment_revision,
-                request_id: crypto.randomUUID(),
-              });
-              await renderPersona();
-            } catch (error) {
-              state.personaNodeErrors[feature.feature_id] = error.message;
-              await renderPersona();
-            } finally {
-              releaseButton.disabled = false;
-            }
-          });
-          row.append(releaseButton);
-        }
-        row.append(nodeError);
-        table.append(row);
-      }
-      nodeSection.append(table);
-    }
-  }
-  root.append(nodeSection);
-
-  // -- Bounded Persona Conductor automation -----------------------------
-  const automationSection = node("section", "persona-automation");
-  automationSection.append(node("h3", "", "전용 컨덕터 자동화"));
-  automationSection.append(node("p", "persona-hint",
-    "배정과 실행은 분리되어 있습니다. 이 화면은 영속 run 상태를 표시하고, Master queue 접수와 결과 검토를 따로 기록합니다."));
-  const run = automation.run;
-  const runSummary = node("div", "persona-automation-summary");
-  if (run) {
-    const decision = run.current_decision || {};
-    const assignment = run.current_assignment || {};
-    const review = run.current_review || {};
-    runSummary.append(
-      node("p", "", `상태: ${run.state} · run ${run.run_id} · revision ${run.revision}`),
-      node("p", "", `페르소나: ${run.persona_id} rev ${run.persona_revision} · Anchor: ${run.session_anchor_ref}`),
-      node("p", "", `현재 판단: ${decision.kind || "없음"}${decision.rationale ? ` — ${decision.rationale}` : ""}`),
-      node("p", "", `현재 배정: ${assignment.message_id || "없음"}${assignment.title ? ` — ${assignment.title}` : ""}`),
-      node("p", "", `마지막 검토: ${review.outcome || "없음"} · acceptance: ${review.acceptance_status || "UNKNOWN"}${review.result_ref ? ` — ${review.result_ref}` : ""}`),
-      node("p", "", `다음 조건: ${run.next_condition || "없음"} · quota: ${run.quota_state || "UNKNOWN"}`),
-    );
-    const controlError = node("p", "memory-action-error");
-    const controls = node("div", "persona-automation-controls");
-    const invokeRunControl = async (actionId, extra = {}) => {
-      try {
-        await invokeServerAction(actionId, { run_id: run.run_id, request_id: crypto.randomUUID(), expected_revision: run.revision, ...extra });
-        await renderPersona();
-      } catch (error) {
-        controlError.textContent = error.message;
-      }
-    };
-    if (["RUNNING", "WAITING"].includes(run.state)) {
-      const pause = node("button", "", "일시정지");
-      pause.type = "button";
-      pause.addEventListener("click", () => invokeRunControl("persona.automation.pause", { reason: "operator_pause" }));
-      controls.append(pause);
-    }
-    if (run.state === "PAUSED") {
-      const resume = node("button", "", "재개");
-      resume.type = "button";
-      resume.addEventListener("click", () => invokeRunControl("persona.automation.resume"));
-      controls.append(resume);
-    }
-    if (["RUNNING", "WAITING", "PAUSED"].includes(run.state)) {
-      const stop = node("button", "", "정지");
-      stop.type = "button";
-      stop.addEventListener("click", () => invokeRunControl("persona.automation.stop", { reason: "operator_stop" }));
-      controls.append(stop);
-    }
-    runSummary.append(controls, controlError);
-  } else {
-    runSummary.append(node("p", "persona-hint", `프로젝트 ${projectId}에 실행 중인 run이 없습니다.`));
-    const conductor = terminals.find((terminal) =>
-      String(terminal.mode || "").toUpperCase() === "CONDUCTOR" &&
-      String(terminal.project_id || "").trim() === projectId
-    );
-    let conductorAssignment = null;
-    if (conductor?.session_anchor_ref) {
-      try {
-        const assignmentResp = await invokeServerAction("persona.assignment-read", { session_anchor_ref: conductor.session_anchor_ref });
-        conductorAssignment = assignmentResp.assignment;
-      } catch (_) {
-        conductorAssignment = null;
-      }
-    }
-    if (conductorAssignment?.state === "ACTIVE") {
-      const scopeInput = document.createElement("input");
-      scopeInput.placeholder = "이번 bounded 작업의 범위";
-      const instructionInput = document.createElement("textarea");
-      instructionInput.rows = 3;
-      instructionInput.placeholder = "컨덕터가 읽을 실행 지시와 완료조건";
-      const startButton = node("button", "", "자동화 시작");
-      const startError = node("p", "memory-action-error");
-      startButton.type = "button";
-      startButton.addEventListener("click", async () => {
-        if (!scopeInput.value.trim() || !instructionInput.value.trim()) {
-          startError.textContent = "범위와 지시를 모두 입력하세요.";
-          return;
-        }
-        startButton.disabled = true;
-        try {
-          await invokeServerAction("persona.automation.start", {
-            project_id: projectId,
-            session_anchor_ref: conductorAssignment.session_anchor_ref,
-            scope: scopeInput.value.trim(),
-            instruction: instructionInput.value.trim(),
-            request_id: crypto.randomUUID(),
-          });
-          await renderPersona();
-        } catch (error) {
-          startError.textContent = error.message;
-        } finally {
-          startButton.disabled = false;
-        }
-      });
-      runSummary.append(
-        node("p", "persona-hint", `활성 배정: ${conductorAssignment.persona_id} (assignment rev ${conductorAssignment.assignment_revision})`),
-        scopeInput, instructionInput, startButton, startError,
-      );
-    } else {
-      runSummary.append(node("p", "persona-hint", "CONDUCTOR 세션에 활성 페르소나를 먼저 배정하세요."));
-    }
-  }
-  automationSection.append(runSummary);
-  root.append(automationSection);
-
-  // -- Persona list ---------------------------------------------------
   const listSection = node("section", "persona-list");
-  listSection.append(node("h3", "", "페르소나 목록"));
-  if (!personas.length) {
-    listSection.append(node("p", "persona-hint", "아직 만든 페르소나가 없습니다."));
-  }
+  listSection.append(node("h3", "", "Personas"));
+  if (!personas.length) listSection.append(node("p", "persona-hint", "No Persona definitions are available."));
   for (const persona of personas) {
-    const card = node("div", "persona-card" + (persona.state === "ARCHIVED" ? " persona-card-archived" : ""));
-    card.append(node("h4", "", `${persona.title} (rev ${persona.revision}, ${persona.state})`));
-    const bodyView = node("p", "persona-body", persona.body);
-    card.append(bodyView);
-
-    const editButton = node("button", "", "편집");
-    const archiveButton = node("button", "", persona.state === "ACTIVE" ? "보관" : "복원");
+    const archived = String(persona.state || "").toUpperCase() === "ARCHIVED";
+    const card = node("article", `persona-card${archived ? " persona-card-archived" : ""}`);
+    card.dataset.personaId = persona.persona_id || "";
+    card.append(
+      node("h4", "", `${persona.title || "Untitled Persona"} (rev ${valueOrUnknown(persona.revision)}, ${valueOrUnknown(persona.state)})`),
+      node("p", "persona-body", persona.body || ""),
+      metadata(persona),
+    );
+    const editButton = node("button", "", "Edit");
+    const archiveButton = node("button", "", archived ? "Restore" : "Archive");
     editButton.type = "button"; archiveButton.type = "button";
     const cardError = node("p", "memory-action-error");
-
     editButton.addEventListener("click", () => {
       if (card.querySelector(".persona-edit-form")) return;
       const form = node("div", "persona-edit-form");
       const editTitle = document.createElement("input");
-      editTitle.type = "text"; editTitle.value = persona.title; editTitle.maxLength = 200;
+      editTitle.type = "text"; editTitle.value = persona.title || ""; editTitle.maxLength = 200;
       const editBody = document.createElement("textarea");
-      editBody.rows = 5; editBody.value = persona.body; editBody.maxLength = 4000;
-      const saveButton = node("button", "", "저장");
+      editBody.rows = 5; editBody.value = persona.body || ""; editBody.maxLength = 4000;
+      const saveButton = node("button", "", "Save");
       saveButton.type = "button";
       saveButton.addEventListener("click", async () => {
         saveButton.disabled = true;
@@ -18573,49 +18386,29 @@ async function renderPersona() {
           await invokeServerAction("persona.update", {
             persona_id: persona.persona_id,
             expected_revision: persona.revision,
-            title: editTitle.value.trim(),
-            body: editBody.value.trim(),
-            request_id: crypto.randomUUID(),
+            title: editTitle.value.trim(), body: editBody.value.trim(), request_id: crypto.randomUUID(),
           });
-          renderPersona();
-        } catch (error) {
-          cardError.textContent = error.message;
-        } finally {
-          saveButton.disabled = false;
-        }
+          await renderPersona();
+        } catch (error) { cardError.textContent = error.message; }
+        finally { saveButton.disabled = false; }
       });
-      form.append(editTitle, editBody, saveButton);
-      card.append(form);
+      form.append(editTitle, editBody, saveButton); card.append(form);
     });
-
     archiveButton.addEventListener("click", async () => {
       archiveButton.disabled = true;
       try {
-        await invokeServerAction(persona.state === "ACTIVE" ? "persona.archive" : "persona.restore", {
-          persona_id: persona.persona_id,
-          expected_revision: persona.revision,
-          request_id: crypto.randomUUID(),
+        await invokeServerAction(archived ? "persona.restore" : "persona.archive", {
+          persona_id: persona.persona_id, expected_revision: persona.revision, request_id: crypto.randomUUID(),
         });
-        renderPersona();
-      } catch (error) {
-        cardError.textContent = error.message;
-      } finally {
-        archiveButton.disabled = false;
-      }
+        await renderPersona();
+      } catch (error) { cardError.textContent = error.message; }
+      finally { archiveButton.disabled = false; }
     });
-
     card.append(editButton, archiveButton, cardError);
     listSection.append(card);
   }
   root.append(listSection);
-
-  if (state.pendingPersonaNodeScrollTarget) {
-    const target = nodeSection.querySelector(
-      `.persona-node-row[data-feature-id="${CSS.escape(state.pendingPersonaNodeScrollTarget)}"]`
-    );
-    state.pendingPersonaNodeScrollTarget = null;
-    if (target) target.scrollIntoView({ block: "center" });
-  }
+  panel.replaceChildren(root);
 }
 
 function renderMemoryLegacy() {
@@ -19200,6 +18993,14 @@ function bindEvents() {
       for (const item of elements.mobileWorkTabs.querySelectorAll("button")) {
         item.classList.toggle("selected", item.dataset.mobileWorkView === "goals");
       }
+    });
+  }
+  if (elements.sessionSummaryDialog) {
+    elements.sessionSummaryDialog.addEventListener("close", () => {
+      // A cancelled Fleet "New Master session" must not bind a later,
+      // unrelated session to the stale node selection.
+      if (state.pendingFleetNodeBinding) state.pendingFleetNodeBinding = null;
+      if (state.pendingNewSessionCoordinate) state.pendingNewSessionCoordinate = null;
     });
   }
   if (elements.settingsDialog) {

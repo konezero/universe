@@ -148,9 +148,6 @@
         <button class="selected" type="button" data-mobile-work-view="goals">Goals</button>
         <button type="button" data-mobile-work-view="sessions">Sessions</button>
         <button type="button" data-mobile-work-view="bench">Bench</button>
-        <button type="button" data-mobile-work-view="actions" aria-haspopup="dialog" aria-controls="action-inbox-dialog">
-          Actions <span id="mobile-action-inbox-badge" class="chat-badge hidden" aria-hidden="true"></span>
-        </button>
       </nav>
       <section id="goal-plan-workspace" class="goal-plan-workspace" aria-label="Project goal plan">
         <header class="goal-plan-header">
@@ -330,10 +327,6 @@
             </div>
             <button id="terminal-dock-side" class="icon-button compact" type="button" title="Dock to bottom / right" aria-label="Dock to bottom or right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg></button>
             <input id="conversation-expand" class="conversation-expand-toggle" type="checkbox" aria-label="Expand conversation"><label class="icon-button compact conversation-expand-control" for="conversation-expand" title="Expand conversation">&#x26F6;</label>
-            <button id="action-inbox-button" class="action-inbox-button" type="button" title="Open actions" aria-label="Open actions">
-              Actions
-              <span id="action-inbox-badge" class="chat-badge hidden">0</span>
-            </button>
             <label class="layer-opacity" title="Conversation transparency">
               <span>Opacity</span>
               <input id="conversation-opacity" type="range" min="25" max="100" value="92">
@@ -1041,17 +1034,6 @@
       <button id="session-summary-manage" class="secondary-button" type="button">View in Observatory</button>
       <button id="session-summary-open" class="primary-button" type="button">Open session</button>
     </div>
-  </dialog>
-
-  <dialog id="action-inbox-dialog" class="action-inbox-dialog" aria-labelledby="action-inbox-title">
-    <div class="dialog-heading">
-      <div>
-        <span class="inspector-kicker">Approvals &amp; activity</span>
-        <h2 id="action-inbox-title">Actions</h2>
-      </div>
-      <button class="icon-button" type="button" data-close-dialog title="Close" aria-label="Close">&times;</button>
-    </div>
-    <div id="action-inbox-list" class="action-inbox-list" role="region" aria-label="Actions by category" aria-live="polite" aria-atomic="false"></div>
   </dialog>
 
   <dialog id="session-observatory-dialog" class="session-observatory-dialog wide-dialog" aria-labelledby="session-observatory-title">
