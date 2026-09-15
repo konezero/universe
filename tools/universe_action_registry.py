@@ -155,6 +155,17 @@ SESSION_RESUME_REQUEST_SCHEMA = "universe.session-resume-action-request.v1"
 SESSION_RESUME_RESULT_SCHEMA = "universe.session-resume-receipt.v1"
 SESSION_RESUME_ACTION_SURFACE = "session.resume"
 
+# Provider-neutral delivery Actions. The compatibility HTTP routes front the
+# same typed contracts and durable domain gateways; they do not create a
+# second receipt store or an independent lifecycle.
+MASTER_COMPLETE_ACTION_ID = "master.complete"
+MASTER_COMPLETE_REQUEST_SCHEMA = "universe.master-complete-action-request.v1"
+MASTER_COMPLETE_RESULT_SCHEMA = "universe.master-complete-action-result.v1"
+
+SESSION_BUS_REPLY_ACTION_ID = "session-bus.reply"
+SESSION_BUS_REPLY_REQUEST_SCHEMA = "universe.session-bus-reply-action-request.v1"
+SESSION_BUS_REPLY_RESULT_SCHEMA = "universe.session-bus-reply-action-result.v1"
+
 # Persona Conductor automation is a bounded, durable work loop.  State and
 # queue Actions remain local mutations; the judge Action is the one explicit
 # provider boundary and must use the server-owned Task Frame Host.
@@ -242,6 +253,18 @@ def _canonical_json(value: Any) -> str:
             "ACTION_REQUEST_NOT_CANONICAL",
             "Action request must contain JSON-compatible values",
         ) from error
+
+
+def canonical_value_sha256(value: Any) -> str:
+    """Hash one canonical JSON value as UTF-8 for an Action receipt."""
+
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def utf8_sha256(value: str) -> str:
+    """Hash the exact text bytes received at an Action boundary."""
+
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
 def _forbidden_field_paths(value: Any, path: str = "request") -> list[str]:
@@ -910,6 +933,75 @@ def build_default_action_registry(
         )
 
     supplied_handlers = dict(work_surface_handlers or {})
+    registry.register(
+        ActionContract(
+            action_id=MASTER_COMPLETE_ACTION_ID,
+            request_schema_ref=MASTER_COMPLETE_REQUEST_SCHEMA,
+            result_schema_ref=MASTER_COMPLETE_RESULT_SCHEMA,
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "gateway": "UniverseStore.complete_master_message",
+                "receipt_schema": MASTER_COMPLETE_RESULT_SCHEMA,
+                "authentication": "CLAIMED_MASTER_OWNER",
+                "replay": "EXACT_MESSAGE_PROVIDER_AND_BODY_DIGEST",
+                "request_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["message_id", "provider"],
+                    "properties": {
+                        "message_id": {"type": "string"},
+                        "provider": {"type": "string"},
+                        "body_text": {"type": "string"},
+                        "result_ref": {"type": "string"},
+                        "terminal_id": {"type": "string"},
+                        "session_anchor_ref": {"type": "string"},
+                    },
+                },
+            },
+        ),
+        supplied_handlers.get(MASTER_COMPLETE_ACTION_ID),
+        surfaces=(MASTER_COMPLETE_ACTION_ID,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=SESSION_BUS_REPLY_ACTION_ID,
+            request_schema_ref=SESSION_BUS_REPLY_REQUEST_SCHEMA,
+            result_schema_ref=SESSION_BUS_REPLY_RESULT_SCHEMA,
+            side_effect_class="SESSION_LIFECYCLE_MUTATION",
+            metadata={
+                "gateway": "SessionBus.reply",
+                "receipt_schema": SESSION_BUS_REPLY_RESULT_SCHEMA,
+                "authentication": "RECIPIENT_SESSION_ANCHOR",
+                "replay": "EXACT_MESSAGE_RECIPIENT_AND_BODY_DIGEST",
+                "processing_action": "PROCESS_REPLY_IS_CONSUMPTION_ONLY",
+                "request_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "message_id",
+                        "session_anchor_ref",
+                        "body_text",
+                    ],
+                    "properties": {
+                        "message_id": {"type": "string"},
+                        "terminal_id": {"type": "string"},
+                        "session_anchor_ref": {"type": "string"},
+                        "body_text": {"type": "string"},
+                        "result_ref": {"type": "string"},
+                        "outcome": {"enum": ["COMPLETED", "FAILED"]},
+                    },
+                },
+            },
+        ),
+        supplied_handlers.get(SESSION_BUS_REPLY_ACTION_ID),
+        surfaces=(SESSION_BUS_REPLY_ACTION_ID,),
+    )
+    registry.register_legacy_surface(
+        "/v1/master-messages/{message_id}/complete"
+    )
+    registry.register_legacy_surface(
+        "/v1/session-bus/messages/{message_id}/reply"
+    )
     for action_id in ("service.status", "service.restart"):
         if action_id in supplied_handlers:
             registry.register(
@@ -1048,6 +1140,12 @@ __all__ = [
     "SESSION_RESUME_ACTION_SURFACE",
     "SESSION_RESUME_REQUEST_SCHEMA",
     "SESSION_RESUME_RESULT_SCHEMA",
+    "MASTER_COMPLETE_ACTION_ID",
+    "MASTER_COMPLETE_REQUEST_SCHEMA",
+    "MASTER_COMPLETE_RESULT_SCHEMA",
+    "SESSION_BUS_REPLY_ACTION_ID",
+    "SESSION_BUS_REPLY_REQUEST_SCHEMA",
+    "SESSION_BUS_REPLY_RESULT_SCHEMA",
     "PERSONA_AUTOMATION_ACTION_IDS",
     "RegisteredAction",
     "SENSITIVE_CREDENTIAL_FIELDS",
@@ -1069,7 +1167,9 @@ __all__ = [
     "UNCOVERED",
     "UnknownActionError",
     "build_default_action_registry",
+    "canonical_value_sha256",
     "derive_idempotency_key",
     "find_forbidden_caller_fields",
     "find_forbidden_credential_fields",
+    "utf8_sha256",
 ]

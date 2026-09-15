@@ -127,6 +127,56 @@ concurrent requests, durable replay, atomic rollback and propagation recovery.
 `tests/test_todo_actions_ui.js` covers shared Actions and uncertain request replay.
 Existing supervised lifecycle tests remain applicable to their separate gateway.
 
+## Durable delivery Actions
+
+`master.complete` and `session-bus.reply` are the typed Actions for the two
+provider delivery boundaries. The compatibility endpoints
+`/v1/master-messages/{message_id}/complete` and
+`/v1/session-bus/messages/{message_id}/reply` delegate to these contracts, so
+they retain their existing response/status behavior without creating a second
+receipt or lifecycle store.
+
+Both Actions accept one BOM-less UTF-8 JSON envelope through the native Action
+client. The client reads the endpoint and credential from local server state;
+the request file contains no token, actor, authority, approval, or provider
+resume identifier:
+
+```json
+{
+  "action_id": "session-bus.reply",
+  "request": {
+    "message_id": "msg_<observed-message>",
+    "terminal_id": "term_<observed-owner>",
+    "session_anchor_ref": "session_anchor_<observed-owner>",
+    "body_text": "한글😀\n\"quotes\" \\path\n- **markdown**",
+    "result_ref": "artifact://<observed-evidence>",
+    "outcome": "COMPLETED"
+  }
+}
+```
+
+Invoke that file through the installed file-backed Action client; it sends the
+structured object as UTF-8 JSON and writes a UTF-8 result file:
+
+```text
+python .ai/skills/common/action-ir/scripts/action_ir_cli.py --request C:/Temp/session-bus-reply.json --result C:/Temp/session-bus-reply-result.json
+```
+
+Use the same envelope with `action_id: "master.complete"` and a request that
+contains `message_id`, `provider`, `body_text`, and optional `result_ref` (the
+claimed `terminal_id` and `session_anchor_ref` may be supplied for an exact
+owner check). The server records the exact body and a
+`body_text_utf8_sha256` receipt in the existing durable gateway. Leading and
+trailing whitespace, newlines, Unicode, quotes, backslashes and Markdown are
+not normalized. Identical Action input is a replay of the existing result;
+different content for the same message is a conflict. Recipient Anchor and
+owner checks happen before the domain write.
+
+For a forwarded Session Bus result, the server exposes `PROCESS_REPLY` as a
+consumption action. Completing that receipt marks the existing thread consumed
+and never creates a reply-to-reply loop. Provider acceptance, turn start,
+domain application and result delivery remain separate observable states.
+
 ## Web service lifecycle Actions — 2026-09-14
 
 Handler-backed `service.status` and `service.restart` are now implemented in source. They are registered only on a server running this version. They do not restart the PTY Supervisor.

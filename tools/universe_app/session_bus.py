@@ -11,6 +11,7 @@ each live participant inbox.
 from __future__ import annotations
 
 import json as _json_mod
+import hashlib
 import secrets
 import sqlite3
 import threading
@@ -693,6 +694,9 @@ class SessionBus:
         anchor = str(result.get("recipient_anchor_ref") or "")
         terminal_id = str(result.get("recipient_terminal_id") or "")
         body = str(result.get("body_text") or "")
+        body_digest = str(result.get("body_text_utf8_sha256") or "")
+        if not body_digest:
+            body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         if master.get("delivery_state") != "DONE" or not mid or not anchor or not body:
             raise SessionBusError("BUS_MASTER_RESULT_INVALID", "committed completion result required", 409)
         if len(body.encode("utf-8")) > MAX_BODY_BYTES:
@@ -716,7 +720,20 @@ class SessionBus:
                 "recipient_terminal_id": terminal_id,
                 "source_anchor_ref": master.get("owner_session_anchor_ref") or "",
                 "in_reply_to": master["message_id"], "lifecycle_state": "COMPLETED",
-                "lifecycle": {"completed_at": now, "result_ref": master.get("result_ref") or ""},
+                "lifecycle": {
+                    "completed_at": now,
+                    "result_ref": master.get("result_ref") or "",
+                    "body_text_utf8_sha256": body_digest,
+                    **(
+                        {
+                            "action_request_digest": str(
+                                result.get("action_request_digest") or ""
+                            )
+                        }
+                        if result.get("action_request_digest")
+                        else {}
+                    ),
+                },
                 "updated_at": now, "provenance": {"kind": "SESSION_BUS_RESULT", "source_master_message_id": master["message_id"]}}
             # Commit before exposing in memory; a failed write must remain retryable.
             self._persist_message(terminal_id, message)
@@ -1815,6 +1832,11 @@ class SessionBus:
         same_body = body == str(existing.get("body_text") or "")
         same_outcome = terminal_state == str(existing.get("lifecycle_state") or "").upper()
         result_lifecycle = existing.setdefault("lifecycle", {})
+        body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        result_lifecycle.setdefault("body_text_utf8_sha256", body_digest)
+        original.setdefault("lifecycle", {}).setdefault(
+            "body_text_utf8_sha256", body_digest
+        )
         if not (same_body and same_outcome):
             existing.setdefault("revisions", []).append(
                 {
@@ -1827,6 +1849,7 @@ class SessionBus:
             existing["bytes"] = len(body.encode("utf-8"))
             existing["lifecycle_state"] = terminal_state
             existing["updated_at"] = now
+            result_lifecycle["body_text_utf8_sha256"] = body_digest
             result_lifecycle[terminal_state.lower() + "_at"] = now
             if result_ref:
                 result_lifecycle["result_ref"] = _text(
@@ -1860,10 +1883,12 @@ class SessionBus:
         result_ref: str = "",
         outcome: str = "COMPLETED",
         host: Any | None = None,
+        conflict_on_changed: bool = False,
+        action_request_digest: str = "",
     ) -> dict[str, Any]:
         mid = _text(message_id, "message_id", required=True, limit=80)
-        body = str(body_text or "").strip()
-        if not body:
+        body = "" if body_text is None else str(body_text)
+        if not body.strip():
             raise SessionBusError("BUS_BODY_REQUIRED", "body_text is required")
         if len(body.encode("utf-8")) > MAX_BODY_BYTES:
             raise SessionBusError(
@@ -1915,12 +1940,39 @@ class SessionBus:
                     raise SessionBusError("BUS_RESULT_FORWARD_INTEGRITY", "source result is missing", 409)
                 if current not in {"STARTED", "COMPLETED", "FAILED", "DONE"}:
                     raise SessionBusError("BUS_LIFECYCLE_TRANSITION_INVALID", f"cannot consume while {current}", 409)
+                if conflict_on_changed:
+                    prior_receipt = (original.get("lifecycle") or {}).get(
+                        "handling_receipt"
+                    ) or {}
+                    if (
+                        prior_receipt
+                        and (
+                            str(prior_receipt.get("body_text") or "") != body
+                            or str(prior_receipt.get("outcome") or "").upper()
+                            != terminal_state
+                        )
+                    ):
+                        raise SessionBusError(
+                            "BUS_REPLY_CONFLICT",
+                            "reply payload differs from the recorded consumption receipt",
+                            409,
+                        )
                 now = utc_now()
                 original["lifecycle_state"] = "DONE"
                 original["delivery_state"] = "READ"
-                original.setdefault("lifecycle", {}).setdefault("handling_receipt", {
-                    "body_text": body, "outcome": terminal_state, "consumed_at": now,
-                })
+                handling_receipt = {
+                    "body_text": body,
+                    "body_text_utf8_sha256": hashlib.sha256(
+                        body.encode("utf-8")
+                    ).hexdigest(),
+                    "outcome": terminal_state,
+                    "consumed_at": now,
+                }
+                if action_request_digest:
+                    handling_receipt["action_request_digest"] = action_request_digest
+                original.setdefault("lifecycle", {}).setdefault(
+                    "handling_receipt", handling_receipt
+                )
                 source_result.setdefault("lifecycle", {}).setdefault("consumed_at", now)
                 self._persist_message(stored_tid, original)
                 self._persist_message(str(source_result.get("_terminal_id") or ""), source_result)
@@ -1943,6 +1995,22 @@ class SessionBus:
             if current == "REPLIED" and prior_final_id:
                 existing_final = self._messages.get(prior_final_id)
                 if isinstance(existing_final, dict):
+                    if conflict_on_changed:
+                        existing_ref = str(
+                            (existing_final.get("lifecycle") or {}).get("result_ref")
+                            or ""
+                        )
+                        if (
+                            body != str(existing_final.get("body_text") or "")
+                            or terminal_state
+                            != str(existing_final.get("lifecycle_state") or "").upper()
+                            or result_ref != existing_ref
+                        ):
+                            raise SessionBusError(
+                                "BUS_REPLY_CONFLICT",
+                                "reply payload differs from the recorded result",
+                                409,
+                            )
                     return self._resupply_final_result(
                         original=original,
                         existing=existing_final,
@@ -1955,6 +2023,10 @@ class SessionBus:
             original["delivery_state"] = "REPLIED"
             original["updated_at"] = now
             lifecycle = original.setdefault("lifecycle", {})
+            body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            lifecycle["body_text_utf8_sha256"] = body_digest
+            if action_request_digest:
+                lifecycle["action_request_digest"] = action_request_digest
             lifecycle[terminal_state.lower() + "_at"] = lifecycle.get(
                 terminal_state.lower() + "_at", now
             )
@@ -1997,7 +2069,13 @@ class SessionBus:
                 "lifecycle_state": terminal_state,
                 "lifecycle": {
                     terminal_state.lower() + "_at": now,
+                    "body_text_utf8_sha256": body_digest,
                     "result_ref": result_ref,
+                    **(
+                        {"action_request_digest": action_request_digest}
+                        if action_request_digest
+                        else {}
+                    ),
                 },
                 "updated_at": now,
                 "provenance": {"kind": "SESSION_BUS_RESULT"},

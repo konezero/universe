@@ -198,6 +198,10 @@ from universe_action_registry import (
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
     SESSION_RESUME_RESULT_SCHEMA,
+    MASTER_COMPLETE_ACTION_ID,
+    MASTER_COMPLETE_RESULT_SCHEMA,
+    SESSION_BUS_REPLY_ACTION_ID,
+    SESSION_BUS_REPLY_RESULT_SCHEMA,
     MEMORY_BATCH_RUN_ACTION_ID,
     MEMORY_SYNC_PERSIST_SELECTED_ACTION_ID,
     MEMORY_SYNC_PERSIST_SELECTED_RESULT_SCHEMA,
@@ -208,7 +212,9 @@ from universe_action_registry import (
     ActionRegistryError,
     UnknownActionError,
     build_default_action_registry,
+    canonical_value_sha256,
     find_forbidden_caller_fields,
+    utf8_sha256,
 )
 from persona_automation import PersonaAutomationError, PersonaAutomationStore
 from universe_remote_gateway import (
@@ -297,6 +303,7 @@ from universe_app.pty_supervisor import (
 )
 from universe_app.session_bus import (
     ACTIONABLE_KINDS,
+    BUS_SCHEMA,
     SessionBus,
     SessionBusError,
     dispatch_body,
@@ -23347,6 +23354,7 @@ class UniverseStore:
         *,
         provider: str,
         session_anchor_ref: str = "",
+        terminal_id: str = "",
         message_id: str = "",
         lease_ttl_seconds: int = MASTER_MESSAGE_LEASE_TTL_SECONDS,
     ) -> dict[str, Any] | None:
@@ -23390,6 +23398,7 @@ class UniverseStore:
                 updates={
                     "provider": provider,
                     "owner_session_anchor_ref": session_anchor_ref,
+                    "owner_terminal_id": terminal_id or None,
                     "started_at": utc_now(),
                     "lease_expires_at": utc_after(lease_ttl_seconds),
                 },
@@ -23487,6 +23496,7 @@ class UniverseStore:
                 updates={
                     "provider": None,
                     "owner_session_anchor_ref": None,
+                    "owner_terminal_id": None,
                     "started_at": None,
                     "lease_expires_at": None,
                     "reclaimed_at": now,
@@ -23518,7 +23528,8 @@ class UniverseStore:
 
     def complete_master_message(
         self, message_id: str, *, provider: str, result_ref: str = "",
-        body_text: str = "",
+        body_text: str = "", terminal_id: str = "",
+        session_anchor_ref: str = "", action_request_digest: str = "",
     ) -> dict[str, Any]:
         # Store the result and DONE atomically. Bus publication can be retried
         # after a crash without rerunning the Master work.
@@ -23531,10 +23542,30 @@ class UniverseStore:
             )
         if message.get("provider") != provider:
             raise UniverseError("MASTER_MESSAGE_OWNER_MISMATCH", "provider does not own this claim", 409)
+        owner_anchor = str(message.get("owner_session_anchor_ref") or "").strip()
+        owner_terminal = str(message.get("owner_terminal_id") or "").strip()
+        if session_anchor_ref and owner_anchor and session_anchor_ref != owner_anchor:
+            raise UniverseError(
+                "MASTER_MESSAGE_OWNER_MISMATCH",
+                "session_anchor_ref does not own this claim",
+                409,
+            )
+        if terminal_id and owner_terminal and terminal_id != owner_terminal:
+            raise UniverseError(
+                "MASTER_MESSAGE_OWNER_MISMATCH",
+                "terminal_id does not own this claim",
+                409,
+            )
         body_text, result_ref = str(body_text or ""), str(result_ref or "")
         if len(body_text.encode("utf-8")) > 24 * 1024 or len(result_ref.encode("utf-8")) > 2048:
             raise UniverseError("MASTER_RESULT_TOO_LARGE", "result body or reference exceeds limit", 413)
-        request = {"provider": provider, "body_text": body_text, "result_ref": result_ref}
+        body_digest = utf8_sha256(body_text)
+        request = {
+            "provider": provider,
+            "body_text": body_text,
+            "result_ref": result_ref,
+            "body_text_utf8_sha256": body_digest,
+        }
         if message.get("delivery_state") == "DONE":
             if message.get("completion_request") == request:
                 return message
@@ -23544,11 +23575,21 @@ class UniverseStore:
         terminal_id = str(metadata.get("reply_terminal_id") or "").strip()
         updates = {"provider": provider, "result_ref": result_ref,
                    "completed_at": utc_now(), "completion_request": request}
+        receipt = {"body_text_utf8_sha256": body_digest}
+        if action_request_digest:
+            receipt["action_request_digest"] = action_request_digest
+        updates["completion_receipt"] = receipt
         if anchor:
             updates["completion_result"] = {
                 "message_id": "msg_" + hashlib.sha256(("master-result:" + message_id).encode()).hexdigest()[:32],
                 "recipient_anchor_ref": anchor,
                 "recipient_terminal_id": terminal_id,
+                "body_text_utf8_sha256": body_digest,
+                **(
+                    {"action_request_digest": action_request_digest}
+                    if action_request_digest
+                    else {}
+                ),
                 "body_text": "[Master completed: " + message_id + "]\n" +
                     (body_text.strip() or "Result summary was not supplied.") +
                     ("\nEvidence: " + result_ref if result_ref else ""),
@@ -29877,6 +29918,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
+                MASTER_COMPLETE_ACTION_ID: self._handle_master_complete_action,
+                SESSION_BUS_REPLY_ACTION_ID: self._handle_session_bus_reply_action,
             },
         )
         self._planning_binding: dict[str, Any] | None = None
@@ -30811,6 +30854,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "MEMORY_SYNC_SELECTED_PERSISTED",
                 "SESSION_NEW_COMPLETED",
                 "TODO_RECORDED",
+                "REPLIED",
                 "PERSONA_AUTOMATION_RUN_STARTED",
                 "PERSONA_AUTOMATION_WORK_DISPATCHED",
             }
@@ -32445,6 +32489,110 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def _handle_service_restart_action(self, request, context):
         return self._service_action(request, context, restart=True)
+
+    @staticmethod
+    def _action_text(value: Any, field: str, *, default: str = "") -> str:
+        """Validate a text field without trimming its payload bytes."""
+
+        if value is None:
+            return default
+        if not isinstance(value, str):
+            raise UniverseError(
+                "REQUEST_INVALID", f"{field} must be a string", HTTPStatus.BAD_REQUEST
+            )
+        return value
+
+    def _handle_master_complete_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        del context  # The domain gateway validates the claimed owner below.
+        action = _exact_object_fields(
+            request,
+            field="master_complete_action",
+            required=frozenset({"message_id", "provider"}),
+            optional=frozenset(
+                {"body_text", "result_ref", "terminal_id", "session_anchor_ref"}
+            ),
+        )
+        message_id = _required_text(action["message_id"], "message_id")
+        provider = _required_text(action["provider"], "provider").upper()
+        body_text = self._action_text(action.get("body_text"), "body_text")
+        result_ref = self._action_text(action.get("result_ref"), "result_ref")
+        terminal_id = self._action_text(action.get("terminal_id"), "terminal_id")
+        session_anchor_ref = self._action_text(
+            action.get("session_anchor_ref"), "session_anchor_ref"
+        )
+        if bool(terminal_id) != bool(session_anchor_ref):
+            raise UniverseError(
+                "MASTER_MESSAGE_OWNER_REQUIRED",
+                "terminal_id and session_anchor_ref must be supplied together",
+                HTTPStatus.CONFLICT,
+            )
+        action_request_digest = canonical_value_sha256(
+            {"action_id": MASTER_COMPLETE_ACTION_ID, "request": action}
+        )
+        message = self.store.complete_master_message(
+            message_id,
+            provider=provider,
+            result_ref=result_ref,
+            body_text=body_text,
+            terminal_id=terminal_id,
+            session_anchor_ref=session_anchor_ref,
+            action_request_digest=action_request_digest,
+        )
+        result_delivery = self._publish_master_completion_results()
+        return {
+            "schema": MASTER_COMPLETE_RESULT_SCHEMA,
+            "status": "MASTER_MESSAGE_COMPLETED",
+            "action_id": MASTER_COMPLETE_ACTION_ID,
+            "message": message,
+            "result_delivery": result_delivery,
+            "body_text_utf8_sha256": utf8_sha256(body_text),
+            "action_request_digest": action_request_digest,
+        }
+
+    def _handle_session_bus_reply_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        del context  # SessionBus validates the exact recipient Anchor/terminal.
+        action = _exact_object_fields(
+            request,
+            field="session_bus_reply_action",
+            required=frozenset({"message_id", "session_anchor_ref", "body_text"}),
+            optional=frozenset({"terminal_id", "result_ref", "outcome"}),
+        )
+        message_id = _required_text(action["message_id"], "message_id")
+        session_anchor_ref = _required_text(
+            action["session_anchor_ref"], "session_anchor_ref"
+        )
+        body_text = self._action_text(action.get("body_text"), "body_text")
+        terminal_id = self._action_text(action.get("terminal_id"), "terminal_id")
+        result_ref = self._action_text(action.get("result_ref"), "result_ref")
+        outcome = self._action_text(
+            action.get("outcome"), "outcome", default="COMPLETED"
+        )
+        action_request_digest = canonical_value_sha256(
+            {"action_id": SESSION_BUS_REPLY_ACTION_ID, "request": action}
+        )
+        packet = self.reply_session_bus_message(
+            message_id,
+            {
+                "terminal_id": terminal_id,
+                "session_anchor_ref": session_anchor_ref,
+                "body_text": body_text,
+                "result_ref": result_ref,
+                "outcome": outcome,
+            },
+            conflict_on_changed=True,
+            action_request_digest=action_request_digest,
+        )
+        return {
+            **packet,
+            "schema": SESSION_BUS_REPLY_RESULT_SCHEMA,
+            "action_id": SESSION_BUS_REPLY_ACTION_ID,
+            "body_text_utf8_sha256": utf8_sha256(body_text),
+            "action_request_digest": action_request_digest,
+        }
 
     def _handle_feature_create_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
@@ -38580,7 +38728,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             raise UniverseError(error.code, error.detail, error.status) from error
 
     def reply_session_bus_message(
-        self, message_id: str, value: Mapping[str, Any] | None
+        self,
+        message_id: str,
+        value: Mapping[str, Any] | None,
+        *,
+        conflict_on_changed: bool = False,
+        action_request_digest: str = "",
     ) -> dict[str, Any]:
         payload = value if isinstance(value, Mapping) else {}
         try:
@@ -38592,6 +38745,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 result_ref=str(payload.get("result_ref") or ""),
                 outcome=str(payload.get("outcome") or "COMPLETED"),
                 host=self._session_anchor_terminal_host(),
+                conflict_on_changed=conflict_on_changed,
+                action_request_digest=action_request_digest,
             )
         except SessionBusError as error:
             raise UniverseError(error.code, error.detail, error.status) from error
@@ -47499,12 +47654,25 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         )
         if session_bus_reply is not None:
             try:
+                action_request = self._read_json()
+                action_request = (
+                    dict(action_request)
+                    if isinstance(action_request, Mapping)
+                    else {}
+                )
+                action_request["message_id"] = unquote(session_bus_reply.group(1))
+                result = self.server.execute_action(
+                    SESSION_BUS_REPLY_ACTION_ID,
+                    action_request,
+                    source="SESSION_BUS_REPLY_HTTP",
+                )
                 self._send(
                     HTTPStatus.CREATED,
-                    self.server.reply_session_bus_message(
-                        unquote(session_bus_reply.group(1)),
-                        self._read_json(),
-                    ),
+                    {
+                        **result,
+                        "action_schema": result.get("schema"),
+                        "schema": BUS_SCHEMA,
+                    },
                 )
             except UniverseError as error:
                 self._send_error(error)
@@ -50040,6 +50208,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                                             "claim owner must match the live project Master binding", 409)
                 claimed = self.server.store.claim_master_message(
                     parts[0], provider=provider, session_anchor_ref=owner_anchor,
+                    terminal_id=owner_tid,
                     message_id=str((body or {}).get("message_id") or "").strip(),
                 )
                 self._send(
@@ -50820,24 +50989,21 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             if master_message_parts is not None:
                 message_id, operation = master_message_parts
                 if operation == "/complete":
-                    provider = _required_text(
-                        (body or {}).get("provider"), "provider"
+                    action_request = dict(body) if isinstance(body, Mapping) else {}
+                    action_request["message_id"] = message_id
+                    result = self.server.execute_action(
+                        MASTER_COMPLETE_ACTION_ID,
+                        action_request,
+                        source="MASTER_COMPLETE_HTTP",
                     )
-                    message = self.server.store.complete_master_message(
-                        message_id,
-                        provider=provider,
-                        result_ref=str((body or {}).get("result_ref") or ""),
-                        body_text=str((body or {}).get("body_text") or ""),
-                    )
-                    result_delivery = self.server._publish_master_completion_results()
+                    result = {
+                        **result,
+                        "action_schema": result.get("schema"),
+                        "schema": API_SCHEMA,
+                    }
                     self._send(
                         HTTPStatus.OK,
-                        {
-                            "schema": API_SCHEMA,
-                            "status": "MASTER_MESSAGE_COMPLETED",
-                            "result_delivery": result_delivery,
-                            "message": message,
-                        },
+                        result,
                     )
                     return
                 if operation == "/fail":
@@ -53248,6 +53414,14 @@ def _windows_tray_creationflags() -> int:
 
 
 def main() -> int:
+    # JSON bodies and Action catalog metadata are Unicode data.  Windows may
+    # expose a legacy console code page (for example cp949); force the CLI
+    # stream to UTF-8 so a catalog or result cannot turn valid text into `?` or
+    # fail before the caller can read the structured response.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
     args = parser().parse_args()
     try:
         if args.command == "pty-restart":
