@@ -139,6 +139,26 @@ test("Fleet Worker controls use live project Worker/Reviewer sessions and active
   assert.match(roster, /workerPersonaSelect/);
   assert.match(roster, /personaId: workerPersonaSelect\.value/);
   assert.match(roster, /UNKNOWN: no live Worker\/Reviewer session available to assign/);
+  assert.match(appSource, /function fleetAuthoritativeTerminals\(\)/);
+  assert.match(appSource, /state\.supervisorTerminals/);
+});
+
+test("Fleet Worker session-start controls use the typed Action and authoritative lineage", () => {
+  const start = appSource.indexOf("function fleetTaskFrameOptionsForTodo(featureId, todo)");
+  const end = appSource.indexOf("function goToNodeMasterBinding", start);
+  assert.ok(start >= 0 && end > start);
+  const fleet = appSource.slice(start, end);
+  assert.match(fleet, /invokeServerAction\("fleet\.worker-session-start"/);
+  assert.match(fleet, /assigned_by_session_anchor_ref/);
+  assert.match(fleet, /task_frame_id/);
+  assert.match(fleet, /await ensureFleetWorkerAssignments\(featureId\)/);
+  assert.match(fleet, /loadTerminalTabs/);
+  assert.match(fleet, /Start Worker\/Reviewer session/);
+  assert.match(fleet, /workerRole: startRoleSelect\.value/);
+  assert.match(fleet, /provider: startProviderSelect\.value/);
+  assert.match(fleet, /personaId: startPersonaSelect\.value/);
+  assert.doesNotMatch(fleet, /GROK/);
+  assert.match(fleet, /Todo scope \(no authoritative Task Frame\)/);
 });
 
 test("Fleet project selection renders the core projection before slow optional observers", () => {
@@ -151,4 +171,12 @@ test("Fleet project selection renders the core projection before slow optional o
   assert.ok(core >= 0 && optional > core);
   assert.match(selection, /apiWithTimeout\(/);
   assert.match(selection.slice(core, optional), /renderGoalPlan\(\)/);
+});
+
+test("Fleet terminal refresh re-renders Team rows after authoritative Host discovery", () => {
+  const start = terminalSource.indexOf("async function loadTerminalTabs()");
+  const end = terminalSource.indexOf("function hostSessionRefOf", start);
+  assert.ok(start >= 0 && end > start);
+  assert.match(terminalSource.slice(start, end), /state\.supervisorTerminals = incoming/);
+  assert.match(terminalSource.slice(start, end), /renderIntegratedHome\(\)/);
 });

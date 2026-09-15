@@ -2173,6 +2173,11 @@ async function loadTerminalTabs() {
     if (typeof renderSessionObservatory === "function") renderSessionObservatory();
     if (typeof renderTodos === "function") renderTodos();
     if (typeof renderDetails === "function") renderDetails();
+    // Fleet Team rows read the raw supervisor terminal projection. Re-render
+    // the node roster after that authoritative refresh so a Worker/Reviewer
+    // cannot remain visually OFFLINE merely because the first render preceded
+    // terminal discovery.
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
     if (!state.activeTerminalId && visible[0]) {
       selectTerminalTab(visible[0].terminal_id);
     }

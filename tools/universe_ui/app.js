@@ -5157,6 +5157,62 @@ function assignFleetWorker(featureId, { todoId, workerRole, sessionAnchorRef, as
   });
 }
 
+// A Task Frame is selectable here only when the authoritative Todo/ship
+// projection attaches that exact frame to this exact node.  The semantic graph
+// contains project-wide historical frames, so treating its global list as a
+// picker would let a Worker be bound to unrelated work.
+function fleetTaskFrameOptionsForTodo(featureId, todo) {
+  const options = [];
+  const add = (taskFrameId, source) => {
+    const id = String(taskFrameId || "").trim();
+    if (!id || options.some((item) => item.id === id)) return;
+    options.push({ id, source });
+  };
+  add(todo?.task_frame_id, "Todo");
+  const targetNode = `feat:${String(featureId || "").trim()}`;
+  const ship = (state.projection?.ships || []).find((item) =>
+    String(item.todo_id || "") === String(todo?.todo_id || "") &&
+    String(item.target_node || "") === targetNode
+  );
+  add(ship?.task_frame_id, "execution ship");
+  return options;
+}
+
+async function startFleetWorkerSession(featureId, {
+  todoId,
+  taskFrameId,
+  workerRole,
+  provider,
+  modelRef,
+  effort,
+  personaId,
+  assignedBy,
+}) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || !featureId || !todoId || !workerRole || !assignedBy) {
+    throw new Error("project, node, Todo, role, and the assigning Master are all required.");
+  }
+  const request = {
+    project_id: projectId,
+    node_ref: featureId,
+    todo_id: todoId,
+    worker_role: workerRole,
+    assigned_by_session_anchor_ref: assignedBy,
+    provider: String(provider || "CODEX").trim().toUpperCase(),
+    model_ref: String(modelRef || "").trim(),
+    effort: String(effort || "AUTO").trim().toUpperCase(),
+  };
+  if (taskFrameId) request.task_frame_id = taskFrameId;
+  if (personaId) request.persona_id = personaId;
+  const result = await invokeServerAction("fleet.worker-session-start", request);
+  // The Action response is the launch receipt.  Re-read the authoritative
+  // assignment list and terminal projection before rendering the new row.
+  delete (state.fleetWorkerAssignmentsByNode || {})[featureId];
+  await ensureFleetWorkerAssignments(featureId);
+  if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
+  return result;
+}
+
 function unassignFleetWorker(featureId, assignment) {
   return invokeServerAction("fleet.worker-unassign", {
     task_worker_assignment_id: assignment.assignment_id,
@@ -5173,6 +5229,15 @@ function fleetTerminalLabel(terminal) {
   const provider = String(terminal?.provider || "UNKNOWN").toUpperCase();
   const anchor = String(terminal?.session_anchor_ref || "UNKNOWN");
   return `${provider} / ${anchor}`;
+}
+
+// The terminal dock intentionally hides Hosts that are not eligible for an
+// interactive tab. Fleet assignment rows still need the raw server-owned
+// terminal projection so a WORKER can be shown LIVE/RECOVERED even when its
+// dock tab is not attachable. This is a projection choice, never a recency or
+// first-terminal fallback.
+function fleetAuthoritativeTerminals() {
+  return Array.isArray(state.supervisorTerminals) ? state.supervisorTerminals : [];
 }
 
 function fleetWorkerTerminalState(terminal) {
@@ -5195,7 +5260,7 @@ function bindFleetNodeMaster(featureId, sessionAnchorRef, personaId) {
     String(item.persona_id || "") === String(personaId || "") &&
     String(item.state || "").toUpperCase() === "ACTIVE"
   );
-  const terminal = (state.terminals || []).find((item) =>
+  const terminal = fleetAuthoritativeTerminals().find((item) =>
     String(item.session_anchor_ref || "") === anchor &&
     String(item.project_id || "") === projectId &&
     String(item.mode || "").toUpperCase() === "MASTER"
@@ -5269,7 +5334,7 @@ function renderFleetNodeTeamControls(graphNode) {
   const persona = owner && (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(owner.persona_id || ""));
   const ownerLine = node("p", "fleet-node-team-status");
   if (owner) {
-    const ownerLive = (state.terminals || []).some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
+    const ownerLive = fleetAuthoritativeTerminals().some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
     ownerLine.append(
       node("span", "fleet-node-role", "Master"),
       document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${owner.session_anchor_ref} / ${ownerLive ? "LIVE" : "OFFLINE"}`),
@@ -5280,7 +5345,7 @@ function renderFleetNodeTeamControls(graphNode) {
   section.append(ownerLine);
 
   const controls = node("div", "fleet-node-team-controls");
-  const liveMasters = (state.terminals || []).filter((terminal) =>
+  const liveMasters = fleetAuthoritativeTerminals().filter((terminal) =>
     String(terminal.project_id || "") === String(state.selectedProject?.project_id || "") &&
     String(terminal.mode || "").toUpperCase() === "MASTER" &&
     String(terminal.session_anchor_ref || "").trim()
@@ -5364,7 +5429,7 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
     for (const assignment of worker.active) {
       const row = node("p", "fleet-node-team-status");
       const persona = (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(assignment.persona_id || ""));
-      const terminal = (state.terminals || []).find((item) =>
+      const terminal = fleetAuthoritativeTerminals().find((item) =>
         String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || "") &&
         String(item.project_id || "") === String(state.selectedProject?.project_id || "")
       );
@@ -5391,7 +5456,7 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
 
   if (owner) {
     const todosForNode = (state.todos || []).filter((todo) => String(todo.node_ref || "") === String(featureId || ""));
-    const eligibleSessions = (state.terminals || []).filter((terminal) =>
+    const eligibleSessions = fleetAuthoritativeTerminals().filter((terminal) =>
       String(terminal.project_id || "") === String(state.selectedProject?.project_id || "") &&
       String(terminal.session_anchor_ref || "").trim() &&
       String(terminal.state || terminal.lifecycle_state || "").toUpperCase() === "LIVE" &&
@@ -5402,9 +5467,106 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
     );
     if (!todosForNode.length) {
       wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no Todo on this node to bind a Worker to"));
-    } else if (!eligibleSessions.length) {
-      wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no live Worker/Reviewer session available to assign"));
     } else {
+      if (!eligibleSessions.length) {
+        wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: no live Worker/Reviewer session available to assign"));
+      }
+
+      // Start is a separate typed Action from binding an already-running
+      // terminal.  It remains available when the eligible-session list is
+      // empty, which is the production path that creates a Worker terminal.
+      const startControls = node("div", "fleet-node-team-controls fleet-worker-session-start");
+      const startTodoSelect = document.createElement("select");
+      startTodoSelect.setAttribute("aria-label", "Todo for new Worker/Reviewer session");
+      const taskFramesByTodo = new Map();
+      for (const todo of todosForNode) {
+        const option = document.createElement("option");
+        option.value = todo.todo_id;
+        option.textContent = todo.title || todo.todo_id;
+        startTodoSelect.append(option);
+        taskFramesByTodo.set(todo.todo_id, fleetTaskFrameOptionsForTodo(featureId, todo));
+      }
+      const startTaskFrameSelect = document.createElement("select");
+      startTaskFrameSelect.setAttribute("aria-label", "Exact Task Frame for new Worker/Reviewer session");
+      const renderStartTaskFrames = () => {
+        startTaskFrameSelect.replaceChildren();
+        const todoFrames = taskFramesByTodo.get(startTodoSelect.value) || [];
+        startTaskFrameSelect.append(new Option(
+          todoFrames.length ? "Todo scope (no Task Frame)" : "Todo scope (no authoritative Task Frame)",
+          ""
+        ));
+        for (const frame of todoFrames) {
+          startTaskFrameSelect.append(new Option(`${frame.id} (${frame.source})`, frame.id));
+        }
+      };
+      startTodoSelect.addEventListener("change", renderStartTaskFrames);
+      renderStartTaskFrames();
+
+      const startRoleSelect = document.createElement("select");
+      startRoleSelect.setAttribute("aria-label", "Role for new Worker/Reviewer session");
+      for (const [value, label] of [["IMPLEMENTER", "Worker"], ["REVIEWER", "Reviewer"]]) {
+        startRoleSelect.append(new Option(label, value));
+      }
+      const startProviderSelect = document.createElement("select");
+      startProviderSelect.setAttribute("aria-label", "Provider for new Worker/Reviewer session");
+      // Grok is intentionally absent from this acceptance path.  Provider
+      // execution remains explicit in the typed Action request.
+      for (const provider of ["CODEX", "CLAUDE"]) {
+        startProviderSelect.append(new Option(provider, provider));
+      }
+      const startModelSelect = document.createElement("select");
+      startModelSelect.setAttribute("aria-label", "Model for new Worker/Reviewer session");
+      for (const model of ["gpt-5.6-luna", "default"]) {
+        startModelSelect.append(new Option(model, model));
+      }
+      const startEffortSelect = document.createElement("select");
+      startEffortSelect.setAttribute("aria-label", "Effort for new Worker/Reviewer session");
+      for (const effort of ["AUTO", "LOW", "MEDIUM"]) {
+        startEffortSelect.append(new Option(effort, effort));
+      }
+      const startPersonaSelect = document.createElement("select");
+      startPersonaSelect.setAttribute("aria-label", "Persona for new Worker/Reviewer session");
+      for (const item of activePersonas) {
+        startPersonaSelect.append(new Option(
+          `${item.title || item.persona_id} (rev ${item.revision})`,
+          item.persona_id
+        ));
+      }
+      if (!activePersonas.length) {
+        startPersonaSelect.append(new Option("UNKNOWN: no active Persona", ""));
+      }
+      const startButton = node("button", "", "Start Worker/Reviewer session");
+      startButton.type = "button";
+      startButton.disabled = !activePersonas.length;
+      startButton.addEventListener("click", () => {
+        startButton.disabled = true;
+        startFleetWorkerSession(featureId, {
+          todoId: startTodoSelect.value,
+          taskFrameId: startTaskFrameSelect.value,
+          workerRole: startRoleSelect.value,
+          provider: startProviderSelect.value,
+          modelRef: startModelSelect.value === "default" ? "" : startModelSelect.value,
+          effort: startEffortSelect.value,
+          personaId: startPersonaSelect.value,
+          assignedBy: owner.session_anchor_ref,
+        })
+          .then(() => toast("Worker/Reviewer session started and assignment recorded."))
+          .catch((error) => toast(error.message, true))
+          .finally(() => { startButton.disabled = false; });
+      });
+      startControls.append(
+        startTodoSelect,
+        startTaskFrameSelect,
+        startRoleSelect,
+        startProviderSelect,
+        startModelSelect,
+        startEffortSelect,
+        startPersonaSelect,
+        startButton,
+      );
+      wrap.append(startControls);
+
+      if (eligibleSessions.length) {
       const assignControls = node("div", "fleet-node-team-controls");
       const todoSelect = document.createElement("select");
       todoSelect.setAttribute("aria-label", "Todo to bind the Worker/Reviewer to");
@@ -5453,6 +5615,7 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
       });
       assignControls.append(todoSelect, roleSelect, workerSessionSelect, workerPersonaSelect, assignButton);
       wrap.append(assignControls);
+      }
     }
   } else {
     wrap.append(node("p", "fleet-node-team-status is-unknown", "UNKNOWN: assign a Master before binding a Worker/Reviewer"));
