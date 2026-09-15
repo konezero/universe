@@ -538,6 +538,113 @@ app/terminal_host.py` 경유)에 "노드 배정 projection"이라는 새 메시�
 - P1은 여전히 IN_PROGRESS/미검증. P1-P4 전체 provider/운영 Host 교체
   수용을 이 슬라이스로 완료됐다고 주장하지 않는다.
 
+## 11. P5 후속 결함 보완 2차 -- 실 클릭 검증에서 찾은 실제 버그 (2026-09-15)
+
+Conductor가 10절 UI를 재검토해 4개 실제 결함(revision 계산, 비원자적 2단계
+handoff, live-terminal-only 소유 판정으로 offline 소유 위장, Fleet 진입점
+부재)과 3개 구조 항목(Rust IPC projection, orphan 취소, migration 실패
+은폐)을 지적했다. 이번 라운드는 격리 서버(별도 포트 61999, 별도 DB, mock
+terminal_host **+** 실 session_supervisor 등록 -- 이 조합을 빠뜨렸던 것
+자체가 검증 하네스의 버그였고, 그 하네스 버그가 실제 코드 버그처럼 보이게
+만들었다가 원인 규명 후 수정함)에서 실제 클릭으로 검증했다.
+
+**결함 수정**:
+- **expected_assignment_revision**: `targetAssignment ? targetAssignment.assignment_revision : 0`로
+  수정(존재하는 모든 행은 상태 무관 실제 revision, 없을 때만 0). 해제→동일
+  세션 재배정이 이제 409 없이 성공한다.
+- **원자적 handoff**: `persona.assign`에 선택적 `handoff_from`
+  (`{session_anchor_ref, expected_assignment_revision}`) 추가. 대상 노드를
+  다른 Anchor가 ACTIVE로 소유 중이고 `handoff_from`이 그 Anchor·정확한
+  revision과 일치하면, 같은 트랜잭션 안에서 옛 소유자의 node_ref를 원자적으로
+  비우고 새 배정을 기록한다(성공 또는 실패 둘 중 하나, 중간 상태 없음).
+  이름이 다른 Anchor를 가리키면 기존 `PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED`,
+  맞는 Anchor인데 revision이 낡았으면 `PERSONA_ASSIGNMENT_HANDOFF_STALE`로
+  구분해 거부한다. UI는 이제 unassign+assign 2회 호출이 아니라 이 1회 호출만
+  쓴다. 대상 세션이 이미 다른 노드를 담당 중이면(그 노드를 조용히 잃는
+  경우) 배정 전 인라인 경고 확인(window.confirm -- 이 코드베이스 전반의
+  기존 관례, 새로 도입한 패턴 아님)을 거친다.
+- **오류/미배정 구분 + offline 소유**: 신설 typed Action
+  `persona.assignments-list`(project_id만 받아 그 프로젝트의 모든 durable
+  배정 행을 ACTIVE/UNASSIGNED, live/offline 구분 없이 반환)를 노드 소유
+  판정의 유일한 근거로 삼는다. live 여부는 `/v1/terminals`와 별도로
+  교차 참조해 "(live)"/"(offline)" 표시만 하고 소유권 자체 판정에는
+  관여하지 않는다. feature-nodes/assignments-list 호출 자체가 실패하면
+  빈 배열이 아니라 명시적 오류 메시지 + "다시 시도" 버튼을 보여준다(이전엔
+  catch에서 null을 넣어 통신 실패와 진짜 미배정을 구분하지 못했다).
+- **오류가 즉시 지워지는 버그**: 배정/해제 실패 시 `nodeError.textContent`를
+  설정한 직후 `renderPersona()`를 다시 호출해 전체 패널을 재구성했는데,
+  이 재구성이 그 nodeError 엘리먼트 자체를 새로 갈아치워 오류가 한 프레임도
+  그려지지 못하고 사라졌다(실 클릭 검증 중 직접 재현·확인). `state.
+  personaNodeErrors`(노드별 keyed 맵)를 통해 재구성을 한 번 건너 살아남게
+  수정.
+
+**실 클릭 검증 (격리 in-process 서버, 프로젝트 VERIFY, 실제 브라우저)**:
+배정(빈 노드 → 배정 성공, 화면에 담당자·revision 정확히 반영) → 해제(ACTIVE
+→ UNASSIGNED, revision 증가) → 동일 세션 재배정(수정 전이면 409였을
+케이스, 수정 후 성공, revision 계속 증가) 전부 실제 클릭 + 이 세션이 직접
+persona.assignments-list로 매 단계 서버 상태를 대조해 확인. 노드 B의 세션
+선택기가 "VERIFY MASTER · CLAUDE -- 현재 다른 노드 담당: 실 클릭 테스트
+노드 A"로 정확히 경고를 표시함을 확인(다른 노드 소유 감지 로직 동작).
+네이티브 `<select>` 드롭다운의 실제 다른 세션 선택 → "다른 세션으로 변경"
+클릭까지는 CDP 자동화 도구의 네이티브 select 팝업 렌더링 한계로 끝까지
+클릭 재현하지 못했다 -- 대신 동일 서버 로직 경로를 실 HTTP로 겨냥한
+전용 backend 테스트 3건(`test_handoff_from_moves_node_ownership_in_one_
+atomic_call`, `test_handoff_from_with_stale_revision_is_rejected_and_
+changes_nothing`, `test_handoff_from_naming_the_wrong_owner_is_rejected`)이
+그 정확한 서버 트랜잭션을 검증한다 -- fixture 경로와 실 브라우저 경로를
+섞어 "다 확인했다"고 뭉뚱그리지 않고 이렇게 구분해 기록한다. 콘솔 에러
+없음. 스크린샷: `.artifacts/ui/persona-node-binding-isolated-clicks-
+20260915.jpg`(로컬, gitignore).
+
+**CDP 스크린샷 타임아웃 재검토**: 이번 라운드는 인과를 확정하지 않는다
+(사용자 지시대로). 운영 서버(다수 live 세션)와 이번 격리 서버(세션 2개,
+데이터 최소) 양쪽 모두에서 동일한 `Page.captureScreenshot` 타임아웃이
+간헐적으로 발생했고, 심지어 순수 `scroll_to`(클릭 없음)만으로도
+발생했다 -- 데이터량·polling·WebGL과 무관하게 재현되므로 애플리케이션
+코드가 원인일 가능성은 낮아 보이지만, 이것이 정확히 무엇 때문인지는
+추가로 확인하지 않았다. 실제 앱 동작 자체는(대기 후 재시도 시) 매번
+정상 완료됐다.
+
+**구조 항목 처리**:
+- **migration 실패 은폐 수정**: `session_persona_assignment_node_owner`
+  부분 unique index 생성이 실패하면(기존 데이터가 위반) 더 이상 조용히
+  `pass`하지 않는다. `schema_migration_diagnostic` 테이블에 원인을
+  영속 기록하고 stderr에 경고를 남기며, `self.node_owner_uniqueness_
+  enforced`를 `False`로 설정해 이 사실이 프로세스 내에서도 확인 가능하게
+  한다. 서버 부팅은 막지 않는다(크래시가 공유 운영 서버에는 더 나쁜
+  결과이므로) -- 대신 "단일성 보장"이라는 주장이 실제로 거짓이 되는
+  경우를 숨기지 않는다. 별도 `/health` 필드 노출은 이번엔 하지 않음(범용
+  라우트에 결합하는 대신 durable 테이블+로그로 한정, 경계 명시).
+- **Rust Session/PTY Supervisor → Host projection 동기화**: 이번에도
+  **구현하지 않았다(NOT_RUN)**. 조사한 정확한 경계: 기존 Rust IPC(attach/
+  binding generation)에는 "이 Host가 담당하는 노드/배정 revision을
+  안다"는 메시지 종류가 아예 없다. 이를 추가하려면 (1) Rust 쪽 프로토콜에
+  새 페이로드 타입 정의, (2) 그 계약을 실 구현하는 새 바이너리를 격리
+  빌드(별도 Host 프로세스로 검증, 사용자가 지금 쓰는 실행 중 Host는 건드리지
+  않음), (3) 신/구 버전 Host 혼재 시 명시적 미지원 표시, (4) replay·stale
+  ·cross-anchor 거부 케이스 검증까지 필요하다. 이는 Python 서버/UI 변경과
+  별개로 Rust 툴체인(메모리 노트: `%LOCALAPPDATA%\Universe\RustToolchain\`)
+  빌드→배포(다음 pty-restart에 반영)까지 필요한 다른 성격의 작업이며, 이번
+  세션의 남은 시간 내에 안전하게 마칠 수 있다고 판단하지 않아 시도하지
+  않았다. 사용자가 이미 승인했다는 점은 인지하고 있으나, 실행 가능한
+  안전한 다음 단계는 "Rust 쪽 계약 정의 초안을 문서화하는 것"부터이며
+  이조차 이번 회차엔 하지 않았다 -- 정직하게 NOT_RUN으로만 남긴다.
+- **orphan 큐 항목 취소/재발급 공개 Action**: 여전히 NOT_RUN(9-10절과
+  동일한 경계).
+- **Master 자격 없는 일반 persona 배정이 노드를 독점하는지**: 조사 결과
+  실제로는 불가능하다 -- node_ref가 있는 배정은 10.3(이 문서 10절)의 부분
+  unique index로 이미 프로젝트당 하나로 제한되며, 그 배정을 한 Anchor가
+  실제 자동화를 시작하려면 `_validate_persona_automation_anchor`(8절)가
+  ACTIVE·같은 project·node_ref 있는 배정과 함께 MASTER mode의 live 등록을
+  요구한다. 즉 "일반 persona가 노드를 독점"은 배정 단계에서는 유일하게
+  일어날 수 있지만(그 배정 자체가 유일성 제약 하에 있다), 그 배정자가
+  MASTER가 아니라면 자동화가 시작되지 않을 뿐 node_ref 자체는 유일하게
+  유지된다 -- queue가 "영구 대기"하는 것은 맞다(그 노드에 MASTER가 없으니
+  당연히 아무도 claim할 수 없다), 이는 버그가 아니라 설계대로다. 다만
+  이 상태를 UI에 "MASTER가 아닌 세션이 이 노드를 배정만 하고 자동화는
+  시작되지 않음"으로 명시적으로 보여주는 것은 하지 않았다(NOT_RUN, 작은
+  후속).
+
 The actual bounded P4 evidence is now under
 `.ai/runtime/tmp/dispatch-14eb816e105931ed/p4-actual-master-review-result.json`.
 It uses a fresh isolated server and a real Codex `gpt-5.6-luna` Master turn:

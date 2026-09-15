@@ -45,7 +45,7 @@ class NodeMasterAutomationTests(unittest.TestCase):
     def act(self, action_id, request):
         body = dict(request)
         if action_id in {
-            "persona.create", "persona.assign", "persona.automation.start",
+            "persona.create", "persona.assign", "persona.unassign", "persona.automation.start",
             "persona.automation.pause", "persona.automation.resume",
             "persona.automation.stop", "persona.automation.complete",
         }:
@@ -159,6 +159,154 @@ class NodeMasterAutomationTests(unittest.TestCase):
         status, read_back = self.act("persona.assignment-read", {"session_anchor_ref": anchor})
         self.assertEqual(200, status, read_back)
         self.assertEqual(node_ref, read_back["assignment"]["node_ref"])
+
+    # -- reassignment: atomic handoff + revision-of-any-existing-row -----
+    # (2026-09-15 follow-up: Conductor review of the node-binding UI)
+
+    def test_release_then_reassign_to_the_same_session_uses_the_existing_rows_revision(self):
+        # The exact bug the review caught: a caller that sends
+        # expected_assignment_revision=0 for an anchor whose row EXISTS but
+        # is UNASSIGNED (revision > 0) gets a stale-revision 409. The real
+        # rule is "any existing row's real revision, 0 only if truly
+        # absent" -- not "0 unless currently ACTIVE".
+        anchor = self.register("MASTER", "node-master-release-reassign")
+        persona = self.make_persona()
+        node_ref = self.make_feature_node("release-reassign-node")
+        status, bound = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, bound)
+        status, released = self.act("persona.unassign", {
+            "session_anchor_ref": anchor, "expected_assignment_revision": bound["assignment"]["assignment_revision"],
+        })
+        self.assertEqual(200, status, released)
+        existing_revision = released["assignment"]["assignment_revision"]
+        self.assertGreater(existing_revision, 0)
+        # A naive "0 unless ACTIVE" client would send 0 here and 409.
+        status, wrong = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(409, status, wrong)
+        self.assertEqual("PERSONA_ASSIGNMENT_REVISION_CONFLICT", wrong["error_code"])
+        status, correct = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": existing_revision,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, correct)
+
+    def test_handoff_from_moves_node_ownership_in_one_atomic_call(self):
+        old_anchor = self.register("MASTER", "node-master-handoff-old")
+        new_anchor = self.register("MASTER", "node-master-handoff-new")
+        persona = self.make_persona()
+        node_ref = self.make_feature_node("handoff-node")
+        status, bound = self.act("persona.assign", {
+            "session_anchor_ref": old_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, bound)
+        status, handed_off = self.act("persona.assign", {
+            "session_anchor_ref": new_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+            "handoff_from": {
+                "session_anchor_ref": old_anchor,
+                "expected_assignment_revision": bound["assignment"]["assignment_revision"],
+            },
+        })
+        self.assertEqual(200, status, handed_off)
+        self.assertEqual(node_ref, handed_off["assignment"]["node_ref"])
+        # The old owner's row is atomically cleared as part of the same call.
+        status, old_read = self.act("persona.assignment-read", {"session_anchor_ref": old_anchor})
+        self.assertEqual(200, status, old_read)
+        self.assertIsNone(old_read["assignment"]["node_ref"])
+
+    def test_handoff_from_with_stale_revision_is_rejected_and_changes_nothing(self):
+        old_anchor = self.register("MASTER", "node-master-handoff-stale-old")
+        new_anchor = self.register("MASTER", "node-master-handoff-stale-new")
+        persona = self.make_persona()
+        node_ref = self.make_feature_node("handoff-stale-node")
+        status, bound = self.act("persona.assign", {
+            "session_anchor_ref": old_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, bound)
+        status, rejected = self.act("persona.assign", {
+            "session_anchor_ref": new_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+            "handoff_from": {
+                "session_anchor_ref": old_anchor,
+                "expected_assignment_revision": bound["assignment"]["assignment_revision"] + 5,
+            },
+        })
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("PERSONA_ASSIGNMENT_HANDOFF_STALE", rejected["error_code"])
+        # Nothing changed: old owner still owns it, new anchor has no row.
+        status, old_read = self.act("persona.assignment-read", {"session_anchor_ref": old_anchor})
+        self.assertEqual(node_ref, old_read["assignment"]["node_ref"])
+        status, new_read = self.act("persona.assignment-read", {"session_anchor_ref": new_anchor})
+        self.assertIsNone(new_read["assignment"])
+
+    def test_handoff_from_naming_the_wrong_owner_is_rejected(self):
+        real_owner = self.register("MASTER", "node-master-handoff-wrong-real")
+        bystander = self.register("MASTER", "node-master-handoff-wrong-bystander")
+        new_anchor = self.register("MASTER", "node-master-handoff-wrong-new")
+        persona = self.make_persona()
+        node_ref = self.make_feature_node("handoff-wrong-owner-node")
+        status, bound = self.act("persona.assign", {
+            "session_anchor_ref": real_owner, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, bound)
+        status, rejected = self.act("persona.assign", {
+            "session_anchor_ref": new_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+            "handoff_from": {"session_anchor_ref": bystander, "expected_assignment_revision": 1},
+        })
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED", rejected["error_code"])
+
+    # -- persona.assignments-list: authoritative, not live-terminal-derived -
+
+    def test_assignments_list_includes_offline_owners_and_unassigned_rows(self):
+        live_anchor = self.register("MASTER", "node-master-list-live")
+        persona = self.make_persona()
+        live_node = self.make_feature_node("list-live-node")
+        status, live_bound = self.act("persona.assign", {
+            "session_anchor_ref": live_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": live_node,
+        })
+        self.assertEqual(200, status, live_bound)
+        # A second, distinct Anchor's assignment -- persona.assignments-list
+        # must surface it purely from the durable table, with no dependency
+        # on whether that Anchor still appears in any live-terminal probe
+        # (a UI cross-referencing only currently-live terminals is exactly
+        # what would misread an offline owner's node as unassigned).
+        offline_anchor = self.register("MASTER", "node-master-list-offline")
+        offline_node = self.make_feature_node("list-offline-node")
+        status, offline_bound = self.act("persona.assign", {
+            "session_anchor_ref": offline_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": offline_node,
+        })
+        self.assertEqual(200, status, offline_bound)
+        status, listed = self.act("persona.assignments-list", {"project_id": "TEST"})
+        self.assertEqual(200, status, listed)
+        by_anchor = {a["session_anchor_ref"]: a for a in listed["assignments"]}
+        self.assertIn(live_anchor, by_anchor)
+        self.assertEqual(live_node, by_anchor[live_anchor]["node_ref"])
+        self.assertIn(offline_anchor, by_anchor)
+        self.assertEqual(offline_node, by_anchor[offline_anchor]["node_ref"])
 
     # -- automation start: server-verified, not client-claimed -----------
 

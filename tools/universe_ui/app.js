@@ -18011,154 +18011,220 @@ async function renderPersona() {
   root.append(assignSection);
 
   // -- Node Master binding -------------------------------------------------
-  // 2026-09-15: node-scoped MASTER automation ownership needs a way for a
-  // person to see and change, per feature_node, which live MASTER session
-  // owns it -- the same session.assign/unassign Actions above, scoped with
-  // node_ref, not a new endpoint. Reuses this same panel's terminals/
-  // personas fetch; adds one more read (feature-nodes) and one
-  // assignment-read per live MASTER terminal in this project (small N in
-  // practice -- a handful of live sessions).
+  // 2026-09-15/2026-09-15 follow-up: node-scoped MASTER automation
+  // ownership needs a way for a person to see and change, per feature_node,
+  // which MASTER session owns it -- the same persona.assign/unassign
+  // Actions above, scoped with node_ref (and, for a live handoff between
+  // two different sessions, the optional atomic handoff_from field), not a
+  // new endpoint. Ownership itself comes from persona.assignments-list --
+  // the authoritative durable list for this project (ACTIVE and
+  // UNASSIGNED, live or offline) -- never derived by probing only
+  // currently-live terminals, which would misread an offline owner's node
+  // as unassigned.
   const nodeSection = node("section", "persona-node-binding");
   nodeSection.append(node("h3", "", "노드 담당 Master"));
   nodeSection.append(node("p", "persona-hint",
     "각 노드(feature_node)를 자동화로 소유할 MASTER 세션을 배정/변경/해제합니다. "
     + "프로젝트 Conductor(node_ref 없음)의 전체 범위와는 별개입니다."));
-  let features = [];
+
+  const renderNodeSectionError = (message, onRetry) => {
+    nodeSection.append(node("p", "memory-action-error", message));
+    const retryButton = node("button", "", "다시 시도");
+    retryButton.type = "button";
+    retryButton.addEventListener("click", onRetry);
+    nodeSection.append(retryButton);
+  };
+
+  let features = null;
+  let allAssignments = null;
   try {
-    const featureResp = await api(`/v1/projects/${encodeURIComponent(projectId)}/feature-nodes`);
+    const [featureResp, assignmentsResp] = await Promise.all([
+      api(`/v1/projects/${encodeURIComponent(projectId)}/feature-nodes`),
+      invokeServerAction("persona.assignments-list", { project_id: projectId }),
+    ]);
     features = featureResp.features || [];
+    allAssignments = assignmentsResp.assignments || [];
   } catch (error) {
-    nodeSection.append(node("p", "memory-action-error", error.message));
-    features = [];
+    // A fetch failure is NOT "no nodes" or "no owner" -- conflating the two
+    // previously made a real communication failure look like an
+    // unassigned node (2026-09-15 Conductor review).
+    renderNodeSectionError(`노드/배정 정보를 불러오지 못했습니다: ${error.message}`, () => renderPersona());
+    features = null;
   }
-  const projectMasterTerminals = terminals.filter((t) =>
-    String(t.mode || "").toUpperCase() === "MASTER" &&
-    String(t.project_id || "").trim() === projectId
-  );
-  if (!features.length) {
-    nodeSection.append(node("p", "persona-hint", "이 프로젝트에 노드(feature_node)가 없습니다."));
-  } else if (!projectMasterTerminals.length) {
-    nodeSection.append(node("p", "persona-hint",
-      "이 프로젝트에 배정 가능한 live MASTER 세션이 없습니다. "
-      + "기존 지원 경로(session.new)로 이 프로젝트의 MASTER 세션을 먼저 시작하세요."));
-  } else if (!activePersonas.length) {
-    nodeSection.append(node("p", "persona-hint", "먼저 활성 페르소나를 하나 이상 만드세요."));
-  } else {
-    const assignmentByAnchor = new Map();
-    await Promise.all(projectMasterTerminals.map(async (terminal) => {
-      try {
-        const read = await invokeServerAction("persona.assignment-read", { session_anchor_ref: terminal.session_anchor_ref });
-        assignmentByAnchor.set(terminal.session_anchor_ref, read.assignment);
-      } catch (error) {
-        assignmentByAnchor.set(terminal.session_anchor_ref, null);
-      }
-    }));
-    const table = node("div", "persona-node-table");
-    for (const feature of features) {
-      const row = node("div", "persona-node-row");
-      row.append(node("strong", "", feature.title || feature.feature_id));
-      const owner = projectMasterTerminals.find((terminal) => {
-        const assignment = assignmentByAnchor.get(terminal.session_anchor_ref);
-        return assignment && assignment.state === "ACTIVE" && assignment.node_ref === feature.feature_id;
-      });
-      const statusLine = node("p", "persona-hint");
-      if (owner) {
-        const assignment = assignmentByAnchor.get(owner.session_anchor_ref);
-        const persona = personas.find((p) => p.persona_id === assignment.persona_id);
-        statusLine.textContent = `담당: ${personaSessionLabel(owner)} `
-          + `(${persona ? persona.title : assignment.persona_id}, assignment rev ${assignment.assignment_revision})`;
-      } else {
-        statusLine.textContent = "담당 Master 미배정.";
-      }
-      row.append(statusLine);
-      const sessionPicker = document.createElement("select");
-      for (const terminal of projectMasterTerminals) {
-        const option = document.createElement("option");
-        option.value = terminal.session_anchor_ref;
-        option.textContent = personaSessionLabel(terminal);
-        if (owner && terminal.session_anchor_ref === owner.session_anchor_ref) option.selected = true;
-        sessionPicker.append(option);
-      }
-      const nodePersonaPicker = document.createElement("select");
-      for (const persona of activePersonas) {
-        const option = document.createElement("option");
-        option.value = persona.persona_id;
-        option.textContent = `${persona.title} (rev ${persona.revision})`;
-        if (owner) {
-          const assignment = assignmentByAnchor.get(owner.session_anchor_ref);
+
+  if (features !== null) {
+    const projectMasterTerminals = terminals.filter((t) =>
+      String(t.mode || "").toUpperCase() === "MASTER" &&
+      String(t.project_id || "").trim() === projectId
+    );
+    // The authoritative owner map is built from persona.assignments-list
+    // (every durable row for this project), not from probing only live
+    // terminals -- an ACTIVE, node-scoped assignment whose session is
+    // currently offline is still that node's real owner.
+    const activeNodeAssignments = allAssignments.filter((a) => a.state === "ACTIVE" && a.node_ref);
+    const liveAnchors = new Set(
+      terminals.filter((t) => t.state === "LIVE").map((t) => t.session_anchor_ref)
+    );
+    const nodeOwnerByFeatureId = new Map(activeNodeAssignments.map((a) => [a.node_ref, a]));
+    const ownedNodeByAnchor = new Map(activeNodeAssignments.map((a) => [a.session_anchor_ref, a.node_ref]));
+
+    if (!features.length) {
+      nodeSection.append(node("p", "persona-hint", "이 프로젝트에 노드(feature_node)가 없습니다."));
+    } else if (!projectMasterTerminals.length) {
+      nodeSection.append(node("p", "persona-hint",
+        "이 프로젝트에 배정 가능한 live MASTER 세션이 없습니다. "
+        + "기존 지원 경로(session.new)로 이 프로젝트의 MASTER 세션을 먼저 시작하세요. "
+        + "(이 화면에는 아직 클릭 가능한 세션 생성 진입점이 연결되어 있지 않습니다.)"));
+    } else if (!activePersonas.length) {
+      nodeSection.append(node("p", "persona-hint", "먼저 활성 페르소나를 하나 이상 만드세요."));
+    } else {
+      const table = node("div", "persona-node-table");
+      for (const feature of features) {
+        const row = node("div", "persona-node-row");
+        row.append(node("strong", "", feature.title || feature.feature_id));
+        const assignment = nodeOwnerByFeatureId.get(feature.feature_id) || null;
+        const ownerAnchor = assignment ? assignment.session_anchor_ref : null;
+        const ownerLive = ownerAnchor ? liveAnchors.has(ownerAnchor) : false;
+        const ownerTerminal = ownerAnchor
+          ? terminals.find((t) => t.session_anchor_ref === ownerAnchor) || null
+          : null;
+        const statusLine = node("p", "persona-hint");
+        if (assignment) {
+          const persona = personas.find((p) => p.persona_id === assignment.persona_id);
+          const ownerLabel = ownerTerminal ? personaSessionLabel(ownerTerminal) : ownerAnchor;
+          statusLine.textContent = `담당: ${ownerLabel} ${ownerLive ? "(live)" : "(offline)"} `
+            + `(${persona ? persona.title : assignment.persona_id}, assignment rev ${assignment.assignment_revision})`;
+        } else {
+          statusLine.textContent = "담당 Master 미배정.";
+        }
+        row.append(statusLine);
+        const sessionPicker = document.createElement("select");
+        for (const terminal of projectMasterTerminals) {
+          const option = document.createElement("option");
+          option.value = terminal.session_anchor_ref;
+          const otherNode = ownedNodeByAnchor.get(terminal.session_anchor_ref);
+          const otherNodeTitle = otherNode && otherNode !== feature.feature_id
+            ? features.find((f) => f.feature_id === otherNode)
+            : null;
+          option.textContent = otherNodeTitle
+            ? `${personaSessionLabel(terminal)} -- 현재 다른 노드 담당: ${otherNodeTitle.title || otherNode}`
+            : personaSessionLabel(terminal);
+          if (ownerAnchor && terminal.session_anchor_ref === ownerAnchor) option.selected = true;
+          sessionPicker.append(option);
+        }
+        const nodePersonaPicker = document.createElement("select");
+        for (const persona of activePersonas) {
+          const option = document.createElement("option");
+          option.value = persona.persona_id;
+          option.textContent = `${persona.title} (rev ${persona.revision})`;
           if (assignment && assignment.persona_id === persona.persona_id) option.selected = true;
+          nodePersonaPicker.append(option);
         }
-        nodePersonaPicker.append(option);
-      }
-      const nodeError = node("p", "memory-action-error");
-      const assignNodeButton = node("button", "", owner ? "다른 세션으로 변경" : "배정");
-      assignNodeButton.type = "button";
-      assignNodeButton.addEventListener("click", async () => {
-        const targetAnchor = sessionPicker.value;
-        const targetTerminal = projectMasterTerminals.find((t) => t.session_anchor_ref === targetAnchor);
-        const persona = activePersonas.find((p) => p.persona_id === nodePersonaPicker.value);
-        if (!targetAnchor || !targetTerminal || !persona) return;
-        assignNodeButton.disabled = true;
-        try {
-          // node/project/Anchor/revision are server-verified
-          // (tools/universe_server.py::_validate_persona_assignment_node_ref
-          // and the exclusive-owner partial unique index) -- this call can
-          // fail with a clear error (e.g. another Anchor already owns the
-          // node) that the catch below surfaces as-is.
-          if (owner && owner.session_anchor_ref !== targetAnchor) {
-            // Reassigning across sessions: free the old owner first so the
-            // new assign below does not hit PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED
-            // -- an explicit two-step handoff, never a silent takeover.
-            const oldAssignment = assignmentByAnchor.get(owner.session_anchor_ref);
-            await invokeServerAction("persona.unassign", {
-              session_anchor_ref: owner.session_anchor_ref,
-              expected_assignment_revision: oldAssignment.assignment_revision,
-              request_id: crypto.randomUUID(),
-            });
-          }
-          const targetAssignment = assignmentByAnchor.get(targetAnchor);
-          await invokeServerAction("persona.assign", {
-            session_anchor_ref: targetAnchor,
-            project_id: targetTerminal.project_id,
-            persona_id: persona.persona_id,
-            expected_persona_revision: persona.revision,
-            expected_assignment_revision: (targetAssignment && targetAssignment.state === "ACTIVE") ? targetAssignment.assignment_revision : 0,
-            node_ref: feature.feature_id,
-            request_id: crypto.randomUUID(),
-          });
-          await renderPersona();
-        } catch (error) {
-          nodeError.textContent = error.message;
-        } finally {
-          assignNodeButton.disabled = false;
+        const nodeError = node("p", "memory-action-error");
+        // renderPersona() rebuilds the whole panel (including a fresh
+        // nodeError element) on every call, including the recovery
+        // re-render right after a failed write below -- setting text on
+        // the OLD element and then immediately discarding it would show
+        // the error for zero frames. Route it through state, keyed by
+        // node, so it survives exactly one rebuild and is then cleared
+        // (2026-09-15 Conductor review: a shown-then-instantly-wiped error
+        // is not a real error path).
+        state.personaNodeErrors = state.personaNodeErrors || {};
+        if (state.personaNodeErrors[feature.feature_id]) {
+          nodeError.textContent = state.personaNodeErrors[feature.feature_id];
+          delete state.personaNodeErrors[feature.feature_id];
         }
-      });
-      row.append(node("label", "", "세션"), sessionPicker, node("label", "", "페르소나"), nodePersonaPicker, assignNodeButton);
-      if (owner) {
-        const releaseButton = node("button", "", "해제");
-        releaseButton.type = "button";
-        releaseButton.addEventListener("click", async () => {
-          const assignment = assignmentByAnchor.get(owner.session_anchor_ref);
-          releaseButton.disabled = true;
+        const assignNodeButton = node("button", "", assignment ? "다른 세션으로 변경" : "배정");
+        assignNodeButton.type = "button";
+        assignNodeButton.addEventListener("click", async () => {
+          const targetAnchor = sessionPicker.value;
+          const targetTerminal = projectMasterTerminals.find((t) => t.session_anchor_ref === targetAnchor);
+          const persona = activePersonas.find((p) => p.persona_id === nodePersonaPicker.value);
+          if (!targetAnchor || !targetTerminal || !persona) return;
+          if (assignment && targetAnchor === ownerAnchor) return; // already the owner
+          assignNodeButton.disabled = true;
           try {
-            await invokeServerAction("persona.unassign", {
-              session_anchor_ref: owner.session_anchor_ref,
-              expected_assignment_revision: assignment.assignment_revision,
+            const targetExisting = allAssignments.find((a) => a.session_anchor_ref === targetAnchor);
+            const targetOtherNode = ownedNodeByAnchor.get(targetAnchor);
+            if (targetOtherNode && targetOtherNode !== feature.feature_id) {
+              const otherTitle = features.find((f) => f.feature_id === targetOtherNode);
+              if (!window.confirm(
+                `${personaSessionLabel(targetTerminal)}은(는) 이미 다른 노드(${otherTitle ? otherTitle.title : targetOtherNode})를 `
+                + "담당하고 있습니다. 이 배정을 진행하면 그 노드의 담당을 잃습니다. 계속할까요?"
+              )) {
+                assignNodeButton.disabled = false;
+                return;
+              }
+            }
+            // node/project/Anchor/revision are server-verified
+            // (tools/universe_server.py::_validate_persona_assignment_node_ref
+            // and the exclusive-owner partial unique index). When a
+            // DIFFERENT Anchor currently owns this node, handoff_from
+            // makes the release-and-assign one atomic server transaction
+            // instead of two separate calls with a real window between
+            // them (2026-09-15 Conductor review).
+            const requestBody = {
+              session_anchor_ref: targetAnchor,
+              project_id: targetTerminal.project_id,
+              persona_id: persona.persona_id,
+              expected_persona_revision: persona.revision,
+              // Any EXISTING row (regardless of state) needs its real
+              // current revision -- only a truly absent row uses 0. Using
+              // 0 for an UNASSIGNED-but-existing row was the exact bug a
+              // release-then-reassign-to-the-same-session hit
+              // (2026-09-15 Conductor review).
+              expected_assignment_revision: targetExisting ? targetExisting.assignment_revision : 0,
+              node_ref: feature.feature_id,
               request_id: crypto.randomUUID(),
-            });
+            };
+            if (assignment && targetAnchor !== ownerAnchor) {
+              requestBody.handoff_from = {
+                session_anchor_ref: ownerAnchor,
+                expected_assignment_revision: assignment.assignment_revision,
+              };
+            }
+            await invokeServerAction("persona.assign", requestBody);
             await renderPersona();
           } catch (error) {
-            nodeError.textContent = error.message;
+            // A failed write may still have partially landed (e.g. the
+            // error arrived after the write committed) -- re-fetch rather
+            // than leave a stale screen claiming the pre-click state
+            // (2026-09-15 Conductor review: "화면 stale 상태를 복구하지
+            // 않는다"), but keep the error itself visible across that
+            // re-fetch (see state.personaNodeErrors above).
+            state.personaNodeErrors[feature.feature_id] = error.message;
+            await renderPersona();
           } finally {
-            releaseButton.disabled = false;
+            assignNodeButton.disabled = false;
           }
         });
-        row.append(releaseButton);
+        row.append(node("label", "", "세션"), sessionPicker, node("label", "", "페르소나"), nodePersonaPicker, assignNodeButton);
+        if (assignment) {
+          const releaseButton = node("button", "", "해제");
+          releaseButton.type = "button";
+          releaseButton.addEventListener("click", async () => {
+            releaseButton.disabled = true;
+            try {
+              await invokeServerAction("persona.unassign", {
+                session_anchor_ref: ownerAnchor,
+                expected_assignment_revision: assignment.assignment_revision,
+                request_id: crypto.randomUUID(),
+              });
+              await renderPersona();
+            } catch (error) {
+              state.personaNodeErrors[feature.feature_id] = error.message;
+              await renderPersona();
+            } finally {
+              releaseButton.disabled = false;
+            }
+          });
+          row.append(releaseButton);
+        }
+        row.append(nodeError);
+        table.append(row);
       }
-      row.append(nodeError);
-      table.append(row);
+      nodeSection.append(table);
     }
-    nodeSection.append(table);
   }
   root.append(nodeSection);
 

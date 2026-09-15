@@ -8069,25 +8069,45 @@ class UniverseStore:
                     connection.execute(
                         f"ALTER TABLE session_persona_assignment ADD COLUMN {column} {definition}"
                     )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migration_diagnostic ("
+                "name TEXT PRIMARY KEY, detail TEXT NOT NULL, observed_at TEXT NOT NULL)"
+            )
+            # At most one ACTIVE assignment may own a given node at a time
+            # -- this is the actual "node Master uniqueness" guarantee
+            # (distinct from ordinary persona assignment, which stays
+            # many-sessions-per-project as always). Enforced at the DB
+            # layer, rather than by trusting create_master_message's owner
+            # lookup to pick the "right" one out of several ambiguous
+            # ACTIVE rows. This can only fail if data already violates it
+            # (IF NOT EXISTS never raises for "already created"); silently
+            # swallowing that failure would let the rest of the system keep
+            # assuming single ownership when it is not actually enforced
+            # (2026-09-15 Conductor review: "migration 충돌을 조용히 pass하고
+            # 단일성 보장이라 주장하지 말 것"). Record the exact cause
+            # durably and keep booting -- a crash-on-migration would be a
+            # worse outcome for a live shared server than an honestly
+            # recorded gap.
+            self.node_owner_uniqueness_enforced = True
             try:
-                # At most one ACTIVE assignment may own a given node at a
-                # time -- this is the actual "node Master uniqueness"
-                # guarantee (distinct from ordinary persona assignment,
-                # which stays many-sessions-per-project as always). Enforced
-                # here, at the DB layer, rather than by trusting
-                # create_master_message's owner lookup to pick the "right"
-                # one out of several ambiguous ACTIVE rows
-                # (2026-09-15 Conductor review finding). Wrapped: pre-2026-
-                # 09-15 databases cannot have violating rows since node_ref
-                # did not exist before this migration, but a defensive
-                # skip avoids ever crashing startup over this index.
                 connection.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS session_persona_assignment_node_owner "
                     "ON session_persona_assignment(project_id, node_ref) "
                     "WHERE node_ref IS NOT NULL AND state = 'ACTIVE'"
                 )
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as error:
+                self.node_owner_uniqueness_enforced = False
+                detail = (
+                    f"session_persona_assignment_node_owner index creation failed: {error}. "
+                    "Node-ownership exclusivity is NOT enforced at the DB layer until this is "
+                    "resolved (duplicate ACTIVE rows for one (project_id, node_ref) exist)."
+                )
+                print(f"[universe_server] WARNING: {detail}", file=sys.stderr)
+                connection.execute(
+                    "INSERT INTO schema_migration_diagnostic(name, detail, observed_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET detail = excluded.detail, observed_at = excluded.observed_at",
+                    ("session_persona_assignment_node_owner", detail, utc_now()),
+                )
             ensure_project_work_model_schema(connection)
             backfill_template_instances(
                 connection,
@@ -20031,6 +20051,27 @@ class UniverseStore:
             ).fetchone()
         return self._assignment_row(row)
 
+    def list_persona_assignments(self, project_id: str) -> list[dict[str, Any]]:
+        """Every durable assignment row for a project -- ACTIVE and
+        UNASSIGNED, whether or not that Anchor's session is currently live.
+
+        This is the authoritative source for "who owns this node", never a
+        derived list built by probing only the currently-live terminals: a
+        Session Anchor that holds an ACTIVE, node-scoped assignment but
+        whose session is offline right now is still that node's real
+        owner, and a caller cross-referencing only live terminals would
+        wrongly read the node as unassigned (2026-09-15 Conductor review).
+        """
+
+        project = self.get_project(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE project_id = ? "
+                "ORDER BY updated_at DESC, session_anchor_ref",
+                (project["project_id"],),
+            ).fetchall()
+        return [self._assignment_row(row) for row in rows]
+
     def assign_persona(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
         anchor = _required_text(value.get("session_anchor_ref"), "session_anchor_ref")
         project_id = _project_id(value.get("project_id"))
@@ -20046,6 +20087,44 @@ class UniverseStore:
         if len(scope) > 400:
             raise UniverseError("PERSONA_ASSIGNMENT_INVALID", "scope is too long")
         node_ref = value.get("node_ref")
+        # Optional atomic node handoff: when the target node is already
+        # ACTIVEly owned by a DIFFERENT Anchor, an ordinary assign is
+        # refused (PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED below). A caller
+        # that wants to move ownership in one step (not two separate
+        # unassign+assign calls, which leave a real window where the old
+        # owner is unassigned but the new assign has not yet landed -- a
+        # failure or lost response in between leaves the node with no
+        # owner and no way to tell from the new assignment's own state) may
+        # pass handoff_from = {session_anchor_ref, expected_assignment_revision}
+        # naming the CURRENT owner and its exact revision. Both writes then
+        # happen in this one transaction, or neither does
+        # (2026-09-15 Conductor review: UI two-step handoff had no atomic
+        # or recoverable path).
+        handoff_from = value.get("handoff_from")
+        if handoff_from is not None:
+            if (
+                not isinstance(handoff_from, Mapping)
+                or set(handoff_from) != {"session_anchor_ref", "expected_assignment_revision"}
+            ):
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_HANDOFF_INVALID",
+                    "handoff_from must be exactly {session_anchor_ref, expected_assignment_revision}",
+                )
+            handoff_anchor = _required_text(handoff_from.get("session_anchor_ref"), "handoff_from.session_anchor_ref")
+            handoff_revision = handoff_from.get("expected_assignment_revision")
+            if type(handoff_revision) is not int or isinstance(handoff_revision, bool) or handoff_revision < 1:
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_HANDOFF_INVALID",
+                    "handoff_from.expected_assignment_revision must be a positive integer",
+                )
+            if handoff_anchor == anchor:
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_HANDOFF_INVALID",
+                    "handoff_from must name a different Session Anchor than the one being assigned",
+                )
+        else:
+            handoff_anchor = None
+            handoff_revision = None
 
         def write(connection: sqlite3.Connection) -> dict[str, Any]:
             now = utc_now()
@@ -20084,17 +20163,46 @@ class UniverseStore:
                 # owner first -- ownership is never silently taken over
                 # (2026-09-15 Conductor review finding).
                 conflicting_owner = connection.execute(
-                    "SELECT session_anchor_ref FROM session_persona_assignment "
+                    "SELECT * FROM session_persona_assignment "
                     "WHERE project_id = ? AND node_ref = ? AND state = 'ACTIVE' "
                     "AND session_anchor_ref != ?",
                     (project_id, node_ref, anchor),
                 ).fetchone()
                 if conflicting_owner is not None:
-                    raise UniverseError(
-                        "PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED",
-                        "another Session Anchor already actively owns this node; unassign it first",
-                        HTTPStatus.CONFLICT,
-                    )
+                    if handoff_anchor == conflicting_owner["session_anchor_ref"]:
+                        if handoff_revision != conflicting_owner["assignment_revision"]:
+                            raise UniverseError(
+                                "PERSONA_ASSIGNMENT_HANDOFF_STALE",
+                                "handoff_from names the current owner but its revision has "
+                                f"changed; current revision is {conflicting_owner['assignment_revision']}",
+                                HTTPStatus.CONFLICT,
+                            )
+                        # Clear the old owner's node ownership atomically,
+                        # in this same transaction -- CAS-guarded on the
+                        # exact revision the caller named (re-checked here
+                        # too, defending against a concurrent change between
+                        # the SELECT above and this UPDATE), so a stale
+                        # handoff_from is rejected rather than clobbering an
+                        # unrelated later state.
+                        cleared = connection.execute(
+                            "UPDATE session_persona_assignment SET node_ref = NULL, "
+                            "assignment_revision = assignment_revision + 1, actor_ref = ?, updated_at = ? "
+                            "WHERE session_anchor_ref = ? AND assignment_revision = ? AND state = 'ACTIVE'",
+                            (str(actor.get("actor_ref") or ""), now, handoff_anchor, handoff_revision),
+                        )
+                        if cleared.rowcount != 1:
+                            raise UniverseError(
+                                "PERSONA_ASSIGNMENT_HANDOFF_STALE",
+                                "handoff_from no longer matches the current owner; re-read and retry",
+                                HTTPStatus.CONFLICT,
+                            )
+                    else:
+                        raise UniverseError(
+                            "PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED",
+                            "another Session Anchor already actively owns this node; unassign it first "
+                            "(or pass handoff_from naming that owner and its exact assignment_revision)",
+                            HTTPStatus.CONFLICT,
+                        )
             actor_ref = str(actor.get("actor_ref") or "")
             if existing is None:
                 connection.execute(
@@ -30164,6 +30272,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             persona_restore_handler=self._handle_persona_restore_action,
             persona_assign_handler=self._handle_persona_assign_action,
             persona_assignment_read_handler=self._handle_persona_assignment_read_action,
+            persona_assignments_list_handler=self._handle_persona_assignments_list_action,
             persona_unassign_handler=self._handle_persona_unassign_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
@@ -31837,7 +31946,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "session_anchor_ref", "project_id", "persona_id",
                 "expected_persona_revision", "request_id",
             }),
-            optional=frozenset({"expected_assignment_revision", "scope", "node_ref"}),
+            optional=frozenset({"expected_assignment_revision", "scope", "node_ref", "handoff_from"}),
         )
         project_id = _identifier(value["project_id"], "project_id")
         self._validate_persona_assignment_anchor(project_id, value["session_anchor_ref"])
@@ -31850,6 +31959,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         assignment = self.store.read_persona_assignment(value["session_anchor_ref"])
         return {"schema": "universe.persona-assignment-read-result.v1", "status": "PERSONA_ASSIGNMENT_READ",
                 "assignment": assignment}
+
+    def _handle_persona_assignments_list_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        self._persona_actor(context)
+        value = _exact_object_fields(request, field="persona_assignments_list", required=frozenset({"project_id"}))
+        project_id = _identifier(value["project_id"], "project_id")
+        assignments = self.store.list_persona_assignments(project_id)
+        return {"schema": "universe.persona-assignments-list-result.v1", "status": "PERSONA_ASSIGNMENTS_LISTED",
+                "project_id": project_id, "assignments": assignments}
 
     def _handle_persona_unassign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
         actor = self._persona_actor(context)

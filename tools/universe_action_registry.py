@@ -677,6 +677,7 @@ def build_default_action_registry(
     persona_restore_handler: ActionHandler | None = None,
     persona_assign_handler: ActionHandler | None = None,
     persona_assignment_read_handler: ActionHandler | None = None,
+    persona_assignments_list_handler: ActionHandler | None = None,
     persona_unassign_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
@@ -844,6 +845,27 @@ def build_default_action_registry(
             side_effect_class="READ_ONLY",
         ),
         persona_assignment_read_handler, surfaces=("persona.assignment-read",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="persona.assignments-list",
+            request_schema_ref="universe.persona-assignments-list-request.v1",
+            result_schema_ref="universe.persona-assignments-list-result.v1",
+            side_effect_class="READ_ONLY",
+            metadata={
+                "request_schema": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["project_id"], "properties": {"project_id": {"type": "string", "minLength": 1}},
+                },
+                "statement": (
+                    "Every durable session_persona_assignment row for a project "
+                    "(ACTIVE and UNASSIGNED, live or offline Anchor) -- the "
+                    "authoritative source for node ownership, not a list derived "
+                    "by probing only currently-live terminals (2026-09-15)."
+                ),
+            },
+        ),
+        persona_assignments_list_handler, surfaces=("persona.assignments-list",),
     )
     registry.register(
         ActionContract(
