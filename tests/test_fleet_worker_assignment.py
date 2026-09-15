@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -313,6 +314,169 @@ class FleetWorkerAssignmentTests(unittest.TestCase):
         })
         self.assertEqual(400, status, result)
         self.assertEqual("TASK_WORKER_ASSIGNMENT_ROLE_INVALID", result["error_code"])
+
+
+class FleetWorkerSessionStartTests(unittest.TestCase):
+    """2026-09-16: the real blocker -- Fleet could bind a Worker/Reviewer
+    assignment, but the live project had no eligible Worker/Reviewer
+    terminal, and generic session.new only creates Project Master or
+    Conductor. fleet.worker-session-start closes this by reusing
+    create_cli_terminal (the same real Host-launch route session.new uses)
+    with mode="WORKER", then recording the durable Fleet assignment only
+    once that terminal actually exists.
+
+    The real OS-level CLI process spawn is mocked (same boundary the
+    existing persona-native-queue test in test_persona_assignment.py uses)
+    -- everything else (Supervisor anchor-before-spawn resolution, the
+    exact kwargs create_cli_terminal passes to the Host, the assignment
+    write and its CAS/lineage checks) runs for real.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = fixtures.MemoryCandidateApiTests()
+        cls.fixture.setUp()
+        cls.server = cls.fixture.server
+        cls.request = cls.fixture.request
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture.tearDown()
+
+    def act(self, action_id, request):
+        return self.request("POST", "/v1/actions", {"action_id": action_id, "request": dict(request)})
+
+    def register(self, mode, session_id):
+        material, _ = self.server.session_supervisor.register_session({
+            "session_id": session_id, "node": "TEST", "mode": mode, "provider": "CODEX",
+        })
+        return material["session_anchor_ref"]
+
+    def make_todo(self, title="Worker pilot todo"):
+        todo = self.server.store.create_todo({
+            "project_id": "TEST", "scope_kind": "PROJECT", "title": title, "detail": "d",
+            "priority": "P2", "state": "READY", "source_kind": "USER", "sort_order": 0,
+        })
+        return todo["todo_id"]
+
+    def fake_worker_host(self):
+        fake_host = Mock()
+        fake_host.find_live.return_value = None
+
+        def fake_create(**kwargs):
+            # Echo back the exact Session Anchor create_cli_terminal already
+            # resolved via the Supervisor (anchor-before-spawn) -- the real
+            # Host launch confirms receipt for that anchor, never invents a
+            # different one.
+            return {
+                "terminal_id": "term_worker_pilot",
+                "state": "LIVE",
+                "provider": kwargs.get("provider"),
+                "mode": kwargs.get("mode"),
+                "session_anchor_ref": kwargs["session_anchor_ref"],
+                "host_reused_existing": False,
+            }
+
+        fake_host.create.side_effect = fake_create
+        return fake_host
+
+    def test_session_start_creates_a_real_terminal_and_records_the_assignment_only_after_receipt(self):
+        master = self.register("MASTER", "fleet-worker-pilot-master")
+        todo_id = self.make_todo()
+        fake_host = self.fake_worker_host()
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            status, result = self.act("fleet.worker-session-start", {
+                "project_id": "TEST", "todo_id": todo_id, "worker_role": "IMPLEMENTER",
+                "assigned_by_session_anchor_ref": master, "provider": "CODEX",
+            })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual(200, status, result)
+        self.assertEqual("FLEET_WORKER_SESSION_STARTED", result["status"])
+        terminal = result["terminal"]
+        assignment = result["assignment"]
+        self.assertEqual("LIVE", terminal["state"])
+        self.assertEqual("WORKER", terminal["mode"])
+        self.assertTrue(terminal["session_anchor_ref"])
+        self.assertEqual(terminal["session_anchor_ref"], assignment["session_anchor_ref"])
+        self.assertEqual("ACTIVE", assignment["state"])
+        self.assertEqual("IMPLEMENTER", assignment["worker_role"])
+        fake_host.create.assert_called_once()
+
+        # The durable row is real and readable back, exactly like a manually
+        # bound assignment.
+        status, listed = self.act("fleet.worker-assignments-list", {
+            "project_id": "TEST", "todo_id": todo_id,
+        })
+        self.assertEqual(200, status, listed)
+        self.assertEqual(1, len(listed["assignments"]))
+        self.assertEqual(assignment["assignment_id"], listed["assignments"][0]["assignment_id"])
+
+    def test_session_start_supports_reviewer_role_as_a_worker_session_not_a_new_authority(self):
+        master = self.register("MASTER", "fleet-worker-pilot-reviewer-master")
+        todo_id = self.make_todo()
+        fake_host = self.fake_worker_host()
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            status, result = self.act("fleet.worker-session-start", {
+                "project_id": "TEST", "todo_id": todo_id, "worker_role": "REVIEWER",
+                "assigned_by_session_anchor_ref": master, "provider": "CODEX",
+            })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual(200, status, result)
+        # The session itself is mode=WORKER -- REVIEWER is the assignment's
+        # role, never a distinct session mode/authority.
+        self.assertEqual("WORKER", result["terminal"]["mode"])
+        self.assertEqual("REVIEWER", result["assignment"]["worker_role"])
+
+    def test_session_start_rejects_a_non_master_assigner(self):
+        not_master = self.register("CONDUCTOR", "fleet-worker-pilot-non-master")
+        todo_id = self.make_todo()
+        status, result = self.act("fleet.worker-session-start", {
+            "project_id": "TEST", "todo_id": todo_id, "worker_role": "IMPLEMENTER",
+            "assigned_by_session_anchor_ref": not_master,
+        })
+        self.assertEqual(409, status, result)
+        self.assertEqual("TASK_WORKER_ASSIGNMENT_MASTER_REQUIRED", result["error_code"])
+
+    def test_session_start_requires_a_todo_or_task_frame_scope(self):
+        master = self.register("MASTER", "fleet-worker-pilot-scope-master")
+        status, result = self.act("fleet.worker-session-start", {
+            "project_id": "TEST", "worker_role": "IMPLEMENTER",
+            "assigned_by_session_anchor_ref": master,
+        })
+        self.assertEqual(400, status, result)
+        self.assertEqual("TASK_WORKER_ASSIGNMENT_SCOPE_REQUIRED", result["error_code"])
+
+    def test_a_failed_host_launch_never_records_a_durable_assignment(self):
+        master = self.register("MASTER", "fleet-worker-pilot-failure-master")
+        todo_id = self.make_todo()
+        fake_host = Mock()
+        fake_host.find_live.return_value = None
+        from universe_app.terminal_host import TerminalHostError
+        fake_host.create.side_effect = TerminalHostError(
+            "TERMINAL_PROVIDER_LAUNCH_FAILED", "the provider CLI failed to start"
+        )
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            status, result = self.act("fleet.worker-session-start", {
+                "project_id": "TEST", "todo_id": todo_id, "worker_role": "IMPLEMENTER",
+                "assigned_by_session_anchor_ref": master, "provider": "CODEX",
+            })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual(409, status, result)
+        self.assertEqual("TERMINAL_PROVIDER_LAUNCH_FAILED", result["error_code"])
+        status, listed = self.act("fleet.worker-assignments-list", {
+            "project_id": "TEST", "todo_id": todo_id,
+        })
+        self.assertEqual(200, status, listed)
+        self.assertEqual([], listed["assignments"])
 
 
 if __name__ == "__main__":

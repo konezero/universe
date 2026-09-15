@@ -30819,6 +30819,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             fleet_worker_assign_handler=self._handle_fleet_worker_assign_action,
             fleet_worker_unassign_handler=self._handle_fleet_worker_unassign_action,
             fleet_worker_assignments_list_handler=self._handle_fleet_worker_assignments_list_action,
+            fleet_worker_session_start_handler=self._handle_fleet_worker_session_start_action,
             memory_sync_persist_selected_handler=self._handle_memory_sync_persist_selected_action,
             session_new_handler=self._handle_session_new_action,
             session_resume_handler=self._handle_session_resume_action,
@@ -32983,6 +32984,111 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "FLEET_WORKER_ASSIGNMENTS_LISTED",
             "project_id": value["project_id"],
             "assignments": assignments,
+        }
+
+    def _handle_fleet_worker_session_start_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Create (or reuse) a real, live Worker/Reviewer terminal for an
+        exact node/Todo/Task Frame, then record the durable Fleet binding
+        only once that terminal actually exists (2026-09-16: "the live
+        project has no eligible Worker/Reviewer terminal and generic
+        session.new only creates Project Master or Conductor" -- the real
+        blocker this closes).
+
+        Reuses create_cli_terminal exactly as session.new does -- same
+        Supervisor-anchor-before-spawn path, same real terminal_host.create
+        Host launch -- with mode="WORKER" instead of broadening session.new
+        with a guessed mode. "Reviewer" is not a second session mode: a
+        Worker-mode session carries a REVIEWER worker_role in the Fleet
+        assignment it receives here, never a separate authority (2026-09-16
+        Conductor review: "do not invent authority").
+
+        The assignment is written only after create_cli_terminal returns
+        (Host/session receipt is exactly its success return, or the
+        TerminalHostError-derived UniverseError this method never catches --
+        a failed launch never produces a durable Fleet row).
+        """
+
+        self._require_session_action_user(context, "fleet.worker-session-start")
+        value = _exact_object_fields(
+            request, field="fleet_worker_session_start",
+            required=frozenset({"project_id", "worker_role", "assigned_by_session_anchor_ref"}),
+            optional=frozenset({
+                "node_ref", "todo_id", "task_frame_id", "persona_id",
+                "provider", "model_ref", "effort",
+            }),
+        )
+        worker_role = _required_text(value.get("worker_role"), "worker_role").upper()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_ROLE_INVALID",
+                "worker_role must be IMPLEMENTER or REVIEWER",
+            )
+        project_id = _project_id(value.get("project_id"))
+        assigned_by = _required_text(
+            value.get("assigned_by_session_anchor_ref"), "assigned_by_session_anchor_ref"
+        )
+        self._validate_persona_assignment_anchor(project_id, assigned_by)
+        if "MASTER" not in self._anchor_modes(assigned_by):
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_MASTER_REQUIRED",
+                "assigned_by_session_anchor_ref must be a project Master Session Anchor",
+                HTTPStatus.CONFLICT,
+            )
+        scope = self._validate_fleet_worker_scope_filters({
+            "project_id": project_id, "node_ref": value.get("node_ref"),
+            "todo_id": value.get("todo_id"), "task_frame_id": value.get("task_frame_id"),
+        })
+        if not scope["todo_id"] and not scope["task_frame_id"]:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_SCOPE_REQUIRED",
+                "at least one of todo_id or task_frame_id is required",
+            )
+        persona_id = value.get("persona_id")
+        if persona_id is not None:
+            persona_id = _identifier(persona_id, "persona_id")
+            persona = self.store.get_persona(persona_id)
+            if str(persona.get("state") or "").upper() != "ACTIVE":
+                raise UniverseError(
+                    "TASK_WORKER_ASSIGNMENT_PERSONA_UNAVAILABLE",
+                    "persona_id must refer to an active Persona",
+                    HTTPStatus.CONFLICT,
+                )
+
+        created = self.create_cli_terminal({
+            "project_id": project_id,
+            "mode": "WORKER",
+            "cwd": self._session_action_project_root(project_id),
+            **self._session_action_options(value),
+        })
+        terminal = created.get("terminal") or {}
+        worker_anchor = str(terminal.get("session_anchor_ref") or "").strip()
+        if not worker_anchor:
+            raise UniverseError(
+                "TASK_WORKER_SESSION_RECEIPT_UNAVAILABLE",
+                "the Host did not return a Session Anchor for the new Worker/Reviewer terminal",
+                HTTPStatus.CONFLICT,
+            )
+        assign_result = self.store.assign_task_worker(
+            {
+                "project_id": project_id, "node_ref": scope["node_ref"],
+                "todo_id": scope["todo_id"], "task_frame_id": scope["task_frame_id"],
+                "worker_role": worker_role, "session_anchor_ref": worker_anchor,
+                "persona_id": persona_id, "assigned_by_session_anchor_ref": assigned_by,
+            },
+            self._persona_actor(context),
+        )
+        assignment = assign_result.get("assignment") or {}
+        self._record_worker_assignment_event(
+            project_id=project_id, outcome="ASSIGNED", assignment=assignment,
+        )
+        return {
+            "schema": "universe.fleet-worker-session-start-result.v1",
+            "status": "FLEET_WORKER_SESSION_STARTED",
+            "terminal_status": created.get("status"),
+            "terminal": terminal,
+            "assignment": assignment,
         }
 
     def _record_worker_assignment_event(

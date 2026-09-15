@@ -682,6 +682,7 @@ def build_default_action_registry(
     fleet_worker_assign_handler: ActionHandler | None = None,
     fleet_worker_unassign_handler: ActionHandler | None = None,
     fleet_worker_assignments_list_handler: ActionHandler | None = None,
+    fleet_worker_session_start_handler: ActionHandler | None = None,
     memory_sync_persist_selected_handler: ActionHandler | None = None,
     session_new_handler: ActionHandler | None = None,
     session_resume_handler: ActionHandler | None = None,
@@ -914,6 +915,25 @@ def build_default_action_registry(
             metadata={"statement": _FLEET_WORKER_STATEMENT},
         ),
         fleet_worker_assignments_list_handler, surfaces=("fleet.worker-assignments-list",),
+    )
+    registry.register(
+        ActionContract(
+            action_id="fleet.worker-session-start",
+            request_schema_ref="universe.fleet-worker-session-start-request.v1",
+            result_schema_ref="universe.fleet-worker-session-start-result.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "statement": (
+                    "Creates a real, live Worker/Reviewer terminal through the "
+                    "same Host-launch route as session.new (mode=WORKER, never "
+                    "a guessed session.new target), then records the durable "
+                    "Fleet Worker/Reviewer binding only once that terminal "
+                    "actually exists (2026-09-16 -- closes the 'no eligible "
+                    "Worker/Reviewer terminal exists' blocker)."
+                ),
+            },
+        ),
+        fleet_worker_session_start_handler, surfaces=("fleet.worker-session-start",),
     )
     registry.register(
         ActionContract(
