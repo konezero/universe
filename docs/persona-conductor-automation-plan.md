@@ -855,17 +855,28 @@ state is also shown on its owning tab. The separate terminal-header Actions
 inbox is retired. Selected-terminal cancel, stop, reconnect and handoff remain
 contextual session controls.
 
-Activity is the immutable project execution history. Commit/push, test and
-validation, Todo transition, session lifecycle, assignment/handoff, command or
-typed Action result, failure, quota stop and recovery belong there with exact
-node -> Todo -> Task Frame -> Session Anchor lineage. Activity is supplied by one
-authoritative server projection with cursor/order; the browser must not merge
-fallback sources into apparent truth. Activity records what happened, Fleet
-shows what should happen next, and the terminal shows what is executing now.
+Activity is the immutable project work-change history. Planning and scope change,
+assignment/handoff, execution start/stop/resume, artifact change, test and
+validation, Todo transition, decision, failure, quota stop and recovery belong
+there with exact node -> Todo -> Task Frame -> Session Anchor lineage. An error
+is promoted to Activity only when it changes work state, invalidates a result,
+exhausts bounded retry, requires a decision, or recurs as a structural problem.
+Transient polling/tool errors stay in diagnostics. Error and recovery events
+retain stable code, impact, evidence, next condition and correlation without
+copying raw terminal logs.
 
-Implementation remains pending for the complete surface move: the current
-Persona page still contains assignment controls, the Actions dialog still mixes
-active reply/approval with Git history, and the dedicated Activity renderer still
-merges room messages and Master handoffs rather than consuming the complete
-project event projection. These are implementation gaps, not alternate product
-contracts.
+Activity is supplied by one authoritative project event ledger with stable
+cursor/order; the browser must not merge fallback sources into apparent truth.
+Repeated equivalent low-level observations may collapse into one counted row,
+but their source events remain immutable. Activity records what changed, Fleet
+shows current and next work, and the terminal shows what is executing now.
+
+The first implementation slice now reads `/v1/projects/{project_id}/events`
+exclusively, renders known work/artifact/validation/session/decision categories,
+shows error code, reason, lineage, evidence and next condition, collapses repeated
+identical session-start observations, and exposes read failure instead of an empty
+feed. Remaining surface work: move assignment controls out of Persona into Fleet,
+retire the Actions dialog and move Git history to the event ledger, expand event
+production for automation/assignment/recovery, add contextual Fleet/terminal
+navigation, and verify the full browser flow. These are implementation gaps, not
+alternate product contracts.

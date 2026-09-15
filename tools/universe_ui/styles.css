@@ -2186,6 +2186,29 @@ body.inspector-open .inspector {
   content: "";
 }
 
+.project-activity-item[data-category="ERROR"]::before {
+  background: var(--red);
+  box-shadow: 0 0 0 1px rgba(168, 111, 102, 0.45);
+}
+
+.project-activity-item[data-category="RECOVERY"]::before {
+  background: var(--green);
+  box-shadow: 0 0 0 1px rgba(111, 155, 120, 0.45);
+}
+
+.project-activity-item[data-category="VALIDATION"]::before,
+.project-activity-item[data-category="ARTIFACT"]::before {
+  background: var(--blue);
+}
+
+.project-activity-item[data-category="ERROR"] .activity-event-meta {
+  color: var(--red);
+}
+
+.project-activity-item[data-category="RECOVERY"] .activity-event-meta {
+  color: var(--green);
+}
+
 .timeline-copy {
   display: flex;
   flex-direction: column;

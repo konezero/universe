@@ -32,6 +32,8 @@ const state = {
   releaseProposals: [],
   selectedReleaseTargetProjectId: null,
   masterHandoffs: [],
+  /** Authoritative project work-change events. Read failures stay explicit. */
+  projectActivity: { status: "IDLE", events: [], error: "" },
   skillPlanAdoptions: [],
   skillObservations: [],
   skillBench: [],
@@ -6242,6 +6244,34 @@ async function proposeProjectRelease(releaseId, button = null) {
   }
 }
 
+function loadProjectActivity(projectId) {
+  state.projectActivity = {
+    projectId,
+    status: "LOADING",
+    events: [],
+    error: "",
+  };
+  renderActivity();
+  api(`/v1/projects/${encodeURIComponent(projectId)}/events`)
+    .then((payload) => ({
+      projectId,
+      status: "READY",
+      events: Array.isArray(payload.events) ? payload.events : [],
+      error: "",
+    }))
+    .catch((error) => ({
+      projectId,
+      status: "ERROR",
+      events: [],
+      error: error?.message || "Activity events could not be loaded",
+    }))
+    .then((result) => {
+      if (state.selectedProject?.project_id !== projectId) return;
+      state.projectActivity = result;
+      renderActivity();
+    });
+}
+
 async function selectProject(
   projectId,
   { revealInspector = true, syncAssets = false } = {}
@@ -6254,6 +6284,7 @@ async function selectProject(
   state.focusedNodeId = null;
   state.inspectorDismissed = !revealInspector;
   renderProjects();
+  loadProjectActivity(projectId);
   if (syncAssets) {
     await api(`/v1/projects/${encodeURIComponent(projectId)}/sync`, {
       method: "POST",
@@ -14034,41 +14065,122 @@ function renderSemanticNodeActivity(graphNode) {
   elements.activity.append(timeline);
 }
 
-function renderHandoffTimelineRow(handoff) {
-  const row = node("div", "timeline-item handoff-item");
-  const copy = node("div", "timeline-copy");
-  const sourceKind = handoff.source?.kind || "UNKNOWN";
-  copy.append(
-    node("strong", "", `MASTER_HANDOFF / ${sourceKind}`),
-    node("small", "", `${handoff.delivery_state} · ${handoff.handoff_id}`),
-    node(
-      "small",
-      "",
-      handoff.purpose || handoff.next_operation || "Project Master handoff"
+function activityEventCategory(event) {
+  const payload = event?.payload || {};
+  const eventType = String(event?.event_type || "EVENT").toUpperCase();
+  const states = [payload.state, payload.status, payload.outcome]
+    .map((value) => String(value || "").toUpperCase())
+    .filter(Boolean);
+  if (
+    eventType.includes("RECOVER") ||
+    eventType.includes("RESUME") ||
+    states.some((value) => ["RECOVERED", "RESUMED", "RESOLVED"].includes(value))
+  ) return "RECOVERY";
+  if (
+    payload.successful === false ||
+    payload.error_code ||
+    states.some((value) =>
+      ["FAILED", "BLOCKED", "ERROR", "TIMED_OUT", "DENIED", "QUOTA_EXHAUSTED"].includes(value)
     )
-  );
-  if (handoff.delivery_state === "PROPOSAL_ONLY") {
-    const action = node("button", "timeline-action", "Deliver");
-    action.type = "button";
-    action.addEventListener("click", () =>
-      deliverMasterHandoff(state.selectedProject.project_id, handoff)
-    );
-    copy.append(action);
-  }
-  // Marker is CSS ::before — do not prepend an extra empty span
-  // (it steals the content column and collapses copy into a 10px vertical strip).
-  row.append(copy);
-  return row;
+  ) return "ERROR";
+  if (eventType === "TODO_ACTION_APPLIED") return "WORK";
+  if (eventType === "TEST_WORK_STATUS") return "VALIDATION";
+  if (eventType === "GIT_WORK_STATUS") return "ARTIFACT";
+  if (eventType === "HOOK_SESSION_BOUND") return "SESSION";
+  if (eventType.includes("MEMORY") || eventType.includes("DECISION")) return "DECISION";
+  return "CHANGE";
 }
 
-function renderRoomMessageTimelineRow(message) {
-  const row = node("div", "timeline-item room-message");
+function activityEventTitle(event) {
+  const payload = event?.payload || {};
+  const eventType = String(event?.event_type || "EVENT").toUpperCase();
+  if (eventType === "TODO_ACTION_APPLIED") {
+    return `Todo · ${payload.outcome || payload.state || payload.action_id || "changed"}`;
+  }
+  if (eventType === "TEST_WORK_STATUS") {
+    const result = payload.successful === true ? "PASSED" : payload.successful === false ? "FAILED" : "RECORDED";
+    return `Tests · ${payload.tier || "UNKNOWN"} · ${result}`;
+  }
+  if (eventType === "GIT_WORK_STATUS") {
+    return `${payload.operation || "Git"} · ${payload.state || "OBSERVED"}`;
+  }
+  if (eventType === "HOOK_SESSION_BOUND") {
+    return `Session · ${payload.trigger || "BOUND"} · ${payload.provider || "UNKNOWN"}`;
+  }
+  return eventType.replaceAll("_", " ");
+}
+
+function activityEventLineage(payload) {
+  return [
+    payload.node_ref && `Node ${payload.node_ref}`,
+    payload.todo_id && `Todo ${payload.todo_id}`,
+    payload.task_frame_id && `Task Frame ${payload.task_frame_id}`,
+    payload.session_anchor_ref && `Session ${payload.session_anchor_ref}`,
+  ].filter(Boolean).join(" · ");
+}
+
+function activityEventDetails(event, occurrenceCount = 1) {
+  const payload = event?.payload || {};
+  const details = [];
+  const fromState = payload.from_state || payload.previous_state;
+  const toState = payload.to_state || payload.state;
+  if (fromState && toState && fromState !== toState) {
+    details.push(`${fromState} → ${toState}`);
+  } else if (payload.outcome) {
+    details.push(String(payload.outcome));
+  }
+  if (payload.error_code) details.push(`오류 ${payload.error_code}`);
+  const reason = payload.detail || payload.reason || payload.blocked_reason || payload.error_message;
+  if (reason) details.push(String(reason));
+  const next = payload.next_condition || payload.next_action;
+  if (next) details.push(`다음 조건: ${next}`);
+  const lineage = activityEventLineage(payload);
+  if (lineage) details.push(lineage);
+  const evidence = payload.evidence_ref || payload.result_ref || payload.commit_sha || payload.short_sha;
+  if (evidence) details.push(`근거: ${evidence}`);
+  const correlation = payload.correlation_id || payload.operation_id || payload.request_id;
+  if (correlation) details.push(`연결 ID: ${correlation}`);
+  if (occurrenceCount > 1) details.push(`동일 세션 사건 ${occurrenceCount}회`);
+  return details;
+}
+
+function collapseProjectActivity(events) {
+  const entries = [];
+  const repeatedSessions = new Map();
+  for (const event of [...events].sort((left, right) =>
+    String(right.created_at || "").localeCompare(String(left.created_at || ""))
+  )) {
+    if (event.event_type === "HOOK_SESSION_BOUND") {
+      const payload = event.payload || {};
+      const key = [event.event_type, payload.session_anchor_ref, payload.trigger, payload.provider].join(":");
+      const prior = repeatedSessions.get(key);
+      if (prior) {
+        prior.occurrenceCount += 1;
+        continue;
+      }
+      const entry = { event, occurrenceCount: 1 };
+      repeatedSessions.set(key, entry);
+      entries.push(entry);
+      continue;
+    }
+    entries.push({ event, occurrenceCount: 1 });
+  }
+  return entries;
+}
+
+function renderProjectActivityRow(entry) {
+  const event = entry.event;
+  const category = activityEventCategory(event);
+  const row = node("div", "timeline-item project-activity-item");
+  row.dataset.category = category;
   const copy = node("div", "timeline-copy");
   copy.append(
-    node("strong", "", `${message.kind} / ${message.sender}`),
-    node("small", "", message.body),
-    node("small", "", `${message.delivery_state} / ${message.created_at}`)
+    node("strong", "", activityEventTitle(event)),
+    node("small", "activity-event-meta", `${category} · ${event.created_at || "Unknown time"}`)
   );
+  for (const detail of activityEventDetails(event, entry.occurrenceCount)) {
+    copy.append(node("small", "activity-event-detail", detail));
+  }
   row.append(copy);
   return row;
 }
@@ -14079,37 +14191,40 @@ function renderActivity() {
     elements.activity.append(node("p", "empty-copy", "No project selected"));
     return;
   }
-  if (
-    state.view === "semantic" &&
-    state.selectedNode &&
-    state.selectedNode.kind !== "project"
-  ) {
-    renderSemanticNodeActivity(state.selectedNode);
+  const activity = state.projectActivity || { status: "IDLE", events: [], error: "" };
+  if (activity.status === "LOADING" || activity.status === "IDLE") {
+    elements.activity.append(node("p", "empty-copy", "Activity를 불러오는 중입니다."));
     return;
   }
-  if (!state.roomMessages.length && !state.masterHandoffs.length) {
-    elements.activity.append(node("p", "empty-copy", "No activity yet"));
+  if (activity.status === "ERROR") {
+    elements.activity.append(
+      node("p", "form-error", `Activity를 불러오지 못했습니다: ${activity.error || "UNKNOWN"}`)
+    );
     return;
   }
-  // Newest first. Merge both sources by their own created_at instead of two
-  // fixed handoffs-then-messages blocks (each internally oldest-first,
-  // scrollable only) — that buried today's activity under both older
-  // handoffs above it and an ever-growing message history below it.
-  const entries = [
-    ...state.masterHandoffs.map((handoff) => ({
-      sortKey: handoff.created_at || "",
-      render: () => renderHandoffTimelineRow(handoff),
-    })),
-    ...state.roomMessages.map((message) => ({
-      sortKey: message.created_at || "",
-      render: () => renderRoomMessageTimelineRow(message),
-    })),
-  ].sort((left, right) => right.sortKey.localeCompare(left.sortKey));
+  const entries = collapseProjectActivity(Array.isArray(activity.events) ? activity.events : []);
+  if (!entries.length) {
+    elements.activity.append(node("p", "empty-copy", "기록된 작업 변화가 없습니다."));
+    return;
+  }
+  const counts = entries.reduce((result, entry) => {
+    const category = activityEventCategory(entry.event);
+    result[category] = (result[category] || 0) + 1;
+    return result;
+  }, {});
+  const context = node("div", "activity-context");
+  context.append(
+    node("strong", "", "프로젝트 작업 변화"),
+    node(
+      "small",
+      "",
+      Object.entries(counts).map(([category, count]) => `${category} ${count}`).join(" · ")
+    ),
+    node("small", "", "상태 변경·결과·오류·복구만 프로젝트 이벤트 원장에서 표시합니다.")
+  );
   const timeline = node("div", "timeline");
-  for (const entry of entries) {
-    timeline.append(entry.render());
-  }
-  elements.activity.append(timeline);
+  for (const entry of entries) timeline.append(renderProjectActivityRow(entry));
+  elements.activity.append(context, timeline);
 }
 
 function renderEmpty() {
