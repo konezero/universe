@@ -7729,7 +7729,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("HIDDEN", hidden["visibility"])
         self.assertEqual(1, hidden["revision"])
         self.assertEqual(
-            ["sess-claude-new"],
+            ["sess-claude-new", "sess-codex-old"],
             [row["session_id"] for row in self.server.list_resumable_sessions()["resume"]],
         )
 
@@ -7740,11 +7740,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual(
-            ["sess-codex-new", "sess-claude-new"],
+            ["sess-claude-new", "sess-codex-old"],
             [row["session_id"] for row in with_hidden["resume"]],
         )
-        self.assertEqual("HIDDEN", with_hidden["resume"][0]["visibility"])
-        self.assertEqual(1, with_hidden["resume"][0]["visibility_revision"])
+        self.assertEqual(
+            ["sess-codex-new"],
+            [row["session_id"] for row in with_hidden["excluded"]],
+        )
+        self.assertEqual("HIDDEN", with_hidden["excluded"][0]["visibility"])
+        self.assertEqual(1, with_hidden["excluded"][0]["visibility_revision"])
 
         status, stale = self.request(
             "POST",

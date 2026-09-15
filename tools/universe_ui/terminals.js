@@ -2077,7 +2077,6 @@ async function loadTerminalTabs() {
     if (typeof renderDetails === "function") renderDetails();
     if (!state.activeTerminalId && visible[0]) {
       selectTerminalTab(visible[0].terminal_id);
-      return;
     }
     if (state.activeTerminalId) applyCliDockTitle(activeTerminalSession());
     else applyCliDockTitle(null);
@@ -2188,14 +2187,61 @@ function currentReattachHosts() {
   return hosts;
 }
 
-async function loadResumableSessions() {
+async function migrateLegacyResumeExclusions() {
+  let saved;
   try {
-    const payload = await api("/v1/sessions/resumable?limit=7&include_hidden=true");
-    state.resumableSessions = payload;
-    return payload;
+    saved = JSON.parse(localStorage.getItem("universe.resume.excluded.v1") || "[]");
   } catch (_error) {
-    state.resumableSessions = { reattach: [], resume: [], incompatible: [] };
-    return state.resumableSessions;
+    saved = [];
+  }
+  if (!Array.isArray(saved) || !saved.length) return;
+  let retryNeeded = false;
+  for (const identity of saved) {
+    try {
+      const [projectId, sessionId] = JSON.parse(identity);
+      if (!projectId || !sessionId) continue;
+      await api("/v1/sessions/resumable/visibility", {
+        method: "POST",
+        body: {
+          project_id: String(projectId),
+          session_id: String(sessionId),
+          visibility: "HIDDEN",
+          expected_revision: 0,
+        },
+      });
+    } catch (error) {
+      if (error?.errorCode !== "RESUMABLE_SESSION_VISIBILITY_CONFLICT") retryNeeded = true;
+    }
+  }
+  if (!retryNeeded) {
+    try { localStorage.removeItem("universe.resume.excluded.v1"); } catch (_error) { /* migration already persisted */ }
+  }
+}
+
+async function loadResumableSessions() {
+  if (state.resumableSessionsPromise) return state.resumableSessionsPromise;
+  state.resumableSessionsLoading = true;
+  if (typeof renderTerminalNewMenu === "function") renderTerminalNewMenu();
+  const pending = (async () => {
+    try {
+      await migrateLegacyResumeExclusions();
+      const payload = await api("/v1/sessions/resumable?limit=7&include_hidden=true");
+      state.resumableSessions = payload;
+      state.resumableSessionsError = null;
+      return payload;
+    } catch (error) {
+      state.resumableSessions = state.resumableSessions || { reattach: [], resume: [], excluded: [], incompatible: [] };
+      state.resumableSessionsError = error?.message || "Resume list could not be loaded";
+      return state.resumableSessions;
+    } finally {
+      state.resumableSessionsLoading = false;
+    }
+  })();
+  state.resumableSessionsPromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (state.resumableSessionsPromise === pending) state.resumableSessionsPromise = null;
   }
 }
 
@@ -2261,6 +2307,14 @@ function renderTerminalNewMenu() {
     });
   });
   menu.append(neu);
+  if (state.resumableSessionsLoading && !state.resumableSessions) {
+    const loading = document.createElement("button");
+    loading.type = "button";
+    loading.className = "terminal-new-menu-item";
+    loading.disabled = true;
+    loading.textContent = "Resume 목록 불러오는 중...";
+    menu.append(loading);
+  }
   for (const host of hosts) {
     const item = document.createElement("div");
     item.type = "button";
@@ -2282,15 +2336,30 @@ function renderTerminalNewMenu() {
       const hostId = hostSessionRefOf(host);
       if (!hostId || !window.confirm("Terminate this persistent Host?")) return;
       api("/v1/reconnection-hosts/" + encodeURIComponent(hostId) + "/terminate", { method: "POST" })
-        .then(() => loadResumableSessions())
-        .then(() => { renderReattachBanner(); renderTerminalNewMenu(); })
+        .then(() => refreshAfterHostTermination(hostId))
         .catch((error) => toast(error.message, true));
     });
     item.append(terminate);
     menu.append(item);
   }
-  const sessions = state.resumableSessions?.resume || [];
-  const excludedCount = sessions.filter(resumeSessionExcluded).length;
+  if (state.resumableSessionsError) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "terminal-new-menu-item";
+    retry.textContent = "Resume list load failed - Retry";
+    retry.title = state.resumableSessionsError;
+    retry.addEventListener("click", (event) => {
+      event.stopPropagation();
+      loadResumableSessions().then(renderTerminalNewMenu);
+    });
+    menu.append(retry);
+  }
+  const visibleSessions = state.resumableSessions?.resume || [];
+  const excludedSessions = state.resumableSessions?.excluded || [];
+  const excludedCount = excludedSessions.length;
+  const sessions = state.showExcludedResumeSessions
+    ? [...visibleSessions, ...excludedSessions]
+    : visibleSessions;
   for (const session of sessions) {
     const excluded = resumeSessionExcluded(session);
     if (excluded && !state.showExcludedResumeSessions) continue;
@@ -2339,6 +2408,22 @@ function renderTerminalNewMenu() {
   if (menu.matches(":popover-open")) positionTerminalNewMenu(menu, document.querySelector("#terminal-new-session"));
 }
 
+async function refreshAfterHostTermination(hostId) {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await loadTerminalTabs();
+    const stillLive = (state.supervisorHosts || []).some(
+      (host) => hostSessionRefOf(host) === hostId && hostRuntimeLive(host)
+    );
+    if (!stillLive) {
+      renderReattachBanner();
+      renderTerminalNewMenu();
+      return;
+    }
+  }
+  throw new Error("Host termination is still pending. Please retry.");
+}
+
 function positionTerminalNewMenu(menu, button) {
   if (!button) return;
     const anchor = button.getBoundingClientRect();
@@ -2371,6 +2456,10 @@ function toggleTerminalNewMenu() {
   if (open) {
     menu.showPopover();
     positionTerminalNewMenu(menu, button);
+    loadResumableSessions().then(() => {
+      renderReattachBanner();
+      renderTerminalNewMenu();
+    });
   } else if (menu.matches(":popover-open")) {
     menu.hidePopover();
   }

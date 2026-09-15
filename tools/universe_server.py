@@ -38101,6 +38101,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
             )
         resume_candidates: list[dict[str, Any]] = []
+        excluded_candidates: list[dict[str, Any]] = []
         seen_coord: set[tuple[str, str, str]] = set()
         visibility_by_session = self.store.resumable_session_visibility_map()
         # A provider session remains resumable after a different provider
@@ -38150,48 +38151,60 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 or anchor in incompatible_anchors
             ):
                 continue
-            # Compact the default menu to the newest resumable session for
-            # each provider. Multiple providers can legitimately own distinct
-            # Master sessions for the same project and Mode.
+            visibility = visibility_by_session.get(
+                (project_id, session_id),
+                {"visibility": "VISIBLE", "revision": 0},
+            )
+            candidate = {
+                "kind": "RESUME",
+                "session_id": session_id,
+                "session_anchor_ref": anchor,
+                "project_id": project_id,
+                "mode": mode,
+                "provider": provider,
+                "last_seen_at": str(session.get("last_seen_at") or ""),
+                "label": _resumable_label(session),
+                "visibility": visibility["visibility"],
+                "visibility_revision": visibility["revision"],
+            }
+            # Excluded rows have their own collection and limit. They remain
+            # recoverable even when they are older than the provider's compact
+            # Resume row or fall outside the visible menu limit.
+            if visibility["visibility"] == "HIDDEN":
+                if include_hidden:
+                    excluded_candidates.append(candidate)
+                continue
+            # Compact the visible default menu to the newest resumable session
+            # for each provider. Multiple providers can legitimately own
+            # distinct Master sessions for the same project and Mode.
             coord = (project_id.casefold(), mode, provider)
             if not expand:
                 if coord in seen_coord:
                     continue
                 seen_coord.add(coord)
-            visibility = visibility_by_session.get(
-                (project_id, session_id),
-                {"visibility": "VISIBLE", "revision": 0},
-            )
-            if visibility["visibility"] == "HIDDEN" and not include_hidden:
-                continue
-            resume_candidates.append(
-                {
-                    "kind": "RESUME",
-                    "session_id": session_id,
-                    "session_anchor_ref": anchor,
-                    "project_id": project_id,
-                    "mode": mode,
-                    "provider": provider,
-                    "last_seen_at": str(session.get("last_seen_at") or ""),
-                    "label": _resumable_label(session),
-                    "visibility": visibility["visibility"],
-                    "visibility_revision": visibility["revision"],
-                }
-            )
+            resume_candidates.append(candidate)
         if before:
             resume_candidates = [
                 item
                 for item in resume_candidates
                 if str(item.get("last_seen_at") or "") < before
             ]
+            excluded_candidates = [
+                item
+                for item in excluded_candidates
+                if str(item.get("last_seen_at") or "") < before
+            ]
         truncated = len(resume_candidates) > limit
+        excluded_truncated = len(excluded_candidates) > 50
         return {
             "schema": API_SCHEMA,
             "status": "SESSIONS_RESUMABLE_COLLECTED",
             "reattach": reattach,
             "resume": resume_candidates[:limit],
+            "excluded": excluded_candidates[:50],
             "incompatible": incompatible,
             "resume_truncated": truncated,
+            "excluded_truncated": excluded_truncated,
         }
 
     def set_resumable_session_visibility(
@@ -38206,19 +38219,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         project_id = _project_id(value["project_id"])
         session_id = _required_text(value["session_id"], "session_id")
-        exists = any(
-            str(item.get("project_id") or "") == project_id
-            and str(
-                item.get("universe_session_id") or item.get("session_id") or ""
-            ) == session_id
-            for item in self.list_project_anchor_sessions(project_id)["sessions"]
-        )
-        if not exists:
-            raise UniverseError(
-                "RESUMABLE_SESSION_NOT_FOUND",
-                "resume-list session does not exist in the project session archive",
-                HTTPStatus.NOT_FOUND,
-            )
+        # Visibility is a harmless durable preference. Validate the attached
+        # project, while allowing one-time import of legacy browser exclusions
+        # whose historical session may no longer be in the compact menu.
+        self.store.get_project(project_id)
         result = self.store.set_resumable_session_visibility(
             project_id,
             session_id,
