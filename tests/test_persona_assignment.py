@@ -29,6 +29,7 @@ import itertools
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 import test_memory_candidates_and_delegations as fixtures
 
 from universe_app.terminal_host import (  # noqa: E402
+    TerminalHost,
+    TerminalHostError,
     native_queue_persona_text,
     persona_delivery_mode,
     persona_delivery_supported,
@@ -605,6 +608,22 @@ class PersonaActionTests(unittest.TestCase):
         reassigned = persona_native_queue_message_id(**values, assignment_revision=8)
         self.assertEqual(first, replay)
         self.assertNotEqual(first, reassigned)
+
+    def test_codex_native_queue_rejects_missing_or_invalid_assignment_message_id(self):
+        host = TerminalHost.__new__(TerminalHost)
+        host.get = Mock(return_value=SimpleNamespace(provider="CODEX"))
+        for message_id in ("", "msg_wrong_namespace", "persona-has spaces"):
+            with self.subTest(message_id=message_id):
+                with self.assertRaises(TerminalHostError) as caught:
+                    host.deliver_persona_native_queue(
+                        "term-test",
+                        '복합 "본문"\n둘째 줄',
+                        message_id=message_id,
+                    )
+                self.assertEqual(
+                    "PERSONA_NATIVE_QUEUE_MESSAGE_ID_INVALID",
+                    caught.exception.code,
+                )
 
     def test_server_records_codex_native_queue_acceptance_separately_from_applied(self):
         persona = self.make_persona(
