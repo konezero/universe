@@ -63,6 +63,10 @@ vm.runInContext(source.slice(source.indexOf("async function resumeRecordedSessio
   assert.equal(source.includes("async function refreshAfterHostTermination(hostId)"), true);
   assert.equal(source.includes("openHosts.has(href)"), true, "server Host-file rows must be filtered against open dock tabs");
   assert.equal(source.includes("openAnchors.has(anchor)"), true, "open Anchors must not reappear as Re-attach rows");
+  assert.equal(source.includes("function joinReattachHost("), false, "UI must not fill missing Host identity from other projections");
+  assert.equal(source.includes("Host binding is incomplete; Re-attach is refused."), true);
+  assert.equal(source.includes("Session binding is incomplete; Resume is refused."), true);
+  assert.equal(source.includes("Host unavailable ·"), true, "invalid Host bindings must remain visible as typed diagnostics");
   assert.equal(source.includes("state.resumableSessionsPromise"), true, "concurrent menu and startup loads must share one request");
   assert.equal(source.includes("Resume \ubaa9\ub85d \ubd88\ub7ec\uc624\ub294 \uc911..."), true, "slow initial loads must render an explicit loading row");
   assert.equal(source.includes("selectTerminalTab(visible[0].terminal_id);\n      return;"), false);

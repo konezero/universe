@@ -2104,92 +2104,24 @@ function hostCompatibilityOk(host) {
   );
 }
 
-function eligibleReattachHosts() {
-  const openHosts = new Set((state.terminals || []).map(hostSessionRefOf).filter(Boolean));
-  const openAnchors = new Set(
-    (state.terminals || [])
-      .map((item) => String(item.session_anchor_ref || item.active_session_anchor_ref || "").trim())
-      .filter(Boolean)
-  );
-  return (state.supervisorHosts || []).filter((host) => {
-    const href = hostSessionRefOf(host);
-    const anchor = String(host.session_anchor_ref || host.anchor_ref || "").trim();
-    return hostRuntimeLive(host)
-      && host.reconnect_eligible === true
-      && hostCompatibilityOk(host)
-      && href
-      && !openHosts.has(href)
-      && !(anchor && openAnchors.has(anchor));
-  });
-}
-
-function reattachHostLabel(host) {
-  const project = String(host.project_id || host.node || "session").trim();
-  const mode = String(host.mode || "").trim().toUpperCase();
-  const provider = String(host.provider || "").trim().toUpperCase();
-  const parts = [project, mode, provider].filter(Boolean);
-  return parts.length ? parts.join(" ") : hostSessionRefOf(host);
-}
-
-function joinReattachHost(host, catalog) {
-  const row = { ...host };
-  const href = hostSessionRefOf(host);
-  const anchor = String(host.session_anchor_ref || host.anchor_ref || "").trim();
-  const match = (catalog || []).find((item) => {
-    if (item.kind === "REATTACH" && hostSessionRefOf(item) === href) return true;
-    return String(item.session_anchor_ref || "").trim() === anchor && Boolean(anchor);
-  });
-  if (match) {
-    row.project_id = row.project_id || match.project_id;
-    row.mode = row.mode || match.mode;
-    row.provider = row.provider || match.provider;
-    row.supervisor_session_id = row.supervisor_session_id || match.supervisor_session_id;
-    row.label = match.label || row.label;
-    row.last_seen_at = row.last_seen_at || match.last_seen_at;
-  }
-  const session = (state.projectAnchorSessions || []).find(
-    (item) => String(item.session_anchor_ref || "").trim() === anchor && Boolean(anchor)
-  );
-  if (session) {
-    row.project_id = row.project_id || session.project_id || session.node;
-    row.mode = row.mode || session.mode;
-    row.provider = row.provider || session.provider;
-    row.supervisor_session_id =
-      row.supervisor_session_id || session.universe_session_id || session.session_id;
-    row.last_seen_at = row.last_seen_at || session.last_seen_at;
-  }
-  const live = (state.supervisorTerminals || []).find(
-    (item) => hostSessionRefOf(item) === href && Boolean(href)
-  );
-  if (live) {
-    row.project_id = row.project_id || live.project_id;
-    row.mode = row.mode || live.mode;
-    row.provider = row.provider || live.provider;
-    row.supervisor_session_id =
-      row.supervisor_session_id || live.supervisor_session_id || live.session_id;
-    row.session_anchor_ref =
-      row.session_anchor_ref || live.session_anchor_ref || live.active_session_anchor_ref;
-  }
-  if (!row.label) row.label = reattachHostLabel(row);
-  return row;
-}
-
+// Re-attach entries come only from the server's exact Host/ledger binding.
+// Other UI projections never fill missing identity fields.
 function currentReattachHosts() {
   const catalog = state.resumableSessions?.reattach || [];
-  const hosts = eligibleReattachHosts().map((host) => joinReattachHost(host, catalog));
-  const seen = new Set(hosts.map(hostSessionRefOf).filter(Boolean));
-  const openHosts = new Set((state.terminals || []).map(hostSessionRefOf).filter(Boolean));
+  const hosts = [];
+  const openHosts = new Set(
+    (state.terminals || []).map((item) => String(item.host_session_ref || "").trim()).filter(Boolean)
+  );
   const openAnchors = new Set(
     (state.terminals || [])
       .map((item) => String(item.session_anchor_ref || item.active_session_anchor_ref || "").trim())
       .filter(Boolean)
   );
   for (const item of catalog) {
-    const href = hostSessionRefOf(item);
-    const anchor = String(item.session_anchor_ref || item.anchor_ref || "").trim();
-    if ((href && (seen.has(href) || openHosts.has(href))) || (anchor && openAnchors.has(anchor))) continue;
+    const href = String(item.host_session_ref || "").trim();
+    const anchor = String(item.session_anchor_ref || "").trim();
+    if ((href && openHosts.has(href)) || (anchor && openAnchors.has(anchor))) continue;
     hosts.push(item);
-    if (href) seen.add(href);
   }
   return hosts;
 }
@@ -2340,7 +2272,8 @@ function renderTerminalNewMenu() {
     item.type = "button";
     item.className = "terminal-new-menu-item";
     item.setAttribute("role", "menuitem");
-    const label = host.label || reattachHostLabel(host);
+    const label = String(host.label || "").trim();
+    if (!label) continue;
     item.textContent = `Re-attach ${label}`;
     item.title = "Live PTY — re-attach immediately";
     item.addEventListener("click", () => {
@@ -2373,6 +2306,15 @@ function renderTerminalNewMenu() {
       loadResumableSessions().then(renderTerminalNewMenu);
     });
     menu.append(retry);
+  }
+  for (const issue of state.resumableSessions?.incompatible || []) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "terminal-new-menu-item";
+    item.disabled = true;
+    item.textContent = `Host unavailable · ${String(issue.label || "Host binding invalid")}`;
+    item.title = String(issue.reason || "HOST_BINDING_INVALID");
+    menu.append(item);
   }
   const visibleSessions = state.resumableSessions?.resume || [];
   const excludedSessions = state.resumableSessions?.excluded || [];
@@ -2488,6 +2430,13 @@ function toggleTerminalNewMenu() {
 
 async function resumeRecordedSession(session) {
   const projectId = String(session.project_id || "").trim();
+  const mode = String(session.mode || "").trim().toUpperCase();
+  const provider = String(session.provider || "").trim().toUpperCase();
+  const sessionId = String(session.session_id || "").trim();
+  const anchorRef = String(session.session_anchor_ref || "").trim();
+  if (!projectId || !mode || !provider || !sessionId || !anchorRef) {
+    throw new Error("Session binding is incomplete; Resume is refused.");
+  }
   const project = (state.projects || []).find((item) => item.project_id === projectId);
   if (!project?.project_root) throw new Error("등록된 프로젝트 경로가 필요합니다");
   await createTerminalTab({ project, nodeId: projectId, mode: session.mode, effort: "AUTO" }, session);
@@ -2497,30 +2446,30 @@ async function resumeRecordedSession(session) {
 }
 
 async function reattachLiveHost(host) {
-  const projectId = String(host.project_id || host.node || "universe").trim() || "universe";
+  const projectId = String(host.project_id || "").trim();
+  const mode = String(host.mode || "").trim().toUpperCase();
+  const provider = String(host.provider || "").trim().toUpperCase();
+  const hostRef = String(host.host_session_ref || "").trim();
+  const anchorRef = String(host.session_anchor_ref || "").trim();
+  const supervisorSessionId = String(host.supervisor_session_id || "").trim();
+  if (!projectId || !mode || !provider || !hostRef || !anchorRef || !supervisorSessionId) {
+    throw new Error("Host binding is incomplete; Re-attach is refused.");
+  }
   const project = (state.projects || []).find(
     (item) => String(item.project_id || "").trim() === projectId
-  ) || { project_id: projectId, project_root: "" };
-  if (!project.project_root) {
-    const universe = (state.projects || []).find(
-      (item) => String(item.project_id || "").trim() === "universe"
-    );
-    if (universe) {
-      project.project_id = project.project_id || universe.project_id;
-      project.project_root = universe.project_root;
-    }
-  }
+  );
+  if (!project?.project_root) throw new Error("The exact Host project is not registered.");
   const session = {
-    host_session_ref: hostSessionRefOf(host),
-    session_anchor_ref: String(host.session_anchor_ref || host.anchor_ref || "").trim(),
-    project_id: project.project_id || projectId,
-    mode: String(host.mode || "MASTER").toUpperCase(),
-    provider: String(host.provider || "AUTO").toUpperCase(),
-    session_id: host.supervisor_session_id || host.session_id,
-    universe_session_id: host.supervisor_session_id || host.session_id,
+    host_session_ref: hostRef,
+    session_anchor_ref: anchorRef,
+    project_id: projectId,
+    mode,
+    provider,
+    session_id: supervisorSessionId,
+    universe_session_id: supervisorSessionId,
   };
   await createTerminalTab(
-    { project, nodeId: project.project_id || projectId, mode: session.mode, modelRef: "", effort: "AUTO" },
+    { project, nodeId: projectId, mode, modelRef: "", effort: "AUTO" },
     session
   );
   await loadResumableSessions();

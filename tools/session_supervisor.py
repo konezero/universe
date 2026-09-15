@@ -2746,7 +2746,14 @@ class SessionSupervisorStore:
                 WHERE provider IN ('CODEX', 'CLAUDE', 'GROK')
                   AND provider_session_ref IS NOT NULL
                   AND TRIM(provider_session_ref) != ''
-                ORDER BY COALESCE(last_seen_at, updated_at) DESC, session_id
+                  AND current_project_id IS NOT NULL
+                  AND TRIM(current_project_id) != ''
+                  AND session_anchor_ref IS NOT NULL
+                  AND TRIM(session_anchor_ref) != ''
+                  AND mode IN ('CONDUCTOR', 'MASTER')
+                  AND last_seen_at IS NOT NULL
+                  AND TRIM(last_seen_at) != ''
+                ORDER BY last_seen_at DESC, session_id
                 """
             ).fetchall()
         return [
@@ -2754,14 +2761,14 @@ class SessionSupervisorStore:
                 "session_id": str(row["session_id"]),
                 "universe_session_id": str(row["session_id"]),
                 "node": str(row["node"]),
-                "project_id": str(row["current_project_id"] or row["node"]),
+                "project_id": str(row["current_project_id"]),
                 "mode": str(row["mode"]),
                 "provider": str(row["provider"]),
                 "provider_session_ref": str(row["provider_session_ref"]),
-                "session_anchor_ref": str(row["session_anchor_ref"] or ""),
+                "session_anchor_ref": str(row["session_anchor_ref"]),
                 "state": str(row["state"]),
                 "currentness": str(row["currentness"]),
-                "last_seen_at": str(row["last_seen_at"] or row["updated_at"] or ""),
+                "last_seen_at": str(row["last_seen_at"]),
             }
             for row in rows
         ]

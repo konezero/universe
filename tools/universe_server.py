@@ -37977,26 +37977,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         hosts = self.terminal_host.list_host_records()
         sessions = self._resumable_host_sessions()
         by_anchor = {
-            str(session.get("session_anchor_ref") or "").strip(): session
+            str(session["session_anchor_ref"]).strip(): session
             for session in sessions
-            if str(session.get("session_anchor_ref") or "").strip()
         }
 
         def _anchor_view(anchor_ref: str) -> dict[str, Any]:
             return dict(by_anchor.get(anchor_ref) or {})
 
-        def _resumable_label(
-            session: Mapping[str, Any], host: Mapping[str, Any] | None = None
-        ) -> str:
-            project_id = str(
-                session.get("project_id") or session.get("node") or ""
-            ).strip()
-            mode = str(session.get("mode") or "").upper()
-            provider = str(
-                (host or {}).get("provider") or session.get("provider") or ""
-            ).upper()
+        def _resume_label(session: Mapping[str, Any]) -> str:
             return " ".join(
-                part for part in (project_id or "session", mode, provider) if part
+                (
+                    str(session["project_id"]).strip(),
+                    str(session["mode"]).strip().upper(),
+                    str(session["provider"]).strip().upper(),
+                )
+            )
+
+        def _reattach_label(session: Mapping[str, Any], host: Mapping[str, Any]) -> str:
+            return " ".join(
+                (
+                    str(session["project_id"]).strip(),
+                    str(host["mode"]).strip().upper(),
+                    str(host["provider"]).strip().upper(),
+                )
             )
 
         reattach: list[dict[str, Any]] = []
@@ -38005,14 +38008,44 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         incompatible_anchors: set[str] = set()
         for host in hosts:
             runtime = str(host.get("runtime_state") or "").upper()
-            compatibility = str(
-                host.get("compatibility") or host.get("host_compatibility") or ""
-            ).upper()
-            href = str(host.get("host_session_ref") or host.get("host_id") or "").strip()
-            anchor = str(
-                host.get("session_anchor_ref") or host.get("anchor_ref") or ""
-            ).strip()
+            compatibility = str(host.get("compatibility") or "").upper()
+            href = str(host.get("host_session_ref") or "").strip()
+            anchor = str(host.get("session_anchor_ref") or "").strip()
             session = _anchor_view(anchor)
+            binding_error = ""
+            if runtime == "LIVE" and (
+                not href
+                or not anchor
+                or not str(host.get("provider") or "").strip()
+                or not str(host.get("mode") or "").strip()
+            ):
+                binding_error = "HOST_DISCOVERY_IDENTITY_INCOMPLETE"
+            elif runtime == "LIVE" and not session:
+                binding_error = "HOST_SESSION_LEDGER_MISSING"
+            elif runtime == "LIVE" and str(host.get("provider") or "").strip() and (
+                str(host.get("provider") or "").strip().upper()
+                != str(session.get("provider") or "").strip().upper()
+            ):
+                binding_error = "HOST_SESSION_PROVIDER_MISMATCH"
+            elif runtime == "LIVE" and str(host.get("mode") or "").strip() and (
+                str(host.get("mode") or "").strip().upper()
+                != str(session.get("mode") or "").strip().upper()
+            ):
+                binding_error = "HOST_SESSION_MODE_MISMATCH"
+            if binding_error:
+                incompatible_anchors.add(anchor)
+                incompatible.append(
+                    {
+                        "kind": "INCOMPATIBLE",
+                        "host_session_ref": href,
+                        "session_anchor_ref": anchor,
+                        "compatibility": "INCOMPATIBLE",
+                        "runtime_state": runtime,
+                        "reason": binding_error,
+                        "label": "Host binding invalid",
+                    }
+                )
+                continue
             if compatibility == "INCOMPATIBLE":
                 if runtime == "LIVE":
                     if anchor:
@@ -38022,17 +38055,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             "kind": "INCOMPATIBLE",
                             "host_session_ref": href,
                             "session_anchor_ref": anchor,
-                            "project_id": str(
-                                session.get("project_id") or session.get("node") or ""
-                            ).strip(),
-                            "mode": str(session.get("mode") or "").upper(),
-                            "provider": str(
-                                host.get("provider") or session.get("provider") or ""
-                            ).upper(),
+                            "project_id": str(session["project_id"]).strip(),
+                            "mode": str(host["mode"]).strip().upper(),
+                            "provider": str(host["provider"]).strip().upper(),
                             "compatibility": compatibility,
                             "runtime_state": runtime,
                             "reason": "런타임 바뀜 — 종료 후 재생성",
-                            "label": _resumable_label(session, host),
+                            "label": _reattach_label(session, host),
                         }
                     )
                 continue
@@ -38044,31 +38073,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if anchor:
                 reattach_anchors.add(anchor)
-            project_id = str(
-                session.get("project_id") or session.get("node") or ""
-            ).strip()
-            mode = str(session.get("mode") or "").upper()
-            provider = str(
-                host.get("provider") or session.get("provider") or ""
-            ).upper()
+            project_id = str(session["project_id"]).strip()
+            mode = str(host["mode"]).strip().upper()
+            provider = str(host["provider"]).strip().upper()
             reattach.append(
                 {
                     "kind": "REATTACH",
                     "host_session_ref": href,
                     "session_anchor_ref": anchor,
-                    "supervisor_session_id": str(
-                        session.get("universe_session_id")
-                        or session.get("session_id")
-                        or ""
-                    ),
+                    "supervisor_session_id": str(session["universe_session_id"]),
                     "project_id": project_id,
                     "mode": mode,
                     "provider": provider,
-                    "last_seen_at": str(session.get("last_seen_at") or ""),
+                    "last_seen_at": str(session["last_seen_at"]),
                     "compatibility": compatibility,
                     "runtime_state": runtime,
                     "reconnect_eligible": True,
-                    "label": _resumable_label(session, host),
+                    "label": _reattach_label(session, host),
                 }
             )
         resume_candidates: list[dict[str, Any]] = []
@@ -38085,14 +38106,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         for original in pool:
             session = dict(original)
-            session_id = str(session.get("universe_session_id") or session.get("session_id") or "").strip()
+            session_id = str(session["universe_session_id"]).strip()
             # Provider identity and Anchor already come from the single Host
             # session ledger; do not re-read project archives per candidate.
-            project_id = str(
-                session.get("project_id") or session.get("node") or ""
-            ).strip()
-            mode = str(session.get("mode") or "").upper()
-            provider = str(session.get("provider") or "").upper()
+            project_id = str(session["project_id"]).strip()
+            mode = str(session["mode"]).strip().upper()
+            provider = str(session["provider"]).strip().upper()
             if project_filter and project_id != project_filter:
                 continue
             if mode_filter and mode != mode_filter:
@@ -38116,8 +38135,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "project_id": project_id,
                 "mode": mode,
                 "provider": provider,
-                "last_seen_at": str(session.get("last_seen_at") or ""),
-                "label": _resumable_label(session),
+                "last_seen_at": str(session["last_seen_at"]),
+                "label": _resume_label(session),
                 "visibility": visibility["visibility"],
                 "visibility_revision": visibility["revision"],
             }

@@ -7566,6 +7566,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "reconnect_eligible": True,
             "compatibility": "CURRENT",
             "provider": "GROK",
+            "mode": "MASTER",
         }
         incompatible_host = {
             "host_session_ref": "host-incompatible",
@@ -7574,6 +7575,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "reconnect_eligible": True,
             "compatibility": "INCOMPATIBLE",
             "provider": "CLAUDE",
+            "mode": "CONDUCTOR",
         }
         terminal_host = Mock()
         terminal_host.list_sessions.return_value = []
@@ -7800,20 +7802,23 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "reconnect_eligible": True,
             "compatibility": "CURRENT",
             "provider": "CODEX",
+            "mode": "MASTER",
         })
         self.assertEqual([], self.server.list_resumable_sessions()["resume"])
         host_records.clear()
         self.assertEqual(1, len(self.server.list_resumable_sessions()["resume"]))
 
-    def test_reattach_row_provider_falls_back_to_host_session_ledger(self) -> None:
-        # After a server restart, the Host file identifies the live Anchor and
-        # the single Host session ledger supplies its provider and coordinates.
+    def test_reattach_requires_exact_host_and_session_ledger_binding(self) -> None:
+        # Host owns the live provider/mode identity. The exact Anchor ledger row
+        # supplies project/session coordinates; neither source fills the other.
         live_host = {
             "host_session_ref": "host-live",
             "session_anchor_ref": "anchor-live",
             "runtime_state": "LIVE",
             "reconnect_eligible": True,
             "compatibility": "CURRENT",
+            "provider": "CODEX",
+            "mode": "MASTER",
         }
         terminal_host = Mock()
         terminal_host.list_host_records.return_value = [live_host]
@@ -7824,6 +7829,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.server._resumable_host_sessions = lambda: [  # type: ignore[method-assign]
             {
                 "session_anchor_ref": "anchor-live",
+                "session_id": "sess-live",
                 "universe_session_id": "sess-live",
                 "project_id": "universe",
                 "mode": "MASTER",
@@ -7845,7 +7851,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("universe MASTER CODEX", row["label"])
         self.assertNotIn("UNKNOWN", row["label"])
 
-    def test_reattach_row_prefers_live_host_provider_over_stale_anchor_provider(self) -> None:
+    def test_reattach_quarantines_host_ledger_identity_conflict(self) -> None:
         live_host = {
             "host_session_ref": "host-live-claude",
             "session_anchor_ref": "anchor-live-claude",
@@ -7853,6 +7859,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "reconnect_eligible": True,
             "compatibility": "CURRENT",
             "provider": "CLAUDE",
+            "mode": "CONDUCTOR",
         }
         terminal_host = Mock()
         terminal_host.list_host_records.return_value = [live_host]
@@ -7874,8 +7881,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
 
         listed = self.server.list_resumable_sessions({"limit": 7})
 
-        self.assertEqual("CLAUDE", listed["reattach"][0]["provider"])
-        self.assertEqual("universe CONDUCTOR CLAUDE", listed["reattach"][0]["label"])
+        self.assertEqual([], listed["reattach"])
+        self.assertEqual("HOST_SESSION_PROVIDER_MISMATCH", listed["incompatible"][0]["reason"])
 
     def test_provider_quota_endpoint_returns_three_rows_and_absorbs_a_sweep(
         self,
