@@ -4798,11 +4798,21 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
         raise UniverseError(
             "MASTER_MESSAGE_METADATA_INVALID", "metadata must be an object"
         )
+    # None (the default, and the only value any caller before 2026-09-15 ever
+    # supplied) keeps the original, unchanged meaning: claimable by ANY live
+    # project Master. A real value narrows this one item to whichever MASTER
+    # currently owns that feature_node -- create_master_message (which has
+    # store access) validates the node exists and derives its current owner;
+    # this function only checks the identifier shape (2026-09-15: node-scoped
+    # Master queue items).
+    raw_node_ref = value.get("node_ref")
+    node_ref = _identifier(raw_node_ref, "node_ref") if raw_node_ref is not None else None
     material = {
         "project_id": project_id,
         "title": title,
         "instruction": instruction,
         "metadata": metadata,
+        "node_ref": node_ref,
     }
     return {
         "schema": PROJECT_MASTER_MESSAGE_SCHEMA,
@@ -4812,6 +4822,11 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
         "title": title,
         "instruction": instruction,
         "metadata": metadata,
+        "node_ref": node_ref,
+        # Stamped by create_master_message from the real current assignment,
+        # never trusted from this request -- see there.
+        "node_owner_session_anchor_ref": None,
+        "node_owner_assignment_revision": None,
         "content_digest": hashlib.sha256(
             _canonical_json(material).encode("utf-8")
         ).hexdigest(),
@@ -23314,6 +23329,31 @@ class UniverseStore:
                     )
                 stored["created_at"] = existing["created_at"]
                 return stored, False
+            if message["node_ref"] is not None:
+                # The server derives the current owner at creation time --
+                # never trusted from the request. A node with no ACTIVE
+                # Master assignment cannot receive node-scoped work (there
+                # would be no eligible claimant at all).
+                node = self.get_feature_node(message["node_ref"])
+                if str(node.get("project_id") or "") != project["project_id"]:
+                    raise UniverseError(
+                        "MASTER_MESSAGE_NODE_PROJECT_MISMATCH",
+                        "node_ref belongs to a different project",
+                        HTTPStatus.CONFLICT,
+                    )
+                owner_row = connection.execute(
+                    "SELECT session_anchor_ref, assignment_revision FROM session_persona_assignment "
+                    "WHERE project_id = ? AND node_ref = ? AND state = 'ACTIVE'",
+                    (project["project_id"], message["node_ref"]),
+                ).fetchone()
+                if owner_row is None:
+                    raise UniverseError(
+                        "MASTER_MESSAGE_NODE_UNASSIGNED",
+                        "node_ref has no ACTIVE Master assignment to own this work item",
+                        HTTPStatus.CONFLICT,
+                    )
+                message["node_owner_session_anchor_ref"] = owner_row["session_anchor_ref"]
+                message["node_owner_assignment_revision"] = int(owner_row["assignment_revision"])
             connection.execute(
                 """
                 INSERT INTO project_master_message(
@@ -23408,6 +23448,43 @@ class UniverseStore:
             ).fetchone()
         return row is not None
 
+    def has_queued_master_message_for(
+        self,
+        project_id: str,
+        node_ref: str | None,
+        assignment_revision: int | None,
+        claimant_anchor: str = "",
+    ) -> bool:
+        """Same eligibility rule claim_master_message's candidate query
+        uses (Anchor identity AND assignment_revision, not revision alone --
+        see claim_master_message's comment on why revision alone is
+        ambiguous across different Anchors), so a wake nudge and a real
+        claimable item always agree -- used to avoid waking a Master that
+        could not actually claim anything (2026-09-15: node-scoped Master
+        queue items)."""
+
+        node_ref_param = node_ref or ""
+        revision_param = assignment_revision if assignment_revision is not None else -1
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM project_master_message
+                WHERE project_id = ?
+                  AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                  AND (
+                    json_extract(message_json, '$.node_ref') IS NULL
+                    OR (
+                      json_extract(message_json, '$.node_ref') = ?
+                      AND json_extract(message_json, '$.node_owner_assignment_revision') = ?
+                      AND json_extract(message_json, '$.node_owner_session_anchor_ref') = ?
+                    )
+                  )
+                LIMIT 1
+                """,
+                (project_id, node_ref_param, revision_param, claimant_anchor),
+            ).fetchone()
+        return row is not None
+
     def claim_master_message(
         self,
         project_id: str,
@@ -23417,6 +23494,8 @@ class UniverseStore:
         terminal_id: str = "",
         message_id: str = "",
         lease_ttl_seconds: int = MASTER_MESSAGE_LEASE_TTL_SECONDS,
+        claimant_node_ref: str | None = None,
+        claimant_assignment_revision: int | None = None,
     ) -> dict[str, Any] | None:
         """Claim the oldest QUEUED item for this project, safe under any
         number of concurrent Master instances racing on the same project's
@@ -23437,19 +23516,69 @@ class UniverseStore:
 
         project = self.get_project(project_id)
         self.reclaim_expired_master_messages(project["project_id"])
+        # A node-scoped item (node_ref set) is eligible only for the EXACT
+        # (Anchor, assignment_revision) pair captured when it was queued --
+        # assignment_revision is a per-Anchor counter (session_anchor_ref is
+        # session_persona_assignment's primary key), so a fresh Anchor newly
+        # assigned to the same node can coincidentally start at the same
+        # revision number a different, older Anchor once had. Matching
+        # revision alone would let a brand-new assignee silently inherit a
+        # predecessor's still-queued item; the owning Anchor identity must
+        # match too. Reassignment or unassignment always changes at least
+        # one of the two (a different anchor entirely, or the same anchor's
+        # revision incrementing), so a stale or wrong claimant can never
+        # match both. A project-wide item (node_ref NULL) keeps its
+        # original meaning: claimable by any live project Master, unnarrowed
+        # (2026-09-15: node-scoped Master queue items).
+        node_ref_param = claimant_node_ref or ""
+        revision_param = (
+            claimant_assignment_revision if claimant_assignment_revision is not None else -1
+        )
         with self._connection() as connection:
-            candidates = connection.execute(
-                """
-                SELECT message_id
-                FROM project_master_message
-                WHERE project_id = ?
-                  AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
-                  AND (? = '' OR message_id = ?)
-                ORDER BY created_at, rowid
-                LIMIT 8
-                """,
-                (project["project_id"], message_id, message_id),
-            ).fetchall()
+            if message_id:
+                # An explicit target must say clearly why it was refused,
+                # not fall through to a misleading "queue is empty".
+                row = connection.execute(
+                    "SELECT message_json FROM project_master_message "
+                    "WHERE project_id = ? AND message_id = ? "
+                    "AND json_extract(message_json, '$.delivery_state') = 'QUEUED'",
+                    (project["project_id"], message_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                stored = json.loads(row["message_json"])
+                stored_node_ref = stored.get("node_ref")
+                if stored_node_ref is not None and (
+                    stored_node_ref != claimant_node_ref
+                    or stored.get("node_owner_assignment_revision") != claimant_assignment_revision
+                    or stored.get("node_owner_session_anchor_ref") != session_anchor_ref
+                ):
+                    raise UniverseError(
+                        "MASTER_MESSAGE_NODE_OWNER_MISMATCH",
+                        "this item is scoped to a different node, a different Master, or a stale assignment revision",
+                        HTTPStatus.CONFLICT,
+                    )
+                candidates = [{"message_id": message_id}]
+            else:
+                candidates = connection.execute(
+                    """
+                    SELECT message_id
+                    FROM project_master_message
+                    WHERE project_id = ?
+                      AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                      AND (
+                        json_extract(message_json, '$.node_ref') IS NULL
+                        OR (
+                          json_extract(message_json, '$.node_ref') = ?
+                          AND json_extract(message_json, '$.node_owner_assignment_revision') = ?
+                          AND json_extract(message_json, '$.node_owner_session_anchor_ref') = ?
+                        )
+                      )
+                    ORDER BY created_at, rowid
+                    LIMIT 8
+                    """,
+                    (project["project_id"], node_ref_param, revision_param, session_anchor_ref),
+                ).fetchall()
         for row in candidates:
             claimed = self._transition_master_message(
                 row["message_id"],
@@ -38729,6 +38858,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
         woken = 0
         for terminal in terminals:
+            terminal_anchor = str(terminal.get("session_anchor_ref") or "")
+            eligible_node_ref: str | None = None
+            eligible_assignment_revision: int | None = None
+            if terminal_anchor:
+                assignment = self.store.read_persona_assignment(terminal_anchor)
+                if (
+                    assignment is not None
+                    and assignment.get("state") == "ACTIVE"
+                    and assignment.get("project_id") == project_id
+                    and assignment.get("node_ref")
+                ):
+                    eligible_node_ref = assignment["node_ref"]
+                    eligible_assignment_revision = assignment["assignment_revision"]
+            # A live Master with no queued item it could actually claim
+            # (its own node, or a project-wide item) is not woken -- this is
+            # exactly the repeated QUEUE_EMPTY wake pattern this closes
+            # (2026-09-15: node-scoped Master queue items).
+            if not self.store.has_queued_master_message_for(
+                project_id, eligible_node_ref, eligible_assignment_revision, terminal_anchor
+            ):
+                continue
             try:
                 delivered = self.session_bus.deliver_to_terminal(
                     host,
@@ -50375,10 +50525,28 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                                for item in owners):
                         raise UniverseError("MASTER_MESSAGE_OWNER_MISMATCH",
                                             "claim owner must match the live project Master binding", 409)
+                # A node-scoped item is eligible only for the exact Master
+                # whose CURRENT assignment names that node at that revision
+                # -- resolved from the durable assignment record, never from
+                # a client-claimed role string or node_ref
+                # (2026-09-15: node-scoped Master queue items).
+                claimant_assignment = self.server.store.read_persona_assignment(owner_anchor)
+                claimant_node_ref = None
+                claimant_assignment_revision = None
+                if (
+                    claimant_assignment is not None
+                    and claimant_assignment.get("state") == "ACTIVE"
+                    and claimant_assignment.get("project_id") == parts[0]
+                    and claimant_assignment.get("node_ref")
+                ):
+                    claimant_node_ref = claimant_assignment["node_ref"]
+                    claimant_assignment_revision = claimant_assignment["assignment_revision"]
                 claimed = self.server.store.claim_master_message(
                     parts[0], provider=provider, session_anchor_ref=owner_anchor,
                     terminal_id=owner_tid,
                     message_id=str((body or {}).get("message_id") or "").strip(),
+                    claimant_node_ref=claimant_node_ref,
+                    claimant_assignment_revision=claimant_assignment_revision,
                 )
                 self._send(
                     HTTPStatus.OK,

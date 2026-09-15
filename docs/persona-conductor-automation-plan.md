@@ -289,6 +289,87 @@ Master·Worker/근거/제안/합의-미합의/다음 행동을 소유 범위와 
 `persona.automation.start`의 공개 catalog 계약에 실제 request_schema(및
 node_ref 필드)를 노출해 사람 UI와 LLM이 같은 계약을 읽게 하는 slice.
 
+## 9. P5 후속 -- 노드 지정 Master 작업 큐 (2026-09-15)
+
+사용자 후속 확정: "큐에 노드도 지정해야겠넹" -> project_id·실제 node_ref·해당
+노드의 Master persona 배정 식별자/revision을 Master 작업 큐(`project_master_message`,
+`create_master_message`/`claim_master_message`)에 결속한다. 8절의 node-scoped
+자동화 소유 모델과 같은 슬라이스의 좁은 보완이며 별도 작업/두 번째 구현
+담당을 만들지 않는다.
+
+**결속**: `create_master_message`가 `node_ref`를 받으면 그 시점의 실제
+`session_persona_assignment`(project_id·node_ref·state=ACTIVE)를 서버가
+조회해 `node_owner_session_anchor_ref`/`node_owner_assignment_revision`을
+메시지에 그대로 새긴다 -- 요청 본문이 아니라 서버가 조회한 값이다. 노드에
+ACTIVE 배정이 없으면 `MASTER_MESSAGE_NODE_UNASSIGNED`로 거부한다.
+
+**claim 경계**: `claim_master_message`는 후보를 "node_ref가 없는 항목(기존
+그대로 아무 live Master나 claim 가능, 좁히지 않음) 또는 claim하는 Anchor의
+**현재** (node_ref, assignment_revision, session_anchor_ref) 3중 일치"로만
+필터한다. preferred_provider/preferred_terminal_id(기존 metadata 필드)는
+선호일 뿐이며 이 검증을 대체하지 않는다. **assignment_revision은 Anchor별
+카운터**(session_persona_assignment의 기본키가 session_anchor_ref)이므로
+새로 배정된 다른 Anchor가 우연히 같은 revision 번호로 시작할 수 있다 --
+1차 구현은 이를 놓쳤다 -- 자체 테스트
+(`test_reassigning_the_node_does_not_transfer_the_old_queued_item`)가 정확히
+이 시나리오를 잡아냈다: 새로 배정된 Anchor의 revision이 예전에 큐 항목에
+새겨진 revision과 숫자만 우연히 같아 잘못 claim될 뻔했음 --
+session_anchor_ref 동일성 검사를 추가해 즉시 수정. explicit message_id claim이 부적격이면
+`MASTER_MESSAGE_NODE_OWNER_MISMATCH`(409)로 명확히 거부하고, 익명
+폴링(message_id 없음)은 그 항목을 조용히 건너뛴다(기존 "다음 것 아무거나"
+의미 보존).
+
+**담당자 변경/해제 이후**: `assign_persona`/`unassign_persona`는 항상
+`assignment_revision`을 증가시키므로, 큐 항목에 새겨진 옛 revision은
+재배정·해제 이후 어떤 Anchor와도(원 소유자 포함) 다시는 3중 일치하지
+않는다 -- 새 담당자가 몰래 이어받거나 원 소유자가 계속 붙잡는 일이 구조적으로
+불가능하다. 이 orphan 항목은 자동으로 취소/재발급되지 않고 QUEUED로 남는다
+-- 명시적 취소/재발급 API는 이번 슬라이스에서 **구현하지 않음**(NOT_RUN,
+아래 참조). 결과/lease provenance는 기존 `owner_session_anchor_ref`/
+`owner_terminal_id`(claim 시점에 새겨짐, 불변)로 이미 원 claim자 신원에
+영구히 묶여 있어 재배정과 무관하게 보존된다 -- 별도 변경 불필요.
+
+**동시 claim**: 새 필터는 기존 `_transition_master_message`의 원자적
+QUEUED→PROCESSING CAS 전환을 그대로 재사용한다 -- 후보를 좁힐 뿐, 실제
+단일 승자 보장은 손대지 않았다.
+
+**알림**: `_wake_live_master_sessions`가 이제 각 live Master 터미널의 실제
+현재 배정을 조회해 그 터미널이 claim할 수 있는 항목이 하나라도 있을 때만
+깨운다(`has_queued_master_message_for`, claim과 동일한 3중 일치 규칙). 이
+세션 자체가 이번 대화 앞부분에서 반복적으로 관찰한 "QUEUE_EMPTY만 반복되는
+빈 깨우기" 패턴의 실제 원인이었다 -- 근본 원인을 여기서 고쳤다.
+
+**하위 호환 경계**: node_ref가 없는 메시지(2026-09-15 이전의 모든 호출자,
+그리고 이후에도 project-wide Conductor 작업)는 의미를 바꾸지 않았다 --
+여전히 아무 live project Master나 claim 가능하다. 과거 큐 항목을 일괄
+재등록하거나 node_ref를 소급 부여하지 않았다.
+
+**구현·검증 상태 (2026-09-15, Claude)**:
+- 구현: `tools/universe_server.py`의 `normalize_master_message`(node_ref
+  형식 검증), `create_master_message`(실 feature_node 존재/프로젝트 일치
+  검증 + 현재 소유 배정 조회·각인), `claim_master_message`(3중 일치 필터,
+  explicit-claim 명시 거부), `has_queued_master_message_for`(신설, claim과
+  동일 규칙), `_wake_live_master_sessions`(터미널별 적격성 확인 후에만
+  깨움).
+- 검증: `tests/test_master_queue_node_scope.py` 11건(실 HTTP, project
+  "TEST") -- 존재하지 않는/미배정 node 거부, 생성 시 소유자/revision 각인,
+  project-wide 항목 하위호환 불변, 올바른 노드 Master claim 성공, 무관한
+  Master의 익명 폴링에 노출 안 됨, 다른 노드 Master의 explicit claim 거부,
+  해제 후 원 소유자도 영구 claim 불가, **재배정 후 새 소유자도 옛 항목을
+  이어받지 않음(자체 발견한 revision-번호-우연일치 버그를 여기서 수정)**,
+  동일 항목 2차 claim은 빈 큐, wake 적격성 계산이 claim 규칙과 정확히
+  일치. 회귀: `tests/test_universe_server.py`의 master_message/master_queue
+  관련 11건 전부 PASS.
+- **NOT_RUN**: (1) 명시적 재배정/취소/재발급 API(orphan 항목을 사람/LLM이
+  다시 살리거나 취소하는 공개 Action) -- 이번엔 "몰래 이어받지 않는다"는
+  안전 속성만 구조적으로 보장했고, 편의 재발급 경로는 만들지 않음. (2)
+  공개 catalog(사람 UI/LLM)에 master-messages 생성/claim의 실제
+  request_schema·node_ref·오류·wait-reason 노출 -- 아직 레거시 HTTP
+  라우트 그대로이며 todo.bind_goal류의 typed Action 계약으로 옮기지
+  않음. (3) UI에 노드별 대기 항목/담당 Master/거부 사유 표시 -- UI 코드
+  변경 없음. (4) 이 후속 자체를 별도 완료/새 자동화 실행으로 취급하지
+  않음 -- 8절 P5 WORK(msg_f79d24d707e76d1d)의 최종 결과에 합쳐 보고한다.
+
 The actual bounded P4 evidence is now under
 `.ai/runtime/tmp/dispatch-14eb816e105931ed/p4-actual-master-review-result.json`.
 It uses a fresh isolated server and a real Codex `gpt-5.6-luna` Master turn:
