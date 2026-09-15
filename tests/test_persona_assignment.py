@@ -584,7 +584,8 @@ class PersonaActionTests(unittest.TestCase):
     def test_codex_native_queue_mode_and_frame_preserve_exact_body(self):
         text = '  첫 줄\n둘째 "quoted" 😀\\path  \r\n'
         self.assertEqual("NATIVE_QUEUE", persona_delivery_mode("CODEX", text)[0])
-        framed = native_queue_persona_text(text)
+        framed = native_queue_persona_text(text, message_id="persona-abc123")
+        self.assertIn("Persona delivery message id: persona-abc123", framed)
         self.assertIn("--- PERSONA BODY BEGIN ---\n" + text + "\n--- PERSONA BODY END ---", framed)
         body = framed.split("--- PERSONA BODY BEGIN ---\n", 1)[1].rsplit("\n--- PERSONA BODY END ---", 1)[0]
         self.assertEqual(text, body)

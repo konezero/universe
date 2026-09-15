@@ -48,6 +48,19 @@ class StopHookTests(unittest.TestCase):
             self.assertEqual("STOPPING",normalize_event(payload,provider,env)["event"])
             payload.update(hook_event_name="UserPromptSubmit",prompt="instruction_ref: session-bus:msg_abc hello")
             self.assertEqual("msg_abc",normalize_event(payload,provider,env)["message_id"])
+            persona_prompt = (
+                "Universe persona assignment context.\n"
+                "Persona delivery message id: persona-abc123\n"
+                "--- PERSONA BODY BEGIN ---\n"
+                "Unicode \"quote\"\nline\n"
+                "--- PERSONA BODY END ---"
+            )
+            persona_event = normalize_event(
+                {"session_id":"s", "hook_event_name":"UserPromptSubmit", "prompt":persona_prompt},
+                "CODEX",
+                {"UNIVERSE_PROVIDER":"CODEX"},
+            )
+            self.assertEqual("persona-abc123", persona_event["message_id"])
             self.assertIsNone(normalize_event({**payload,"agent_id":"child"},provider,env))
         native=normalize_event({"sessionId":"s","hookEventName":"user_prompt_submit"},"GROK",{})
         self.assertEqual("PROMPT_SUBMITTED",native["event"])

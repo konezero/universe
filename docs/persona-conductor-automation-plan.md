@@ -85,6 +85,14 @@ the user-level queue, never a developer/system instruction or permission grant.
 GROK remains unsupported for those complex bodies, and no real Grok call is
 made while quota is constrained.
 
+For exact CODEX queue correlation, the native frame also carries a deterministic
+`persona-<sha256>` message marker. The Host `UserPromptSubmit` observation
+extracts that marker, and the server CAS promotes the assignment only when the
+same message, Persona revision, assignment revision, and Session Anchor reach
+`PROMPT_SUBMITTED` or `STARTED`; `NATIVE_QUEUED` remains pending. This marker
+is lifecycle correlation evidence only and does not assert Persona content
+compliance.
+
 ### P2 — 전용 컨덕터와 지속 실행 제어
 
 TODO `todo_persona_automation_run_20260914`; P1에 의존.

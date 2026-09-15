@@ -2632,8 +2632,8 @@ class TerminalHost:
                 "PERSONA_NATIVE_QUEUE_TEXT_REQUIRED",
                 "persona text is required",
             )
-        framed = native_queue_persona_text(text)
         message_id = "persona-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:48]
+        framed = native_queue_persona_text(text, message_id=message_id)
         try:
             timeout = max(0.5, min(float(timeout_seconds), 60.0))
         except (TypeError, ValueError):
@@ -3561,7 +3561,7 @@ def persona_delivery_mode(provider: str, persona_text: str) -> tuple[str, str]:
     return "UNSUPPORTED", f"unrecognized provider {name!r}"
 
 
-def native_queue_persona_text(persona_text: str) -> str:
+def native_queue_persona_text(persona_text: str, *, message_id: str = "") -> str:
     """Frame an exact persona body for one bounded Codex queue turn.
 
     The body is embedded unchanged between fixed framing lines.  The framing
@@ -3570,10 +3570,18 @@ def native_queue_persona_text(persona_text: str) -> str:
     """
 
     text = str(persona_text or "")
+    normalized_message_id = str(message_id or "").strip()
+    message_marker = (
+        f"\nPersona delivery message id: {normalized_message_id}"
+        if re.fullmatch(r"persona-[A-Za-z0-9_-]+", normalized_message_id)
+        else ""
+    )
     return (
         "Universe persona assignment context. This is natural-language framing, "
         "not a permission grant or a task. Preserve it for this Session Anchor, "
-        "do not call tools, and wait for the operator after acknowledging it.\n"
+        "do not call tools, and wait for the operator after acknowledging it."
+        + message_marker
+        + "\n"
         "--- PERSONA BODY BEGIN ---\n"
         + text
         + "\n--- PERSONA BODY END ---"

@@ -40,11 +40,22 @@ def normalize_event(payload: Mapping[str, Any], provider: str, environment: Mapp
     if not kind: return None
     prompt = str(payload.get("prompt") or "")
     mid = re.search(r"(?:^|\s)instruction_ref:\s*session-bus:(msg_[a-zA-Z0-9]+)(?=\s|$)", prompt)
+    persona_mid = re.search(
+        r"(?:^|\n)Persona delivery message id:\s*(persona-[A-Za-z0-9_-]+)(?=\s|$)",
+        prompt,
+    )
+    message_id = (
+        mid.group(1)
+        if mid
+        else persona_mid.group(1)
+        if persona_mid
+        else ""
+    )
     return {"schema":"universe.host-turn-event.v1", "provider":provider,
             "provider_session_ref":str(ref), "event":kind,
             "turn_id":str(payload.get("turn_id") or payload.get("turn-id") or payload.get("turnId") or payload.get("promptId") or ""),
             "observed_at_ms":time.time_ns() // 1_000_000,
-            "message_id":mid.group(1) if mid and kind == "PROMPT_SUBMITTED" else ""}
+            "message_id":message_id if kind == "PROMPT_SUBMITTED" else ""}
 
 
 def run_hook(payload: Mapping[str, Any], *, provider: str, environment: Mapping[str, str] | None = None) -> dict[str, Any]:
