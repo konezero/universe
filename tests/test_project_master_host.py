@@ -1443,51 +1443,68 @@ class ProjectMasterHostTests(unittest.TestCase):
         self.assertEqual(1, len(continuity.dirty_ends))
         self.assertIn("GROK_REPLY_FAILED", continuity.dirty_ends[0]["reason"])
 
-    def test_resident_mode_session_checkpoints_quota_without_replacing_session(
+    def test_each_resident_provider_checkpoints_quota_without_replacing_session(
         self,
     ) -> None:
-        continuity = FakeContinuityCoordinator()
+        for provider_name in ("CLAUDE", "CODEX", "GROK"):
+            with self.subTest(provider=provider_name):
+                continuity = FakeContinuityCoordinator()
 
-        class QuotaProvider(PreparedFakeProvider):
-            def reply(self, message: Mapping[str, Any]) -> str:
-                raise ProjectMasterHostError("CLAUDE_QUOTA_EXHAUSTED")
+                class QuotaProvider(PreparedFakeProvider):
+                    def reply(self, message: Mapping[str, Any]) -> str:
+                        raise ProjectMasterHostError(
+                            f"{provider_name}_QUOTA_EXHAUSTED"
+                        )
 
-            def runtime_observation(self) -> dict[str, Any]:
-                return {
-                    "schema": "universe.provider-runtime-observation.v1",
-                    "provider": "CLAUDE",
-                    "session_ref": self.session_ref,
-                    "state": "QUOTA_EXHAUSTED",
-                    "quota_state": "EXHAUSTED",
-                    "usage": {"input_tokens": 12, "output_tokens": 3},
-                }
+                    def runtime_observation(self) -> dict[str, Any]:
+                        return {
+                            "schema": "universe.provider-runtime-observation.v1",
+                            "provider": provider_name,
+                            "session_ref": self.session_ref,
+                            "state": "QUOTA_EXHAUSTED",
+                            "quota_state": "EXHAUSTED",
+                            "usage": {"input_tokens": 12, "output_tokens": 3},
+                        }
 
-        provider = QuotaProvider()
-        host = ResidentModeSessionHost(
-            self.root,
-            "CONDUCTOR",
-            "CONDUCTOR",
-            self.root / "conductor-quota.sqlite",
-            actor_label="Universe Conductor",
-            continuity_coordinator=continuity,
-            provider_factory=lambda *_args: provider,
-        )
-        try:
-            with self.assertRaisesRegex(ProjectMasterHostError, "QUOTA_EXHAUSTED"):
-                host.reply("CLAUDE", self._envelope()["message"])
-            self.assertIs(provider, host._provider)
-            self.assertFalse(provider.closed)
-            self.assertEqual("EXHAUSTED", host.status()["runtime_observation"]["quota_state"])
-        finally:
-            host.close()
-        quota_saves = [
-            item for item in continuity.saves if item["trigger"] == "PROVIDER_QUOTA"
-        ]
-        self.assertEqual(1, len(quota_saves))
-        saved_context = json.loads(quota_saves[0]["compressed_context"])
-        self.assertEqual("fake-provider:actual-session", saved_context["provider_session_ref"])
-        self.assertEqual("EXHAUSTED", saved_context["quota_state"])
-        self.assertEqual([], continuity.dirty_ends)
+                provider = QuotaProvider()
+                host = ResidentModeSessionHost(
+                    self.root,
+                    "CONDUCTOR",
+                    "CONDUCTOR",
+                    self.root / f"conductor-{provider_name.lower()}-quota.sqlite",
+                    actor_label="Universe Conductor",
+                    continuity_coordinator=continuity,
+                    provider_factory=lambda *_args: provider,
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        ProjectMasterHostError, "QUOTA_EXHAUSTED"
+                    ):
+                        host.reply(provider_name, self._envelope()["message"])
+                    self.assertIs(provider, host._provider)
+                    self.assertFalse(provider.closed)
+                    self.assertEqual(
+                        "EXHAUSTED",
+                        host.status()["runtime_observation"]["quota_state"],
+                    )
+                finally:
+                    host.close()
+                quota_saves = [
+                    item
+                    for item in continuity.saves
+                    if item["trigger"] == "PROVIDER_QUOTA"
+                ]
+                self.assertEqual(1, len(quota_saves))
+                saved_context = json.loads(
+                    quota_saves[0]["compressed_context"]
+                )
+                self.assertEqual(
+                    "fake-provider:actual-session",
+                    saved_context["provider_session_ref"],
+                )
+                self.assertEqual(provider_name, saved_context["provider"])
+                self.assertEqual("EXHAUSTED", saved_context["quota_state"])
+                self.assertEqual([], continuity.dirty_ends)
 
     def test_resident_mode_session_restores_last_coordinate_after_restart(self) -> None:
         serial = {"value": 0}

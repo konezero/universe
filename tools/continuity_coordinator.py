@@ -21,6 +21,8 @@ AUTO_SAVE_TRIGGERS = frozenset(
         "NORMAL_STOP",
         "PROVIDER_SWITCH",
         "SESSION_SELECTION_CHANGED",
+        "NEW_SESSION",
+        "PROVIDER_PROFILE_CHANGED",
         "MODE_SWITCH",
         "PROVIDER_QUOTA",
         "IDLE",

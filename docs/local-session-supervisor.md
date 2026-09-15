@@ -117,7 +117,8 @@ alternative sessions remain visible.
 
 Automatic continuity saves are project-local and target each project's
 `.ai/runtime/continuity/continuity.sqlite`. Triggers are bounded idle, normal
-stop, provider or Mode switch, provider quota exhaustion, and completed work.
+stop, provider or Mode switch, explicit new-session selection, provider-session
+selection or profile change, provider quota exhaustion, and completed work.
 Saves are debounced and idempotent across process restarts. A quota stop keeps
 the resident session and active Task Frame available for retry and does not
 claim a dirty end. Crash handling records dirty-end evidence and preserves the

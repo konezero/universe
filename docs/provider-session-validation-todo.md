@@ -73,11 +73,32 @@ config path for one final cleanup attempt during close.
 
 ## P2 - long-running Provider recovery probes
 
-- [ ] Exhaust or simulate each Provider's bounded quota in a controlled account.
+- [x] Exhaust or simulate each Provider's bounded quota in a controlled account.
 - [ ] Restart Universe and prove the same Node/Mode session coordinate and Task
   Frame are selected after reset.
-- [ ] Verify retry, explicit Provider rebinding, and user cancellation remain
+- [x] Verify retry, explicit Provider rebinding, and user cancellation remain
   distinct audit outcomes.
+
+On 2026-09-16 the controlled quota regression was expanded across Claude,
+Codex and Grok. Each Provider records `PROVIDER_QUOTA`, retains its resident
+adapter and exact provider-session reference, and does not create a dirty end.
+The same suite keeps retry (`COMPLETE` after explicit re-registration), explicit
+provider replacement (`REPLACED`), and user cancellation (`CANCELLED`) as
+separate durable outcomes. The continuity allow-list now also accepts the
+already-emitted `NEW_SESSION` and `PROVIDER_PROFILE_CHANGED` triggers, instead
+of silently dropping those two explicit rebind reasons; a regression asserts
+all four provider-rebinding triggers remain distinct.
+
+A governed live Web restart (`provider-p2-recovery-restart-20260916`) completed
+from PID 34640 to PID 36336 while preserving the PTY Supervisor. The Conductor,
+Claude Master, Codex Master and Grok Master retained their exact live Session
+Anchor, Host and provider-session coordinates. Evidence is stored at
+`.ai/runtime/tmp/grok-persona-acceptance-20260916/provider-p2-restart-acceptance.json`.
+No active Task Frame coordinate is exposed by the current terminal or
+Supervisor projection, so that restart does not complete the remaining Task
+Frame clause. One controlled restart with an actually active Task Frame remains
+required; it must be observed from the Task Frame's authoritative runtime store,
+not inferred from an unchanged terminal.
 
 ## Deferred boundary
 

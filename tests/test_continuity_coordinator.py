@@ -133,6 +133,27 @@ class ProjectContinuityCoordinatorTests(unittest.TestCase):
         self.assertEqual("AUTO_CONTINUITY_ALREADY_SAVED", second["status"])
         self.assertEqual(1, len(self.backend.calls))
 
+    def test_provider_rebinding_triggers_remain_distinct_durable_outcomes(self) -> None:
+        self.write_coordinates()
+        for trigger in (
+            "PROVIDER_SWITCH",
+            "SESSION_SELECTION_CHANGED",
+            "NEW_SESSION",
+            "PROVIDER_PROFILE_CHANGED",
+        ):
+            with self.subTest(trigger=trigger):
+                result = self.coordinator.save(
+                    project_root=self.root,
+                    trigger=trigger,
+                    compressed_context=f"Bounded transition {trigger}",
+                )
+                self.assertEqual("AUTO_CONTINUITY_SAVED", result["status"])
+                self.assertEqual(trigger, result["trigger"])
+                self.assertEqual(
+                    trigger,
+                    self.coordinator.status(self.root)["last_trigger"],
+                )
+
     def test_flush_trigger_does_not_duplicate_identical_bounded_state(self) -> None:
         self.write_coordinates()
         values = {
