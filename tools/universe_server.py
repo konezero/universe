@@ -8072,6 +8072,19 @@ class UniverseStore:
                 "queued_assignment_revision": "INTEGER",
                 "applied_phase": "TEXT",
                 "applied_message_id": "TEXT",
+                # Both of these were only ever in CREATE TABLE IF NOT EXISTS,
+                # never in this additive migration loop -- a database created
+                # before either column existed in the CREATE TABLE never
+                # gained them, so every read of row["applied_assignment_
+                # revision"] / row["unsupported_at"] raised IndexError on
+                # that database (2026-09-15 live crash: persona.assignments-
+                # list dropped the connection outright rather than returning
+                # a typed error). Additive and nullable, same as the others.
+                "applied_assignment_revision": "INTEGER",
+                "unsupported_at": "TEXT",
+                "unsupported_terminal_id": "TEXT",
+                "unsupported_provider": "TEXT",
+                "unsupported_reason": "TEXT",
                 # NULL = project-wide scope (the existing CONDUCTOR path,
                 # unchanged). A non-NULL value is a real feature_node's
                 # feature_id, checked against that project at assign time
@@ -52096,6 +52109,26 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     "status": "ERROR",
                     "error_code": "SERVICE_FAILURE",
                     "detail": str(error),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - an uncaught application
+            # bug (e.g. a sqlite3.Row indexed by a column a stale database
+            # never migrated -- IndexError, not sqlite3.Error) must still
+            # produce an HTTP response. Without this, do_POST returns by
+            # raising, no bytes were ever written, and the client sees the
+            # connection close with no response at all -- indistinguishable
+            # from a network failure (2026-09-15 live incident: persona.
+            # assignments-list). Never substitutes another store or masks
+            # the failure -- it is surfaced as a typed 500, same shape as
+            # the sqlite3.Error branch above, with the real exception type
+            # in the detail for diagnosis.
+            self._send(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "ERROR",
+                    "error_code": "SERVICE_FAILURE",
+                    "detail": f"{type(error).__name__}: {error}",
                 },
             )
 
