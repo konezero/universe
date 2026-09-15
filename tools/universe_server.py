@@ -317,6 +317,7 @@ from universe_app.terminal_host import (
     TerminalHostError,
     persona_delivery_mode,
     persona_delivery_supported,
+    persona_native_queue_message_id,
     scan_managed_shell_identities,
 )
 from universe_app.terminal_ws import pump_terminal_socket, websocket_accept_key
@@ -40113,8 +40114,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             "PERSONA_NATIVE_QUEUE_UNAVAILABLE",
                             "the configured Terminal Host has no native Codex queue adapter",
                         )
+                    persona_message_id = persona_native_queue_message_id(
+                        persona_prompt,
+                        session_anchor_ref=spawn_anchor_ref,
+                        persona_id=persona_resolution[1]["persona_id"],
+                        persona_revision=persona_resolution[1]["persona_revision"],
+                        assignment_revision=persona_resolution[1]["assignment_revision"],
+                    )
                     queue_result = deliver_persona(
-                        terminal.get("terminal_id", ""), persona_prompt
+                        terminal.get("terminal_id", ""),
+                        persona_prompt,
+                        message_id=persona_message_id,
                     )
                     delivery_receipt = queue_result.get("delivery") or {}
                     queued_message_id = str(

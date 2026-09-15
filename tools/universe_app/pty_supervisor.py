@@ -682,6 +682,7 @@ class SupervisedTerminalHost:
         terminal_id: str,
         persona_text: str,
         *,
+        message_id: str,
         timeout_seconds: float = 20.0,
     ) -> dict[str, Any]:
         """Deliver one exact Codex persona through the supervisor-owned Host.
@@ -701,6 +702,7 @@ class SupervisedTerminalHost:
             f"/v1/terminals/{quote(terminal_id, safe='')}/persona-native-queue",
             payload={
                 "persona_text": str(persona_text),
+                "message_id": str(message_id),
                 "timeout_seconds": bounded_timeout,
             },
             # The Host waits once for binding and once for the native queue

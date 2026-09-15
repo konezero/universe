@@ -2608,6 +2608,7 @@ class TerminalHost:
         terminal_id: str,
         persona_text: str,
         *,
+        message_id: str,
         timeout_seconds: float = 20.0,
     ) -> dict[str, Any]:
         """Deliver one exact Codex persona body through the authenticated Host queue.
@@ -2632,7 +2633,12 @@ class TerminalHost:
                 "PERSONA_NATIVE_QUEUE_TEXT_REQUIRED",
                 "persona text is required",
             )
-        message_id = "persona-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:48]
+        message_id = str(message_id or "").strip()
+        if re.fullmatch(r"persona-[A-Za-z0-9_-]+", message_id) is None:
+            raise TerminalHostError(
+                "PERSONA_NATIVE_QUEUE_MESSAGE_ID_INVALID",
+                "an assignment-bound persona message_id is required",
+            )
         framed = native_queue_persona_text(text, message_id=message_id)
         try:
             timeout = max(0.5, min(float(timeout_seconds), 60.0))
@@ -3586,6 +3592,33 @@ def native_queue_persona_text(persona_text: str, *, message_id: str = "") -> str
         + text
         + "\n--- PERSONA BODY END ---"
     )
+
+
+def persona_native_queue_message_id(
+    persona_text: str,
+    *,
+    session_anchor_ref: str,
+    persona_id: str,
+    persona_revision: int,
+    assignment_revision: int,
+) -> str:
+    """Return the durable Host message id for one exact assignment revision."""
+
+    material = json.dumps(
+        {
+            "session_anchor_ref": str(session_anchor_ref or "").strip(),
+            "persona_id": str(persona_id or "").strip(),
+            "persona_revision": int(persona_revision),
+            "assignment_revision": int(assignment_revision),
+            "persona_sha256": hashlib.sha256(
+                str(persona_text or "").encode("utf-8")
+            ).hexdigest(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "persona-" + hashlib.sha256(material).hexdigest()[:48]
 
 
 def _write_persona_prompt_cache_file(persona_text: str) -> Path:

@@ -868,6 +868,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = supervisor.host.deliver_persona_native_queue(
                     terminal_id,
                     str(body.get("persona_text") or ""),
+                    message_id=str(body.get("message_id") or ""),
                     timeout_seconds=body.get("timeout_seconds", 20.0),
                 )
             except TerminalHostError as error:

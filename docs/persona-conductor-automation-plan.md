@@ -86,7 +86,10 @@ GROK remains unsupported for those complex bodies, and no real Grok call is
 made while quota is constrained.
 
 For exact CODEX queue correlation, the native frame also carries a deterministic
-`persona-<sha256>` message marker. The Host `UserPromptSubmit` observation
+`persona-<sha256>` message marker bound to the Session Anchor, Persona revision,
+assignment revision, and exact body digest. Reassigning the same Persona body
+therefore creates a different Host message while an exact retry reuses the same
+one. The Host `UserPromptSubmit` observation
 extracts that marker, and the server CAS promotes the assignment only when the
 same message, Persona revision, assignment revision, and Session Anchor reach
 `PROMPT_SUBMITTED` or `STARTED`; `NATIVE_QUEUED` remains pending. This marker

@@ -40,6 +40,7 @@ from universe_app.terminal_host import (  # noqa: E402
     native_queue_persona_text,
     persona_delivery_mode,
     persona_delivery_supported,
+    persona_native_queue_message_id,
     startup_argv,
 )
 
@@ -592,6 +593,19 @@ class PersonaActionTests(unittest.TestCase):
         self.assertEqual("INLINE_FILE", persona_delivery_mode("CLAUDE", text)[0])
         self.assertEqual("UNSUPPORTED", persona_delivery_mode("GROK", text)[0])
 
+    def test_codex_native_queue_message_id_is_bound_to_assignment_revision(self):
+        values = {
+            "persona_text": '동일한 "본문"\n두 번째 줄',
+            "session_anchor_ref": "session_anchor_same",
+            "persona_id": "persona_same",
+            "persona_revision": 3,
+        }
+        first = persona_native_queue_message_id(**values, assignment_revision=7)
+        replay = persona_native_queue_message_id(**values, assignment_revision=7)
+        reassigned = persona_native_queue_message_id(**values, assignment_revision=8)
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first, reassigned)
+
     def test_server_records_codex_native_queue_acceptance_separately_from_applied(self):
         persona = self.make_persona(
             "Codex native queue",
@@ -612,6 +626,13 @@ class PersonaActionTests(unittest.TestCase):
             "persona_id": persona["persona_id"],
             "expected_persona_revision": 1,
         })
+        expected_message_id = persona_native_queue_message_id(
+            persona["body"],
+            session_anchor_ref=anchor,
+            persona_id=persona["persona_id"],
+            persona_revision=1,
+            assignment_revision=assigned["assignment"]["assignment_revision"],
+        )
 
         fake_host = Mock()
         fake_host.find_live.return_value = None
@@ -623,10 +644,10 @@ class PersonaActionTests(unittest.TestCase):
         }
         fake_host.deliver_persona_native_queue.return_value = {
             "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
-            "message_id": "persona-test-native",
+            "message_id": expected_message_id,
             "persona_sha256": "digest",
             "delivery": {
-                "message_id": "persona-test-native",
+                "message_id": expected_message_id,
                 "phase": "NATIVE_QUEUED",
                 "queued_submission_id": "queued-submission-test",
             },
@@ -650,12 +671,14 @@ class PersonaActionTests(unittest.TestCase):
             created["terminal"]["persona_delivery"]["application"],
         )
         fake_host.deliver_persona_native_queue.assert_called_once_with(
-            "term_persona_native_queue", persona["body"]
+            "term_persona_native_queue",
+            persona["body"],
+            message_id=expected_message_id,
         )
         after = self.server.store.read_persona_assignment(anchor)
         self.assertIsNone(after["applied_at"], "queue receipt is not provider application")
         self.assertEqual("NATIVE_QUEUED", after["delivery_status"])
-        self.assertEqual("persona-test-native", after["queued_message_id"])
+        self.assertEqual(expected_message_id, after["queued_message_id"])
         self.assertEqual("queued-submission-test", after["queued_submission_id"])
         self.assertIsNone(after["unsupported_at"])
         self.assertEqual(assigned["assignment"]["assignment_revision"], after["queued_assignment_revision"])
@@ -681,7 +704,7 @@ class PersonaActionTests(unittest.TestCase):
                 1,
                 assigned["assignment"]["assignment_revision"],
                 phase="PROMPT_SUBMITTED",
-                message_id="persona-test-native",
+                message_id=expected_message_id,
             )
         )
         applied = self.server.store.read_persona_assignment(anchor)
