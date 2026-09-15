@@ -214,24 +214,46 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(201, status_b, started_b)
         self.assertNotEqual(started_a["run"]["run_id"], started_b["run"]["run_id"])
 
-    def test_same_node_rejects_a_second_concurrent_run(self):
+    def test_same_node_cannot_be_assigned_to_a_second_master(self):
+        # 2026-09-15 follow-up (Conductor review of the queue slice): node
+        # ownership is exclusive at the assignment layer itself now (a
+        # partial unique index on session_persona_assignment), not merely
+        # "only one automation run" -- two different Masters can no longer
+        # both hold an ACTIVE assignment on the same node at all.
         persona = self.make_persona()
         node_ref = self.make_feature_node("same-node-conflict")
         anchor_1 = self.register("MASTER", "node-master-same-node-1")
         anchor_2 = self.register("MASTER", "node-master-same-node-2")
-        for anchor in (anchor_1, anchor_2):
-            status, assigned = self.act("persona.assign", {
-                "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
-                "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
-                "node_ref": node_ref,
-            })
-            self.assertEqual(200, status, assigned)
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor_1, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
+        status, rejected = self.act("persona.assign", {
+            "session_anchor_ref": anchor_2, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED", rejected["error_code"])
+
+    def test_same_node_rejects_a_second_concurrent_run(self):
+        persona = self.make_persona()
+        node_ref = self.make_feature_node("same-node-run-conflict")
+        anchor = self.register("MASTER", "node-master-same-node-run")
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
         status1, started1 = self.act("persona.automation.start", {
-            "project_id": "TEST", "session_anchor_ref": anchor_1, "scope": "first", "instruction": "first",
+            "project_id": "TEST", "session_anchor_ref": anchor, "scope": "first", "instruction": "first",
         })
         self.assertEqual(201, status1, started1)
         status2, started2 = self.act("persona.automation.start", {
-            "project_id": "TEST", "session_anchor_ref": anchor_2, "scope": "second", "instruction": "second",
+            "project_id": "TEST", "session_anchor_ref": anchor, "scope": "second", "instruction": "second",
         })
         self.assertEqual(409, status2, started2)
         self.assertEqual("PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS", started2["error_code"])
@@ -291,6 +313,68 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(
             own_goal["goal_id"], planned["decision"]["target"]["selection"]["selected_goal_id"]
         )
+
+    def test_dispatch_from_a_node_scoped_run_creates_a_node_scoped_queue_item(self):
+        # 2026-09-15 follow-up (Conductor review): dispatch_work's
+        # message_value never carried node_ref, so a node-scoped run's
+        # actual dispatched work silently fell into the project-wide queue
+        # bucket -- any live Master for the project could claim it, not
+        # just the owning node Master. Fixed in
+        # tools/persona_automation.py::dispatch_work (node_ref copied from
+        # the run's own immutable column, never from the dispatch request).
+        anchor = self.register("MASTER", "node-master-dispatch-node-scoped")
+        persona = self.make_persona()
+        own_node = self.make_feature_node("dispatch-node-scoped")
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": own_node,
+        })
+        self.assertEqual(200, status, assigned)
+        own_goal = self.make_node_goal(own_node, "Dispatch Node Goal")
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor, "scope": "x", "instruction": "x",
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        status, tick = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "dispatch-node-scoped-tick",
+        })
+        self.assertEqual(200, status, tick)
+        status, decided = self.act("persona.automation.decide", {
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "dispatch-node-scoped-decision",
+            "kind": "EXECUTE", "rationale": "bounded node-scoped test work", "evidence_refs": [own_goal["goal_id"]],
+        })
+        self.assertEqual(200, status, decided)
+        status, dispatched = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"], "owner_ref": anchor, "dispatch_id": "dispatch-node-scoped-dispatch",
+            "title": "node scoped bounded task", "instruction": "run the isolated node-scoped check",
+            "completion_conditions": ["result evidence"],
+        })
+        self.assertEqual(201, status, dispatched)
+        message = self.server.store.get_master_message(dispatched["message"]["message_id"])
+        self.assertEqual(own_node, message["node_ref"])
+        self.assertEqual(anchor, message["node_owner_session_anchor_ref"])
+        self.assertEqual(assigned["assignment"]["assignment_revision"], message["node_owner_assignment_revision"])
+        # And it is claimable only by the owning node Master -- an
+        # unrelated Master's anonymous poll must not see it.
+        outsider = self.register("MASTER", "node-master-dispatch-outsider")
+        outsider_status, outsider_result = self.act("persona.automation.status", {"run_id": run["run_id"]})
+        self.assertEqual(200, outsider_status, outsider_result)  # sanity: run itself is readable
+        from unittest.mock import Mock
+        host = Mock()
+        host.list_sessions.return_value = [{
+            "terminal_id": "term-dispatch-outsider", "session_anchor_ref": outsider,
+            "project_id": "TEST", "provider": "CLAUDE", "mode": "MASTER", "state": "LIVE",
+        }]
+        host.get.return_value = host.list_sessions.return_value[0]
+        host.list_hosts.return_value = []
+        self.server.terminal_host = host
+        claim_status, claim_result = self.request("POST", "/v1/projects/TEST/master-messages/claim", {
+            "provider": "CLAUDE", "terminal_id": "term-dispatch-outsider", "session_anchor_ref": outsider,
+        })
+        self.assertEqual(200, claim_status, claim_result)
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claim_result["status"])
 
     # -- regression: the existing project-wide CONDUCTOR path is unchanged -
 

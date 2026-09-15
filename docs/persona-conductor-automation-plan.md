@@ -370,6 +370,158 @@ QUEUED→PROCESSING CAS 전환을 그대로 재사용한다 -- 후보를 좁힐 
   변경 없음. (4) 이 후속 자체를 별도 완료/새 자동화 실행으로 취급하지
   않음 -- 8절 P5 WORK(msg_f79d24d707e76d1d)의 최종 결과에 합쳐 보고한다.
 
+**9절의 정정 (2026-09-15, 같은 날 Conductor 정적 검토 후)**: 위 "동시
+claim: 기존 `_transition_master_message`의 원자적 CAS 재사용" 서술은
+10절에서 대체됐다 -- 실제로는 배정 조회와 실제 전이가 분리돼 있어 그 사이
+경쟁이 가능했다(Conductor가 정확히 지적). 10절이 실제 수정 내용이다.
+
+## 10. P5 후속 결함 보완 + 노드 결속 UI (2026-09-15)
+
+사용자 승인: "오케 진행해 / 그리고 UI상으로 결속하는거 만들어야 한다."
+Conductor의 정적 검토(`.ai/runtime/tmp/node-master-automation-20260915/queue-report-review.json`)가
+지적한 3개 우선 결함을 보완하고, 노드 결속을 실제 사용할 수 있는 UI로
+연결했다. 여전히 Claude 담당, 별도 작업/담당 생성 없음.
+
+### 10.1 결함1 -- dispatch_work가 node_ref를 전달하지 않음
+
+`tools/persona_automation.py::dispatch_work`의 `message_value`에 `node_ref`
+키가 아예 없었다 -- 노드 스코프 run이 실제로 작업을 dispatch하면 그 결과
+큐 항목이 조용히 project-wide bucket으로 빠졌다(9절이 만든 claim 경계
+자체는 맞았지만, 정작 node-scoped run의 실제 산출물은 그 경계를 타지
+않았다). 수정: `message_value["node_ref"] = row["node_ref"]` -- run
+자신의 불변 컬럼에서만 가져오며, dispatch 요청 스키마에는애초에 node_ref
+필드가 없어(`required`/`optional`에 없음) client가 이 값을 넓히거나 다른
+노드를 지정할 수 없다. `create_master_message`는 이 node_ref로 그 시점의
+실제 소유 배정을 독립적으로 다시 조회·검증하므로(9절), run 시작 이후 그
+노드가 재배정됐다면 그 재검증에서 다시 걸러진다. 검증:
+`tests/test_persona_node_master_automation.py::test_dispatch_from_a_node_scoped_run_creates_a_node_scoped_queue_item`
+(실 HTTP로 start→tick→decide→dispatch 전 경로를 실행해 결과 큐 항목의
+node_ref/소유자/revision을 확인하고, 무관한 Master의 익명 폴링에 노출되지
+않음도 함께 확인).
+
+### 10.2 결함2 -- 배정 조회와 claim 전이 사이의 경쟁 (TOCTOU)
+
+기존 설계(9절)는 HTTP 핸들러가 claim 시도 *전에* 별도 쿼리로 claimant의
+현재 배정을 읽어 `claim_master_message`에 넘기고, 그 값을 `claim_master_
+message`가 다시 후보 필터링·전이에 사용했다. 이 두 단계 사이에 재배정/
+해제가 끼어들면 이미 낡은 권한으로 전이가 진행될 수 있었다(Conductor가
+"claimant 배정 조회/후보 조회와 실제 전이가 분리돼 있다"고 정확히 지적).
+
+수정: 소유권 재검증을 실제 원자적 UPDATE의 WHERE 절 자체에 넣었다 --
+`_claim_master_message_atomic`의 UPDATE는 `session_persona_assignment`에
+대한 실시간 `EXISTS` 서브쿼리(claim하는 Anchor 신원으로만 join)를 그
+자리에서 평가하며, 이 하나의 SQL 문이 "여전히 QUEUED인가" + "지금 이
+순간 이 Anchor가 정말 이 노드의 소유자인가"를 함께, 원자적으로 확인한다.
+더 이상 "핸들러가 먼저 배정을 읽고 그 스냅샷을 넘기는" 2단계 구조가 아니다
+-- `claim_master_message`는 `session_anchor_ref`만 받고, 소유권 확인은
+매 후보 선택과 매 실제 전이 시도마다 그 자리에서 새로 이루어진다. 후보
+목록(SELECT)도 같은 `EXISTS` 조건으로 미리 좁히지만, 이는 효율을 위한
+근사 필터일 뿐 -- 진짜 권한 판정은 이 UPDATE 자체다.
+
+자체 결정론적 경쟁 재현 테스트로 입증했다(별도 스레드/프로세스 없이,
+store 메서드를 직접 순서대로 호출해 "배정 해제가 claim 시도 사이에 끼어든
+경우"를 정확히 재현): `test_reassignment_race_is_closed_by_the_atomic_recheck`
+-- eligibility가 존재함을 먼저 확인하고, 그 다음 배정을 해제한 뒤, 미리
+알고 있던 message_id로 claim을 시도하면 `MASTER_MESSAGE_NODE_OWNER_
+MISMATCH`로 거부되고 항목은 QUEUED로 남는다. `_wake_live_master_sessions`
+/ `has_queued_master_message_for`도 같은 live join을 재사용하도록
+단순화했다(더 이상 호출자가 배정을 미리 읽어 넘기지 않는다) --
+`test_reassigned_master_immediately_loses_wake_eligibility_for_the_old_item`.
+
+### 10.3 결함3 -- 노드 소유의 모호성 (동일 노드에 여러 ACTIVE 배정 가능)
+
+`create_master_message`의 소유자 조회는 `fetchone()` 하나였을 뿐, 같은
+(project, node_ref)에 여러 ACTIVE 배정이 동시에 존재할 수 있다는 것을
+막지 않았다 -- 있었다면 어느 것을 "그 노드의 Master"로 볼지 임의였다.
+일반 persona 배정(자연어 페르소나를 임의 세션에 적용하는 P1 기능, 다수
+세션이 각자 페르소나를 가질 수 있음)은 건드리지 않으면서, "노드 담당
+Master의 유일성"만 별도로 강제해야 했다.
+
+수정: `session_persona_assignment(project_id, node_ref)`에 부분 unique
+색인(`WHERE node_ref IS NOT NULL AND state = 'ACTIVE'`)을 추가해 DB
+계층에서 노드당 ACTIVE 배정을 정확히 하나로 강제한다 -- 두 번째
+authoritative 테이블을 만들지 않고 기존 테이블의 제약만 강화했다.
+`assign_persona`는 이 제약을 위반하기 전에 명확한 `PERSONA_ASSIGNMENT_
+NODE_ALREADY_OWNED`(409)로 먼저 거부하며, 재배정은 기존 소유자를 먼저
+명시적으로 `persona.unassign`한 뒤에만 가능하다(임의 가로채기 없음). 이제
+`create_master_message`의 `fetchone()`은 "우연히 하나뿐이라 안전"이 아니라
+"제약상 절대 하나뿐"이 되어 모호성이 구조적으로 사라졌다. MASTER
+mode인지는 이 durable 테이블이 아니라 여전히 live 세션 레지스트리가
+결정하며(기존 경계 보존, `session_record.node`를 재해석하지 않음),
+`_validate_persona_automation_anchor`(8절)가 자동화 시작 시점에 이를
+검증한다. 검증:
+`tests/test_persona_node_master_automation.py::test_same_node_cannot_be_assigned_to_a_second_master`
+(같은 노드에 두 번째 Master를 배정하려 하면 즉시 거부됨을 확인; 기존
+`test_same_node_rejects_a_second_concurrent_run`은 이제 도달 불가능해진
+시나리오였으므로 한 Anchor가 같은 노드에서 run을 두 번 시작하려는
+시나리오로 좁혀 재작성).
+
+### 10.4 노드 결속 UI (`tools/universe_ui/app.js`, Fleet의 Persona 패널 재사용)
+
+`renderPersona()`에 "노드 담당 Master" 섹션을 추가했다. 별도 화면/프로젝트가
+아니라 기존 "세션 배정" 섹션 바로 아래, 같은 fetch(terminals/personas)를
+재사용한다. 프로젝트의 feature_node 목록(`GET /v1/projects/{id}/feature-nodes`,
+기존 레거시 라우트)마다 한 줄로: 현재 담당 Master(있으면 세션 라벨 +
+페르소나 + assignment revision, 없으면 "담당 Master 미배정"), 세션
+선택기(이 프로젝트의 live MASTER 세션만), 페르소나 선택기, "배정"/"다른
+세션으로 변경" 버튼, 담당이 있으면 "해제" 버튼을 보여준다.
+
+- 조작은 전부 기존 typed Action(`persona.assign`/`persona.unassign`,
+  `node_ref` 포함)만 호출한다 -- 사람 UI와 LLM이 완전히 같은 입력으로
+  같은 서버 검증(node/project/Anchor/revision, 10.3의 유일성 제약)을
+  거친다. 새 서버 라우트를 추가하지 않았다.
+- 다른 세션으로 재배정할 때는 UI가 먼저 기존 소유자를 명시적으로
+  `persona.unassign`한 뒤에 새 배정을 시도한다 -- 10.3의 제약을 우회하는
+  임의 탈취가 아니라 명시적 2단계 인계다.
+- 담당 가능한 live MASTER 세션이 이 프로젝트에 없으면 빈 상태 메시지로
+  기존 지원 경로(`session.new`)를 언급한다 -- 이 웹 Fleet UI 안에는 세션
+  생성 진입점이 원래 없었으므로(조사 확인), 새 진입점을 만들지 않고
+  텍스트로 안내했다. 이는 "지원되는 기존 세션 생성 경로를 연결"의 부분
+  이행이다 -- 실제 클릭 가능한 링크는 아니다(NOT_RUN, 아래 참조).
+- 저장된 배정과 Host 동기화 확인 상태는 이번 절 범위 밖이다(10.5).
+
+문법 검증: `node --check tools/universe_ui/app.js` 통과. 이 세션에는
+브라우저 자동화 도구(claude-in-chrome)가 있어 실제 로컬 서버에 대해
+`.artifacts/ui/`에 스크린샷을 남기는 실 브라우저 검증도 수행했다 --
+아래 10.6 참조.
+
+### 10.5 Rust Session/PTY Supervisor Host projection 동기화 -- NOT_RUN
+
+사용자 확정 구조(원 지시 5): Session/PTY Supervisor가 검증된 최신 배정
+projection을 정확한 Rust Host에 전달하고, Host가 자신의 프로젝트/노드/
+배정 ID·버전·활성 상태를 알게 하되 claim·결과의 최종 유효성은 여전히
+UniverseStore가 검사한다. 이는 **이번 슬라이스에서 구현하지 않았다** --
+정확한 경계: 기존 Rust IPC/attach/binding generation 계약(`tools/universe_
+app/terminal_host.py` 경유)에 "노드 배정 projection"이라는 새 메시지
+종류가 없다. 이를 추가하려면 (a) Rust 쪽 바이너리 계약 확장, (b) 격리
+빌드/Host로 새 바이너리 검증, (c) provider ref/mode sealing을 깨지 않는
+방식의 명시적 supported 계약 문서화가 필요하며, 이는 Python 서버 코드
+변경보다 훨씬 큰 별도 작업이다. 미지원 상태를 "동기화 확인 안 됨"으로
+정직하게 유지하는 것이 이번 회차의 실제 이행이며(UI도 이 프로젝션 동기화
+상태를 별도로 표시하지 않는다 -- 저장된 배정 자체는 항상 신뢰할 수 있는
+값을 보여준다), "동기화 성공"으로 꾸미지 않았다.
+
+### 10.6 검증 상태 종합 (2026-09-15, Claude)
+
+- 실 HTTP 단위/통합: `tests/test_master_queue_node_scope.py` 13건(신규
+  2건 포함), `tests/test_persona_node_master_automation.py` 14건(신규
+  2건 포함, 1건 재작성) 전부 PASS. 회귀: `tests/test_persona_assignment.py`
+  (33), `tests/test_persona_automation.py`, `tests/test_universe_action_
+  registry.py`, `tests/test_todo_bind_goal_action.py`,
+  `tests/test_universe_server.py`의 master_message/master_queue 서브셋
+  (11) 전부 PASS(반복 실행으로 안정성 확인).
+- 실 브라우저: 10.6-a(아래, 실제 스크린샷 결과로 갱신).
+- Worker 파일럿(작고 유용한 실 작업 1건 + 결과 검토 1회 + 필요 보완
+  1회): 이번 슬라이스는 여전히 코드/테스트/UI 구현에 집중했다 -- 별도
+  실 Task Frame/Host 경로의 Worker 작업 1건은 **NOT_RUN**으로 남긴다
+  (한도 소진 없음, 다만 시간 배분상 이번 회차에 실행하지 않음).
+- 협의/충돌 프로토콜의 실제 메시지 경로: 여전히 설계만 확정, 구현 없음
+  (8절/9절과 동일한 NOT_RUN).
+- orphan 큐 항목의 명시적 취소/재발급 공개 Action: 여전히 NOT_RUN(9절과
+  동일 -- 안전 속성만 구조적으로 보장, 재발급 편의 경로는 없음).
+- P1은 여전히 IN_PROGRESS/미검증. P1-P4 전체 provider/운영 Host 교체
+  수용을 이 슬라이스로 완료됐다고 주장하지 않는다.
+
 The actual bounded P4 evidence is now under
 `.ai/runtime/tmp/dispatch-14eb816e105931ed/p4-actual-master-review-result.json`.
 It uses a fresh isolated server and a real Codex `gpt-5.6-luna` Master turn:

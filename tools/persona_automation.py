@@ -581,7 +581,18 @@ class PersonaAutomationStore:
             reply_anchor = reply_anchor or str(row["session_anchor_ref"])
             assignment_revision = int(row["revision"]) + 1
             assignment_id = f"persona_assignment:{run_id}:{dispatch_id}"
-            message_value = {"idempotency_key": f"persona-automation:{run_id}:{dispatch_id}", "title": title, "instruction": instruction, "metadata": {"persona_automation_run_id": run_id, "persona_automation_assignment_id": assignment_id, "dispatch_id": dispatch_id, "session_anchor_ref": row["session_anchor_ref"], "persona_id": row["persona_id"], "persona_revision": int(row["persona_revision"]), "completion_conditions": conditions, "reply_anchor_ref": reply_anchor, "reply_terminal_id": reply_terminal, "provider_invocation": "DEFERRED_TO_MASTER_QUEUE"}}
+            # node_ref comes only from the run's own immutable, server-set
+            # column (copied from the owning Anchor's assignment at
+            # start_run) -- dispatch's own request schema has no node_ref
+            # field at all, so a caller cannot widen or redirect scope here.
+            # create_master_message independently re-resolves and stamps
+            # the CURRENT owning assignment for this exact node_ref, so a
+            # node reassigned since the run started is re-verified at
+            # enqueue time, not merely copied forward
+            # (2026-09-15 Conductor review: dispatch_work previously never
+            # passed node_ref, so every node-scoped run's work silently
+            # fell back to the project-wide queue bucket).
+            message_value = {"idempotency_key": f"persona-automation:{run_id}:{dispatch_id}", "title": title, "instruction": instruction, "node_ref": row["node_ref"], "metadata": {"persona_automation_run_id": run_id, "persona_automation_assignment_id": assignment_id, "dispatch_id": dispatch_id, "session_anchor_ref": row["session_anchor_ref"], "persona_id": row["persona_id"], "persona_revision": int(row["persona_revision"]), "completion_conditions": conditions, "reply_anchor_ref": reply_anchor, "reply_terminal_id": reply_terminal, "provider_invocation": "DEFERRED_TO_MASTER_QUEUE"}}
             # The callback is the existing Master queue gateway.  No provider
             # call is made here; delivery and result review remain separate.
             try:

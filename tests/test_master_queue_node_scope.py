@@ -254,6 +254,38 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         self.assertEqual(200, status2, claimed2)
         self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claimed2["status"])
 
+    def test_reassignment_race_is_closed_by_the_atomic_recheck(self):
+        # Deterministic reproduction of the exact race the Conductor
+        # flagged: previously, the HTTP handler resolved the claimant's
+        # assignment BEFORE calling claim_master_message, which then reused
+        # that possibly-stale snapshot for its transition. Here the
+        # assignment is revoked between resolving eligibility and the
+        # actual claim attempt -- calling the store method directly (not
+        # through HTTP) to control that ordering precisely. The atomic
+        # UPDATE's own live EXISTS-subquery must refuse the claim, not the
+        # value observed a moment earlier.
+        anchor = self.register("race-window")
+        node_ref = self.make_feature_node("queue-node-race-window")
+        assignment = self.assign_master_to_node(anchor, node_ref)
+        message, _ = self.queue_message("race-window-msg", node_ref=node_ref)
+        # Confirm eligibility exists right now (what the old design would
+        # have resolved and then trusted for the rest of the call).
+        self.assertTrue(self.server.store.has_queued_master_message_for("TEST", anchor))
+        # Unassign lands "during" the race window, before the claim below.
+        status, unassigned = self.act("persona.unassign", {
+            "session_anchor_ref": anchor, "expected_assignment_revision": assignment["assignment_revision"],
+        })
+        self.assertEqual(200, status, unassigned)
+        with self.assertRaises(Exception) as ctx:
+            self.server.store.claim_master_message(
+                "TEST", provider="CLAUDE", session_anchor_ref=anchor,
+                terminal_id="term-race-window", message_id=message["message_id"],
+            )
+        self.assertEqual("MASTER_MESSAGE_NODE_OWNER_MISMATCH", getattr(ctx.exception, "code", None))
+        # The item must still be QUEUED -- untouched, not silently claimed.
+        current = self.server.store.get_master_message(message["message_id"])
+        self.assertEqual("QUEUED", current["delivery_state"])
+
     # -- wake eligibility (has_queued_master_message_for) -------------------
 
     def test_wake_eligibility_check_matches_claim_eligibility(self):
@@ -261,26 +293,33 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         assignment = self.assign_master_to_node(self.register("wake-eligible"), node_ref)
         self.queue_message("wake-eligibility-msg", node_ref=node_ref)
         self.assertTrue(
-            self.server.store.has_queued_master_message_for(
-                "TEST", node_ref, assignment["assignment_revision"], assignment["session_anchor_ref"]
-            )
+            self.server.store.has_queued_master_message_for("TEST", assignment["session_anchor_ref"])
         )
         self.assertFalse(
-            self.server.store.has_queued_master_message_for(
-                "TEST", node_ref, 999999, assignment["session_anchor_ref"]
-            )
+            # A DIFFERENT Anchor identity, even an unrelated one, must not
+            # see this node's item -- it has no assignment at all here.
+            self.server.store.has_queued_master_message_for("TEST", "some-other-anchor")
         )
         self.assertFalse(
-            # Same node_ref/revision but a DIFFERENT Anchor identity must not
-            # match -- the exact bug a coincidental revision-number
-            # collision across two different Anchors would otherwise cause.
-            self.server.store.has_queued_master_message_for(
-                "TEST", node_ref, assignment["assignment_revision"], "some-other-anchor"
-            )
+            self.server.store.has_queued_master_message_for("TEST", "")
         )
-        self.assertFalse(
-            self.server.store.has_queued_master_message_for("TEST", None, None)
-        )
+
+    def test_reassigned_master_immediately_loses_wake_eligibility_for_the_old_item(self):
+        # Directly exercises the atomic, live re-check (not a value resolved
+        # earlier and passed down) that closes the Conductor-flagged TOCTOU
+        # window: the moment the old owner is unassigned, both wake
+        # eligibility and claim eligibility must reflect that immediately,
+        # with no separate cache or snapshot to go stale.
+        anchor = self.register("live-recheck")
+        node_ref = self.make_feature_node("queue-node-live-recheck")
+        assignment = self.assign_master_to_node(anchor, node_ref)
+        self.queue_message("live-recheck-msg", node_ref=node_ref)
+        self.assertTrue(self.server.store.has_queued_master_message_for("TEST", anchor))
+        status, unassigned = self.act("persona.unassign", {
+            "session_anchor_ref": anchor, "expected_assignment_revision": assignment["assignment_revision"],
+        })
+        self.assertEqual(200, status, unassigned)
+        self.assertFalse(self.server.store.has_queued_master_message_for("TEST", anchor))
 
 
 if __name__ == "__main__":
