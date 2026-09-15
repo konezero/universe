@@ -21,6 +21,8 @@ dist/portable/
 
 # Generated browser test artifacts
 .artifacts/ui/
+.artifacts/*.json
+.artifacts/*.py
 
 # Generated release artifacts
 dist/releases/
