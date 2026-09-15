@@ -37948,6 +37948,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         return scan_managed_shell_identities(Path(__file__).resolve().parents[1])
 
+    def _resumable_host_sessions(self) -> list[dict[str, Any]]:
+        # Online UI reads one Host-owned ledger. Project runtime/session-store
+        # discovery belongs to explicit batch reconciliation, not this request.
+        return self.session_supervisor.list_resume_sessions()
+
     def list_resumable_sessions(
         self, query: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -37966,53 +37971,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "yes",
         }
         expand = bool(project_filter or mode_filter or provider_filter)
-        listed = self.list_cli_terminals()
-        terminals = [item for item in (listed.get("terminals") or [])
-                     if str(item.get("state") or "").upper() == "LIVE"]
-        open_session_ids = {str(item.get("supervisor_session_id") or "").strip()
-                            for item in terminals if item.get("supervisor_session_id")}
-        hosts = listed.get("hosts") or []
-        open_host_refs = {
-            str(
-                item.get("host_session_ref") or item.get("reconnection_host_id") or ""
-            ).strip()
-            for item in terminals
-            if str(
-                item.get("host_session_ref") or item.get("reconnection_host_id") or ""
-            ).strip()
-        }
-        open_anchors = {
-            str(
-                item.get("session_anchor_ref")
-                or item.get("active_session_anchor_ref")
-                or ""
-            ).strip()
-            for item in terminals
-            if str(
-                item.get("session_anchor_ref")
-                or item.get("active_session_anchor_ref")
-                or ""
-            ).strip()
-        }
-        sessions = self.list_all_project_anchor_sessions()
+        # The online Resume menu reads only Host discovery files plus the one
+        # Host session ledger below. Open dock tabs are filtered client-side
+        # from its already loaded terminal state; no terminal refresh belongs here.
+        hosts = self.terminal_host.list_host_records()
+        sessions = self._resumable_host_sessions()
         by_anchor = {
             str(session.get("session_anchor_ref") or "").strip(): session
             for session in sessions
             if str(session.get("session_anchor_ref") or "").strip()
         }
-        # The anchor-session projection can come back without a provider after a
-        # server restart (the live terminal is not re-registered yet). The
-        # managed-shell identity file persists provider/mode/project on disk,
-        # keyed by anchor, so a re-attach row never renders "session MASTER".
-        shell_identities = self._managed_shell_identities()
 
         def _anchor_view(anchor_ref: str) -> dict[str, Any]:
-            view = dict(by_anchor.get(anchor_ref) or {})
-            shell = shell_identities.get(anchor_ref) or {}
-            for field in ("provider", "mode", "project_id", "supervisor_session_id"):
-                if not str(view.get(field) or "").strip() and shell.get(field):
-                    view[field] = shell[field]
-            return view
+            return dict(by_anchor.get(anchor_ref) or {})
 
         def _resumable_label(
             session: Mapping[str, Any], host: Mapping[str, Any] | None = None
@@ -38069,7 +38040,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if compatibility not in {"CURRENT", "COMPATIBLE_OLD"}:
                 continue
-            if not href or href in open_host_refs:
+            if not href:
                 continue
             if anchor:
                 reattach_anchors.add(anchor)
@@ -38115,24 +38086,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for original in pool:
             session = dict(original)
             session_id = str(session.get("universe_session_id") or session.get("session_id") or "").strip()
-            if session_id in open_session_ids:
-                continue
-            # Provider identity survives Host death in the Supervisor session
-            # ledger. Join only the exact session and matching project/mode.
-            try:
-                supervised = self.session_supervisor.get_session(session_id)
-            except SessionSupervisorError:
-                supervised = {}
-            if (str(supervised.get("current_project_id") or supervised.get("project_id") or supervised.get("node") or "").casefold()
-                    == str(session.get("project_id") or session.get("node") or "").casefold()
-                    and str(supervised.get("mode") or "").upper() == str(session.get("mode") or "").upper()
-                    and str(supervised.get("provider") or "").upper() in {"CODEX", "CLAUDE", "GROK"}):
-                session["provider"] = str(supervised["provider"]).upper()
-                if supervised.get("session_anchor_ref"):
-                    session["session_anchor_ref"] = supervised["session_anchor_ref"]
-            # The managed-shell identity fallback is only trusted for a live
-            # reconnection host (re-attach). A dead session's stale identity
-            # file must not stamp a provider the anchor-session record lacks.
+            # Provider identity and Anchor already come from the single Host
+            # session ledger; do not re-read project archives per candidate.
             project_id = str(
                 session.get("project_id") or session.get("node") or ""
             ).strip()
@@ -38147,7 +38102,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             anchor = str(session.get("session_anchor_ref") or "").strip()
             if (
                 anchor in reattach_anchors
-                or anchor in open_anchors
                 or anchor in incompatible_anchors
             ):
                 continue

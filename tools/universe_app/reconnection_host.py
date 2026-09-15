@@ -689,6 +689,63 @@ class ReconnectionHostRegistry:
             raise ReconnectionHostError("Rust Host id is not uniquely LIVE")
         return matches[0]
 
+    def list_discovery_records(self) -> list[dict[str, Any]]:
+        """Read current Host discovery files without contacting every Host."""
+
+        self.prepare()
+        records: list[dict[str, Any]] = []
+        for path in sorted(self.root.glob("anchor-*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                if path.stat().st_size > MAX_STATE_BYTES:
+                    raise ReconnectionHostError("Host state exceeds size limit")
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ReconnectionHostError("Host state must be an object")
+                state = ReconnectionHostState.from_mapping(raw)
+                if self.state_path(state.anchor_ref) != path:
+                    raise ReconnectionHostError("Host state Anchor does not match its discovery path")
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError, ReconnectionHostError) as error:
+                records.append(
+                    {
+                        "host_session_ref": "UNKNOWN",
+                        "runtime_state": "UNKNOWN",
+                        "compatibility": "INCOMPATIBLE",
+                        "reconnect_eligible": False,
+                        "detail": str(error),
+                    }
+                )
+                continue
+            alive = process_is_alive(state.pid)
+            runtime_state = (
+                str(raw.get("runtime_state") or "UNKNOWN").strip().upper()
+                if alive
+                else "EXITED"
+            )
+            snapshot: dict[str, Any] = {
+                "host_session_ref": state.host_id,
+                "host_id": state.host_id,
+                "session_anchor_ref": state.anchor_ref,
+                "host_kind": state.host_kind,
+                "owner_ref": state.owner_ref,
+                "pid": state.pid,
+                "child_pid": state.child_pid,
+                "runtime_state": runtime_state,
+                "protocol_state": str(raw.get("protocol_state") or "UNKNOWN").strip().upper(),
+                "provider": str(raw.get("provider") or "").strip().upper(),
+                "mode": str(raw.get("mode") or "").strip().upper(),
+                **runtime_version_snapshot(state.__dict__),
+            }
+            compatibility = evaluate_runtime_compatibility(snapshot)
+            snapshot["compatibility"] = compatibility
+            snapshot["reconnect_eligible"] = bool(
+                runtime_state == "LIVE"
+                and compatibility in {"CURRENT", "COMPATIBLE_OLD"}
+            )
+            records.append(snapshot)
+        return records
+
     def list_observed_hosts(self) -> list[dict[str, Any]]:
         """Project live, stale, and incompatible Hosts without granting reuse."""
 

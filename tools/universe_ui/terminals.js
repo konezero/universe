@@ -2178,9 +2178,16 @@ function currentReattachHosts() {
   const catalog = state.resumableSessions?.reattach || [];
   const hosts = eligibleReattachHosts().map((host) => joinReattachHost(host, catalog));
   const seen = new Set(hosts.map(hostSessionRefOf).filter(Boolean));
+  const openHosts = new Set((state.terminals || []).map(hostSessionRefOf).filter(Boolean));
+  const openAnchors = new Set(
+    (state.terminals || [])
+      .map((item) => String(item.session_anchor_ref || item.active_session_anchor_ref || "").trim())
+      .filter(Boolean)
+  );
   for (const item of catalog) {
     const href = hostSessionRefOf(item);
-    if (href && seen.has(href)) continue;
+    const anchor = String(item.session_anchor_ref || item.anchor_ref || "").trim();
+    if ((href && (seen.has(href) || openHosts.has(href))) || (anchor && openAnchors.has(anchor))) continue;
     hosts.push(item);
     if (href) seen.add(href);
   }

@@ -425,6 +425,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, payload)
             return
+        if path == "/v1/reconnection-hosts/discovery":
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "schema": API_SCHEMA,
+                    "status": "OK",
+                    "hosts": supervisor.host.list_host_records(),
+                },
+            )
+            return
         if path == "/v1/terminals":
             rows = [supervisor.public_session(item) for item in supervisor.host.list_sessions()]
             hosts = supervisor.host.list_hosts()

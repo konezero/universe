@@ -865,6 +865,12 @@ class TerminalHost:
             return []
         return registry.list_observed_hosts()
 
+    def list_host_records(self) -> list[dict[str, Any]]:
+        registry = self._reconnection_registry
+        if registry is None:
+            return []
+        return registry.list_discovery_records()
+
     def audit_events(self, *, terminal_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
         return self.audit.list(terminal_id=terminal_id, limit=limit)
 

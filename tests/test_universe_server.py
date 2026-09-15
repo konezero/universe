@@ -7577,9 +7577,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
         }
         terminal_host = Mock()
         terminal_host.list_sessions.return_value = []
-        terminal_host.list_hosts.return_value = [live_host, incompatible_host]
+        terminal_host.list_host_records.return_value = [live_host, incompatible_host]
         self.server.terminal_host = terminal_host
-        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+        self.server.list_cli_terminals = Mock(
+            side_effect=AssertionError("online Resume must not refresh terminal sessions")
+        )
+        self.server.list_all_project_anchor_sessions = Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("online Resume must not scan project archives")
+        )
+        self.server._resumable_host_sessions = lambda: [  # type: ignore[method-assign]
             {
                 "session_anchor_ref": "anchor-live",
                 "universe_session_id": "sess-live",
@@ -7670,9 +7676,11 @@ class UniverseLocalServiceTests(unittest.TestCase):
     def test_resumable_sessions_keep_each_provider_and_persist_visibility(self) -> None:
         self.server._managed_shell_identities = lambda: {}  # type: ignore[method-assign]
         terminal_host = Mock()
-        terminal_host.list_sessions.return_value = []
-        terminal_host.list_hosts.return_value = []
+        terminal_host.list_host_records.return_value = []
         self.server.terminal_host = terminal_host
+        self.server.list_cli_terminals = Mock(
+            side_effect=AssertionError("online Resume must not refresh terminal sessions")
+        )
         session_rows = [
             {
                 "session_anchor_ref": "anchor-codex-new",
@@ -7702,7 +7710,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "last_seen_at": "2026-09-14T01:00:00Z",
             },
         ]
-        self.server.list_all_project_anchor_sessions = lambda: session_rows  # type: ignore[method-assign]
+        self.server._resumable_host_sessions = lambda: session_rows  # type: ignore[method-assign]
         self.server.list_project_anchor_sessions = lambda _project_id: {  # type: ignore[method-assign]
             "sessions": session_rows
         }
@@ -7769,28 +7777,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "session_id": "session_resume_closed", "node": "GCS", "project_id": "GCS",
             "mode": "MASTER", "provider": "CODEX", "provider_session_ref": "codex-app-server:existing-thread",
             "state": "DISCONNECTED", "currentness": "CURRENT"})
-        terminal = {"terminal_id": "term_old", "state": "CLOSED", "supervisor_session_id": supervised["session_id"],
-                    "session_anchor_ref": "runtime-anchor", "host_session_ref": "old-host"}
-        self.server.list_cli_terminals = lambda: {"terminals": [terminal], "hosts": []}
-        self.server._managed_shell_identities = lambda: {}
-        self.server.list_all_project_anchor_sessions = lambda: [{
-            "session_id": supervised["session_id"], "session_anchor_ref": "canonical-anchor", "project_id": "GCS",
-            "mode": "MASTER", "provider": "UNKNOWN", "currentness": "CURRENT", "last_seen_at": "2026-09-14T01:00:00Z"}]
+        host_records: list[dict[str, object]] = []
+        terminal_host = Mock()
+        terminal_host.list_host_records.side_effect = lambda: list(host_records)
+        self.server.terminal_host = terminal_host
+        self.server.list_cli_terminals = Mock(
+            side_effect=AssertionError("online Resume must not refresh terminal sessions")
+        )
+        self.server.list_all_project_anchor_sessions = Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("online Resume must not scan project archives")
+        )
         listed = self.server.list_resumable_sessions()
         self.assertEqual([supervised["session_id"]], [row["session_id"] for row in listed["resume"]])
         self.assertEqual("CODEX", listed["resume"][0]["provider"])
         self.assertEqual(supervised["session_anchor_ref"], listed["resume"][0]["session_anchor_ref"])
-        # The same live session is excluded even when runtime and canonical
-        # anchors differ; Host termination must be the transition to RESUME.
-        terminal["state"] = "LIVE"
+        # A live Host discovery file moves the session to Re-attach; Host
+        # termination removes that record and makes the same ledger row resumable.
+        host_records.append({
+            "host_session_ref": "live-host",
+            "session_anchor_ref": supervised["session_anchor_ref"],
+            "runtime_state": "LIVE",
+            "reconnect_eligible": True,
+            "compatibility": "CURRENT",
+            "provider": "CODEX",
+        })
         self.assertEqual([], self.server.list_resumable_sessions()["resume"])
-        terminal["state"] = "EXITED"
+        host_records.clear()
         self.assertEqual(1, len(self.server.list_resumable_sessions()["resume"]))
 
-    def test_reattach_row_provider_falls_back_to_managed_shell_identity(self) -> None:
-        # After a server restart the anchor-session projection can lose provider
-        # before the live terminal re-registers; the persisted managed-shell
-        # identity file still carries it, so the re-attach label stays specific.
+    def test_reattach_row_provider_falls_back_to_host_session_ledger(self) -> None:
+        # After a server restart, the Host file identifies the live Anchor and
+        # the single Host session ledger supplies its provider and coordinates.
         live_host = {
             "host_session_ref": "host-live",
             "session_anchor_ref": "anchor-live",
@@ -7799,28 +7816,25 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "compatibility": "CURRENT",
         }
         terminal_host = Mock()
-        terminal_host.list_sessions.return_value = []
-        terminal_host.list_hosts.return_value = [live_host]
+        terminal_host.list_host_records.return_value = [live_host]
         self.server.terminal_host = terminal_host
-        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+        self.server.list_cli_terminals = Mock(
+            side_effect=AssertionError("online Resume must not refresh terminal sessions")
+        )
+        self.server._resumable_host_sessions = lambda: [  # type: ignore[method-assign]
             {
                 "session_anchor_ref": "anchor-live",
                 "universe_session_id": "sess-live",
-                "project_id": "",
-                "mode": "",
-                "provider": "",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
                 "currentness": "CURRENT",
                 "last_seen_at": "2026-09-04T03:00:00Z",
             }
         ]
-        self.server._managed_shell_identities = lambda: {  # type: ignore[method-assign]
-            "anchor-live": {
-                "provider": "CODEX",
-                "mode": "MASTER",
-                "project_id": "universe",
-                "supervisor_session_id": "sess-live",
-            }
-        }
+        self.server._managed_shell_identities = Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("online Resume must not scan managed-shell files")
+        )
 
         listed = self.server.list_resumable_sessions({"limit": 7})
         self.assertEqual(1, len(listed["reattach"]))
@@ -7841,10 +7855,12 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "provider": "CLAUDE",
         }
         terminal_host = Mock()
-        terminal_host.list_sessions.return_value = []
-        terminal_host.list_hosts.return_value = [live_host]
+        terminal_host.list_host_records.return_value = [live_host]
         self.server.terminal_host = terminal_host
-        self.server.list_all_project_anchor_sessions = lambda: [  # type: ignore[method-assign]
+        self.server.list_cli_terminals = Mock(
+            side_effect=AssertionError("online Resume must not refresh terminal sessions")
+        )
+        self.server._resumable_host_sessions = lambda: [  # type: ignore[method-assign]
             {
                 "session_anchor_ref": "anchor-live-claude",
                 "universe_session_id": "sess-stale-codex",

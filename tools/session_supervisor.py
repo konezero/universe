@@ -2733,6 +2733,39 @@ class SessionSupervisorStore:
                 return materials
             return [item for item in materials if item["visibility"] == "VISIBLE"]
 
+    def list_resume_sessions(self) -> list[dict[str, Any]]:
+        """Read provider-resumable sessions from the single Host ledger."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT session_id, node, mode, provider, provider_session_ref,
+                       session_anchor_ref, current_project_id, state, currentness,
+                       last_seen_at, updated_at
+                FROM session_record
+                WHERE provider IN ('CODEX', 'CLAUDE', 'GROK')
+                  AND provider_session_ref IS NOT NULL
+                  AND TRIM(provider_session_ref) != ''
+                ORDER BY COALESCE(last_seen_at, updated_at) DESC, session_id
+                """
+            ).fetchall()
+        return [
+            {
+                "session_id": str(row["session_id"]),
+                "universe_session_id": str(row["session_id"]),
+                "node": str(row["node"]),
+                "project_id": str(row["current_project_id"] or row["node"]),
+                "mode": str(row["mode"]),
+                "provider": str(row["provider"]),
+                "provider_session_ref": str(row["provider_session_ref"]),
+                "session_anchor_ref": str(row["session_anchor_ref"] or ""),
+                "state": str(row["state"]),
+                "currentness": str(row["currentness"]),
+                "last_seen_at": str(row["last_seen_at"] or row["updated_at"] or ""),
+            }
+            for row in rows
+        ]
+
     def get_project_mode_anchor(self, project_id: str, mode: str) -> dict[str, Any]:
         """Return the append-only Session Anchor lineage for one Project/Mode."""
 

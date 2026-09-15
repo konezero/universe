@@ -443,6 +443,11 @@ class SupervisedTerminalHost:
     def list_hosts(self) -> list[dict[str, Any]]:
         return list(self._request("GET", "/v1/terminals").get("hosts") or [])
 
+    def list_host_records(self) -> list[dict[str, Any]]:
+        return list(
+            self._request("GET", "/v1/reconnection-hosts/discovery").get("hosts") or []
+        )
+
     def reconcile_reconnection_hosts(self) -> list[dict[str, Any]]:
         return list(
             self._request("POST", "/v1/terminals/reconcile", payload={}).get(

@@ -297,6 +297,38 @@ class ReconnectionHostRegistryTests(unittest.TestCase):
                 else:
                     self.assertTrue(state_path.exists())
 
+    def test_discovery_records_read_files_without_host_ipc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "universe_app.reconnection_host.provision_private_registry_directory"
+        ):
+            root = Path(temp)
+            registry = ReconnectionHostRegistry(root, root / "host.exe")
+            state_path = self.write_state(
+                registry, "anchor-file-only", pid=1001, started_at=10.0
+            )
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            raw.update(
+                {
+                    "runtime_state": "LIVE",
+                    "protocol_state": "READY",
+                    "provider": "CODEX",
+                    "mode": "MASTER",
+                }
+            )
+            state_path.write_text(json.dumps(raw), encoding="utf-8")
+            with patch(
+                "universe_app.reconnection_host.process_is_alive", return_value=True
+            ), patch(
+                "universe_app.reconnection_host.ReconnectionHostClient.status",
+                side_effect=AssertionError("file-only discovery must not contact the Host"),
+            ):
+                records = registry.list_discovery_records()
+            self.assertEqual(1, len(records))
+            self.assertEqual("host-1001", records[0]["host_session_ref"])
+            self.assertEqual("LIVE", records[0]["runtime_state"])
+            self.assertEqual("CURRENT", records[0]["compatibility"])
+            self.assertTrue(records[0]["reconnect_eligible"])
+
     def write_state(
         self,
         registry: ReconnectionHostRegistry,
