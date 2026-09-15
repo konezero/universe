@@ -52,6 +52,28 @@ TODO_MOVE_PROJECT_ACTION_ID = "todo.move_project"
 TODO_REORDER_ACTION_ID = "todo.reorder"
 TODO_ARCHIVE_ACTION_ID = "todo.archive"
 TODO_RESTORE_ACTION_ID = "todo.restore"
+
+# The exact shape UniverseServer._handle_todo_bind_goal_action /
+# UniverseStore.set_todo_goal_binding accept: additionalProperties is False
+# there (via _exact_object_fields), so this schema must list every field the
+# handler actually reads, nothing more - a caller relying only on the
+# catalog (not the source) needs this to construct a valid call.
+_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+TODO_BIND_GOAL_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "goal_id": {
+            "type": ["string", "null"],
+            "pattern": _IDENTIFIER_PATTERN,
+            "description": "Omit or set null to unbind; a non-null value must "
+            "name an existing Goal in the same project as the Todo.",
+        },
+    },
+}
 TODO_DELETE_ACTION_ID = "todo.delete"
 
 TODO_ACTION_IDS = (
@@ -1050,11 +1072,6 @@ def build_default_action_registry(
             "universe.todo-update-action-request.v1",
             "universe.todo-update-receipt.v1",
         ),
-        (
-            TODO_BIND_GOAL_ACTION_ID,
-            "universe.todo-bind-goal-action-request.v1",
-            "universe.todo-bind-goal-receipt.v1",
-        ),
     )
     for action_id, request_schema, result_schema in implemented_specs:
         registry.register(
@@ -1068,6 +1085,40 @@ def build_default_action_registry(
             supplied_handlers.get(action_id),
             surfaces=(action_id,),
         )
+    registry.register(
+        ActionContract(
+            action_id=TODO_BIND_GOAL_ACTION_ID,
+            request_schema_ref="universe.todo-bind-goal-action-request.v1",
+            result_schema_ref="universe.todo-bind-goal-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_BIND_GOAL_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                # A lost response cannot be safely resolved by literal request
+                # replay: this is a narrow CAS write (expected_revision), so
+                # repeating the exact same call after it already applied
+                # returns 409 TODO_REVISION_CONFLICT, not a replayed success.
+                # Recover by calling todo.read and comparing goal_id/revision
+                # to the intended target state before deciding whether to
+                # retry with a fresh expected_revision.
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_GOAL_BINDING_REQUEST_INVALID",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                    "GOAL_NOT_FOUND",
+                    "TODO_GOAL_BINDING_PROJECT_MISMATCH",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_BIND_GOAL_ACTION_ID),
+        surfaces=(TODO_BIND_GOAL_ACTION_ID,),
+    )
     from universe_todo_actions import REQUEST_SCHEMAS
     for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
         registry.register(
@@ -1164,6 +1215,7 @@ __all__ = [
     "TODO_ACTION_IDS",
     "TODO_ARCHIVE_ACTION_ID",
     "TODO_BIND_GOAL_ACTION_ID",
+    "TODO_BIND_GOAL_REQUEST_SCHEMA",
     "TODO_BIND_NODE_ACTION_ID",
     "TODO_CREATE_ACTION_ID",
     "TODO_DELETE_ACTION_ID",

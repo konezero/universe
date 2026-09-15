@@ -131,6 +131,88 @@ class TodoBindGoalActionTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("TODO_GOAL_BINDING_PROJECT_MISMATCH", result["error_code"])
 
+    def _bind_goal_contract(self):
+        """The published catalog entry, read the same way an external LLM
+        caller would (GET /v1/actions), never the source constants directly.
+        """
+        status, catalog = self.request("GET", "/v1/actions", None)
+        self.assertEqual(200, status)
+        contracts = {c["action_id"]: c for c in catalog["registry"]["contracts"]}
+        self.assertIn("todo.bind_goal", contracts)
+        return contracts["todo.bind_goal"]
+
+    def test_catalog_publishes_an_accurate_request_schema(self):
+        # 2026-09-15 Conductor NEEDS_REVISION: prior registration only carried
+        # a request_schema_ref string, no metadata.request_schema -- an LLM
+        # reading the catalog (not the source) could not learn required
+        # fields, optional goal_id, or that additional fields are rejected.
+        contract = self._bind_goal_contract()
+        schema = contract["metadata"]["request_schema"]
+        self.assertEqual({"todo_id", "expected_revision"}, set(schema["required"]))
+        self.assertEqual(
+            {"todo_id", "expected_revision", "goal_id"}, set(schema["properties"])
+        )
+        self.assertFalse(schema["additionalProperties"])
+        # The narrow CAS write is not safely retryable by literal replay --
+        # the catalog must say so rather than implying idempotent success.
+        self.assertEqual(
+            "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ", contract["metadata"]["replay"]
+        )
+
+    def test_call_built_from_only_catalog_required_fields_succeeds(self):
+        schema = self._bind_goal_contract()["metadata"]["request_schema"]
+        todo = self.make_todo()
+        values = {"todo_id": todo["todo_id"], "expected_revision": todo["revision"]}
+        request = {field: values[field] for field in schema["required"]}
+        status, result = self.act("todo.bind_goal", request)
+        self.assertEqual(200, status, result)
+        self.assertEqual("TODO_GOAL_UNBOUND", result["status"])
+
+    def test_field_missing_from_catalog_required_is_rejected(self):
+        todo = self.make_todo()
+        status, result = self.act("todo.bind_goal", {"todo_id": todo["todo_id"]})
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_INVALID", result["error_code"])
+
+    def test_field_not_in_catalog_properties_is_rejected(self):
+        # additionalProperties: False in the published schema must match the
+        # handler's actual _exact_object_fields behaviour.
+        todo = self.make_todo()
+        status, result = self.act("todo.bind_goal", {
+            "todo_id": todo["todo_id"],
+            "expected_revision": todo["revision"],
+            "not_a_published_field": "x",
+        })
+        self.assertEqual(400, status)
+        self.assertEqual("REQUEST_INVALID", result["error_code"])
+
+    def test_explicit_null_goal_id_matches_catalog_nullable_type(self):
+        schema = self._bind_goal_contract()["metadata"]["request_schema"]
+        self.assertIn("null", schema["properties"]["goal_id"]["type"])
+        todo = self.make_todo()
+        status, result = self.act("todo.bind_goal", {
+            "todo_id": todo["todo_id"], "expected_revision": todo["revision"], "goal_id": None,
+        })
+        self.assertEqual(200, status, result)
+        self.assertIsNone(result["todo"]["goal_id"])
+
+    def test_repeating_an_applied_call_is_not_idempotent_success(self):
+        # Documents the recovery contract itself: replaying the identical CAS
+        # request after it already applied is a 409, not a replayed 200 --
+        # a caller must todo.read and compare before deciding to retry.
+        todo = self.make_todo()
+        goal = self.make_goal("Replay")
+        request = {
+            "todo_id": todo["todo_id"], "expected_revision": todo["revision"], "goal_id": goal["goal_id"],
+        }
+        status1, result1 = self.act("todo.bind_goal", request)
+        self.assertEqual(200, status1)
+        status2, result2 = self.act("todo.bind_goal", request)
+        self.assertEqual(409, status2)
+        self.assertEqual("TODO_REVISION_CONFLICT", result2["error_code"])
+        _, read_back = self.act("todo.read", {"todo_id": todo["todo_id"]})
+        self.assertEqual(goal["goal_id"], read_back["todo"]["goal_id"])
+
     def test_title_detail_priority_untouched_by_bind(self):
         # A narrow write: binding a Goal must not touch any other field,
         # unlike a full todo.update PATCH body.
