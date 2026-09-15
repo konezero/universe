@@ -8043,6 +8043,12 @@ class UniverseStore:
                 "queued_assignment_revision": "INTEGER",
                 "applied_phase": "TEXT",
                 "applied_message_id": "TEXT",
+                # NULL = project-wide scope (the existing CONDUCTOR path,
+                # unchanged). A non-NULL value is a real feature_node's
+                # feature_id, checked against that project at assign time
+                # (2026-09-15: node-scoped MASTER automation ownership) -- it
+                # is never a free-text label like `scope`.
+                "node_ref": "TEXT",
             }.items():
                 if column not in persona_assignment_columns:
                     connection.execute(
@@ -19956,6 +19962,7 @@ class UniverseStore:
             "persona_id": row["persona_id"],
             "persona_revision": row["persona_revision"],
             "scope": row["scope"],
+            "node_ref": row["node_ref"],
             "assignment_revision": row["assignment_revision"],
             "state": row["state"],
             "applied_at": applied_at,
@@ -20004,6 +20011,7 @@ class UniverseStore:
         scope = str(value.get("scope") or "")
         if len(scope) > 400:
             raise UniverseError("PERSONA_ASSIGNMENT_INVALID", "scope is too long")
+        node_ref = value.get("node_ref")
 
         def write(connection: sqlite3.Connection) -> dict[str, Any]:
             now = utc_now()
@@ -20034,12 +20042,12 @@ class UniverseStore:
             if existing is None:
                 connection.execute(
                     "INSERT INTO session_persona_assignment"
-                    "(session_anchor_ref, project_id, persona_id, persona_revision, scope, assignment_revision, "
+                    "(session_anchor_ref, project_id, persona_id, persona_revision, scope, node_ref, assignment_revision, "
                     "state, applied_at, applied_terminal_id, applied_persona_revision, applied_assignment_revision, "
                     "unsupported_at, unsupported_terminal_id, unsupported_provider, unsupported_reason, "
                     "actor_ref, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, 1, 'ACTIVE', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
-                    (anchor, project_id, persona_id, expected_persona_revision, scope, actor_ref, now, now),
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, 'ACTIVE', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)",
+                    (anchor, project_id, persona_id, expected_persona_revision, scope, node_ref, actor_ref, now, now),
                 )
             else:
                 # A fresh assignment_revision means nothing has been applied
@@ -20049,7 +20057,7 @@ class UniverseStore:
                 # (2026-09-14 Conductor finding).
                 connection.execute(
                     "UPDATE session_persona_assignment SET project_id = ?, persona_id = ?, persona_revision = ?, "
-                    "scope = ?, assignment_revision = assignment_revision + 1, state = 'ACTIVE', "
+                    "scope = ?, node_ref = ?, assignment_revision = assignment_revision + 1, state = 'ACTIVE', "
                     "applied_at = NULL, applied_terminal_id = NULL, applied_persona_revision = NULL, "
                     "applied_assignment_revision = NULL, applied_phase = NULL, applied_message_id = NULL, "
                     "queued_at = NULL, queued_terminal_id = NULL, queued_provider = NULL, "
@@ -20058,7 +20066,7 @@ class UniverseStore:
                     "unsupported_at = NULL, unsupported_terminal_id = NULL, "
                     "unsupported_provider = NULL, unsupported_reason = NULL, "
                     "actor_ref = ?, updated_at = ? WHERE session_anchor_ref = ?",
-                    (project_id, persona_id, expected_persona_revision, scope, actor_ref, now, anchor),
+                    (project_id, persona_id, expected_persona_revision, scope, node_ref, actor_ref, now, anchor),
                 )
             row = connection.execute(
                 "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
@@ -31499,25 +31507,74 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 HTTPStatus.CONFLICT,
             )
 
-    def _validate_persona_automation_anchor(self, project_id: str, session_anchor_ref: str) -> None:
-        """Automation runs may only be owned by a project CONDUCTOR Anchor."""
-
-        self._validate_persona_assignment_anchor(project_id, session_anchor_ref)
+    def _anchor_modes(self, session_anchor_ref: str) -> set[str]:
         anchor = str(session_anchor_ref or "").strip()
         sessions = [
             session for session in self.session_supervisor.list_sessions(include_hidden=True)
             if str(session.get("session_anchor_ref") or "").strip() == anchor
         ]
-        modes = {
+        return {
             str(session.get("mode") or session.get("current_mode") or "").strip().upper()
             for session in sessions
         }
-        if "CONDUCTOR" not in modes:
+
+    def _validate_persona_assignment_node_ref(
+        self, project_id: str, node_ref: str | None
+    ) -> str | None:
+        """A supplied node_ref must name a real feature_node in this project.
+
+        This does not require or forbid node_ref by Anchor mode -- ordinary
+        persona assignment (P1: natural-language persona applied to a
+        session, any mode) is unchanged and stays optional-scope. The actual
+        MASTER-must-be-node-scoped requirement is enforced later, only where
+        it matters: at persona automation start
+        (_validate_persona_automation_anchor), never here (2026-09-15: node
+        Master automation ownership).
+        """
+
+        if node_ref is None:
+            return None
+        normalized = _identifier(node_ref, "node_ref")
+        node = self.store.get_feature_node(normalized)
+        if str(node.get("project_id") or "") != project_id:
             raise UniverseError(
-                "PERSONA_AUTOMATION_CONDUCTOR_REQUIRED",
-                "persona automation requires a registered CONDUCTOR Session Anchor",
+                "PERSONA_ASSIGNMENT_NODE_PROJECT_MISMATCH",
+                "node_ref belongs to a different project",
                 HTTPStatus.CONFLICT,
             )
+        return normalized
+
+    def _validate_persona_automation_anchor(self, project_id: str, session_anchor_ref: str) -> None:
+        """Automation runs are owned by a project CONDUCTOR Anchor (project-wide
+        scope, unchanged) or a MASTER Anchor with a durable node-scoped
+        assignment (2026-09-15). A MASTER Anchor with no assignment, or one
+        assigned without a node_ref, cannot start automation -- there is no
+        implicit project-wide fallback for MASTER.
+        """
+
+        self._validate_persona_assignment_anchor(project_id, session_anchor_ref)
+        modes = self._anchor_modes(session_anchor_ref)
+        if "CONDUCTOR" in modes:
+            return
+        if "MASTER" in modes:
+            assignment = self.store.read_persona_assignment(session_anchor_ref)
+            if (
+                assignment is not None
+                and assignment.get("state") == "ACTIVE"
+                and assignment.get("project_id") == project_id
+                and assignment.get("node_ref")
+            ):
+                return
+            raise UniverseError(
+                "PERSONA_AUTOMATION_NODE_ASSIGNMENT_REQUIRED",
+                "a MASTER Anchor needs an ACTIVE, node-scoped persona assignment in this project to start automation",
+                HTTPStatus.CONFLICT,
+            )
+        raise UniverseError(
+            "PERSONA_AUTOMATION_CONDUCTOR_REQUIRED",
+            "persona automation requires a registered CONDUCTOR or node-assigned MASTER Session Anchor",
+            HTTPStatus.CONFLICT,
+        )
 
     def _persona_automation_reply_terminal(self, session_anchor_ref: str) -> str:
         """Resolve the live terminal that receives a Master result.
@@ -31559,10 +31616,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "session_anchor_ref", "project_id", "persona_id",
                 "expected_persona_revision", "request_id",
             }),
-            optional=frozenset({"expected_assignment_revision", "scope"}),
+            optional=frozenset({"expected_assignment_revision", "scope", "node_ref"}),
         )
-        self._validate_persona_assignment_anchor(value["project_id"], value["session_anchor_ref"])
-        return self.store.assign_persona(value, actor)
+        project_id = _identifier(value["project_id"], "project_id")
+        self._validate_persona_assignment_anchor(project_id, value["session_anchor_ref"])
+        node_ref = self._validate_persona_assignment_node_ref(project_id, value.get("node_ref"))
+        return self.store.assign_persona({**value, "node_ref": node_ref}, actor)
 
     def _handle_persona_assignment_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
         self._persona_actor(context)
@@ -31605,7 +31664,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         run_owner = str(run.get("session_anchor_ref") or "").strip()
         requested_next = str(value.get("next_condition") or "").strip()
 
+        # A node-scoped MASTER run (run.node_ref set) may only see and
+        # select this project's Goals/Todos already scoped to that same
+        # feature_node -- the real Goal.node_ref/Todo.node_ref graph
+        # contract, not a new field or enum. A project-wide CONDUCTOR run
+        # (node_ref is None) keeps its original, unrestricted project view
+        # (2026-09-15: node Master automation ownership).
+        run_node_ref = str(run.get("node_ref") or "").strip() or None
         goals = self.store.list_project_goals(project_id)
+        if run_node_ref is not None:
+            goals = [
+                goal for goal in goals
+                if str(goal.get("scope_kind") or "") == "NODE"
+                and str(goal.get("node_ref") or "") == run_node_ref
+            ]
         goals_by_id = {
             str(goal.get("goal_id") or ""): goal
             for goal in goals
@@ -32314,6 +32386,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 anchor = _required_text(value["session_anchor_ref"], "session_anchor_ref")
                 self._validate_persona_automation_anchor(project_id, anchor)
                 assignment = self.store.read_persona_assignment(anchor)
+                if assignment is not None and "CONDUCTOR" in self._anchor_modes(anchor):
+                    # A CONDUCTOR's automation is always project-wide -- its
+                    # own Anchor mode decides that, never whatever node_ref
+                    # happens to sit on its assignment row (which ordinary
+                    # persona.assign leaves optional for any mode).
+                    assignment = {**assignment, "node_ref": None}
                 return self.persona_automation.start_run(value, assignment or {})
             if action_id == "persona.automation.pause":
                 value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))

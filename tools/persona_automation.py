@@ -225,6 +225,22 @@ class PersonaAutomationStore:
                 connection.execute(
                     "ALTER TABLE persona_automation_decision ADD COLUMN invocation_json TEXT"
                 )
+            run_columns = {
+                str(item[1])
+                for item in connection.execute(
+                    "PRAGMA table_info(persona_automation_run)"
+                ).fetchall()
+            }
+            if "node_ref" not in run_columns:
+                # NULL = project-wide (CONDUCTOR) scope, unchanged. A
+                # non-NULL value is copied from the owning MASTER Anchor's
+                # persona assignment at start_run and never re-derived from
+                # a later request -- reassigning that Anchor to a different
+                # node does not retroactively widen or move an existing run
+                # (2026-09-15: node Master automation ownership).
+                connection.execute(
+                    "ALTER TABLE persona_automation_run ADD COLUMN node_ref TEXT"
+                )
 
     @staticmethod
     def _row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
@@ -239,6 +255,7 @@ class PersonaAutomationStore:
             "instruction": row["instruction_text"],
             "goal_ref": row["goal_ref"],
             "goal_version": row["goal_version"],
+            "node_ref": row["node_ref"],
             "budget": _load(row["budget_json"], {}),
             "state": row["state"],
             "cursor": _load(row["cursor_json"], {}),
@@ -307,6 +324,12 @@ class PersonaAutomationStore:
         scope = _text(value.get("scope"), "scope")
         instruction = _text(value.get("instruction"), "instruction")
         key = _text(value.get("idempotency_key") or value.get("request_id"), "idempotency_key")
+        # NULL = the project-wide CONDUCTOR scope (legacy, unchanged); a real
+        # feature_id pins one MASTER's node. Never taken from the request --
+        # only the caller's own durable assignment decides this, so a
+        # client cannot claim a wider or different node than it owns
+        # (2026-09-15: node Master automation ownership).
+        node_ref = assignment.get("node_ref")
         payload = {
             "project_id": project_id, "session_anchor_ref": anchor, "scope": scope,
             "instruction": instruction, "goal_ref": value.get("goal_ref"),
@@ -314,6 +337,7 @@ class PersonaAutomationStore:
             "persona_id": assignment.get("persona_id"),
             "persona_revision": assignment.get("persona_revision"),
             "assignment_revision": assignment.get("assignment_revision"),
+            "node_ref": node_ref,
         }
         digest = _digest(payload)
         now = _timestamp()
@@ -327,15 +351,28 @@ class PersonaAutomationStore:
                 if existing["request_digest"] != digest:
                     raise PersonaAutomationError("PERSONA_AUTOMATION_IDEMPOTENCY_CONFLICT", "idempotency_key already refers to another run", 409)
                 return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_RUN_REPLAYED", "run": self._row(existing), "created": False}
+            # One active run per (project, node) bucket, not per project:
+            # the whole point of node ownership is that separate nodes run
+            # concurrently under their own Master. The project-wide
+            # CONDUCTOR bucket (node_ref IS NULL) keeps its original
+            # single-active-run behaviour.
             active = connection.execute(
-                "SELECT run_id FROM persona_automation_run WHERE project_id = ? AND state IN ('RUNNING','WAITING','PAUSED') ORDER BY updated_at DESC LIMIT 1",
-                (project_id,),
+                "SELECT run_id FROM persona_automation_run WHERE project_id = ? "
+                "AND (node_ref IS ?) AND state IN ('RUNNING','WAITING','PAUSED') "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (project_id, node_ref),
             ).fetchone()
             if active is not None:
-                raise PersonaAutomationError("PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS", "project already has an active persona automation run", 409)
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS",
+                    "this node already has an active persona automation run"
+                    if node_ref
+                    else "project already has an active persona automation run",
+                    409,
+                )
             connection.execute(
-                "INSERT INTO persona_automation_run(run_id, project_id, session_anchor_ref, persona_id, persona_revision, assignment_revision, scope_text, instruction_text, goal_ref, goal_version, budget_json, state, cursor_json, idempotency_key, request_digest, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?)",
-                (run_id, project_id, anchor, assignment["persona_id"], int(assignment["persona_revision"]), int(assignment["assignment_revision"]), scope, instruction, value.get("goal_ref"), value.get("goal_version"), _json(value.get("budget") or {}), _json({}), key, digest, now, now),
+                "INSERT INTO persona_automation_run(run_id, project_id, session_anchor_ref, persona_id, persona_revision, assignment_revision, scope_text, instruction_text, goal_ref, goal_version, node_ref, budget_json, state, cursor_json, idempotency_key, request_digest, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?)",
+                (run_id, project_id, anchor, assignment["persona_id"], int(assignment["persona_revision"]), int(assignment["assignment_revision"]), scope, instruction, value.get("goal_ref"), value.get("goal_version"), node_ref, _json(value.get("budget") or {}), _json({}), key, digest, now, now),
             )
             self._event(connection, run_id, "RUN_STARTED", "start:" + key, {"assignment": assignment, "provider_invocation": "NONE"})
             row = self._get(connection, run_id)
