@@ -3562,7 +3562,12 @@ def persona_delivery_mode(provider: str, persona_text: str) -> tuple[str, str]:
         return "INLINE_ARG", ""
     if name == "GROK":
         if re.search(r"[\r\n\"]", text):
-            return "UNSUPPORTED", "Grok interactive Host has no exact file/native queue persona transport"
+            return (
+                "UNSUPPORTED",
+                "Grok interactive Host has no exact file/native queue persona transport "
+                "(grok 1.0.30 --rules/--system-prompt-override are inline text; "
+                "no grok queue; --agent-profile is ACP grok agent only)",
+            )
         return "INLINE_ARG", ""
     return "UNSUPPORTED", f"unrecognized provider {name!r}"
 
@@ -3686,9 +3691,13 @@ def startup_argv(
         and delivered through the Rust Session Host's native
         ``codex queue --thread --message`` transport after the provider
         session binds. The queue receives the original body unchanged.
-      - GROK: no equivalent exact-text transport was found for the
-        interactive launch this codebase uses; unsupported bodies remain
-        omitted and are recorded as unsupported. See
+      - GROK: installed grok 1.0.30 interactive launch exposes
+        ``--rules <RULES>`` as inline text (wrapped in ``<human_rules>``)
+        and ``--system-prompt-override`` as inline replacement text.
+        ``--prompt-file`` is a single-turn user prompt, not interactive
+        Persona. ``grok queue`` is not a command. ``--agent-profile``
+        exists only under ``grok agent`` (ACP), which this Host does not
+        use. Unsupported bodies remain omitted. See
         ``persona_delivery_mode`` for the per-provider decision.
     """
     name = str(provider or "").strip().upper()

@@ -39957,23 +39957,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             stored_ref = str(
                 supervised.get("provider_session_ref") or ""
             ).strip()
-            if not stored_ref:
-                raise UniverseError(
-                    "TERMINAL_PROVIDER_SESSION_UNAVAILABLE",
-                    "Supervisor session has no provider-owned session id",
-                    HTTPStatus.CONFLICT,
-                )
-            vendor_identity = _vendor_identity_from_observer(stored_ref)
-            if vendor_identity is not None:
-                stored_provider, stored_ref = vendor_identity
-                if stored_provider != provider:
-                    raise UniverseError(
-                        "TERMINAL_RESUME_PROVIDER_MISMATCH",
-                        "Stored provider session does not match the terminal provider",
-                        HTTPStatus.CONFLICT,
-                    )
-            resume_ref = stored_ref
-            resume_attachment_authorized = True
+            if stored_ref:
+                vendor_identity = _vendor_identity_from_observer(stored_ref)
+                if vendor_identity is not None:
+                    stored_provider, stored_ref = vendor_identity
+                    if stored_provider != provider:
+                        raise UniverseError(
+                            "TERMINAL_RESUME_PROVIDER_MISMATCH",
+                            "Stored provider session does not match the terminal provider",
+                            HTTPStatus.CONFLICT,
+                        )
+                resume_ref = stored_ref
+                resume_attachment_authorized = True
+            # A Supervisor row with no provider session is the assign-then-
+            # spawn path: keep this exact Session Anchor and launch a fresh
+            # Host. Requiring a provider session id here made GROK/CLAUDE
+            # INLINE_ARG Persona application unreachable without inventing a
+            # resume. Do not flatten Persona text and do not mint a second
+            # Anchor.
         elif pty_binding_anchor_ref:
             binding = self._resolve_project_anchor_pty_binding(
                 project_id=project_id,

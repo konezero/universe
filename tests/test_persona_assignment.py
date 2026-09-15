@@ -730,6 +730,118 @@ class PersonaActionTests(unittest.TestCase):
         self.assertEqual("APPLIED", applied["delivery_status"])
         self.assertEqual("PROMPT_SUBMITTED", applied["applied_phase"])
 
+    def test_grok_assign_then_fresh_spawn_applies_safe_inline_arg(self):
+        persona = self.make_persona(
+            "Grok safe inline",
+            "THROWACCEPT GROK PERSONA MARKER 7f3c9e2a 한글 single-line",
+        )
+        session_id = f"persona-test-grok-safe-{next(_SESSION_ID_SEQ):08d}"
+        anchor_material, _created = self.server.session_supervisor.register_session({
+            "session_id": session_id,
+            "node": "TEST",
+            "mode": "MASTER",
+            "provider": "GROK",
+        })
+        anchor = str(anchor_material["session_anchor_ref"])
+        self.assertFalse(str(anchor_material.get("provider_session_ref") or "").strip())
+        self.act("persona.assign", {
+            "session_anchor_ref": anchor,
+            "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": 1,
+        })
+        fake_host = Mock()
+        fake_host.find_live.return_value = None
+        fake_host.create.return_value = {
+            "terminal_id": "term_persona_grok_safe",
+            "state": "LIVE",
+            "provider": "GROK",
+            "host_reused_existing": False,
+        }
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            created = self.server.create_cli_terminal({
+                "project_id": "TEST",
+                "mode": "MASTER",
+                "cwd": str(ROOT),
+                "provider": "GROK",
+                "model_ref": "grok-4.5",
+                "effort": "LOW",
+                "supervisor_session_id": session_id,
+                "pty_binding_anchor_ref": anchor,
+            })
+        finally:
+            self.server.terminal_host = original_host
+        self.assertEqual("CLI_TERMINAL_CREATED", created["status"])
+        self.assertEqual(
+            "APPLIED_INLINE_ARG",
+            created["terminal"]["persona_delivery"]["status"],
+        )
+        create_kwargs = fake_host.create.call_args.kwargs
+        self.assertEqual("", create_kwargs["resume_session_ref"])
+        self.assertFalse(create_kwargs["resume_attachment_authorized"])
+        self.assertIn(persona["body"], create_kwargs["persona_prompt"])
+        after = self.server.store.read_persona_assignment(anchor)
+        self.assertEqual("APPLIED", after["delivery_status"])
+        self.assertIsNone(after["unsupported_at"])
+
+    def test_grok_assign_then_fresh_spawn_records_complex_text_unsupported(self):
+        persona = self.make_persona(
+            "Grok complex unsupported",
+            'THROWACCEPT COMPLEX\n둘째 줄 "quoted" 🚀',
+        )
+        session_id = f"persona-test-grok-complex-{next(_SESSION_ID_SEQ):08d}"
+        anchor_material, _created = self.server.session_supervisor.register_session({
+            "session_id": session_id,
+            "node": "TEST",
+            "mode": "MASTER",
+            "provider": "GROK",
+        })
+        anchor = str(anchor_material["session_anchor_ref"])
+        self.act("persona.assign", {
+            "session_anchor_ref": anchor,
+            "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": 1,
+        })
+        fake_host = Mock()
+        fake_host.find_live.return_value = None
+        fake_host.create.return_value = {
+            "terminal_id": "term_persona_grok_complex",
+            "state": "LIVE",
+            "provider": "GROK",
+            "host_reused_existing": False,
+        }
+        original_host = self.server.terminal_host
+        self.server.terminal_host = fake_host
+        try:
+            created = self.server.create_cli_terminal({
+                "project_id": "TEST",
+                "mode": "MASTER",
+                "cwd": str(ROOT),
+                "provider": "GROK",
+                "supervisor_session_id": session_id,
+                "pty_binding_anchor_ref": anchor,
+            })
+        finally:
+            self.server.terminal_host = original_host
+        delivery = created["terminal"]["persona_delivery"]
+        self.assertEqual("UNSUPPORTED", delivery["status"])
+        self.assertIn("newline", delivery["reason"])
+        create_kwargs = fake_host.create.call_args.kwargs
+        self.assertEqual("", create_kwargs["resume_session_ref"])
+        argv = startup_argv(
+            "GROK",
+            "",
+            persona_prompt=create_kwargs["persona_prompt"],
+        )
+        self.assertNotIn("--rules", argv)
+        after = self.server.store.read_persona_assignment(anchor)
+        self.assertEqual("UNSUPPORTED", after["delivery_status"])
+        self.assertEqual("GROK", after["unsupported_provider"])
+        self.assertIsNone(after["applied_at"])
+
     def test_startup_argv_omits_unsupported_persona_text_rather_than_flatten_it(self):
         # The 2026-09-14 defect: a newline used to be silently flattened to
         # a space and sent anyway. Now it must be left OUT of argv entirely.
