@@ -12,19 +12,13 @@ const context = {
   currentReattachHosts: () => [], closeTerminalNewMenu() {}, renderReattachBanner() {},
   api: async (path, options) => {
     apiCalls.push({ path, options });
-    const session = context.state.resumableSessions.resume[0] || context.state.resumableSessions.excluded[0];
-    session.visibility = options.body.visibility;
-    session.visibility_revision += 1;
-    if (session.visibility === "HIDDEN") {
-      context.state.resumableSessions.resume = [];
-      context.state.resumableSessions.excluded = [session];
-    } else {
-      context.state.resumableSessions.resume = [session];
-      context.state.resumableSessions.excluded = [];
-    }
-    return { status: "RESUMABLE_SESSION_VISIBILITY_UPDATED" };
+    return {
+      status: "RESUMABLE_SESSION_VISIBILITY_UPDATED",
+      visibility: options.body.visibility,
+      revision: options.body.expected_revision + 1,
+    };
   },
-  loadResumableSessions: async () => context.state.resumableSessions,
+  loadResumableSessions: async () => new Promise(() => {}),
   createTerminalTab: async (coordinate, session) => created.push({ coordinate, session }), toast: (message) => { throw new Error(message); }
 };
 vm.createContext(context);

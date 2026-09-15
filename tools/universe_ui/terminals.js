@@ -2275,7 +2275,7 @@ async function setResumeSessionExcluded(session, excluded) {
   const sessionId = String(session?.session_id || "").trim();
   const projectId = String(session?.project_id || "").trim();
   if (!sessionId || !projectId) throw new Error("재개 세션 식별자가 없습니다");
-  await api("/v1/sessions/resumable/visibility", {
+  const updated = await api("/v1/sessions/resumable/visibility", {
     method: "POST",
     body: {
       project_id: projectId,
@@ -2284,7 +2284,20 @@ async function setResumeSessionExcluded(session, excluded) {
       expected_revision: Number(session.visibility_revision || 0),
     },
   });
-  await loadResumableSessions();
+  const payload = state.resumableSessions || { reattach: [], resume: [], excluded: [], incompatible: [] };
+  const sameSession = (item) => String(item?.project_id || "") === projectId
+    && String(item?.session_id || "") === sessionId;
+  const current = [...(payload.resume || []), ...(payload.excluded || [])].find(sameSession) || session;
+  const row = {
+    ...current,
+    visibility: String(updated.visibility || (excluded ? "HIDDEN" : "VISIBLE")),
+    visibility_revision: Number(updated.revision ?? current.visibility_revision ?? 0),
+  };
+  payload.resume = (payload.resume || []).filter((item) => !sameSession(item));
+  payload.excluded = (payload.excluded || []).filter((item) => !sameSession(item));
+  if (resumeSessionExcluded(row)) payload.excluded.push(row);
+  else payload.resume.push(row);
+  state.resumableSessions = payload;
   renderTerminalNewMenu();
 }
 
