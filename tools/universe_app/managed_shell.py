@@ -489,7 +489,8 @@ def managed_host_provider_command(
 
     ``cmd /s`` cannot safely carry literal quotes, so the launch-time builder
     above remains fail-closed. A Rust Host writes this command only after its
-    persistent cmd shell exists. Arguments that cmd could expand or reinterpret
+    persistent cmd shell exists. Arguments that cmd could expand or reinterpret,
+    and non-ASCII arguments that the shell's active code page cannot preserve,
     are placed in Host-owned environment slots as an already encoded Windows
     argv token and inserted with delayed expansion. Expansion happens after cmd
     has parsed operators, while the child still receives the exact
@@ -511,7 +512,8 @@ def managed_host_provider_command(
                     "argument contains a character that cannot cross a command line",
                 )
         if (
-            '"' in part
+            not part.isascii()
+            or '"' in part
             or _CMD_EXPANSION_CHARACTER in part
             or _CMD_DELAYED_EXPANSION_CHARACTER in part
         ):

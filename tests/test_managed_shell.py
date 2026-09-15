@@ -119,6 +119,17 @@ class ManagedShellCmdlineTests(unittest.TestCase):
         self.assertEqual(f"more | claude.exe --json-schema !{name}!", line)
         self.assertEqual(subprocess.list2cmdline([schema]), environment[name])
 
+    def test_host_command_defers_non_ascii_without_cmd_codepage_loss(self) -> None:
+        rules = "THROWACCEPT 한글 🚀 single-line"
+
+        line, environment = managed_host_provider_command(
+            ["grok.exe", "--rules", rules],
+        )
+
+        name = "UNIVERSE_PROVIDER_ARGUMENT_0002"
+        self.assertEqual(f"grok.exe --rules !{name}!", line)
+        self.assertEqual(subprocess.list2cmdline([rules]), environment[name])
+
     def test_stream_protocol_can_receive_console_input_through_one_cmd(self) -> None:
         line = managed_shell_cmdline(
             ["claude.exe", "--input-format", "stream-json"],

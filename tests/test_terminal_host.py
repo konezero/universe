@@ -808,6 +808,45 @@ class TerminalHostTests(unittest.TestCase):
             finally:
                 host.terminate(created["terminal_id"])
 
+    def test_rust_host_defers_grok_unicode_rules_through_environment(self) -> None:
+        registry = FakeReconnectionRegistry()
+        persona = "THROWACCEPT 한글 🚀 single-line"
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "universe_app.terminal_host.resolve_cli_executable",
+            return_value="grok.exe",
+        ), patch(
+            "universe_app.terminal_host.resolve_shell_identity",
+            return_value=ProcessIdentity(pid=4243, started_at=124.5),
+        ):
+            host = TerminalHost(reconnection_registry=registry)
+            created = host.create(
+                project_id="universe",
+                mode="MASTER",
+                cwd=tmp,
+                session_anchor_ref="anchor-rust-host-grok-persona",
+                provider="GROK",
+                supervisor_session_id="grok-persona-session",
+                persona_prompt=persona,
+            )
+            try:
+                launch = registry.launches[0]
+                name = next(
+                    key
+                    for key, value in launch["environment"].items()
+                    if persona in value
+                )
+                self.assertEqual(
+                    ("/d", "/q", "/v:on", "/k"),
+                    launch["shell_args"],
+                )
+                command = registry.clients[
+                    "anchor-rust-host-grok-persona"
+                ].executions[0].decode("utf-8")
+                self.assertIn(f"--rules !{name}!", command)
+                self.assertNotIn(persona, command)
+            finally:
+                host.terminate(created["terminal_id"])
+
     def test_session_host_registers_identity_before_cli_execute(self) -> None:
         registry = FakeReconnectionRegistry()
         observations: list[tuple[int, bool]] = []
