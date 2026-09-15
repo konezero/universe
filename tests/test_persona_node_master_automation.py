@@ -123,27 +123,46 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(409, status, result)
         self.assertEqual("PERSONA_ASSIGNMENT_NODE_PROJECT_MISMATCH", result["error_code"])
 
-    def test_conductor_automation_ignores_any_stored_node_ref(self):
-        # Even if a CONDUCTOR Anchor's assignment happened to carry a
-        # node_ref, automation ownership resolution never consults it for
-        # CONDUCTOR mode -- the project-wide path is unconditional.
+    def test_conductor_cannot_claim_a_node_ref_assignment_at_all(self):
+        # 2026-09-15 follow-up (Conductor review): a non-MASTER Anchor
+        # claiming a node_ref would occupy the exclusive-owner slot (the
+        # partial unique index is mode-agnostic) and permanently block the
+        # real MASTER from ever being assigned that node -- the reverse of
+        # "harmless, automation just won't start". Only a MASTER-mode
+        # Anchor may hold a node-scoped assignment at all now; this
+        # supersedes the older, weaker test that a CONDUCTOR's automation
+        # merely ignored a node_ref it was allowed to hold.
         anchor = self.register("CONDUCTOR", "node-master-conductor-with-node")
         persona = self.make_persona()
-        node_ref = self.make_feature_node("conductor-node-ignored")
-        status, assigned = self.act("persona.assign", {
+        node_ref = self.make_feature_node("conductor-node-rejected")
+        status, rejected = self.act("persona.assign", {
             "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
             "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
             "node_ref": node_ref,
         })
-        self.assertEqual(200, status, assigned)
-        status, started = self.act("persona.automation.start", {
-            "project_id": "TEST", "session_anchor_ref": anchor, "scope": "x", "instruction": "x",
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("PERSONA_ASSIGNMENT_NODE_REQUIRES_MASTER", rejected["error_code"])
+        # The node remains free for a real MASTER to claim.
+        master_anchor = self.register("MASTER", "node-master-conductor-rejected-then-master")
+        status, bound = self.act("persona.assign", {
+            "session_anchor_ref": master_anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
         })
-        self.assertEqual(201, status, started)
-        self.assertIsNone(started["run"]["node_ref"])
-        # Free the project-wide bucket for other tests in this class.
-        status, stopped = self.act("persona.automation.stop", {"run_id": started["run"]["run_id"]})
-        self.assertEqual(200, status, stopped)
+        self.assertEqual(200, status, bound)
+
+    def test_conductor_project_wide_persona_assignment_still_works_unchanged(self):
+        # The MASTER-only requirement applies ONLY when node_ref is
+        # present. Ordinary, node_ref-less persona assignment for a
+        # CONDUCTOR (its actual, existing use) is completely unaffected.
+        anchor = self.register("CONDUCTOR", "node-master-conductor-plain-assign")
+        persona = self.make_persona()
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assigned)
+        self.assertIsNone(assigned["assignment"]["node_ref"])
 
     def test_master_assign_with_valid_node_ref_succeeds_and_reads_back(self):
         anchor = self.register("MASTER", "node-master-valid")
@@ -159,6 +178,39 @@ class NodeMasterAutomationTests(unittest.TestCase):
         status, read_back = self.act("persona.assignment-read", {"session_anchor_ref": anchor})
         self.assertEqual(200, status, read_back)
         self.assertEqual(node_ref, read_back["assignment"]["node_ref"])
+
+    def test_node_writes_are_refused_when_uniqueness_index_not_enforced(self):
+        # 2026-09-15 second follow-up (Conductor review): a diagnostic flag
+        # that nothing actually checks is not a guarantee. Flip the flag
+        # the way a failed migration would leave it, and confirm both
+        # node-scoped write paths refuse rather than silently proceed as
+        # if exclusivity still held -- then restore it so later tests in
+        # this class are unaffected.
+        node_ref = self.make_feature_node("integrity-gate-node")
+        anchor = self.register("MASTER", "node-master-integrity-gate")
+        persona = self.make_persona()
+        original = self.server.store.node_owner_uniqueness_enforced
+        self.server.store.node_owner_uniqueness_enforced = False
+        try:
+            status, rejected = self.act("persona.assign", {
+                "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+                "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+                "node_ref": node_ref,
+            })
+            self.assertEqual(409, status, rejected)
+            self.assertEqual("NODE_OWNERSHIP_INTEGRITY_UNCONFIRMED", rejected["error_code"])
+        finally:
+            self.server.store.node_owner_uniqueness_enforced = original
+        # Ordinary node_ref-less assignment is unaffected by the flag.
+        self.server.store.node_owner_uniqueness_enforced = False
+        try:
+            status, plain = self.act("persona.assign", {
+                "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+                "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            })
+            self.assertEqual(200, status, plain)
+        finally:
+            self.server.store.node_owner_uniqueness_enforced = original
 
     # -- reassignment: atomic handoff + revision-of-any-existing-row -----
     # (2026-09-15 follow-up: Conductor review of the node-binding UI)

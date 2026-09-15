@@ -1057,6 +1057,37 @@ class ReconnectionPty:
         return dict(self.client.request("turn_offer", supervisor_id=self.supervisor_id,
                                         channel=dict(payload)).get("channel") or {})
 
+    def push_node_projection(
+        self, *, node_ref: str | None, assignment_revision: int, state: str
+    ) -> dict[str, Any]:
+        """Push this exact, sealed Anchor's current node-assignment
+        projection to the live Host (2026-09-15: Session/PTY Supervisor ->
+        Host node projection sync). `session_anchor_ref` is always this
+        adapter's own bound Anchor, never caller-supplied -- the Host
+        itself refuses anything else (HOST_NODE_PROJECTION_ANCHOR_MISMATCH).
+
+        Raises ReconnectionHostError(code="HOST_ACTION_UNSUPPORTED") when
+        talking to an older Host binary that predates this protocol --
+        callers must treat that as "sync unconfirmed" (a real, disclosed
+        gap), never as a silent success or a hard failure of the
+        assignment write itself, which already durably landed in
+        UniverseStore before this push is attempted.
+        """
+
+        channel = {
+            "session_anchor_ref": self.anchor_ref,
+            "state": state,
+            "assignment_revision": int(assignment_revision),
+        }
+        if node_ref is not None:
+            channel["node_ref"] = node_ref
+        return dict(
+            self.client.request(
+                "node_projection", supervisor_id=self.supervisor_id, channel=channel
+            ).get("channel")
+            or {}
+        )
+
     def turn_delivery_status(self) -> dict[str, Any]:
         return dict(self.client.request("turn_delivery_status", supervisor_id=self.supervisor_id,
                                         channel={}).get("channel") or {})

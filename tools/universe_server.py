@@ -20152,6 +20152,24 @@ class UniverseStore:
                     HTTPStatus.CONFLICT,
                 )
             if node_ref is not None:
+                if not self.node_owner_uniqueness_enforced:
+                    # The DB-level exclusivity guarantee is not actually in
+                    # place (the partial unique index failed to create --
+                    # see _initialize). A diagnostic flag alone changes
+                    # nothing if writes keep proceeding as though it were
+                    # enforced, so node-scoped writes are refused outright
+                    # until the underlying data conflict is resolved and a
+                    # restart re-attempts the index (2026-09-15 Conductor
+                    # review: "진단만 추가한 것일 뿐 단일성 보장이 아니다").
+                    # Ordinary, node_ref-less persona assignment is
+                    # unaffected -- only the node-ownership guarantee this
+                    # index exists for is unavailable.
+                    raise UniverseError(
+                        "NODE_OWNERSHIP_INTEGRITY_UNCONFIRMED",
+                        "node-scoped assignment is refused: the DB-level node-ownership "
+                        "uniqueness index is not currently enforced (see schema_migration_diagnostic)",
+                        HTTPStatus.CONFLICT,
+                    )
                 # Node ownership is exclusive: at most one ACTIVE assignment
                 # may hold a given (project, node_ref) at a time (the
                 # session_persona_assignment_node_owner partial unique index
@@ -23480,6 +23498,18 @@ class UniverseStore:
                 stored["created_at"] = existing["created_at"]
                 return stored, False
             if message["node_ref"] is not None:
+                if not self.node_owner_uniqueness_enforced:
+                    # Without the DB-level exclusivity guarantee, the
+                    # fetchone() below would pick an arbitrary row if
+                    # duplicates exist -- refuse rather than silently
+                    # accept an ambiguous owner (2026-09-15 Conductor
+                    # review).
+                    raise UniverseError(
+                        "NODE_OWNERSHIP_INTEGRITY_UNCONFIRMED",
+                        "node-scoped work cannot be queued: the DB-level node-ownership "
+                        "uniqueness index is not currently enforced (see schema_migration_diagnostic)",
+                        HTTPStatus.CONFLICT,
+                    )
                 # The server derives the current owner at creation time --
                 # never trusted from the request. A node with no ACTIVE
                 # Master assignment cannot receive node-scoped work (there
@@ -31951,6 +31981,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         project_id = _identifier(value["project_id"], "project_id")
         self._validate_persona_assignment_anchor(project_id, value["session_anchor_ref"])
         node_ref = self._validate_persona_assignment_node_ref(project_id, value.get("node_ref"))
+        if node_ref is not None:
+            # The node_owner partial unique index is mode-agnostic (it has
+            # to be -- it enforces exclusivity on the durable table, which
+            # has no live mode of its own). Without this check, a non-
+            # MASTER Anchor (e.g. CONDUCTOR, or any session that happens to
+            # call this Action) could claim a node_ref first and then block
+            # the real MASTER from ever being assigned that node -- the
+            # unique index would reject the MASTER's assign as "already
+            # owned" by a session that can never actually run automation
+            # for it. This is the reverse of "non-MASTER can't monopolize";
+            # a non-MASTER CAN occupy and deny the slot (2026-09-15
+            # Conductor review: this was reported backwards before being
+            # corrected here). Ordinary node_ref-less persona assignment
+            # (P1) is completely unaffected.
+            if "MASTER" not in self._anchor_modes(value["session_anchor_ref"]):
+                raise UniverseError(
+                    "PERSONA_ASSIGNMENT_NODE_REQUIRES_MASTER",
+                    "only a MASTER-mode Session Anchor may hold a node-scoped (node_ref) assignment",
+                    HTTPStatus.CONFLICT,
+                )
         return self.store.assign_persona({**value, "node_ref": node_ref}, actor)
 
     def _handle_persona_assignment_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:

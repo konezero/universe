@@ -1,5 +1,6 @@
 mod turn_delivery;
 mod native_queue;
+mod node_projection;
 use base64::Engine;
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,7 @@ struct HostSnapshot {
     auth_token: String,
     #[serde(serialize_with = "turn_delivery::serialize_recent")]
     turn_delivery: turn_delivery::TurnDelivery,
+    node_projection: node_projection::NodeProjection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +147,7 @@ struct PublicSnapshot {
     channel_enabled: bool,
     channel_registered: bool,
     turn_delivery: turn_delivery::TurnDelivery,
+    node_projection: node_projection::NodeProjection,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,6 +554,7 @@ impl From<&HostSnapshot> for PublicSnapshot {
             channel_enabled: value.channel_enabled,
             channel_registered: value.channel_registered,
             turn_delivery: value.turn_delivery.clone(),
+            node_projection: value.node_projection.clone(),
         }
     }
 }
@@ -901,6 +905,23 @@ fn apply_request(
             }
             channel_success(state,serde_json::to_value(&state.turn_delivery).unwrap())
         }
+        "node_projection" => {
+            // A Supervisor push, exactly like turn_offer: only the
+            // currently attached Supervisor may write it. Read-only
+            // observation of the current projection is already covered by
+            // "status" (PublicSnapshot always includes node_projection).
+            if let Err(response) = require_attached_supervisor(state, &request) {
+                return *response;
+            }
+            let payload = request.channel.unwrap_or_else(|| json!({}));
+            match state
+                .node_projection
+                .apply(&payload, &state.anchor_ref.clone(), now_unix_ms() as u64)
+            {
+                Ok(_) => channel_success(state, serde_json::to_value(&state.node_projection).unwrap()),
+                Err((code, detail)) => failure(code, detail),
+            }
+        }
         "status" => success(state),
         "bind_provider_session" => {
             let provider = request.provider.unwrap_or_default().trim().to_ascii_uppercase();
@@ -1179,6 +1200,7 @@ fn handle_connection(
         }
     };
     let before_turn_revision = state.turn_delivery.revision;
+    let before_node_projection_revision = state.node_projection.revision;
     state.turn_delivery.expire_submit(now_unix_ms());
     let before_generation = state.attachment_generation;
     let before_session_binding_generation = state.session_binding_generation;
@@ -1204,6 +1226,7 @@ fn handle_connection(
     );
     if response.status == "OK"
         && (before_turn_revision != state.turn_delivery.revision
+            || before_node_projection_revision != state.node_projection.revision
             || before_generation != state.attachment_generation
             || before_session_binding_generation != state.session_binding_generation
             || before_provider != state.provider
@@ -1305,6 +1328,7 @@ fn serve(config: Config) -> Result<(), String> {
         channel_registered: false,
         auth_token: config.token,
         turn_delivery: turn_delivery::TurnDelivery { native_queue_available: terminal.native_queue.is_some(), ..Default::default() },
+        node_projection: Default::default(),
     };
     atomic_write_state(&config.state_file, &state)?;
     if let (Some(path), Some(bootstrap)) = (
@@ -1417,6 +1441,7 @@ mod tests {
             channel_registered: false,
             auth_token: "token".to_owned(),
             turn_delivery: Default::default(),
+            node_projection: Default::default(),
         }
     }
 

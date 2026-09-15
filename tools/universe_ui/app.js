@@ -5028,6 +5028,68 @@ function homeCard(id, titleText, { selected, blocked, unsel, bodyRows }) {
   return card;
 }
 
+// Fleet↔Persona node-binding entry point (2026-09-15 follow-up): Fleet
+// shows read-only node-owner status (fetched once per project, cached,
+// re-rendered on arrival -- same shape as ensureHomeTodoResult above) and
+// a link into the SAME Persona "노드 담당 Master" editor -- it never
+// duplicates the assign/unassign/handoff write logic, only reads for
+// display and links out for writes. Only FEATURE-kind nodes carry a real
+// feature_node identity (node_id "feat:<feature_id>"); structural/domain
+// graph nodes have no feature_id and are explicitly out of node-binding's
+// supported scope, not silently treated as unassigned.
+async function ensureHomeNodeOwners() {
+  const projectId = String(state.selectedProject?.project_id || "");
+  if (!projectId) return;
+  if (state.homeNodeOwnersProjectId === projectId && state.homeNodeOwners) return;
+  if (state.homeNodeOwnersPending === projectId) return;
+  state.homeNodeOwnersPending = projectId;
+  try {
+    const result = await invokeServerAction("persona.assignments-list", { project_id: projectId });
+    if (String(state.selectedProject?.project_id || "") !== projectId) return; // project changed mid-fetch
+    const owners = new Map();
+    for (const assignment of result.assignments || []) {
+      if (assignment.state === "ACTIVE" && assignment.node_ref) owners.set(assignment.node_ref, assignment);
+    }
+    state.homeNodeOwners = owners;
+    state.homeNodeOwnersProjectId = projectId;
+  } catch (_error) {
+    state.homeNodeOwners = null;
+    state.homeNodeOwnersProjectId = null;
+  } finally {
+    if (state.homeNodeOwnersPending === projectId) state.homeNodeOwnersPending = null;
+    if (String(state.selectedProject?.project_id || "") === projectId) renderIntegratedHome();
+  }
+}
+
+function goToNodeMasterBinding(featureId) {
+  state.pendingPersonaNodeScrollTarget = featureId || null;
+  showProjectScreen("persona");
+}
+
+function renderHomeNodeOwnerRow(graphNode) {
+  if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") return null;
+  const featureId = homeNodeRefKey(graphNode.node_id);
+  void ensureHomeNodeOwners();
+  const row = node("div", "home-card-meta");
+  const owners = state.homeNodeOwners;
+  if (owners === null) {
+    row.append(node("span", "", "담당 Master 조회 실패"));
+  } else if (!owners) {
+    row.append(node("span", "", "담당 Master 확인 중…"));
+  } else {
+    const owner = owners.get(featureId);
+    row.append(node("span", "", owner ? `담당: ${owner.session_anchor_ref}` : "담당 Master 미배정"));
+  }
+  const link = node("button", "home-node-archive", "결속 관리 →");
+  link.type = "button";
+  link.addEventListener("click", (event) => {
+    event.stopPropagation();
+    goToNodeMasterBinding(featureId);
+  });
+  row.append(link);
+  return row;
+}
+
 function renderHomeNodes(selNode) {
   const listEl = document.querySelector("#home-node-list");
   const head = document.querySelector("#home-nodes-head");
@@ -5115,6 +5177,8 @@ function renderHomeNodes(selNode) {
       archiveRow.append(archiveBtn);
       rows.push(archiveRow);
     }
+    const ownerRow = renderHomeNodeOwnerRow(graphNode);
+    if (ownerRow) rows.push(ownerRow);
 
     const card = homeCard(`node:${graphNode.node_id}`, graphNode.title || graphNode.node_id, {
       selected,
@@ -18025,7 +18089,14 @@ async function renderPersona() {
   nodeSection.append(node("h3", "", "노드 담당 Master"));
   nodeSection.append(node("p", "persona-hint",
     "각 노드(feature_node)를 자동화로 소유할 MASTER 세션을 배정/변경/해제합니다. "
-    + "프로젝트 Conductor(node_ref 없음)의 전체 범위와는 별개입니다."));
+    + "프로젝트 Conductor(node_ref 없음)의 전체 범위와는 별개입니다. "
+    + "구조/도메인 노드(feature_node가 아닌 그래프 노드)는 이 배정 대상이 아닙니다."));
+  if (state.pendingPersonaNodeScrollTarget) {
+    const backButton = node("button", "", "← Fleet로 돌아가기");
+    backButton.type = "button";
+    backButton.addEventListener("click", () => showGoalPlanView());
+    nodeSection.append(backButton);
+  }
 
   const renderNodeSectionError = (message, onRetry) => {
     nodeSection.append(node("p", "memory-action-error", message));
@@ -18081,6 +18152,7 @@ async function renderPersona() {
       const table = node("div", "persona-node-table");
       for (const feature of features) {
         const row = node("div", "persona-node-row");
+        row.dataset.featureId = feature.feature_id;
         row.append(node("strong", "", feature.title || feature.feature_id));
         const assignment = nodeOwnerByFeatureId.get(feature.feature_id) || null;
         const ownerAnchor = assignment ? assignment.session_anchor_ref : null;
@@ -18399,6 +18471,14 @@ async function renderPersona() {
     listSection.append(card);
   }
   root.append(listSection);
+
+  if (state.pendingPersonaNodeScrollTarget) {
+    const target = nodeSection.querySelector(
+      `.persona-node-row[data-feature-id="${CSS.escape(state.pendingPersonaNodeScrollTarget)}"]`
+    );
+    state.pendingPersonaNodeScrollTarget = null;
+    if (target) target.scrollIntoView({ block: "center" });
+  }
 }
 
 function renderMemoryLegacy() {

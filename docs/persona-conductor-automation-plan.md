@@ -645,6 +645,174 @@ changes_nothing`, `test_handoff_from_naming_the_wrong_owner_is_rejected`)이
   시작되지 않음"으로 명시적으로 보여주는 것은 하지 않았다(NOT_RUN, 작은
   후속).
 
+**11절 정정(2026-09-15, 같은 날 후속 Conductor 검토 후)**: 위 "비-MASTER
+persona가 노드를 독점하는지" 결론은 **틀렸다** -- 유일성 제약이 mode
+무관이므로, 비-MASTER가 먼저 그 슬롯을 차지하면 진짜 MASTER는 배정 자체를
+못 받는다(반대 방향의 실제 서비스 거부). 12절에서 MASTER 전용 검증을
+추가해 바로잡았다.
+
+## 12. P5 3차 후속 -- 로직 버그 정정, Fleet 완결, Rust Host projection 구현
+(2026-09-15)
+
+Conductor 검토가 지적한 항목을 반영: (1) 비-MASTER 노드 독점 로직 정정,
+(2) migration 무결성 플래그가 쓰기 경로를 실제로 막지 않던 문제 수정,
+(3) Fleet에서 노드 결속으로 직접 진입/복귀, (4) native select를 통한 실제
+handoff 클릭 완주, (5) Rust Session/PTY Supervisor → Host node projection
+동기화 실제 구현(이전엔 NOT_RUN이었던 항목).
+
+### 12.1 로직 버그 2건 정정
+
+- **비-MASTER의 노드 슬롯 선점**: `persona.assign`이 `node_ref`를 받을 때
+  이제 그 Anchor가 MASTER mode로 등록돼 있는지 먼저 검증한다
+  (`PERSONA_ASSIGNMENT_NODE_REQUIRES_MASTER`, 409). CONDUCTOR나 그 외
+  mode는 애초에 node_ref를 가질 수 없으므로, 유일성 제약 슬롯을 선점해
+  진짜 MASTER의 배정을 막는 시나리오 자체가 발생할 수 없다. 범용
+  node_ref-없는 persona 배정(P1, CONDUCTOR 포함)은 완전히 그대로다.
+- **migration 무결성 미실행**: `node_owner_uniqueness_enforced=False`
+  플래그를 실제로 검사하도록 `assign_persona`의 node_ref 쓰기 경로와
+  `create_master_message`의 node-scoped 큐 생성 경로 양쪽에
+  `NODE_OWNERSHIP_INTEGRITY_UNCONFIRMED`(409) 거부를 추가했다. 일반
+  persona 배정(node_ref 없음)은 영향받지 않는다 -- 노드 소유권 보장이
+  실제로 없을 때만 노드-스코프 쓰기를 막는다.
+- 검증: `tests/test_persona_node_master_automation.py`에 4건 추가/재작성
+  (`test_conductor_cannot_claim_a_node_ref_assignment_at_all`,
+  `test_conductor_project_wide_persona_assignment_still_works_unchanged`,
+  `test_node_writes_are_refused_when_uniqueness_index_not_enforced`, 그리고
+  이제 도달 불가능해진 옛 "CONDUCTOR가 node_ref를 들고 있어도 무시된다"
+  테스트를 "CONDUCTOR는 애초에 가질 수 없다"로 교체). 총 105건 회귀 PASS.
+
+### 12.2 Fleet ↔ Persona 노드 결속 완결
+
+`tools/universe_ui/app.js`의 `renderHomeNodes`(Fleet NODES 컬럼)에 각
+FEATURE-kind 노드 카드마다 실제 담당 Master 상태(요약)와 "결속 관리 →"
+버튼을 추가했다 (`renderHomeNodeOwnerRow`, `ensureHomeNodeOwners` --
+`ensureHomeTodoResult`와 동일한 fetch-once-cache-rerender 패턴,
+`persona.assignments-list`를 프로젝트당 1회만 호출). 구조/도메인 노드
+(feature_node가 아닌 그래프 노드, FEATURE-kind 아님)에는 이 버튼이 아예
+나타나지 않는다 -- 지원 범위 밖임을 조용한 누락이 아니라 명시적 조건
+분기로 구분했다. 클릭 시 `showProjectScreen("persona")`로 이동하고
+(`goToNodeMasterBinding`), 도착한 Persona 화면이 해당 노드 행으로
+자동 스크롤한다(`state.pendingPersonaNodeScrollTarget`,
+`row.dataset.featureId`). Persona 쪽 노드 섹션에는 "← Fleet로 돌아가기"
+버튼이 나타나(`showGoalPlanView()` 재사용), 선택된 프로젝트/Fleet 노드
+선택 상태(`state.selectedProject`, `state.homeNodeId`)는 화면 전환 중
+전역 상태라 그대로 보존된다. 배정/해제/handoff 쓰기 로직은 전부 기존
+"노드 담당 Master" 섹션 그대로이며 Fleet 쪽에 별도로 만들지 않았다(중복
+쓰기 로직 없음, 읽기 전용 요약 + 진입 링크만 추가).
+
+### 12.3 실 클릭으로 handoff_from 전체 경로 완주 (10절의 미완료를 이어서 완료)
+
+이전 라운드는 "네이티브 select 팝업을 CDP 도구로 완주하지 못했다"고 정직히
+기록했다. 이번엔 `form_input`(요소 ref에 값을 설정, 실제 change 이벤트를
+발생시켜 앱의 실제 이벤트 핸들러를 통과함 -- API 직접 호출이 아니다)로
+Node A의 세션 선택기를 CODEX 세션으로 바꾼 뒤 "다른 세션으로 변경" 버튼을
+실제로 클릭해 전체 handoff_from 경로를 완주했다. 결과를
+`persona.assignments-list`로 직접 대조: 옛 소유자(CLAUDE 세션) 행은
+`node_ref=null, state=ACTIVE, revision 1→2`로 원자적으로 비워졌고, 새
+소유자(CODEX 세션) 행은 `node_ref=feature_..., state=ACTIVE, revision=1`로
+새로 생성됨 -- 서버가 기록한 실제 트랜잭션 결과이지 클라이언트의 추측이
+아니다. 이 두 API 조회는 검증(readback)이며, 실제 조작 자체는 select
+`form_input` + button 클릭으로 수행했다는 점을 구분해 기록한다.
+
+또한 Fleet→Persona 진입, 노드 섹션 자동 스크롤, "Fleet로 돌아가기"
+클릭까지의 프로젝트/노드 선택 유지도 실제 클릭으로 확인했다(격리
+in-process 서버, 아래 12.4). 격리 프로젝트에는 실제 Goal/Todo 연결이
+없어 Fleet의 unified_graph 투영에 아무 노드도 나타나지 않는 사실을 먼저
+발견했다 -- feature_node 존재만으로는 Fleet에 뜨지 않고, Goal/Todo가
+그 node_ref를 참조해야 unified_graph에 그래프된다(서버 투영 로직, 이번에
+새로 만든 동작이 아니라 기존 계약을 그대로 발견/재확인한 것). 이 사실을
+그대로 이용하기엔 실제 입양(adoption) 파이프라인 설정이 너무 크므로,
+Fleet 카드 렌더링 자체(이번에 변경한 코드)만 격리 검증하기 위해
+`state.projection.unified_graph.nodes`를 JS로 직접 주입하는 테스트 전용
+shim을 썼다 -- 이는 명시적으로 disclosed된 fixture이며, 실제 앱 코드
+경로(카드 렌더링, 버튼 클릭, 화면 전환, 스크롤)는 전부 실제로 실행됐다.
+스크린샷: `.artifacts/ui/persona-node-binding-handoff-result-20260915.jpg`,
+`.artifacts/ui/persona-node-binding-isolated-clicks-20260915.jpg`(로컬).
+
+### 12.4 CDP 스크린샷 타임아웃 -- 더 강한 반증, 여전히 인과 미확정
+
+이번에도 여러 차례 간헐 재현(격리 서버, 클릭 직후, 순수 scroll_to 이후
+등). 계속 인과를 확정하지 않는다.
+
+### 12.5 Rust Session/PTY Supervisor → Host node projection 동기화 -- 실제 구현
+
+이전 라운드의 "IPC에 이 메시지 종류가 없다"는 정확했지만, 사용자가 정확히
+지적한 대로 이는 "추가할 위치를 찾았다"는 뜻이지 불가능이 아니었다. 실제
+Rust 코드를 조사해(`tools/session_host/src/main.rs`, `turn_delivery.rs`가
+과거에 정확히 이 방식으로 새 기능을 추가한 선례) 같은 패턴으로 구현했다.
+
+**Rust (`tools/session_host/src/node_projection.rs`, 신규 모듈)**:
+`NodeProjection` 구조체(`projection_state`, `node_ref`,
+`owner_session_anchor_ref`, `owner_assignment_revision`, `received_at_ms`,
+`revision`)와 그 유일한 변경 지점 `apply()`. 검증 규칙: (1) 요청의
+`session_anchor_ref`가 이 Host 자신의 `anchor_ref`(sealed, 요청에서 신뢰
+안 함)와 다르면 `HOST_NODE_PROJECTION_ANCHOR_MISMATCH`로 거부(cross-anchor
+거부). (2) 이미 기록된 revision보다 낮은 revision은
+`HOST_NODE_PROJECTION_STALE`로 거부(stale/out-of-order 거부), 단 **같은**
+revision의 재전송(replay)은 멱등하게 수락(Supervisor가 응답을 분실하고
+재시도하는 실제 시나리오). (3) `state`는 ACTIVE/UNASSIGNED만 허용, ACTIVE인데
+`node_ref`가 없으면 거부. `main.rs`에 새 `"node_projection"` action을
+등록했고, 기존 `require_attached_supervisor`(turn_offer가 쓰는 것과 동일한
+보안 경계)를 그대로 재사용해 "현재 attach된 Supervisor만 쓸 수 있다"는
+provider ref/mode sealing과 동일한 원칙을 적용했다. 읽기는 별도 action
+없이 기존 `"status"`(PublicSnapshot)에 항상 포함되도록 했다 -- 새 읽기
+전용 action을 늘리지 않았다. `handle_connection`의 상태-파일 dirty-check
+목록에 `node_projection.revision`을 추가하지 않으면 성공한 projection이
+디스크에 저장되지 않는 실제 버그가 있었다 -- 직접 발견하고 즉시 수정.
+
+**격리 빌드/테스트(생산 바이너리는 건드리지 않음)**: 리포의
+`Cargo.toml` `[[bin]] name`이 실제 배포 바이너리 이름과 같아
+`cargo build --release`를 리포 디렉터리에서 그냥 실행하면 현재 사용 중인
+라이브 Host 실행 파일을 덮어쓰려다 실패한다(실제로 한 번 시도해
+"액세스가 거부되었습니다"로 막힘 -- OS가 잠긴 파일이라 보호함, 데이터
+손상 없음). `--target-dir`을 완전히 별도의 임시 폴더로 지정해 다시
+빌드했고, 이 세션 전체에서 실행 중인 사용자 Host는 전혀 건드리지 않았다.
+`cargo test`(전체 30건: 기존 24건 + node_projection 신규 6건) 전부 PASS.
+격리된 새 바이너리를 **직접 프로세스로 실행**하고(실 HTTP 아님 -- Host의
+실제 wire 프로토콜은 개행-구분 JSON-over-TCP다, `read_request`/
+`write_response` 확인 후 정확한 프로토콜로 재작성) attach 전 거부→attach→
+실제 ACTIVE projection 수락→cross-anchor 거부→stale(구 revision) 거부→
+동일 revision replay 수락→UNASSIGNED 전이→최종 status 반영까지 9단계
+전부 실제 프로세스 간 통신으로 확인(스크립트에 각 단계 출력 남김). 상태
+파일에 `node_projection`이 실제로 영속됨도 확인.
+
+**Python 어댑터(`tools/universe_app/reconnection_host.py`)**: `turn_offer`와
+동일한 형태로 `ReconnectionPty.push_node_projection(node_ref,
+assignment_revision, state)`를 추가했다 -- `session_anchor_ref`는 항상
+이 adapter 자신의 `self.anchor_ref`(sealed)이며 호출자가 다른 값을 줄 수
+없다. 구형 Host가 `"node_projection"` action을 모르면 기존
+`HOST_ACTION_UNSUPPORTED` 에러가 그대로 올라온다 -- 이것이 곧 "미지원 Host"
+신호이며, 호출자는 이를 실패나 무음 성공이 아니라 "동기화 미확인"으로
+다뤄야 한다(문서화, 실제 호출부 연결은 아래 NOT_RUN).
+
+**NOT_RUN(정확한 경계, 숨기지 않음)**: (1) `push_node_projection`을 실제
+`assign_persona`/`unassign_persona`/handoff 성공 경로에 연결하는 것 --
+이러려면 배정 행에 `host_sync_status`/`host_sync_at` 같은 새 durable
+컬럼과 그 값을 UI가 "저장됨" vs "Host 확인됨" vs "미지원"으로 구분
+표시하는 추가 UI 작업이 필요하다(별도 스키마 마이그레이션 + UI 상태
+분기, 이번 회차엔 하지 않음). (2) 이 새 Rust 바이너리를 실제 배포(어떤
+live Host에도 pty-restart로 반영하지 않았다) -- 이 세션이 지금 이 대화를
+포함해 여러 실제 활성 Master 세션의 Host를 운영 중이므로, 배포는 신/구
+Host 혼재 시나리오에 대한 훨씬 더 넓은 검증(실제 attach/reconnect
+재동기화를 살아있는 Supervisor로, 여러 Anchor로)이 필요하다고 판단해
+이번 회차에서 시도하지 않았다. 소스는 커밋하지만 프로덕션에 영향을 주는
+행동(빌드 배포·재시작)은 하지 않는다.
+
+### 12.6 검증 종합
+
+- 실 HTTP(Python): 105건 전부 PASS(4건 신규/재작성 포함).
+- 실 Rust(cargo test, 격리 target-dir): 30건 전부 PASS(6건 신규).
+- 실 격리 바이너리 프로세스(raw TCP, 실제 Host 실행 파일): 9단계 시나리오
+  전부 기대대로 동작, 상태 파일 영속 확인.
+- 실 브라우저(격리 in-process 서버, claude-in-chrome): Fleet 진입→배정→
+  handoff(select `form_input` + 버튼 클릭)→해제→Fleet 복귀까지 실제 클릭.
+  콘솔 에러 없음.
+- 여전히 NOT_RUN: orphan 큐 취소/재발급, 협의/escalation 실제 메시지
+  경로, node-scoped pause/stop/resume 검증, 실 Worker 파일럿 1건+검토
+  1회+보완 1회, Host projection의 실제 쓰기-경로 연결과 배포.
+- P1 여전히 IN_PROGRESS/미검증. 이 slice로 P1-P4 전체 provider/운영 Host
+  교체 수용 완료를 주장하지 않는다.
+
 The actual bounded P4 evidence is now under
 `.ai/runtime/tmp/dispatch-14eb816e105931ed/p4-actual-master-review-result.json`.
 It uses a fresh isolated server and a real Codex `gpt-5.6-luna` Master turn:
