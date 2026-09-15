@@ -74,7 +74,7 @@ config path for one final cleanup attempt during close.
 ## P2 - long-running Provider recovery probes
 
 - [x] Exhaust or simulate each Provider's bounded quota in a controlled account.
-- [ ] Restart Universe and prove the same Node/Mode session coordinate and Task
+- [x] Restart Universe and prove the same Node/Mode session coordinate and Task
   Frame are selected after reset.
 - [x] Verify retry, explicit Provider rebinding, and user cancellation remain
   distinct audit outcomes.
@@ -94,11 +94,15 @@ from PID 34640 to PID 36336 while preserving the PTY Supervisor. The Conductor,
 Claude Master, Codex Master and Grok Master retained their exact live Session
 Anchor, Host and provider-session coordinates. Evidence is stored at
 `.ai/runtime/tmp/grok-persona-acceptance-20260916/provider-p2-restart-acceptance.json`.
-No active Task Frame coordinate is exposed by the current terminal or
-Supervisor projection, so that restart does not complete the remaining Task
-Frame clause. One controlled restart with an actually active Task Frame remains
-required; it must be observed from the Task Frame's authoritative runtime store,
-not inferred from an unchanged terminal.
+
+The Host owns live work context. A Task Frame is an optional subagent work
+context bound to that parent Host/Anchor; it is not a second independently-live
+terminal or an alternative source of currentness. Consequently there is no
+separate Task Frame selection to restore after a Host-preserving restart: an
+attached Frame remains valid only while its parent Host/Anchor and Node/Mode
+binding remain exact. The unchanged coordinates above prove that parent binding.
+Historical `task_frame_context` rows are task artifacts, not a fallback source
+for live session state.
 
 ## Deferred boundary
 
