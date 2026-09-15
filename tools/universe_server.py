@@ -8064,6 +8064,18 @@ class UniverseStore:
                 # (2026-09-15: node-scoped MASTER automation ownership) -- it
                 # is never a free-text label like `scope`.
                 "node_ref": "TEXT",
+                # Durable record of whether the live Rust Host for this
+                # Anchor actually confirmed the node_ref/state this row now
+                # holds -- distinct from the DB write succeeding. CAS-guarded
+                # by host_sync_assignment_revision so a late/out-of-order
+                # Host acknowledgment can never be recorded as confirming a
+                # newer assignment than it actually reflects (2026-09-15
+                # Conductor review: "늦은 응답이 새 배정 성공으로 표시되지
+                # 않게 한다"). NULL/UNKNOWN until the first sync attempt.
+                "host_sync_status": "TEXT",
+                "host_sync_assignment_revision": "INTEGER",
+                "host_sync_at": "TEXT",
+                "host_sync_detail": "TEXT",
             }.items():
                 if column not in persona_assignment_columns:
                     connection.execute(
@@ -20038,10 +20050,63 @@ class UniverseStore:
             "unsupported_terminal_id": row["unsupported_terminal_id"],
             "unsupported_provider": row["unsupported_provider"],
             "unsupported_reason": row["unsupported_reason"],
+            # Whether the live Rust Host for this Anchor actually confirmed
+            # this row's node_ref/state -- SAVED means only the DB write
+            # succeeded (no Host reply recorded yet or the Host push has not
+            # been attempted); CONFIRMED means the Host acknowledged this
+            # exact assignment_revision; OFFLINE/UNSUPPORTED/ERROR are
+            # distinct failure reasons, never conflated with SAVED
+            # (2026-09-15 Conductor review: "저장됨/Host 확인됨/미확인·미지원·
+            # 오류를 정확히 표시").
+            "host_sync_status": row["host_sync_status"] or "SAVED",
+            "host_sync_assignment_revision": row["host_sync_assignment_revision"],
+            "host_sync_at": row["host_sync_at"],
+            "host_sync_detail": row["host_sync_detail"],
             "actor_ref": row["actor_ref"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def record_host_sync_receipt(
+        self,
+        *,
+        session_anchor_ref: str,
+        assignment_revision: int,
+        status: str,
+        detail: str = "",
+    ) -> dict[str, Any] | None:
+        """CAS-record whether a live Host confirmed one assignment revision.
+
+        Guarded on the row's CURRENT assignment_revision: a late reply for
+        an assignment_revision that is no longer current (a newer assign/
+        unassign/handoff has since landed) is a documented no-op, never a
+        write -- otherwise a late response could be recorded as if it
+        confirmed a newer assignment than it actually reflects (2026-09-15
+        Conductor review). ``status`` is one of SAVED, CONFIRMED, OFFLINE,
+        UNSUPPORTED, ERROR.
+        """
+
+        anchor = _required_text(session_anchor_ref, "session_anchor_ref")
+        if status not in {"SAVED", "CONFIRMED", "OFFLINE", "UNSUPPORTED", "ERROR"}:
+            raise UniverseError("HOST_SYNC_STATUS_INVALID", "unrecognized host_sync_status")
+        now = utc_now()
+        with self._connection() as connection:
+            updated = connection.execute(
+                "UPDATE session_persona_assignment SET host_sync_status = ?, "
+                "host_sync_assignment_revision = ?, host_sync_at = ?, host_sync_detail = ? "
+                "WHERE session_anchor_ref = ? AND assignment_revision = ?",
+                (status, assignment_revision, now, detail[:2000], anchor, assignment_revision),
+            )
+            row = connection.execute(
+                "SELECT * FROM session_persona_assignment WHERE session_anchor_ref = ?", (anchor,)
+            ).fetchone()
+        if updated.rowcount != 1:
+            # Not stale in a way that raises -- the assignment moved on
+            # (superseded) between the push attempt and this receipt, which
+            # is the exact late-response case this method exists to guard
+            # against.  Report it, do not write.
+            return {"status": "SUPERSEDED", "assignment": self._assignment_row(row)}
+        return {"status": "RECORDED", "assignment": self._assignment_row(row)}
 
     def read_persona_assignment(self, session_anchor_ref: str) -> dict[str, Any] | None:
         anchor = _required_text(session_anchor_ref, "session_anchor_ref")
@@ -20151,6 +20216,7 @@ class UniverseStore:
                     f"assignment revision changed; current revision is {current_revision}",
                     HTTPStatus.CONFLICT,
                 )
+            handoff_cleared = None
             if node_ref is not None:
                 if not self.node_owner_uniqueness_enforced:
                     # The DB-level exclusivity guarantee is not actually in
@@ -20214,6 +20280,15 @@ class UniverseStore:
                                 "handoff_from no longer matches the current owner; re-read and retry",
                                 HTTPStatus.CONFLICT,
                             )
+                        # Both sides of a handoff must reach the live Host,
+                        # not just the new owner's row -- capture the old
+                        # owner's post-clear revision here so the caller can
+                        # sync its UNASSIGNED state too (2026-09-15: "handoff는
+                        # 구소유 해제와 신소유 활성 둘 다 동기화").
+                        handoff_cleared = {
+                            "session_anchor_ref": handoff_anchor,
+                            "assignment_revision": handoff_revision + 1,
+                        }
                     else:
                         raise UniverseError(
                             "PERSONA_ASSIGNMENT_NODE_ALREADY_OWNED",
@@ -20258,6 +20333,7 @@ class UniverseStore:
                 "schema": "universe.persona-assign-result.v1",
                 "status": "PERSONA_ASSIGNED",
                 "assignment": self._assignment_row(row),
+                "handoff_cleared": handoff_cleared,
             }
 
         return self._persona_idempotent(value.get("request_id"), value, actor, write)
@@ -30102,10 +30178,12 @@ class _SessionAnchorTerminalHost:
         mode: str,
         provider: str = "",
         supervisor_session_id: str = "",
+        session_anchor_ref: str = "",
     ) -> dict[str, Any] | None:
         wanted_mode = str(mode or "").upper()
         wanted_provider = str(provider or "").upper()
         wanted_session = str(supervisor_session_id or "")
+        wanted_anchor = str(session_anchor_ref or "").strip()
 
         def matches(item: Mapping[str, Any]) -> bool:
             return (
@@ -30122,6 +30200,10 @@ class _SessionAnchorTerminalHost:
                     or str(item.get("supervisor_session_id") or "")
                     == wanted_session
                 )
+                and (
+                    not wanted_anchor
+                    or str(item.get("session_anchor_ref") or "") == wanted_anchor
+                )
             )
 
         candidate = self._host.find_live(
@@ -30129,6 +30211,7 @@ class _SessionAnchorTerminalHost:
             mode=mode,
             provider=provider,
             supervisor_session_id=supervisor_session_id,
+            **({"session_anchor_ref": session_anchor_ref} if session_anchor_ref else {}),
         )
         if isinstance(candidate, Mapping):
             projected_candidate = self._resolver(candidate)
@@ -31878,6 +31961,105 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             for session in sessions
         }
 
+    def _sync_node_projection(
+        self,
+        *,
+        session_anchor_ref: str,
+        project_id: str,
+        state: str,
+        assignment_revision: int,
+        node_ref: str | None,
+    ) -> None:
+        """Best-effort push of one committed node-assignment to its live Host.
+
+        The DB write already landed durably before this is ever called --
+        this can only add a host_sync_status receipt, never undo or block
+        the assignment.  Distinguishes OFFLINE (no live Host found for this
+        Anchor right now), UNSUPPORTED (an older Host binary that predates
+        the node_projection action -- HOST_ACTION_UNSUPPORTED, never
+        retried in a loop here), and ERROR (any other transport/protocol
+        failure) so the UI can show exactly which one applies, instead of
+        conflating "DB saved" with "Host confirmed" (2026-09-15 Conductor
+        review: "저장됨/Host 확인됨/미확인·미지원·오류를 정확히 표시").
+        """
+
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return
+        try:
+            self._sync_node_projection_unguarded(
+                anchor=anchor, project_id=project_id, state=state,
+                assignment_revision=assignment_revision, node_ref=node_ref,
+            )
+        except Exception as error:  # noqa: BLE001 - must never break an
+            # already-committed assignment write; the transport underneath
+            # (an HTTP proxy to the standalone PTY supervisor, or a raw TCP
+            # Host client) can raise things well outside TerminalHostError/
+            # SessionBusError (socket/http.client errors, timeouts). Record
+            # what happened and return -- never propagate out of an assign/
+            # unassign action handler.
+            try:
+                self.store.record_host_sync_receipt(
+                    session_anchor_ref=anchor, assignment_revision=assignment_revision,
+                    status="ERROR", detail=f"host sync failed: {error}",
+                )
+            except Exception:
+                pass
+
+    def _sync_node_projection_unguarded(
+        self,
+        *,
+        anchor: str,
+        project_id: str,
+        state: str,
+        assignment_revision: int,
+        node_ref: str | None,
+    ) -> None:
+        try:
+            terminal = self._session_anchor_terminal_host().find_live(
+                project_id=project_id, mode="MASTER", session_anchor_ref=anchor,
+            )
+        except (SessionBusError, TerminalHostError, UniverseError) as error:
+            self.store.record_host_sync_receipt(
+                session_anchor_ref=anchor, assignment_revision=assignment_revision,
+                status="ERROR", detail=f"host lookup failed: {error}",
+            )
+            return
+        if not isinstance(terminal, Mapping):
+            self.store.record_host_sync_receipt(
+                session_anchor_ref=anchor, assignment_revision=assignment_revision,
+                status="OFFLINE", detail="no live Host found for this Session Anchor",
+            )
+            return
+        terminal_id = str(terminal.get("terminal_id") or "").strip()
+        if not terminal_id:
+            self.store.record_host_sync_receipt(
+                session_anchor_ref=anchor, assignment_revision=assignment_revision,
+                status="OFFLINE", detail="no live Host found for this Session Anchor",
+            )
+            return
+        try:
+            self._session_anchor_terminal_host().push_node_projection(
+                terminal_id,
+                session_anchor_ref=anchor,
+                state=state,
+                assignment_revision=assignment_revision,
+                node_ref=node_ref,
+            )
+        except TerminalHostError as error:
+            status = "UNSUPPORTED" if error.code == "HOST_ACTION_UNSUPPORTED" else (
+                "OFFLINE" if error.code == "HOST_NODE_PROJECTION_UNAVAILABLE" else "ERROR"
+            )
+            self.store.record_host_sync_receipt(
+                session_anchor_ref=anchor, assignment_revision=assignment_revision,
+                status=status, detail=f"{error.code}: {error.detail}",
+            )
+            return
+        self.store.record_host_sync_receipt(
+            session_anchor_ref=anchor, assignment_revision=assignment_revision,
+            status="CONFIRMED", detail="",
+        )
+
     def _validate_persona_assignment_node_ref(
         self, project_id: str, node_ref: str | None
     ) -> str | None:
@@ -32001,7 +32183,22 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "only a MASTER-mode Session Anchor may hold a node-scoped (node_ref) assignment",
                     HTTPStatus.CONFLICT,
                 )
-        return self.store.assign_persona({**value, "node_ref": node_ref}, actor)
+        result = self.store.assign_persona({**value, "node_ref": node_ref}, actor)
+        if node_ref is not None:
+            assignment = result.get("assignment") or {}
+            self._sync_node_projection(
+                session_anchor_ref=value["session_anchor_ref"], project_id=project_id,
+                state="ACTIVE", assignment_revision=assignment.get("assignment_revision"),
+                node_ref=node_ref,
+            )
+            handoff_cleared = result.get("handoff_cleared")
+            if handoff_cleared is not None:
+                self._sync_node_projection(
+                    session_anchor_ref=handoff_cleared["session_anchor_ref"], project_id=project_id,
+                    state="UNASSIGNED", assignment_revision=handoff_cleared["assignment_revision"],
+                    node_ref=None,
+                )
+        return result
 
     def _handle_persona_assignment_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
         self._persona_actor(context)
@@ -32024,7 +32221,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             request, field="persona_unassign",
             required=frozenset({"session_anchor_ref", "expected_assignment_revision", "request_id"}),
         )
-        return self.store.unassign_persona(value, actor)
+        result = self.store.unassign_persona(value, actor)
+        assignment = result.get("assignment") or {}
+        if assignment.get("node_ref") is not None:
+            self._sync_node_projection(
+                session_anchor_ref=value["session_anchor_ref"],
+                project_id=str(assignment.get("project_id") or ""),
+                state="UNASSIGNED", assignment_revision=assignment.get("assignment_revision"),
+                node_ref=None,
+            )
+        return result
 
     def _persona_automation_plan(
         self, value: Mapping[str, Any], *, record: bool = True

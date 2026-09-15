@@ -662,6 +662,12 @@ class SupervisedTerminalHost:
         return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/offer-turn",
                                   payload=dict(payload)).get("turn_delivery") or {})
 
+    def push_node_projection(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(self._request(
+            "POST", f"/v1/terminals/{quote(terminal_id, safe='')}/node-projection",
+            payload=dict(payload),
+        ).get("node_projection") or {})
+
     def turn_delivery_status(self, terminal_id: str) -> dict[str, Any]:
         return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/turn-delivery-status",
                                   payload={}).get("turn_delivery") or {})

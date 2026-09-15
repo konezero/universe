@@ -594,6 +594,86 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(201, status, started)
         self.assertIsNone(started["run"]["node_ref"])
 
+    # -- Host sync status (2026-09-15: assign/unassign/handoff -> Host) --
+
+    def test_node_scoped_assign_records_offline_host_sync_when_no_live_host_exists(self):
+        # This test fixture's session_supervisor.register_session has no
+        # real Rust Host behind it -- _sync_node_projection's find_live must
+        # come back empty, and that must be recorded as OFFLINE, never
+        # silently left looking the same as a real Host confirmation
+        # (2026-09-15 Conductor review: "저장됨/Host 확인됨/미확인·미지원·
+        # 오류를 정확히 표시").
+        anchor = self.register("MASTER", "node-master-host-sync-offline")
+        node_ref = self.make_feature_node("host-sync-offline-node")
+        persona = self.make_persona()
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
+        assignment = assigned["assignment"]
+        # The Host sync attempt runs after the DB write this response
+        # already reflects, so the receipt shows up on a fresh read, not on
+        # this same response's echoed assignment (mirrors how applied_at/
+        # delivery_status for P1 persona delivery are read back separately
+        # too, never assumed synchronous with the write response).
+        status, read_back = self.act("persona.assignment-read", {"session_anchor_ref": anchor})
+        self.assertEqual(200, status, read_back)
+        self.assertEqual("OFFLINE", read_back["assignment"]["host_sync_status"])
+        self.assertEqual(
+            assignment["assignment_revision"], read_back["assignment"]["host_sync_assignment_revision"]
+        )
+
+        status, unassigned = self.act("persona.unassign", {
+            "session_anchor_ref": anchor, "expected_assignment_revision": assignment["assignment_revision"],
+        })
+        self.assertEqual(200, status, unassigned)
+        status, read_back2 = self.act("persona.assignment-read", {"session_anchor_ref": anchor})
+        self.assertEqual(200, status, read_back2)
+        self.assertEqual("OFFLINE", read_back2["assignment"]["host_sync_status"])
+
+    def test_record_host_sync_receipt_is_cas_guarded_against_late_responses(self):
+        # A late Host acknowledgment for a superseded assignment_revision
+        # must never be recorded as confirming the CURRENT one -- the write
+        # is a documented no-op (2026-09-15 Conductor review: "늦은 응답이
+        # 새 배정 성공으로 표시되지 않게 한다").
+        anchor = self.register("MASTER", "node-master-host-sync-cas")
+        node_ref = self.make_feature_node("host-sync-cas-node")
+        persona = self.make_persona()
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
+        revision_1 = assigned["assignment"]["assignment_revision"]
+
+        status, unassigned = self.act("persona.unassign", {
+            "session_anchor_ref": anchor, "expected_assignment_revision": revision_1,
+        })
+        self.assertEqual(200, status, unassigned)
+        revision_2 = unassigned["assignment"]["assignment_revision"]
+        self.assertGreater(revision_2, revision_1)
+
+        # A late CONFIRMED receipt for the now-superseded revision_1 push
+        # must not overwrite the row's already-recorded (OFFLINE) status
+        # for revision_2.
+        late = self.server.store.record_host_sync_receipt(
+            session_anchor_ref=anchor, assignment_revision=revision_1,
+            status="CONFIRMED", detail="late reply from a slow Host",
+        )
+        self.assertEqual("SUPERSEDED", late["status"])
+        self.assertEqual("OFFLINE", late["assignment"]["host_sync_status"])
+        self.assertEqual(revision_2, late["assignment"]["host_sync_assignment_revision"])
+
+        current = self.server.store.record_host_sync_receipt(
+            session_anchor_ref=anchor, assignment_revision=revision_2,
+            status="CONFIRMED", detail="",
+        )
+        self.assertEqual("RECORDED", current["status"])
+        self.assertEqual("CONFIRMED", current["assignment"]["host_sync_status"])
+
 
 if __name__ == "__main__":
     unittest.main()

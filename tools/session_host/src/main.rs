@@ -918,7 +918,24 @@ fn apply_request(
                 .node_projection
                 .apply(&payload, &state.anchor_ref.clone(), now_unix_ms() as u64)
             {
-                Ok(_) => channel_success(state, serde_json::to_value(&state.node_projection).unwrap()),
+                Ok(outcome) => {
+                    // apply()'s Ok(..) is the only place the ACCEPTED vs
+                    // REPLAYED distinction exists -- re-serializing just
+                    // state.node_projection (as offer_turn does for
+                    // turn_delivery) silently drops it, since the struct
+                    // itself carries no "status" field. Overlay it onto the
+                    // full projection snapshot rather than sending outcome
+                    // alone, so callers keep seeing revision/received_at_ms
+                    // too (2026-09-15: caught by a real IPC test expecting
+                    // "status" on the wire, not just in the Rust return type).
+                    let mut snapshot = serde_json::to_value(&state.node_projection).unwrap();
+                    if let (Some(object), Some(status)) =
+                        (snapshot.as_object_mut(), outcome.get("status"))
+                    {
+                        object.insert("status".to_string(), status.clone());
+                    }
+                    channel_success(state, snapshot)
+                }
                 Err((code, detail)) => failure(code, detail),
             }
         }

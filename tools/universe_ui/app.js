@@ -18170,6 +18170,28 @@ async function renderPersona() {
           statusLine.textContent = "담당 Master 미배정.";
         }
         row.append(statusLine);
+        if (assignment) {
+          // Whether the live Rust Host for this Anchor actually confirmed
+          // this exact assignment_revision -- distinct from the DB write
+          // succeeding above. Never conflate SAVED with CONFIRMED
+          // (2026-09-15 Conductor review: "저장됨/Host 확인됨/미확인·미지원·
+          // 오류를 정확히 표시").
+          const hostSyncLine = node("p", "persona-hint");
+          const syncStatus = assignment.host_sync_status || "SAVED";
+          const syncRevisionMatches = assignment.host_sync_assignment_revision === assignment.assignment_revision;
+          const HOST_SYNC_LABELS = {
+            SAVED: "Host 미확인 (저장됨)",
+            CONFIRMED: syncRevisionMatches ? "Host 확인됨" : "Host 확인됨 (이전 revision)",
+            OFFLINE: "Host 오프라인 (미확인)",
+            UNSUPPORTED: "Host 미지원 버전 (미확인)",
+            ERROR: "Host 동기화 오류 (미확인)",
+          };
+          hostSyncLine.textContent = HOST_SYNC_LABELS[syncStatus] || `Host 상태: ${syncStatus}`;
+          if (syncStatus !== "SAVED" && syncStatus !== "CONFIRMED" && assignment.host_sync_detail) {
+            hostSyncLine.title = assignment.host_sync_detail;
+          }
+          row.append(hostSyncLine);
+        }
         const sessionPicker = document.createElement("select");
         for (const terminal of projectMasterTerminals) {
           const option = document.createElement("option");

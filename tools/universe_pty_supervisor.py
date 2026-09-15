@@ -836,6 +836,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, {"schema":API_SCHEMA, "status":"OK", "turn_delivery":result})
             return
+        if path.startswith("/v1/terminals/") and path.endswith("/node-projection") and path.count("/") == 4:
+            terminal_id = path.split("/")[3]
+            try:
+                result = supervisor.host.push_node_projection(
+                    terminal_id,
+                    session_anchor_ref=str(body.get("session_anchor_ref") or ""),
+                    state=str(body.get("state") or ""),
+                    assignment_revision=body.get("assignment_revision"),
+                    node_ref=body.get("node_ref"),
+                )
+            except TerminalHostError as error:
+                self._send(HTTPStatus.CONFLICT, {"schema": API_SCHEMA, "status": "ERROR",
+                           "error_code": error.code, "detail": error.detail})
+                return
+            self._send(HTTPStatus.OK, {"schema": API_SCHEMA, "status": "OK", "node_projection": result})
+            return
         if path.startswith("/v1/terminals/") and path.endswith("/persona-native-queue") and path.count("/") == 4:
             terminal_id = path.split("/")[3]
             try:

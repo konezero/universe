@@ -26,7 +26,11 @@ from universe_app.reconnection_host import (  # noqa: E402
     evaluate_runtime_compatibility,
 )
 from universe_app.windows_process import process_is_alive  # noqa: E402
-from universe_app.terminal_host import TerminalHost  # noqa: E402
+from universe_app.terminal_host import (  # noqa: E402
+    TerminalHost,
+    TerminalHostError,
+    TerminalSession,
+)
 
 
 MANIFEST = ROOT / "tools" / "session_host" / "Cargo.toml"
@@ -161,6 +165,103 @@ class RustReconnectionHostTests(unittest.TestCase):
             finally:
                 client.shutdown()
                 registry.reap_launched_process("anchor-turn-fixture")
+
+    def test_node_projection_pushes_through_real_rust_host(self) -> None:
+        """2026-09-15: Supervisor/Host node-projection sync, end to end
+        against a real cargo-built Rust Host process -- not a stub.
+
+        Exercises both layers this round wired: the low-level
+        ReconnectionPty.push_node_projection adapter (previous round) and
+        TerminalHost.push_node_projection (this round), which is the exact
+        method universe_server.py's _sync_node_projection calls after a
+        committed persona assignment.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ReconnectionHostRegistry(root / "registry", self.binary)
+            anchor_ref = "anchor-node-projection-fixture"
+            client = registry.launch(anchor_ref, cwd=root, shell_args=("/Q",))
+            try:
+                pty = ReconnectionPty(client, supervisor_id="supervisor-first")
+                pty.write(b"\x1b[1;1R")
+
+                accepted = pty.push_node_projection(
+                    node_ref="feature_x", assignment_revision=3, state="ACTIVE"
+                )
+                self.assertEqual("ACCEPTED", accepted["status"])
+                self.assertEqual("feature_x", accepted["node_ref"])
+
+                replayed = pty.push_node_projection(
+                    node_ref="feature_x", assignment_revision=3, state="ACTIVE"
+                )
+                self.assertEqual("REPLAYED", replayed["status"])
+
+                with self.assertRaises(ReconnectionHostError) as raised:
+                    pty.push_node_projection(
+                        node_ref="feature_y", assignment_revision=3, state="ACTIVE"
+                    )
+                self.assertEqual("HOST_NODE_PROJECTION_CONFLICT", raised.exception.code)
+
+                cleared = pty.push_node_projection(
+                    node_ref=None, assignment_revision=4, state="UNASSIGNED"
+                )
+                self.assertEqual("ACCEPTED", cleared["status"])
+                self.assertIsNone(cleared["node_ref"])
+
+                with self.assertRaises(ReconnectionHostError) as stale:
+                    pty.push_node_projection(
+                        node_ref="feature_x", assignment_revision=2, state="ACTIVE"
+                    )
+                self.assertEqual("HOST_NODE_PROJECTION_STALE", stale.exception.code)
+
+                # Same real Host process, through TerminalHost.push_node_
+                # projection -- the exact method universe_server.py's
+                # _sync_node_projection calls after a committed assign_
+                # persona/unassign_persona. Reuse the same live ``pty``
+                # rather than spawning a second real Host process: this is
+                # exercising TerminalHost's lookup/anchor-check/dispatch
+                # logic (this round's new code) against a real Host's real
+                # replies, not the Host process lifecycle itself (already
+                # covered by the production-reconnect tests above).
+                host = TerminalHost(audit_database_path=root / "universe.sqlite3")
+                terminal_id = "term-node-projection-fixture"
+                host._sessions[terminal_id] = TerminalSession(
+                    terminal_id=terminal_id,
+                    project_id="universe",
+                    mode="MASTER",
+                    provider="CODEX",
+                    supervisor_session_id="provider-session-node-projection",
+                    cwd=str(root),
+                    executable="cmd.exe",
+                    created_at="2026-09-15T00:00:00Z",
+                    state="LIVE",
+                    backend=pty,
+                    backend_owner="RUST_RECONNECTION_HOST",
+                    session_anchor_ref=anchor_ref,
+                )
+                via_host = host.push_node_projection(
+                    terminal_id,
+                    session_anchor_ref=anchor_ref,
+                    state="ACTIVE",
+                    assignment_revision=5,
+                    node_ref="feature_z",
+                )
+                self.assertEqual("ACCEPTED", via_host["status"])
+                with self.assertRaises(TerminalHostError) as mismatch:
+                    host.push_node_projection(
+                        terminal_id,
+                        session_anchor_ref="some-other-anchor",
+                        state="ACTIVE",
+                        assignment_revision=5,
+                        node_ref="feature_z",
+                    )
+                self.assertEqual(
+                    "HOST_NODE_PROJECTION_ANCHOR_MISMATCH", mismatch.exception.code
+                )
+            finally:
+                client.shutdown()
+                registry.reap_launched_process(anchor_ref)
 
     def test_native_queue_uses_exact_argv_and_never_writes_terminal(self):
         # Isolated Python executable stands in for the provider queue command.

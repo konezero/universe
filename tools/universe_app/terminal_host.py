@@ -2550,6 +2550,43 @@ class TerminalHost:
         except ReconnectionHostError as error:
             raise TerminalHostError(error.code, str(error)) from error
 
+    def push_node_projection(
+        self,
+        terminal_id: str,
+        *,
+        session_anchor_ref: str,
+        state: str,
+        assignment_revision: int,
+        node_ref: str | None,
+    ) -> dict[str, Any]:
+        """Push one node-ownership projection to the live Rust Host.
+
+        Mirrors offer_turn's exact shape: a live ReconnectionPty-backed Host
+        is required (an older PYTHON_CONPTY-backed session has no projection
+        channel at all -- that is HOST_NODE_PROJECTION_UNAVAILABLE, distinct
+        from an unsupported *Rust* Host, which surfaces the Host's own
+        HOST_ACTION_UNSUPPORTED unchanged rather than being swallowed here).
+        """
+
+        session = self.get(terminal_id)
+        if not isinstance(session.backend, ReconnectionPty):
+            raise TerminalHostError(
+                "HOST_NODE_PROJECTION_UNAVAILABLE", "a surviving Rust Host is required"
+            )
+        if session_anchor_ref != session.session_anchor_ref:
+            raise TerminalHostError(
+                "HOST_NODE_PROJECTION_ANCHOR_MISMATCH",
+                "projection anchor does not match terminal",
+            )
+        try:
+            return session.backend.push_node_projection(
+                node_ref=node_ref,
+                assignment_revision=assignment_revision,
+                state=state,
+            )
+        except ReconnectionHostError as error:
+            raise TerminalHostError(error.code, str(error)) from error
+
     def deliver_persona_native_queue(
         self,
         terminal_id: str,
