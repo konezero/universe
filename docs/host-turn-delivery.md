@@ -109,6 +109,12 @@ arrays, while hidden rows are returned only in `excluded` when `include_hidden=t
 Tests cover exclude/restore for all three row kinds and assert that no project scan,
 browser cache, or alternate identity source fills missing values.
 
+A ledger session is actionable only while its exact `project_id` exists in the
+server-owned `project_connection` table. The online request reads those identifiers
+with one narrow SQLite query. Sessions for detached or removed projects are omitted
+from all clickable arrays and returned only in the API's `unavailable` diagnostics
+with `SESSION_PROJECT_NOT_ATTACHED`; no directory scan or name substitution occurs.
+
 ## 2026-09-14 TUI submit regression comparison
 
 The failed self probe `msg_337036bad333bda5` recorded body_writes=1 and

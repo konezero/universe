@@ -7558,6 +7558,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertIn("prompt_activity", filled)
 
     def test_list_resumable_sessions_splits_reattach_and_resume(self) -> None:
+        self.server.store.register_project(self.registration())
         self.server._managed_shell_identities = lambda: {}  # type: ignore[method-assign]
         live_host = {
             "host_session_ref": "host-live-current",
@@ -7633,6 +7634,15 @@ class UniverseLocalServiceTests(unittest.TestCase):
                 "currentness": "STALE",
                 "last_seen_at": "2026-09-03T00:00:00Z",
             },
+            {
+                "session_anchor_ref": "anchor-project-unattached",
+                "universe_session_id": "sess-project-unattached",
+                "project_id": "removed-project",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "PAST",
+                "last_seen_at": "2026-09-02T00:00:00Z",
+            },
         ]
 
         listed = self.server.list_resumable_sessions({"limit": 7})
@@ -7641,6 +7651,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(["REATTACH"], [row["kind"] for row in listed["reattach"]])
         self.assertEqual(["sess-dead-new"], [row["session_id"] for row in listed["resume"]])
         self.assertEqual(["RESUME"], [row["kind"] for row in listed["resume"]])
+        self.assertEqual(
+            [("sess-project-unattached", "SESSION_PROJECT_NOT_ATTACHED")],
+            [(row["session_id"], row["reason"]) for row in listed["unavailable"]],
+        )
         self.assertEqual(
             ["anchor-incompatible"],
             [row["session_anchor_ref"] for row in listed["incompatible"]],
@@ -7674,6 +7688,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
         self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
+        self.assertEqual(["sess-project-unattached"], [row["session_id"] for row in payload["unavailable"]])
 
     def test_resumable_visibility_hides_live_and_incompatible_host_rows(self) -> None:
         terminal_host = Mock()

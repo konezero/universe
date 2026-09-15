@@ -10076,6 +10076,15 @@ class UniverseStore:
             ).fetchall()
         return [self._project_row(row) for row in rows]
 
+    def attached_project_ids(self) -> frozenset[str]:
+        """Return only authoritative attached project identifiers."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT project_id FROM project_connection ORDER BY project_id"
+            ).fetchall()
+        return frozenset(str(row["project_id"]) for row in rows)
+
     def get_project(self, project_id: str) -> dict[str, Any]:
         normalized = _project_id(project_id)
         with self._connection() as connection:
@@ -37976,6 +37985,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         # from its already loaded terminal state; no terminal refresh belongs here.
         hosts = self.terminal_host.list_host_records()
         sessions = self._resumable_host_sessions()
+        attached_project_ids = self.store.attached_project_ids()
         by_anchor = {
             str(session["session_anchor_ref"]).strip(): session
             for session in sessions
@@ -38006,6 +38016,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         reattach_anchors: set[str] = set()
         incompatible: list[dict[str, Any]] = []
         incompatible_anchors: set[str] = set()
+        unavailable: list[dict[str, Any]] = []
         excluded_candidates: list[dict[str, Any]] = []
         visibility_by_session = self.store.resumable_session_visibility_map()
 
@@ -38045,6 +38056,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             anchor = str(host.get("session_anchor_ref") or "").strip()
             session = _anchor_view(anchor)
             session_fields = _host_session_fields(session)
+            if session_fields and session_fields["project_id"] not in attached_project_ids:
+                if anchor:
+                    incompatible_anchors.add(anchor)
+                unavailable.append(
+                    {
+                        "kind": "UNAVAILABLE",
+                        "host_session_ref": href,
+                        "session_anchor_ref": anchor,
+                        "reason": "SESSION_PROJECT_NOT_ATTACHED",
+                        **session_fields,
+                    }
+                )
+                continue
             binding_error = ""
             if runtime == "LIVE" and (
                 not href
@@ -38140,10 +38164,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if provider_filter and provider != provider_filter:
                 continue
             anchor = str(session.get("session_anchor_ref") or "").strip()
-            if (
-                anchor in reattach_anchors
-                or anchor in incompatible_anchors
-            ):
+            if anchor in reattach_anchors or anchor in incompatible_anchors:
+                continue
+            if project_id not in attached_project_ids:
+                unavailable.append(
+                    {
+                        "kind": "UNAVAILABLE",
+                        "session_id": session_id,
+                        "session_anchor_ref": anchor,
+                        "project_id": project_id,
+                        "mode": mode,
+                        "provider": provider,
+                        "last_seen_at": str(session["last_seen_at"]),
+                        "reason": "SESSION_PROJECT_NOT_ATTACHED",
+                    }
+                )
                 continue
             visibility = visibility_by_session.get(
                 (project_id, session_id),
@@ -38191,6 +38226,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ]
         truncated = len(resume_candidates) > limit
         excluded_truncated = len(excluded_candidates) > 50
+        unavailable_truncated = len(unavailable) > 50
         return {
             "schema": API_SCHEMA,
             "status": "SESSIONS_RESUMABLE_COLLECTED",
@@ -38198,8 +38234,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "resume": resume_candidates[:limit],
             "excluded": excluded_candidates[:50],
             "incompatible": incompatible,
+            "unavailable": unavailable[:50],
             "resume_truncated": truncated,
             "excluded_truncated": excluded_truncated,
+            "unavailable_truncated": unavailable_truncated,
         }
 
     def set_resumable_session_visibility(
