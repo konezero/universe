@@ -510,7 +510,23 @@ app/terminal_host.py` 경유)에 "노드 배정 projection"이라는 새 메시�
   registry.py`, `tests/test_todo_bind_goal_action.py`,
   `tests/test_universe_server.py`의 master_message/master_queue 서브셋
   (11) 전부 PASS(반복 실행으로 안정성 확인).
-- 실 브라우저: 10.6-a(아래, 실제 스크린샷 결과로 갱신).
+- 실 브라우저(claude-in-chrome, 실 로컬 서버 http://127.0.0.1:61265, 프로젝트
+  "universe"): "노드 담당 Master" 섹션이 "새 페르소나" → "세션 배정" →
+  "노드 담당 Master" → "전용 컨덕터 자동화" 순서로 정확히 렌더링됨을
+  확인. 이 프로젝트에 현재 ACTIVE 페르소나가 0개라 "먼저 활성 페르소나를
+  하나 이상 만드세요" 빈 상태가 표시됨(세션 배정 섹션과 동일 조건, 일관됨).
+  콘솔 에러 없음. 스크린샷:
+  `.artifacts/ui/persona-node-binding-section-20260915.jpg`.
+  검증 중 페이지 로드가 여러 차례 CDP `Page.captureScreenshot` 타임아웃을
+  일으켜 "렌더러 멈춤"처럼 보였다 -- `git show HEAD~1:tools/universe_ui/
+  app.js`로 이번 변경 이전 버전을 디스크에 임시로 되돌려 같은 현상이
+  동일하게 재현됨을 확인해(재시작 불필요, app.js는 요청마다 디스크에서
+  읽음) 이 변경과 무관한, 이 실 운영 서버의 기존 특성(다수 live PTY/WebGL
+  터미널과 1.2s/4s/5s 주기 polling 하의 실제 부하)임을 검증 직후 확정하고
+  원래 버전으로 즉시 복구했다. 실제로는 멈춘 게 아니라 8~15초 정도 걸릴
+  뿐이었다 -- 충분히 기다리면 매번 정상 렌더링됨.
+  버튼(배정/변경/해제) 클릭은 운영 데이터 오염을 피하기 위해 수행하지
+  않았다 -- 시각적 렌더링과 콘솔 상태만 확인.
 - Worker 파일럿(작고 유용한 실 작업 1건 + 결과 검토 1회 + 필요 보완
   1회): 이번 슬라이스는 여전히 코드/테스트/UI 구현에 집중했다 -- 별도
   실 Task Frame/Host 경로의 Worker 작업 1건은 **NOT_RUN**으로 남긴다
