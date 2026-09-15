@@ -66,12 +66,47 @@ vm.runInContext(source.slice(source.indexOf("async function resumeRecordedSessio
   assert.equal(source.includes("function joinReattachHost("), false, "UI must not fill missing Host identity from other projections");
   assert.equal(source.includes("Host binding is incomplete; Re-attach is refused."), true);
   assert.equal(source.includes("Session binding is incomplete; Resume is refused."), true);
-  assert.equal(source.includes("Host unavailable ·"), true, "invalid Host bindings must remain visible as typed diagnostics");
+  assert.equal(source.includes("Host unavailable \\u00b7"), true, "bound invalid Hosts remain typed diagnostics and can be excluded");
   assert.equal(source.includes("state.resumableSessionsPromise"), true, "concurrent menu and startup loads must share one request");
   assert.equal(source.includes("Resume \ubaa9\ub85d \ubd88\ub7ec\uc624\ub294 \uc911..."), true, "slow initial loads must render an explicit loading row");
   assert.equal(source.includes("selectTerminalTab(visible[0].terminal_id);\n      return;"), false);
+  const liveHost = {
+    kind: "REATTACH", host_session_ref: "host-live", session_id: "session-live",
+    session_anchor_ref: "anchor-live", project_id: "demo", label: "demo MASTER CODEX",
+    visibility: "VISIBLE", visibility_revision: 0,
+  };
+  const invalidHost = {
+    kind: "INCOMPATIBLE", host_session_ref: "host-invalid", session_id: "session-invalid",
+    session_anchor_ref: "anchor-invalid", project_id: "demo", label: "Host binding invalid",
+    visibility: "VISIBLE", visibility_revision: 0,
+  };
+  context.state.showExcludedResumeSessions = false;
+  context.state.resumableSessions = { reattach: [liveHost], resume: [], excluded: [], incompatible: [invalidHost] };
+  context.currentReattachHosts = () => context.state.resumableSessions.reattach;
+  context.renderTerminalNewMenu();
+  assert.equal(menu.children.length, 3);
+  assert.equal(menu.children[1].children[2].textContent, "\ubaa9\ub85d \uc81c\uc678");
+  menu.children[1].children[2].listeners.click({stopPropagation() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(apiCalls[2].options.body.session_id, "session-live");
+  assert.equal(context.state.resumableSessions.excluded[0].kind, "REATTACH");
+  assert.equal(menu.children.length, 3, "excluded live Host disappears while the incompatible Host and toggle remain");
+  menu.children[2].listeners.click({stopPropagation() {}});
+  assert.equal(menu.children[2].children[1].textContent, "\ubcf5\uc6d0");
+  menu.children[2].children[1].listeners.click({stopPropagation() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(context.state.resumableSessions.reattach[0].host_session_ref, "host-live");
+  context.state.resumableSessions.reattach = [];
+  context.renderTerminalNewMenu();
+  assert.equal(menu.children[1].children[1].textContent, "\ubaa9\ub85d \uc81c\uc678");
+  menu.children[1].children[1].listeners.click({stopPropagation() {}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(apiCalls[4].options.body.session_id, "session-invalid");
+  assert.equal(context.state.resumableSessions.incompatible.length, 0);
+
+  context.state.showExcludedResumeSessions = false;
   context.state.resumableSessions.resume = [];
   context.renderTerminalNewMenu();
-  assert.equal(menu.children.length, 1);
+  assert.equal(menu.children.length, 2, "only New session and the excluded-items toggle remain");
   console.log("Resume menu loads on startup and restores server-backed excluded sessions");
 })().catch(error => { console.error(error); process.exitCode = 1; });

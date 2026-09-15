@@ -38006,12 +38006,45 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         reattach_anchors: set[str] = set()
         incompatible: list[dict[str, Any]] = []
         incompatible_anchors: set[str] = set()
+        excluded_candidates: list[dict[str, Any]] = []
+        visibility_by_session = self.store.resumable_session_visibility_map()
+
+        def _host_session_fields(session: Mapping[str, Any]) -> dict[str, Any]:
+            if not session:
+                return {}
+            project_id = str(session["project_id"]).strip()
+            session_id = str(session["universe_session_id"]).strip()
+            visibility = visibility_by_session.get(
+                (project_id, session_id),
+                {"visibility": "VISIBLE", "revision": 0},
+            )
+            return {
+                "session_id": session_id,
+                "supervisor_session_id": session_id,
+                "project_id": project_id,
+                "mode": str(session["mode"]).strip().upper(),
+                "provider": str(session["provider"]).strip().upper(),
+                "last_seen_at": str(session["last_seen_at"]),
+                "visibility": visibility["visibility"],
+                "visibility_revision": visibility["revision"],
+            }
+
+        def _append_host_candidate(
+            candidate: dict[str, Any], visible_bucket: list[dict[str, Any]]
+        ) -> None:
+            if candidate.get("visibility") == "HIDDEN":
+                if include_hidden:
+                    excluded_candidates.append(candidate)
+                return
+            visible_bucket.append(candidate)
+
         for host in hosts:
             runtime = str(host.get("runtime_state") or "").upper()
             compatibility = str(host.get("compatibility") or "").upper()
             href = str(host.get("host_session_ref") or "").strip()
             anchor = str(host.get("session_anchor_ref") or "").strip()
             session = _anchor_view(anchor)
+            session_fields = _host_session_fields(session)
             binding_error = ""
             if runtime == "LIVE" and (
                 not href
@@ -38033,37 +38066,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ):
                 binding_error = "HOST_SESSION_MODE_MISMATCH"
             if binding_error:
-                incompatible_anchors.add(anchor)
-                incompatible.append(
-                    {
-                        "kind": "INCOMPATIBLE",
-                        "host_session_ref": href,
-                        "session_anchor_ref": anchor,
-                        "compatibility": "INCOMPATIBLE",
-                        "runtime_state": runtime,
-                        "reason": binding_error,
-                        "label": "Host binding invalid",
-                    }
-                )
+                if anchor:
+                    incompatible_anchors.add(anchor)
+                candidate = {
+                    "kind": "INCOMPATIBLE",
+                    "host_session_ref": href,
+                    "session_anchor_ref": anchor,
+                    "compatibility": "INCOMPATIBLE",
+                    "runtime_state": runtime,
+                    "reason": binding_error,
+                    "label": "Host binding invalid",
+                    **session_fields,
+                }
+                _append_host_candidate(candidate, incompatible)
                 continue
             if compatibility == "INCOMPATIBLE":
                 if runtime == "LIVE":
                     if anchor:
                         incompatible_anchors.add(anchor)
-                    incompatible.append(
-                        {
-                            "kind": "INCOMPATIBLE",
-                            "host_session_ref": href,
-                            "session_anchor_ref": anchor,
-                            "project_id": str(session["project_id"]).strip(),
-                            "mode": str(host["mode"]).strip().upper(),
-                            "provider": str(host["provider"]).strip().upper(),
-                            "compatibility": compatibility,
-                            "runtime_state": runtime,
-                            "reason": "런타임 바뀜 — 종료 후 재생성",
-                            "label": _reattach_label(session, host),
-                        }
-                    )
+                    candidate = {
+                        "kind": "INCOMPATIBLE",
+                        "host_session_ref": href,
+                        "session_anchor_ref": anchor,
+                        "compatibility": compatibility,
+                        "runtime_state": runtime,
+                        "reason": "Host runtime is incompatible; terminate and recreate it",
+                        "label": _reattach_label(session, host),
+                        **session_fields,
+                    }
+                    _append_host_candidate(candidate, incompatible)
                 continue
             if runtime != "LIVE" or host.get("reconnect_eligible") is not True:
                 continue
@@ -38073,29 +38104,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 continue
             if anchor:
                 reattach_anchors.add(anchor)
-            project_id = str(session["project_id"]).strip()
-            mode = str(host["mode"]).strip().upper()
-            provider = str(host["provider"]).strip().upper()
-            reattach.append(
-                {
-                    "kind": "REATTACH",
-                    "host_session_ref": href,
-                    "session_anchor_ref": anchor,
-                    "supervisor_session_id": str(session["universe_session_id"]),
-                    "project_id": project_id,
-                    "mode": mode,
-                    "provider": provider,
-                    "last_seen_at": str(session["last_seen_at"]),
-                    "compatibility": compatibility,
-                    "runtime_state": runtime,
-                    "reconnect_eligible": True,
-                    "label": _reattach_label(session, host),
-                }
-            )
+            candidate = {
+                "kind": "REATTACH",
+                "host_session_ref": href,
+                "session_anchor_ref": anchor,
+                "compatibility": compatibility,
+                "runtime_state": runtime,
+                "reconnect_eligible": True,
+                "label": _reattach_label(session, host),
+                **session_fields,
+            }
+            _append_host_candidate(candidate, reattach)
         resume_candidates: list[dict[str, Any]] = []
-        excluded_candidates: list[dict[str, Any]] = []
         seen_coord: set[tuple[str, str, str]] = set()
-        visibility_by_session = self.store.resumable_session_visibility_map()
         # A provider session remains resumable after a different provider
         # becomes the Project/Mode Current Anchor. Compact the full durable
         # archive below instead of discarding those past provider sessions.

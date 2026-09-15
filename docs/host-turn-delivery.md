@@ -90,10 +90,24 @@ Web restart `resume-list-web-20260914` completed (PID 61320). Live API shows fou
 
 ### Resume list exclusion
 
-Each Resume row now has `목록 제외`. This is a browser preference stored under `universe.resume.excluded.v1`, keyed by project and durable session ID. It does not terminate a Host, delete a session, or modify the server catalog. `제외 항목 보기` reveals disabled excluded rows with `복원`; the default view hides them again after reload. Preference write failure is reported and does not pretend the exclusion was saved.
+Resume-menu visibility is durable server state keyed by the exact
+`(project_id, session_id)` from the Session Supervisor ledger. The browser requests
+that state and never owns the exclusion list. The same visibility contract applies
+to recorded `RESUME` rows, live `REATTACH` rows, and ledger-bound `INCOMPATIBLE`
+Host diagnostics. `?? ??` preserves both the provider session and Host lifecycle;
+it only removes the row from the default `+` menu. `?? ?? ??` exposes disabled
+rows with `??`, including rows whose Host is still live or incompatible.
 
-The existing JS regression verifies persistence, restore and unchanged session data. A real Chromium session using the live catalog verified exclude, page reload, hidden state, show-excluded, restore and menu bounds, with no page errors. Test preferences were restored in the isolated browser context. Screenshot: `.artifacts/ui/resume-list-exclusion-20260914.png`. Static UI assets are served directly; no service restart is required.
+A Host discovery record without an exact ledger binding has no session visibility
+identity. It remains a typed server diagnostic and the UI does not invent a
+project/session coordinate or offer a false exclusion write. Host termination is a
+separate lifecycle action: it stops the Host and leaves the durable provider session
+eligible for `RESUME` unless that session itself is excluded.
 
+The server applies visibility before filling `reattach`, `resume`, and `incompatible`
+arrays, while hidden rows are returned only in `excluded` when `include_hidden=true`.
+Tests cover exclude/restore for all three row kinds and assert that no project scan,
+browser cache, or alternate identity source fills missing values.
 
 ## 2026-09-14 TUI submit regression comparison
 

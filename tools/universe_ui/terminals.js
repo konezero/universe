@@ -2210,10 +2210,17 @@ function resumeSessionExcluded(session) {
   return String(session?.visibility || "VISIBLE").toUpperCase() === "HIDDEN";
 }
 
+function resumableCatalogBucket(item) {
+  const kind = String(item?.kind || "RESUME").toUpperCase();
+  if (kind === "REATTACH") return "reattach";
+  if (kind === "INCOMPATIBLE") return "incompatible";
+  return "resume";
+}
+
 async function setResumeSessionExcluded(session, excluded) {
   const sessionId = String(session?.session_id || "").trim();
   const projectId = String(session?.project_id || "").trim();
-  if (!sessionId || !projectId) throw new Error("재개 세션 식별자가 없습니다");
+  if (!sessionId || !projectId) throw new Error("\uc7ac\uac1c \uc138\uc158 \uc2dd\ubcc4\uc790\uac00 \uc5c6\uc2b5\ub2c8\ub2e4");
   const updated = await api("/v1/sessions/resumable/visibility", {
     method: "POST",
     body: {
@@ -2226,16 +2233,20 @@ async function setResumeSessionExcluded(session, excluded) {
   const payload = state.resumableSessions || { reattach: [], resume: [], excluded: [], incompatible: [] };
   const sameSession = (item) => String(item?.project_id || "") === projectId
     && String(item?.session_id || "") === sessionId;
-  const current = [...(payload.resume || []), ...(payload.excluded || [])].find(sameSession) || session;
+  const buckets = ["reattach", "resume", "excluded", "incompatible"];
+  const current = buckets
+    .flatMap((bucket) => payload[bucket] || [])
+    .find(sameSession) || session;
   const row = {
     ...current,
     visibility: String(updated.visibility || (excluded ? "HIDDEN" : "VISIBLE")),
     visibility_revision: Number(updated.revision ?? current.visibility_revision ?? 0),
   };
-  payload.resume = (payload.resume || []).filter((item) => !sameSession(item));
-  payload.excluded = (payload.excluded || []).filter((item) => !sameSession(item));
+  for (const bucket of buckets) {
+    payload[bucket] = (payload[bucket] || []).filter((item) => !sameSession(item));
+  }
   if (resumeSessionExcluded(row)) payload.excluded.push(row);
-  else payload.resume.push(row);
+  else payload[resumableCatalogBucket(row)].push(row);
   state.resumableSessions = payload;
   renderTerminalNewMenu();
 }
@@ -2268,22 +2279,23 @@ function renderTerminalNewMenu() {
     menu.append(loading);
   }
   for (const host of hosts) {
+    const row = document.createElement("div");
+    row.className = "terminal-resume-row";
     const item = document.createElement("div");
-    item.type = "button";
     item.className = "terminal-new-menu-item";
     item.setAttribute("role", "menuitem");
     const label = String(host.label || "").trim();
     if (!label) continue;
     item.textContent = `Re-attach ${label}`;
-    item.title = "Live PTY — re-attach immediately";
+    item.title = "Re-attach the live PTY immediately";
     item.addEventListener("click", () => {
       closeTerminalNewMenu();
       reattachLiveHost(host).catch((error) => toast(error.message, true));
     });
     const terminate = document.createElement("button");
     terminate.type = "button";
-    terminate.className = "terminal-host-terminate";
-    terminate.textContent = "Host 종료";
+    terminate.className = "terminal-resume-exclude terminal-host-terminate";
+    terminate.textContent = "Host \uc885\ub8cc";
     terminate.addEventListener("click", (event) => {
       event.stopPropagation();
       const hostId = hostSessionRefOf(host);
@@ -2292,8 +2304,16 @@ function renderTerminalNewMenu() {
         .then(() => refreshAfterHostTermination(hostId))
         .catch((error) => toast(error.message, true));
     });
-    item.append(terminate);
-    menu.append(item);
+    const exclude = document.createElement("button");
+    exclude.type = "button";
+    exclude.className = "terminal-resume-exclude";
+    exclude.textContent = "\ubaa9\ub85d \uc81c\uc678";
+    exclude.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setResumeSessionExcluded(host, true).catch((error) => toast(error.message, true));
+    });
+    row.append(item, terminate, exclude);
+    menu.append(row);
   }
   if (state.resumableSessionsError) {
     const retry = document.createElement("button");
@@ -2308,13 +2328,25 @@ function renderTerminalNewMenu() {
     menu.append(retry);
   }
   for (const issue of state.resumableSessions?.incompatible || []) {
+    if (!String(issue.session_id || "").trim() || !String(issue.project_id || "").trim()) continue;
+    const row = document.createElement("div");
+    row.className = "terminal-resume-row";
     const item = document.createElement("button");
     item.type = "button";
     item.className = "terminal-new-menu-item";
     item.disabled = true;
-    item.textContent = `Host unavailable · ${String(issue.label || "Host binding invalid")}`;
+    item.textContent = `Host unavailable \u00b7 ${String(issue.label || "Host binding invalid")}`;
     item.title = String(issue.reason || "HOST_BINDING_INVALID");
-    menu.append(item);
+    const exclude = document.createElement("button");
+    exclude.type = "button";
+    exclude.className = "terminal-resume-exclude";
+    exclude.textContent = "\ubaa9\ub85d \uc81c\uc678";
+    exclude.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setResumeSessionExcluded(issue, true).catch((error) => toast(error.message, true));
+    });
+    row.append(item, exclude);
+    menu.append(row);
   }
   const visibleSessions = state.resumableSessions?.resume || [];
   const excludedSessions = state.resumableSessions?.excluded || [];
@@ -2325,6 +2357,7 @@ function renderTerminalNewMenu() {
   for (const session of sessions) {
     const excluded = resumeSessionExcluded(session);
     if (excluded && !state.showExcludedResumeSessions) continue;
+    const kind = String(session.kind || "RESUME").toUpperCase();
     const row = document.createElement("div");
     row.className = "terminal-resume-row";
     row.dataset.excluded = String(excluded);
@@ -2332,19 +2365,21 @@ function renderTerminalNewMenu() {
     item.type = "button";
     item.className = "terminal-new-menu-item";
     item.setAttribute("role", "menuitem");
-    item.textContent = `${excluded ? "제외됨" : "Resume"} ${session.label || session.session_id}`;
-    item.title = excluded ? "목록에 복원한 뒤 재개할 수 있습니다" : "기존 대화를 새 Host에서 이어서 열기";
+    item.textContent = `${excluded ? "\uc81c\uc678\ub428" : "Resume"} ${session.label || session.session_id}`;
+    item.title = excluded ? "Restore this item to use it again" : "Resume the recorded provider session in a new Host";
     item.dataset.sessionId = session.session_id || "";
-    item.disabled = excluded;
-    item.addEventListener("click", () => {
-      closeTerminalNewMenu();
-      resumeRecordedSession(session).catch((error) => toast(error.message, true));
-    });
+    item.disabled = excluded || kind !== "RESUME";
+    if (!item.disabled) {
+      item.addEventListener("click", () => {
+        closeTerminalNewMenu();
+        resumeRecordedSession(session).catch((error) => toast(error.message, true));
+      });
+    }
     const exclude = document.createElement("button");
     exclude.type = "button";
     exclude.className = "terminal-resume-exclude";
-    exclude.textContent = excluded ? "복원" : "목록 제외";
-    exclude.title = excluded ? "재개 목록에 다시 표시" : "세션 기록을 보존하고 이 브라우저의 재개 목록에서 숨기기";
+    exclude.textContent = excluded ? "\ubcf5\uc6d0" : "\ubaa9\ub85d \uc81c\uc678";
+    exclude.title = excluded ? "Show this item in the Resume list again" : "Keep the session record and hide it from the Resume list";
     exclude.setAttribute("aria-label", `${session.label || session.session_id} ${exclude.textContent}`);
     exclude.addEventListener("click", (event) => {
       event.stopPropagation();

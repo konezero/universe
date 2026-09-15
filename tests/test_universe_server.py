@@ -7645,7 +7645,7 @@ class UniverseLocalServiceTests(unittest.TestCase):
             ["anchor-incompatible"],
             [row["session_anchor_ref"] for row in listed["incompatible"]],
         )
-        self.assertIn("런타임 바뀜", listed["incompatible"][0]["reason"])
+        self.assertIn("Host runtime is incompatible", listed["incompatible"][0]["reason"])
         self.assertFalse(listed["resume_truncated"])
 
         expanded = self.server.list_resumable_sessions(
@@ -7674,6 +7674,68 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("SESSIONS_RESUMABLE_COLLECTED", payload["status"])
         self.assertEqual(["host-live-current"], [row["host_session_ref"] for row in payload["reattach"]])
+
+    def test_resumable_visibility_hides_live_and_incompatible_host_rows(self) -> None:
+        terminal_host = Mock()
+        terminal_host.list_host_records.return_value = [
+            {
+                "host_session_ref": "host-live-hidden",
+                "session_anchor_ref": "anchor-live-hidden",
+                "runtime_state": "LIVE",
+                "reconnect_eligible": True,
+                "compatibility": "CURRENT",
+                "provider": "CODEX",
+                "mode": "MASTER",
+            },
+            {
+                "host_session_ref": "host-invalid-hidden",
+                "session_anchor_ref": "anchor-invalid-hidden",
+                "runtime_state": "LIVE",
+                "reconnect_eligible": False,
+                "compatibility": "INCOMPATIBLE",
+                "provider": "CLAUDE",
+                "mode": "MASTER",
+            },
+        ]
+        self.server.terminal_host = terminal_host
+        self.server._resumable_host_sessions = lambda: [  # type: ignore[method-assign]
+            {
+                "session_anchor_ref": "anchor-live-hidden",
+                "universe_session_id": "sess-live-hidden",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CODEX",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-15T03:00:00Z",
+            },
+            {
+                "session_anchor_ref": "anchor-invalid-hidden",
+                "universe_session_id": "sess-invalid-hidden",
+                "project_id": "universe",
+                "mode": "MASTER",
+                "provider": "CLAUDE",
+                "currentness": "CURRENT",
+                "last_seen_at": "2026-09-15T02:00:00Z",
+            },
+        ]
+        for session_id in ("sess-live-hidden", "sess-invalid-hidden"):
+            self.server.store.set_resumable_session_visibility(
+                "universe", session_id, visibility="HIDDEN", expected_revision=0
+            )
+
+        listed = self.server.list_resumable_sessions()
+        self.assertEqual([], listed["reattach"])
+        self.assertEqual([], listed["incompatible"])
+        self.assertEqual([], listed["resume"])
+        self.assertEqual([], listed["excluded"])
+
+        expanded = self.server.list_resumable_sessions({"include_hidden": "true"})
+        self.assertEqual(
+            [("REATTACH", "sess-live-hidden"), ("INCOMPATIBLE", "sess-invalid-hidden")],
+            [(row["kind"], row["session_id"]) for row in expanded["excluded"]],
+        )
+        self.assertTrue(all(row["visibility"] == "HIDDEN" for row in expanded["excluded"]))
+        self.assertTrue(all(row["visibility_revision"] == 1 for row in expanded["excluded"]))
 
     def test_resumable_sessions_keep_each_provider_and_persist_visibility(self) -> None:
         self.server._managed_shell_identities = lambda: {}  # type: ignore[method-assign]
