@@ -987,3 +987,20 @@ still requires the existing result and acceptance-review evidence; picking a
 Todo does not mark it done. `persona.automation.kick` creates one new bounded
 control cycle keyed to the current run revision; a retry of that same revision
 reuses its queue message, while a prior completed control message cannot block it.
+
+### Review follow-up Todo continuation (2026-09-16)
+
+`PASS/VERIFIED_EVIDENCE` remains a completion review and does not manufacture
+new work. For `NEEDS_REVISION`, `BLOCKED`, or `NOT_RUN`, the server creates one
+durable `READY` follow-up Todo only when the reviewed decision identifies an
+exact source Todo. The generated Todo retains that source Todo's project/node
+scope, plan coordinates, priority, and sort order; it records the review,
+result, evidence, and explicit next action in its detail. Its id is derived
+from the review receipt, so an Action replay or a process interruption cannot
+create a duplicate. A node Master then receives one new bounded control cycle
+and selects work from its authoritative queue by the existing priority rules.
+
+Goal-only or meeting reviews have no authoritative Todo priority to inherit.
+They remain explicit `REVIEW_FOLLOWUP_SOURCE_UNAVAILABLE` results rather than
+creating a guessed project-wide Todo. Project-wide Conductor runs can record
+the same follow-up Todo but do not claim the node-Master delivery route.

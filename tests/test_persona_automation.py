@@ -825,6 +825,86 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
         self.assertEqual(200, status, surface)
         self.assertEqual(run["run_id"], surface["run"]["run_id"])
         self.assertEqual(dispatched["message"]["message_id"], surface["run"]["current_assignment"]["message_id"])
+        status, stopped = self.act("persona.automation.stop", {
+            "run_id": run["run_id"], "reason": "test cleanup",
+        })
+        self.assertEqual(200, status, stopped)
+        self.assertEqual("STOPPED", stopped["run"]["state"])
+
+    def test_non_passing_review_creates_one_priority_inheriting_followup_todo(self):
+        material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-review-followup-session",
+            "node": "TEST",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+        })
+        anchor = material["session_anchor_ref"]
+        status, persona_result = self.act("persona.create", {
+            "title": "review follow-up lead", "body": "Record reviewed follow-up work."
+        })
+        self.assertEqual(200, status, persona_result)
+        persona = persona_result["persona"]
+        status, assignment = self.act("persona.assign", {
+            "session_anchor_ref": anchor,
+            "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"],
+            "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assignment)
+        source = self.server.store.create_todo({
+            "scope_kind": "PROJECT", "project_id": "TEST",
+            "title": "Source Todo for review follow-up", "detail": "source",
+            "priority": "P0", "state": "IN_PROGRESS", "source_kind": "MASTER",
+            "sort_order": 41,
+        })
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor,
+            "scope": "review follow-up integration", "instruction": "review one Todo",
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        status, _ = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "followup-tick",
+        })
+        self.assertEqual(200, status)
+        status, _ = self.act("persona.automation.decide", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "decision_id": "followup-decision", "kind": "EXECUTE",
+            "rationale": "the source Todo is in scope", "evidence_refs": ["test:source"],
+            "target": {"todo_id": source["todo_id"]},
+        })
+        self.assertEqual(200, status)
+        status, dispatched = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "dispatch_id": "followup-dispatch", "title": "review source Todo",
+            "instruction": "inspect source", "completion_conditions": ["review evidence"],
+        })
+        self.assertEqual(201, status, dispatched)
+        review_request = {
+            "run_id": run["run_id"], "result_ref": "followup-result",
+            "outcome": "NEEDS_REVISION", "evidence_refs": ["test:review"],
+            "next_action": "Add the missing regression coverage.",
+            "dispatch_id": dispatched["dispatch"]["dispatch_id"],
+            "assignment_revision": dispatched["dispatch"]["assignment_revision"],
+            "source_message_id": dispatched["message"]["message_id"],
+        }
+        status, reviewed = self.act("persona.automation.review", review_request)
+        self.assertEqual(200, status, reviewed)
+        followup = reviewed["followup"]
+        self.assertTrue(followup["todo_created"])
+        self.assertEqual("P0", followup["todo"]["priority"])
+        self.assertEqual("READY", followup["todo"]["state"])
+        self.assertEqual("MASTER", followup["todo"]["source_kind"])
+        self.assertIn(source["todo_id"], followup["todo"]["detail"])
+        self.assertEqual(
+            "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
+            reviewed["driver"]["status"],
+        )
+        status, replayed = self.act("persona.automation.review", review_request)
+        self.assertEqual(200, status, replayed)
+        self.assertFalse(replayed["followup"]["todo_created"])
+        self.assertEqual(followup["todo"]["todo_id"], replayed["followup"]["todo"]["todo_id"])
 
 
 if __name__ == "__main__":

@@ -763,6 +763,59 @@ class PersonaAutomationStore:
     def _review_row(row: sqlite3.Row) -> dict[str, Any]:
         return {"review_id": row["review_id"], "result_ref": row["result_ref"], "outcome": row["outcome"], "acceptance_status": row["acceptance_status"], "evidence_refs": _load(row["evidence_refs_json"], []), "note": row["note"], "next_action": row["next_action"], "dispatch_id": row["dispatch_id"], "assignment_revision": row["assignment_revision"], "source_message_id": row["source_message_id"], "source_project_id": row["source_project_id"], "source_reply_anchor_ref": row["source_reply_anchor_ref"], "source_reply_terminal_id": row["source_reply_terminal_id"], "created_at": row["created_at"]}
 
+    def record_review_followup(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Record the exact Todo generated from one non-passing review.
+
+        The Todo itself is owned by the work store.  This durable automation
+        event is its idempotency receipt: a retry after creating the Todo but
+        before this receipt is written reuses the caller-supplied deterministic
+        Todo id, while a retry after the receipt is a pure replay.
+        """
+
+        run_id = _text(value.get("run_id"), "run_id")
+        review_id = _text(value.get("review_id"), "review_id")
+        todo_id = _text(value.get("todo_id"), "todo_id")
+        source_todo_id = _text(value.get("source_todo_id"), "source_todo_id")
+        payload = {
+            "review_id": review_id,
+            "todo_id": todo_id,
+            "source_todo_id": source_todo_id,
+            "outcome": _text(value.get("outcome"), "outcome").upper(),
+        }
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            review = _load(row["current_review_json"], {})
+            if str(review.get("review_id") or "") != review_id:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PROVENANCE_MISMATCH",
+                    "follow-up Todo must be bound to the current review",
+                    409,
+                )
+            if str(review.get("outcome") or "").upper() == "PASS":
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_NOT_REQUIRED",
+                    "a passing review cannot generate a follow-up Todo",
+                    409,
+                )
+            event, created = self._event(
+                connection,
+                run_id,
+                "REVIEW_FOLLOWUP_TODO_CREATED",
+                "review-followup:" + review_id,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": (
+                    "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_RECORDED"
+                    if created
+                    else "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_REPLAYED"
+                ),
+                "run": self._row(self._get(connection, run_id)),
+                "followup": payload,
+                "event": event,
+            }
+
     def complete_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
         run_id = _text(value.get("run_id"), "run_id")
         if value.get("complete") is not True:

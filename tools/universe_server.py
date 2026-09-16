@@ -34364,6 +34364,144 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return recorded
 
+    def _create_persona_review_followup_todo(
+        self, review_result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Turn one non-PASS, Todo-bound review into one durable READY Todo.
+
+        A review can only inherit priority when its recorded decision named an
+        exact Todo.  We intentionally do not synthesize a project-wide priority
+        for a meeting or a Goal-only review.  The generated id is derived from
+        the review receipt, so retries cannot produce a second Todo even across
+        the separate automation/work SQLite stores.
+        """
+
+        run = review_result.get("run")
+        review = review_result.get("review")
+        if not isinstance(run, Mapping) or not isinstance(review, Mapping):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_REVIEW_RESULT_INVALID",
+                "review result is missing its durable run or review receipt",
+                502,
+            )
+        outcome = str(review.get("outcome") or "").upper()
+        if outcome == "PASS":
+            return {
+                "status": "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_NOT_REQUIRED",
+                "reason": "PASS",
+            }
+        decision = run.get("current_decision")
+        target = decision.get("target") if isinstance(decision, Mapping) else None
+        source_todo_id = str(target.get("todo_id") or "").strip() if isinstance(target, Mapping) else ""
+        if not source_todo_id:
+            return {
+                "status": "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_SOURCE_UNAVAILABLE",
+                "reason": "REVIEW_HAS_NO_EXACT_TODO_TARGET",
+            }
+        source = self.store.get_todo(source_todo_id)
+        project_id = str(run.get("project_id") or "").strip()
+        if source.get("project_id") != project_id:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PROJECT_MISMATCH",
+                "the reviewed Todo is not in the automation run project",
+                409,
+            )
+        run_node_ref = str(run.get("node_ref") or "").strip()
+        if run_node_ref and source.get("node_ref") != run_node_ref:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_SCOPE_MISMATCH",
+                "the reviewed Todo is outside the node-bound automation run",
+                409,
+            )
+        review_id = _required_text(review.get("review_id"), "review_id")
+        todo_id = "todo_review_" + hashlib.sha256(
+            review_id.encode("utf-8")
+        ).hexdigest()[:24]
+        next_action = str(review.get("next_action") or "").strip()
+        title_basis = next_action or f"Resolve {outcome} review for {source['title']}"
+        title = ("Review follow-up: " + title_basis)[:160]
+        detail_lines = [
+            "Generated automatically from a non-passing Persona automation review.",
+            f"Review: {review_id}",
+            f"Result: {review.get('result_ref')}",
+            f"Source Todo: {source_todo_id}",
+            f"Outcome: {outcome}",
+            "Next action: " + (next_action or "Review evidence and define the bounded corrective action."),
+        ]
+        note = str(review.get("note") or "").strip()
+        if note:
+            detail_lines.append("Review note: " + note)
+        evidence = review.get("evidence_refs") or []
+        if evidence:
+            detail_lines.append("Evidence: " + ", ".join(str(item) for item in evidence))
+        todo_value = {
+            "todo_id": todo_id,
+            "scope_kind": source["scope_kind"],
+            "project_id": source["project_id"],
+            "node_ref": source["node_ref"],
+            "universe_goal_id": source["universe_goal_id"],
+            "goal_id": source["goal_id"],
+            "milestone_id": source["milestone_id"],
+            "title": title,
+            "detail": "\n".join(detail_lines)[:4000],
+            "priority": source["priority"],
+            "state": "READY",
+            "source_kind": "MASTER",
+            "sort_order": int(source["sort_order"]),
+        }
+        try:
+            todo = self.store.create_todo(todo_value)
+            todo_created = True
+        except UniverseError as error:
+            if error.code != "TODO_ID_CONFLICT":
+                raise
+            todo = self.store.get_todo(todo_id)
+            immutable_fields = (
+                "scope_kind", "project_id", "node_ref", "universe_goal_id",
+                "goal_id", "milestone_id", "title", "detail", "priority",
+                "state", "source_kind", "sort_order",
+            )
+            if any(todo.get(field) != todo_value.get(field) for field in immutable_fields):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_TODO_CONFLICT",
+                    "the deterministic review follow-up Todo id has different content",
+                    409,
+                ) from error
+            todo_created = False
+        receipt = self.persona_automation.record_review_followup(
+            {
+                "run_id": run["run_id"],
+                "review_id": review_id,
+                "todo_id": todo_id,
+                "source_todo_id": source_todo_id,
+                "outcome": outcome,
+            }
+        )
+        event, event_created = self.store.append_event(
+            project_id,
+            {
+                "event_id": "persona-review-followup-" + review_id,
+                "event_type": "PERSONA_REVIEW_FOLLOWUP_TODO_CREATED",
+                "payload": {
+                    "run_id": run["run_id"],
+                    "review_id": review_id,
+                    "source_todo_id": source_todo_id,
+                    "todo_id": todo_id,
+                    "outcome": outcome,
+                    "priority": todo["priority"],
+                    "node_ref": todo["node_ref"],
+                },
+            },
+        )
+        return {
+            "status": receipt["status"],
+            "todo": todo,
+            "todo_created": todo_created,
+            "receipt": receipt,
+            "event": event,
+            "event_created": event_created,
+        }
+
     def _handle_persona_automation_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -34506,7 +34644,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 return result
             if action_id == "persona.automation.review":
                 value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id", "source_reply_anchor_ref", "source_reply_terminal_id"}))
-                return self.persona_automation.record_review(value)
+                result = self.persona_automation.record_review(value)
+                followup = self._create_persona_review_followup_todo(result)
+                result["followup"] = followup
+                if followup.get("todo") is not None:
+                    current_run = self.persona_automation.get_run(value["run_id"])
+                    if str(current_run.get("node_ref") or "").strip():
+                        result["driver"] = self._enqueue_persona_automation_driver(
+                            current_run,
+                            driver_key=f"review-{result['review']['review_id']}",
+                        )
+                    else:
+                        # A project-wide Conductor may create the same
+                        # durable follow-up Todo, but it is not a node Master
+                        # scheduler.  Do not fail a successful review after
+                        # its Todo write by pretending that this run has a
+                        # node-bound delivery route.
+                        result["driver"] = {
+                            "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
+                            "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
+                        }
+                return result
             if action_id == "persona.automation.complete":
                 value = _exact_object_fields(request, field="persona_automation_complete", required=frozenset({"run_id", "request_id", "complete"}), optional=frozenset({"expected_revision"}))
                 return self.persona_automation.complete_run(value)
