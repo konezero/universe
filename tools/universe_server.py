@@ -34426,6 +34426,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "a driver can be queued only for a RUNNING or WAITING run",
                         409,
                     )
+                # A dispatched work item is the next authoritative step.
+                # Wake its eligible Master rather than enqueueing a second
+                # control cycle that could compete for the same Todo.
+                assignment = run.get("current_assignment")
+                if isinstance(assignment, Mapping) and assignment.get("state") == "DISPATCHED":
+                    return {
+                        "schema": "universe.persona-automation.v1",
+                        "status": "PERSONA_AUTOMATION_WORK_WAKE_REPLAYED",
+                        "run": run,
+                        "message_id": assignment.get("message_id"),
+                        "woken_master_sessions": self._wake_live_master_sessions(
+                            str(run.get("project_id") or ""),
+                            reason="PERSONA_AUTOMATION_WORK_PENDING",
+                        ),
+                    }
                 # A kick after a completed/WAITING control cycle is a new
                 # bounded cycle.  Tie its idempotency key to the durable run
                 # revision so exact retries reuse one message, while a new
@@ -34475,7 +34490,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if requested_anchor != expected_anchor:
                     raise PersonaAutomationError("PERSONA_AUTOMATION_REPLY_ANCHOR_MISMATCH", "reply_anchor_ref must equal the run Session Anchor", 409)
                 value = {**value, "reply_anchor_ref": requested_anchor, "reply_terminal_id": str(value.get("reply_terminal_id") or self._persona_automation_reply_terminal(expected_anchor)).strip()}
-                return self.persona_automation.dispatch_work(value, self.store.create_master_message)
+                result = self.persona_automation.dispatch_work(
+                    value, self.store.create_master_message
+                )
+                # A newly created work item needs the same targeted live-Master
+                # nudge as a control driver.  Replayed dispatches must not
+                # create another wake or provider turn.
+                if result.get("status") == "PERSONA_AUTOMATION_WORK_DISPATCHED":
+                    result["woken_master_sessions"] = self._wake_live_master_sessions(
+                        str(run.get("project_id") or ""),
+                        reason="PERSONA_AUTOMATION_WORK_DISPATCHED",
+                    )
+                else:
+                    result["woken_master_sessions"] = 0
+                return result
             if action_id == "persona.automation.review":
                 value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id", "source_reply_anchor_ref", "source_reply_terminal_id"}))
                 return self.persona_automation.record_review(value)

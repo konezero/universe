@@ -808,11 +808,19 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
             "kind": "EXECUTE", "rationale": "the test is inside the declared scope", "evidence_refs": ["test:scope"],
         })
         self.assertEqual(200, status, decision)
-        status, dispatched = self.act("persona.automation.dispatch", {
-            "run_id": run["run_id"], "owner_ref": anchor, "dispatch_id": "integration-dispatch",
-            "title": "bounded task", "instruction": "run the isolated check", "completion_conditions": ["result evidence"],
-        })
+        wakes = []
+        original_wake = self.server._wake_live_master_sessions
+        self.server._wake_live_master_sessions = lambda project_id, *, reason: wakes.append((project_id, reason)) or 1
+        try:
+            status, dispatched = self.act("persona.automation.dispatch", {
+                "run_id": run["run_id"], "owner_ref": anchor, "dispatch_id": "integration-dispatch",
+                "title": "bounded task", "instruction": "run the isolated check", "completion_conditions": ["result evidence"],
+            })
+        finally:
+            self.server._wake_live_master_sessions = original_wake
         self.assertEqual(201, status, dispatched)
+        self.assertEqual([("TEST", "PERSONA_AUTOMATION_WORK_DISPATCHED")], wakes)
+        self.assertEqual(1, dispatched["woken_master_sessions"])
         status, surface = self.request("GET", "/v1/projects/TEST/persona-automation")
         self.assertEqual(200, status, surface)
         self.assertEqual(run["run_id"], surface["run"]["run_id"])
