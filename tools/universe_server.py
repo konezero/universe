@@ -195,6 +195,7 @@ from universe_action_registry import (
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
     TODO_BIND_GOAL_ACTION_ID,
+    TODO_BIND_NODE_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -14720,6 +14721,74 @@ class UniverseStore:
                 "UPDATE project_todo SET goal_id = ?, revision = revision + 1, updated_at = ? "
                 "WHERE todo_id = ? AND revision = ?",
                 (normalized_goal_id, now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_node_binding(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow CAS write for a Todo's Feature Node binding.
+
+        Binding a node sets scope_kind=NODE and node_ref to that Feature.
+        Unbinding clears node_ref and returns the Todo to PROJECT scope.
+        A non-null node_ref must name a Feature Node in the same project.
+        When a Goal is already linked, the Goal must share the resulting
+        scope/node coordinates (same rule as _validate_todo_plan_binding).
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision", "node_ref"}:
+            raise UniverseError(
+                "TODO_NODE_BINDING_REQUEST_INVALID",
+                "expected_revision and node_ref are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        todo = self.get_todo(normalized_id)
+        if todo.get("project_id") is None or str(todo.get("scope_kind") or "").upper() == "UNIVERSE":
+            raise UniverseError(
+                "TODO_NODE_BINDING_SCOPE_INVALID",
+                "only a PROJECT or NODE Todo in a project can bind a Feature Node",
+                HTTPStatus.CONFLICT,
+            )
+        node_ref = value.get("node_ref")
+        normalized_node: str | None = None
+        next_scope = "PROJECT"
+        if node_ref is not None:
+            normalized_node = _identifier(node_ref, "node_ref")
+            feature = self.get_feature_node(normalized_node)
+            if feature["project_id"] != todo["project_id"]:
+                raise UniverseError(
+                    "TODO_NODE_BINDING_PROJECT_MISMATCH",
+                    "node_ref belongs to a different project than this todo",
+                    HTTPStatus.CONFLICT,
+                )
+            next_scope = "NODE"
+        # Preserve Goal/Todo hierarchy: changing node while a Goal is linked
+        # is only valid when that Goal already uses the same resulting scope.
+        if todo.get("goal_id"):
+            goal = self.get_goal(str(todo["goal_id"]))
+            if (
+                str(goal.get("scope_kind") or "").upper() != next_scope
+                or goal.get("node_ref") != normalized_node
+            ):
+                raise UniverseError(
+                    "TODO_NODE_BINDING_GOAL_SCOPE_CONFLICT",
+                    "Todo Goal binding requires matching Goal project/node scope",
+                    HTTPStatus.CONFLICT,
+                )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET scope_kind = ?, node_ref = ?, revision = revision + 1, "
+                "updated_at = ? WHERE todo_id = ? AND revision = ?",
+                (next_scope, normalized_node, now, normalized_id, expected_revision),
             )
         if cursor.rowcount != 1:
             current = self.get_todo(normalized_id)
@@ -31077,6 +31146,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
                 TODO_BIND_GOAL_ACTION_ID: self._handle_todo_bind_goal_action,
+                TODO_BIND_NODE_ACTION_ID: self._handle_todo_bind_node_action,
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
@@ -35250,6 +35320,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).result_schema_ref,
             "status": "TODO_GOAL_BOUND" if action.get("goal_id") is not None else "TODO_GOAL_UNBOUND",
             "action_id": TODO_BIND_GOAL_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_bind_node_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.bind_node: narrow Feature Node bind/unbind for LLM/UI callers.
+
+        Mirrors todo.bind_goal: one CAS field write instead of a full
+        todo.update body. Binding sets NODE scope; unbinding returns PROJECT
+        scope. Existing Goal links must keep matching scope coordinates.
+        """
+
+        action = _exact_object_fields(
+            request,
+            field="todo_bind_node_action",
+            required=frozenset({"todo_id", "expected_revision"}),
+            optional=frozenset({"node_ref"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_node_binding(todo_id, {
+            "expected_revision": action["expected_revision"],
+            "node_ref": action.get("node_ref"),
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_BIND_NODE_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_NODE_BOUND" if action.get("node_ref") is not None else "TODO_NODE_UNBOUND",
+            "action_id": TODO_BIND_NODE_ACTION_ID,
             "todo": todo,
         }
 

@@ -74,6 +74,22 @@ TODO_BIND_GOAL_REQUEST_SCHEMA = {
         },
     },
 }
+TODO_BIND_NODE_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "node_ref": {
+            "type": ["string", "null"],
+            "pattern": _IDENTIFIER_PATTERN,
+            "description": "Omit or set null to unbind to PROJECT scope; a "
+            "non-null value must name an existing Feature Node in the same "
+            "project as the Todo.",
+        },
+    },
+}
 TODO_DELETE_ACTION_ID = "todo.delete"
 
 TODO_ACTION_IDS = (
@@ -105,10 +121,10 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     TODO_LIST_ACTION_ID,
     TODO_STATE_ACTION_ID,
     TODO_BIND_GOAL_ACTION_ID,
+    TODO_BIND_NODE_ACTION_ID,
 )
 PENDING_WORK_SURFACE_ACTION_IDS = (
     TODO_PRIORITY_ACTION_ID,
-    TODO_BIND_NODE_ACTION_ID,
     TODO_MOVE_PROJECT_ACTION_ID,
     TODO_REORDER_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
@@ -1193,12 +1209,11 @@ def build_default_action_registry(
     # contracts. The remaining pending todo.* Actions are intentionally left
     # unregistered (coverage reports them UNCOVERED, never available) until
     # they have both a handler and a receipt-aware path where one is needed
-    # - see docs/action-ir-work-surface.md. todo.bind_goal moved out of that
-    # pending set on 2026-09-15: like todo.update, it is a metadata edit
-    # (goal_id only, CAS-guarded), not a lifecycle transition, so it needs
-    # no receipt path of its own - it reuses UniverseStore.set_todo_goal_
-    # binding, the same narrow-write shape as the existing blocked_reason
-    # field.
+    # - see docs/action-ir-work-surface.md. todo.bind_goal (2026-09-15) and
+    # todo.bind_node (2026-09-16) moved out of that pending set: like
+    # todo.update, they are metadata edits (goal_id / node_ref only,
+    # CAS-guarded), not lifecycle transitions, so they need no receipt path
+    # of their own.
     implemented_specs = (
         (
             FEATURE_CREATE_ACTION_ID,
@@ -1261,6 +1276,35 @@ def build_default_action_registry(
         ),
         supplied_handlers.get(TODO_BIND_GOAL_ACTION_ID),
         surfaces=(TODO_BIND_GOAL_ACTION_ID,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=TODO_BIND_NODE_ACTION_ID,
+            request_schema_ref="universe.todo-bind-node-action-request.v1",
+            result_schema_ref="universe.todo-bind-node-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_BIND_NODE_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_NODE_BINDING_REQUEST_INVALID",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                    "FEATURE_NODE_NOT_FOUND",
+                    "TODO_NODE_BINDING_PROJECT_MISMATCH",
+                    "TODO_NODE_BINDING_SCOPE_INVALID",
+                    "TODO_NODE_BINDING_GOAL_SCOPE_CONFLICT",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_BIND_NODE_ACTION_ID),
+        surfaces=(TODO_BIND_NODE_ACTION_ID,),
     )
     from universe_todo_actions import REQUEST_SCHEMAS
     for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
@@ -1360,6 +1404,7 @@ __all__ = [
     "TODO_BIND_GOAL_ACTION_ID",
     "TODO_BIND_GOAL_REQUEST_SCHEMA",
     "TODO_BIND_NODE_ACTION_ID",
+    "TODO_BIND_NODE_REQUEST_SCHEMA",
     "TODO_CREATE_ACTION_ID",
     "TODO_DELETE_ACTION_ID",
     "TODO_MOVE_PROJECT_ACTION_ID",

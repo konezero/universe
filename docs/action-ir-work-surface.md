@@ -112,9 +112,11 @@ unrelated list response.
 
 ## Remaining coverage
 
-`todo.priority`, `todo.reorder`, `todo.bind_node`, `todo.bind_goal`, and
-`todo.move_project` remain unregistered dedicated Actions. Read the current Todo
-and use revision-checked `todo.update` for supported metadata changes.
+`todo.bind_goal` (2026-09-15) and `todo.bind_node` (2026-09-16) are registered
+dedicated Actions with catalog `metadata.request_schema` and narrow CAS store
+writes. `todo.priority`, `todo.reorder`, and `todo.move_project` remain
+unregistered dedicated Actions. Read the current Todo and use revision-checked
+`todo.update` for supported metadata changes those Actions would cover.
 `todo.archive`, `todo.restore`, and `todo.delete` are also pending dedicated
 contracts. Legacy delete remains available in the work-map UI. Registration and
 handler-backed coverage must be distinguished from the full vocabulary.
