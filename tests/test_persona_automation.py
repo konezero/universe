@@ -285,6 +285,7 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         self.assertEqual("EXECUTE", planned["decision"]["kind"])
         self.assertEqual("todo-owned", planned["decision"]["target"]["todo_id"])
         self.assertEqual("NODE_ASSIGNMENT_BOUND", planned["planning_context"]["selection"]["scope_alignment"])
+        self.assertEqual("TODO_SCOPE_READY", planned["planning_context"]["selection"]["status"])
         self.assertEqual(["todo-owned"], [item["todo_id"] for item in planned["planning_context"]["scoped_todos"]])
 
     def test_plan_prefers_in_progress_todo_in_scope_over_goal_metadata(self):

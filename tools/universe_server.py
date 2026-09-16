@@ -33616,12 +33616,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         goal_version_match = bool(
             selected_goal and requested_version and requested_version == goal_revision
         )
+        # Goal metadata is contextual to Todo execution.  Preserve a pinned
+        # Goal/version as evidence, but never label an otherwise eligible
+        # Todo scope as missing work merely because it has no Goal binding.
         goal_selection_status = (
             "PINNED_AND_VERSION_MATCHED"
             if selected_goal and goal_version_match
-            else "GOAL_VERSION_REQUIRED"
+            else "GOAL_CONTEXT_UNVERSIONED"
             if selected_goal
-            else "GOAL_SELECTION_REQUIRED"
+            else "TODO_SCOPE_READY"
         )
 
         todos = [

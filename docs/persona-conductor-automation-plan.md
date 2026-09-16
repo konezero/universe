@@ -975,7 +975,7 @@ same Todo-state ordering across its project.
 
 A Goal is contextual provenance only when the selected Todo already references
 one. A run must not wait merely because `goal_ref` or `goal_version` was not
-provided. An optional `goal_id`, `todo_id`, or `scope_ref` may narrow the
+provided; this state is reported as `TODO_SCOPE_READY`, never as a missing Goal. An optional `goal_id`, `todo_id`, or `scope_ref` may narrow the
 selection; a mismatched Todo or scope fails closed. If no executable Todo
 exists, a BLOCKED Todo escalates and BACKLOG/empty work remains WAITING. The
 separate Goal Work Plan meeting route is considered only after no executable
