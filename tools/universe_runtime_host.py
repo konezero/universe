@@ -37,7 +37,7 @@ CONDUCTOR_INTENT_GATE_STATUSES = frozenset(
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class RuntimeHostError(Exception):
     code: str
     detail: str
