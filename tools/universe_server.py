@@ -33610,7 +33610,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     except Exception:
                         pass
                 try:
-                    self.close_cli_terminal(str(terminal.get("terminal_id") or ""))
+                    # This terminal was minted by this request and has no
+                    # durable assignment after the bind failure. Detaching
+                    # only the Python-side handle lets the persistent Rust
+                    # Host reattach and leaves a throwaway Worker orphaned;
+                    # terminate the exact newly-created Host through the
+                    # supported lifecycle route instead.
+                    self.terminate_cli_terminal(str(terminal.get("terminal_id") or ""))
                 except Exception:
                     pass
                 try:
@@ -33732,11 +33738,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "PERSONA_NATIVE_QUEUE_UNAVAILABLE",
                     "the configured Terminal Host has no native Codex queue adapter",
                 )
-            queue_result = deliver_persona(terminal_id, persona_text)
+            # The supervised Host adapter requires the same deterministic,
+            # assignment-bound message id as the direct TerminalHost path.
+            # Passing only the body works with a narrow in-process test double
+            # but fails at the live Web/Supervisor boundary before any queue
+            # receipt can be recorded. Derive the id from the exact Anchor,
+            # Persona revision and assignment revision so a replay cannot be
+            # mistaken for a different delivery.
+            persona_message_id = persona_native_queue_message_id(
+                persona_text,
+                session_anchor_ref=session_anchor_ref,
+                persona_id=str(assignment.get("persona_id") or ""),
+                persona_revision=int(assignment.get("persona_revision") or 0),
+                assignment_revision=int(assignment.get("assignment_revision") or 0),
+            )
+            queue_result = deliver_persona(
+                terminal_id,
+                persona_text,
+                message_id=persona_message_id,
+            )
             delivery_receipt = queue_result.get("delivery") or {}
             queued_message_id = str(
                 queue_result.get("message_id") or delivery_receipt.get("message_id") or ""
             )
+            if queued_message_id and queued_message_id != persona_message_id:
+                raise TerminalHostError(
+                    "PERSONA_NATIVE_QUEUE_MESSAGE_MISMATCH",
+                    "Host returned a Persona queue message for a different assignment",
+                )
+            queued_message_id = queued_message_id or persona_message_id
             queued_submission_id = str(
                 delivery_receipt.get("queued_submission_id")
                 or queue_result.get("queued_submission_id")

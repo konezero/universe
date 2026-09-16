@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
 import test_memory_candidates_and_delegations as fixtures  # noqa: E402
+from universe_app.terminal_host import persona_native_queue_message_id  # noqa: E402
 
 
 class FleetWorkerAssignmentTests(unittest.TestCase):
@@ -444,15 +445,18 @@ class FleetWorkerSessionStartTests(unittest.TestCase):
         self.assertEqual(200, status, persona_result)
         persona = persona_result["persona"]
         fake_host = self.fake_worker_host()
-        fake_host.deliver_persona_native_queue.return_value = {
-            "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
-            "message_id": "worker-persona-message",
-            "delivery": {
-                "message_id": "worker-persona-message",
-                "phase": "NATIVE_QUEUED",
-                "queued_submission_id": "worker-persona-submission",
-            },
-        }
+        def queue_persona(_terminal_id, _body, *, message_id):
+            return {
+                "status": "PERSONA_NATIVE_QUEUE_ACCEPTED",
+                "message_id": message_id,
+                "delivery": {
+                    "message_id": message_id,
+                    "phase": "NATIVE_QUEUED",
+                    "queued_submission_id": "worker-persona-submission",
+                },
+            }
+
+        fake_host.deliver_persona_native_queue.side_effect = queue_persona
         original_host = self.server.terminal_host
         self.server.terminal_host = fake_host
         try:
@@ -470,13 +474,20 @@ class FleetWorkerSessionStartTests(unittest.TestCase):
         worker_anchor = result["assignment"]["session_anchor_ref"]
         self.assertEqual(worker_anchor, result["persona_assignment"]["session_anchor_ref"])
         self.assertEqual(persona["persona_id"], result["persona_assignment"]["persona_id"])
+        expected_message_id = persona_native_queue_message_id(
+            persona["body"],
+            session_anchor_ref=worker_anchor,
+            persona_id=persona["persona_id"],
+            persona_revision=persona["revision"],
+            assignment_revision=result["persona_assignment"]["assignment_revision"],
+        )
         fake_host.deliver_persona_native_queue.assert_called_once_with(
-            "term_worker_pilot", persona["body"]
+            "term_worker_pilot", persona["body"], message_id=expected_message_id
         )
         persisted = self.server.store.read_persona_assignment(worker_anchor)
         self.assertEqual("NATIVE_QUEUED", persisted["delivery_status"])
         self.assertIsNone(persisted["applied_at"])
-        self.assertEqual("worker-persona-message", persisted["queued_message_id"])
+        self.assertEqual(expected_message_id, persisted["queued_message_id"])
 
     def test_session_start_cleans_persona_assignment_when_late_delivery_binding_fails(self):
         master = self.register("MASTER", "fleet-worker-pilot-persona-cleanup-master")
