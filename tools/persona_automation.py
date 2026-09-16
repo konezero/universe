@@ -610,8 +610,6 @@ class PersonaAutomationStore:
         conditions = value.get("completion_conditions") or []
         if not isinstance(conditions, list) or not conditions:
             raise PersonaAutomationError("PERSONA_AUTOMATION_COMPLETION_CONDITIONS_REQUIRED", "completion_conditions must contain at least one condition")
-        reply_anchor = str(value.get("reply_anchor_ref") or "").strip()
-        reply_terminal = str(value.get("reply_terminal_id") or "").strip()
         with self._connection() as connection:
             row = self._get(connection, run_id)
             self._require_lease(row, owner)
@@ -634,7 +632,6 @@ class PersonaAutomationStore:
                     current_review = _load(row["current_review_json"], {})
                     if str(current_review.get("outcome") or "").upper() == "PASS":
                         raise PersonaAutomationError("PERSONA_AUTOMATION_ASSIGNMENT_PASS_PENDING_COMPLETION", "the current assignment passed review and must be completed before another dispatch", 409)
-            reply_anchor = reply_anchor or str(row["session_anchor_ref"])
             assignment_revision = int(row["revision"]) + 1
             assignment_id = f"persona_assignment:{run_id}:{dispatch_id}"
             # node_ref comes only from the run's own immutable, server-set
@@ -648,7 +645,7 @@ class PersonaAutomationStore:
             # (2026-09-15 Conductor review: dispatch_work previously never
             # passed node_ref, so every node-scoped run's work silently
             # fell back to the project-wide queue bucket).
-            message_value = {"idempotency_key": f"persona-automation:{run_id}:{dispatch_id}", "title": title, "instruction": instruction, "node_ref": row["node_ref"], "metadata": {"persona_automation_run_id": run_id, "persona_automation_assignment_id": assignment_id, "dispatch_id": dispatch_id, "session_anchor_ref": row["session_anchor_ref"], "persona_id": row["persona_id"], "persona_revision": int(row["persona_revision"]), "completion_conditions": conditions, "reply_anchor_ref": reply_anchor, "reply_terminal_id": reply_terminal, "provider_invocation": "DEFERRED_TO_MASTER_QUEUE"}}
+            message_value = {"idempotency_key": f"persona-automation:{run_id}:{dispatch_id}", "title": title, "instruction": instruction, "node_ref": row["node_ref"], "metadata": {"persona_automation_run_id": run_id, "persona_automation_assignment_id": assignment_id, "persona_automation_assignment_revision": assignment_revision, "dispatch_id": dispatch_id, "session_anchor_ref": row["session_anchor_ref"], "persona_id": row["persona_id"], "persona_revision": int(row["persona_revision"]), "completion_conditions": conditions, "provider_invocation": "DEFERRED_TO_MASTER_QUEUE", "completion_route": "PERSONA_AUTOMATION_STORE"}}
             # The callback is the existing Master queue gateway.  No provider
             # call is made here; delivery and result review remain separate.
             try:
@@ -659,13 +656,110 @@ class PersonaAutomationStore:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_QUEUE_ENQUEUE_FAILED", "Master queue enqueue failed; retry the same dispatch idempotency key", 503) from error
             if not isinstance(message, Mapping) or not str(message.get("message_id") or "").strip():
                 raise PersonaAutomationError("PERSONA_AUTOMATION_QUEUE_RECEIPT_INVALID", "Master queue did not return a message receipt", 502)
-            assignment = {"assignment_id": assignment_id, "assignment_revision": assignment_revision, "state": "DISPATCHED", "dispatch_id": dispatch_id, "message_id": message.get("message_id"), "created": bool(created), "title": title, "completion_conditions": conditions, "result_ref": None, "review_id": None, "reply_anchor_ref": reply_anchor, "reply_terminal_id": reply_terminal}
+            assignment = {"assignment_id": assignment_id, "assignment_revision": assignment_revision, "state": "DISPATCHED", "dispatch_id": dispatch_id, "message_id": message.get("message_id"), "created": bool(created), "title": title, "completion_conditions": conditions, "result_ref": None, "review_id": None}
             now = _timestamp()
             cursor = connection.execute("UPDATE persona_automation_run SET current_assignment_json = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?", (_json(assignment), now, run_id, int(row["revision"])))
             if cursor.rowcount != 1:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "automation run changed while recording dispatch", 409)
             event, _ = self._event(connection, run_id, "WORK_DISPATCHED", "dispatch:" + dispatch_id, {"dispatch": assignment, "message": dict(message)})
             return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_WORK_DISPATCHED" if created else "PERSONA_AUTOMATION_WORK_REPLAYED", "run": self._row(self._get(connection, run_id)), "dispatch": assignment, "message": dict(message), "event": event}
+
+    def record_master_completion(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Bind an exact Master completion to its automation dispatch.
+
+        A Master calls ``master.complete`` to report to the server.  That is
+        the control-plane acknowledgement for Persona automation; it must not
+        be routed back into the same Master session's inbox.  The resulting
+        state is deliberately *not* a review or acceptance: an independent
+        Reviewer still has to record the verdict through ``record_review``.
+        """
+
+        run_id = _text(value.get("run_id"), "run_id")
+        dispatch_id = _text(value.get("dispatch_id"), "dispatch_id")
+        source_message_id = _text(value.get("source_message_id"), "source_message_id")
+        assignment_revision = _positive_int(value.get("assignment_revision"), "assignment_revision")
+        result_ref = str(value.get("result_ref") or "").strip()
+        body_digest = _text(value.get("body_text_utf8_sha256"), "body_text_utf8_sha256")
+        completed_at = _text(value.get("completed_at"), "completed_at")
+        payload = {
+            "dispatch_id": dispatch_id,
+            "assignment_revision": int(assignment_revision),
+            "source_message_id": source_message_id,
+            "result_ref": result_ref,
+            "body_text_utf8_sha256": body_digest,
+            "completed_at": completed_at,
+        }
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            existing = connection.execute(
+                "SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, "master-completion:" + source_message_id),
+            ).fetchone()
+            if existing is not None:
+                stored = _load(existing["payload_json"], {})
+                if _digest(stored) != _digest(payload):
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_MASTER_COMPLETION_CONFLICT",
+                        "Master completion differs from the recorded automation result", 409,
+                    )
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_MASTER_RESULT_REPLAYED",
+                    "run": self._row(row),
+                    "result": dict(stored),
+                }
+            assignment = _load(row["current_assignment_json"], None)
+            if not isinstance(assignment, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_ASSIGNMENT_REQUIRED",
+                    "a current Master assignment is required before recording its result", 409,
+                )
+            if (
+                str(assignment.get("dispatch_id") or "") != dispatch_id
+                or str(assignment.get("message_id") or "") != source_message_id
+                or int(assignment.get("assignment_revision") or -1) != int(assignment_revision)
+            ):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH",
+                    "Master completion is not bound to the current automation assignment", 409,
+                )
+            if str(assignment.get("state") or "") != "DISPATCHED":
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_MASTER_COMPLETION_STATE_INVALID",
+                    "Master completion requires a DISPATCHED automation assignment", 409,
+                )
+            updated_assignment = dict(assignment)
+            updated_assignment.update({
+                "state": "RESULT_READY_FOR_REVIEW",
+                "result_ref": result_ref or None,
+                "master_result_digest": body_digest,
+                "master_completed_at": completed_at,
+            })
+            next_condition = "Independent Reviewer verdict is required before automation can complete."
+            now = _timestamp()
+            cursor = connection.execute(
+                "UPDATE persona_automation_run SET state = 'WAITING', current_assignment_json = ?, next_condition = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
+                (_json(updated_assignment), next_condition, now, run_id, int(row["revision"])),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while recording Master completion", 409,
+                )
+            event, _ = self._event(
+                connection,
+                run_id,
+                "MASTER_RESULT_RECORDED",
+                "master-completion:" + source_message_id,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": "PERSONA_AUTOMATION_MASTER_RESULT_RECORDED",
+                "run": self._row(self._get(connection, run_id)),
+                "result": payload,
+                "event": event,
+            }
 
     def record_review(self, value: Mapping[str, Any]) -> dict[str, Any]:
         run_id = _text(value.get("run_id"), "run_id")
@@ -743,19 +837,13 @@ class PersonaAutomationStore:
             source_project_id = str(value.get("source_project_id") or row["project_id"]).strip()
             if source_project_id != str(row["project_id"]):
                 raise PersonaAutomationError("PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH", "result belongs to another project", 409)
-            source_reply_anchor = str(value.get("source_reply_anchor_ref") or "").strip()
-            source_reply_terminal = str(value.get("source_reply_terminal_id") or "").strip()
-            if source_reply_anchor and source_reply_anchor != str(assignment.get("reply_anchor_ref") or ""):
-                raise PersonaAutomationError("PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH", "result reply anchor does not match the assignment", 409)
-            if source_reply_terminal and source_reply_terminal != str(assignment.get("reply_terminal_id") or ""):
-                raise PersonaAutomationError("PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH", "result terminal does not match the assignment", 409)
             prior_review = _load(row["current_review_json"], {})
             if str(prior_review.get("outcome") or "").upper() == "PASS":
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEW_ALREADY_PASSED", "a passed assignment cannot accept another result", 409)
             review_id = "persona_review_" + uuid.uuid4().hex[:24]
             now = _timestamp()
-            connection.execute("INSERT INTO persona_automation_review(review_id, run_id, result_ref, outcome, acceptance_status, evidence_refs_json, note, next_action, dispatch_id, assignment_revision, source_message_id, source_project_id, source_reply_anchor_ref, source_reply_terminal_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (review_id, run_id, result_ref, outcome, acceptance_status, _json(evidence), value.get("note"), value.get("next_action"), dispatch_id, int(assignment_revision), source_message_id, source_project_id, source_reply_anchor or None, source_reply_terminal or None, now))
-            review_payload = {"review_id": review_id, "result_ref": result_ref, "outcome": outcome, "acceptance_status": acceptance_status, "evidence_refs": evidence, "note": value.get("note"), "next_action": value.get("next_action"), "dispatch_id": dispatch_id, "assignment_revision": int(assignment_revision), "source_message_id": source_message_id, "source_project_id": source_project_id, "source_reply_anchor_ref": source_reply_anchor or None, "source_reply_terminal_id": source_reply_terminal or None}
+            connection.execute("INSERT INTO persona_automation_review(review_id, run_id, result_ref, outcome, acceptance_status, evidence_refs_json, note, next_action, dispatch_id, assignment_revision, source_message_id, source_project_id, source_reply_anchor_ref, source_reply_terminal_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)", (review_id, run_id, result_ref, outcome, acceptance_status, _json(evidence), value.get("note"), value.get("next_action"), dispatch_id, int(assignment_revision), source_message_id, source_project_id, now))
+            review_payload = {"review_id": review_id, "result_ref": result_ref, "outcome": outcome, "acceptance_status": acceptance_status, "evidence_refs": evidence, "note": value.get("note"), "next_action": value.get("next_action"), "dispatch_id": dispatch_id, "assignment_revision": int(assignment_revision), "source_message_id": source_message_id, "source_project_id": source_project_id}
             updated_assignment = dict(assignment)
             updated_assignment.update({"state": "REVIEWED", "result_ref": result_ref, "review_id": review_id, "review_outcome": outcome})
             cursor = connection.execute("UPDATE persona_automation_run SET current_assignment_json = ?, current_review_json = ?, next_condition = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?", (_json(updated_assignment), _json(review_payload), value.get("next_action"), now, run_id, int(row["revision"])))

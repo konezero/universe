@@ -241,6 +241,48 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         completed = self.store.complete_run({"run_id": run["run_id"], "request_id": "complete-2", "complete": True})
         self.assertEqual("COMPLETED", completed["run"]["state"])
 
+    def test_master_completion_records_review_pending_without_session_reply_target(self):
+        run = self.start("master-completion-route")
+        owner = self.assignment["session_anchor_ref"]
+        self.store.claim_tick({"run_id": run["run_id"], "owner_ref": owner, "tick_id": "completion-tick"})
+        self.store.record_decision({
+            "run_id": run["run_id"], "owner_ref": owner, "decision_id": "completion-decision",
+            "kind": "EXECUTE", "rationale": "the Todo is inside scope",
+            "evidence_refs": ["todo:exact"], "target": {"todo_id": "todo-exact"},
+        })
+        queued = []
+
+        def enqueue(project_id, value):
+            queued.append((project_id, dict(value)))
+            return {"message_id": "master-completion-route-1"}, True
+
+        dispatched = self.store.dispatch_work({
+            "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "completion-dispatch",
+            "title": "exact Todo", "instruction": "implement it",
+            "completion_conditions": ["review verdict"],
+        }, enqueue)
+        metadata = queued[0][1]["metadata"]
+        self.assertEqual("PERSONA_AUTOMATION_STORE", metadata["completion_route"])
+        self.assertNotIn("reply_anchor_ref", metadata)
+        self.assertNotIn("reply_terminal_id", metadata)
+        assignment = dispatched["dispatch"]
+        completion = {
+            "run_id": run["run_id"], "dispatch_id": assignment["dispatch_id"],
+            "assignment_revision": assignment["assignment_revision"],
+            "source_message_id": assignment["message_id"], "result_ref": "result:exact",
+            "body_text_utf8_sha256": "a" * 64,
+            "completed_at": "2026-09-16T09:00:00Z",
+        }
+        recorded = self.store.record_master_completion(completion)
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_RESULT_RECORDED", recorded["status"])
+        self.assertEqual("WAITING", recorded["run"]["state"])
+        self.assertEqual("RESULT_READY_FOR_REVIEW", recorded["run"]["current_assignment"]["state"])
+        self.assertIn("Independent Reviewer", recorded["run"]["next_condition"])
+        replayed = self.store.record_master_completion(completion)
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_RESULT_REPLAYED", replayed["status"])
+        with self.assertRaisesRegex(PersonaAutomationError, "differs"):
+            self.store.record_master_completion({**completion, "result_ref": "result:changed"})
+
     @staticmethod
     def _planner_stub(run, goals, todos):
         class Store:
@@ -682,13 +724,11 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         first = self.store.dispatch_work({
             "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "dispatch-one",
             "title": "one", "instruction": "one", "completion_conditions": ["one"],
-            "reply_anchor_ref": "anchor-one", "reply_terminal_id": "term-one",
         }, enqueue)
         with self.assertRaisesRegex(PersonaAutomationError, "different bounded work assignment"):
             self.store.dispatch_work({
                 "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "dispatch-two",
                 "title": "two", "instruction": "two", "completion_conditions": ["two"],
-                "reply_anchor_ref": "anchor-one", "reply_terminal_id": "term-one",
             }, enqueue)
         self.assertEqual(first["dispatch"]["dispatch_id"], self.store.get_run(run["run_id"])["current_assignment"]["dispatch_id"])
         self.assertEqual(1, len(queued))
@@ -718,7 +758,6 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         request = {
             "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "dispatch-retry",
             "title": "retry", "instruction": "retry", "completion_conditions": ["evidence"],
-            "reply_anchor_ref": "anchor-retry", "reply_terminal_id": "term-retry",
         }
         with self.assertRaises(sqlite3.OperationalError):
             self.store.dispatch_work(request, enqueue)
@@ -733,7 +772,6 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         dispatch = self.store.dispatch_work({
             "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "dispatch-review",
             "title": "review", "instruction": "review", "completion_conditions": ["evidence"],
-            "reply_anchor_ref": "anchor-review", "reply_terminal_id": "term-review",
         }, lambda project_id, value: ({"message_id": "message-review", "project_id": project_id}, True))
         assignment = dispatch["dispatch"]
         with self.assertRaisesRegex(PersonaAutomationError, "not bound to the current assignment"):
@@ -745,7 +783,6 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             "run_id": run["run_id"], "result_ref": "result-review", "outcome": "PASS", "evidence_refs": ["test"],
             "note": "verified", "next_action": "complete", "dispatch_id": assignment["dispatch_id"],
             "assignment_revision": assignment["assignment_revision"], "source_message_id": assignment["message_id"],
-            "source_reply_anchor_ref": "anchor-review", "source_reply_terminal_id": "term-review",
         }
         recorded = self.store.record_review(request)
         self.assertEqual("PASS", recorded["review"]["outcome"])

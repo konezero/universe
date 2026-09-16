@@ -128,6 +128,59 @@ class DeliveryActionHTTPTests(unittest.TestCase):
         self.assertEqual(409, status, result)
         self.assertEqual("MASTER_RESULT_CONFLICT", result["error_code"])
 
+    def test_persona_automation_master_complete_records_server_review_pending_not_self_inbox(self) -> None:
+        assignment = {
+            "session_anchor_ref": "anchor-automation-master",
+            "project_id": "GCS",
+            "persona_id": "persona-automation-master",
+            "persona_revision": 1,
+            "assignment_revision": 1,
+            "state": "ACTIVE",
+        }
+        started = self.server.persona_automation.start_run({
+            "project_id": "GCS", "session_anchor_ref": assignment["session_anchor_ref"],
+            "scope": "exact completion routing regression", "instruction": "run one bounded test",
+            "request_id": "automation-completion-routing", "idempotency_key": "automation-completion-routing",
+        }, assignment)
+        run = started["run"]
+        self.server.persona_automation.claim_tick({
+            "run_id": run["run_id"], "owner_ref": assignment["session_anchor_ref"],
+            "tick_id": "completion-routing-tick",
+        })
+        self.server.persona_automation.record_decision({
+            "run_id": run["run_id"], "owner_ref": assignment["session_anchor_ref"],
+            "decision_id": "completion-routing-decision", "kind": "EXECUTE",
+            "rationale": "the test has exact scope", "evidence_refs": ["test:delivery"],
+        })
+        dispatched = self.server.persona_automation.dispatch_work({
+            "run_id": run["run_id"], "owner_ref": assignment["session_anchor_ref"],
+            "dispatch_id": "completion-routing-dispatch", "title": "completion routing",
+            "instruction": "complete with a result", "completion_conditions": ["review required"],
+        }, self.server.store.create_master_message)
+        message_id = dispatched["message"]["message_id"]
+        claimed = self.server.store.claim_master_message(
+            "GCS", provider="CODEX", terminal_id="term-automation-master",
+            session_anchor_ref=assignment["session_anchor_ref"],
+        )
+        self.assertEqual(message_id, claimed["message_id"])
+        status, completed = self.request({
+            "action_id": "master.complete",
+            "request": {
+                "message_id": message_id, "provider": "CODEX",
+                "terminal_id": "term-automation-master",
+                "session_anchor_ref": assignment["session_anchor_ref"],
+                "body_text": "finished bounded work", "result_ref": "test://automation/result",
+            },
+        })
+        self.assertEqual(200, status, completed)
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_RESULT_RECORDED", completed["automation_result"]["status"])
+        self.assertEqual([], completed["result_delivery"]["message_ids"])
+        self.assertNotIn("completion_result", completed["message"])
+        current = self.server.persona_automation.get_run(run["run_id"])
+        self.assertEqual("WAITING", current["state"])
+        self.assertEqual("RESULT_READY_FOR_REVIEW", current["current_assignment"]["state"])
+        self.assertIn("Independent Reviewer", current["next_condition"])
+
     def test_session_bus_reply_action_preserves_exact_body_and_rejects_changed_replay(self) -> None:
         terminal_id = "term-bus-action"
         anchor = "session_anchor_bus_action"

@@ -33090,38 +33090,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             HTTPStatus.CONFLICT,
         )
 
-    def _persona_automation_reply_terminal(self, session_anchor_ref: str) -> str:
-        """Resolve the live terminal that receives a Master result.
-
-        The Session Anchor is the durable owner coordinate.  A terminal is
-        only included when the Supervisor can prove the exact live binding;
-        an empty value remains explicit evidence that terminal delivery is
-        unresolved rather than a guessed coordinate.
-        """
-
-        anchor = str(session_anchor_ref or "").strip()
-        if not anchor:
-            return ""
-        sessions = [
-            item for item in self.session_supervisor.list_sessions(include_hidden=True)
-            if str(item.get("session_anchor_ref") or "").strip() == anchor
-        ]
-        if len(sessions) != 1:
-            return ""
-        supervisor_session_id = str(sessions[0].get("session_id") or "").strip()
-        if not supervisor_session_id:
-            return ""
-        try:
-            terminals = self._session_anchor_terminal_host().list_sessions()
-        except (SessionBusError, TerminalHostError, UniverseError):
-            return ""
-        matches = [
-            item for item in terminals
-            if str(item.get("supervisor_session_id") or "").strip() == supervisor_session_id
-            and str(item.get("active_session_anchor_ref") or item.get("session_anchor_ref") or "").strip() == anchor
-        ]
-        return str(matches[0].get("terminal_id") or "").strip() if len(matches) == 1 else ""
-
     def _handle_persona_assign_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
         actor = self._persona_actor(context)
         value = _exact_object_fields(
@@ -34814,13 +34782,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_judge", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"provider", "goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "todo_id", "max_turns"}))
                 return self._persona_automation_judge(value)
             if action_id == "persona.automation.dispatch":
-                value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}), optional=frozenset({"reply_anchor_ref", "reply_terminal_id"}))
+                value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}))
                 run = self.persona_automation.get_run(value["run_id"])
-                expected_anchor = str(run.get("session_anchor_ref") or "").strip()
-                requested_anchor = str(value.get("reply_anchor_ref") or expected_anchor).strip()
-                if requested_anchor != expected_anchor:
-                    raise PersonaAutomationError("PERSONA_AUTOMATION_REPLY_ANCHOR_MISMATCH", "reply_anchor_ref must equal the run Session Anchor", 409)
-                value = {**value, "reply_anchor_ref": requested_anchor, "reply_terminal_id": str(value.get("reply_terminal_id") or self._persona_automation_reply_terminal(expected_anchor)).strip()}
                 result = self.persona_automation.dispatch_work(
                     value, self.store.create_master_message
                 )
@@ -34836,7 +34799,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     result["woken_master_sessions"] = 0
                 return result
             if action_id == "persona.automation.review":
-                value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id", "source_reply_anchor_ref", "source_reply_terminal_id"}))
+                value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id"}))
                 result = self.persona_automation.record_review(value)
                 followup = self._create_persona_review_followup_todo(result)
                 result["followup"] = followup
@@ -35249,12 +35212,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             session_anchor_ref=session_anchor_ref,
             action_request_digest=action_request_digest,
         )
+        automation_result = None
+        metadata = message.get("metadata") if isinstance(message, Mapping) else None
+        if isinstance(metadata, Mapping) and str(metadata.get("completion_route") or "") == "PERSONA_AUTOMATION_STORE":
+            try:
+                automation_result = self.persona_automation.record_master_completion({
+                    "run_id": metadata.get("persona_automation_run_id"),
+                    "dispatch_id": metadata.get("dispatch_id"),
+                    "assignment_revision": metadata.get("persona_automation_assignment_revision"),
+                    "source_message_id": message_id,
+                    "result_ref": result_ref,
+                    "body_text_utf8_sha256": utf8_sha256(body_text),
+                    "completed_at": message.get("completed_at"),
+                })
+            except PersonaAutomationError as error:
+                automation_result = {
+                    "status": "PERSONA_AUTOMATION_MASTER_RESULT_NOT_RECORDED",
+                    "error_code": error.code,
+                    "detail": error.detail,
+                }
         result_delivery = self._publish_master_completion_results()
         return {
             "schema": MASTER_COMPLETE_RESULT_SCHEMA,
             "status": "MASTER_MESSAGE_COMPLETED",
             "action_id": MASTER_COMPLETE_ACTION_ID,
             "message": message,
+            "automation_result": automation_result,
             "result_delivery": result_delivery,
             "body_text_utf8_sha256": utf8_sha256(body_text),
             "action_request_digest": action_request_digest,
@@ -41486,7 +41469,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         + ". Keep these exact owner coordinates on the claim. "
                         + "Finish with POST /v1/master-messages/{message_id}/complete including provider, "
                         + "body_text (actual result summary), and optional result_ref. "
-                        + "The server publishes this result to the recorded reply Anchor; do not send a second coordination reply."
+                        + "For Persona automation work, master.complete records the result directly in the server's automation run as review-pending; do not send a result to your own Session Bus inbox."
                     ),
                 )
             except SessionBusError:
