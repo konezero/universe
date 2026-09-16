@@ -236,6 +236,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
                 "todo.list",
                 "todo.state",
                 "todo.bind_goal",
+                "todo.bind_node",
             ),
             IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
         )

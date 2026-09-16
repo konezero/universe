@@ -999,6 +999,10 @@ result, evidence, and explicit next action in its detail. Its id is derived
 from the review receipt, so an Action replay or a process interruption cannot
 create a duplicate. A node Master then receives one new bounded control cycle
 and selects work from its authoritative queue by the existing priority rules.
+While that generated Todo is `READY` or `IN_PROGRESS`, `persona.automation.pause`
+is rejected as `PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING`; an operator can
+still stop the run explicitly. This prevents a stale "stop at review gate"
+prompt from silently defeating the continuation contract.
 
 Goal-only or meeting reviews have no authoritative Todo priority to inherit.
 They remain explicit `REVIEW_FOLLOWUP_SOURCE_UNAVAILABLE` results rather than

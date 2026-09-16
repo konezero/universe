@@ -34409,6 +34409,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.plan to select and record one Todo from your bound scope (Goal evidence is optional); "
                     "if and only if the decision is EXECUTE, use persona.automation.dispatch "
                     "for one bounded Master work item with explicit completion conditions. "
+                    "A non-PASS review with a durable follow-up Todo is not a pause gate: "
+                    "continue with the next bounded control cycle and do not call persona.automation.pause. "
                     "For MEETING, ESCALATE, or WAIT, do not invent work or adopt a plan; "
                     "record the next condition and finish this control message with evidence."
                 ),
@@ -34433,6 +34435,47 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             reason="PERSONA_AUTOMATION_CONTROL_QUEUED",
         )
         return recorded
+
+    def _pending_persona_review_followup(
+        self, run: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the durable non-PASS follow-up that still needs automation.
+
+        The Persona automation event is the sole receipt.  We never infer a
+        follow-up from review prose or scan unrelated Todos, and a missing
+        Todo is surfaced as missing evidence rather than treated as pending.
+        """
+
+        review = run.get("current_review")
+        if not isinstance(review, Mapping):
+            return None
+        if str(review.get("outcome") or "").upper() == "PASS":
+            return None
+        review_id = str(review.get("review_id") or "").strip()
+        if not review_id:
+            return None
+        followup = next(
+            (
+                event.get("payload")
+                for event in self.persona_automation.events(str(run["run_id"]), 500)
+                if event.get("event_type") == "REVIEW_FOLLOWUP_TODO_CREATED"
+                and isinstance(event.get("payload"), Mapping)
+                and str(event["payload"].get("review_id") or "") == review_id
+            ),
+            None,
+        )
+        if not isinstance(followup, Mapping):
+            return None
+        todo_id = str(followup.get("todo_id") or "").strip()
+        if not todo_id:
+            return None
+        try:
+            todo = self.store.get_todo(todo_id)
+        except UniverseError:
+            return None
+        if str(todo.get("state") or "").upper() not in {"READY", "IN_PROGRESS"}:
+            return None
+        return {"review_id": review_id, "todo": todo}
 
     def _create_persona_review_followup_todo(
         self, review_result: Mapping[str, Any]
@@ -34658,6 +34701,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             if action_id == "persona.automation.pause":
                 value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
+                run = self.persona_automation.get_run(value["run_id"])
+                pending_followup = self._pending_persona_review_followup(run)
+                if pending_followup is not None:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING",
+                        "a non-PASS review generated a READY or IN_PROGRESS follow-up Todo; continue automation or stop explicitly",
+                        409,
+                    )
                 return self.persona_automation.pause_run(value)
             if action_id == "persona.automation.resume":
                 value = _exact_object_fields(request, field="persona_automation_resume", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision"}))

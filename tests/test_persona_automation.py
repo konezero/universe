@@ -901,6 +901,14 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
             "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
             reviewed["driver"]["status"],
         )
+        status, pause_rejected = self.act("persona.automation.pause", {
+            "run_id": run["run_id"], "reason": "incorrect review gate pause",
+        })
+        self.assertEqual(409, status, pause_rejected)
+        self.assertEqual(
+            "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING",
+            pause_rejected["error_code"],
+        )
         status, replayed = self.act("persona.automation.review", review_request)
         self.assertEqual(200, status, replayed)
         self.assertFalse(replayed["followup"]["todo_created"])
