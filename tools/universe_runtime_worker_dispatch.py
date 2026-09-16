@@ -46,7 +46,7 @@ READ_ONLY_WORKER_RESPONSE_TIMEOUT_SECONDS = 240
 QA_WORKER_RESPONSE_TIMEOUT_SECONDS = 900
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkerDispatchError(Exception):
     code: str
     stage: str

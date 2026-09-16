@@ -1277,6 +1277,31 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         )
         self.assertIsNotNone(store.get(captured.exception.host_evidence_ref))
 
+    def test_worker_dispatch_error_is_not_frozen_and_survives_a_real_chained_raise(self):
+        """2026-09-16 live incident: WorkerDispatchError was `@dataclass(frozen=True)`
+        while also subclassing Exception. The interpreter's own exception
+        machinery assigns `__traceback__` (and `__context__`/`__cause__` on a
+        chained raise) onto the exception instance after it propagates out of
+        a `raise` -- a frozen dataclass's generated `__setattr__` rejects that
+        assignment, so *every* real `raise WorkerDispatchError(...)` failed
+        with `FrozenInstanceError: cannot assign to field '__traceback__'`
+        instead of the intended error. This masked the real error entirely
+        (reproduced live via memory.batch.run, which raises it through
+        several stack frames). assertRaises(...) elsewhere in this file
+        does not exercise a real interpreter-level chained raise the same
+        way, so it did not catch this. A plain `raise ... from ...` inside a
+        real function call (not just constructing/catching the instance
+        directly) is the actual failure mode.
+        """
+
+        def inner():
+            raise WorkerDispatchError("CODE", "STAGE", "reason") from ValueError("origin")
+
+        with self.assertRaises(WorkerDispatchError) as captured:
+            inner()
+        self.assertEqual("CODE", captured.exception.code)
+        self.assertIsInstance(captured.exception.__cause__, ValueError)
+
 
 if __name__ == "__main__":
     unittest.main()
