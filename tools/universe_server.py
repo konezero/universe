@@ -34483,6 +34483,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         # receipt.  Prefer the newest active receipt, never Todo prose.
         followup = next((item for item in followups if isinstance(item, Mapping)), None)
         if not isinstance(followup, Mapping):
+            # A Master handoff starts a new run, so its local automation-event
+            # stream cannot contain the predecessor's receipt.  The project
+            # event is the same append-only receipt published at review time;
+            # use it only with the exact project/node boundary, never a Todo
+            # text scan or heuristic.  This keeps an unresolved remediation
+            # Todo actionable after an exhausted Master is replaced.
+            project_events = getattr(self.store, "list_events", None)
+            run_node_ref = str(run.get("node_ref") or "").strip()
+            if callable(project_events):
+                followup = next(
+                    (
+                        event.get("payload")
+                        for event in project_events(str(run.get("project_id") or ""), 500)
+                        if event.get("event_type") == "PERSONA_REVIEW_FOLLOWUP_TODO_CREATED"
+                        and isinstance(event.get("payload"), Mapping)
+                        and (
+                            not run_node_ref
+                            or str(event["payload"].get("node_ref") or "") == run_node_ref
+                        )
+                    ),
+                    None,
+                )
+        if not isinstance(followup, Mapping):
             return None
         review_id = str(followup.get("review_id") or review_id).strip()
         todo_id = str(followup.get("todo_id") or "").strip()

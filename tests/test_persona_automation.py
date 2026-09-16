@@ -250,6 +250,9 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             def list_todos(self):
                 return list(todos)
 
+            def list_events(self, project_id, limit=100):
+                return []
+
             def goal_work_plan_surface(self, goal_id):
                 return {
                     "feature_goal_derivation": None,
