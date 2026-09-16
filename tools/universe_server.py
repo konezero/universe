@@ -33824,8 +33824,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         backlog_todos = [
             todo for todo in selected_todos if str(todo.get("state") or "").upper() == "BACKLOG"
         ]
+        # A non-PASS review creates one durable remediation Todo.  It is the
+        # authoritative continuation receipt for this run, so select it ahead
+        # of an older IN_PROGRESS source Todo.  Without this explicit edge the
+        # normal IN_PROGRESS-first ordering repeatedly retries the failed work
+        # and leaves the review's own Todo stranded in READY.
+        pending_reader = getattr(self, "_pending_persona_review_followup", None)
+        pending_followup = pending_reader(run) if callable(pending_reader) else None
+        pending_followup_id = (
+            str((pending_followup.get("todo") or {}).get("todo_id") or "").strip()
+            if isinstance(pending_followup, Mapping) and not requested_todo
+            else ""
+        )
         executable_todos.sort(
             key=lambda todo: (
+                0 if pending_followup_id and str(todo.get("todo_id") or "") == pending_followup_id else 1,
                 0 if str(todo.get("state") or "").upper() == "IN_PROGRESS" else 1,
                 {"P0": 0, "P1": 1, "P2": 2, "P3": 3}.get(
                     str(todo.get("priority") or "P3").upper(), 4
@@ -34446,26 +34459,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         Todo is surfaced as missing evidence rather than treated as pending.
         """
 
+        events_reader = getattr(self.persona_automation, "events", None)
+        if not callable(events_reader):
+            # Small planner-only test doubles deliberately implement no event
+            # history.  They have no durable follow-up receipt to prefer.
+            return None
         review = run.get("current_review")
-        if not isinstance(review, Mapping):
-            return None
-        if str(review.get("outcome") or "").upper() == "PASS":
-            return None
-        review_id = str(review.get("review_id") or "").strip()
-        if not review_id:
-            return None
-        followup = next(
-            (
-                event.get("payload")
-                for event in self.persona_automation.events(str(run["run_id"]), 500)
-                if event.get("event_type") == "REVIEW_FOLLOWUP_TODO_CREATED"
-                and isinstance(event.get("payload"), Mapping)
-                and str(event["payload"].get("review_id") or "") == review_id
-            ),
-            None,
+        review_id = (
+            str(review.get("review_id") or "").strip()
+            if isinstance(review, Mapping)
+            and str(review.get("outcome") or "").upper() != "PASS"
+            else ""
         )
+        followups = [
+            event.get("payload")
+            for event in events_reader(str(run["run_id"]), 500)
+            if event.get("event_type") == "REVIEW_FOLLOWUP_TODO_CREATED"
+            and isinstance(event.get("payload"), Mapping)
+            and (not review_id or str(event["payload"].get("review_id") or "") == review_id)
+        ]
+        # A run transition may clear the presentation-level current_review;
+        # the event itself is still the durable, authoritative continuation
+        # receipt.  Prefer the newest active receipt, never Todo prose.
+        followup = next((item for item in followups if isinstance(item, Mapping)), None)
         if not isinstance(followup, Mapping):
             return None
+        review_id = str(followup.get("review_id") or review_id).strip()
         todo_id = str(followup.get("todo_id") or "").strip()
         if not todo_id:
             return None
@@ -34714,7 +34733,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_resume", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision"}))
                 return self.persona_automation.resume_run(value)
             if action_id == "persona.automation.stop":
-                value = _exact_object_fields(request, field="persona_automation_stop", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_stop",
+                    required=frozenset({"run_id", "request_id"}),
+                    optional=frozenset({"expected_revision", "reason", "force"}),
+                )
+                if value.get("force") is not None and type(value["force"]) is not bool:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_STOP_FORCE_INVALID",
+                        "force must be a boolean when provided",
+                    )
+                run = self.persona_automation.get_run(value["run_id"])
+                pending_followup = self._pending_persona_review_followup(run)
+                if pending_followup is not None and value.get("force") is not True:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING",
+                        "a non-PASS review generated a READY or IN_PROGRESS follow-up Todo; continue automation or explicitly stop with force=true",
+                        409,
+                    )
                 return self.persona_automation.stop_run(value)
             if action_id == "persona.automation.status":
                 value = _exact_object_fields(request, field="persona_automation_status", required=frozenset(), optional=frozenset({"run_id", "project_id", "node_ref", "session_anchor_ref"}))

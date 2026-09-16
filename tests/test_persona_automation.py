@@ -909,10 +909,32 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
             "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING",
             pause_rejected["error_code"],
         )
+        status, stop_rejected = self.act("persona.automation.stop", {
+            "run_id": run["run_id"], "reason": "incorrect automatic stop",
+        })
+        self.assertEqual(409, status, stop_rejected)
+        self.assertEqual(
+            "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_PENDING",
+            stop_rejected["error_code"],
+        )
         status, replayed = self.act("persona.automation.review", review_request)
         self.assertEqual(200, status, replayed)
         self.assertFalse(replayed["followup"]["todo_created"])
         self.assertEqual(followup["todo"]["todo_id"], replayed["followup"]["todo"]["todo_id"])
+        status, _ = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "followup-plan-tick",
+        })
+        self.assertEqual(200, status)
+        status, planned = self.act("persona.automation.plan", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "decision_id": "followup-remediation-decision",
+        })
+        self.assertEqual(200, status, planned)
+        self.assertEqual(followup["todo"]["todo_id"], planned["decision"]["target"]["todo_id"])
+        status, stopped = self.act("persona.automation.stop", {
+            "run_id": run["run_id"], "reason": "explicit operator stop", "force": True,
+        })
+        self.assertEqual(200, status, stopped)
 
 
 if __name__ == "__main__":
