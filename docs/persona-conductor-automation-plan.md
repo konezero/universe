@@ -964,3 +964,26 @@ PID 42552 and completed with PID 42980; the service operation reported
 same local endpoint and the authoritative terminal projection retains the three
 user Host anchors (Conductor, Claude Master and this Codex Master) as LIVE.
 No throwaway terminal remained live after cleanup.
+
+### Todo-first node Master execution (2026-09-16)
+
+A node-scoped Master automation run is a Todo execution loop. Its authoritative
+work surface is the run's bound `feature_node` and the Todos whose `node_ref`
+matches that node. It selects one `IN_PROGRESS` Todo first, then one `READY`
+Todo by priority, sort order, and Todo id. A project-wide Conductor run uses the
+same Todo-state ordering across its project.
+
+A Goal is contextual provenance only when the selected Todo already references
+one. A run must not wait merely because `goal_ref` or `goal_version` was not
+provided. An optional `goal_id`, `todo_id`, or `scope_ref` may narrow the
+selection; a mismatched Todo or scope fails closed. If no executable Todo
+exists, a BLOCKED Todo escalates and BACKLOG/empty work remains WAITING. The
+separate Goal Work Plan meeting route is considered only after no executable
+Todo exists and an explicitly selected design Goal provides that route.
+
+This keeps the roles distinct: Conductor shapes project goals and plans;
+node Masters resolve the Todo backlog that implements those plans. Completion
+still requires the existing result and acceptance-review evidence; picking a
+Todo does not mark it done. `persona.automation.kick` creates one new bounded
+control cycle keyed to the current run revision; a retry of that same revision
+reuses its queue message, while a prior completed control message cannot block it.

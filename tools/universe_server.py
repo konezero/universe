@@ -33554,15 +33554,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _persona_automation_plan(
         self, value: Mapping[str, Any], *, record: bool = True
     ) -> dict[str, Any]:
-        """Prepare a durable, evidence-backed Conductor decision.
+        """Prepare one durable, evidence-backed Todo decision for a run.
 
-        Planning must not turn list order into authority.  A Goal and its
-        revision must be explicitly pinned by the run or this request, and a
-        Todo is eligible only when it belongs to that Goal and project.  Scope
-        and owner checks are returned as evidence so an unresolved selection
-        remains WAIT rather than being silently handed to Master.  This
-        method never invokes a provider; the existing Work Plan meeting route
-        is exposed as an explicit follow-up with its own result/review gate.
+        Node Masters solve the eligible Todo backlog in their bound node.
+        A Goal remains contextual evidence when a Todo already references one;
+        it is not a prerequisite for selecting and executing that Todo.  Scope
+        comes from the run's authoritative node binding (or the Conductor's
+        project-wide scope), and owner checks prevent another Anchor from
+        choosing work.  A Work Plan meeting remains a separate fallback only
+        when no executable Todo exists and an explicitly selected design Goal
+        needs planning.
         """
 
         run = self.persona_automation.get_run(value["run_id"])
@@ -33668,29 +33669,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             for token in re.split(r"[^A-Za-z0-9_.:-]+", scope_text)
             if token
         }
-        scope_matches = set()
+        scope_matches = {project_id}
+        if run_node_ref:
+            scope_matches.add(run_node_ref)
         if selected_goal:
             scope_matches.update(
                 {
                     str(selected_goal.get("goal_id") or ""),
                     str(selected_goal.get("node_ref") or ""),
-                    project_id,
                 }
             )
-        scope_alignment = "UNPROVEN"
-        if requested_scope_ref and requested_scope_ref in scope_matches:
-            scope_alignment = "EXPLICIT_REF_MATCHED"
-        elif requested_scope_ref and requested_scope_ref not in scope_matches:
-            scope_alignment = "MISMATCH"
-        elif (
-            selected_goal
-            and run_goal_ref == str(selected_goal.get("goal_id") or "")
-            and goal_version_match
-            and scope_tokens.intersection(scope_matches)
-        ):
-            scope_alignment = "RUN_GOAL_PINNED"
-        elif scope_tokens.intersection(scope_matches):
-            scope_alignment = "EXACT_REF_IN_SCOPE_TEXT"
+        if requested_scope_ref:
+            scope_alignment = (
+                "EXPLICIT_REF_MATCHED"
+                if requested_scope_ref in scope_matches
+                else "MISMATCH"
+            )
+        elif run_node_ref:
+            scope_alignment = "NODE_ASSIGNMENT_BOUND"
+        else:
+            scope_alignment = "PROJECT_SCOPE_BOUND"
 
         owner_ref = requested_owner or run_owner
         owner_alignment = (
@@ -33715,13 +33713,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "work_owner_alignment": owner_alignment,
         }
 
-        selected_todos = [
-            todo
-            for todo in todos
-            if selected_goal
-            and str(todo.get("goal_id") or "") == str(selected_goal.get("goal_id") or "")
-            and str(todo.get("project_id") or "") == project_id
-        ]
+        # The run's node binding is the authoritative work boundary.  A
+        # project-wide Conductor run deliberately retains the full project
+        # Todo surface.  Goal filtering is optional and only narrows a caller
+        # request; it never manufactures a Goal requirement for execution.
+        selected_todos = list(todos)
+        if run_node_ref is not None:
+            selected_todos = [
+                todo for todo in selected_todos
+                if str(todo.get("node_ref") or "") == run_node_ref
+            ]
+        if requested_goal:
+            selected_todos = [
+                todo for todo in selected_todos
+                if str(todo.get("goal_id") or "") == requested_goal
+            ]
+        requested_todo = str(value.get("todo_id") or "").strip()
+        if requested_todo:
+            selected_todos = [
+                todo for todo in selected_todos
+                if str(todo.get("todo_id") or "") == requested_todo
+            ]
+            if not selected_todos:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_TODO_NOT_FOUND",
+                    "todo_id is not in the run's authoritative scope",
+                    404,
+                )
         blocked_todos = [
             todo for todo in selected_todos if str(todo.get("state") or "").upper() == "BLOCKED"
         ]
@@ -33758,42 +33776,62 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
 
         decision_kind = "WAIT"
-        rationale = "An explicit Goal, revision, scope, and work-owner alignment is required before selecting work."
+        rationale = "The run will select one eligible Todo from its authoritative scope."
         target: dict[str, Any] | None = {"selection": selection_evidence}
-        next_condition = requested_next or "Conductor pins a Goal, goal_version, scope_ref, and work owner for this run."
+        next_condition = requested_next or "an eligible READY or IN_PROGRESS Todo exists in this run's scope"
         meeting: dict[str, Any] | None = None
 
         selection_ready = bool(
-            selected_goal
-            and goal_version_match
-            and scope_alignment in {"EXPLICIT_REF_MATCHED", "RUN_GOAL_PINNED", "EXACT_REF_IN_SCOPE_TEXT"}
-            and owner_alignment == "RUN_ANCHOR_BOUND"
+            owner_alignment == "RUN_ANCHOR_BOUND"
+            and scope_alignment != "MISMATCH"
         )
         selected_plan = next(
             (item for item in work_plans if item.get("goal_id") == (selected_goal or {}).get("goal_id")),
             None,
         )
 
-        if not selected_goal or not goal_version_match:
+        if not selection_ready:
             decision_kind = "WAIT"
-            rationale = "No Goal selection with an exact current goal_version is pinned to this run."
-        elif not selection_ready:
-            decision_kind = "WAIT"
-            rationale = "Goal selection exists, but scope or work-owner alignment is not proven for this run."
-        elif str(selected_goal.get("state") or "").upper() == "BLOCKED":
+            rationale = "The requested scope or work owner does not match this automation run."
+        elif executable_todos:
+            decision_kind = "EXECUTE"
+            todo = executable_todos[0]
+            todo_goal_id = str(todo.get("goal_id") or "").strip() or None
+            target.update(
+                {
+                    "todo_id": todo.get("todo_id"),
+                    "goal_id": todo_goal_id,
+                    "node_ref": todo.get("node_ref") or run_node_ref,
+                    "state": todo.get("state"),
+                    "selection": selection_evidence,
+                    "ownership": {
+                        "project_id": todo.get("project_id"),
+                        "goal_id": todo_goal_id,
+                        "node_ref": todo.get("node_ref") or run_node_ref,
+                        "source_kind": todo.get("source_kind"),
+                        "owner_ref": owner_ref,
+                    },
+                }
+            )
+            evidence_refs.append(f"universe://todos/{todo['todo_id']}")
+            if todo_goal_id:
+                evidence_refs.append(f"universe://goals/{todo_goal_id}")
+            rationale = "The bound scope contains an executable Todo; it can be handed to Master."
+            next_condition = requested_next or "Master result is returned to the bound reply coordinates and receives an acceptance review"
+        elif blocked_todos:
+            decision_kind = "ESCALATE"
+            blocked = blocked_todos[0]
+            target.update({"todo_id": blocked.get("todo_id"), "node_ref": blocked.get("node_ref") or run_node_ref, "state": "BLOCKED"})
+            evidence_refs.append(f"universe://todos/{blocked['todo_id']}")
+            rationale = "No executable Todo remains in scope and the next Todo is BLOCKED."
+            next_condition = requested_next or "the blocked Todo receives an explicit resolution"
+        elif selected_goal and str(selected_goal.get("state") or "").upper() == "BLOCKED":
             decision_kind = "ESCALATE"
             target["goal_id"] = selected_goal["goal_id"]
             target["state"] = "BLOCKED"
             evidence_refs.append(f"universe://goals/{selected_goal['goal_id']}")
             rationale = "The selected Goal is BLOCKED; execution cannot be inferred from another project Todo."
             next_condition = requested_next or "the selected Goal receives an explicit resolution"
-        elif blocked_todos:
-            decision_kind = "ESCALATE"
-            blocked = blocked_todos[0]
-            target.update({"todo_id": blocked.get("todo_id"), "state": "BLOCKED"})
-            evidence_refs.append(f"universe://todos/{blocked['todo_id']}")
-            rationale = "A Todo in the selected Goal is BLOCKED; unrelated project Todos do not satisfy this run."
-            next_condition = requested_next or "the selected Goal Todo receives an explicit resolution"
         else:
             planning_gap = bool(
                 selected_plan
@@ -33866,34 +33904,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     rationale = "The selected Goal needs a Work Plan meeting, but its room/provider prerequisites are not verified."
                     next_condition = requested_next or "a verified MEETING room with at least two bound model sessions"
                     target["meeting_preconditions"] = meeting_preconditions
-            elif executable_todos:
-                decision_kind = "EXECUTE"
-                todo = executable_todos[0]
-                target.update(
-                    {
-                        "todo_id": todo.get("todo_id"),
-                        "goal_id": todo.get("goal_id"),
-                        "state": todo.get("state"),
-                        "selection": selection_evidence,
-                        "ownership": {
-                            "project_id": todo.get("project_id"),
-                            "goal_id": todo.get("goal_id"),
-                            "source_kind": todo.get("source_kind"),
-                            "owner_ref": owner_ref,
-                        },
-                    }
-                )
-                evidence_refs.append(f"universe://todos/{todo['todo_id']}")
-                rationale = "The selected Goal and exact revision/scope/owner checks identify one executable Todo; it can be handed to Master."
-                next_condition = requested_next or "Master result is returned to the bound reply coordinates and receives an acceptance review"
             elif backlog_todos:
                 decision_kind = "WAIT"
-                rationale = "The selected Goal has only BACKLOG Todos; a READY or IN_PROGRESS selection is required before dispatch."
-                next_condition = requested_next or "a selected Todo is explicitly moved to READY or IN_PROGRESS"
+                rationale = "This run has only BACKLOG Todos; a READY or IN_PROGRESS Todo is required before dispatch."
+                next_condition = requested_next or "a Todo in this run's scope is explicitly moved to READY or IN_PROGRESS"
             else:
                 decision_kind = "WAIT"
-                rationale = "The selected Goal has no executable Todo or unresolved verified Work Plan route."
-                next_condition = requested_next or "the selected Goal surface changes or a reviewable planning result is recorded"
+                rationale = "This run has no executable Todo and no explicit planning route to evaluate."
+                next_condition = requested_next or "a Todo is added or becomes READY in this run's scope"
 
         decision_value = {
             "run_id": value["run_id"],
@@ -33936,9 +33954,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "goals": goal_candidates,
             "todos": todos,
             "selected_goal_todos": selected_todos,
+            "scoped_todos": selected_todos,
             "work_plans": work_plans,
             "decision_basis": {
                 "selected_goal_todo_count": len(selected_todos),
+                "scoped_todo_count": len(selected_todos),
                 "executable_todo_count": len(executable_todos),
                 "backlog_todo_count": len(backlog_todos),
                 "blocked_todo_count": len(blocked_todos),
@@ -33986,6 +34006,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "scope_ref",
             "work_owner_ref",
             "next_condition",
+            "todo_id",
         ):
             if field in value:
                 plan_value[field] = value[field]
@@ -34276,7 +34297,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return recorded
 
     def _enqueue_persona_automation_driver(
-        self, run: Mapping[str, Any]
+        self, run: Mapping[str, Any], *, driver_key: str = "initial-v1"
     ) -> dict[str, Any]:
         """Queue exactly one bounded control turn for a node Master run.
 
@@ -34299,7 +34320,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "automatic Master control is available only for a node-bound Master run",
                 409,
             )
-        driver_key = "initial-v1"
+        driver_key = _required_text(driver_key, "driver_key")
         message, created = self.store.create_master_message(
             project_id,
             {
@@ -34312,7 +34333,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     f"Run one bounded automation control cycle for {run_id}. "
                     "Use the typed persona.automation Actions in this order: "
                     "persona.automation.tick to claim one tick using your own Session Anchor; "
-                    "persona.automation.plan to record the pinned Goal/Work Plan/Todo evidence; "
+                    "persona.automation.plan to select and record one Todo from your bound scope (Goal evidence is optional); "
                     "if and only if the decision is EXECUTE, use persona.automation.dispatch "
                     "for one bounded Master work item with explicit completion conditions. "
                     "For MEETING, ESCALATE, or WAIT, do not invent work or adopt a plan; "
@@ -34402,7 +34423,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "a driver can be queued only for a RUNNING or WAITING run",
                         409,
                     )
-                return self._enqueue_persona_automation_driver(run)
+                # A kick after a completed/WAITING control cycle is a new
+                # bounded cycle.  Tie its idempotency key to the durable run
+                # revision so exact retries reuse one message, while a new
+                # decision can never collide with the initial driver.
+                return self._enqueue_persona_automation_driver(
+                    run, driver_key=f"kick-r{int(run.get('revision') or 0)}"
+                )
             if action_id == "persona.automation.pause":
                 value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
                 return self.persona_automation.pause_run(value)
@@ -34432,10 +34459,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_decide", required=frozenset({"run_id", "owner_ref", "decision_id", "kind", "rationale", "evidence_refs"}), optional=frozenset({"target", "next_condition", "meeting", "invocation"}))
                 return self.persona_automation.record_decision(value)
             if action_id == "persona.automation.plan":
-                value = _exact_object_fields(request, field="persona_automation_plan", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition"}))
+                value = _exact_object_fields(request, field="persona_automation_plan", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "todo_id"}))
                 return self._persona_automation_plan(value)
             if action_id == "persona.automation.judge":
-                value = _exact_object_fields(request, field="persona_automation_judge", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"provider", "goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "max_turns"}))
+                value = _exact_object_fields(request, field="persona_automation_judge", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"provider", "goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "todo_id", "max_turns"}))
                 return self._persona_automation_judge(value)
             if action_id == "persona.automation.dispatch":
                 value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}), optional=frozenset({"reply_anchor_ref", "reply_terminal_id"}))

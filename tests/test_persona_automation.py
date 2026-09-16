@@ -141,6 +141,16 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         self.assertIn("persona.automation.tick", request["instruction"])
         self.assertEqual("PERSONA_AUTOMATION_CONTROL", request["metadata"]["kind"])
         self.assertEqual("initial-v1", recorded[0][1])
+        self.assertEqual(
+            "persona-automation-driver:persona_run_driver_test:initial-v1",
+            request["idempotency_key"],
+        )
+        UniverseHTTPServer._enqueue_persona_automation_driver(server, run, driver_key="kick-r3")
+        self.assertEqual(2, len(queued))
+        self.assertEqual(
+            "persona-automation-driver:persona_run_driver_test:kick-r3",
+            queued[1][1]["idempotency_key"],
+        )
 
     def test_pause_resume_preserves_cursor_and_stopped_run_cannot_tick(self):
         run = self.start()
@@ -256,100 +266,80 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             multi_rooms=SimpleNamespace(list_bindings=lambda room_id: []),
         )
 
-    def test_plan_requires_explicit_goal_and_ignores_unrelated_project_todo(self):
+    def test_plan_selects_node_scoped_todo_without_goal_pin(self):
         run = {
-            "run_id": "run-plan-selection",
-            "project_id": "project_test",
-            "session_anchor_ref": "session_anchor_conductor_test",
-            "scope": "bounded automation check",
-            "goal_ref": None,
-            "goal_version": None,
+            "run_id": "run-plan-node", "project_id": "project_test",
+            "session_anchor_ref": "session_anchor_master_test",
+            "scope": "node:feature-owned", "node_ref": "feature-owned",
+            "goal_ref": None, "goal_version": None,
         }
-        goals = [
-            {"goal_id": "goal-blocked", "project_id": "project_test", "revision": 4, "state": "BLOCKED", "node_ref": None},
-            {"goal_id": "goal-ready", "project_id": "project_test", "revision": 2, "state": "READY", "node_ref": None},
-        ]
+        goals = [{"goal_id": "goal-other", "project_id": "project_test", "revision": 4, "state": "BLOCKED", "node_ref": "feature-other"}]
         todos = [
-            {"todo_id": "todo-blocked", "project_id": "project_test", "goal_id": "goal-blocked", "state": "BLOCKED", "priority": "P0", "sort_order": 0, "source_kind": "USER"},
-            {"todo_id": "todo-ready", "project_id": "project_test", "goal_id": "goal-ready", "state": "READY", "priority": "P1", "sort_order": 0, "source_kind": "USER"},
+            {"todo_id": "todo-other", "project_id": "project_test", "node_ref": "feature-other", "goal_id": "goal-other", "state": "READY", "priority": "P0", "sort_order": 0, "source_kind": "USER"},
+            {"todo_id": "todo-owned", "project_id": "project_test", "node_ref": "feature-owned", "goal_id": None, "state": "READY", "priority": "P1", "sort_order": 0, "source_kind": "USER"},
         ]
         server = self._planner_stub(run, goals, todos)
         planned = UniverseHTTPServer._persona_automation_plan(server, {
-            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-selection",
-        })
-        self.assertEqual("WAIT", planned["decision"]["kind"])
-        self.assertEqual("GOAL_SELECTION_REQUIRED", planned["planning_context"]["selection"]["status"])
-        self.assertEqual([], planned["planning_context"]["selected_goal_todos"])
-        self.assertNotEqual("todo-ready", planned["decision"]["target"].get("todo_id"))
-
-    def test_plan_selects_exact_goal_revision_scope_and_owner_before_todo(self):
-        run = {
-            "run_id": "run-plan-exact",
-            "project_id": "project_test",
-            "session_anchor_ref": "session_anchor_conductor_test",
-            "scope": "goal-selected bounded automation check",
-            "goal_ref": "goal-selected",
-            "goal_version": "2",
-        }
-        goals = [
-            {"goal_id": "goal-selected", "project_id": "project_test", "revision": 2, "state": "READY", "node_ref": None},
-            {"goal_id": "goal-other", "project_id": "project_test", "revision": 8, "state": "BLOCKED", "node_ref": None},
-        ]
-        todos = [
-            {"todo_id": "todo-selected-ready", "project_id": "project_test", "goal_id": "goal-selected", "state": "READY", "priority": "P0", "sort_order": 0, "source_kind": "USER"},
-            {"todo_id": "todo-selected-progress", "project_id": "project_test", "goal_id": "goal-selected", "state": "IN_PROGRESS", "priority": "P2", "sort_order": 3, "source_kind": "MASTER"},
-            {"todo_id": "todo-other-blocked", "project_id": "project_test", "goal_id": "goal-other", "state": "BLOCKED", "priority": "P0", "sort_order": 0, "source_kind": "USER"},
-        ]
-        server = self._planner_stub(run, goals, todos)
-        planned = UniverseHTTPServer._persona_automation_plan(server, {
-            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-exact",
-            "goal_id": "goal-selected", "goal_version": "2", "scope_ref": "goal-selected",
-            "work_owner_ref": run["session_anchor_ref"],
+            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-node",
         })
         self.assertEqual("EXECUTE", planned["decision"]["kind"])
-        self.assertEqual("todo-selected-progress", planned["decision"]["target"]["todo_id"])
-        self.assertEqual("PINNED_AND_VERSION_MATCHED", planned["planning_context"]["selection"]["status"])
-        self.assertEqual("EXPLICIT_REF_MATCHED", planned["planning_context"]["selection"]["scope_alignment"])
-        self.assertEqual(2, planned["planning_context"]["decision_basis"]["selected_goal_todo_count"])
-        self.assertEqual(0, planned["planning_context"]["decision_basis"]["blocked_todo_count"])
+        self.assertEqual("todo-owned", planned["decision"]["target"]["todo_id"])
+        self.assertEqual("NODE_ASSIGNMENT_BOUND", planned["planning_context"]["selection"]["scope_alignment"])
+        self.assertEqual(["todo-owned"], [item["todo_id"] for item in planned["planning_context"]["scoped_todos"]])
 
-    def test_plan_does_not_escalate_stale_blocked_goal_revision(self):
+    def test_plan_prefers_in_progress_todo_in_scope_over_goal_metadata(self):
         run = {
-            "run_id": "run-plan-stale",
-            "project_id": "project_test",
-            "session_anchor_ref": "session_anchor_conductor_test",
-            "scope": "goal-stale bounded automation check",
-            "goal_ref": "goal-stale",
-            "goal_version": "1",
+            "run_id": "run-plan-priority", "project_id": "project_test",
+            "session_anchor_ref": "session_anchor_master_test",
+            "scope": "node:feature-owned", "node_ref": "feature-owned",
+            "goal_ref": None, "goal_version": None,
         }
-        goals = [{"goal_id": "goal-stale", "project_id": "project_test", "revision": 2, "state": "BLOCKED", "node_ref": None}]
-        server = self._planner_stub(run, goals, [])
-        planned = UniverseHTTPServer._persona_automation_plan(server, {
-            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-stale",
-            "goal_id": "goal-stale", "goal_version": "1", "scope_ref": "goal-stale",
-            "work_owner_ref": run["session_anchor_ref"],
-        })
-        self.assertEqual("WAIT", planned["decision"]["kind"])
-        self.assertEqual("GOAL_VERSION_REQUIRED", planned["planning_context"]["selection"]["status"])
-
-    def test_plan_requires_scope_alignment_even_when_run_goal_is_pinned(self):
-        run = {
-            "run_id": "run-plan-scope-mismatch",
-            "project_id": "project_test",
-            "session_anchor_ref": "session_anchor_conductor_test",
-            "scope": "unrelated work with no goal coordinate",
-            "goal_ref": "goal-scoped",
-            "goal_version": "3",
-        }
-        goals = [{"goal_id": "goal-scoped", "project_id": "project_test", "revision": 3, "state": "READY", "node_ref": None}]
-        todos = [{"todo_id": "todo-scoped", "project_id": "project_test", "goal_id": "goal-scoped", "state": "READY", "priority": "P1", "sort_order": 0, "source_kind": "USER"}]
+        goals = [{"goal_id": "goal-context", "project_id": "project_test", "revision": 2, "state": "READY", "node_ref": "feature-owned"}]
+        todos = [
+            {"todo_id": "todo-ready", "project_id": "project_test", "node_ref": "feature-owned", "goal_id": "goal-context", "state": "READY", "priority": "P0", "sort_order": 0, "source_kind": "USER"},
+            {"todo_id": "todo-progress", "project_id": "project_test", "node_ref": "feature-owned", "goal_id": "goal-context", "state": "IN_PROGRESS", "priority": "P2", "sort_order": 3, "source_kind": "MASTER"},
+        ]
         server = self._planner_stub(run, goals, todos)
         planned = UniverseHTTPServer._persona_automation_plan(server, {
+            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-priority",
+        })
+        self.assertEqual("EXECUTE", planned["decision"]["kind"])
+        self.assertEqual("todo-progress", planned["decision"]["target"]["todo_id"])
+        self.assertEqual("goal-context", planned["decision"]["target"]["goal_id"])
+        self.assertEqual(2, planned["planning_context"]["decision_basis"]["scoped_todo_count"])
+
+    def test_plan_escalates_blocked_todo_without_goal_version_gate(self):
+        run = {
+            "run_id": "run-plan-blocked", "project_id": "project_test",
+            "session_anchor_ref": "session_anchor_master_test",
+            "scope": "node:feature-owned", "node_ref": "feature-owned",
+            "goal_ref": None, "goal_version": None,
+        }
+        todos = [{"todo_id": "todo-blocked", "project_id": "project_test", "node_ref": "feature-owned", "goal_id": "goal-stale", "state": "BLOCKED", "priority": "P0", "sort_order": 0, "source_kind": "USER"}]
+        server = self._planner_stub(run, [], todos)
+        planned = UniverseHTTPServer._persona_automation_plan(server, {
+            "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-blocked",
+        })
+        self.assertEqual("ESCALATE", planned["decision"]["kind"])
+        self.assertEqual("todo-blocked", planned["decision"]["target"]["todo_id"])
+        self.assertNotEqual("GOAL_VERSION_REQUIRED", planned["planning_context"]["selection"]["status"])
+
+    def test_plan_rejects_explicit_scope_outside_bound_node(self):
+        run = {
+            "run_id": "run-plan-scope-mismatch", "project_id": "project_test",
+            "session_anchor_ref": "session_anchor_master_test",
+            "scope": "node:feature-owned", "node_ref": "feature-owned",
+            "goal_ref": None, "goal_version": None,
+        }
+        todos = [{"todo_id": "todo-scoped", "project_id": "project_test", "node_ref": "feature-owned", "goal_id": None, "state": "READY", "priority": "P1", "sort_order": 0, "source_kind": "USER"}]
+        server = self._planner_stub(run, [], todos)
+        planned = UniverseHTTPServer._persona_automation_plan(server, {
             "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-scope-mismatch",
-            "goal_id": "goal-scoped", "goal_version": "3", "work_owner_ref": run["session_anchor_ref"],
+            "scope_ref": "feature-other",
         })
         self.assertEqual("WAIT", planned["decision"]["kind"])
-        self.assertEqual("UNPROVEN", planned["planning_context"]["selection"]["scope_alignment"])
+        self.assertEqual("MISMATCH", planned["planning_context"]["selection"]["scope_alignment"])
+        self.assertNotIn("todo-scoped", str(planned["decision"]["target"]))
 
     def test_plan_meeting_is_an_explicit_reviewable_work_plan_route(self):
         run = {
