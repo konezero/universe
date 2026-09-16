@@ -77,6 +77,71 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PersonaAutomationError, "active persona automation run"):
             self.start("start-2")
 
+    def test_driver_receipt_is_durable_and_replay_safe(self):
+        run = self.start()
+        message = {
+            "message_id": "master_driver_1",
+            "target_session_anchor_ref": self.assignment["session_anchor_ref"],
+            "node_ref": "feature_test",
+            "created": True,
+        }
+        first = self.store.record_driver_message(
+            run["run_id"], driver_key="initial-v1", message=message
+        )
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_ENQUEUED", first["status"])
+        replay = self.store.record_driver_message(
+            run["run_id"], driver_key="initial-v1", message=message
+        )
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_REPLAYED", replay["status"])
+        self.assertEqual("master_driver_1", replay["driver"]["message_id"])
+        with self.assertRaisesRegex(PersonaAutomationError, "idempotency key"):
+            self.store.record_driver_message(
+                run["run_id"],
+                driver_key="initial-v1",
+                message={**message, "message_id": "master_driver_other"},
+            )
+
+    def test_node_master_driver_is_exactly_targeted_and_woken_once(self):
+        run = {
+            "run_id": "persona_run_driver_test",
+            "project_id": "project_test",
+            "session_anchor_ref": self.assignment["session_anchor_ref"],
+            "node_ref": "feature_test",
+        }
+        queued = []
+
+        class Store:
+            def create_master_message(self, project_id, value):
+                queued.append((project_id, dict(value)))
+                return {
+                    "message_id": "master_driver_1",
+                    "target_session_anchor_ref": value["target_session_anchor_ref"],
+                    "node_ref": value["node_ref"],
+                }, True
+
+        recorded = []
+        class Automation:
+            def record_driver_message(self, run_id, *, driver_key, message):
+                recorded.append((run_id, driver_key, dict(message)))
+                return {"status": "PERSONA_AUTOMATION_DRIVER_ENQUEUED", "driver": dict(message)}
+
+        wakes = []
+        server = SimpleNamespace(
+            store=Store(),
+            persona_automation=Automation(),
+            _wake_live_master_sessions=lambda project_id, *, reason: wakes.append((project_id, reason)),
+        )
+        result = UniverseHTTPServer._enqueue_persona_automation_driver(server, run)
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_ENQUEUED", result["status"])
+        self.assertEqual([("project_test", "PERSONA_AUTOMATION_CONTROL_QUEUED")], wakes)
+        self.assertEqual(1, len(queued))
+        request = queued[0][1]
+        self.assertEqual(self.assignment["session_anchor_ref"], request["target_session_anchor_ref"])
+        self.assertEqual("feature_test", request["node_ref"])
+        self.assertIn("persona.automation.tick", request["instruction"])
+        self.assertEqual("PERSONA_AUTOMATION_CONTROL", request["metadata"]["kind"])
+        self.assertEqual("initial-v1", recorded[0][1])
+
     def test_pause_resume_preserves_cursor_and_stopped_run_cannot_tick(self):
         run = self.start()
         tick = self.store.claim_tick({"run_id": run["run_id"], "owner_ref": self.assignment["session_anchor_ref"], "tick_id": "tick-1", "cursor": {"todo": "todo-1"}})

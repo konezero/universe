@@ -378,6 +378,57 @@ class PersonaAutomationStore:
             row = self._get(connection, run_id)
         return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_RUN_STARTED", "run": self._row(row), "created": True}
 
+    def record_driver_message(
+        self,
+        run_id: str,
+        *,
+        driver_key: str,
+        message: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record the exact bounded Master-control message for a run.
+
+        Starting a run must mean more than creating a RUNNING row.  The
+        durable event is deliberately separate from a work assignment: this
+        message asks the owning Master to perform one control cycle (tick,
+        plan, and only then any bounded dispatch).  A deterministic queue key
+        makes retries reuse the same message rather than wake a Master twice.
+        """
+
+        run_id = _text(run_id, "run_id")
+        driver_key = _text(driver_key, "driver_key")
+        message_id = _text(message.get("message_id"), "message.message_id")
+        payload = {
+            "driver_key": driver_key,
+            "message_id": message_id,
+            "target_session_anchor_ref": message.get("target_session_anchor_ref"),
+            "node_ref": message.get("node_ref"),
+            # The driver key identifies the durable queue item.  It is a
+            # creation fact, not the current call's replay result, so keep it
+            # stable across retries (including runs written by the first
+            # deployed version of this feature).
+            "created": True,
+        }
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            event, created = self._event(
+                connection,
+                run_id,
+                "DRIVER_ENQUEUED",
+                "driver:" + driver_key,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": (
+                    "PERSONA_AUTOMATION_DRIVER_ENQUEUED"
+                    if created
+                    else "PERSONA_AUTOMATION_DRIVER_REPLAYED"
+                ),
+                "run": self._row(row),
+                "driver": payload,
+                "event": event,
+            }
+
     def _mutate_state(self, run_id: str, state: str, *, request_id: str, expected_revision: int | None = None, reason: str | None = None) -> dict[str, Any]:
         if state not in RUN_STATES:
             raise PersonaAutomationError("PERSONA_AUTOMATION_STATE_INVALID", "unsupported automation run state")

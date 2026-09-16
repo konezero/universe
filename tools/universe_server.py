@@ -31055,6 +31055,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.resume",
                     "persona.automation.stop",
                     "persona.automation.status",
+                    "persona.automation.kick",
                     "persona.automation.tick",
                     "persona.automation.plan",
                     "persona.automation.judge",
@@ -34274,6 +34275,71 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         recorded["meeting"] = meeting_result
         return recorded
 
+    def _enqueue_persona_automation_driver(
+        self, run: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Queue exactly one bounded control turn for a node Master run.
+
+        A run is durable state, but it is not a scheduler.  The actual
+        automation owner is the Master bound to the node, so starting or
+        recovering a node run creates a targeted Master-queue message rather
+        than polling every run or silently invoking a provider in the web
+        process.  The queue's exact target binding and its idempotency key are
+        the delivery boundary; a completed control turn never causes a second
+        wake merely because the UI refreshed.
+        """
+
+        run_id = _required_text(run.get("run_id"), "run_id")
+        project_id = _identifier(run.get("project_id"), "project_id")
+        anchor = _required_text(run.get("session_anchor_ref"), "session_anchor_ref")
+        node_ref = str(run.get("node_ref") or "").strip()
+        if not node_ref:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_DRIVER_NODE_REQUIRED",
+                "automatic Master control is available only for a node-bound Master run",
+                409,
+            )
+        driver_key = "initial-v1"
+        message, created = self.store.create_master_message(
+            project_id,
+            {
+                "idempotency_key": f"persona-automation-driver:{run_id}:{driver_key}",
+                "target_session_anchor_ref": anchor,
+                "node_ref": node_ref,
+                "title": f"Run bounded node automation: {node_ref}",
+                "instruction": (
+                    "You are the exact Master bound to this Feature Node. "
+                    f"Run one bounded automation control cycle for {run_id}. "
+                    "Use the typed persona.automation Actions in this order: "
+                    "persona.automation.tick to claim one tick using your own Session Anchor; "
+                    "persona.automation.plan to record the pinned Goal/Work Plan/Todo evidence; "
+                    "if and only if the decision is EXECUTE, use persona.automation.dispatch "
+                    "for one bounded Master work item with explicit completion conditions. "
+                    "For MEETING, ESCALATE, or WAIT, do not invent work or adopt a plan; "
+                    "record the next condition and finish this control message with evidence."
+                ),
+                "metadata": {
+                    "kind": "PERSONA_AUTOMATION_CONTROL",
+                    "persona_automation_run_id": run_id,
+                    "session_anchor_ref": anchor,
+                    "node_ref": node_ref,
+                    "control_cycle": "ONE_BOUNDED_TICK",
+                },
+            },
+        )
+        receipt = dict(message)
+        receipt["created"] = bool(created)
+        recorded = self.persona_automation.record_driver_message(
+            run_id,
+            driver_key=driver_key,
+            message=receipt,
+        )
+        self._wake_live_master_sessions(
+            project_id,
+            reason="PERSONA_AUTOMATION_CONTROL_QUEUED",
+        )
+        return recorded
+
     def _handle_persona_automation_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -34304,7 +34370,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     # happens to sit on its assignment row (which ordinary
                     # persona.assign leaves optional for any mode).
                     assignment = {**assignment, "node_ref": None}
-                return self.persona_automation.start_run(value, assignment or {})
+                result = self.persona_automation.start_run(value, assignment or {})
+                # A node-bound Master run must immediately have one bounded
+                # control message to execute.  Do not turn a successful state
+                # write into a failed start if the independent queue transport
+                # is momentarily unavailable: expose the failed driver receipt
+                # so the caller can retry through persona.automation.kick.
+                if result.get("created"):
+                    try:
+                        result["driver"] = self._enqueue_persona_automation_driver(
+                            result["run"]
+                        )
+                    except (UniverseError, PersonaAutomationError) as error:
+                        result["driver"] = {
+                            "status": "PERSONA_AUTOMATION_DRIVER_ENQUEUE_FAILED",
+                            "code": getattr(error, "code", "PERSONA_AUTOMATION_QUEUE_ENQUEUE_FAILED"),
+                            "detail": str(error),
+                        }
+                return result
+            if action_id == "persona.automation.kick":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_kick",
+                    required=frozenset({"run_id"}),
+                    optional=frozenset(),
+                )
+                run = self.persona_automation.get_run(value["run_id"])
+                if str(run.get("state") or "") not in {"RUNNING", "WAITING"}:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_DRIVER_STATE_INVALID",
+                        "a driver can be queued only for a RUNNING or WAITING run",
+                        409,
+                    )
+                return self._enqueue_persona_automation_driver(run)
             if action_id == "persona.automation.pause":
                 value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))
                 return self.persona_automation.pause_run(value)

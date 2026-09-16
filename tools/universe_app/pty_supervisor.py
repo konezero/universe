@@ -667,10 +667,31 @@ class SupervisedTerminalHost:
         return dict(self._request("POST", f"/v1/terminals/{quote(terminal_id, safe='')}/offer-turn",
                                   payload=dict(payload)).get("turn_delivery") or {})
 
-    def push_node_projection(self, terminal_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def push_node_projection(
+        self,
+        terminal_id: str,
+        *,
+        session_anchor_ref: str,
+        state: str,
+        assignment_revision: int,
+        node_ref: str | None,
+    ) -> dict[str, Any]:
+        """Forward the same typed node-projection call accepted by TerminalHost.
+
+        ``UniverseHTTPServer`` is intentionally written against the
+        TerminalHost contract.  The supervised proxy must preserve that
+        contract rather than exposing its HTTP payload shape to callers;
+        otherwise live assignments are saved but their Host confirmation is
+        incorrectly recorded as an ERROR before the request is even sent.
+        """
         return dict(self._request(
             "POST", f"/v1/terminals/{quote(terminal_id, safe='')}/node-projection",
-            payload=dict(payload),
+            payload={
+                "session_anchor_ref": session_anchor_ref,
+                "state": state,
+                "assignment_revision": assignment_revision,
+                "node_ref": node_ref,
+            },
         ).get("node_projection") or {})
 
     def turn_delivery_status(self, terminal_id: str) -> dict[str, Any]:

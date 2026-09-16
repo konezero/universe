@@ -152,6 +152,30 @@ class PtySupervisorTests(unittest.TestCase):
             audit_source="UNIVERSE_PERSONA_NATIVE_QUEUE",
         )
 
+    def test_supervised_host_node_projection_preserves_terminal_host_contract(self) -> None:
+        host = SupervisedTerminalHost.__new__(SupervisedTerminalHost)
+        receipt = {"status": "ACCEPTED", "revision": 7}
+        with patch.object(host, "_request", return_value={"node_projection": receipt}) as request:
+            result = host.push_node_projection(
+                "term-supervised",
+                session_anchor_ref=TEST_ANCHOR,
+                state="ACTIVE",
+                assignment_revision=7,
+                node_ref="feature_test",
+            )
+
+        self.assertEqual(receipt, result)
+        request.assert_called_once_with(
+            "POST",
+            "/v1/terminals/term-supervised/node-projection",
+            payload={
+                "session_anchor_ref": TEST_ANCHOR,
+                "state": "ACTIVE",
+                "assignment_revision": 7,
+                "node_ref": "feature_test",
+            },
+        )
+
     def test_supervisor_polls_orphan_reclaim_without_ui_clients(self) -> None:
         observed = threading.Event()
 
