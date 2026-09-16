@@ -35214,12 +35214,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         automation_result = None
         metadata = message.get("metadata") if isinstance(message, Mapping) else None
-        if isinstance(metadata, Mapping) and str(metadata.get("completion_route") or "") == "PERSONA_AUTOMATION_STORE":
+        completion_route = str(metadata.get("completion_route") or "") if isinstance(metadata, Mapping) else ""
+        legacy_self_reply = (
+            isinstance(metadata, Mapping)
+            and not completion_route
+            and bool(str(metadata.get("persona_automation_run_id") or "").strip())
+            and bool(str(metadata.get("persona_automation_assignment_id") or "").strip())
+            and bool(str(metadata.get("reply_anchor_ref") or "").strip())
+        )
+        if completion_route == "PERSONA_AUTOMATION_STORE" or legacy_self_reply:
             try:
                 automation_result = self.persona_automation.record_master_completion({
                     "run_id": metadata.get("persona_automation_run_id"),
                     "dispatch_id": metadata.get("dispatch_id"),
                     "assignment_revision": metadata.get("persona_automation_assignment_revision"),
+                    "legacy_self_reply_migration": legacy_self_reply,
                     "source_message_id": message_id,
                     "result_ref": result_ref,
                     "body_text_utf8_sha256": utf8_sha256(body_text),

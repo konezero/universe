@@ -677,20 +677,46 @@ class PersonaAutomationStore:
         run_id = _text(value.get("run_id"), "run_id")
         dispatch_id = _text(value.get("dispatch_id"), "dispatch_id")
         source_message_id = _text(value.get("source_message_id"), "source_message_id")
-        assignment_revision = _positive_int(value.get("assignment_revision"), "assignment_revision")
+        supplied_assignment_revision = value.get("assignment_revision")
+        legacy_self_reply_migration = value.get("legacy_self_reply_migration") is True
+        if supplied_assignment_revision is None and not legacy_self_reply_migration:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_INTEGER_INVALID",
+                "assignment_revision must be a positive integer",
+            )
+        assignment_revision = (
+            _positive_int(supplied_assignment_revision, "assignment_revision")
+            if supplied_assignment_revision is not None
+            else None
+        )
         result_ref = str(value.get("result_ref") or "").strip()
         body_digest = _text(value.get("body_text_utf8_sha256"), "body_text_utf8_sha256")
         completed_at = _text(value.get("completed_at"), "completed_at")
-        payload = {
-            "dispatch_id": dispatch_id,
-            "assignment_revision": int(assignment_revision),
-            "source_message_id": source_message_id,
-            "result_ref": result_ref,
-            "body_text_utf8_sha256": body_digest,
-            "completed_at": completed_at,
-        }
         with self._connection() as connection:
             row = self._get(connection, run_id)
+            assignment = _load(row["current_assignment_json"], None)
+            if not isinstance(assignment, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_ASSIGNMENT_REQUIRED",
+                    "a current Master assignment is required before recording its result", 409,
+                )
+            current_assignment_revision = int(assignment.get("assignment_revision") or -1)
+            if assignment_revision is None:
+                # One-time, explicit migration for already committed
+                # automation messages that used the removed self-reply route.
+                # The current assignment's exact run/dispatch/message tuple is
+                # still authoritative; no anchor, cache, or message scan is
+                # consulted to fill a missing revision.
+                assignment_revision = current_assignment_revision
+            payload = {
+                "dispatch_id": dispatch_id,
+                "assignment_revision": int(assignment_revision),
+                "source_message_id": source_message_id,
+                "result_ref": result_ref,
+                "body_text_utf8_sha256": body_digest,
+                "completed_at": completed_at,
+                "route": "LEGACY_SELF_REPLY_MIGRATION" if legacy_self_reply_migration else "AUTOMATION_STORE",
+            }
             existing = connection.execute(
                 "SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
                 (run_id, "master-completion:" + source_message_id),
@@ -708,12 +734,6 @@ class PersonaAutomationStore:
                     "run": self._row(row),
                     "result": dict(stored),
                 }
-            assignment = _load(row["current_assignment_json"], None)
-            if not isinstance(assignment, Mapping):
-                raise PersonaAutomationError(
-                    "PERSONA_AUTOMATION_ASSIGNMENT_REQUIRED",
-                    "a current Master assignment is required before recording its result", 409,
-                )
             if (
                 str(assignment.get("dispatch_id") or "") != dispatch_id
                 or str(assignment.get("message_id") or "") != source_message_id

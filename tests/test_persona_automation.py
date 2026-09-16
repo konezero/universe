@@ -283,6 +283,36 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PersonaAutomationError, "differs"):
             self.store.record_master_completion({**completion, "result_ref": "result:changed"})
 
+    def test_legacy_self_reply_migration_derives_revision_only_from_exact_current_assignment(self):
+        run = self.start("legacy-self-reply")
+        owner = self.assignment["session_anchor_ref"]
+        self.store.claim_tick({"run_id": run["run_id"], "owner_ref": owner, "tick_id": "legacy-tick"})
+        self.store.record_decision({
+            "run_id": run["run_id"], "owner_ref": owner, "decision_id": "legacy-decision",
+            "kind": "EXECUTE", "rationale": "migrate one exact old completion",
+            "evidence_refs": ["test:legacy"],
+        })
+        dispatch = self.store.dispatch_work({
+            "run_id": run["run_id"], "owner_ref": owner, "dispatch_id": "legacy-dispatch",
+            "title": "legacy", "instruction": "legacy", "completion_conditions": ["review"],
+        }, lambda project_id, value: ({"message_id": "legacy-master-message"}, True))
+        assignment = dispatch["dispatch"]
+        recorded = self.store.record_master_completion({
+            "run_id": run["run_id"], "dispatch_id": assignment["dispatch_id"],
+            "source_message_id": assignment["message_id"], "result_ref": "legacy:result",
+            "body_text_utf8_sha256": "b" * 64, "completed_at": "2026-09-16T09:10:00Z",
+            "legacy_self_reply_migration": True,
+        })
+        self.assertEqual("LEGACY_SELF_REPLY_MIGRATION", recorded["result"]["route"])
+        self.assertEqual(assignment["assignment_revision"], recorded["result"]["assignment_revision"])
+        with self.assertRaisesRegex(PersonaAutomationError, "differs"):
+            self.store.record_master_completion({
+                "run_id": run["run_id"], "dispatch_id": "other-dispatch",
+                "source_message_id": assignment["message_id"], "result_ref": "wrong",
+                "body_text_utf8_sha256": "c" * 64, "completed_at": "2026-09-16T09:10:01Z",
+                "legacy_self_reply_migration": True,
+            })
+
     @staticmethod
     def _planner_stub(run, goals, todos):
         class Store:
