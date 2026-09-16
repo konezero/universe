@@ -49,9 +49,25 @@ class MasterCompletionDeliveryTests(unittest.TestCase):
         server.session_bus = SessionBus(database_path=self.bus_path)
         recovered = UniverseHTTPServer._publish_master_completion_results(server)
         self.assertFalse(recovered["errors"])
+        self.assertEqual(1, len(recovered["message_ids"]))
+        self.assertEqual([], self.store.master_completion_results())
+        self.assertEqual([], UniverseHTTPServer._publish_master_completion_results(server)["message_ids"])
         again = SessionBus(database_path=self.bus_path)
         again.publish_master_completion(done)
         self.assertEqual(1, len(again._messages))
+
+    def test_publish_receipt_is_exact_and_prevents_historic_rescan(self):
+        done = self.complete()
+        server = Mock(store=self.store, session_bus=self.bus)
+        first = UniverseHTTPServer._publish_master_completion_results(server)
+        self.assertEqual([done["completion_result"]["message_id"]], first["message_ids"])
+        stored = self.store.get_master_message(self.mid)
+        self.assertEqual("PUBLISHED", stored["completion_delivery"]["status"])
+        self.assertEqual(done["completion_result"]["message_id"], stored["completion_delivery"]["message_id"])
+        second = UniverseHTTPServer._publish_master_completion_results(server)
+        self.assertEqual([], second["message_ids"])
+        with self.assertRaises(UniverseError):
+            self.store.mark_master_completion_published(self.mid, "msg_wrong")
 
     def test_master_completion_closes_only_matching_claude_handoff(self):
         self.complete()

@@ -24817,11 +24817,102 @@ class UniverseStore:
             return completed
 
     def master_completion_results(self) -> list[dict[str, Any]]:
+        """Return only committed results that have not reached the Bus once.
+
+        ``SessionBus.publish_master_completion`` is idempotent, but polling
+        every historic DONE result on every five-second recovery sweep still
+        creates unnecessary work and misleading repeated delivery receipts.
+        The Store owns this one-way publish receipt.  If the process crashes
+        after the Bus commit and before this receipt, a single idempotent Bus
+        replay is safe; after the receipt, the result is no longer scanned.
+        """
         with self._connection() as connection:
             rows = connection.execute("""SELECT message_json FROM project_master_message
                 WHERE json_extract(message_json, '$.delivery_state') = 'DONE'
-                  AND json_type(message_json, '$.completion_result') = 'object'""").fetchall()
+                  AND json_type(message_json, '$.completion_result') = 'object'
+                  AND json_type(message_json, '$.completion_delivery') IS NULL""").fetchall()
         return [json.loads(row["message_json"]) for row in rows]
+
+    def mark_master_completion_published(
+        self, message_id: str, completion_message_id: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Record the exact successful Session Bus import once.
+
+        This is an explicit recovery receipt, not a delivery fallback.  The
+        result envelope has already been durably accepted by Session Bus when
+        this method is called.  A crash before this CAS leaves the receipt
+        absent and permits one idempotent replay; a conflicting receipt fails
+        closed rather than pointing one Master result at another Bus message.
+        """
+
+        master_id = _required_text(message_id, "message_id")
+        result_id = _required_text(completion_message_id, "completion_message_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT message_json FROM project_master_message WHERE message_id = ?",
+                (master_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "MASTER_MESSAGE_NOT_FOUND", "Master message is not registered", HTTPStatus.NOT_FOUND
+                )
+            message = json.loads(row["message_json"])
+            if message.get("delivery_state") != "DONE" or not isinstance(
+                message.get("completion_result"), Mapping
+            ):
+                raise UniverseError(
+                    "MASTER_MESSAGE_STATE_CONFLICT",
+                    "only a completed Master result can receive a publish receipt",
+                    HTTPStatus.CONFLICT,
+                )
+            expected_result_id = str(message["completion_result"].get("message_id") or "")
+            if expected_result_id != result_id:
+                raise UniverseError(
+                    "MASTER_COMPLETION_DELIVERY_CONFLICT",
+                    "Session Bus receipt does not match the committed Master result",
+                    HTTPStatus.CONFLICT,
+                )
+            existing = message.get("completion_delivery")
+            if isinstance(existing, Mapping):
+                if str(existing.get("message_id") or "") == result_id:
+                    return message, False
+                raise UniverseError(
+                    "MASTER_COMPLETION_DELIVERY_CONFLICT",
+                    "Master result already has a different publish receipt",
+                    HTTPStatus.CONFLICT,
+                )
+            message["completion_delivery"] = {
+                "status": "PUBLISHED",
+                "message_id": result_id,
+                "published_at": utc_now(),
+            }
+            message["updated_at"] = utc_now()
+            cursor = connection.execute(
+                """UPDATE project_master_message SET message_json = ?
+                   WHERE message_id = ?
+                     AND json_extract(message_json, '$.delivery_state') = 'DONE'
+                     AND json_type(message_json, '$.completion_delivery') IS NULL""",
+                (_canonical_json(message), master_id),
+            )
+            if cursor.rowcount != 1:
+                # A concurrent recovery worker may have completed the exact
+                # same marker between our read and write.  Re-read and only
+                # accept that exact durable receipt.
+                current = connection.execute(
+                    "SELECT message_json FROM project_master_message WHERE message_id = ?",
+                    (master_id,),
+                ).fetchone()
+                if current is not None:
+                    stored = json.loads(current["message_json"])
+                    receipt = stored.get("completion_delivery")
+                    if isinstance(receipt, Mapping) and str(receipt.get("message_id") or "") == result_id:
+                        return stored, False
+                raise UniverseError(
+                    "MASTER_COMPLETION_DELIVERY_CONFLICT",
+                    "Master completion publish receipt changed concurrently",
+                    HTTPStatus.CONFLICT,
+                )
+        return message, True
 
     def _transition_master_message(
         self,
@@ -41169,7 +41260,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for message in self.store.master_completion_results():
             try:
                 result = self.session_bus.publish_master_completion(message)
-                published.append(result["message_id"])
+                _, marked = self.store.mark_master_completion_published(
+                    message["message_id"], result["message_id"]
+                )
+                if marked:
+                    published.append(result["message_id"])
                 handoff = self.session_bus.reconcile_master_completion_handoff(message)
                 if handoff.get("message_ids"):
                     handoffs.extend(handoff["message_ids"])
@@ -41182,7 +41277,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         }
                         for error in handoff["errors"]
                     )
-            except (SessionBusError, sqlite3.Error) as error:
+            except (SessionBusError, UniverseError, sqlite3.Error) as error:
                 errors.append({"operation": "PUBLISH_MASTER_RESULT", "message_id": message["message_id"],
                                "error_code": getattr(error, "code", type(error).__name__), "detail": str(error)})
         return {
