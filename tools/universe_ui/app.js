@@ -42,6 +42,12 @@ const state = {
   /** Reusable Persona Library rows; operational binding never lives here. */
   personaLibrary: null,
   personaLibraryStatus: "UNKNOWN",
+  /** Authoritative Supervisor terminal projection used by Fleet Team rows. */
+  supervisorTerminalsStatus: "UNKNOWN",
+  supervisorTerminalsError: "",
+  /** Project-wide Conductor Persona Action state; separate from node Master UI. */
+  fleetProjectConductorActionStatus: "IDLE",
+  fleetProjectConductorActionError: "",
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
   fleetWorkerAssignmentsByNode: {},
   /** Authoritative node-scoped Persona automation projections. */
@@ -4931,6 +4937,8 @@ function renderIntegratedHome() {
   const project = state.selectedProject;
   renderHomeProjects();
   if (!project) {
+    const conductorTarget = document.querySelector("#home-conductor-persona");
+    if (conductorTarget) conductorTarget.replaceChildren();
     document.querySelector("#home-node-list").replaceChildren(
       node("div", "goal-plan-empty", "Choose a project.")
     );
@@ -4947,6 +4955,7 @@ function renderIntegratedHome() {
   const selTodo = homeSelectedTodo(visibleTodos);
   state.homeTodoId = selTodo?.todo_id || null;
 
+  renderFleetProjectConductor(project.project_id);
   renderHomeNodes(selNode);
   renderHomeTodos(selNode, visibleTodos, selTodo);
   renderHomeDetail(selNode, selTodo);
@@ -5106,6 +5115,314 @@ function fleetNodeAssignmentError() {
   if (state.personaAssignmentsStatus === "ERROR") return state.personaAssignmentsError || "PERSONA_ASSIGNMENTS_READ_FAILED";
   if (state.personaAssignmentsStatus === "LOADING") return "PERSONA_ASSIGNMENTS_LOADING";
   return "PERSONA_ASSIGNMENTS_UNKNOWN";
+}
+
+// Project Conductor ownership is a separate projection from a node Master.
+// The assignment list carries the durable saved row (including offline
+// Anchors); the Supervisor terminal list carries the current live Host
+// projection.  Neither side is filled from the terminal dock, recency, or a
+// first-session heuristic.
+function fleetProjectConductorAssignments(projectId) {
+  const normalizedProjectId = String(projectId || "").trim();
+  const rows = fleetAssignmentRows();
+  if (!rows) {
+    const readStatus = String(state.personaAssignmentsStatus || "UNKNOWN").toUpperCase();
+    return {
+      status: readStatus === "ERROR" ? "ERROR" : readStatus === "LOADING" ? "LOADING" : "UNKNOWN",
+      error: state.personaAssignmentsError || "PERSONA_ASSIGNMENTS_UNKNOWN",
+      active: [], all: [],
+    };
+  }
+  const all = rows.filter((assignment) =>
+    String(assignment.project_id || "") === normalizedProjectId &&
+    !String(assignment.node_ref || "").trim()
+  );
+  const active = all.filter((assignment) => String(assignment.state || "").toUpperCase() === "ACTIVE");
+  return { status: active.length > 1 ? "ERROR" : "READY", error: "", active, all };
+}
+
+function fleetProjectConductorTerminalIsLive(terminal) {
+  const stateName = String(
+    terminal?.state || terminal?.lifecycle_state || terminal?.runtime_state || ""
+  ).toUpperCase();
+  return stateName === "LIVE";
+}
+
+function fleetProjectConductorTerminals(projectId) {
+  const normalizedProjectId = String(projectId || "").trim();
+  const observedStatus = String(state.supervisorTerminalsStatus || "").toUpperCase();
+  const status = observedStatus || (Array.isArray(state.supervisorTerminals) ? "READY" : "UNKNOWN");
+  if (status !== "READY") {
+    return {
+      status: status === "ERROR" ? "ERROR" : status === "LOADING" ? "LOADING" : "UNKNOWN",
+      error: state.supervisorTerminalsError || "SUPERVISOR_TERMINALS_UNKNOWN",
+      live: [], all: [],
+    };
+  }
+  const all = (Array.isArray(state.supervisorTerminals) ? state.supervisorTerminals : []).filter((terminal) =>
+    String(terminal.project_id || "") === normalizedProjectId &&
+    String(terminal.mode || "").toUpperCase() === "CONDUCTOR" &&
+    String(terminal.session_anchor_ref || "").trim()
+  );
+  const live = all.filter(fleetProjectConductorTerminalIsLive);
+  return { status: live.length > 1 ? "ERROR" : "READY", error: "", live, all };
+}
+
+function fleetProjectConductorProjection(projectId) {
+  const assignments = fleetProjectConductorAssignments(projectId);
+  const terminals = fleetProjectConductorTerminals(projectId);
+  const assignment = assignments.active.length === 1 ? assignments.active[0] : null;
+  const liveAnchor = terminals.live.length === 1
+    ? String(terminals.live[0].session_anchor_ref || "").trim()
+    : "";
+  const assignedAnchor = String(assignment?.session_anchor_ref || "").trim();
+  const assignedTerminal = assignedAnchor
+    ? terminals.all.find((terminal) => String(terminal.session_anchor_ref || "").trim() === assignedAnchor) || null
+    : null;
+  let status = "READY";
+  if (assignments.status !== "READY") status = assignments.status;
+  else if (terminals.status !== "READY") status = terminals.status;
+  return {
+    status,
+    assignment,
+    assignments,
+    terminals,
+    liveAnchor,
+    assignedTerminal,
+  };
+}
+
+function fleetProjectConductorRequestId(operation) {
+  return `fleet-project-conductor:${String(state.selectedProject?.project_id || "")}:${operation}:${crypto.randomUUID()}`;
+}
+
+function fleetProjectConductorActivePersona(personaId) {
+  return (state.personaLibrary || []).find((item) =>
+    String(item.persona_id || "") === String(personaId || "") &&
+    String(item.state || "").toUpperCase() === "ACTIVE"
+  ) || null;
+}
+
+async function refreshFleetProjectConductorProjection(projectId) {
+  await loadPersonaProjectProjection(projectId);
+  if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
+}
+
+function assignFleetProjectConductorPersona(personaId) {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const projection = fleetProjectConductorProjection(projectId);
+  const persona = fleetProjectConductorActivePersona(personaId);
+  const live = projection.terminals.live;
+  if (projection.assignments.status !== "READY") {
+    return Promise.reject(new Error(projection.assignments.error || "Authoritative Persona assignments are unavailable."));
+  }
+  if (projection.terminals.status !== "READY") {
+    return Promise.reject(new Error(projection.terminals.error || "Authoritative Conductor Host projection is unavailable."));
+  }
+  if (live.length !== 1) {
+    return Promise.reject(new Error(live.length ? "Multiple live project Conductor sessions are available; resolve the authoritative conflict first." : "A live project Conductor session is required."));
+  }
+  if (!persona) return Promise.reject(new Error("An active Persona is required."));
+  const terminalAnchor = String(live[0].session_anchor_ref || "").trim();
+  const targetExisting = projection.assignments.all.find((item) =>
+    String(item.session_anchor_ref || "").trim() === terminalAnchor
+  );
+  const request = {
+    session_anchor_ref: terminalAnchor,
+    project_id: projectId,
+    persona_id: persona.persona_id,
+    expected_persona_revision: persona.revision,
+    expected_assignment_revision: targetExisting ? targetExisting.assignment_revision : 0,
+    request_id: fleetProjectConductorRequestId("assign"),
+  };
+  if (projection.assignment && String(projection.assignment.session_anchor_ref || "").trim() !== terminalAnchor) {
+    request.handoff_from = {
+      session_anchor_ref: projection.assignment.session_anchor_ref,
+      expected_assignment_revision: projection.assignment.assignment_revision,
+    };
+  }
+  state.fleetProjectConductorActionStatus = "SAVING";
+  state.fleetProjectConductorActionError = "";
+  if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+  return invokeServerAction("persona.assign", request)
+    .then(async (result) => {
+      await refreshFleetProjectConductorProjection(projectId);
+      state.fleetProjectConductorActionStatus = "IDLE";
+      state.fleetProjectConductorActionError = "";
+      if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+      return result;
+    })
+    .catch((error) => {
+      state.fleetProjectConductorActionStatus = "ERROR";
+      state.fleetProjectConductorActionError = error?.message || "PERSONA_ASSIGN_FAILED";
+      if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+      throw error;
+    });
+}
+
+function unassignFleetProjectConductor() {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const projection = fleetProjectConductorProjection(projectId);
+  const assignment = projection.assignment;
+  if (projection.assignments.status !== "READY") {
+    return Promise.reject(new Error(projection.assignments.error || "Authoritative Persona assignments are unavailable."));
+  }
+  if (!assignment) return Promise.reject(new Error("No authoritative active project Conductor Persona assignment is available."));
+  const request = {
+    session_anchor_ref: assignment.session_anchor_ref,
+    expected_assignment_revision: assignment.assignment_revision,
+    request_id: fleetProjectConductorRequestId("unassign"),
+  };
+  state.fleetProjectConductorActionStatus = "SAVING";
+  state.fleetProjectConductorActionError = "";
+  if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+  return invokeServerAction("persona.unassign", request)
+    .then(async (result) => {
+      await refreshFleetProjectConductorProjection(projectId);
+      state.fleetProjectConductorActionStatus = "IDLE";
+      state.fleetProjectConductorActionError = "";
+      if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+      return result;
+    })
+    .catch((error) => {
+      state.fleetProjectConductorActionStatus = "ERROR";
+      state.fleetProjectConductorActionError = error?.message || "PERSONA_UNASSIGN_FAILED";
+      if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+      throw error;
+    });
+}
+
+async function retryFleetProjectConductorProjection(projectId) {
+  const normalizedProjectId = String(projectId || "").trim();
+  await Promise.allSettled([
+    loadPersonaProjectProjection(normalizedProjectId),
+    typeof loadTerminalTabs === "function" ? loadTerminalTabs() : Promise.resolve(),
+  ]);
+}
+
+function renderFleetProjectConductor(projectId) {
+  const target = document.querySelector("#home-conductor-persona");
+  if (!target) return;
+  target.replaceChildren();
+  const wrap = node("section", "fleet-project-conductor");
+  wrap.append(node("div", "fleet-project-conductor-head", "Project Team / Conductor Persona"));
+  wrap.append(node("p", "fleet-project-conductor-detail", "Project-wide Conductor binding. node_ref is reserved for a node Master."));
+  if (!projectId) {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", "UNKNOWN: select a project."));
+    target.append(wrap);
+    return;
+  }
+  const projection = fleetProjectConductorProjection(projectId);
+  const assignment = projection.assignment;
+  const assignmentStatus = String(projection.assignments.status || "UNKNOWN").toUpperCase();
+  const terminalStatus = String(projection.terminals.status || "UNKNOWN").toUpperCase();
+  const actionStatus = String(state.fleetProjectConductorActionStatus || "IDLE").toUpperCase();
+  if (actionStatus === "SAVING") wrap.append(node("p", "fleet-project-conductor-status", "Saving typed Persona assignment..."));
+  if (actionStatus === "ERROR") wrap.append(node("p", "fleet-project-conductor-status is-error", `ERROR: ${state.fleetProjectConductorActionError || "Persona assignment failed"}`));
+
+  const assignmentLine = node("p", "fleet-project-conductor-status");
+  if (assignmentStatus === "ERROR") {
+    assignmentLine.classList.add("is-error");
+    assignmentLine.textContent = `ERROR: ${projection.assignments.error || "PERSONA_ASSIGNMENTS_READ_FAILED"}`;
+  } else if (assignmentStatus === "LOADING" || assignmentStatus === "UNKNOWN") {
+    assignmentLine.classList.add("is-unknown");
+    assignmentLine.textContent = `${assignmentStatus}: loading authoritative Persona assignment...`;
+  } else if (assignment) {
+    const persona = (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(assignment.persona_id || ""));
+    const delivery = String(assignment.delivery_status || "PENDING").toUpperCase();
+    const savedLabel = delivery === "PENDING" ? "SAVED" : delivery;
+    assignmentLine.textContent = `Persona assignment: ${savedLabel} / ${persona?.title || assignment.persona_id || "UNKNOWN"} / rev ${assignment.persona_revision} / Anchor ${assignment.session_anchor_ref}`;
+  } else {
+    assignmentLine.textContent = "Persona assignment: UNASSIGNED (project scope)";
+  }
+  wrap.append(assignmentLine);
+
+  const hostLine = node("p", "fleet-project-conductor-status");
+  const live = projection.terminals.live || [];
+  if (terminalStatus === "ERROR") {
+    hostLine.classList.add("is-error");
+    hostLine.textContent = `ERROR: ${projection.terminals.error || "SUPERVISOR_TERMINALS_READ_FAILED"}`;
+  } else if (terminalStatus === "LOADING" || terminalStatus === "UNKNOWN") {
+    hostLine.classList.add("is-unknown");
+    hostLine.textContent = `${terminalStatus}: loading authoritative Conductor Host projection...`;
+  } else if (live.length > 1) {
+    hostLine.classList.add("is-error");
+    hostLine.textContent = `ERROR: MULTIPLE_LIVE_CONDUCTORS (${live.map((item) => item.session_anchor_ref).join(", ")})`;
+  } else if (live.length === 1) {
+    hostLine.textContent = `Live Conductor Anchor: LIVE / ${live[0].session_anchor_ref}`;
+  } else {
+    hostLine.classList.add("is-unknown");
+    hostLine.textContent = `Live Conductor Anchor: OFFLINE / ${assignment?.session_anchor_ref || "no live Anchor"}`;
+  }
+  wrap.append(hostLine);
+
+  if (assignment) {
+    const appliedPhase = String(assignment.applied_phase || "").trim() || "NOT_CONFIRMED";
+    const hostSync = String(assignment.host_sync_status || "SAVED").toUpperCase();
+    const applyLine = node("p", "fleet-project-conductor-status");
+    applyLine.textContent = `Host apply: ${appliedPhase} / sync ${hostSync}${assignment.applied_message_id ? ` / message ${assignment.applied_message_id}` : ""}`;
+    wrap.append(applyLine);
+    if (projection.assignedTerminal && !fleetProjectConductorTerminalIsLive(projection.assignedTerminal)) {
+      wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Assigned Anchor state: OFFLINE / ${assignment.session_anchor_ref}`));
+    } else if (projection.assignedTerminal && fleetProjectConductorTerminalIsLive(projection.assignedTerminal)) {
+      wrap.append(node("p", "fleet-project-conductor-status", `Assigned Anchor state: LIVE / ${assignment.session_anchor_ref}`));
+    }
+  }
+
+  if (assignmentStatus === "ERROR" || terminalStatus === "ERROR") {
+    const retry = node("button", "secondary-button compact-action", "Retry authoritative projection");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      retry.disabled = true;
+      retryFleetProjectConductorProjection(projectId)
+        .catch((error) => toast(error.message, true))
+        .finally(() => { retry.disabled = false; });
+    });
+    wrap.append(retry);
+  }
+
+  const controls = node("div", "fleet-project-conductor-controls");
+  const activePersonas = state.personaLibraryStatus === "READY"
+    ? (state.personaLibrary || []).filter((item) => String(item.state || "").toUpperCase() === "ACTIVE")
+    : [];
+  const personaSelect = document.createElement("select");
+  personaSelect.setAttribute("aria-label", "Project Conductor Persona");
+  for (const item of activePersonas) {
+    const option = document.createElement("option");
+    option.value = item.persona_id;
+    option.textContent = `${item.title || item.persona_id} (rev ${item.revision})`;
+    if (assignment && String(assignment.persona_id || "") === String(item.persona_id || "")) option.selected = true;
+    personaSelect.append(option);
+  }
+  if (state.personaLibraryStatus !== "READY") {
+    controls.append(node("span", "fleet-project-conductor-status is-unknown", `${state.personaLibraryStatus || "UNKNOWN"}: active Persona library unavailable`));
+  } else if (!activePersonas.length) {
+    controls.append(node("span", "fleet-project-conductor-status is-unknown", "UNKNOWN: no active Persona available"));
+  }
+  const assign = node("button", "secondary-button compact-action", assignment ? "Change Conductor Persona" : "Assign Conductor Persona");
+  assign.type = "button";
+  assign.disabled = !activePersonas.length || assignmentStatus !== "READY" || terminalStatus !== "READY" || live.length !== 1 || actionStatus === "SAVING";
+  assign.addEventListener("click", () => {
+    assign.disabled = true;
+    assignFleetProjectConductorPersona(personaSelect.value)
+      .catch((error) => toast(error.message, true))
+      .finally(() => { assign.disabled = false; });
+  });
+  controls.append(personaSelect, assign);
+  if (assignment && assignmentStatus === "READY") {
+    const unassign = node("button", "secondary-button compact-action", "Unassign Conductor Persona");
+    unassign.type = "button";
+    unassign.disabled = actionStatus === "SAVING";
+    unassign.addEventListener("click", () => {
+      unassign.disabled = true;
+      unassignFleetProjectConductor()
+        .catch((error) => toast(error.message, true))
+        .finally(() => { unassign.disabled = false; });
+    });
+    controls.append(unassign);
+  }
+  wrap.append(controls);
+  target.append(wrap);
 }
 
 // Zero-or-more Worker (IMPLEMENTER) / Reviewer bindings per node, read from

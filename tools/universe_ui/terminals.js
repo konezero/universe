@@ -2142,11 +2142,16 @@ function focusTerminalForSession(coordinate, session) {
 
 async function loadTerminalTabs() {
   startProviderQuotaPolling();
+  state.supervisorTerminalsStatus = "LOADING";
+  state.supervisorTerminalsError = "";
   try {
     const payload = await api("/v1/terminals");
-    const incoming = payload.terminals || [];
+    if (!Array.isArray(payload?.terminals)) throw new Error("SUPERVISOR_TERMINALS_SCHEMA_INVALID");
+    const incoming = payload.terminals;
     state.supervisorTerminals = incoming;
     state.supervisorHosts = payload.hosts || [];
+    state.supervisorTerminalsStatus = "READY";
+    state.supervisorTerminalsError = "";
     const liveIds = new Set(incoming.map((item) => item.terminal_id));
     state.dismissedTerminalIds = state.dismissedTerminalIds || {};
     for (const id of Object.keys(state.dismissedTerminalIds)) {
@@ -2186,8 +2191,11 @@ async function loadTerminalTabs() {
     await loadResumableSessions();
     renderReattachBanner();
     renderTerminalNewMenu();
-  } catch (_error) {
+  } catch (error) {
+    state.supervisorTerminalsStatus = "ERROR";
+    state.supervisorTerminalsError = error?.message || "SUPERVISOR_TERMINALS_READ_FAILED";
     state.terminals = state.terminals || [];
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
   }
 }
 

@@ -97,6 +97,80 @@ test("Fleet binding status never turns an unavailable assignment read into UNASS
   assert.equal(context.fleetNodeAssignments("feature-1").active.length, 0);
 });
 
+test("Project Conductor projection stays project-scoped and separates saved and live state", () => {
+  const context = evaluate(
+    appSource,
+    "function fleetAssignmentRows()",
+    "function fleetTerminalLabel(terminal)",
+    {
+      state: {
+        personaAssignmentsStatus: "READY",
+        personaAssignments: [
+          {
+            project_id: "universe", node_ref: null, state: "ACTIVE",
+            session_anchor_ref: "conductor-anchor", persona_id: "conductor-persona",
+            assignment_revision: 7, persona_revision: 3,
+          },
+          {
+            project_id: "universe", node_ref: "feature-1", state: "ACTIVE",
+            session_anchor_ref: "master-anchor", persona_id: "master-persona",
+          },
+          {
+            project_id: "other", node_ref: null, state: "ACTIVE",
+            session_anchor_ref: "other-conductor", persona_id: "other-persona",
+          },
+        ],
+        supervisorTerminalsStatus: "READY",
+        supervisorTerminals: [
+          { project_id: "universe", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "conductor-anchor" },
+          { project_id: "universe", mode: "MASTER", state: "LIVE", session_anchor_ref: "master-anchor" },
+          { project_id: "other", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "other-conductor" },
+        ],
+      },
+    },
+  );
+  const projection = context.fleetProjectConductorProjection("universe");
+  assert.equal(projection.status, "READY");
+  assert.equal(projection.assignment.session_anchor_ref, "conductor-anchor");
+  assert.equal(projection.liveAnchor, "conductor-anchor");
+  assert.equal(projection.terminals.live.length, 1);
+  assert.equal(projection.terminals.live[0].session_anchor_ref, "conductor-anchor");
+
+  context.state.supervisorTerminalsStatus = "ERROR";
+  context.state.supervisorTerminalsError = "HTTP_503";
+  const failed = context.fleetProjectConductorProjection("universe");
+  assert.equal(failed.status, "ERROR");
+  assert.equal(failed.assignment.session_anchor_ref, "conductor-anchor");
+  assert.equal(failed.terminals.error, "HTTP_503");
+});
+
+test("Project Conductor actions use typed project scope without node_ref or terminal fallback", () => {
+  const assignStart = appSource.indexOf("function assignFleetProjectConductorPersona(");
+  const assignEnd = appSource.indexOf("function unassignFleetProjectConductor(", assignStart);
+  assert.ok(assignStart >= 0 && assignEnd > assignStart);
+  const assignSource = appSource.slice(assignStart, assignEnd);
+  assert.match(assignSource, /invokeServerAction\("persona\.assign"/);
+  assert.match(assignSource, /session_anchor_ref: terminalAnchor/);
+  assert.match(assignSource, /expected_assignment_revision/);
+  assert.doesNotMatch(assignSource, /node_ref\s*:/);
+
+  const unassignStart = appSource.indexOf("function unassignFleetProjectConductor(");
+  const unassignEnd = appSource.indexOf("async function retryFleetProjectConductorProjection", unassignStart);
+  assert.ok(unassignStart >= 0 && unassignEnd > unassignStart);
+  const unassignSource = appSource.slice(unassignStart, unassignEnd);
+  assert.match(unassignSource, /invokeServerAction\("persona\.unassign"/);
+  assert.doesNotMatch(unassignSource, /state\.terminals|first|recent|cache/);
+
+  const renderStart = appSource.indexOf("function renderFleetProjectConductor(");
+  const renderEnd = appSource.indexOf("// Zero-or-more Worker", renderStart);
+  assert.ok(renderStart >= 0 && renderEnd > renderStart);
+  const renderSource = appSource.slice(renderStart, renderEnd);
+  assert.match(renderSource, /Live Conductor Anchor/);
+  assert.match(renderSource, /Host apply/);
+  assert.match(renderSource, /Retry authoritative projection/);
+  assert.match(renderSource, /Unassign Conductor Persona/);
+});
+
 test("Activity labels authoritative lifecycle events and exposes explicit navigation hooks", () => {
   const context = evaluate(
     appSource,
@@ -199,4 +273,7 @@ test("Fleet terminal refresh re-renders Team rows after authoritative Host disco
   assert.ok(start >= 0 && end > start);
   assert.match(terminalSource.slice(start, end), /state\.supervisorTerminals = incoming/);
   assert.match(terminalSource.slice(start, end), /renderIntegratedHome\(\)/);
+  assert.match(terminalSource.slice(start, end), /supervisorTerminalsStatus = "ERROR"/);
+  assert.match(terminalSource.slice(start, end), /supervisorTerminalsError/);
+  assert.match(terminalSource.slice(start, end), /SUPERVISOR_TERMINALS_SCHEMA_INVALID/);
 });
