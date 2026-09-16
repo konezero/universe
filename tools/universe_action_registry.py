@@ -90,6 +90,35 @@ TODO_BIND_NODE_REQUEST_SCHEMA = {
         },
     },
 }
+TODO_PRIORITY_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision", "priority"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "priority": {
+            "type": "string",
+            "enum": ["AUTO", "P0", "P1", "P2", "P3"],
+            "description": "AUTO resolves server-side via infer_todo_priority; "
+            "P0..P3 are stored as the explicit user/Master choice.",
+        },
+    },
+}
+TODO_REORDER_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision", "sort_order"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "sort_order": {
+            "type": "integer",
+            "description": "Explicit list order among sibling Todos; lower "
+            "values sort earlier in todo.list ORDER BY sort_order.",
+        },
+    },
+}
 TODO_DELETE_ACTION_ID = "todo.delete"
 
 TODO_ACTION_IDS = (
@@ -122,11 +151,11 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     TODO_STATE_ACTION_ID,
     TODO_BIND_GOAL_ACTION_ID,
     TODO_BIND_NODE_ACTION_ID,
+    TODO_PRIORITY_ACTION_ID,
+    TODO_REORDER_ACTION_ID,
 )
 PENDING_WORK_SURFACE_ACTION_IDS = (
-    TODO_PRIORITY_ACTION_ID,
     TODO_MOVE_PROJECT_ACTION_ID,
-    TODO_REORDER_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
     TODO_RESTORE_ACTION_ID,
     TODO_DELETE_ACTION_ID,
@@ -219,6 +248,8 @@ PERSONA_AUTOMATION_ACTION_IDS = (
     "persona.automation.judge",
     "persona.automation.decide",
     "persona.automation.dispatch",
+    "persona.automation.worker-result",
+    "persona.automation.reviewer-verdict",
     "persona.automation.review",
     "persona.automation.complete",
 )
@@ -1087,6 +1118,8 @@ def build_default_action_registry(
         "persona.automation.judge": ("LOCAL_DATABASE_MUTATION", "judge"),
         "persona.automation.decide": ("LOCAL_DATABASE_MUTATION", "decision"),
         "persona.automation.dispatch": ("LOCAL_DATABASE_MUTATION", "dispatch"),
+        "persona.automation.worker-result": ("LOCAL_DATABASE_MUTATION", "worker_result"),
+        "persona.automation.reviewer-verdict": ("LOCAL_DATABASE_MUTATION", "reviewer_verdict"),
         "persona.automation.review": ("LOCAL_DATABASE_MUTATION", "review"),
         "persona.automation.complete": ("LOCAL_DATABASE_MUTATION", "complete"),
     }
@@ -1209,11 +1242,12 @@ def build_default_action_registry(
     # contracts. The remaining pending todo.* Actions are intentionally left
     # unregistered (coverage reports them UNCOVERED, never available) until
     # they have both a handler and a receipt-aware path where one is needed
-    # - see docs/action-ir-work-surface.md. todo.bind_goal (2026-09-15) and
-    # todo.bind_node (2026-09-16) moved out of that pending set: like
-    # todo.update, they are metadata edits (goal_id / node_ref only,
-    # CAS-guarded), not lifecycle transitions, so they need no receipt path
-    # of their own.
+    # - see docs/action-ir-work-surface.md. todo.bind_goal (2026-09-15),
+    # todo.bind_node (2026-09-16), todo.priority (2026-09-16), and
+    # todo.reorder (2026-09-16) moved out of that pending set: like
+    # todo.update, they are metadata edits (goal_id / node_ref / priority /
+    # sort_order only, CAS-guarded), not lifecycle transitions, so they need
+    # no receipt path of their own.
     implemented_specs = (
         (
             FEATURE_CREATE_ACTION_ID,
@@ -1305,6 +1339,58 @@ def build_default_action_registry(
         ),
         supplied_handlers.get(TODO_BIND_NODE_ACTION_ID),
         surfaces=(TODO_BIND_NODE_ACTION_ID,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=TODO_PRIORITY_ACTION_ID,
+            request_schema_ref="universe.todo-priority-action-request.v1",
+            result_schema_ref="universe.todo-priority-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_PRIORITY_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_PRIORITY_REQUEST_INVALID",
+                    "TODO_PRIORITY_INVALID",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_PRIORITY_ACTION_ID),
+        surfaces=(TODO_PRIORITY_ACTION_ID,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=TODO_REORDER_ACTION_ID,
+            request_schema_ref="universe.todo-reorder-action-request.v1",
+            result_schema_ref="universe.todo-reorder-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_REORDER_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_REORDER_REQUEST_INVALID",
+                    "TODO_SORT_ORDER_INVALID",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_REORDER_ACTION_ID),
+        surfaces=(TODO_REORDER_ACTION_ID,),
     )
     from universe_todo_actions import REQUEST_SCHEMAS
     for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
@@ -1409,7 +1495,9 @@ __all__ = [
     "TODO_DELETE_ACTION_ID",
     "TODO_MOVE_PROJECT_ACTION_ID",
     "TODO_PRIORITY_ACTION_ID",
+    "TODO_PRIORITY_REQUEST_SCHEMA",
     "TODO_REORDER_ACTION_ID",
+    "TODO_REORDER_REQUEST_SCHEMA",
     "TODO_RESTORE_ACTION_ID",
     "TODO_STATE_ACTION_ID",
     "TODO_READ_ACTION_ID",

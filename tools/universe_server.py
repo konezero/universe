@@ -122,7 +122,7 @@ from project_skill_plan_apply import (
     build_project_skill_plan_approval,
 )
 from project_release_apply import (
-    INSTALLATION_MANIFEST_PATH,
+    INSTALL_STATE_PATH,
     ProjectReleaseApplyError,
     apply_project_release_plan,
     apply_project_release_proposal,
@@ -196,6 +196,8 @@ from universe_action_registry import (
     TODO_UPDATE_ACTION_ID,
     TODO_BIND_GOAL_ACTION_ID,
     TODO_BIND_NODE_ACTION_ID,
+    TODO_PRIORITY_ACTION_ID,
+    TODO_REORDER_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -14799,6 +14801,92 @@ class UniverseStore:
             )
         return self.get_todo(normalized_id)
 
+    def set_todo_priority(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow CAS write for a Todo's priority field only.
+
+        Separate from update_todo's full-body replace so an unrelated
+        title/detail/goal edit cannot silently change priority, and so
+        LLM/UI callers can use the typed todo.priority Action instead of
+        reconstructing a full PATCH body. AUTO resolves through
+        infer_todo_priority using the current Todo row; P0..P3 are stored
+        as the explicit choice.
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision", "priority"}:
+            raise UniverseError(
+                "TODO_PRIORITY_REQUEST_INVALID",
+                "expected_revision and priority are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        raw_priority = value.get("priority")
+        if not isinstance(raw_priority, str):
+            raise UniverseError("TODO_PRIORITY_INVALID", "priority must be AUTO, P0, P1, P2, or P3")
+        priority = raw_priority.strip().upper()
+        todo = self.get_todo(normalized_id)
+        if priority == "AUTO":
+            priority = infer_todo_priority(todo)["priority"]
+        elif priority not in TODO_PRIORITIES:
+            raise UniverseError(
+                "TODO_PRIORITY_INVALID",
+                "priority must be AUTO, P0, P1, P2, or P3",
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET priority = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ?",
+                (priority, now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_sort_order(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow CAS write for a Todo's sort_order field only.
+
+        Separate from update_todo's full-body replace so an unrelated
+        title/detail/priority edit cannot silently reshuffle list order,
+        and so LLM/UI callers can use the typed todo.reorder Action.
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision", "sort_order"}:
+            raise UniverseError(
+                "TODO_REORDER_REQUEST_INVALID",
+                "expected_revision and sort_order are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        sort_order = value.get("sort_order")
+        if isinstance(sort_order, bool) or not isinstance(sort_order, int):
+            raise UniverseError("TODO_SORT_ORDER_INVALID", "sort_order must be an integer")
+        # Existence check before CAS so missing ids return TODO_NOT_FOUND.
+        self.get_todo(normalized_id)
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET sort_order = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ?",
+                (sort_order, now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
     def delete_todo(self, todo_id: str) -> dict[str, Any]:
         normalized = _identifier(todo_id, "todo_id")
         with self._connection() as connection:
@@ -20880,6 +20968,24 @@ class UniverseStore:
                 params,
             ).fetchall()
         return [self._task_worker_assignment_row(row) for row in rows]
+
+    def get_task_worker_assignment(self, assignment_id: str) -> dict[str, Any]:
+        """Read one authoritative Worker/Reviewer assignment by id."""
+
+        assignment_id = _required_text(assignment_id, "assignment_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_worker_assignment WHERE assignment_id = ?",
+                (assignment_id,),
+            ).fetchone()
+        assignment = self._task_worker_assignment_row(row)
+        if assignment is None:
+            raise UniverseError(
+                "TASK_WORKER_ASSIGNMENT_NOT_FOUND",
+                "no such Worker/Reviewer assignment",
+                HTTPStatus.NOT_FOUND,
+            )
+        return assignment
 
     def resolve_active_persona_prompt(self, session_anchor_ref: str) -> tuple[str, dict[str, Any]] | None:
         """Look up the ACTIVE persona body PINNED at assignment time for a launch's Anchor.
@@ -31176,6 +31282,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         # the Universe database but remains distinct from Goal scheduling and
         # from persona assignment itself.
         self.persona_automation = PersonaAutomationStore(store.database_path)
+        self.todo_actions.completion_gate = self.persona_automation.todo_completion_gate
         # Coordination is a durable negotiation projection.  It never grants
         # execution authority or mutates a Worker assignment; those remain on
         # their existing typed gateways.
@@ -31221,6 +31328,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.judge",
                     "persona.automation.decide",
                     "persona.automation.dispatch",
+                    "persona.automation.worker-result",
+                    "persona.automation.reviewer-verdict",
                     "persona.automation.review",
                     "persona.automation.complete",
                 )
@@ -31238,6 +31347,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
                 TODO_BIND_GOAL_ACTION_ID: self._handle_todo_bind_goal_action,
                 TODO_BIND_NODE_ACTION_ID: self._handle_todo_bind_node_action,
+                TODO_PRIORITY_ACTION_ID: self._handle_todo_priority_action,
+                TODO_REORDER_ACTION_ID: self._handle_todo_reorder_action,
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
@@ -32180,6 +32291,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "REPLIED",
                 "PERSONA_AUTOMATION_RUN_STARTED",
                 "PERSONA_AUTOMATION_WORK_DISPATCHED",
+                "PERSONA_AUTOMATION_WORKER_DISPATCHED",
             }
             else HTTPStatus.OK
         )
@@ -33527,6 +33639,30 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "persona_delivery": persona_delivery,
         }
 
+    def _create_persona_automation_worker(
+        self, spec: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Create an automation Worker through the public Fleet Action path.
+
+        Persona automation owns orchestration state; Fleet owns the live Host
+        and assignment receipt.  Keeping this adapter at the server boundary
+        means the automation store never creates a terminal or invents an
+        Anchor, while retries continue to use the same typed route.
+        """
+
+        request: dict[str, Any] = {
+            "project_id": spec.get("project_id"),
+            "worker_role": spec.get("worker_role"),
+            "assigned_by_session_anchor_ref": spec.get("assigned_by_session_anchor_ref"),
+            "node_ref": spec.get("node_ref"),
+            "todo_id": spec.get("todo_id"),
+            "task_frame_id": spec.get("task_frame_id"),
+        }
+        for field in ("persona_id", "provider", "model_ref", "effort"):
+            if spec.get(field) not in (None, ""):
+                request[field] = spec[field]
+        return self._handle_fleet_worker_session_start_action(request, context)
+
     def _deliver_persona_to_existing_terminal(
         self,
         *,
@@ -34734,11 +34870,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     request,
                     field="persona_automation_start",
                     required=frozenset({"project_id", "session_anchor_ref", "scope", "instruction", "request_id"}),
-                    optional=frozenset({"idempotency_key", "goal_ref", "goal_version", "budget"}),
+                    optional=frozenset({"idempotency_key", "goal_ref", "goal_version", "budget", "execution_mode", "worker_persona_id", "worker_provider", "worker_model_ref", "worker_effort"}),
                 )
                 project_id = _identifier(value["project_id"], "project_id")
                 anchor = _required_text(value["session_anchor_ref"], "session_anchor_ref")
                 self._validate_persona_automation_anchor(project_id, anchor)
+                if str(value.get("execution_mode") or "MASTER_DIRECT").strip().upper() == "WORKER_REVIEW" and "MASTER" not in self._anchor_modes(anchor):
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_WORKER_REVIEW_MASTER_REQUIRED",
+                        "WORKER_REVIEW automation is owned by a node Master Anchor",
+                        409,
+                    )
                 assignment = self.store.read_persona_assignment(anchor)
                 if assignment is not None and "CONDUCTOR" in self._anchor_modes(anchor):
                     # A CONDUCTOR's automation is always project-wide -- its
@@ -34873,10 +35015,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_judge", required=frozenset({"run_id", "owner_ref", "decision_id"}), optional=frozenset({"provider", "goal_id", "goal_version", "scope_ref", "work_owner_ref", "next_condition", "todo_id", "max_turns"}))
                 return self._persona_automation_judge(value)
             if action_id == "persona.automation.dispatch":
-                value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}))
+                value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}), optional=frozenset({"todo_id", "task_frame_id"}))
                 run = self.persona_automation.get_run(value["run_id"])
+                create_worker = None
+                if str(run.get("execution_mode") or "MASTER_DIRECT").upper() == "WORKER_REVIEW":
+                    create_worker = lambda spec: self._create_persona_automation_worker(spec, context)
                 result = self.persona_automation.dispatch_work(
-                    value, self.store.create_master_message
+                    value, self.store.create_master_message, create_worker=create_worker
                 )
                 # A newly created work item needs the same targeted live-Master
                 # nudge as a control driver.  Replayed dispatches must not
@@ -34888,6 +35033,66 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 else:
                     result["woken_master_sessions"] = 0
+                return result
+            if action_id == "persona.automation.worker-result":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_worker_result",
+                    required=frozenset({"run_id", "dispatch_id", "worker_assignment_id", "worker_assignment_revision", "worker_anchor_ref", "result_ref", "outcome", "evidence_refs"}),
+                    optional=frozenset({"result_digest", "result_text", "validation_state"}),
+                )
+                worker_assignment = self.store.get_task_worker_assignment(value["worker_assignment_id"])
+                if worker_assignment.get("state") != "ACTIVE" or worker_assignment.get("worker_role") != "IMPLEMENTER":
+                    raise UniverseError(
+                        "TASK_WORKER_ASSIGNMENT_NOT_ACTIVE",
+                        "Worker result requires the exact active IMPLEMENTER assignment",
+                        HTTPStatus.CONFLICT,
+                    )
+                if worker_assignment.get("session_anchor_ref") != value["worker_anchor_ref"]:
+                    raise UniverseError(
+                        "TASK_WORKER_ASSIGNMENT_ANCHOR_MISMATCH",
+                        "Worker result Anchor does not match the authoritative assignment",
+                        HTTPStatus.CONFLICT,
+                    )
+                return self.persona_automation.record_worker_result(
+                    value,
+                    lambda spec: self._create_persona_automation_worker(spec, context),
+                )
+            if action_id == "persona.automation.reviewer-verdict":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_reviewer_verdict",
+                    required=frozenset({"run_id", "dispatch_id", "reviewer_assignment_id", "reviewer_assignment_revision", "reviewer_anchor_ref", "worker_result_ref", "outcome", "evidence_refs"}),
+                    optional=frozenset({"acceptance_status", "note", "next_action"}),
+                )
+                reviewer_assignment = self.store.get_task_worker_assignment(value["reviewer_assignment_id"])
+                if reviewer_assignment.get("state") != "ACTIVE" or reviewer_assignment.get("worker_role") != "REVIEWER":
+                    raise UniverseError(
+                        "TASK_WORKER_ASSIGNMENT_NOT_ACTIVE",
+                        "Reviewer verdict requires the exact active REVIEWER assignment",
+                        HTTPStatus.CONFLICT,
+                    )
+                if reviewer_assignment.get("session_anchor_ref") != value["reviewer_anchor_ref"]:
+                    raise UniverseError(
+                        "TASK_WORKER_ASSIGNMENT_ANCHOR_MISMATCH",
+                        "Reviewer verdict Anchor does not match the authoritative assignment",
+                        HTTPStatus.CONFLICT,
+                    )
+                result = self.persona_automation.record_reviewer_verdict(value)
+                followup = self._create_persona_review_followup_todo(result)
+                result["followup"] = followup
+                if followup.get("todo") is not None:
+                    current_run = self.persona_automation.get_run(value["run_id"])
+                    if str(current_run.get("node_ref") or "").strip():
+                        result["driver"] = self._enqueue_persona_automation_driver(
+                            current_run,
+                            driver_key=f"review-{result['review']['review_id']}",
+                        )
+                    else:
+                        result["driver"] = {
+                            "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
+                            "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
+                        }
                 return result
             if action_id == "persona.automation.review":
                 value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id"}))
@@ -35556,6 +35761,64 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).result_schema_ref,
             "status": "TODO_NODE_BOUND" if action.get("node_ref") is not None else "TODO_NODE_UNBOUND",
             "action_id": TODO_BIND_NODE_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_priority_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.priority: narrow CAS priority write for LLM/UI callers.
+
+        Mirrors todo.bind_goal/bind_node: one field write instead of a full
+        todo.update body. AUTO is resolved server-side; P0..P3 are stored
+        as the explicit choice.
+        """
+
+        action = _exact_object_fields(
+            request,
+            field="todo_priority_action",
+            required=frozenset({"todo_id", "expected_revision", "priority"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_priority(todo_id, {
+            "expected_revision": action["expected_revision"],
+            "priority": action["priority"],
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_PRIORITY_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_PRIORITY_SET",
+            "action_id": TODO_PRIORITY_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_reorder_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.reorder: narrow CAS sort_order write for LLM/UI callers.
+
+        Mirrors todo.priority: one field write instead of a full todo.update
+        body. sort_order is an explicit integer; list order is
+        ORDER BY sort_order, updated_at, todo_id.
+        """
+
+        action = _exact_object_fields(
+            request,
+            field="todo_reorder_action",
+            required=frozenset({"todo_id", "expected_revision", "sort_order"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_sort_order(todo_id, {
+            "expected_revision": action["expected_revision"],
+            "sort_order": action["sort_order"],
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_REORDER_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_REORDERED",
+            "action_id": TODO_REORDER_ACTION_ID,
             "todo": todo,
         }
 
@@ -38146,7 +38409,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         project_id = _project_id(request["project_id"])
         root = _canonical_project_root(request["project_root"])
-        runtime_manifest = root / INSTALLATION_MANIFEST_PATH
+        runtime_manifest = root / INSTALL_STATE_PATH
         if runtime_manifest.is_file() and not runtime_manifest.is_symlink():
             material = {
                 "project_id": project_id,

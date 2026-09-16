@@ -92,6 +92,10 @@ def normalize_state(request):
 class TodoActions:
     def __init__(self, store):
         self.store = store
+        # The server may bind the Persona automation completion gate after
+        # constructing this action gateway.  Direct TodoActions fixtures keep
+        # the callback unset and retain their standalone contract.
+        self.completion_gate = None
         with store._connection() as connection:
             connection.execute('''CREATE TABLE IF NOT EXISTS todo_state_action (
                 request_id TEXT PRIMARY KEY, request_json TEXT NOT NULL,
@@ -148,6 +152,18 @@ class TodoActions:
                     raise TodoActionError('TODO_SCOPE_CONFLICT', 'Todo belongs to a different project scope', 409)
                 if row['revision'] != value['expected_revision']:
                     raise TodoActionError('TODO_REVISION_CONFLICT', f"Todo revision changed; current revision is {row['revision']}", 409)
+                if value['state'] == 'DONE' and row['project_id'] and callable(self.completion_gate):
+                    gate = self.completion_gate(
+                        str(row['project_id'] or ''),
+                        str(row['todo_id']),
+                        str(row['node_ref'] or '') or None,
+                    )
+                    if gate is not None:
+                        raise TodoActionError(
+                            'TODO_AUTOMATION_REVIEW_REQUIRED',
+                            'a WORKER_REVIEW automation run requires an independent PASS verdict before this Todo can be completed',
+                            409,
+                        )
                 previous = row['state']
                 changed = previous != value['state']
                 if changed:

@@ -32,9 +32,13 @@ must use the Worker/Reviewer route.
 - Direct Master work remains available only when explicitly selected; the server does
   not infer safety from Todo wording.
 
-## Current implementation gap
+## Implementation status
 
-Fleet already provides typed Worker/Reviewer session creation and durable bindings.
-Persona automation still dispatches a Master message directly. The next implementation
-slice adds the durable execution/result/review records and routes `WORKER_REVIEW`
-through Fleet instead of treating a Master message completion as a result.
+`WORKER_REVIEW` now routes through the typed Fleet Worker session Action. The
+automation projection durably records the exact Worker instruction/result and
+the distinct Reviewer assignment/verdict, while `MASTER_DIRECT` retains the
+existing Master queue route. Todo completion is rejected until the current
+Worker result has an independent Reviewer `PASS`; non-PASS verdicts use the
+existing deterministic follow-up Todo route. Provider execution and live
+acceptance remain separate evidence fields and are never inferred from a
+session or queue receipt.

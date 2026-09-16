@@ -5532,6 +5532,19 @@ function renderFleetAutomationControls(featureId, owner) {
   }
   const run = projection.run;
   const stateLabel = String(run?.state || "IDLE").toUpperCase();
+  if (run?.execution_mode) wrap.append(node("p", "fleet-node-team-status", `Execution: ${run.execution_mode}`));
+  const worker = run?.current_worker;
+  if (worker) {
+    const workerAssignment = worker.assignment || {};
+    const workerResult = worker.result || {};
+    wrap.append(node("p", "fleet-node-team-status", `Worker: ${worker.state || "PENDING"} - ${workerAssignment.session_anchor_ref || "UNKNOWN"}${workerResult.result_ref ? ` - result ${workerResult.result_ref}` : ""}`));
+  }
+  const reviewer = run?.current_reviewer;
+  if (reviewer) {
+    const reviewerAssignment = reviewer.assignment || {};
+    const verdict = reviewer.verdict || {};
+    wrap.append(node("p", "fleet-node-team-status", `Reviewer: ${reviewer.state || "PENDING"} - ${reviewerAssignment.session_anchor_ref || "UNKNOWN"}${verdict.outcome ? ` - ${verdict.outcome}` : ""}`));
+  }
   wrap.append(node("p", "fleet-node-team-status", `Automation: ${stateLabel}${run?.next_condition ? ` · next ${run.next_condition}` : ""}`));
   if (run?.current_review) wrap.append(node("p", "fleet-node-team-status", `Review: ${run.current_review.outcome || "PENDING"} · ${run.current_review.acceptance_status || "NOT_RUN"}`));
   const controls = node("div", "fleet-node-team-controls");
