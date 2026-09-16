@@ -4809,12 +4809,24 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
     # Master queue items).
     raw_node_ref = value.get("node_ref")
     node_ref = _identifier(raw_node_ref, "node_ref") if raw_node_ref is not None else None
+    # Project-wide work may be deliberately addressed to one exact Master
+    # Session Anchor.  This is a claim boundary, not a provider preference:
+    # a preferred provider in metadata remains only a hint, while this field
+    # is matched by the same atomic SQL predicate used for queue polling and
+    # the QUEUED -> PROCESSING transition.
+    raw_target_anchor = value.get("target_session_anchor_ref")
+    target_session_anchor_ref = (
+        _required_text(raw_target_anchor, "target_session_anchor_ref")
+        if raw_target_anchor is not None
+        else None
+    )
     material = {
         "project_id": project_id,
         "title": title,
         "instruction": instruction,
         "metadata": metadata,
         "node_ref": node_ref,
+        "target_session_anchor_ref": target_session_anchor_ref,
     }
     return {
         "schema": PROJECT_MASTER_MESSAGE_SCHEMA,
@@ -4825,6 +4837,7 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
         "instruction": instruction,
         "metadata": metadata,
         "node_ref": node_ref,
+        "target_session_anchor_ref": target_session_anchor_ref,
         # Stamped by create_master_message from the real current assignment,
         # never trusted from this request -- see there.
         "node_owner_session_anchor_ref": None,
@@ -24138,13 +24151,18 @@ class UniverseStore:
                 SELECT 1 FROM project_master_message
                 WHERE project_id = ?
                   AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
-                  AND ({self._MASTER_MESSAGE_NODE_OWNERSHIP_EXISTS_SQL})
+                  AND ({self._MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL})
                 LIMIT 1
                 """,
-                (project_id, claimant_anchor, claimant_anchor),
+                (project_id, claimant_anchor, claimant_anchor, claimant_anchor),
             ).fetchone()
         return row is not None
 
+    # A targeted item's exact Anchor and a node-scoped item's ownership both
+    # join live in this single eligibility predicate.  It is used for queue
+    # polling, wake eligibility, and inside the atomic claim UPDATE: no
+    # Master can race in merely because it sees a project-wide queued row.
+    #
     # A node-scoped item's ownership check joins live against this exact
     # SELECT on session_persona_assignment, keyed only by the claiming
     # Anchor's own identity -- assignment_revision is a per-Anchor counter
@@ -24164,9 +24182,12 @@ class UniverseStore:
     # still proceeded on stale authority (2026-09-15 Conductor review
     # finding). A project-wide item (node_ref NULL) needs no such check --
     # unnarrowed, claimable by any live project Master, unchanged.
-    _MASTER_MESSAGE_NODE_OWNERSHIP_EXISTS_SQL = """
-        json_extract(message_json, '$.node_ref') IS NULL
-        OR (
+    _MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL = """
+        (json_extract(message_json, '$.target_session_anchor_ref') IS NULL
+         OR json_extract(message_json, '$.target_session_anchor_ref') = ?)
+        AND (
+          json_extract(message_json, '$.node_ref') IS NULL
+          OR (
           -- The message's OWN stamped owner Anchor must be the exact
           -- claimant -- required in addition to the live revision check
           -- below, because assignment_revision is a per-Anchor counter
@@ -24185,6 +24206,7 @@ class UniverseStore:
               AND spa.project_id = project_master_message.project_id
               AND spa.node_ref = json_extract(project_master_message.message_json, '$.node_ref')
               AND spa.assignment_revision = json_extract(project_master_message.message_json, '$.node_owner_assignment_revision')
+          )
           )
         )
     """
@@ -24225,9 +24247,9 @@ class UniverseStore:
                 SET message_json = ?
                 WHERE message_id = ?
                   AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
-                  AND ({self._MASTER_MESSAGE_NODE_OWNERSHIP_EXISTS_SQL})
+                  AND ({self._MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL})
                 """,
-                (_canonical_json(message), message_id, session_anchor_ref, session_anchor_ref),
+                (_canonical_json(message), message_id, session_anchor_ref, session_anchor_ref, session_anchor_ref),
             )
             if cursor.rowcount != 1:
                 return None
@@ -24252,7 +24274,7 @@ class UniverseStore:
             return
         raise UniverseError(
             "MASTER_MESSAGE_NODE_OWNER_MISMATCH",
-            "this item is scoped to a different node, a different Master, or a stale assignment revision",
+            "this item is scoped to a different target Master or node owner, or its assignment revision is stale",
             HTTPStatus.CONFLICT,
         )
 
@@ -24299,11 +24321,11 @@ class UniverseStore:
                     FROM project_master_message
                     WHERE project_id = ?
                       AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
-                      AND ({self._MASTER_MESSAGE_NODE_OWNERSHIP_EXISTS_SQL})
+                      AND ({self._MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL})
                     ORDER BY created_at, rowid
                     LIMIT 8
                     """,
-                    (project["project_id"], session_anchor_ref, session_anchor_ref),
+                    (project["project_id"], session_anchor_ref, session_anchor_ref, session_anchor_ref),
                 ).fetchall()
         for row in candidates:
             claimed = self._claim_master_message_atomic(
@@ -52536,6 +52558,30 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parts is not None and parts[1] == "/master-messages":
+                # A target Anchor is an explicit routing boundary, unlike a
+                # metadata preference.  Resolve it at creation while it is a
+                # real, live Master for this project; the durable message then
+                # preserves that exact Anchor and later claim/wake paths will
+                # not substitute another Master if it goes offline.
+                requested_target_anchor = str(
+                    (body or {}).get("target_session_anchor_ref") or ""
+                ).strip()
+                if requested_target_anchor:
+                    candidates = match_live_terminals(
+                        self.server._session_anchor_terminal_host(),
+                        project_id=parts[0],
+                        mode="MASTER",
+                    )
+                    if not any(
+                        str(item.get("session_anchor_ref") or "")
+                        == requested_target_anchor
+                        for item in candidates
+                    ):
+                        raise UniverseError(
+                            "MASTER_MESSAGE_TARGET_UNAVAILABLE",
+                            "target_session_anchor_ref must name a live Master for this project",
+                            HTTPStatus.CONFLICT,
+                        )
                 message, created = self.server.store.create_master_message(
                     parts[0], body
                 )

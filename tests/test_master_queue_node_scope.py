@@ -106,11 +106,14 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
             "project_id": "TEST", "provider": "CLAUDE", "mode": "MASTER", "state": "LIVE",
         }
 
-    def queue_message(self, key, node_ref=None):
-        return self.server.store.create_master_message("TEST", {
+    def queue_message(self, key, node_ref=None, target_session_anchor_ref=None):
+        value = {
             "idempotency_key": key, "title": key, "instruction": "bounded fixture work",
             **({"node_ref": node_ref} if node_ref is not None else {}),
-        })
+            **({"target_session_anchor_ref": target_session_anchor_ref}
+               if target_session_anchor_ref is not None else {}),
+        }
+        return self.server.store.create_master_message("TEST", value)
 
     def claim(self, terminal_id, anchor, message_id=""):
         request = {"provider": "CLAUDE", "terminal_id": terminal_id, "session_anchor_ref": anchor}
@@ -152,6 +155,75 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         status, claimed = self.claim("term-anywide", "anchor-anywide")
         self.assertEqual(200, status, claimed)
         self.assertEqual(message["message_id"], claimed["message"]["message_id"])
+
+    def test_targeted_project_message_is_claimable_only_by_its_exact_master_anchor(self):
+        target = self.register("targeted-master")
+        other = self.register("other-master")
+        message, _ = self.queue_message(
+            "targeted-project-msg", target_session_anchor_ref=target
+        )
+        self.assertEqual(target, message["target_session_anchor_ref"])
+        self.set_terminal_host([
+            self.live_master_terminal("term-targeted", target),
+            self.live_master_terminal("term-other", other),
+        ])
+        # Generic polling by another live Master must skip the targeted row;
+        # this is the regression that previously let CODEX take Claude work.
+        status, empty = self.claim("term-other", other)
+        self.assertEqual(200, status, empty)
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", empty["status"])
+        status, claimed = self.claim("term-targeted", target)
+        self.assertEqual(200, status, claimed)
+        self.assertEqual(message["message_id"], claimed["message"]["message_id"])
+
+    def test_targeted_project_message_rejects_an_explicit_wrong_master_claim(self):
+        target = self.register("targeted-explicit-owner")
+        other = self.register("targeted-explicit-outsider")
+        message, _ = self.queue_message(
+            "targeted-explicit-msg", target_session_anchor_ref=target
+        )
+        self.set_terminal_host([self.live_master_terminal("term-outsider", other)])
+        status, rejected = self.claim(
+            "term-outsider", other, message_id=message["message_id"]
+        )
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("MASTER_MESSAGE_NODE_OWNER_MISMATCH", rejected["error_code"])
+        self.assertEqual(
+            "QUEUED",
+            self.server.store.get_master_message(message["message_id"])["delivery_state"],
+        )
+
+    def test_targeted_message_wake_eligibility_matches_its_claim_boundary(self):
+        target = self.register("targeted-wake-owner")
+        other = self.register("targeted-wake-outsider")
+        self.queue_message("targeted-wake-msg", target_session_anchor_ref=target)
+        self.assertTrue(self.server.store.has_queued_master_message_for("TEST", target))
+        self.assertFalse(self.server.store.has_queued_master_message_for("TEST", other))
+
+    def test_http_queue_rejects_a_target_anchor_that_is_not_live_project_master(self):
+        status, rejected = self.request("POST", "/v1/projects/TEST/master-messages", {
+            "idempotency_key": "target-unavailable-http",
+            "title": "target unavailable",
+            "instruction": "bounded fixture work",
+            "target_session_anchor_ref": "session_anchor_not_live",
+        })
+        self.assertEqual(409, status, rejected)
+        self.assertEqual("MASTER_MESSAGE_TARGET_UNAVAILABLE", rejected["error_code"])
+
+    def test_http_queue_stamps_a_live_project_master_target(self):
+        target = self.register("target-http-owner")
+        self.set_terminal_host([self.live_master_terminal("term-target-http", target)])
+        status, created = self.request("POST", "/v1/projects/TEST/master-messages", {
+            "idempotency_key": "target-live-http",
+            "title": "target live",
+            "instruction": "bounded fixture work",
+            "target_session_anchor_ref": target,
+        })
+        self.assertEqual(201, status, created)
+        self.assertEqual(
+            target,
+            created["message"]["target_session_anchor_ref"],
+        )
 
     def test_correct_node_master_can_claim_its_own_item(self):
         anchor = self.register("claim-correct")
