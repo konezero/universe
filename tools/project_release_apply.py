@@ -10,6 +10,8 @@ from release_runtime import (
     INSTALL_STATE_SCHEMA,
     ReleaseRuntime,
     ReleaseRuntimeError,
+    _replace_file,
+    _target_path,
 )
 from runtime_store import default_store_root
 
@@ -274,6 +276,17 @@ def apply_project_release_proposal(
                     target_root=root,
                     approved_plan_digest=install_plan["plan_digest"],
                 )
+            _replace_file(
+                _target_path(root, INSTALLATION_MANIFEST_PATH),
+                runtime.legacy_installation_manifest_bytes(
+                    project_id=normalized_proposal["project_id"]
+                ),
+            )
+            install_result["changed"] = [
+                *install_result["changed"],
+                {"operation": "UPDATE", "path": INSTALLATION_MANIFEST_PATH},
+            ]
+            install_result["changed_count"] = len(install_result["changed"])
     except ProjectReleaseApplyError:
         raise
     except (OSError, ReleaseRuntimeError) as error:
