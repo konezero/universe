@@ -34730,8 +34730,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 return self.persona_automation.pause_run(value)
             if action_id == "persona.automation.resume":
-                value = _exact_object_fields(request, field="persona_automation_resume", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision"}))
-                return self.persona_automation.resume_run(value)
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_resume",
+                    required=frozenset({"run_id", "request_id"}),
+                    optional=frozenset({"expected_revision", "recover_stopped"}),
+                )
+                if value.get("recover_stopped") is not None and type(value["recover_stopped"]) is not bool:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_RECOVERY_FLAG_INVALID",
+                        "recover_stopped must be a boolean when provided",
+                    )
+                return self.persona_automation.resume_run(
+                    value, recover_stopped=value.get("recover_stopped") is True
+                )
             if action_id == "persona.automation.stop":
                 value = _exact_object_fields(
                     request,

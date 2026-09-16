@@ -429,13 +429,13 @@ class PersonaAutomationStore:
                 "event": event,
             }
 
-    def _mutate_state(self, run_id: str, state: str, *, request_id: str, expected_revision: int | None = None, reason: str | None = None) -> dict[str, Any]:
+    def _mutate_state(self, run_id: str, state: str, *, request_id: str, expected_revision: int | None = None, reason: str | None = None, allowed_sources: set[str] | None = None) -> dict[str, Any]:
         if state not in RUN_STATES:
             raise PersonaAutomationError("PERSONA_AUTOMATION_STATE_INVALID", "unsupported automation run state")
         with self._connection() as connection:
             row = self._get(connection, _text(run_id, "run_id"))
             current = str(row["state"])
-            allowed = {
+            allowed = allowed_sources if allowed_sources is not None else {
                 "PAUSED": {"RUNNING", "WAITING"},
                 "RUNNING": {"PAUSED", "WAITING"},
                 "STOPPED": {"RUNNING", "WAITING", "PAUSED"},
@@ -461,8 +461,13 @@ class PersonaAutomationStore:
     def pause_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return self._mutate_state(value.get("run_id"), "PAUSED", request_id=_text(value.get("request_id"), "request_id"), expected_revision=value.get("expected_revision"), reason=value.get("reason"))
 
-    def resume_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        return self._mutate_state(value.get("run_id"), "RUNNING", request_id=_text(value.get("request_id"), "request_id"), expected_revision=value.get("expected_revision"), reason=None)
+    def resume_run(self, value: Mapping[str, Any], *, recover_stopped: bool = False) -> dict[str, Any]:
+        return self._mutate_state(
+            value.get("run_id"), "RUNNING",
+            request_id=_text(value.get("request_id"), "request_id"),
+            expected_revision=value.get("expected_revision"), reason=None,
+            allowed_sources={"PAUSED", "WAITING", "STOPPED"} if recover_stopped else None,
+        )
 
     def stop_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return self._mutate_state(value.get("run_id"), "STOPPED", request_id=_text(value.get("request_id"), "request_id"), expected_revision=value.get("expected_revision"), reason=value.get("reason") or "operator_stop")

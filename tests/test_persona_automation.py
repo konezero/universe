@@ -164,6 +164,11 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         self.assertEqual("STOPPED", stopped["run"]["state"])
         with self.assertRaises(PersonaAutomationError):
             self.store.claim_tick({"run_id": run["run_id"], "owner_ref": self.assignment["session_anchor_ref"], "tick_id": "tick-2"})
+        recovered = self.store.resume_run(
+            {"run_id": run["run_id"], "request_id": "recover-1"},
+            recover_stopped=True,
+        )
+        self.assertEqual("RUNNING", recovered["run"]["state"])
 
     def test_stale_lease_can_be_reclaimed_after_restart(self):
         run = self.start()
