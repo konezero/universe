@@ -33449,7 +33449,48 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     state="UNASSIGNED", assignment_revision=handoff_cleared["assignment_revision"],
                     node_ref=None,
                 )
+                self._stop_superseded_persona_automation_run(
+                    project_id=project_id, node_ref=node_ref,
+                    handed_off_from_anchor=handoff_cleared["session_anchor_ref"],
+                    handed_off_to_anchor=value["session_anchor_ref"],
+                )
         return result
+
+    def _stop_superseded_persona_automation_run(
+        self, *, project_id: str, node_ref: str, handed_off_from_anchor: str, handed_off_to_anchor: str
+    ) -> None:
+        """Auto-stop the old owner's still-active automation run on handoff.
+
+        persona_automation_run.session_anchor_ref is pinned at start_run and
+        is never re-pointed by a later ownership handoff, so a node handoff
+        alone used to leave the old owner's RUNNING/WAITING/PAUSED run
+        stranded: the new owner cannot start a fresh run
+        (PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS is per (project, node), not
+        per Anchor) yet nothing could ever advance the old run once its
+        Anchor's session was gone (2026-09-17 incident:
+        persona_run_f928b72114614bc5b8ce8a99, discovered only via manual DB
+        inspection). An explicit handoff is itself the deliberate signal
+        that the old owner is being replaced, so this bypasses the
+        pending-review-followup guard persona.automation.stop's action
+        handler applies for an ordinary operator-initiated stop. Best-effort
+        and silent: a failure here just leaves the ordinary manual
+        persona.automation.stop path available, same as before this existed.
+        """
+        try:
+            surfaced = self.persona_automation.surface(project_id, node_ref=node_ref)
+            stale_run = surfaced.get("run")
+            if not isinstance(stale_run, Mapping):
+                return
+            if str(stale_run.get("session_anchor_ref") or "") != handed_off_from_anchor:
+                return
+            self.persona_automation.stop_run({
+                "run_id": stale_run["run_id"],
+                "request_id": f"persona-handoff-auto-stop:{stale_run['run_id']}:r{stale_run.get('revision')}",
+                "expected_revision": stale_run.get("revision"),
+                "reason": f"Node ownership handed off to {handed_off_to_anchor}; the previous owner's automation run is superseded.",
+            })
+        except PersonaAutomationError:
+            pass
 
     def _handle_persona_assignment_read_action(self, request: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
         self._persona_actor(context)
@@ -35328,13 +35369,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 if value.get("run_id"):
                     result = self.persona_automation.get_run(value["run_id"])
                     result["events"] = self.persona_automation.events(value["run_id"], 30)
+                    result = self._annotate_persona_automation_owner_availability(result)
                     return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_STATUS_COLLECTED", "run": result}
                 if value.get("project_id"):
-                    return self.persona_automation.surface(
+                    surfaced = self.persona_automation.surface(
                         _identifier(value["project_id"], "project_id"),
                         node_ref=value.get("node_ref"),
                         session_anchor_ref=value.get("session_anchor_ref"),
                     )
+                    surfaced["run"] = self._annotate_persona_automation_owner_availability(
+                        surfaced.get("run")
+                    )
+                    return surfaced
                 raise PersonaAutomationError("PERSONA_AUTOMATION_STATUS_TARGET_REQUIRED", "run_id or project_id is required")
             if action_id == "persona.automation.tick":
                 value = _exact_object_fields(request, field="persona_automation_tick", required=frozenset({"run_id", "owner_ref", "tick_id"}), optional=frozenset({"lease_seconds", "cursor"}))
@@ -42272,6 +42318,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             self._dispatch_live_posted_session_instructions({"messages": [delivered]})
             woken += 1
         return woken
+
+    def _persona_automation_owner_availability(self, session_anchor_ref: str) -> str:
+        """Best-effort liveness classification for a persona automation
+        run's pinned owner Anchor.
+
+        A RUNNING/WAITING/PAUSED run is pinned to the exact Anchor that
+        started it (session_anchor_ref is not re-pointed by a later
+        handoff), so once that Anchor's session is gone for good the run
+        can wait forever with nothing to surface that fact (2026-09-17
+        incident: persona_run_f928b72114614bc5b8ce8a99 sat WAITING ~16h
+        after its owner went DISCONNECTED with no resumable session, and
+        this required a manual DB query to notice). LIVE/RESUMABLE/
+        UNAVAILABLE mirrors the vocabulary list_resumable_sessions already
+        uses. Never raises -- this is observability, not authority; it
+        does not gate or alter the run itself.
+        """
+        anchor = str(session_anchor_ref or "").strip()
+        if not anchor:
+            return "UNKNOWN"
+        try:
+            for session in self.session_supervisor.list_sessions(include_hidden=True):
+                if str(session.get("session_anchor_ref") or "") == anchor:
+                    if str(session.get("state") or "").upper() == "LIVE":
+                        return "LIVE"
+                    break
+            resumable = self.list_resumable_sessions({"limit": 50})
+            if any(
+                str(item.get("session_anchor_ref") or "") == anchor
+                for item in resumable.get("reattach") or []
+            ):
+                return "RESUMABLE"
+        except (UniverseError, SessionSupervisorError):
+            return "UNKNOWN"
+        return "UNAVAILABLE"
+
+    def _annotate_persona_automation_owner_availability(
+        self, run: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not isinstance(run, Mapping):
+            return None
+        annotated = dict(run)
+        if str(annotated.get("state") or "") in {"RUNNING", "WAITING", "PAUSED"}:
+            annotated["owner_availability"] = self._persona_automation_owner_availability(
+                str(annotated.get("session_anchor_ref") or "")
+            )
+        return annotated
 
     def _wake_master_queue_on_session_ready(
         self, project_id: str, mode: str, *, reason: str
