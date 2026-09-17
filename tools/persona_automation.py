@@ -1359,6 +1359,8 @@ class PersonaAutomationStore:
             worker = _load(row["current_worker_json"], None)
             reviewer_assignment = reviewer.get("assignment") if isinstance(reviewer, Mapping) and isinstance(reviewer.get("assignment"), Mapping) else {}
             worker_result = worker.get("result") if isinstance(worker, Mapping) and isinstance(worker.get("result"), Mapping) else {}
+            master_result = reviewer.get("master_result") if isinstance(reviewer, Mapping) and isinstance(reviewer.get("master_result"), Mapping) else {}
+            source_result = worker_result or master_result
             if not isinstance(assignment, Mapping) or str(assignment.get("dispatch_id") or "") != dispatch_id:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH", "Reviewer verdict is not bound to the current dispatch", 409)
             expected = {
@@ -1374,7 +1376,7 @@ class PersonaAutomationStore:
             for field, expected_value in expected.items():
                 if reviewer_assignment.get(field) != expected_value:
                     raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH", f"Reviewer verdict does not preserve exact {field} lineage", 409)
-            if worker_result.get("result_ref") != worker_result_ref or reviewer.get("worker_result_ref") != worker_result_ref:
+            if source_result.get("result_ref") != worker_result_ref or reviewer.get("worker_result_ref") != worker_result_ref:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH", "Reviewer verdict must name the exact Worker result", 409)
             existing = _load(row["current_review_json"], None)
             if isinstance(existing, Mapping):
@@ -1451,8 +1453,9 @@ class PersonaAutomationStore:
         A Master calls ``master.complete`` to report to the server.  That is
         the control-plane acknowledgement for Persona automation; it must not
         be routed back into the same Master session's inbox.  The resulting
-        state is deliberately *not* a review or acceptance: an independent
-        Reviewer still has to record the verdict through ``record_review``.
+        state is deliberately *not* a review or acceptance: the server then
+        creates an independent Reviewer Worker, whose typed verdict advances
+        the run.
         """
 
         run_id = _text(value.get("run_id"), "run_id")
@@ -1534,6 +1537,7 @@ class PersonaAutomationStore:
                 "state": "RESULT_READY_FOR_REVIEW",
                 "result_ref": result_ref or None,
                 "master_result_digest": body_digest,
+                "master_result_text": str(value.get("result_text") or ""),
                 "master_completed_at": completed_at,
             })
             next_condition = "Independent Reviewer verdict is required before automation can complete."
@@ -1559,6 +1563,313 @@ class PersonaAutomationStore:
                 "status": "PERSONA_AUTOMATION_MASTER_RESULT_RECORDED",
                 "run": self._row(self._get(connection, run_id)),
                 "result": payload,
+                "event": event,
+            }
+
+    def attach_master_reviewer(
+        self,
+        value: Mapping[str, Any],
+        create_reviewer: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Create the Reviewer Worker for one completed Master assignment.
+
+        ``master.complete`` records the Master result first.  This second
+        transition reserves and creates a distinct Fleet Reviewer through the
+        server callback, then CAS-binds that assignment to the exact
+        project/node/Todo/Task Frame/result tuple.  A queue receipt or a
+        Master result is never treated as a review verdict.
+        """
+
+        run_id = _text(value.get("run_id"), "run_id")
+        dispatch_id = _text(value.get("dispatch_id"), "dispatch_id")
+        source_message_id = _text(value.get("source_message_id"), "source_message_id")
+        assignment_revision = _positive_int(
+            value.get("assignment_revision"), "assignment_revision"
+        )
+        result_ref = _text(value.get("result_ref"), "result_ref")
+        result_text = value.get("result_text")
+        if result_text is None:
+            with self._connection() as connection:
+                prior = _load(self._get(connection, run_id)["current_assignment_json"], {})
+            result_text = prior.get("master_result_text") if isinstance(prior, Mapping) else ""
+            result_text = result_text if isinstance(result_text, str) else ""
+        if not isinstance(result_text, str):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_RESULT_TEXT_INVALID",
+                "result_text must be text",
+            )
+        body_digest = _text(
+            value.get("body_text_utf8_sha256"), "body_text_utf8_sha256"
+        )
+        master_result = {
+            "result_ref": result_ref,
+            "result_text": result_text,
+            "body_text_utf8_sha256": body_digest,
+            "source_message_id": source_message_id,
+            "dispatch_id": dispatch_id,
+            "assignment_revision": assignment_revision,
+            "source_role": "MASTER",
+        }
+        reviewer_spec: dict[str, Any]
+        reservation_id: str
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            assignment = _load(row["current_assignment_json"], None)
+            if not isinstance(assignment, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_ASSIGNMENT_REQUIRED",
+                    "a current Master assignment is required before creating its Reviewer",
+                    409,
+                )
+            if (
+                str(assignment.get("dispatch_id") or "") != dispatch_id
+                or str(assignment.get("message_id") or "") != source_message_id
+                or int(assignment.get("assignment_revision") or -1)
+                != assignment_revision
+                or str(assignment.get("result_ref") or "") != result_ref
+            ):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_RESULT_PROVENANCE_MISMATCH",
+                    "Reviewer creation is not bound to the exact completed Master assignment",
+                    409,
+                )
+            existing = _load(row["current_reviewer_json"], None)
+            if isinstance(existing, Mapping):
+                existing_ref = str(
+                    existing.get("worker_result_ref")
+                    or (existing.get("master_result") or {}).get("result_ref")
+                    or ""
+                )
+                if existing_ref and existing_ref != result_ref:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REVIEWER_PROVENANCE_MISMATCH",
+                        "a different Master result already owns this Reviewer slot",
+                        409,
+                    )
+                existing_state = str(existing.get("state") or "").upper()
+                if existing_state in {"ASSIGNED", "VERDICT_RECORDED"}:
+                    return {
+                        "schema": SCHEMA,
+                        "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
+                        "run": self._row(row),
+                        "reviewer": existing,
+                    }
+                if existing_state == "CREATING":
+                    return {
+                        "schema": SCHEMA,
+                        "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_CREATION_PENDING",
+                        "run": self._row(row),
+                        "reviewer": existing,
+                    }
+            worker_config = _load(row["worker_config_json"], {})
+            if not isinstance(worker_config, Mapping):
+                worker_config = {}
+            reviewer_spec = {
+                "run_id": run_id,
+                "dispatch_id": dispatch_id,
+                "worker_result_ref": result_ref,
+                "assignment_revision": assignment_revision,
+                "project_id": row["project_id"],
+                "node_ref": row["node_ref"],
+                "todo_id": assignment.get("todo_id"),
+                "task_frame_id": assignment.get("task_frame_id"),
+                "worker_role": "REVIEWER",
+                "assigned_by_session_anchor_ref": row["session_anchor_ref"],
+                "persona_id": worker_config.get("persona_id"),
+                "provider": worker_config.get("provider"),
+                "model_ref": worker_config.get("model_ref"),
+                "effort": worker_config.get("effort"),
+                "title": "Review Master result: " + result_ref,
+                "instruction": (
+                    "Independently review the pinned Master result and record "
+                    "PASS, NEEDS_REVISION, or BLOCKED."
+                ),
+                "master_result": master_result,
+                "worker_result": master_result,
+            }
+            reservation_id = "master-reviewer-create:" + _digest(
+                {"run_id": run_id, "dispatch_id": dispatch_id, "result_ref": result_ref}
+            )[:24]
+            reservation_payload = {
+                "state": "CREATING",
+                "reservation_id": reservation_id,
+                "worker_result_ref": result_ref,
+                "source_role": "MASTER",
+                "master_result": master_result,
+                "instruction": reviewer_spec["instruction"],
+            }
+            now = _timestamp()
+            cursor = connection.execute(
+                "UPDATE persona_automation_run SET current_reviewer_json = ?, "
+                "state = 'WAITING', next_condition = ?, revision = revision + 1, "
+                "updated_at = ? WHERE run_id = ? AND revision = ?",
+                (
+                    _json(reservation_payload),
+                    "Reviewer Worker must submit an independent verdict",
+                    now,
+                    run_id,
+                    int(row["revision"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while reserving Master Reviewer creation",
+                    409,
+                )
+            self._event(
+                connection,
+                run_id,
+                "MASTER_REVIEWER_CREATION_RESERVED",
+                "master-reviewer-reservation:" + result_ref,
+                reservation_payload,
+            )
+            row = self._get(connection, run_id)
+
+        def mark_failed(reason: str, error_code: str) -> dict[str, Any]:
+            with self._connection() as connection:
+                current = self._get(connection, run_id)
+                current_reviewer = {
+                    "state": "CREATION_FAILED",
+                    "reservation_id": reservation_id,
+                    "worker_result_ref": result_ref,
+                    "source_role": "MASTER",
+                    "master_result": master_result,
+                    "reason": reason,
+                    "error_code": error_code,
+                }
+                now = _timestamp()
+                connection.execute(
+                    "UPDATE persona_automation_run SET current_reviewer_json = ?, "
+                    "next_condition = ?, revision = revision + 1, updated_at = ? "
+                    "WHERE run_id = ? AND revision = ?",
+                    (
+                        _json(current_reviewer),
+                        "retry creation of the exact Reviewer Worker assignment",
+                        now,
+                        run_id,
+                        int(current["revision"]),
+                    ),
+                )
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_CREATION_FAILED",
+                    "run": self._row(self._get(connection, run_id)),
+                    "reviewer": current_reviewer,
+                    "error_code": error_code,
+                    "reason": reason,
+                }
+
+        if not callable(create_reviewer):
+            return mark_failed("ROUTE_UNAVAILABLE", "PERSONA_AUTOMATION_REVIEWER_ROUTE_UNAVAILABLE")
+        try:
+            reviewer_result = create_reviewer(reviewer_spec)
+        except PersonaAutomationError as error:
+            return mark_failed(str(error), error.code)
+        except Exception as error:
+            return mark_failed(str(error), type(error).__name__)
+        reviewer_assignment = (
+            reviewer_result.get("assignment")
+            if isinstance(reviewer_result, Mapping)
+            else None
+        )
+        if not isinstance(reviewer_assignment, Mapping):
+            return mark_failed(
+                "Fleet Reviewer session route did not return a durable assignment",
+                "PERSONA_AUTOMATION_REVIEWER_RECEIPT_INVALID",
+            )
+        for field, expected_value in {
+            "project_id": reviewer_spec["project_id"],
+            "node_ref": reviewer_spec["node_ref"],
+            "todo_id": reviewer_spec["todo_id"],
+            "task_frame_id": reviewer_spec["task_frame_id"],
+            "worker_role": "REVIEWER",
+            "assigned_by_session_anchor_ref": reviewer_spec[
+                "assigned_by_session_anchor_ref"
+            ],
+        }.items():
+            if reviewer_assignment.get(field) != expected_value:
+                return mark_failed(
+                    f"Fleet Reviewer assignment does not preserve exact {field} lineage",
+                    "PERSONA_AUTOMATION_REVIEWER_PROVENANCE_MISMATCH",
+                )
+        reviewer_anchor = _text(
+            reviewer_assignment.get("session_anchor_ref"),
+            "reviewer_assignment.session_anchor_ref",
+        )
+        if reviewer_anchor == str(reviewer_spec["assigned_by_session_anchor_ref"]):
+            return mark_failed(
+                "Reviewer must use a distinct Worker Session Anchor",
+                "PERSONA_AUTOMATION_REVIEWER_MUST_BE_INDEPENDENT",
+            )
+        reviewer_revision = _positive_int(
+            reviewer_assignment.get("assignment_revision"),
+            "reviewer_assignment.assignment_revision",
+        )
+        reviewer_payload = {
+            "state": "ASSIGNED",
+            "reservation_id": reservation_id,
+            "assignment": dict(reviewer_assignment),
+            "worker_result_ref": result_ref,
+            "source_role": "MASTER",
+            "master_result": master_result,
+            "instruction": reviewer_spec["instruction"],
+        }
+        with self._connection() as connection:
+            current = self._get(connection, run_id)
+            existing = _load(current["current_reviewer_json"], None)
+            if not isinstance(existing, Mapping) or str(
+                existing.get("reservation_id") or ""
+            ) != reservation_id:
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
+                    "run": self._row(current),
+                    "reviewer": existing,
+                }
+            assignment = _load(current["current_assignment_json"], {})
+            updated_assignment = {
+                **dict(assignment),
+                "state": "REVIEWER_ASSIGNED",
+                "reviewer_assignment_id": reviewer_assignment.get("assignment_id"),
+                "reviewer_assignment_revision": reviewer_revision,
+                "reviewer_anchor_ref": reviewer_anchor,
+            }
+            now = _timestamp()
+            cursor = connection.execute(
+                "UPDATE persona_automation_run SET current_assignment_json = ?, "
+                "current_reviewer_json = ?, next_condition = ?, revision = revision + 1, "
+                "updated_at = ? WHERE run_id = ? AND revision = ?",
+                (
+                    _json(updated_assignment),
+                    _json(reviewer_payload),
+                    "Reviewer Worker must submit an independent verdict",
+                    now,
+                    run_id,
+                    int(current["revision"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while recording Master Reviewer assignment",
+                    409,
+                )
+            event, _ = self._event(
+                connection,
+                run_id,
+                "MASTER_REVIEWER_ASSIGNED",
+                "master-reviewer:" + result_ref,
+                {
+                    "reviewer": reviewer_payload,
+                    "master_result_ref": result_ref,
+                },
+            )
+            return {
+                "schema": SCHEMA,
+                "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
+                "run": self._row(self._get(connection, run_id)),
+                "reviewer": reviewer_payload,
                 "event": event,
             }
 

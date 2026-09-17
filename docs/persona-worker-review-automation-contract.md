@@ -37,8 +37,12 @@ must use the Worker/Reviewer route.
 `WORKER_REVIEW` now routes through the typed Fleet Worker session Action. The
 automation projection durably records the exact Worker instruction/result and
 the distinct Reviewer assignment/verdict, while `MASTER_DIRECT` retains the
-existing Master queue route. Todo completion is rejected until the current
-Worker result has an independent Reviewer `PASS`; non-PASS verdicts use the
-existing deterministic follow-up Todo route. Provider execution and live
-acceptance remain separate evidence fields and are never inferred from a
-session or queue receipt.
+existing Master queue route. A node-bound `MASTER_DIRECT` result immediately
+creates a distinct Reviewer Worker through the same typed Fleet route; the
+node Master is therefore the orchestrator and does not wait for an unrelated
+human review. A Reviewer `PASS` queues the next node-Master control turn,
+which completes the exact automation assignment and Todo through typed
+Actions. Todo completion is rejected until the required independent Reviewer
+`PASS`; non-PASS verdicts use the existing deterministic follow-up Todo route.
+Provider execution and live acceptance remain separate evidence fields and are
+never inferred from a session or queue receipt.

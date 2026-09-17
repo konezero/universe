@@ -33819,6 +33819,52 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 request[field] = spec[field]
         return self._handle_fleet_worker_session_start_action(request, context)
 
+    def _ensure_persona_automation_master_reviewer(
+        self,
+        run: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any],
+        result_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Ensure the node Master result has one typed Reviewer Worker.
+
+        The assignment/result coordinates come only from the automation
+        projection.  This helper is used both immediately after
+        ``master.complete`` and by a later ``persona.automation.kick`` repair;
+        it never scans queues or chooses a newer terminal heuristically.
+        """
+
+        assignment = run.get("current_assignment")
+        if not isinstance(assignment, Mapping):
+            return {
+                "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_NOT_CREATED",
+                "reason": "automation assignment is missing",
+            }
+        result_ref = str(assignment.get("result_ref") or "").strip()
+        source_message_id = str(assignment.get("message_id") or "").strip()
+        if not result_ref or not source_message_id:
+            return {
+                "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_NOT_CREATED",
+                "reason": "Master result coordinates are incomplete",
+            }
+        if result_text is None:
+            result_text = str(assignment.get("master_result_text") or "")
+        return self.persona_automation.attach_master_reviewer(
+            {
+                "run_id": run.get("run_id"),
+                "dispatch_id": assignment.get("dispatch_id"),
+                "assignment_revision": assignment.get("assignment_revision"),
+                "source_message_id": source_message_id,
+                "result_ref": result_ref,
+                "body_text_utf8_sha256": str(
+                    assignment.get("master_result_digest")
+                    or utf8_sha256(result_text or "")
+                ),
+                "result_text": result_text or "",
+            },
+            lambda spec: self._create_persona_automation_worker(spec, context),
+        )
+
     def _ensure_persona_automation_worker_instruction(
         self, run: Mapping[str, Any], *, context: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -33877,9 +33923,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         result_payload = result_payload if isinstance(result_payload, Mapping) else {}
         worker_result = result_payload.get("result")
         worker_result = worker_result if isinstance(worker_result, Mapping) else {}
+        master_result = current.get("master_result")
+        master_result = master_result if isinstance(master_result, Mapping) else {}
         result_ref = str(
             current.get("worker_result_ref")
             or worker_result.get("result_ref")
+            or master_result.get("result_ref")
             or ""
         ).strip()
         instruction = str(
@@ -33909,6 +33958,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         ]
         body_lines.extend(f"- {condition}" for condition in conditions)
         if worker_role == "REVIEWER":
+            reviewed_result_text = str(
+                worker_result.get("result_text")
+                or master_result.get("result_text")
+                or ""
+            )
             body_lines.extend(
                 [
                     "",
@@ -33916,7 +33970,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "VERDICT: PASS, VERDICT: NEEDS_REVISION, or VERDICT: BLOCKED, followed by evidence.",
                     f"worker_result_ref: {result_ref or '<missing>'}",
                     "Worker result text:",
-                    str(worker_result.get("result_text") or "")[:16000],
+                    reviewed_result_text[:16000],
                 ]
             )
         else:
@@ -34488,7 +34542,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 else:
                     assignment_gate["next_condition"] = (
-                        "record persona.automation.review for this exact result, then complete after PASS"
+                        "create or repair the exact Reviewer Worker assignment for this result"
                     )
             elif assignment_state == "REVIEWED" and review_outcome == "PASS":
                 assignment_gate = {
@@ -35087,6 +35141,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.plan to select and record one Todo from your bound scope (Goal evidence is optional); "
                     "if and only if the decision is EXECUTE, use persona.automation.dispatch "
                     "for one bounded Master work item with explicit completion conditions. "
+                    "When the current assignment is REVIEWED with a PASS verdict, "
+                    "call persona.automation.complete for that exact run, then use the "
+                    "typed todo.state Action with the freshly read Todo revision to mark "
+                    "the same Todo DONE only with PASSED validation evidence. "
+                    "When the current assignment is RESULT_READY_FOR_REVIEW and no Reviewer "
+                    "assignment exists, repair the exact Reviewer route before selecting "
+                    "another Todo. "
                     "A non-PASS review with a durable follow-up Todo is not a pause gate: "
                     "continue with the next bounded control cycle and do not call persona.automation.pause. "
                     "For MEETING, ESCALATE, or WAIT, do not invent work or adopt a plan; "
@@ -35394,6 +35455,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 # Wake its eligible Master rather than enqueueing a second
                 # control cycle that could compete for the same Todo.
                 assignment = run.get("current_assignment")
+                if (
+                    str(run.get("node_ref") or "").strip()
+                    and str(run.get("execution_mode") or "MASTER_DIRECT").upper()
+                    == "MASTER_DIRECT"
+                    and isinstance(assignment, Mapping)
+                    and str(assignment.get("state") or "").upper()
+                    in {"RESULT_READY_FOR_REVIEW", "REVIEWER_ASSIGNED"}
+                ):
+                    reviewer = run.get("current_reviewer")
+                    reviewer_state = (
+                        str(reviewer.get("state") or "").upper()
+                        if isinstance(reviewer, Mapping)
+                        else ""
+                    )
+                    if reviewer_state != "ASSIGNED":
+                        repaired = self._ensure_persona_automation_master_reviewer(
+                            run, context=context
+                        )
+                        repaired_run = repaired.get("run") if isinstance(repaired, Mapping) else None
+                        if isinstance(repaired_run, Mapping):
+                            repaired_reviewer = repaired.get("reviewer")
+                            if (
+                                isinstance(repaired_reviewer, Mapping)
+                                and str(repaired_reviewer.get("state") or "").upper()
+                                == "ASSIGNED"
+                            ):
+                                repaired["reviewer_instruction"] = self._ensure_persona_automation_worker_instruction(
+                                    repaired_run, context=context
+                                )
+                        return repaired
                 if isinstance(assignment, Mapping) and str(assignment.get("state") or "").upper() in {
                     "WORKER_ASSIGNED",
                     "REVIEWER_ASSIGNED",
@@ -35622,41 +35713,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 result = self.persona_automation.record_reviewer_verdict(value)
                 followup = self._create_persona_review_followup_todo(result)
                 result["followup"] = followup
-                if followup.get("todo") is not None:
-                    current_run = self.persona_automation.get_run(value["run_id"])
-                    if str(current_run.get("node_ref") or "").strip():
-                        result["driver"] = self._enqueue_persona_automation_driver(
-                            current_run,
-                            driver_key=f"review-{result['review']['review_id']}",
-                        )
-                    else:
-                        result["driver"] = {
-                            "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
-                            "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
-                        }
+                current_run = self.persona_automation.get_run(value["run_id"])
+                review_outcome = str(result.get("review", {}).get("outcome") or "").upper()
+                if str(current_run.get("node_ref") or "").strip() and (
+                    review_outcome == "PASS" or followup.get("todo") is not None
+                ):
+                    result["driver"] = self._enqueue_persona_automation_driver(
+                        current_run,
+                        driver_key=f"review-{result['review']['review_id']}",
+                    )
+                elif followup.get("todo") is not None:
+                    result["driver"] = {
+                        "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
+                        "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
+                    }
                 return result
             if action_id == "persona.automation.review":
                 value = _exact_object_fields(request, field="persona_automation_review", required=frozenset({"run_id", "result_ref", "outcome", "evidence_refs", "dispatch_id", "assignment_revision", "source_message_id"}), optional=frozenset({"acceptance_status", "note", "next_action", "source_project_id"}))
                 result = self.persona_automation.record_review(value)
                 followup = self._create_persona_review_followup_todo(result)
                 result["followup"] = followup
-                if followup.get("todo") is not None:
-                    current_run = self.persona_automation.get_run(value["run_id"])
-                    if str(current_run.get("node_ref") or "").strip():
-                        result["driver"] = self._enqueue_persona_automation_driver(
-                            current_run,
-                            driver_key=f"review-{result['review']['review_id']}",
-                        )
-                    else:
-                        # A project-wide Conductor may create the same
-                        # durable follow-up Todo, but it is not a node Master
-                        # scheduler.  Do not fail a successful review after
-                        # its Todo write by pretending that this run has a
-                        # node-bound delivery route.
-                        result["driver"] = {
-                            "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
-                            "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
-                        }
+                current_run = self.persona_automation.get_run(value["run_id"])
+                review_outcome = str(result.get("review", {}).get("outcome") or "").upper()
+                if str(current_run.get("node_ref") or "").strip() and (
+                    review_outcome == "PASS" or followup.get("todo") is not None
+                ):
+                    result["driver"] = self._enqueue_persona_automation_driver(
+                        current_run,
+                        driver_key=f"review-{result['review']['review_id']}",
+                    )
+                elif followup.get("todo") is not None:
+                    # A project-wide Conductor may create the same durable
+                    # follow-up Todo, but it is not a node Master scheduler.
+                    result["driver"] = {
+                        "status": "PERSONA_AUTOMATION_FOLLOWUP_DRIVER_NOT_APPLICABLE",
+                        "reason": "PROJECT_WIDE_CONDUCTOR_RUN",
+                    }
                 return result
             if action_id == "persona.automation.complete":
                 value = _exact_object_fields(request, field="persona_automation_complete", required=frozenset({"run_id", "request_id", "complete"}), optional=frozenset({"expected_revision"}))
@@ -36069,6 +36161,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "source_message_id": message_id,
                     "result_ref": result_ref,
                     "body_text_utf8_sha256": utf8_sha256(body_text),
+                    "result_text": body_text,
                     "completed_at": message.get("completed_at"),
                 })
             except PersonaAutomationError as error:
@@ -36078,25 +36171,64 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "detail": error.detail,
                 }
             else:
-                # record_master_completion leaves the run WAITING on an
-                # Independent Reviewer verdict but, unlike RUN_STARTED/kick,
-                # never queues the next control turn itself. A node-bound
-                # Master that finishes its own turn right after completing
-                # (the common case) then has nothing telling it -- or a
-                # later-reconnected Master -- to come back and review its
-                # own result, so the run stalls in WAITING forever (2026-09-17
-                # incident: persona_run_f928b72114614bc5b8ce8a99 stuck ~16h
-                # after MASTER_RESULT_RECORDED with no queued follow-up).
-                # Mirror the same enqueue+wake RUN_STARTED/kick use so the
-                # review step is reachable the same way the work step was.
                 run = automation_result.get("run") if isinstance(automation_result, Mapping) else None
-                if isinstance(run, Mapping):
+                reviewer_result = None
+                if (
+                    isinstance(run, Mapping)
+                    and str(run.get("node_ref") or "").strip()
+                    and str(run.get("execution_mode") or "MASTER_DIRECT").upper()
+                    == "MASTER_DIRECT"
+                ):
+                    # A direct Master result is still a result, not an
+                    # acceptance.  The node Master owns the orchestration,
+                    # so it immediately creates a distinct Reviewer Worker
+                    # through the typed Fleet route instead of waiting for a
+                    # human or an unrelated queue consumer to do so.
+                    try:
+                        reviewer_result = self._ensure_persona_automation_master_reviewer(
+                            run,
+                            context=context,
+                            result_text=body_text,
+                        )
+                        automation_result["reviewer"] = reviewer_result.get("reviewer")
+                        automation_result["reviewer_result"] = reviewer_result
+                        reviewer_run = reviewer_result.get("run")
+                        reviewer = reviewer_result.get("reviewer")
+                        if (
+                            isinstance(reviewer_run, Mapping)
+                            and isinstance(reviewer, Mapping)
+                            and str(reviewer.get("state") or "").upper() == "ASSIGNED"
+                        ):
+                            automation_result["reviewer_instruction"] = (
+                                self._ensure_persona_automation_worker_instruction(
+                                    reviewer_run, context=context
+                                )
+                            )
+                    except PersonaAutomationError as error:
+                        automation_result["reviewer_result"] = {
+                            "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_NOT_CREATED",
+                            "error_code": error.code,
+                            "detail": error.detail,
+                        }
+                if isinstance(run, Mapping) and (
+                    not isinstance(reviewer_result, Mapping)
+                    or str((reviewer_result.get("status") or "")).upper()
+                    not in {
+                        "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
+                        "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
+                        "PERSONA_AUTOMATION_MASTER_REVIEWER_CREATION_PENDING",
+                    }
+                ):
+                    # Preserve a recoverable control receipt when the typed
+                    # Reviewer route is unavailable or the old assignment
+                    # lacks an exact Todo/Task Frame.  This is a repair path,
+                    # not a substitute for the Reviewer assignment.
                     try:
                         self._enqueue_persona_automation_driver(
                             run, driver_key=f"post-result-r{int(run.get('revision') or 0)}"
                         )
                     except PersonaAutomationError:
-                        pass  # project-wide (node_ref-less) runs have no node driver; harmless
+                        pass
         result_delivery = self._publish_master_completion_results()
         return {
             "schema": MASTER_COMPLETE_RESULT_SCHEMA,

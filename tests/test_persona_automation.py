@@ -283,6 +283,83 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PersonaAutomationError, "differs"):
             self.store.record_master_completion({**completion, "result_ref": "result:changed"})
 
+    def test_master_completion_creates_distinct_reviewer_worker_and_accepts_verdict(self):
+        assignment = {**self.assignment, "node_ref": "feature_master_review"}
+        run = self.store.start_run(
+            {
+                "project_id": "project_test",
+                "session_anchor_ref": assignment["session_anchor_ref"],
+                "scope": "one direct Master Todo",
+                "instruction": "complete one bounded Todo",
+                "request_id": "master-review-worker",
+                "idempotency_key": "master-review-worker",
+            },
+            assignment,
+        )["run"]
+        owner = assignment["session_anchor_ref"]
+        self.store.claim_tick({"run_id": run["run_id"], "owner_ref": owner, "tick_id": "master-review-tick"})
+        self.store.record_decision({
+            "run_id": run["run_id"], "owner_ref": owner,
+            "decision_id": "master-review-decision", "kind": "EXECUTE",
+            "rationale": "the exact node Todo is selected",
+            "evidence_refs": ["todo:master-review"],
+            "target": {"todo_id": "todo-master-review"},
+        })
+        queued = []
+        dispatched = self.store.dispatch_work({
+            "run_id": run["run_id"], "owner_ref": owner,
+            "dispatch_id": "master-review-dispatch", "title": "direct Master work",
+            "instruction": "complete the bounded Todo", "completion_conditions": ["evidence"],
+        }, lambda project_id, value: (queued.append(dict(value)) or ({"message_id": "master-review-message", "project_id": project_id}, True)))
+        assignment_row = dispatched["dispatch"]
+        completion = self.store.record_master_completion({
+            "run_id": run["run_id"], "dispatch_id": assignment_row["dispatch_id"],
+            "assignment_revision": assignment_row["assignment_revision"],
+            "source_message_id": assignment_row["message_id"],
+            "result_ref": "master-result-review", "body_text_utf8_sha256": "c" * 64,
+            "completed_at": "2026-09-17T00:00:00Z",
+        })
+        self.assertEqual("RESULT_READY_FOR_REVIEW", completion["run"]["current_assignment"]["state"])
+        reviewer_assignment = {
+            "assignment_id": "task_master_reviewer",
+            "project_id": "project_test",
+            "node_ref": "feature_master_review",
+            "todo_id": "todo-master-review",
+            "task_frame_id": None,
+            "worker_role": "REVIEWER",
+            "session_anchor_ref": "master-reviewer-anchor",
+            "assignment_revision": 1,
+            "assigned_by_session_anchor_ref": owner,
+        }
+        reviewer = self.store.attach_master_reviewer(
+            {
+                "run_id": run["run_id"],
+                "dispatch_id": assignment_row["dispatch_id"],
+                "assignment_revision": assignment_row["assignment_revision"],
+                "source_message_id": assignment_row["message_id"],
+                "result_ref": "master-result-review",
+                "body_text_utf8_sha256": "c" * 64,
+                "result_text": "direct Master result",
+            },
+            create_reviewer=lambda spec: self.assertEqual(
+                "master-result-review", spec["worker_result_ref"]
+            ) or {"assignment": reviewer_assignment},
+        )
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED", reviewer["status"])
+        self.assertEqual("REVIEWER_ASSIGNED", reviewer["run"]["current_assignment"]["state"])
+        self.assertEqual("MASTER", reviewer["run"]["current_reviewer"]["source_role"])
+        verdict = self.store.record_reviewer_verdict({
+            "run_id": run["run_id"], "dispatch_id": assignment_row["dispatch_id"],
+            "reviewer_assignment_id": reviewer_assignment["assignment_id"],
+            "reviewer_assignment_revision": 1,
+            "reviewer_anchor_ref": reviewer_assignment["session_anchor_ref"],
+            "worker_result_ref": "master-result-review", "outcome": "PASS",
+            "acceptance_status": "VERIFIED_EVIDENCE",
+            "evidence_refs": ["review:master-result"],
+        })
+        self.assertEqual("PASS", verdict["review"]["outcome"])
+        self.assertEqual("REVIEWED", verdict["run"]["current_assignment"]["state"])
+
     def test_legacy_self_reply_migration_derives_revision_only_from_exact_current_assignment(self):
         run = self.start("legacy-self-reply")
         owner = self.assignment["session_anchor_ref"]
