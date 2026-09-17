@@ -620,6 +620,15 @@ function terminalAttentionProjection(session) {
   if (["DISCONNECTED", "OFFLINE", "STOPPED"].includes(lifecycle) || session?.provider_cli_alive === false) {
     return { state: "DISCONNECTED", detail: lifecycle || "CLI_UNAVAILABLE" };
   }
+  // A native queue receipt is only delivery evidence. If the authoritative
+  // Host turn has ended, keep that state visible even when the last delivery
+  // still says NATIVE_QUEUED; otherwise Fleet presents a dead Worker as LIVE
+  // and operators cannot tell why automation stopped advancing.
+  if (["SESSION_ENDED", "ENDED", "CLI_EXITED", "TERMINAL_ENDED"].includes(turn) ||
+      ["SESSION_ENDED", "ENDED", "CLI_EXITED", "TERMINAL_ENDED"].includes(turnEvent) ||
+      ["ENDED", "SESSION_ENDED"].includes(lifecycle)) {
+    return { state: "ENDED", detail: turn || turnEvent || lifecycle };
+  }
   if (["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turn) ||
       ["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turnEvent)) {
     return { state: "WAITING_INPUT", detail: turn || turnEvent };
@@ -2651,5 +2660,14 @@ async function noteServiceReconnect() {
   state.reattachBannerDismissed = false;
   await loadTerminalTabs();
   await loadResumableSessions();
+  // Host recovery changes the authoritative terminal/assignment projection.
+  // Drop Fleet's read caches before rendering so a recovered service cannot
+  // show the pre-outage node state until the next manual click.
+  if (typeof invalidateFleetAuthoritativeCaches === "function") {
+    invalidateFleetAuthoritativeCaches();
+  }
   renderReattachBanner();
+  if (typeof refreshFleetHomeSoft === "function") {
+    await refreshFleetHomeSoft().catch(() => {});
+  }
 }

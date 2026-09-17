@@ -187,6 +187,82 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             queued[1][1]["idempotency_key"],
         )
 
+    def test_replayed_done_driver_does_not_emit_another_wake(self):
+        run = {
+            "run_id": "persona_run_driver_replay",
+            "project_id": "project_test",
+            "session_anchor_ref": self.assignment["session_anchor_ref"],
+            "node_ref": "feature_test",
+            "state": "WAITING",
+        }
+        queued = []
+        calls = {"create": 0}
+
+        class Store:
+            def create_master_message(self, project_id, value):
+                calls["create"] += 1
+                queued.append((project_id, dict(value)))
+                return {
+                    "message_id": "master_driver_replay",
+                    "target_session_anchor_ref": value["target_session_anchor_ref"],
+                    "node_ref": value["node_ref"],
+                    "delivery_state": "QUEUED" if calls["create"] == 1 else "DONE",
+                }, calls["create"] == 1
+
+        class Automation:
+            def record_driver_message(self, run_id, *, driver_key, message):
+                return {
+                    "status": (
+                        "PERSONA_AUTOMATION_DRIVER_ENQUEUED"
+                        if message["created"]
+                        else "PERSONA_AUTOMATION_DRIVER_REPLAYED"
+                    ),
+                    "driver": dict(message),
+                }
+
+        wakes = []
+        server = SimpleNamespace(
+            store=Store(),
+            persona_automation=Automation(),
+            _wake_live_master_sessions=lambda project_id, *, reason: wakes.append(
+                (project_id, reason)
+            ),
+        )
+        first = UniverseHTTPServer._enqueue_persona_automation_driver(
+            server, run, driver_key="same-driver"
+        )
+        replay = UniverseHTTPServer._enqueue_persona_automation_driver(
+            server, run, driver_key="same-driver"
+        )
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_ENQUEUED", first["status"])
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_REPLAYED", replay["status"])
+        self.assertEqual(1, len(wakes))
+        self.assertEqual(2, calls["create"])
+
+    def test_terminal_run_cannot_enqueue_a_driver(self):
+        run = {
+            "run_id": "persona_run_driver_terminal",
+            "project_id": "project_test",
+            "session_anchor_ref": self.assignment["session_anchor_ref"],
+            "node_ref": "feature_test",
+            "state": "COMPLETED",
+        }
+        calls = []
+
+        class Store:
+            def create_master_message(self, project_id, value):
+                calls.append((project_id, value))
+                raise AssertionError("terminal run must not create a driver message")
+
+        server = SimpleNamespace(
+            store=Store(),
+            persona_automation=SimpleNamespace(),
+            _wake_live_master_sessions=lambda **kwargs: calls.append(kwargs),
+        )
+        result = UniverseHTTPServer._enqueue_persona_automation_driver(server, run)
+        self.assertEqual("PERSONA_AUTOMATION_DRIVER_NOT_ELIGIBLE", result["status"])
+        self.assertEqual([], calls)
+
     def test_pause_resume_preserves_cursor_and_stopped_run_cannot_tick(self):
         run = self.start()
         tick = self.store.claim_tick({"run_id": run["run_id"], "owner_ref": self.assignment["session_anchor_ref"], "tick_id": "tick-1", "cursor": {"todo": "todo-1"}})
@@ -1174,6 +1250,93 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
         })
         self.assertEqual(200, status, stopped)
         self.assertEqual("STOPPED", stopped["run"]["state"])
+
+    def test_dispatch_auto_marks_ready_todo_in_progress(self):
+        material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-automation-auto-ip-session",
+            "node": "TEST",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+        })
+        anchor = material["session_anchor_ref"]
+        status, persona_result = self.act("persona.create", {
+            "title": "auto in-progress lead",
+            "body": "Dispatch should mark the selected Todo IN_PROGRESS.",
+        })
+        self.assertEqual(200, status, persona_result)
+        persona = persona_result["persona"]
+        status, assignment = self.act("persona.assign", {
+            "session_anchor_ref": anchor,
+            "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"],
+            "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assignment)
+        todo = self.server.store.create_todo({
+            "scope_kind": "PROJECT",
+            "project_id": "TEST",
+            "title": "ready work that should start",
+            "detail": "auto IN_PROGRESS on dispatch",
+            "priority": "P2",
+            "state": "READY",
+            "source_kind": "USER",
+            "sort_order": 0,
+        })
+        self.assertEqual("READY", todo["state"])
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST",
+            "session_anchor_ref": anchor,
+            "scope": "one bounded ready Todo",
+            "instruction": "dispatch the ready Todo",
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        status, tick = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "auto-ip-tick",
+        })
+        self.assertEqual(200, status, tick)
+        status, decision = self.act("persona.automation.decide", {
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "auto-ip-decision",
+            "kind": "EXECUTE",
+            "rationale": "selected ready Todo is inside scope",
+            "evidence_refs": ["todo:ready"],
+            "target": {"todo_id": todo["todo_id"]},
+        })
+        self.assertEqual(200, status, decision)
+        status, dispatched = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"],
+            "owner_ref": anchor,
+            "dispatch_id": "auto-ip-dispatch-1",
+            "todo_id": todo["todo_id"],
+            "title": "start ready Todo",
+            "instruction": "do the work",
+            "completion_conditions": ["result evidence"],
+        })
+        self.assertEqual(201, status, dispatched)
+        progress = dispatched.get("todo_progress") or {}
+        self.assertEqual("TODO_STATE_CHANGED", progress.get("status"), progress)
+        self.assertEqual("READY", progress.get("previous_state"))
+        self.assertEqual("IN_PROGRESS", progress.get("state"))
+        refreshed = self.server.store.get_todo(todo["todo_id"])
+        self.assertEqual("IN_PROGRESS", refreshed["state"])
+        # Replay must not fail and must keep IN_PROGRESS.
+        status, replayed = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"],
+            "owner_ref": anchor,
+            "dispatch_id": "auto-ip-dispatch-1",
+            "todo_id": todo["todo_id"],
+            "title": "start ready Todo",
+            "instruction": "do the work",
+            "completion_conditions": ["result evidence"],
+        })
+        self.assertEqual(200, status, replayed)
+        self.assertIn(
+            (replayed.get("todo_progress") or {}).get("status"),
+            {"ALREADY_IN_PROGRESS", "TODO_STATE_UNCHANGED", "TODO_STATE_CHANGED"},
+        )
+        self.assertEqual("IN_PROGRESS", self.server.store.get_todo(todo["todo_id"])["state"])
+        self.act("persona.automation.stop", {"run_id": run["run_id"], "reason": "test cleanup"})
 
     def test_non_passing_review_creates_one_priority_inheriting_followup_todo(self):
         material, _ = self.server.session_supervisor.register_session({

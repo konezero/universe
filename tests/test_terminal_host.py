@@ -1233,6 +1233,42 @@ class TerminalHostTests(unittest.TestCase):
             spawned[0][5],
         )
 
+    def test_aggregate_reads_do_not_block_on_rust_host_refresh(self) -> None:
+        """Fleet terminal reads use the cached pump projection for Rust Hosts."""
+
+        refreshed = []
+        session = SimpleNamespace(
+            backend_owner="RUST_RECONNECTION_HOST",
+            state="LIVE",
+            public=lambda: {
+                "terminal_id": "term-rust-cached",
+                "state": "LIVE",
+            },
+        )
+        host = object.__new__(TerminalHost)
+        host._lock = threading.Lock()
+        host._sessions = {"term-rust-cached": session}
+        host._refresh_session_state = lambda value: refreshed.append(value)
+
+        self.assertEqual(
+            [{"terminal_id": "term-rust-cached", "state": "LIVE"}],
+            host.list_sessions(),
+        )
+        self.assertEqual([], refreshed)
+
+        class Registry:
+            def list_discovery_records(self):
+                return [{"host_id": "host-rust-cached", "runtime_state": "LIVE"}]
+
+            def list_observed_hosts(self):
+                raise AssertionError("aggregate reads must not handshake every Host")
+
+        host._reconnection_registry = Registry()
+        self.assertEqual(
+            [{"host_id": "host-rust-cached", "runtime_state": "LIVE"}],
+            host.list_hosts(),
+        )
+
     def test_managed_shell_identity_file_is_written_and_cleaned(self) -> None:
         spawned_environment: dict[str, str] = {}
 

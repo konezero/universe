@@ -35633,6 +35633,20 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """
 
         run_id = _required_text(run.get("run_id"), "run_id")
+        run_state = str(run.get("state") or "").strip().upper()
+        if run_state and run_state not in {"RUNNING", "WAITING"}:
+            # A replayed review/result callback can arrive after the run has
+            # already reached a terminal state.  Do not create another
+            # control message for COMPLETED/STOPPED runs; their durable
+            # state is authoritative and a fresh run must be started through
+            # persona.automation.start if more work is intended.
+            return {
+                "schema": "universe.persona-automation.v1",
+                "status": "PERSONA_AUTOMATION_DRIVER_NOT_ELIGIBLE",
+                "run": dict(run),
+                "driver": {"driver_key": driver_key, "created": False},
+                "reason": f"automation run is {run_state}; terminal runs are not queued",
+            }
         project_id = _identifier(run.get("project_id"), "project_id")
         anchor = _required_text(run.get("session_anchor_ref"), "session_anchor_ref")
         node_ref = str(run.get("node_ref") or "").strip()
@@ -35686,10 +35700,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             driver_key=driver_key,
             message=receipt,
         )
-        self._wake_live_master_sessions(
-            project_id,
-            reason="PERSONA_AUTOMATION_CONTROL_QUEUED",
-        )
+        # Replaying an idempotent driver whose queue item is already DONE or
+        # PROCESSING must not emit another wake.  A queued item may still need
+        # a nudge after a transient transport failure, while a newly created
+        # item always needs its first wake.
+        message_state = str(message.get("delivery_state") or "").strip().upper()
+        if created or message_state in {"QUEUED", "PENDING"}:
+            self._wake_live_master_sessions(
+                project_id,
+                reason="PERSONA_AUTOMATION_CONTROL_QUEUED",
+            )
         return recorded
 
     def _persona_automation_node_has_executable_todo(

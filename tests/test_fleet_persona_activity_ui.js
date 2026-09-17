@@ -80,7 +80,30 @@ test("terminal attention projection preserves quota, failure, waiting and unknow
       latest_delivery: { phase: "NATIVE_UNCONFIRMED", error_code: "HOST_TURN_BINDING_MISMATCH" },
     },
   }).state, "FAILED");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    provider_cli_alive: true,
+    host_turn_state: {
+      state: "SESSION_ENDED",
+      last_event: "SESSION_ENDED",
+      latest_delivery: { phase: "NATIVE_QUEUED", error_code: null },
+    },
+  }).state, "ENDED");
   assert.equal(context.terminalAttentionProjection({ provider: "CODEX" }).state, "UNKNOWN");
+});
+
+test("Fleet Worker state preserves an ended Host turn over LIVE terminal metadata", () => {
+  const context = evaluate(
+    appSource,
+    "function fleetWorkerTerminalState(terminal)",
+    "function bindFleetNodeMaster",
+    {
+      state: {},
+      terminalAttentionProjection: () => ({ state: "ENDED", detail: "SESSION_ENDED" }),
+    },
+  );
+  assert.equal(context.fleetWorkerTerminalState({ state: "LIVE" }), "ENDED");
 });
 
 test("Fleet binding status never turns an unavailable assignment read into UNASSIGNED", () => {
@@ -283,6 +306,44 @@ test("Fleet project selection renders the core projection before slow optional o
   assert.match(selection.slice(core, optional), /renderGoalPlan\(\)/);
 });
 
+test("Fleet renderGoalPlan clears stale graph-mode so Galaxy legend cannot leak", () => {
+  const start = appSource.indexOf("function renderGoalPlan()");
+  const end = appSource.indexOf("function renderFleetFeatureSummaries", start);
+  assert.ok(start >= 0 && end > start);
+  const body = appSource.slice(start, end);
+  assert.match(body, /classList\.remove\("graph-mode",\s*"galaxy-view"\)/);
+  assert.match(body, /classList\.add\("fleet-mode"\)/);
+  // Galaxy entry removes home/fleet; Fleet entry must symmetrically clear graph-mode.
+  const galaxy = appSource.indexOf("function showGraphView(");
+  const galaxyEnd = appSource.indexOf("function showGoalPlanView", galaxy);
+  assert.ok(galaxy >= 0 && galaxyEnd > galaxy);
+  assert.match(
+    appSource.slice(galaxy, galaxyEnd),
+    /classList\.remove\("home-mode",\s*"fleet-mode"\)/
+  );
+});
+
+test("Fleet home soft refresh polls while visible and skips edit/dialog focus", () => {
+  assert.match(appSource, /async function refreshFleetHomeSoft\(/);
+  assert.match(appSource, /function fleetHomeEditingGuarded\(/);
+  assert.match(appSource, /function fleetHomeSoftRefreshActive\(/);
+  const start = appSource.indexOf("async function refreshFleetHomeSoft(");
+  const end = appSource.indexOf("function renderIntegratedHome()", start);
+  assert.ok(start >= 0 && end > start);
+  const body = appSource.slice(start, end);
+  assert.match(body, /fleetHomeSoftRefreshActive\(\)/);
+  assert.match(body, /\/v1\/todos/);
+  assert.match(body, /\/goals/);
+  assert.match(body, /delete state\.fleetAutomationByNode\[featureId\]/);
+  assert.match(body, /delete state\.fleetWorkerAssignmentsByNode\[featureId\]/);
+  assert.match(body, /refreshFleetProjectConductorProjection/);
+  assert.match(appSource, /function invalidateFleetAuthoritativeCaches\(\)/);
+  assert.match(appSource, /state\.fleetCoordinationByNode = \{\}/);
+  assert.match(appSource, /fleetHomeRefreshTimer[\s\S]{0,120}setInterval\(\(\)\s*=>\s*\{\s*void refreshFleetHomeSoft\(\)/);
+  assert.match(appSource, /dialog\[open\]/);
+  assert.match(appSource, /TEXTAREA/);
+});
+
 test("Fleet terminal refresh re-renders Team rows after authoritative Host discovery", () => {
   const start = terminalSource.indexOf("async function loadTerminalTabs()");
   const end = terminalSource.indexOf("function hostSessionRefOf", start);
@@ -292,4 +353,13 @@ test("Fleet terminal refresh re-renders Team rows after authoritative Host disco
   assert.match(terminalSource.slice(start, end), /supervisorTerminalsStatus = "ERROR"/);
   assert.match(terminalSource.slice(start, end), /supervisorTerminalsError/);
   assert.match(terminalSource.slice(start, end), /SUPERVISOR_TERMINALS_SCHEMA_INVALID/);
+});
+
+test("Host reconnect invalidates Fleet projections before soft refresh", () => {
+  const start = terminalSource.indexOf("async function noteServiceReconnect()");
+  const end = terminalSource.indexOf("\n}", start);
+  assert.ok(start >= 0 && end > start);
+  const body = terminalSource.slice(start, end);
+  assert.match(body, /invalidateFleetAuthoritativeCaches/);
+  assert.match(body, /refreshFleetHomeSoft/);
 });

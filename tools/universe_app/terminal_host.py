@@ -854,7 +854,16 @@ class TerminalHost:
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
-            self._refresh_session_state(session)
+            # Rust Reconnection Hosts own the live process and are sampled by
+            # their per-terminal pump.  Re-querying every Host synchronously
+            # from this aggregate read makes one slow/stale IPC endpoint block
+            # the whole `/v1/terminals` projection (and therefore Fleet).  The
+            # cached row is the latest authoritative pump projection; targeted
+            # lifecycle operations still use `get()` and refresh the exact
+            # Host before acting.  Legacy in-process PTYs retain the old read
+            # path because their state is only refreshed here.
+            if session.backend_owner != "RUST_RECONNECTION_HOST":
+                self._refresh_session_state(session)
         rows = [item.public() for item in sessions]
         rows.sort(key=lambda item: str(item.get("created_at") or ""))
         return rows
@@ -863,7 +872,13 @@ class TerminalHost:
         registry = self._reconnection_registry
         if registry is None:
             return []
-        return registry.list_observed_hosts()
+        # `/v1/terminals` is an aggregate UI read.  `list_observed_hosts()`
+        # performs a live authenticated IPC handshake for every Host, so one
+        # stale endpoint can hold the complete terminal projection past the
+        # HTTP timeout.  Discovery records are the same durable Host registry
+        # with OS PID/liveness and compatibility projection, and targeted
+        # Host operations continue to use the authenticated `discover()` path.
+        return registry.list_discovery_records()
 
     def list_host_records(self) -> list[dict[str, Any]]:
         registry = self._reconnection_registry

@@ -52,6 +52,10 @@ const state = {
   fleetConductorAutomation: null,
   /** Whether the Conductor "Manage" modal is open, for refresh-while-open. */
   fleetConductorDialogOpen: false,
+  /** Soft poll in-flight guard for Fleet home live refresh. */
+  fleetHomeRefreshInFlight: false,
+  /** Interval handle for Fleet home soft refresh (todos/automation/roster). */
+  fleetHomeRefreshTimer: null,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
@@ -4936,6 +4940,82 @@ function homeChev() {
   return svg;
 }
 
+// Fleet home previously refreshed only on explicit clicks. Soft-poll Todo /
+// goal / automation / Worker projections while the home is visible, but never
+// while the operator is editing or a dialog is open (avoids clobbering drafts).
+function fleetHomeEditingGuarded() {
+  const el = document.activeElement;
+  if (el) {
+    const tag = String(el.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (el.isContentEditable) return true;
+  }
+  return Boolean(document.querySelector("dialog[open]"));
+}
+
+function fleetHomeSoftRefreshActive() {
+  if (state.view !== "work") return false;
+  if (
+    !document.body.classList.contains("home-mode") &&
+    !document.body.classList.contains("fleet-mode")
+  ) {
+    return false;
+  }
+  if (fleetHomeEditingGuarded()) return false;
+  return Boolean(String(state.selectedProject?.project_id || "").trim());
+}
+
+function invalidateFleetAuthoritativeCaches() {
+  // These are only client-side projections. Clearing them after Host
+  // recovery forces the next render/read to use typed server Actions and
+  // authoritative Host/Session stores again.
+  state.fleetWorkerAssignmentsByNode = {};
+  state.fleetAutomationByNode = {};
+  state.fleetCoordinationByNode = {};
+  state.fleetOrphanMessagesByNode = {};
+  state.fleetConductorAutomation = null;
+}
+
+async function refreshFleetHomeSoft() {
+  if (state.fleetHomeRefreshInFlight) return;
+  if (!fleetHomeSoftRefreshActive()) return;
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  state.fleetHomeRefreshInFlight = true;
+  try {
+    const [todoResult, goalPlan] = await Promise.all([
+      api("/v1/todos").catch(() => null),
+      apiWithTimeout(
+        `/v1/projects/${encodeURIComponent(projectId)}/goals`,
+        {},
+        8000
+      ).catch(() => null),
+    ]);
+    if (state.selectedProject?.project_id !== projectId) return;
+    // Re-check after awaits: an edit or dialog may have started mid-flight.
+    if (!fleetHomeSoftRefreshActive()) return;
+    if (Array.isArray(todoResult?.todos)) state.todos = todoResult.todos;
+    if (goalPlan) {
+      state.goals = goalPlan.goals || state.goals || [];
+      state.unassignedTodos = (goalPlan.unassigned_todos || []).filter(
+        (todo) => todo.state !== "DONE"
+      );
+    }
+    const featureId = homeNodeRefKey(homeSelectedNode()?.node_id || "");
+    if (featureId) {
+      if (state.fleetAutomationByNode?.[featureId]) {
+        delete state.fleetAutomationByNode[featureId];
+      }
+      if (state.fleetWorkerAssignmentsByNode?.[featureId]) {
+        delete state.fleetWorkerAssignmentsByNode[featureId];
+      }
+    }
+    void refreshFleetProjectConductorProjection(projectId).catch(() => {});
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+  } finally {
+    state.fleetHomeRefreshInFlight = false;
+  }
+}
+
 function renderIntegratedHome() {
   const root = document.querySelector("#home-view");
   if (!root) return;
@@ -6032,6 +6112,7 @@ function fleetWorkerTerminalState(terminal) {
     const attention = terminalAttentionProjection(terminal);
     if (attention?.state === "DISCONNECTED") return "DISCONNECTED";
     if (attention?.state === "FAILED") return "FAILED";
+    if (attention?.state === "ENDED") return "ENDED";
     if (attention?.state === "RECOVERED") return "RECOVERED";
   }
   return String(terminal.state || terminal.lifecycle_state || "").toUpperCase() === "LIVE"
@@ -16921,9 +17002,11 @@ function openGoalEditor(goal) {
 function renderGoalPlan() {
   // Background project refresh must not activate the home over another screen.
   if (state.view !== "work" || !elements.goalPlanList) return;
-  if (!document.body.classList.contains("graph-mode")) {
-    syncPrimaryNavSelection("work");
-  }
+  // Fleet/home entry must clear Galaxy chrome. showGraphView adds graph-mode and
+  // removes home/fleet; without the symmetric remove here, a stale graph-mode
+  // leaves #graph-legend / .graph-toolbar visible on Fleet (CSS: body:not(.graph-mode)).
+  document.body.classList.remove("graph-mode", "galaxy-view");
+  syncPrimaryNavSelection("work");
   // The home (Project → Node → Todo → Kanban) is the only layout.
   const boardEl = document.querySelector("#fleet-board");
   const homeEl = document.querySelector("#home-view");
@@ -21519,6 +21602,13 @@ refresh().finally(() => {
 });
 window.setInterval(refreshConductorRoom, 1200);
 state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);
+// Fleet home soft refresh: keep node/Todo/automation/Worker projections current
+// without a full page reload. 4s matches provider tail; editing/dialogs skip.
+if (!state.fleetHomeRefreshTimer) {
+  state.fleetHomeRefreshTimer = window.setInterval(() => {
+    void refreshFleetHomeSoft();
+  }, 4000);
+}
 window.setInterval(async () => {
   try {
     const healthResponse = await fetch("/health", { cache: "no-store" });
