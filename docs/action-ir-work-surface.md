@@ -113,14 +113,18 @@ unrelated list response.
 ## Remaining coverage
 
 `todo.bind_goal` (2026-09-15), `todo.bind_node` (2026-09-16),
-`todo.priority` (2026-09-16), `todo.reorder` (2026-09-16), and
-`todo.move_project` (2026-09-17) are registered dedicated Actions with catalog
+`todo.priority` (2026-09-16), `todo.reorder` (2026-09-16),
+`todo.move_project` (2026-09-17), `todo.archive` (2026-09-17), and
+`todo.restore` (2026-09-17) are registered dedicated Actions with catalog
 `metadata.request_schema` and narrow CAS store writes. `todo.move_project`
 moves PROJECT/UNIVERSE Todos only; NODE scope or an existing `node_ref` /
-`goal_id` must be unbound first. `todo.archive`, `todo.restore`, and
-`todo.delete` remain pending dedicated contracts. Legacy delete remains
-available in the work-map UI. Registration and handler-backed coverage must
-be distinguished from the full vocabulary.
+`goal_id` must be unbound first. `todo.archive` sets `archived_at` and
+hides the row from default `todo.list` / `list_todos` without hard delete;
+`todo.read` still returns it. `todo.restore` clears `archived_at` (rejects
+non-archived Todos with `TODO_NOT_ARCHIVED`). `todo.delete` remains a
+pending dedicated contract. Legacy delete remains available in the
+work-map UI. Registration and handler-backed coverage must be distinguished
+from the full vocabulary.
 
 ## Verification
 

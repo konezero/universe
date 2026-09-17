@@ -135,6 +135,24 @@ TODO_MOVE_PROJECT_REQUEST_SCHEMA = {
         },
     },
 }
+TODO_ARCHIVE_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+    },
+}
+TODO_RESTORE_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+    },
+}
 TODO_DELETE_ACTION_ID = "todo.delete"
 
 TODO_ACTION_IDS = (
@@ -170,10 +188,10 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     TODO_PRIORITY_ACTION_ID,
     TODO_REORDER_ACTION_ID,
     TODO_MOVE_PROJECT_ACTION_ID,
-)
-PENDING_WORK_SURFACE_ACTION_IDS = (
     TODO_ARCHIVE_ACTION_ID,
     TODO_RESTORE_ACTION_ID,
+)
+PENDING_WORK_SURFACE_ACTION_IDS = (
     TODO_DELETE_ACTION_ID,
 )
 
@@ -1260,9 +1278,10 @@ def build_default_action_registry(
     # they have both a handler and a receipt-aware path where one is needed
     # - see docs/action-ir-work-surface.md. todo.bind_goal (2026-09-15),
     # todo.bind_node (2026-09-16), todo.priority (2026-09-16),
-    # todo.reorder (2026-09-16), and todo.move_project (2026-09-17) moved out
-    # of that pending set: like todo.update, they are metadata edits
-    # (goal_id / node_ref / priority / sort_order / project_id only,
+    # todo.reorder (2026-09-16), todo.move_project (2026-09-17),
+    # todo.archive (2026-09-17), and todo.restore (2026-09-17) moved out of
+    # that pending set: like todo.update, they are metadata edits (goal_id /
+    # node_ref / priority / sort_order / project_id / archived_at only,
     # CAS-guarded), not lifecycle transitions, so they need no receipt path
     # of their own.
     implemented_specs = (
@@ -1437,6 +1456,58 @@ def build_default_action_registry(
         supplied_handlers.get(TODO_MOVE_PROJECT_ACTION_ID),
         surfaces=(TODO_MOVE_PROJECT_ACTION_ID,),
     )
+    registry.register(
+        ActionContract(
+            action_id=TODO_ARCHIVE_ACTION_ID,
+            request_schema_ref="universe.todo-archive-action-request.v1",
+            result_schema_ref="universe.todo-archive-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_ARCHIVE_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_ARCHIVE_REQUEST_INVALID",
+                    "TODO_ALREADY_ARCHIVED",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_ARCHIVE_ACTION_ID),
+        surfaces=(TODO_ARCHIVE_ACTION_ID,),
+    )
+    registry.register(
+        ActionContract(
+            action_id=TODO_RESTORE_ACTION_ID,
+            request_schema_ref="universe.todo-restore-action-request.v1",
+            result_schema_ref="universe.todo-restore-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_RESTORE_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "NOT_IDEMPOTENT_CAS_RECOVER_VIA_TODO_READ",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_RESTORE_REQUEST_INVALID",
+                    "TODO_NOT_ARCHIVED",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_RESTORE_ACTION_ID),
+        surfaces=(TODO_RESTORE_ACTION_ID,),
+    )
     from universe_todo_actions import REQUEST_SCHEMAS
     for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
         registry.register(
@@ -1532,6 +1603,8 @@ __all__ = [
     "SERVER_RESOLVED_CALLER_FIELDS",
     "TODO_ACTION_IDS",
     "TODO_ARCHIVE_ACTION_ID",
+    "TODO_ARCHIVE_REQUEST_SCHEMA",
+    "TODO_RESTORE_REQUEST_SCHEMA",
     "TODO_BIND_GOAL_ACTION_ID",
     "TODO_BIND_GOAL_REQUEST_SCHEMA",
     "TODO_BIND_NODE_ACTION_ID",

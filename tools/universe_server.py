@@ -199,6 +199,8 @@ from universe_action_registry import (
     TODO_PRIORITY_ACTION_ID,
     TODO_REORDER_ACTION_ID,
     TODO_MOVE_PROJECT_ACTION_ID,
+    TODO_ARCHIVE_ACTION_ID,
+    TODO_RESTORE_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -7786,6 +7788,11 @@ class UniverseStore:
                 # column so it is never silently wiped by an unrelated
                 # todo.update full-body edit.
                 connection.execute("ALTER TABLE project_todo ADD COLUMN blocked_reason TEXT")
+            if "archived_at" not in todo_columns:
+                # Soft-archive marker owned by todo.archive (and later
+                # todo.restore). Null means visible in default todo.list;
+                # a UTC timestamp hides the row without hard delete.
+                connection.execute("ALTER TABLE project_todo ADD COLUMN archived_at TEXT")
             goal_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(project_goal)").fetchall()
@@ -14587,14 +14594,15 @@ class UniverseStore:
             row=connection.execute("SELECT * FROM goal_work_plan_application WHERE application_id = ?",(application_id,)).fetchone()
         return self._goal_work_plan_application_row(row), True
 
-    def list_todos(self) -> list[dict[str, Any]]:
+    def list_todos(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
-                       created_at, updated_at, blocked_reason
+                       created_at, updated_at, blocked_reason, archived_at
                 FROM project_todo
+                WHERE (? = 1 OR archived_at IS NULL)
                 ORDER BY
                     CASE state
                         WHEN 'IN_PROGRESS' THEN 0
@@ -14610,7 +14618,8 @@ class UniverseStore:
                         ELSE 3
                     END,
                     sort_order, updated_at DESC, todo_id
-                """
+                """,
+                (1 if include_archived else 0,),
             ).fetchall()
         return [self._todo_row(row) for row in rows]
 
@@ -14621,7 +14630,7 @@ class UniverseStore:
                 """
                 SELECT todo_id, scope_kind, project_id, node_ref, universe_goal_id, goal_id, milestone_id, title, detail,
                        priority, state, source_kind, sort_order, revision,
-                       created_at, updated_at, blocked_reason
+                       created_at, updated_at, blocked_reason, archived_at
                 FROM project_todo
                 WHERE todo_id = ?
                 """,
@@ -14988,6 +14997,97 @@ class UniverseStore:
             )
         if cursor.rowcount != 1:
             current = self.get_todo(normalized_id)
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_archived(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow CAS soft-archive write for a Todo.
+
+        Sets archived_at to the current UTC timestamp. Default todo.list hides
+        archived rows; get_todo still returns them so callers can recover via
+        todo.read before a future todo.restore. Hard delete remains separate.
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision"}:
+            raise UniverseError(
+                "TODO_ARCHIVE_REQUEST_INVALID",
+                "expected_revision is the only accepted field",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        todo = self.get_todo(normalized_id)
+        if todo.get("archived_at"):
+            raise UniverseError(
+                "TODO_ALREADY_ARCHIVED",
+                "Todo is already archived",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET archived_at = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ? AND archived_at IS NULL",
+                (now, now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            if current.get("archived_at"):
+                raise UniverseError(
+                    "TODO_ALREADY_ARCHIVED",
+                    "Todo is already archived",
+                    HTTPStatus.CONFLICT,
+                )
+            raise UniverseError(
+                "TODO_REVISION_CONFLICT",
+                f"Todo revision changed; current revision is {current['revision']}",
+                HTTPStatus.CONFLICT,
+            )
+        return self.get_todo(normalized_id)
+
+    def set_todo_restored(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Narrow CAS restore write for a soft-archived Todo.
+
+        Clears archived_at so the row returns to default todo.list. Rejects
+        Todos that are not currently archived (TODO_NOT_ARCHIVED).
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {"expected_revision"}:
+            raise UniverseError(
+                "TODO_RESTORE_REQUEST_INVALID",
+                "expected_revision is the only accepted field",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        todo = self.get_todo(normalized_id)
+        if not todo.get("archived_at"):
+            raise UniverseError(
+                "TODO_NOT_ARCHIVED",
+                "Todo is not archived",
+                HTTPStatus.CONFLICT,
+            )
+        now = utc_now()
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE project_todo SET archived_at = NULL, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ? AND archived_at IS NOT NULL",
+                (now, normalized_id, expected_revision),
+            )
+        if cursor.rowcount != 1:
+            current = self.get_todo(normalized_id)
+            if not current.get("archived_at"):
+                raise UniverseError(
+                    "TODO_NOT_ARCHIVED",
+                    "Todo is not archived",
+                    HTTPStatus.CONFLICT,
+                )
             raise UniverseError(
                 "TODO_REVISION_CONFLICT",
                 f"Todo revision changed; current revision is {current['revision']}",
@@ -30781,6 +30881,7 @@ class UniverseStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "blocked_reason": row["blocked_reason"] if "blocked_reason" in row.keys() else None,
+            "archived_at": row["archived_at"] if "archived_at" in row.keys() else None,
         }
 
     @staticmethod
@@ -31458,6 +31559,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 TODO_PRIORITY_ACTION_ID: self._handle_todo_priority_action,
                 TODO_REORDER_ACTION_ID: self._handle_todo_reorder_action,
                 TODO_MOVE_PROJECT_ACTION_ID: self._handle_todo_move_project_action,
+                TODO_ARCHIVE_ACTION_ID: self._handle_todo_archive_action,
+                TODO_RESTORE_ACTION_ID: self._handle_todo_restore_action,
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
@@ -36617,6 +36720,59 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ).result_schema_ref,
             "status": "TODO_PROJECT_MOVED",
             "action_id": TODO_MOVE_PROJECT_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_archive_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.archive: narrow CAS soft-archive for LLM/UI callers.
+
+        Sets archived_at; default todo.list hides archived rows. Hard delete
+        and restore remain separate Actions.
+        """
+
+        action = _exact_object_fields(
+            request,
+            field="todo_archive_action",
+            required=frozenset({"todo_id", "expected_revision"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_archived(todo_id, {
+            "expected_revision": action["expected_revision"],
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_ARCHIVE_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_ARCHIVED",
+            "action_id": TODO_ARCHIVE_ACTION_ID,
+            "todo": todo,
+        }
+
+    def _handle_todo_restore_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.restore: narrow CAS clear of archived_at for LLM/UI callers.
+
+        Rejects Todos that are not archived. Hard delete remains separate.
+        """
+
+        action = _exact_object_fields(
+            request,
+            field="todo_restore_action",
+            required=frozenset({"todo_id", "expected_revision"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        todo = self.store.set_todo_restored(todo_id, {
+            "expected_revision": action["expected_revision"],
+        })
+        return {
+            "schema": self.action_registry.lookup(
+                TODO_RESTORE_ACTION_ID
+            ).result_schema_ref,
+            "status": "TODO_RESTORED",
+            "action_id": TODO_RESTORE_ACTION_ID,
             "todo": todo,
         }
 
