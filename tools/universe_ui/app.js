@@ -6674,6 +6674,66 @@ function shortLabel(value, max) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+// Fleet's own Todo detail had no way to change state at all -- BACKLOG
+// could only be promoted to READY through the separate "Todo work map"
+// dialog (#todo-button), which nothing in Fleet links to. Reuses the same
+// updateTodoState() the work-map dialog already calls, so both surfaces
+// hit the identical typed todo.state Action and CAS/evidence contract.
+// 2026-09-17 operator finding: automation never dispatches a BACKLOG Todo
+// (state, not priority, gates executability), so promoting to READY had to
+// be reachable from wherever the operator is actually looking -- Fleet.
+function renderHomeTodoStateControl(todo) {
+  const wrap = node("section", "home-detail-section home-todo-state-control");
+  wrap.append(node("h4", "", "State"));
+  const row = node("div", "home-todo-state-row");
+  const select = todoSelect(
+    [
+      ["BACKLOG", "Backlog"],
+      ["READY", "Ready"],
+      ["IN_PROGRESS", "In progress"],
+      ["BLOCKED", "Blocked"],
+      ["DONE", "Done"],
+    ],
+    todo.state,
+    "todo-item-state",
+  );
+  const evidence = node("input", "todo-completion-evidence");
+  evidence.placeholder = "완료 근거 또는 결과 링크";
+  evidence.maxLength = 1000;
+  evidence.setAttribute("aria-label", "완료 근거");
+  const validationLabel = node("label", "todo-completion-validation", "완료 조건 확인");
+  const validated = node("input", "");
+  validated.type = "checkbox";
+  validated.setAttribute("aria-label", "완료 조건 확인");
+  validationLabel.prepend(validated);
+  const applyState = node("button", "secondary-button todo-state-save", "상태 적용");
+  applyState.type = "button";
+  const showCompletion = () => {
+    const pending = pendingTodoState(todo);
+    if (pending) {
+      select.value = pending.state;
+      evidence.value = pending.validation?.evidence_ref || "";
+      validated.checked = pending.validation?.status === "PASSED";
+    }
+    select.disabled = evidence.disabled = validated.disabled = Boolean(pending);
+    applyState.textContent = pending ? "이전 요청 확인" : "상태 적용";
+    applyState.title = pending ? "응답을 확인하지 못한 요청을 같은 요청 번호로 다시 확인합니다." : "";
+    const completing = select.value === "DONE";
+    evidence.hidden = !completing;
+    validationLabel.hidden = !completing;
+  };
+  select.addEventListener("change", showCompletion);
+  applyState.addEventListener("click", async () => {
+    applyState.disabled = true;
+    try { await updateTodoState(todo, select.value, evidence.value, validated.checked); }
+    finally { applyState.disabled = false; showCompletion(); }
+  });
+  showCompletion();
+  row.append(select, applyState);
+  wrap.append(row, evidence, validationLabel);
+  return wrap;
+}
+
 function renderHomeDetail(selNode, selTodo) {
   const el = document.querySelector("#home-todo-detail");
   if (!el) return;
@@ -6699,6 +6759,8 @@ function renderHomeDetail(selNode, selTodo) {
   if (executor?.task_frame_id) add("Task Frame", executor.task_frame_id, "#a8a8a4");
   add("Executor", executor ? executor.label : "unassigned", executor ? "#7fb0a7" : "#8a8a86");
   el.append(grid);
+
+  el.append(renderHomeTodoStateControl(selTodo));
 
   const blockedReason = renderTodoBlockedReason(selTodo, () => renderIntegratedHome());
   if (blockedReason) {
@@ -17147,6 +17209,7 @@ async function updateTodoState(todo, desiredState, evidence, validated) {
     if (result.result_propagation?.status !== "PENDING") sessionStorage.removeItem(storageKey);
     state.todos = state.todos.map((item) => item.todo_id === todo.todo_id ? current.todo : item);
     renderProjects(); renderTodos(); renderDetails(); drawGraph();
+    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
     elements.todoFormError.textContent = "";
     toast(result.result_propagation?.status === "PENDING" ? "상태 저장됨 · 결과 전달 대기" : "Todo 상태 저장됨");
   } catch (error) {
