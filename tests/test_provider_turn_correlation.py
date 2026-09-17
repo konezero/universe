@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
@@ -126,7 +127,12 @@ class ProviderTurnCorrelationTests(unittest.TestCase):
             'provider':'CODEX','mode':'MASTER','project_id':'p',
             'backend_owner':'RUST_RECONNECTION_HOST','launch_profile':'INTERACTIVE'}
         host.get.return_value=terminal; host.find_live.return_value=terminal
-        host.list_sessions.return_value=[terminal]; host.submit_prompt.return_value='delivered'
+        host.list_sessions.return_value=[terminal]
+        host.offer_turn.return_value={
+            'capability':'HOST_TURN_DELIVERY_V1',
+            'state':'WORKING',
+            'messages':[],
+        }
         bus=SessionBus()
         message=bus.deliver_to_terminal(host, terminal=terminal, source={},
             to={'session_anchor_ref':'a'}, kind='INSTRUCTION', notify='NONE', body='work')
@@ -139,13 +145,46 @@ class ProviderTurnCorrelationTests(unittest.TestCase):
             session={'session_id':'s','session_anchor_ref':'a','provider':'CODEX',
                      'provider_session_ref':'codex-turn-test','mode':'MASTER'})
         self.assertEqual('DISPATCHED',result['status'],result)
-        body=host.submit_prompt.call_args.args[1]
+        body=host.offer_turn.call_args.args[1]["text"]
         ref=bus._messages[mid]['lifecycle']['bus_dispatch_ref']
         self.assertTrue(body.startswith(f'universe_dispatch_ref: {ref}\ninstruction_ref: session-bus:{mid}\n'))
         activity=self.scan(user(mid=mid,ref=ref),complete())[-1]
         result=server._project_observed_session_bus_terminal_result(
             session={'session_anchor_ref':'a'},activity=activity,source_id=self.source)
         self.assertEqual('SESSION_BUS_RESULT_PROJECTED',result['status'])
+
+    def test_exact_codex_turn_projects_transient_assistant_result_body(self):
+        host=Mock(); terminal={'terminal_id':'t','session_anchor_ref':'a','state':'LIVE',
+            'provider':'CODEX','mode':'WORKER','project_id':'p'}
+        host.get.return_value=terminal; host.list_sessions.return_value=[terminal]
+        bus=SessionBus()
+        message=bus.deliver_to_terminal(host, terminal=terminal, source={},
+            to={'session_anchor_ref':'a'}, kind='INSTRUCTION', notify='NONE', body='work')
+        mid=message['message_id']
+        bus.claim_instruction(host, terminal_id='t', session_anchor_ref='a')
+        bus.complete_instruction_claim(
+            terminal_id='t', message_id=mid, session_anchor_ref='a',
+            observer_source_id=self.source, bus_dispatch_ref=REF,
+            delivery_channel='HOST_TURN_DELIVERY', awaits_authoritative_reply=False,
+        )
+        rows=self.scan(
+            user(turn='turn-result', mid=mid),
+            {'type':'response_item','id':'assistant-result','payload':{
+                'type':'message','role':'assistant','content':[{
+                    'type':'output_text','text':'WORKER_RESULT: PASS\\nactual bounded result'}]}},
+            complete('turn-result'),
+        )
+        activity=next(row for row in rows if row.get('bus_message_id') == mid
+                      and row.get('event_kind') == 'TURN_COMPLETED')
+        server=UniverseHTTPServer.__new__(UniverseHTTPServer)
+        server.session_bus=bus
+        server._session_anchor_terminal_host=lambda:host
+        server.store=SimpleNamespace(provider_session_observer=self.store)
+        projected=server._project_observed_session_bus_terminal_result(
+            session={'session_anchor_ref':'a'}, activity=activity, source_id=self.source)
+        self.assertEqual('SESSION_BUS_RESULT_PROJECTED', projected['status'])
+        results=bus.inbox(host, session_anchor_ref='a', projection='RESULTS')['messages']
+        self.assertEqual('WORKER_RESULT: PASS\\nactual bounded result', results[0]['body_text'])
 
 
 if __name__=='__main__':

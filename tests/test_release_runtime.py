@@ -290,6 +290,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.plan_project_install(self.target)
             result = runtime.apply_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 approved_plan_digest=plan["plan_digest"],
             )
 
@@ -328,6 +329,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.plan_project_install(self.target)
             runtime.apply_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 approved_plan_digest=plan["plan_digest"],
             )
 
@@ -341,6 +343,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.plan_project_install(self.target)
             update = runtime.apply_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 approved_plan_digest=plan["plan_digest"],
             )
 
@@ -397,6 +400,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.plan_project_install(self.target)
             result = runtime.apply_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 approved_plan_digest=plan["plan_digest"],
             )
 
@@ -428,6 +432,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.plan_project_install(self.target)
             runtime.apply_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 approved_plan_digest=plan["plan_digest"],
             )
         (self.target / ".ai/core/CORE_SURFACE_REGISTRY.md").write_text(
@@ -452,6 +457,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             ):
                 runtime.apply_project_install(
                     target_root=self.target,
+                    project_id="test-project",
                     approved_plan_digest=plan["plan_digest"],
                 )
         after_apply = {
@@ -469,6 +475,7 @@ class ReleaseRuntimeTests(_ReleaseFixture, unittest.TestCase):
             with self.assertRaisesRegex(ReleaseRuntimeError, "stale"):
                 runtime.apply_project_install(
                     target_root=self.target,
+                    project_id="test-project",
                     approved_plan_digest="0" * 64,
                 )
         self.assertEqual([], list(self.target.iterdir()))
@@ -542,6 +549,7 @@ class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
             plan = runtime.link_project_plan(target, store_root=self.store)
             return runtime.link_project_install(
                 target_root=target,
+                project_id="test-project",
                 store_root=self.store,
                 approved_plan_digest=plan["plan_digest"],
             )
@@ -598,6 +606,7 @@ class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
             actions = {item["path"]: item["action"] for item in plan["actions"]}
             runtime.link_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 store_root=self.store,
                 approved_plan_digest=plan["plan_digest"],
             )
@@ -639,6 +648,7 @@ class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
             ):
                 runtime.link_project_install(
                     target_root=self.target,
+                    project_id="test-project",
                     store_root=self.store,
                     approved_plan_digest=plan["plan_digest"],
                 )
@@ -666,6 +676,7 @@ class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
             self.assertEqual("ADOPT", actions[self.core_rel])
             runtime.link_project_install(
                 target_root=self.target,
+                project_id="test-project",
                 store_root=self.store,
                 approved_plan_digest=plan["plan_digest"],
             )
@@ -680,6 +691,7 @@ class LinkedInstallTests(_ReleaseFixture, unittest.TestCase):
             with self.assertRaisesRegex(ReleaseRuntimeError, "stale"):
                 runtime.link_project_install(
                     target_root=self.target,
+                    project_id="test-project",
                     store_root=self.store,
                     approved_plan_digest="0" * 64,
                 )

@@ -19,17 +19,6 @@ INSTALL_STATE_SCHEMA = "universe.project-release-install.v1"
 INSTALL_STATE_PATH = (
     ".ai/runtime/project_instance/UNIVERSE_RELEASE_INSTALL.json"
 )
-# ai-career's shared reference_runtime (task_frame_runtime.py, continuity_runtime.py,
-# mode_registry_runtime.py -- installed via career, not owned by this repo) still
-# hard-requires this legacy path/schema for "installed-distribution" integrity
-# checks; it has no notion of INSTALL_STATE_PATH above. Emitting a minimal,
-# correct manifest here (alongside the real state) keeps those checks satisfied
-# without reverting to a full career-side COPY install. Only the fields those
-# readers actually use are populated -- see legacy_installation_manifest_bytes.
-LEGACY_INSTALLATION_MANIFEST_SCHEMA = "ai-career.project-runtime-installation.v1"
-LEGACY_INSTALLATION_MANIFEST_PATH = (
-    ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
-)
 PLAN_SCHEMA = "universe.project-release-plan.v1"
 LINK_PLAN_SCHEMA = "universe.project-release-link-plan.v1"
 PROFILE_CATALOG_REQUIRED = "PROFILE_CATALOG_REQUIRED"
@@ -491,62 +480,6 @@ class ReleaseRuntime:
                 content=content,
             )
 
-    def legacy_installation_manifest_bytes(self, *, project_id: str) -> bytes:
-        """Minimal ai-career.project-runtime-installation.v1 manifest.
-
-        Covers exactly the fields career's shared reference_runtime readers
-        check: schema, source.{repository,commit}, installation.project, and
-        managed_paths[].{target_path,local_sha256,class} (class="agent" only
-        matters for the one row task_frame_runtime.py resolves as the Worker
-        policy pack, by target_path prefix). Everything else in the original
-        career installer's richer schema (generated_surfaces, registry
-        classifications, validation evidence, ...) belongs to
-        project_runtime_installer.py's own COPY-install bookkeeping, which
-        this LINKED/COPY release-apply path does not use.
-        """
-
-        managed_paths = [
-            {
-                "target_path": item.path,
-                "local_sha256": item.sha256,
-                "source_path": item.path,
-                "source_sha256": item.sha256,
-                "source_blob_oid": item.git_object_id,
-                "class": (
-                    "agent" if item.path.startswith(".ai/agents/common/") else "runtime"
-                ),
-                "required": True,
-                "integrity_policy": "exact",
-                "ownership": "ai-career-project-runtime",
-                "update_policy": "replace_if_owned",
-            }
-            for item in self.iter_release_files()
-        ]
-        manifest = {
-            "schema": LEGACY_INSTALLATION_MANIFEST_SCHEMA,
-            "installation_manifest_path": LEGACY_INSTALLATION_MANIFEST_PATH,
-            "source": {
-                "binding": "provider-attested",
-                "provider": "universe-release-db",
-                "repository": self.metadata["source_repository"],
-                "commit": self.metadata["source_commit"],
-                "commit_date": self.metadata.get("source_committed_at", "UNKNOWN"),
-                "requested_ref": self.metadata.get("source_ref", self.metadata["source_commit"]),
-                "capability_evidence_ref": (
-                    f"universe-release-db://{self.release_id}"
-                    f"@{self.verification['database_sha256']}"
-                ),
-            },
-            "installation": {
-                "project": project_id,
-                "node": "project",
-                "mode": "MASTER",
-                "role": "MASTER",
-            },
-            "managed_paths": managed_paths,
-        }
-        return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
     def materialize_source_bundle(self, bundle_root: Path) -> dict[str, Any]:
         """Rebuild the installer's canonical provider-attested source bundle."""
 
@@ -738,6 +671,7 @@ class ReleaseRuntime:
         self,
         *,
         target_root: Path,
+        project_id: str,
         approved_plan_digest: str,
     ) -> dict[str, Any]:
         plan = self.plan_project_install(target_root)
@@ -765,6 +699,7 @@ class ReleaseRuntime:
 
         state = {
             "schema": INSTALL_STATE_SCHEMA,
+            "project_id": _required_text(project_id, "project_id"),
             "release_id": self.release_id,
             "source_commit": self.metadata["source_commit"],
             "source_repository": self.metadata["source_repository"],
@@ -920,6 +855,7 @@ class ReleaseRuntime:
         self,
         *,
         target_root: Path,
+        project_id: str,
         store_root: Path,
         approved_plan_digest: str,
     ) -> dict[str, Any]:
@@ -954,6 +890,7 @@ class ReleaseRuntime:
 
         state = {
             "schema": INSTALL_STATE_SCHEMA,
+            "project_id": _required_text(project_id, "project_id"),
             "install_mode": "LINKED",
             "store_root": str(store),
             "release_id": self.release_id,
@@ -1169,6 +1106,7 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("--target", type=Path, required=True)
     apply = commands.add_parser("apply")
     apply.add_argument("--target", type=Path, required=True)
+    apply.add_argument("--project", required=True)
     apply.add_argument("--approved-plan-digest", required=True)
     return cli
 
@@ -1193,6 +1131,7 @@ def main() -> int:
             else:
                 result = runtime.apply_project_install(
                     target_root=args.target,
+                    project_id=args.project,
                     approved_plan_digest=args.approved_plan_digest,
                 )
     except (

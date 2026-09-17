@@ -1008,3 +1008,10 @@ Goal-only or meeting reviews have no authoritative Todo priority to inherit.
 They remain explicit `REVIEW_FOLLOWUP_SOURCE_UNAVAILABLE` results rather than
 creating a guessed project-wide Todo. Project-wide Conductor runs can record
 the same follow-up Todo but do not claim the node-Master delivery route.
+
+
+### Codex Worker result-correlation repair (2026-09-17)
+
+The remaining Worker result gap was traced to two exact runtime boundaries. Rust Host Codex delivery used `HOST_TURN_DELIVERY` with the default authoritative-reply wait, so passive provider completion stayed deferred. The generated Codex `bus_dispatch_ref` also used only the message-id suffix; the provider correlation contract requires `dispatch_` plus 32 lowercase hexadecimal characters. The server now explicitly allows the native Codex observer path, derives a stable 32-hex SHA-256 dispatch reference, and reads only the exact correlated provider transcript interval for the assistant result.
+
+Persona automation results still cross the typed `persona.automation.worker-result` and `persona.automation.reviewer-verdict` Actions. The Session Bus observer resolves the normal server-side USER Action context; it does not invent a SYSTEM actor. A missing exact assistant body remains `SESSION_BUS_RESULT_BODY_UNAVAILABLE` and does not advance the run. Fresh CODEX `gpt-5.6-luna` evidence on 2026-09-17 recorded Worker `SUCCEEDED`, independent Reviewer `PASS/VERIFIED_EVIDENCE`, and run `COMPLETED` for `persona_run_e9a609f161b543aeaee423fc`, with throwaway assignment/terminal cleanup through typed routes. Rust user Hosts were preserved and Grok was not called.

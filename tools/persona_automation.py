@@ -308,6 +308,201 @@ class PersonaAutomationStore:
         with self._connection() as connection:
             return self._row(self._get(connection, run_id))
 
+    def record_worker_instruction(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Bind one Session Bus instruction to the exact Worker assignment.
+
+        Creating a live Worker Host and delivering its Persona are separate
+        operations from sending the bounded task.  This receipt closes that
+        gap without widening the assignment: the message id is CAS-bound to
+        the current run, dispatch, Worker role, assignment revision and
+        Session Anchor.  A retry with the same coordinates is a replay.
+        """
+
+        run_id = _text(value.get("run_id"), "run_id")
+        dispatch_id = _text(value.get("dispatch_id"), "dispatch_id")
+        worker_role = _text(value.get("worker_role"), "worker_role").upper()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_WORKER_ROLE_INVALID",
+                "worker_role must be IMPLEMENTER or REVIEWER",
+            )
+        worker_assignment_id = _text(
+            value.get("worker_assignment_id"), "worker_assignment_id"
+        )
+        worker_assignment_revision = _positive_int(
+            value.get("worker_assignment_revision"),
+            "worker_assignment_revision",
+        )
+        worker_anchor_ref = _text(
+            value.get("worker_anchor_ref"), "worker_anchor_ref"
+        )
+        message_id = _text(value.get("message_id"), "message_id")
+        idempotency_key = _text(
+            value.get("idempotency_key"), "idempotency_key"
+        )
+        payload = {
+            "run_id": run_id,
+            "dispatch_id": dispatch_id,
+            "worker_role": worker_role,
+            "worker_assignment_id": worker_assignment_id,
+            "worker_assignment_revision": worker_assignment_revision,
+            "worker_anchor_ref": worker_anchor_ref,
+            "message_id": message_id,
+            "idempotency_key": idempotency_key,
+        }
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            assignment = _load(row["current_assignment_json"], None)
+            if (
+                not isinstance(assignment, Mapping)
+                or str(assignment.get("dispatch_id") or "") != dispatch_id
+            ):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_INSTRUCTION_PROVENANCE_MISMATCH",
+                    "Worker instruction does not belong to the current dispatch",
+                    409,
+                )
+            current = (
+                _load(row["current_worker_json"], None)
+                if worker_role == "IMPLEMENTER"
+                else _load(row["current_reviewer_json"], None)
+            )
+            if not isinstance(current, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_WORKER_ASSIGNMENT_REQUIRED",
+                    "the exact Worker assignment is required before sending work",
+                    409,
+                )
+            current_assignment = current.get("assignment")
+            if not isinstance(current_assignment, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_WORKER_ASSIGNMENT_REQUIRED",
+                    "the exact Worker assignment is required before sending work",
+                    409,
+                )
+            expected = {
+                "assignment_id": worker_assignment_id,
+                "session_anchor_ref": worker_anchor_ref,
+                "assignment_revision": worker_assignment_revision,
+                "worker_role": worker_role,
+                "project_id": row["project_id"],
+                "node_ref": row["node_ref"],
+                "todo_id": assignment.get("todo_id"),
+                "task_frame_id": assignment.get("task_frame_id"),
+            }
+            for field, expected_value in expected.items():
+                if current_assignment.get(field) != expected_value:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_INSTRUCTION_PROVENANCE_MISMATCH",
+                        f"Worker instruction does not preserve exact {field} lineage",
+                        409,
+                    )
+            existing_message_id = str(current.get("instruction_message_id") or "")
+            if existing_message_id:
+                if existing_message_id != message_id:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_INSTRUCTION_CONFLICT",
+                        "the assignment already has a different instruction message",
+                        409,
+                    )
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_WORKER_INSTRUCTION_REPLAYED",
+                    "run": self._row(row),
+                    "instruction": payload,
+                }
+            current_payload = {
+                **dict(current),
+                "instruction_message_id": message_id,
+                "instruction_idempotency_key": idempotency_key,
+                "instruction_state": "DISPATCHED",
+            }
+            assignment_payload = {
+                **dict(assignment),
+                "worker_instruction_message_id": message_id
+                if worker_role == "IMPLEMENTER"
+                else assignment.get("worker_instruction_message_id"),
+                "reviewer_instruction_message_id": message_id
+                if worker_role == "REVIEWER"
+                else assignment.get("reviewer_instruction_message_id"),
+            }
+            now = _timestamp()
+            if worker_role == "IMPLEMENTER":
+                update = (
+                    _json(assignment_payload),
+                    _json(current_payload),
+                    row["current_reviewer_json"],
+                )
+            else:
+                update = (
+                    _json(assignment_payload),
+                    row["current_worker_json"],
+                    _json(current_payload),
+                )
+            cursor = connection.execute(
+                "UPDATE persona_automation_run SET current_assignment_json = ?, "
+                "current_worker_json = ?, current_reviewer_json = ?, "
+                "revision = revision + 1, updated_at = ? "
+                "WHERE run_id = ? AND revision = ?",
+                (*update[:3], now, run_id, int(row["revision"])),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while recording Worker instruction",
+                    409,
+                )
+            event, _ = self._event(
+                connection,
+                run_id,
+                "WORKER_INSTRUCTION_POSTED",
+                "worker-instruction:" + worker_role + ":" + dispatch_id,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": "PERSONA_AUTOMATION_WORKER_INSTRUCTION_RECORDED",
+                "run": self._row(self._get(connection, run_id)),
+                "instruction": payload,
+                "event": event,
+            }
+
+    def record_worker_route_failure(
+        self, value: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Keep a durable diagnostic when a Bus result cannot be correlated."""
+
+        run_id = _text(value.get("run_id"), "run_id")
+        result_message_id = _text(
+            value.get("result_message_id"), "result_message_id"
+        )
+        payload = {
+            "result_message_id": result_message_id,
+            "dispatch_id": _text(value.get("dispatch_id"), "dispatch_id"),
+            "worker_role": _text(value.get("worker_role"), "worker_role").upper(),
+            "error_code": _text(value.get("error_code"), "error_code"),
+            "detail": str(value.get("detail") or "")[:2000],
+        }
+        with self._connection() as connection:
+            self._get(connection, run_id)
+            event, created = self._event(
+                connection,
+                run_id,
+                "WORKER_RESULT_ROUTE_FAILED",
+                "worker-route-failure:" + result_message_id,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": (
+                    "PERSONA_AUTOMATION_WORKER_ROUTE_FAILED"
+                    if created
+                    else "PERSONA_AUTOMATION_WORKER_ROUTE_FAILURE_REPLAYED"
+                ),
+                "run": self._row(self._get(connection, run_id)),
+                "event": event,
+            }
+
     def _event(self, connection: sqlite3.Connection, run_id: str, event_type: str,
                idempotency_key: str, payload: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         existing = connection.execute(

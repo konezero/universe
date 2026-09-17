@@ -232,6 +232,106 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         self.assertEqual("PERSONA_AUTOMATION_WORKER_DISPATCHED", result["status"])
         self.assertEqual("IMPLEMENTER", calls[0]["assignment"]["worker_role"])
 
+    def test_worker_instruction_receipt_is_bound_and_replay_safe(self):
+        run = self._prepared_run()
+        worker_assignment = {
+            "assignment_id": "task_worker_instruction",
+            "project_id": self.assignment["project_id"],
+            "node_ref": self.assignment["node_ref"],
+            "todo_id": "todo_worker_review",
+            "task_frame_id": None,
+            "worker_role": "IMPLEMENTER",
+            "session_anchor_ref": "worker-instruction-anchor",
+            "assignment_revision": 1,
+            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
+        }
+        self.store.dispatch_work(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": self.assignment["session_anchor_ref"],
+                "dispatch_id": "worker-instruction-dispatch",
+                "title": "bounded task",
+                "instruction": "inspect fixture",
+                "completion_conditions": ["result evidence"],
+            },
+            lambda _project_id, _value: self.fail("WORKER_REVIEW must not enqueue Master work"),
+            create_worker=lambda _spec: {"assignment": worker_assignment},
+        )
+        receipt = {
+            "run_id": run["run_id"],
+            "dispatch_id": "worker-instruction-dispatch",
+            "worker_role": "IMPLEMENTER",
+            "worker_assignment_id": worker_assignment["assignment_id"],
+            "worker_assignment_revision": 1,
+            "worker_anchor_ref": worker_assignment["session_anchor_ref"],
+            "message_id": "msg_worker_instruction",
+            "idempotency_key": "persona-worker-instruction-test",
+        }
+        first = self.store.record_worker_instruction(receipt)
+        self.assertEqual(
+            "PERSONA_AUTOMATION_WORKER_INSTRUCTION_RECORDED", first["status"]
+        )
+        self.assertEqual(
+            "msg_worker_instruction",
+            self.store.get_run(run["run_id"])["current_worker"]["instruction_message_id"],
+        )
+        replay = self.store.record_worker_instruction(receipt)
+        self.assertEqual(
+            "PERSONA_AUTOMATION_WORKER_INSTRUCTION_REPLAYED", replay["status"]
+        )
+        with self.assertRaisesRegex(PersonaAutomationError, "different instruction message"):
+            self.store.record_worker_instruction({**receipt, "message_id": "msg_other"})
+
+    def test_session_bus_worker_reply_routes_to_typed_result_action(self):
+        calls = []
+
+        class Automation:
+            def record_worker_route_failure(self, _value):
+                self.failed = True
+
+        server = SimpleNamespace(
+            persona_automation=Automation(),
+            resolve_action_context=lambda action_id, source: {
+                "action_id": action_id,
+                "source": source,
+                "actor": {"kind": "USER", "actor_ref": "server://loopback-user"},
+            },
+            _handle_persona_automation_action=lambda request, context: calls.append((request, context))
+            or {"run": {"current_reviewer": None}},
+            _ensure_persona_automation_worker_instruction=lambda *_args, **_kwargs: None,
+        )
+        original = {
+            "message_id": "msg_worker_instruction",
+            "to": {"mode": "WORKER", "project_id": "project-worker-review"},
+            "lifecycle": {
+                "persona_automation": {
+                    "schema": "universe.persona-automation-session-bus.v1",
+                    "run_id": "run-worker-reply",
+                    "dispatch_id": "dispatch-worker-reply",
+                    "worker_role": "IMPLEMENTER",
+                    "worker_assignment_id": "task_worker_reply",
+                    "worker_assignment_revision": 1,
+                    "worker_anchor_ref": "worker-reply-anchor",
+                }
+            },
+        }
+        result = {
+            "message_id": "msg_worker_result",
+            "body_text": "bounded result",
+            "lifecycle_state": "COMPLETED",
+            "lifecycle": {"result_ref": "worker-result-ref"},
+        }
+        UniverseHTTPServer._observe_persona_automation_result(server, original, result)
+        self.assertEqual(1, len(calls))
+        request, context = calls[0]
+        self.assertEqual("persona.automation.worker-result", context["action_id"])
+        self.assertEqual("USER", context["actor"]["kind"])
+        self.assertEqual("SESSION_BUS_RESULT_OBSERVER", context["source"])
+        self.assertEqual("run-worker-reply", request["run_id"])
+        self.assertEqual("task_worker_reply", request["worker_assignment_id"])
+        self.assertEqual("worker-result-ref", request["result_ref"])
+        self.assertEqual("SUCCEEDED", request["outcome"])
+
 
 if __name__ == "__main__":
     unittest.main()

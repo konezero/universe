@@ -106,6 +106,34 @@ class SessionBusTests(unittest.TestCase):
         )
         self.assertEqual([], empty["messages"])
 
+    def test_persona_automation_context_and_idempotent_post_are_durable(self) -> None:
+        context = {
+            "schema": "universe.persona-automation-session-bus.v1",
+            "run_id": "persona_run_test",
+            "dispatch_id": "dispatch_test",
+            "worker_role": "IMPLEMENTER",
+            "worker_assignment_id": "task_worker_test",
+            "worker_assignment_revision": 1,
+            "worker_anchor_ref": _test_anchor("t1"),
+        }
+        request = {
+            "to": {"terminal_id": self.universe["terminal_id"]},
+            "from": {"project_id": "gcs", "mode": "MASTER", "provider": "CODEX"},
+            "kind": "INSTRUCTION",
+            "body_text": "bounded worker task",
+            "idempotency_key": "persona-worker-post-test",
+            "persona_automation": context,
+        }
+        first = self.host.bus.post(self.host, request)
+        second = self.host.bus.post(self.host, request)
+        self.assertEqual(first["message_id"], second["message_id"])
+        stored = self.host.bus.inbox(
+            self.host, terminal_id=self.universe["terminal_id"], projection="ACTIVITY"
+        )["messages"][0]
+        self.assertEqual(context, stored["lifecycle"]["persona_automation"])
+        with self.assertRaisesRegex(SessionBusError, "different message content"):
+            self.host.bus.post(self.host, {**request, "body_text": "changed"})
+
     def test_coordination_kind_carries_resource_overlap_negotiation(self) -> None:
         """Backs the Execution Guard Skill's Resource Presence / Peer
         Negotiation section (.ai/skills/common/execution-guard/SKILL.md):

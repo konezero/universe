@@ -875,6 +875,15 @@ class SessionBus:
                 "BUS_PROJECTION_STATE_INVALID",
                 f"unsupported projection state: {projection_state}",
             )
+        idempotency_key = _text(
+            payload.get("idempotency_key"), "idempotency_key", limit=256
+        )
+        automation_context = payload.get("persona_automation")
+        if automation_context is not None and not isinstance(automation_context, Mapping):
+            raise SessionBusError(
+                "BUS_AUTOMATION_CONTEXT_INVALID",
+                "persona_automation must be an object when provided",
+            )
         targets = resolve_direct_targets(host, to)
         delivered = [
             self._deliver(
@@ -888,6 +897,8 @@ class SessionBus:
                 room_id=room_id,
                 thread_id=thread_id,
                 projection_state=projection_state,
+                idempotency_key=idempotency_key,
+                persona_automation=automation_context,
             )
             for item in targets
         ]
@@ -943,6 +954,8 @@ class SessionBus:
         thread_id: str,
         projection_state: str,
         system_event: str = "",
+        idempotency_key: str = "",
+        persona_automation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         terminal_id = str(terminal.get("terminal_id") or "").strip()
         recipient_anchor = _terminal_anchor(terminal) or str(
@@ -992,6 +1005,16 @@ class SessionBus:
                     if projection_state
                     else {}
                 ),
+                **(
+                    {"idempotency_key": idempotency_key}
+                    if idempotency_key
+                    else {}
+                ),
+                **(
+                    {"persona_automation": dict(persona_automation)}
+                    if persona_automation is not None
+                    else {}
+                ),
             },
             "updated_at": utc_now(),
             "provenance": {**_instruction_provenance(source, kind),
@@ -999,6 +1022,23 @@ class SessionBus:
         }
         inbox_key = terminal_id or ("anchor:" + recipient_anchor)
         with self._lock:
+            if idempotency_key:
+                for existing_id, existing in self._messages.items():
+                    existing_lifecycle = existing.get("lifecycle") or {}
+                    if (
+                        str(existing_lifecycle.get("idempotency_key") or "")
+                        != idempotency_key
+                        or str(existing.get("recipient_anchor_ref") or "")
+                        != recipient_anchor
+                    ):
+                        continue
+                    if str(existing.get("body_text") or "") != body:
+                        raise SessionBusError(
+                            "BUS_IDEMPOTENCY_CONFLICT",
+                            "idempotency_key already refers to different message content",
+                            409,
+                        )
+                    return self._public_message(existing, headers_only=False)
             inbox = self._inbox.setdefault(inbox_key, [])
             inbox.append(message_id)
             self._messages[message_id] = message
@@ -1094,6 +1134,7 @@ class SessionBus:
         message_id: str,
         session_anchor_ref: str,
         delivery_channel: str = "",
+        awaits_authoritative_reply: bool | None = None,
         observer_source_id: str = "",
         bus_dispatch_ref: str = "",
     ) -> dict[str, Any]:
@@ -1110,6 +1151,10 @@ class SessionBus:
 
         ``bus_dispatch_ref`` binds a new Codex PTY attempt to its exact observer
         source. These attempts must not use time/ordinal-only completion.
+        ``awaits_authoritative_reply`` overrides the historical default for a
+        named delivery channel. Rust Host delivery has a visible transport
+        label, but Codex/Grok provider activity remains its authoritative
+        completion signal; Claude's typed channel keeps the default ``True``.
         """
 
         dispatch_ref = _text(bus_dispatch_ref, "bus_dispatch_ref", limit=80)
@@ -1154,7 +1199,15 @@ class SessionBus:
             channel = _text(delivery_channel, "delivery_channel", limit=64)
             if channel:
                 lifecycle["delivery_channel"] = channel
-                lifecycle["awaits_authoritative_reply"] = True
+                lifecycle["awaits_authoritative_reply"] = (
+                    bool(awaits_authoritative_reply)
+                    if awaits_authoritative_reply is not None
+                    else True
+                )
+            elif awaits_authoritative_reply is not None:
+                lifecycle["awaits_authoritative_reply"] = bool(
+                    awaits_authoritative_reply
+                )
             if dispatch_ref:
                 lifecycle["bus_dispatch_ref"] = dispatch_ref
                 lifecycle["observer_source_id"] = observer_ref

@@ -10,8 +10,6 @@ from release_runtime import (
     INSTALL_STATE_SCHEMA,
     ReleaseRuntime,
     ReleaseRuntimeError,
-    _replace_file,
-    _target_path,
 )
 from runtime_store import default_store_root
 
@@ -20,9 +18,6 @@ RELEASE_APPROVAL_SCHEMA = "universe.project-release-approval.v1"
 RELEASE_APPLY_RECEIPT_SCHEMA = "universe.project-release-apply-receipt.v1"
 DIRECT_LIFECYCLE_RECEIPT_SCHEMA = "universe.project-runtime-lifecycle-receipt.v1"
 LIFECYCLE_PLAN_SCHEMA = "universe.project-runtime-lifecycle-plan.v1"
-INSTALLATION_MANIFEST_PATH = (
-    ".ai/runtime/project_instance/DISTRIBUTION_MANIFEST.json"
-)
 
 
 class ProjectReleaseApplyError(ValueError):
@@ -80,85 +75,17 @@ def plan_project_release_lifecycle(
     normalized_project = _text(project_id, "project_id")
     mode = _install_mode(install_mode)
 
-    if mode == "LINKED":
-        pin_path = root / INSTALL_STATE_PATH
-        prior_pin = _read_release_pin(pin_path)
-        if prior_pin is not None:
-            installed_commit = str(prior_pin.get("source_commit", "UNKNOWN"))
-            manifest_sha256 = hashlib.sha256(pin_path.read_bytes()).hexdigest()
-            operation = "RUNTIME_UPDATE"
-            user_command = "OS_UPDATE"
-            installed_state = "MANAGED"
-        else:
-            installed_commit = "NONE"
-            manifest_sha256 = "NONE"
-            operation = "FRESH_INSTALL"
-            user_command = "OS_INSTALL"
-            installed_state = "ABSENT"
-        material = {
-            "schema": LIFECYCLE_PLAN_SCHEMA,
-            "project_id": normalized_project,
-            "target_root": str(root),
-            "release_id": _text(release_id, "release_id"),
-            "source_commit": _commit(source_commit),
-            "operation": operation,
-            "user_command": user_command,
-            "install_mode": mode,
-            "installed_runtime": {
-                "state": installed_state,
-                "source_commit": installed_commit,
-                "manifest_sha256": manifest_sha256,
-            },
-            "project_host_preflight": "REQUIRED",
-            "candidate_execution": "FORBIDDEN",
-        }
-        material["plan_digest"] = _digest(material)
-        material["status"] = "PROJECT_RUNTIME_LIFECYCLE_PLAN_READY"
-        return material
-
-    installation_manifest = root / INSTALLATION_MANIFEST_PATH
-    if installation_manifest.exists():
-        if not installation_manifest.is_file() or installation_manifest.is_symlink():
-            raise ProjectReleaseApplyError(
-                "PROJECT_RUNTIME_INSTALLATION_STATE_INVALID",
-                "installed Runtime manifest is not a real file",
-            )
-        try:
-            installed = json.loads(installation_manifest.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise ProjectReleaseApplyError(
-                "PROJECT_RUNTIME_INSTALLATION_STATE_INVALID",
-                str(error),
-            ) from error
-        if (
-            not isinstance(installed, Mapping)
-            or installed.get("schema")
-            != "ai-career.project-runtime-installation.v1"
-        ):
-            raise ProjectReleaseApplyError(
-                "PROJECT_RUNTIME_INSTALLATION_STATE_INVALID",
-                "installed Runtime manifest schema is unsupported",
-            )
-        coordinates = installed.get("installation")
-        if not isinstance(coordinates, Mapping):
-            raise ProjectReleaseApplyError(
-                "PROJECT_RUNTIME_INSTALLATION_STATE_INVALID",
-                "installed Runtime coordinates are unavailable",
-            )
-        if coordinates.get("project") != normalized_project:
+    pin_path = root / INSTALL_STATE_PATH
+    prior_pin = _read_release_pin(pin_path)
+    if prior_pin is not None:
+        pin_project = prior_pin.get("project_id")
+        if pin_project is not None and pin_project != normalized_project:
             raise ProjectReleaseApplyError(
                 "PROJECT_RUNTIME_IDENTITY_MISMATCH",
                 "installed Runtime project identity does not match the connection",
             )
-        source = installed.get("source")
-        installed_commit = (
-            str(source.get("commit", "UNKNOWN"))
-            if isinstance(source, Mapping)
-            else "UNKNOWN"
-        )
-        manifest_sha256 = hashlib.sha256(
-            installation_manifest.read_bytes()
-        ).hexdigest()
+        installed_commit = str(prior_pin.get("source_commit", "UNKNOWN"))
+        manifest_sha256 = hashlib.sha256(pin_path.read_bytes()).hexdigest()
         operation = "RUNTIME_UPDATE"
         user_command = "OS_UPDATE"
         installed_state = "MANAGED"
@@ -177,6 +104,7 @@ def plan_project_release_lifecycle(
         "source_commit": _commit(source_commit),
         "operation": operation,
         "user_command": user_command,
+        "install_mode": mode,
         "installed_runtime": {
             "state": installed_state,
             "source_commit": installed_commit,
@@ -261,6 +189,7 @@ def apply_project_release_proposal(
                     )
                 install_result = runtime.link_project_install(
                     target_root=root,
+                    project_id=normalized_proposal["project_id"],
                     store_root=store_root,
                     approved_plan_digest=link_plan["plan_digest"],
                 )
@@ -274,19 +203,9 @@ def apply_project_release_proposal(
                     )
                 install_result = runtime.apply_project_install(
                     target_root=root,
+                    project_id=normalized_proposal["project_id"],
                     approved_plan_digest=install_plan["plan_digest"],
                 )
-            _replace_file(
-                _target_path(root, INSTALLATION_MANIFEST_PATH),
-                runtime.legacy_installation_manifest_bytes(
-                    project_id=normalized_proposal["project_id"]
-                ),
-            )
-            install_result["changed"] = [
-                *install_result["changed"],
-                {"operation": "UPDATE", "path": INSTALLATION_MANIFEST_PATH},
-            ]
-            install_result["changed_count"] = len(install_result["changed"])
     except ProjectReleaseApplyError:
         raise
     except (OSError, ReleaseRuntimeError) as error:

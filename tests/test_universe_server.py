@@ -3746,8 +3746,10 @@ class UniverseLocalServiceTests(unittest.TestCase):
                       "observed_at": "9999-01-01T00:00:00Z"},
             source_id="source-codex-native-001",
         )
-        self.assertEqual("SESSION_BUS_RESULT_DEFERRED_TO_REPLY_CHANNEL", deferred["status"])
-        self.assertEqual("HOST_TURN_DELIVERY", deferred["delivery_channel"])
+        # Rust Host delivery is transport evidence; Codex completion is
+        # projected only after the exact observer source/dispatch/turn join.
+        self.assertEqual("SESSION_BUS_RESULT_CORRELATION_UNPROVEN", deferred["status"])
+        self.assertEqual(posted["message_id"], deferred["message_id"])
         self.assertEqual(posted["message_id"], self.server.terminal_host.offer_turn.call_args.args[1]["message_id"])
         self.server.terminal_host.write.assert_not_called()
         self.server.provider_sessions.submit_channel.assert_not_called()
