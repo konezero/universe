@@ -18,7 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from persona_automation import PersonaAutomationError, PersonaAutomationStore  # noqa: E402
+from persona_automation import (  # noqa: E402
+    PersonaAutomationError,
+    PersonaAutomationStore,
+    resolve_default_reviewer_persona_id,
+)
 from universe_server import UniverseHTTPServer  # noqa: E402
 
 
@@ -34,6 +38,37 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             "assignment_revision": 2,
             "state": "ACTIVE",
         }
+        self._seed_personas(
+            ("persona_lead", "프로젝트 Master"),
+            ("persona_independent_reviewer", "독립 Reviewer"),
+            ("persona_implementer", "구현 Worker"),
+        )
+
+    def _seed_personas(self, *items: tuple[str, str]) -> None:
+        with self.store._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS persona_definition (
+                    persona_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL DEFAULT 'ACTIVE',
+                    origin_ref TEXT NOT NULL DEFAULT '',
+                    actor_ref TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            now = "2026-09-17T00:00:00Z"
+            for persona_id, title in items:
+                connection.execute(
+                    "INSERT OR REPLACE INTO persona_definition"
+                    "(persona_id, title, body, revision, state, origin_ref, actor_ref, created_at, updated_at) "
+                    "VALUES (?, ?, '', 1, 'ACTIVE', 'test', 'test', ?, ?)",
+                    (persona_id, title, now, now),
+                )
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -336,7 +371,9 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             self.assertEqual("CODEX", spec["provider"])
             self.assertEqual("gpt-5.6-luna", spec["model_ref"])
             self.assertEqual("LOW", spec["effort"])
-            self.assertEqual("persona_lead", spec["persona_id"])
+            # Automatic Reviewer must not inherit the Master run persona.
+            self.assertEqual("persona_independent_reviewer", spec["persona_id"])
+            self.assertNotEqual(self.assignment["persona_id"], spec["persona_id"])
             return {"assignment": reviewer_assignment}
 
         reviewer = self.store.attach_master_reviewer(
@@ -362,6 +399,155 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             "worker_result_ref": "master-result-review", "outcome": "PASS",
             "acceptance_status": "VERIFIED_EVIDENCE",
             "evidence_refs": ["review:master-result"],
+        })
+        self.assertEqual("PASS", verdict["review"]["outcome"])
+        self.assertEqual("REVIEWED", verdict["run"]["current_assignment"]["state"])
+
+    def test_default_reviewer_persona_prefers_independent_reviewer_title(self):
+        with self.store._connection() as connection:
+            chosen = resolve_default_reviewer_persona_id(
+                connection,
+                master_persona_id="persona_lead",
+                worker_config={},
+            )
+        self.assertEqual("persona_independent_reviewer", chosen)
+
+    def test_default_reviewer_persona_honors_explicit_worker_config(self):
+        with self.store._connection() as connection:
+            chosen = resolve_default_reviewer_persona_id(
+                connection,
+                master_persona_id="persona_lead",
+                worker_config={"persona_id": "persona_implementer"},
+            )
+        self.assertEqual("persona_implementer", chosen)
+
+    def test_default_reviewer_persona_requires_independent_persona(self):
+        with self.store._connection() as connection:
+            connection.execute("DELETE FROM persona_definition WHERE persona_id != 'persona_lead'")
+            with self.assertRaises(PersonaAutomationError) as raised:
+                resolve_default_reviewer_persona_id(
+                    connection,
+                    master_persona_id="persona_lead",
+                    worker_config={},
+                )
+        self.assertEqual(
+            "PERSONA_AUTOMATION_REVIEWER_PERSONA_REQUIRED",
+            raised.exception.code,
+        )
+
+    def test_needs_revision_replaces_only_historical_reviewer_slot(self):
+        assignment = {**self.assignment, "node_ref": "feature_master_revision"}
+        run = self.store.start_run(
+            {
+                "project_id": "project_test",
+                "session_anchor_ref": assignment["session_anchor_ref"],
+                "scope": "one corrective Master Todo",
+                "instruction": "complete one bounded Todo and repair review evidence",
+                "request_id": "master-review-revision",
+                "idempotency_key": "master-review-revision",
+            },
+            assignment,
+        )["run"]
+        owner = assignment["session_anchor_ref"]
+        self.store.claim_tick({
+            "run_id": run["run_id"], "owner_ref": owner, "tick_id": "revision-tick-1",
+        })
+        self.store.record_decision({
+            "run_id": run["run_id"], "owner_ref": owner,
+            "decision_id": "revision-decision-1", "kind": "EXECUTE",
+            "rationale": "the exact node Todo is selected",
+            "evidence_refs": ["todo:master-revision"],
+            "target": {"todo_id": "todo-master-revision"},
+        })
+        first = self.store.dispatch_work(
+            {
+                "run_id": run["run_id"], "owner_ref": owner,
+                "dispatch_id": "revision-dispatch-1", "title": "first result",
+                "instruction": "capture bounded evidence", "completion_conditions": ["evidence"],
+            },
+            lambda project_id, value: ({"message_id": "revision-message-1", "project_id": project_id}, True),
+        )["dispatch"]
+        self.store.record_master_completion({
+            "run_id": run["run_id"], "dispatch_id": first["dispatch_id"],
+            "assignment_revision": first["assignment_revision"],
+            "source_message_id": first["message_id"], "result_ref": "revision-result-1",
+            "body_text_utf8_sha256": "1" * 64, "completed_at": "2026-09-17T00:00:00Z",
+        })
+        first_reviewer = {
+            "assignment_id": "revision-reviewer-1", "project_id": "project_test",
+            "node_ref": "feature_master_revision", "todo_id": "todo-master-revision",
+            "task_frame_id": None, "worker_role": "REVIEWER",
+            "session_anchor_ref": "revision-reviewer-anchor-1", "assignment_revision": 1,
+            "assigned_by_session_anchor_ref": owner,
+        }
+        self.store.attach_master_reviewer(
+            {
+                "run_id": run["run_id"], "dispatch_id": first["dispatch_id"],
+                "assignment_revision": first["assignment_revision"],
+                "source_message_id": first["message_id"], "result_ref": "revision-result-1",
+                "body_text_utf8_sha256": "1" * 64, "result_text": "first result",
+            },
+            lambda _spec: {"assignment": first_reviewer},
+        )
+        self.store.record_reviewer_verdict({
+            "run_id": run["run_id"], "dispatch_id": first["dispatch_id"],
+            "reviewer_assignment_id": first_reviewer["assignment_id"],
+            "reviewer_assignment_revision": 1,
+            "reviewer_anchor_ref": first_reviewer["session_anchor_ref"],
+            "worker_result_ref": "revision-result-1", "outcome": "NEEDS_REVISION",
+            "evidence_refs": ["review:needs-revision"],
+            "next_action": "repair exact lineage evidence",
+        })
+        self.store.claim_tick({
+            "run_id": run["run_id"], "owner_ref": owner, "tick_id": "revision-tick-2",
+        })
+        self.store.record_decision({
+            "run_id": run["run_id"], "owner_ref": owner,
+            "decision_id": "revision-decision-2", "kind": "EXECUTE",
+            "rationale": "the follow-up Todo is the exact corrective scope",
+            "evidence_refs": ["review:needs-revision"],
+            "target": {"todo_id": "todo-master-revision"},
+        })
+        second = self.store.dispatch_work(
+            {
+                "run_id": run["run_id"], "owner_ref": owner,
+                "dispatch_id": "revision-dispatch-2", "title": "corrected result",
+                "instruction": "separate Master and Reviewer lineage", "completion_conditions": ["evidence"],
+            },
+            lambda project_id, value: ({"message_id": "revision-message-2", "project_id": project_id}, True),
+        )["dispatch"]
+        self.store.record_master_completion({
+            "run_id": run["run_id"], "dispatch_id": second["dispatch_id"],
+            "assignment_revision": second["assignment_revision"],
+            "source_message_id": second["message_id"], "result_ref": "revision-result-2",
+            "body_text_utf8_sha256": "2" * 64, "completed_at": "2026-09-17T00:01:00Z",
+        })
+        second_reviewer = {
+            **first_reviewer,
+            "assignment_id": "revision-reviewer-2",
+            "session_anchor_ref": "revision-reviewer-anchor-2",
+        }
+        repaired = self.store.attach_master_reviewer(
+            {
+                "run_id": run["run_id"], "dispatch_id": second["dispatch_id"],
+                "assignment_revision": second["assignment_revision"],
+                "source_message_id": second["message_id"], "result_ref": "revision-result-2",
+                "body_text_utf8_sha256": "2" * 64, "result_text": "corrected result",
+            },
+            lambda _spec: {"assignment": second_reviewer},
+        )
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED", repaired["status"])
+        self.assertEqual("revision-result-2", repaired["reviewer"]["worker_result_ref"])
+        self.assertEqual("revision-reviewer-anchor-2", repaired["reviewer"]["assignment"]["session_anchor_ref"])
+        self.assertIsNone(repaired["run"].get("current_review"))
+        verdict = self.store.record_reviewer_verdict({
+            "run_id": run["run_id"], "dispatch_id": second["dispatch_id"],
+            "reviewer_assignment_id": second_reviewer["assignment_id"],
+            "reviewer_assignment_revision": 1,
+            "reviewer_anchor_ref": second_reviewer["session_anchor_ref"],
+            "worker_result_ref": "revision-result-2", "outcome": "PASS",
+            "acceptance_status": "VERIFIED_EVIDENCE",
+            "evidence_refs": ["review:corrected-lineage"],
         })
         self.assertEqual("PASS", verdict["review"]["outcome"])
         self.assertEqual("REVIEWED", verdict["run"]["current_assignment"]["state"])

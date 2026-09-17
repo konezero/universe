@@ -87,6 +87,73 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
+def resolve_default_reviewer_persona_id(
+    connection: sqlite3.Connection,
+    *,
+    master_persona_id: str,
+    worker_config: Mapping[str, Any] | None = None,
+) -> str:
+    """Choose the Reviewer persona for an automatic Master-result review.
+
+    Explicit ``worker_config.persona_id`` (or ``reviewer_persona_id``) wins.
+    Otherwise select an ACTIVE project persona whose title identifies an
+    independent Reviewer (prefer exact ``독립 Reviewer``), never the Master
+    run's own ``persona_id``.
+    """
+
+    config = worker_config if isinstance(worker_config, Mapping) else {}
+    explicit = str(
+        config.get("reviewer_persona_id") or config.get("persona_id") or ""
+    ).strip()
+    if explicit:
+        return explicit
+
+    master_id = str(master_persona_id or "").strip()
+    try:
+        rows = connection.execute(
+            "SELECT persona_id, title FROM persona_definition "
+            "WHERE state = 'ACTIVE' ORDER BY updated_at DESC, persona_id"
+        ).fetchall()
+    except sqlite3.Error as error:
+        raise PersonaAutomationError(
+            "PERSONA_AUTOMATION_REVIEWER_PERSONA_REQUIRED",
+            "automatic Reviewer requires an independent Reviewer persona "
+            "(persona_definition is unavailable)",
+            409,
+        ) from error
+
+    preferred: str | None = None
+    fallback: str | None = None
+    for row in rows:
+        persona_id = str(row["persona_id"] or "").strip()
+        title = str(row["title"] or "").strip()
+        if not persona_id or persona_id == master_id:
+            continue
+        if title == "독립 Reviewer":
+            preferred = persona_id
+            break
+        title_key = title.casefold()
+        if "reviewer" in title_key or "리뷰어" in title or "review" in title_key:
+            # Skip implementer/master-shaped titles even if they mention review.
+            if any(
+                marker in title_key
+                for marker in ("implement", "구현", "master", "마스터", "facilitat", "퍼실리")
+            ):
+                continue
+            if fallback is None:
+                fallback = persona_id
+    chosen = preferred or fallback
+    if not chosen:
+        raise PersonaAutomationError(
+            "PERSONA_AUTOMATION_REVIEWER_PERSONA_REQUIRED",
+            "automatic Reviewer requires an independent Reviewer persona; "
+            "worker_config.persona_id was not set and no Reviewer-titled "
+            "ACTIVE persona distinct from the Master persona was found",
+            409,
+        )
+    return chosen
+
+
 class PersonaAutomationStore:
     """SQLite-backed run state with CAS transitions and idempotent events."""
 
@@ -1380,9 +1447,21 @@ class PersonaAutomationStore:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH", "Reviewer verdict must name the exact Worker result", 409)
             existing = _load(row["current_review_json"], None)
             if isinstance(existing, Mapping):
-                if existing.get("result_ref") != worker_result_ref or existing.get("outcome") != outcome:
+                existing_result_ref = str(existing.get("result_ref") or "")
+                if existing_result_ref == worker_result_ref and existing.get("outcome") == outcome:
+                    return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_REVIEW_REPLAYED", "run": self._row(row), "review": existing}
+                # A fresh Reviewer assignment can arrive after a historical
+                # NEEDS_REVISION/BLOCKED verdict.  The old review row remains
+                # immutable history, but its current pointer must not reject
+                # the exact new result that already passed assignment and
+                # Anchor provenance checks above.  Keep conflicts for a
+                # second verdict on the same result or any mismatched slot.
+                if not (
+                    existing_result_ref != worker_result_ref
+                    and str(reviewer.get("worker_result_ref") or "") == worker_result_ref
+                    and str(reviewer.get("state") or "").upper() == "ASSIGNED"
+                ):
                     raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEW_IDEMPOTENCY_CONFLICT", "Worker result already has a different Reviewer verdict", 409)
-                return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_REVIEW_REPLAYED", "run": self._row(row), "review": existing}
             review_id = "persona_review_" + uuid.uuid4().hex[:24]
             review_payload = {
                 "review_id": review_id,
@@ -1612,6 +1691,7 @@ class PersonaAutomationStore:
         }
         reviewer_spec: dict[str, Any]
         reservation_id: str
+        replaces_historical_review = False
         with self._connection() as connection:
             row = self._get(connection, run_id)
             assignment = _load(row["current_assignment_json"], None)
@@ -1641,13 +1721,42 @@ class PersonaAutomationStore:
                     or ""
                 )
                 if existing_ref and existing_ref != result_ref:
-                    raise PersonaAutomationError(
-                        "PERSONA_AUTOMATION_REVIEWER_PROVENANCE_MISMATCH",
-                        "a different Master result already owns this Reviewer slot",
-                        409,
-                    )
+                    # A prior NEEDS_REVISION/BLOCKED verdict is historical
+                    # evidence, not an active Reviewer reservation.  Once the
+                    # node Master dispatches the bounded follow-up, the exact
+                    # old Reviewer slot must be replaceable by a fresh typed
+                    # Worker assignment.  Keep the strict conflict for an
+                    # assigned/creating Reviewer (or any other outcome) so an
+                    # active result can never be silently re-bound.
+                    existing_state = str(existing.get("state") or "").upper()
+                    prior_review = _load(row["current_review_json"], {})
+                    prior_outcome = str(
+                        prior_review.get("outcome") if isinstance(prior_review, Mapping) else ""
+                    ).upper()
+                    if not (
+                        existing_state == "VERDICT_RECORDED"
+                        and prior_outcome in {"NEEDS_REVISION", "BLOCKED"}
+                    ):
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_REVIEWER_PROVENANCE_MISMATCH",
+                            "a different Master result already owns this Reviewer slot",
+                            409,
+                        )
+                    # Keep the prior review row/event as immutable history,
+                    # but clear the current pointer before reserving the new
+                    # Reviewer.  Otherwise a valid verdict for the fresh
+                    # result is mistaken for an idempotency conflict with the
+                    # historical non-PASS result.
+                    replaces_historical_review = True
                 existing_state = str(existing.get("state") or "").upper()
-                if existing_state in {"ASSIGNED", "VERDICT_RECORDED"}:
+                if existing_state == "ASSIGNED":
+                    return {
+                        "schema": SCHEMA,
+                        "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
+                        "run": self._row(row),
+                        "reviewer": existing,
+                    }
+                if existing_state == "VERDICT_RECORDED" and existing_ref == result_ref:
                     return {
                         "schema": SCHEMA,
                         "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
@@ -1671,10 +1780,17 @@ class PersonaAutomationStore:
             # the typed Fleet route.  Keep an explicit configured provider
             # when one exists, while defaulting the bounded automation path
             # to the supported Codex Luna capability.
+            # Persona defaults differently: never reuse the Master run's
+            # persona_id. Prefer an independent Reviewer-titled persona
+            # (or an explicit worker_config persona override).
             reviewer_provider = str(worker_config.get("provider") or "CODEX").strip().upper()
             reviewer_model = str(worker_config.get("model_ref") or "gpt-5.6-luna").strip()
             reviewer_effort = str(worker_config.get("effort") or "LOW").strip().upper()
-            reviewer_persona_id = worker_config.get("persona_id") or row["persona_id"]
+            reviewer_persona_id = resolve_default_reviewer_persona_id(
+                connection,
+                master_persona_id=str(row["persona_id"] or ""),
+                worker_config=worker_config,
+            )
             reviewer_spec = {
                 "run_id": run_id,
                 "dispatch_id": dispatch_id,
@@ -1712,10 +1828,12 @@ class PersonaAutomationStore:
             now = _timestamp()
             cursor = connection.execute(
                 "UPDATE persona_automation_run SET current_reviewer_json = ?, "
+                "current_review_json = CASE WHEN ? THEN NULL ELSE current_review_json END, "
                 "state = 'WAITING', next_condition = ?, revision = revision + 1, "
                 "updated_at = ? WHERE run_id = ? AND revision = ?",
                 (
                     _json(reservation_payload),
+                    1 if replaces_historical_review else 0,
                     "Reviewer Worker must submit an independent verdict",
                     now,
                     run_id,
