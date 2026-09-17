@@ -441,6 +441,17 @@ class ProviderSessionObserverStore:
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        # discover_sources() re-globs and re-reads provider transcript
+        # directories on every session-observer poll. Both the directory
+        # count and per-file size grow unbounded over the life of a
+        # workstation, so an uncached re-read of the top 200 files per
+        # provider becomes the dominant cost of a chat-rooms refresh
+        # (observed >20s once ~600 candidate files accumulated). Metadata
+        # is keyed by (provider, path); once a file's identity metadata is
+        # fully VERIFIED it is immutable (providers write it once at
+        # session start and only append afterward), so it stays cached
+        # even while the file's mtime keeps advancing from later appends.
+        self._discover_metadata_cache: dict[str, dict[str, tuple[float, dict[str, Any]]]] = {}
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30)
@@ -778,10 +789,25 @@ class ProviderSessionObserverStore:
                 # turn a local UI refresh into a transcript read or a failure.
                 continue
         candidates: list[dict[str, Any]] = []
-        for path, modified_at in sorted(
-            file_paths, key=lambda item: item[1], reverse=True
-        )[:200]:
-            metadata = _bounded_session_metadata(normalized_provider, path)
+        cache = self._discover_metadata_cache.setdefault(normalized_provider, {})
+        live_cache_keys: set[str] = set()
+        selected = sorted(file_paths, key=lambda item: item[1], reverse=True)[:200]
+        for path, modified_at in selected:
+            cache_key = str(path)
+            live_cache_keys.add(cache_key)
+            cached = cache.get(cache_key)
+            if cached is not None and cached[0] == modified_at:
+                metadata = cached[1]
+            elif cached is not None and cached[1]["identity_state"] != "UNKNOWN":
+                # Providers write identity metadata once at session start and
+                # only append afterward, so the bounded prefix this was
+                # derived from is immutable even though the file's mtime keeps
+                # advancing. Re-reading would return the same bytes.
+                metadata = cached[1]
+                cache[cache_key] = (modified_at, metadata)
+            else:
+                metadata = _bounded_session_metadata(normalized_provider, path)
+                cache[cache_key] = (modified_at, metadata)
             candidates.append(
                 {
                     "schema": SOURCE_SCHEMA,
@@ -805,6 +831,8 @@ class ProviderSessionObserverStore:
                     "transcript_content": "EXCLUDED",
                 }
             )
+        for stale_key in cache.keys() - live_cache_keys:
+            del cache[stale_key]
         return candidates
 
     def list_sources(self) -> list[dict[str, Any]]:
@@ -858,6 +886,36 @@ class ProviderSessionObserverStore:
                 parameters = (source_id, bounded_limit)
             rows = connection.execute(query, parameters).fetchall()
         return [self._activity_row(row) for row in rows]
+
+    def latest_active_activity_by_source(
+        self, source_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Batch form of list_activities(...)[0] for many sources at once.
+
+        A chat-room catalog refresh looks up the latest activity for every
+        registered source it lists (easily hundreds). Opening one connection
+        and querying per source turns that refresh into hundreds of
+        round trips; this does it in a single indexed query instead.
+        """
+        unique_ids = sorted({str(source_id) for source_id in source_ids if source_id})
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY source_id ORDER BY ordinal DESC, activity_id DESC
+                    ) AS rn
+                    FROM provider_session_activity
+                    WHERE active = 1 AND source_id IN ({placeholders})
+                )
+                WHERE rn = 1
+                """,
+                tuple(unique_ids),
+            ).fetchall()
+        return {str(row["source_id"]): self._activity_row(row) for row in rows}
 
     @staticmethod
     def _rag_activity_rows(connection, source_id, provider):

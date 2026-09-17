@@ -1427,14 +1427,34 @@ def _read_project_runtime_anchors(
     return current_by_mode, beyond_by_anchor
 
 
+# A project's .ai/runtime/session_store/ only grows (one sqlite file per
+# Universe session ever created for that project) and every closed session's
+# file is immutable once written, so re-opening every file on every catalog
+# refresh is pure waste. Cache rows by (session_dir, digest, mtime); a LIVE
+# session's file keeps changing mtime and simply gets re-read like before.
+_SESSION_STORE_ROW_CACHE: dict[str, dict[str, tuple[float, dict[str, Any]]]] = {}
+
+
 def _read_session_store_rows(session_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not session_dir.is_dir():
         return rows
+    cache_key = str(session_dir.resolve())
+    cache = _SESSION_STORE_ROW_CACHE.setdefault(cache_key, {})
+    live_digests: set[str] = set()
     for path in sorted(session_dir.glob("session-*.sqlite3")):
         if path.name.endswith(("-wal", "-shm")):
             continue
         digest = path.stem.removeprefix("session-")
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        live_digests.add(digest)
+        cached = cache.get(digest)
+        if cached is not None and cached[0] == modified_at:
+            rows.append(cached[1])
+            continue
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
@@ -1449,13 +1469,17 @@ def _read_session_store_rows(session_dir: Path) -> list[dict[str, Any]]:
                 ).fetchall()
             }
             if "anchor_snapshot" not in tables:
-                rows.append({"digest": digest, "present": True})
+                result = {"digest": digest, "present": True}
+                rows.append(result)
+                cache[digest] = (modified_at, result)
                 continue
             row = connection.execute(
                 "SELECT * FROM anchor_snapshot WHERE singleton = 1"
             ).fetchone()
             if row is None:
-                rows.append({"digest": digest, "present": True})
+                result = {"digest": digest, "present": True}
+                rows.append(result)
+                cache[digest] = (modified_at, result)
                 continue
             try:
                 payload = json.loads(str(row["snapshot_json"] or ""))
@@ -1465,27 +1489,29 @@ def _read_session_store_rows(session_dir: Path) -> list[dict[str, Any]]:
             coordinates = inner.get("coordinates")
             if not isinstance(coordinates, Mapping):
                 coordinates = {}
-            rows.append(
-                {
-                    "digest": digest,
-                    "present": True,
-                    "anchor_id": str(row["anchor_id"] or "").strip(),
-                    "state": str(
-                        row["state"] or inner.get("state") or ""
-                    ).upper(),
-                    "observed_at": str(row["observed_at"] or ""),
-                    "session_id": str(inner.get("session_id") or "").strip(),
-                    "observer_session_ref": str(
-                        inner.get("observer_session_ref") or ""
-                    ).strip(),
-                    "mode": str(coordinates.get("mode") or "").strip().upper(),
-                }
-            )
+            result = {
+                "digest": digest,
+                "present": True,
+                "anchor_id": str(row["anchor_id"] or "").strip(),
+                "state": str(
+                    row["state"] or inner.get("state") or ""
+                ).upper(),
+                "observed_at": str(row["observed_at"] or ""),
+                "session_id": str(inner.get("session_id") or "").strip(),
+                "observer_session_ref": str(
+                    inner.get("observer_session_ref") or ""
+                ).strip(),
+                "mode": str(coordinates.get("mode") or "").strip().upper(),
+            }
+            rows.append(result)
+            cache[digest] = (modified_at, result)
         except (OSError, sqlite3.Error):
             continue
         finally:
             if connection is not None:
                 connection.close()
+    for stale_digest in cache.keys() - live_digests:
+        del cache[stale_digest]
     return rows
 
 
@@ -11222,6 +11248,13 @@ class UniverseStore:
             raise UniverseError(
                 error.code, error.detail, HTTPStatus.NOT_FOUND
             ) from error
+
+    def latest_provider_session_activity_by_source(
+        self, source_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        return self.provider_session_observer.latest_active_activity_by_source(
+            source_ids
+        )
 
     def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]:
         try:
@@ -40255,7 +40288,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "unchanged": len(observations),
         }
 
-    def list_project_anchor_sessions(self, project_id: str) -> dict[str, Any]:
+    def list_project_anchor_sessions(
+        self,
+        project_id: str,
+        *,
+        all_terminals: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """List Current and durable recent sessions from the project store."""
 
         project = self.store.get_project(project_id)
@@ -40392,7 +40430,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             )
 
-        sessions = self._join_live_pty_bindings(project_id, sessions)
+        sessions = self._join_live_pty_bindings(
+            project_id, sessions, all_terminals=all_terminals
+        )
         sessions.sort(
             key=lambda item: str(item.get("last_seen_at") or ""),
             reverse=True,
@@ -40429,18 +40469,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
     def _join_live_pty_bindings(
-        self, project_id: str, sessions: list[dict[str, Any]]
+        self,
+        project_id: str,
+        sessions: list[dict[str, Any]],
+        *,
+        all_terminals: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Attach PTY observations to already-authoritative session records.
 
         PTY/PID liveness never creates a session record and never changes the
         session lifecycle or activity state.  Reconnect eligibility belongs to
         the Rust Host compatibility projection carried inside ``pty_binding``.
+
+        ``all_terminals`` lets a caller that already listed every terminal
+        (e.g. across all projects) pass that snapshot in instead of this
+        function re-listing them once per project.
         """
 
+        terminal_pool = (
+            all_terminals
+            if all_terminals is not None
+            else self._session_anchor_terminal_host().list_sessions()
+        )
         terminals = [
             terminal
-            for terminal in self._session_anchor_terminal_host().list_sessions()
+            for terminal in terminal_pool
             if str(terminal.get("state") or "").upper() == "LIVE"
             and str(terminal.get("project_id") or "") == str(project_id or "")
         ]
@@ -40493,12 +40546,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def list_all_project_anchor_sessions(self) -> list[dict[str, Any]]:
         sessions: list[dict[str, Any]] = []
+        # Every project below previously re-listed all terminals from the PTY
+        # supervisor for itself; one shared snapshot instead of N replays the
+        # same cross-process round trip only once.
+        all_terminals = self._session_anchor_terminal_host().list_sessions()
         for project in self.store.list_projects()[:100]:
             project_id = str(project.get("project_id") or "").strip()
             if not project_id:
                 continue
             try:
-                listed = self.list_project_anchor_sessions(project_id)
+                listed = self.list_project_anchor_sessions(
+                    project_id, all_terminals=all_terminals
+                )
             except UniverseError:
                 continue
             sessions.extend(listed.get("sessions") or [])
@@ -42535,6 +42594,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
         registered_sources = self.store.list_provider_session_sources()
+        # Hoisted out of the per-source loop below: every discovered source
+        # without an anchor observation re-ran this full (fresh-connection)
+        # project query to find a workspace match, turning a several-hundred
+        # source catalog into several hundred redundant DB round trips.
+        all_projects = self.store.list_projects()
+        # Hoisted for the same reason: the per-source loop below used to open
+        # a fresh connection per registered source just to read its latest
+        # activity row.
+        latest_activity_by_source = self.store.latest_provider_session_activity_by_source(
+            [str(source["source_id"]) for source in registered_sources]
+        )
         registered_by_identity = {
             (
                 str(source.get("provider") or "").upper(),
@@ -42680,7 +42750,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 workspace_name = str(source.get("workspace_name") or "").strip()
                 workspace_path = str(source.get("workspace") or "").strip()
                 project_match = None
-                for item in self.store.list_projects():
+                for item in all_projects:
                     project_id = str(item.get("project_id") or "").strip()
                     project_root = str(item.get("project_root") or "").strip()
                     root_name = Path(project_root).name if project_root else ""
@@ -42714,12 +42784,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             registered = registered_by_identity.get(
                 (provider, provider_session_id, source_path)
             )
-            activities: list[dict[str, Any]] = []
-            if registered is not None:
-                activities = self.store.list_provider_session_activities(
-                    str(registered["source_id"])
-                )
-            latest_activity = activities[0] if activities else None
+            latest_activity = (
+                latest_activity_by_source.get(str(registered["source_id"]))
+                if registered is not None
+                else None
+            )
             workspace = str(source.get("workspace") or "").strip() or None
             evidence_activity = (latest_activity or {}).get("activity_state")
             if evidence_activity is None and bound is not None:
@@ -42924,12 +42993,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ),
             reverse=True,
         )
+        anchor_sessions = self.list_all_project_anchor_sessions()
         return {
             "schema": "universe.provider-chat-catalog.v1",
             "status": "PROVIDER_CHAT_CATALOG_COLLECTED",
             "observed_at": utc_now(),
             "rooms": rooms,
-            "anchor_sessions": self.list_all_project_anchor_sessions(),
+            "anchor_sessions": anchor_sessions,
             "providers": ["CODEX", "CLAUDE", "GROK"],
             "transcript_content": "EXCLUDED",
         }
