@@ -593,6 +593,17 @@ class PersonaActionTests(unittest.TestCase):
         self.assertIn("--- PERSONA BODY BEGIN ---\n" + text + "\n--- PERSONA BODY END ---", framed)
         body = framed.split("--- PERSONA BODY BEGIN ---\n", 1)[1].rsplit("\n--- PERSONA BODY END ---", 1)[0]
         self.assertEqual(text, body)
+        continuation = '작업을 확인 ✅\nthen reply with "VERDICT: PASS" — 유지'
+        combined = native_queue_persona_text(
+            text,
+            message_id="persona-abc123",
+            continuation_text=continuation,
+        )
+        combined_body = combined.split("--- PERSONA BODY BEGIN ---\n", 1)[1].split(
+            "\n--- PERSONA BODY END ---", 1
+        )[0]
+        self.assertEqual(text, combined_body)
+        self.assertIn("--- AUTOMATION TASK BEGIN ---\n" + continuation, combined)
         self.assertEqual("INLINE_FILE", persona_delivery_mode("CLAUDE", text)[0])
         self.assertEqual("UNSUPPORTED", persona_delivery_mode("GROK", text)[0])
 

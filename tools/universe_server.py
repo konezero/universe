@@ -33706,7 +33706,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         }
 
     def _handle_fleet_worker_session_start_action(
-        self, request: Mapping[str, Any], context: Mapping[str, Any]
+        self,
+        request: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        automation_task: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create (or reuse) a real, live Worker/Reviewer terminal for an
         exact node/Todo/Task Frame, then record the durable Fleet binding
@@ -33838,6 +33842,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     project_id=project_id,
                     terminal=terminal,
                     session_anchor_ref=worker_anchor,
+                    automation_task=(
+                        {
+                            **dict(automation_task),
+                            "worker_assignment_id": assignment.get("assignment_id"),
+                            "worker_assignment_revision": assignment.get("assignment_revision"),
+                            "worker_anchor_ref": worker_anchor,
+                            "node_ref": scope.get("node_ref"),
+                        }
+                        if isinstance(automation_task, Mapping)
+                        else None
+                    ),
                 )
             except Exception:
                 # A Persona binding is part of the requested Worker launch.
@@ -33896,6 +33911,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "assignment": assignment,
             "persona_assignment": persona_assignment,
             "persona_delivery": persona_delivery,
+            "automation_instruction": persona_delivery.get("automation_instruction"),
         }
 
     def _create_persona_automation_worker(
@@ -33920,7 +33936,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for field in ("persona_id", "provider", "model_ref", "effort"):
             if spec.get(field) not in (None, ""):
                 request[field] = spec[field]
-        return self._handle_fleet_worker_session_start_action(request, context)
+        return self._handle_fleet_worker_session_start_action(
+            request,
+            context,
+            automation_task=spec,
+        )
 
     def _ensure_persona_automation_master_reviewer(
         self,
@@ -34006,6 +34026,80 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         worker_assignment_revision = int(worker_assignment.get("assignment_revision") or 0)
         if not worker_assignment_id or not worker_anchor_ref or worker_assignment_revision < 1:
             return {"status": "ERROR", "reason": "Worker assignment coordinates are incomplete"}
+        config = run.get("worker_config")
+        config = config if isinstance(config, Mapping) else {}
+        provider = str(config.get("provider") or "CODEX").strip().upper()
+        precreated_instruction = current.get("precreated_instruction")
+        if isinstance(precreated_instruction, Mapping):
+            precreated_message_id = str(precreated_instruction.get("message_id") or "").strip()
+            precreated_metadata = precreated_instruction.get("metadata")
+            if precreated_message_id and isinstance(precreated_metadata, Mapping):
+                try:
+                    recorded = self.persona_automation.record_worker_instruction(
+                        {
+                            **dict(precreated_metadata),
+                            "message_id": precreated_message_id,
+                        }
+                    )
+                    precreated_terminal_id = str(
+                        precreated_instruction.get("terminal_id") or ""
+                    ).strip()
+                    if not precreated_terminal_id:
+                        host = self._session_anchor_terminal_host()
+                        terminal = host.find_live(
+                            project_id=project_id,
+                            mode="WORKER",
+                            provider=provider,
+                            session_anchor_ref=worker_anchor_ref,
+                        )
+                        precreated_terminal_id = str(
+                            (terminal or {}).get("terminal_id") or ""
+                        ).strip()
+                    claim_state = str(
+                        precreated_instruction.get("claim_state") or ""
+                    ).upper()
+                    claim_completed = False
+                    if claim_state == "CLAIMED":
+                        self.session_bus.complete_instruction_claim(
+                            terminal_id=precreated_terminal_id or "automation-worker",
+                            message_id=precreated_message_id,
+                            session_anchor_ref=worker_anchor_ref,
+                            delivery_channel=str(
+                                precreated_instruction.get("delivery_channel")
+                                or "CODEX_NATIVE_QUEUE_COMBINED"
+                            ),
+                            awaits_authoritative_reply=True,
+                        )
+                        self.persona_automation.mark_worker_instruction_claim_state(
+                            run_id=str(run.get("run_id") or ""),
+                            worker_role=worker_role,
+                            message_id=precreated_message_id,
+                            expected_revision=int(
+                                (recorded.get("run") or {}).get("revision") or 0
+                            ),
+                            claim_state="DISPATCHED",
+                        )
+                        claim_completed = True
+                    delivery = {
+                        **dict(precreated_instruction),
+                        "claim_state": claim_state,
+                    }
+                    if claim_completed:
+                        delivery["claim_state"] = "DISPATCHED"
+                    return {
+                        "status": recorded.get("status"),
+                        "message_id": precreated_message_id,
+                        "worker_role": worker_role,
+                        "delivery": delivery,
+                        "record": recorded.get("instruction"),
+                    }
+                except (PersonaAutomationError, SessionBusError, TerminalHostError, UniverseError) as error:
+                    return {
+                        "status": "PERSONA_AUTOMATION_WORKER_INSTRUCTION_FAILED",
+                        "error_code": getattr(error, "code", type(error).__name__),
+                        "detail": str(error),
+                        "worker_role": worker_role,
+                    }
         existing_message_id = str(current.get("instruction_message_id") or "").strip()
         if existing_message_id:
             return {
@@ -34013,9 +34107,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "message_id": existing_message_id,
                 "worker_role": worker_role,
             }
-        config = run.get("worker_config")
-        config = config if isinstance(config, Mapping) else {}
-        provider = str(config.get("provider") or "CODEX").strip().upper()
         todo_id = str(assignment.get("todo_id") or "").strip()
         task_frame_id = str(assignment.get("task_frame_id") or "").strip()
         dispatch_id = str(assignment.get("dispatch_id") or "").strip()
@@ -34171,12 +34262,144 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "worker_role": worker_role,
             }
 
+    def _persona_automation_task_message(
+        self,
+        *,
+        task: Mapping[str, Any],
+        assignment: Mapping[str, Any],
+        project_id: str,
+        session_anchor_ref: str,
+        terminal_id: str,
+    ) -> dict[str, Any]:
+        """Build the one Worker task that follows a Persona native turn.
+
+        A fresh Codex Worker may finish the first native queue turn before a
+        second Session Bus turn can bind.  Automation therefore posts the
+        typed task first, then embeds this exact task body (including its
+        reply coordinates) as a continuation of the Persona queue message.
+        The Persona bytes remain delimited and unchanged; this helper only
+        constructs the adjacent task envelope.
+        """
+
+        worker_role = str(task.get("worker_role") or "IMPLEMENTER").strip().upper()
+        worker_assignment_id = str(assignment.get("assignment_id") or "").strip()
+        worker_assignment_revision = int(assignment.get("assignment_revision") or 0)
+        run_id = str(task.get("run_id") or "").strip()
+        dispatch_id = str(task.get("dispatch_id") or "").strip()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_WORKER_ROLE_INVALID",
+                "automation Worker role must be IMPLEMENTER or REVIEWER",
+                HTTPStatus.CONFLICT,
+            )
+        if not run_id or not dispatch_id or not worker_assignment_id or worker_assignment_revision < 1:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_WORKER_COORDINATE_INVALID",
+                "automation Worker task requires exact run, dispatch, and assignment coordinates",
+                HTTPStatus.CONFLICT,
+            )
+        todo_id = str(assignment.get("todo_id") or "").strip()
+        task_frame_id = str(assignment.get("task_frame_id") or "").strip()
+        instruction = str(task.get("instruction") or "").strip()
+        if not instruction:
+            instruction = "Complete the exact bounded automation task and report the result."
+        conditions = task.get("completion_conditions") or []
+        if not isinstance(conditions, list):
+            conditions = []
+        result_ref = str(task.get("worker_result_ref") or task.get("result_ref") or "").strip()
+        worker_result = task.get("worker_result")
+        worker_result = worker_result if isinstance(worker_result, Mapping) else {}
+        master_result = task.get("master_result")
+        master_result = master_result if isinstance(master_result, Mapping) else {}
+        idempotency_key = (
+            f"persona-automation:{run_id}:{dispatch_id}:{worker_role}:"
+            f"{worker_assignment_id}:{worker_assignment_revision}"
+        )
+        body_lines = [
+            "Persona automation bounded Worker task.",
+            f"run_id: {run_id}",
+            f"dispatch_id: {dispatch_id}",
+            f"worker_role: {worker_role}",
+            f"worker_assignment_id: {worker_assignment_id}",
+            f"worker_assignment_revision: {worker_assignment_revision}",
+            f"todo_id: {todo_id or '<none>'}",
+            f"task_frame_id: {task_frame_id or '<none>'}",
+            "",
+            instruction,
+            "",
+            "Completion conditions:",
+        ]
+        body_lines.extend(f"- {condition}" for condition in conditions)
+        if worker_role == "REVIEWER":
+            reviewed_result_text = str(
+                worker_result.get("result_text")
+                or master_result.get("result_text")
+                or ""
+            )
+            body_lines.extend(
+                [
+                    "",
+                    "Review the exact Worker result below independently. Reply with one explicit line "
+                    "VERDICT: PASS, VERDICT: NEEDS_REVISION, or VERDICT: BLOCKED, followed by evidence.",
+                    f"worker_result_ref: {result_ref or '<missing>'}",
+                    "Worker result text:",
+                    reviewed_result_text[:16000],
+                ]
+            )
+        else:
+            body_lines.extend(
+                [
+                    "",
+                    "Do not edit repository files or change Todo state unless the exact task says so.",
+                    "Return the bounded task result in your reply; delivery/CLI state is not the result.",
+                ]
+            )
+        automation_context = {
+            "schema": "universe.persona-automation-session-bus.v1",
+            "run_id": run_id,
+            "dispatch_id": dispatch_id,
+            "worker_role": worker_role,
+            "worker_assignment_id": worker_assignment_id,
+            "worker_assignment_revision": worker_assignment_revision,
+            "worker_anchor_ref": session_anchor_ref,
+            "worker_result_ref": result_ref,
+            "project_id": project_id,
+            "node_ref": str(task.get("node_ref") or "").strip(),
+            "todo_id": todo_id,
+            "task_frame_id": task_frame_id,
+            "idempotency_key": idempotency_key,
+        }
+        return {
+            "worker_role": worker_role,
+            "body_text": "\n".join(body_lines),
+            "automation_context": automation_context,
+            "idempotency_key": idempotency_key,
+            "to": {
+                "project_id": project_id,
+                "mode": "WORKER",
+                "provider": str(task.get("provider") or "CODEX").strip().upper(),
+                "terminal_id": terminal_id,
+                "session_anchor_ref": session_anchor_ref,
+                "node_ref": str(task.get("node_ref") or "").strip(),
+                "task_frame_ref": task_frame_id,
+            },
+            "from": {
+                "project_id": project_id,
+                "mode": "MASTER",
+                "provider": "UNIVERSE",
+                "session_anchor_ref": str(task.get("assigned_by_session_anchor_ref") or ""),
+                "node_ref": str(task.get("node_ref") or "").strip(),
+                "task_frame_ref": task_frame_id,
+            },
+        }
+
     def _deliver_persona_to_existing_terminal(
         self,
         *,
         project_id: str,
         terminal: Mapping[str, Any],
         session_anchor_ref: str,
+        automation_task: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Deliver a Persona assigned after a Worker Host minted its Anchor.
 
@@ -34233,6 +34456,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
             return {**common, "status": "UNSUPPORTED", "application": "NOT_RUN", "reason": reason}
 
+        automation_instruction: dict[str, Any] | None = None
+        automation_claimed = False
+        automation_message_id = ""
         try:
             deliver_persona = getattr(self.terminal_host, "deliver_persona_native_queue", None)
             if not callable(deliver_persona):
@@ -34254,10 +34480,93 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 persona_revision=int(assignment.get("persona_revision") or 0),
                 assignment_revision=int(assignment.get("assignment_revision") or 0),
             )
+            continuation_text = ""
+            automation_parts: dict[str, Any] | None = None
+            if isinstance(automation_task, Mapping) and provider == "CODEX":
+                host = self._session_anchor_terminal_host()
+                automation_parts = self._persona_automation_task_message(
+                    task=automation_task,
+                    assignment={
+                        **dict(assignment),
+                        "assignment_id": str(
+                            automation_task.get("worker_assignment_id")
+                            or assignment.get("assignment_id")
+                        ),
+                        "assignment_revision": int(
+                            automation_task.get("worker_assignment_revision")
+                            or assignment.get("assignment_revision")
+                            or 0
+                        ),
+                    },
+                    project_id=project_id,
+                    session_anchor_ref=session_anchor_ref,
+                    terminal_id=terminal_id,
+                )
+                posted = self.session_bus.post(
+                    host,
+                    {
+                        "to": automation_parts["to"],
+                        "from": automation_parts["from"],
+                        "kind": "INSTRUCTION",
+                        "protocol": "WORK",
+                        "notify": "NONE",
+                        "thread_id": f"persona-{automation_parts['automation_context']['run_id']}-{automation_parts['worker_role'].lower()}",
+                        "idempotency_key": automation_parts["idempotency_key"],
+                        "persona_automation": automation_parts["automation_context"],
+                        "body_text": automation_parts["body_text"],
+                    },
+                )
+                messages = posted.get("messages") if isinstance(posted, Mapping) else None
+                message = messages[0] if isinstance(messages, list) and messages else posted
+                automation_message_id = (
+                    str(message.get("message_id") or "").strip()
+                    if isinstance(message, Mapping)
+                    else ""
+                )
+                if not automation_message_id:
+                    raise SessionBusError(
+                        "BUS_MESSAGE_ID_MISSING",
+                        "Session Bus did not return an automation Worker message id",
+                    )
+                claim = self.session_bus.claim_instruction(
+                    host,
+                    terminal_id=terminal_id,
+                    session_anchor_ref=session_anchor_ref,
+                    message_id=automation_message_id,
+                )
+                if claim is None:
+                    raise SessionBusError(
+                        "BUS_INSTRUCTION_CLAIM_UNAVAILABLE",
+                        "automation Worker message could not be claimed for its exact Host",
+                    )
+                automation_claimed = True
+                bus_dispatch_ref = (
+                    "dispatch_"
+                    + hashlib.sha256(automation_message_id.encode("utf-8")).hexdigest()[:32]
+                )
+                continuation_text = (
+                    f"universe_dispatch_ref: {bus_dispatch_ref}\n"
+                    f"instruction_ref: session-bus:{automation_message_id}\n"
+                    f"{automation_parts['body_text']}\n"
+                    "[Session Bus reply transport for CODEX] Use the Universe Session Bus HTTP API, not Claude-only universe_channel MCP tools. "
+                    f"After finishing, POST /v1/session-bus/messages/{automation_message_id}/reply with JSON "
+                    + json.dumps(
+                        {
+                            "terminal_id": terminal_id,
+                            "session_anchor_ref": session_anchor_ref,
+                            "body_text": "<actual result summary>",
+                            "outcome": "COMPLETED",
+                        }
+                    )
+                    + ". Use outcome FAILED with the real error if blocked. Resolve the current Universe endpoint and authentication from .ai/skills/common/resolve_universe_endpoint.py (installed Runtime endpoint resolver); never print credentials."
+                )
+            delivery_kwargs: dict[str, Any] = {"message_id": persona_message_id}
+            if continuation_text:
+                delivery_kwargs["continuation_text"] = continuation_text
             queue_result = deliver_persona(
                 terminal_id,
                 persona_text,
-                message_id=persona_message_id,
+                **delivery_kwargs,
             )
             delivery_receipt = queue_result.get("delivery") or {}
             queued_message_id = str(
@@ -34290,14 +34599,42 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 queued_submission_id,
                 queued_phase,
             )
+            if not queued and automation_claimed:
+                self.session_bus.release_instruction_claim(
+                    terminal_id=terminal_id,
+                    message_id=automation_message_id,
+                    session_anchor_ref=session_anchor_ref,
+                )
+                automation_claimed = False
+            if queued and automation_parts is not None:
+                automation_instruction = {
+                    "message_id": automation_message_id,
+                    "terminal_id": terminal_id,
+                    "worker_role": automation_parts["worker_role"],
+                    "metadata": automation_parts["automation_context"],
+                    "idempotency_key": automation_parts["idempotency_key"],
+                    "body_text": automation_parts["body_text"],
+                    "delivery_channel": "CODEX_NATIVE_QUEUE_COMBINED",
+                    "claim_state": "CLAIMED",
+                }
             return {
                 **common,
                 "status": "NATIVE_QUEUED" if queued else "NOT_RUN",
                 "application": "PENDING_PROVIDER_PHASE" if queued else "NOT_RUN",
                 "queue": queue_result,
+                **({"automation_instruction": automation_instruction} if automation_instruction else {}),
                 **({} if queued else {"reason": "assignment changed before queue evidence could be recorded"}),
             }
-        except TerminalHostError as error:
+        except (TerminalHostError, SessionBusError, UniverseError) as error:
+            if automation_claimed and automation_message_id:
+                try:
+                    self.session_bus.release_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=automation_message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                except SessionBusError:
+                    pass
             reason = f"NATIVE_QUEUE_NOT_APPLIED: {error.code}: {error.detail}"
             self.store.record_persona_delivery_unsupported(
                 session_anchor_ref,
@@ -34347,6 +34684,83 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         except UniverseError:
             pass
+
+    def _mark_dispatched_todo_in_progress(
+        self,
+        *,
+        selected_todo_id: str,
+        dispatch_id: str,
+        actor: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Move a READY Todo to IN_PROGRESS after a successful dispatch.
+
+        Uses the typed todo.state Action so Fleet/home projections and history
+        see the same transition as an explicit operator call. Failures are
+        returned as structured progress status and do not roll back dispatch.
+        """
+
+        todo_id = str(selected_todo_id or "").strip()
+        dispatch = str(dispatch_id or "").strip()
+        if not todo_id or not dispatch:
+            return {"status": "NOT_APPLICABLE", "reason": "missing_todo_or_dispatch"}
+        try:
+            todo = self.store.get_todo(todo_id)
+        except UniverseError as error:
+            return {
+                "status": "TODO_NOT_FOUND",
+                "error_code": getattr(error, "code", "TODO_NOT_FOUND"),
+                "detail": str(error),
+            }
+        current_state = str(todo.get("state") or "").upper()
+        if current_state == "IN_PROGRESS":
+            return {
+                "status": "ALREADY_IN_PROGRESS",
+                "todo_id": todo_id,
+                "revision": todo.get("revision"),
+            }
+        if current_state != "READY":
+            return {
+                "status": "SKIPPED",
+                "reason": f"state_{current_state}",
+                "todo_id": todo_id,
+            }
+        request_id = f"auto-ip-{dispatch}"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            request_id = "auto-ip-" + hashlib.sha256(dispatch.encode("utf-8")).hexdigest()[:24]
+        resolved_actor = actor if isinstance(actor, Mapping) else {}
+        if str(resolved_actor.get("kind") or "") != "USER" or not resolved_actor.get("actor_ref"):
+            resolved_actor = {
+                "kind": "USER",
+                "actor_ref": "persona.automation.dispatch",
+            }
+        try:
+            changed = self._todo_action(
+                self.todo_actions.change_state,
+                {
+                    "todo_id": todo_id,
+                    "project_id": todo.get("project_id"),
+                    "expected_revision": todo["revision"],
+                    "request_id": request_id,
+                    "state": "IN_PROGRESS",
+                },
+                resolved_actor,
+            )
+        except UniverseError as error:
+            return {
+                "status": "ERROR",
+                "error_code": getattr(error, "code", "TODO_STATE_ERROR"),
+                "detail": str(error),
+                "todo_id": todo_id,
+            }
+        return {
+            "status": changed.get("status") or "TODO_STATE_CHANGED",
+            "todo_id": todo_id,
+            "previous_state": changed.get("previous_state"),
+            "state": (changed.get("todo") or {}).get("state"),
+            "revision": (changed.get("todo") or {}).get("revision"),
+            "request_id": request_id,
+            "replayed": bool(changed.get("replayed")),
+        }
 
     def _persona_automation_plan(
         self, value: Mapping[str, Any], *, record: bool = True
@@ -35832,6 +36246,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     )
                 else:
                     result["woken_master_sessions"] = 0
+                # Fleet UX: a dispatched Todo that is still READY should move to
+                # IN_PROGRESS so the home/Todo list shows active work without a
+                # separate manual todo.state. Idempotent via request_id=auto-ip-<dispatch_id>.
+                result["todo_progress"] = self._mark_dispatched_todo_in_progress(
+                    selected_todo_id=selected_todo_id,
+                    dispatch_id=str(value.get("dispatch_id") or ""),
+                    actor=context.get("actor"),
+                )
                 return result
             if action_id == "persona.automation.worker-result":
                 value = _exact_object_fields(

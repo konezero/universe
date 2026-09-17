@@ -2609,6 +2609,7 @@ class TerminalHost:
         persona_text: str,
         *,
         message_id: str,
+        continuation_text: str = "",
         timeout_seconds: float = 20.0,
     ) -> dict[str, Any]:
         """Deliver one exact Codex persona body through the authenticated Host queue.
@@ -2639,7 +2640,11 @@ class TerminalHost:
                 "PERSONA_NATIVE_QUEUE_MESSAGE_ID_INVALID",
                 "an assignment-bound persona message_id is required",
             )
-        framed = native_queue_persona_text(text, message_id=message_id)
+        framed = native_queue_persona_text(
+            text,
+            message_id=message_id,
+            continuation_text=continuation_text,
+        )
         try:
             timeout = max(0.5, min(float(timeout_seconds), 60.0))
         except (TypeError, ValueError):
@@ -3572,7 +3577,12 @@ def persona_delivery_mode(provider: str, persona_text: str) -> tuple[str, str]:
     return "UNSUPPORTED", f"unrecognized provider {name!r}"
 
 
-def native_queue_persona_text(persona_text: str, *, message_id: str = "") -> str:
+def native_queue_persona_text(
+    persona_text: str,
+    *,
+    message_id: str = "",
+    continuation_text: str = "",
+) -> str:
     """Frame an exact persona body for one bounded Codex queue turn.
 
     The body is embedded unchanged between fixed framing lines.  The framing
@@ -3587,15 +3597,34 @@ def native_queue_persona_text(persona_text: str, *, message_id: str = "") -> str
         if re.fullmatch(r"persona-[A-Za-z0-9_-]+", normalized_message_id)
         else ""
     )
+    continuation = str(continuation_text or "")
+    if continuation:
+        lead = (
+            "Universe persona assignment context. This is natural-language framing, "
+            "not a permission grant or a task. Preserve it for this Session Anchor, "
+            "then continue with the exact bounded automation task below in the same "
+            "provider turn."
+        )
+        tail = (
+            "\n--- AUTOMATION TASK BEGIN ---\n"
+            + continuation
+            + "\n--- AUTOMATION TASK END ---"
+        )
+    else:
+        lead = (
+            "Universe persona assignment context. This is natural-language framing, "
+            "not a permission grant or a task. Preserve it for this Session Anchor, "
+            "do not call tools, and wait for the operator after acknowledging it."
+        )
+        tail = ""
     return (
-        "Universe persona assignment context. This is natural-language framing, "
-        "not a permission grant or a task. Preserve it for this Session Anchor, "
-        "do not call tools, and wait for the operator after acknowledging it."
+        lead
         + message_marker
         + "\n"
         "--- PERSONA BODY BEGIN ---\n"
         + text
         + "\n--- PERSONA BODY END ---"
+        + tail
     )
 
 

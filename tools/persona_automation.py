@@ -534,6 +534,91 @@ class PersonaAutomationStore:
                 "event": event,
             }
 
+    def mark_worker_instruction_claim_state(
+        self,
+        *,
+        run_id: str,
+        worker_role: str,
+        message_id: str,
+        expected_revision: int,
+        claim_state: str = "DISPATCHED",
+    ) -> dict[str, Any]:
+        """CAS-update the pre-created Bus claim after transport completion.
+
+        A combined native Persona turn creates the typed Bus instruction before
+        it queues the Persona text.  The instruction is therefore persisted as
+        ``CLAIMED`` until ``complete_instruction_claim`` succeeds.  Keeping
+        this marker separate from ``record_worker_instruction`` makes a retry
+        safe when the process stops between those two effects: recovery can
+        retry the same completion instead of treating an unfinished claim as
+        already dispatched.
+        """
+
+        run_id = _text(run_id, "run_id")
+        worker_role = _text(worker_role, "worker_role").upper()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_WORKER_ROLE_INVALID",
+                "worker_role must be IMPLEMENTER or REVIEWER",
+            )
+        message_id = _text(message_id, "message_id")
+        expected_revision = _positive_int(expected_revision, "expected_revision")
+        claim_state = _text(claim_state, "claim_state").upper()
+        if claim_state not in {"CLAIMED", "DISPATCHED"}:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_CLAIM_STATE_INVALID",
+                "claim_state must be CLAIMED or DISPATCHED",
+            )
+        column = "current_worker_json" if worker_role == "IMPLEMENTER" else "current_reviewer_json"
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            current = _load(row[column], None)
+            if not isinstance(current, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_WORKER_ASSIGNMENT_REQUIRED",
+                    "the exact Worker assignment is required before updating claim state",
+                    409,
+                )
+            precreated = current.get("precreated_instruction")
+            if not isinstance(precreated, Mapping) or str(precreated.get("message_id") or "") != message_id:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_INSTRUCTION_PROVENANCE_MISMATCH",
+                    "claim state does not match the pre-created Worker instruction",
+                    409,
+                )
+            if str(precreated.get("claim_state") or "").upper() == claim_state:
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_WORKER_CLAIM_STATE_REPLAYED",
+                    "run": self._row(row),
+                    "claim_state": claim_state,
+                }
+            current_payload = {
+                **dict(current),
+                "precreated_instruction": {
+                    **dict(precreated),
+                    "claim_state": claim_state,
+                },
+            }
+            now = _timestamp()
+            cursor = connection.execute(
+                f"UPDATE persona_automation_run SET {column} = ?, revision = revision + 1, updated_at = ? "
+                "WHERE run_id = ? AND revision = ?",
+                (_json(current_payload), now, run_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while updating Worker claim state",
+                    409,
+                )
+            return {
+                "schema": SCHEMA,
+                "status": "PERSONA_AUTOMATION_WORKER_CLAIM_STATE_UPDATED",
+                "run": self._row(self._get(connection, run_id)),
+                "claim_state": claim_state,
+            }
+
     def record_worker_route_failure(
         self, value: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -1090,10 +1175,22 @@ class PersonaAutomationStore:
                     "result_ref": None,
                     "review_id": None,
                 }
+                precreated_instruction = worker_result.get("automation_instruction") if isinstance(worker_result, Mapping) else None
+                worker_payload = {
+                    "state": "ASSIGNED",
+                    "assignment": dict(worker_assignment),
+                    "instruction": instruction,
+                    "completion_conditions": list(conditions),
+                    **(
+                        {"precreated_instruction": dict(precreated_instruction)}
+                        if isinstance(precreated_instruction, Mapping)
+                        else {}
+                    ),
+                }
                 now = _timestamp()
                 cursor = connection.execute(
                     "UPDATE persona_automation_run SET current_assignment_json = ?, current_worker_json = ?, state = 'WAITING', next_condition = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
-                    (_json(assignment), _json({"state": "ASSIGNED", "assignment": dict(worker_assignment), "instruction": instruction, "completion_conditions": list(conditions)}), "Worker must submit one result through persona.automation.worker-result.", now, run_id, int(row["revision"])),
+                    (_json(assignment), _json(worker_payload), "Worker must submit one result through persona.automation.worker-result.", now, run_id, int(row["revision"])),
                 )
                 if cursor.rowcount != 1:
                     raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "automation run changed while recording Worker dispatch", 409)
@@ -1372,12 +1469,19 @@ class PersonaAutomationStore:
                 )
             raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEWER_MUST_BE_INDEPENDENT", "Reviewer must use a distinct Worker Session Anchor", 409)
         reviewer_revision = _positive_int(reviewer_assignment.get("assignment_revision"), "reviewer_assignment.assignment_revision")
+        precreated_instruction = reviewer_result.get("automation_instruction") if isinstance(reviewer_result, Mapping) else None
         reviewer_payload = {
             "state": "ASSIGNED",
             "assignment": dict(reviewer_assignment),
             "worker_result_ref": result_ref,
             "worker_assignment_id": worker_assignment_id,
             "instruction": reviewer_spec["instruction"],
+            "completion_conditions": [],
+            **(
+                {"precreated_instruction": dict(precreated_instruction)}
+                if isinstance(precreated_instruction, Mapping)
+                else {}
+            ),
         }
         with self._connection() as connection:
             row = self._get(connection, run_id)
