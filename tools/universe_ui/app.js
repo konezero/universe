@@ -5133,9 +5133,26 @@ function fleetProjectConductorAssignments(projectId) {
       active: [], all: [],
     };
   }
+  // node_ref-less is necessary but not sufficient: Fleet Worker/Reviewer
+  // assignments are also project-wide (no node_ref) and vastly outnumber
+  // real Conductor bindings, so counting all of them made this projection
+  // read "2+ active assignments -> ERROR" as soon as any worker/reviewer
+  // was active anywhere in the project (2026-09-17 finding: this panel
+  // showed a permanent, mislabeled PERSONA_ASSIGNMENTS_READ_FAILED with a
+  // single real Conductor assignment present, because unrelated Worker/
+  // Reviewer rows tripped the ambiguity check). The actual distinguishing
+  // signal is the owning session's mode, from the same supervisor session
+  // list fleetProjectConductorTerminals already uses for the terminal side
+  // of this same projection.
+  const conductorAnchors = new Set(
+    (Array.isArray(state.supervisorSessions) ? state.supervisorSessions : [])
+      .filter((session) => String(session.mode || "").toUpperCase() === "CONDUCTOR")
+      .map((session) => String(session.session_anchor_ref || "").trim())
+  );
   const all = rows.filter((assignment) =>
     String(assignment.project_id || "") === normalizedProjectId &&
-    !String(assignment.node_ref || "").trim()
+    !String(assignment.node_ref || "").trim() &&
+    conductorAnchors.has(String(assignment.session_anchor_ref || "").trim())
   );
   const active = all.filter((assignment) => String(assignment.state || "").toUpperCase() === "ACTIVE");
   return { status: active.length > 1 ? "ERROR" : "READY", error: "", active, all };

@@ -119,12 +119,28 @@ test("Project Conductor projection stays project-scoped and separates saved and 
             project_id: "other", node_ref: null, state: "ACTIVE",
             session_anchor_ref: "other-conductor", persona_id: "other-persona",
           },
+          // Fleet Worker/Reviewer assignments are also node_ref-less and
+          // must NOT be counted as competing Conductor bindings (2026-09-17
+          // regression: this shape alone made the projection read as
+          // "2+ active assignments -> ERROR" with only one real Conductor
+          // assignment present).
+          {
+            project_id: "universe", node_ref: null, state: "ACTIVE",
+            session_anchor_ref: "worker-anchor", persona_id: "worker-persona",
+            scope: "FLEET_IMPLEMENTER",
+          },
         ],
         supervisorTerminalsStatus: "READY",
         supervisorTerminals: [
           { project_id: "universe", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "conductor-anchor" },
           { project_id: "universe", mode: "MASTER", state: "LIVE", session_anchor_ref: "master-anchor" },
           { project_id: "other", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "other-conductor" },
+        ],
+        supervisorSessions: [
+          { node: "universe", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "conductor-anchor" },
+          { node: "universe", mode: "MASTER", state: "LIVE", session_anchor_ref: "master-anchor" },
+          { node: "universe", mode: "WORKER", state: "LIVE", session_anchor_ref: "worker-anchor" },
+          { node: "other", mode: "CONDUCTOR", state: "LIVE", session_anchor_ref: "other-conductor" },
         ],
       },
     },

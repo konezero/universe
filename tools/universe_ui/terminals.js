@@ -565,10 +565,19 @@ function terminalPersonaAssignment(session) {
   if (rows.length > 1) return { state: "ERROR", detail: "MULTIPLE_ACTIVE_ASSIGNMENTS" };
   if (!rows.length) return { state: "UNASSIGNED", detail: "NO_ACTIVE_ASSIGNMENT" };
   const row = rows[0];
+  const personaId = String(row.persona_id || "");
+  const persona = (Array.isArray(state.personaLibrary) ? state.personaLibrary : []).find(
+    (item) => String(item.persona_id || "") === personaId
+  );
+  const role = String(persona?.title || "").trim();
   return {
     state: "ASSIGNED",
-    detail: String(row.persona_id || "UNKNOWN"),
-    personaId: String(row.persona_id || ""),
+    // A raw persona_id in a terminal tab told the operator nothing at a
+    // glance; the tab now shows the persona's role/title (e.g. "구현
+    // Worker") and keeps the id only in the tooltip for exact lookup.
+    detail: role || personaId || "UNKNOWN",
+    role,
+    personaId,
     nodeRef: String(row.node_ref || ""),
     revision: row.assignment_revision,
   };
@@ -646,10 +655,12 @@ function renderTerminalDock() {
     tab.append(node("span", "", terminalLabel(session)));
     const assignment = terminalPersonaAssignment(session);
     const ownerChip = node("span", "terminal-tab-owner", assignment.state === "ASSIGNED"
-      ? `Persona ${assignment.detail}`
+      ? assignment.detail
       : assignment.state);
     ownerChip.dataset.state = assignment.state;
-    ownerChip.title = assignment.detail;
+    ownerChip.title = assignment.state === "ASSIGNED" && assignment.role
+      ? `${assignment.role} (${assignment.personaId})`
+      : assignment.detail;
     if (assignment.nodeRef && typeof openFleetNodeFromTerminal === "function") {
       ownerChip.setAttribute("role", "link");
       ownerChip.tabIndex = 0;
