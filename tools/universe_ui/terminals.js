@@ -54,6 +54,11 @@ function terminalHostForSession(session) {
   ) || null;
 }
 
+// Worker/Reviewer sessions are Fleet-managed automation, not interactive
+// terminals a person attaches to -- their status belongs in the node's
+// Worker/Reviewer roster (renderFleetNodeWorkerRoster), not the CLI dock.
+// 2026-09-17: excluded after live dock clutter observed once automation
+// started spawning several concurrent Worker/Reviewer sessions.
 function terminalDockVisible(session) {
   const host = terminalHostForSession(session);
   return Boolean(
@@ -62,7 +67,8 @@ function terminalDockVisible(session) {
       host.reconnect_eligible === true &&
       ["CURRENT", "COMPATIBLE_OLD"].includes(
         String(host.compatibility || "").trim().toUpperCase()
-      )
+      ) &&
+      String(session.mode || "").trim().toUpperCase() !== "WORKER"
   );
 }
 

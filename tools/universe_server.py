@@ -35175,6 +35175,77 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return recorded
 
+    def _persona_automation_node_has_executable_todo(
+        self, project_id: str, node_ref: str
+    ) -> bool:
+        """READY or IN_PROGRESS counts as executable, same as the plan step's
+        own backlog/executable split -- BACKLOG alone never does."""
+
+        return any(
+            todo.get("project_id") == project_id
+            and todo.get("node_ref") == node_ref
+            and str(todo.get("state") or "").upper() in {"READY", "IN_PROGRESS"}
+            for todo in self.store.list_todos()
+        )
+
+    def _continue_persona_automation_if_work_remains(
+        self, completed_run: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """A COMPLETED bounded control cycle does not restart itself --
+        without this, a node Master with a full backlog still goes idle the
+        instant one Todo finishes, and only a manual persona.automation.start
+        wakes it again (2026-09-17 operator finding: node Masters sat idle
+        for up to an hour with READY/IN_PROGRESS Todos still pending). Start
+        exactly one new bounded cycle in the same node/owner scope when
+        executable work remains; project-wide Conductor runs (no node_ref)
+        are left alone, same as the existing review-driven re-enqueue path.
+        """
+
+        node_ref = str(completed_run.get("node_ref") or "").strip()
+        project_id = str(completed_run.get("project_id") or "").strip()
+        anchor = str(completed_run.get("session_anchor_ref") or "").strip()
+        if not node_ref or not project_id or not anchor:
+            return {"status": "PERSONA_AUTOMATION_CONTINUATION_NOT_APPLICABLE"}
+        if not self._persona_automation_node_has_executable_todo(project_id, node_ref):
+            return {"status": "PERSONA_AUTOMATION_CONTINUATION_NO_EXECUTABLE_TODO"}
+        request_id = f"persona-automation-auto-continue:{completed_run.get('run_id')}:r{completed_run.get('revision')}"
+        start_request: dict[str, Any] = {
+            "project_id": project_id,
+            "session_anchor_ref": anchor,
+            "scope": str(completed_run.get("scope") or f"node:{node_ref}"),
+            "instruction": str(
+                completed_run.get("instruction")
+                or f"Bounded automation for node {node_ref}; stop at the next review gate."
+            ),
+            "request_id": request_id,
+            "idempotency_key": request_id,
+        }
+        execution_mode = completed_run.get("execution_mode")
+        if execution_mode:
+            start_request["execution_mode"] = execution_mode
+        worker_config = completed_run.get("worker_config")
+        if isinstance(worker_config, Mapping) and worker_config:
+            field_map = {
+                "persona_id": "worker_persona_id",
+                "provider": "worker_provider",
+                "model_ref": "worker_model_ref",
+                "effort": "worker_effort",
+            }
+            for source_field, start_field in field_map.items():
+                if worker_config.get(source_field):
+                    start_request[start_field] = worker_config[source_field]
+        try:
+            action_context = self.resolve_action_context(
+                "persona.automation.start", source="PERSONA_AUTOMATION_AUTO_CONTINUE"
+            )
+            return self._handle_persona_automation_action(start_request, action_context)
+        except (UniverseError, PersonaAutomationError) as error:
+            return {
+                "status": "PERSONA_AUTOMATION_CONTINUATION_FAILED",
+                "code": getattr(error, "code", "PERSONA_AUTOMATION_CONTINUATION_FAILED"),
+                "detail": str(error),
+            }
+
     def _pending_persona_review_followup(
         self, run: Mapping[str, Any]
     ) -> dict[str, Any] | None:
@@ -35752,7 +35823,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 return result
             if action_id == "persona.automation.complete":
                 value = _exact_object_fields(request, field="persona_automation_complete", required=frozenset({"run_id", "request_id", "complete"}), optional=frozenset({"expected_revision"}))
-                return self.persona_automation.complete_run(value)
+                result = self.persona_automation.complete_run(value)
+                completed_run = result.get("run") if isinstance(result, Mapping) else None
+                if isinstance(completed_run, Mapping):
+                    result["continuation"] = self._continue_persona_automation_if_work_remains(completed_run)
+                return result
             raise PersonaAutomationError("PERSONA_AUTOMATION_ACTION_UNKNOWN", "unsupported persona automation action", 404)
         except PersonaAutomationError as error:
             try:
