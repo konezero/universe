@@ -36106,7 +36106,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _handle_master_complete_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
-        del context  # The domain gateway validates the claimed owner below.
+        # The domain gateway validates the claimed owner below.  Keep the
+        # resolved action context available for the node-bound direct-Master
+        # reviewer route, which uses the same typed Fleet gateway.
         action = _exact_object_fields(
             request,
             field="master_complete_action",

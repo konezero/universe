@@ -331,6 +331,14 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             "assignment_revision": 1,
             "assigned_by_session_anchor_ref": owner,
         }
+        def create_reviewer(spec):
+            self.assertEqual("master-result-review", spec["worker_result_ref"])
+            self.assertEqual("CODEX", spec["provider"])
+            self.assertEqual("gpt-5.6-luna", spec["model_ref"])
+            self.assertEqual("LOW", spec["effort"])
+            self.assertEqual("persona_lead", spec["persona_id"])
+            return {"assignment": reviewer_assignment}
+
         reviewer = self.store.attach_master_reviewer(
             {
                 "run_id": run["run_id"],
@@ -341,9 +349,7 @@ class PersonaAutomationStoreTests(unittest.TestCase):
                 "body_text_utf8_sha256": "c" * 64,
                 "result_text": "direct Master result",
             },
-            create_reviewer=lambda spec: self.assertEqual(
-                "master-result-review", spec["worker_result_ref"]
-            ) or {"assignment": reviewer_assignment},
+            create_reviewer=create_reviewer,
         )
         self.assertEqual("PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED", reviewer["status"])
         self.assertEqual("REVIEWER_ASSIGNED", reviewer["run"]["current_assignment"]["state"])

@@ -1664,6 +1664,17 @@ class PersonaAutomationStore:
             worker_config = _load(row["worker_config_json"], {})
             if not isinstance(worker_config, Mapping):
                 worker_config = {}
+            # MASTER_DIRECT runs do not need a provider to perform the
+            # bounded Master step, so their worker_config is normally empty.
+            # The automatic Reviewer is still a real Worker session and must
+            # therefore carry an explicit supported provider/model through
+            # the typed Fleet route.  Keep an explicit configured provider
+            # when one exists, while defaulting the bounded automation path
+            # to the supported Codex Luna capability.
+            reviewer_provider = str(worker_config.get("provider") or "CODEX").strip().upper()
+            reviewer_model = str(worker_config.get("model_ref") or "gpt-5.6-luna").strip()
+            reviewer_effort = str(worker_config.get("effort") or "LOW").strip().upper()
+            reviewer_persona_id = worker_config.get("persona_id") or row["persona_id"]
             reviewer_spec = {
                 "run_id": run_id,
                 "dispatch_id": dispatch_id,
@@ -1675,10 +1686,10 @@ class PersonaAutomationStore:
                 "task_frame_id": assignment.get("task_frame_id"),
                 "worker_role": "REVIEWER",
                 "assigned_by_session_anchor_ref": row["session_anchor_ref"],
-                "persona_id": worker_config.get("persona_id"),
-                "provider": worker_config.get("provider"),
-                "model_ref": worker_config.get("model_ref"),
-                "effort": worker_config.get("effort"),
+                "persona_id": reviewer_persona_id,
+                "provider": reviewer_provider,
+                "model_ref": reviewer_model,
+                "effort": reviewer_effort,
                 "title": "Review Master result: " + result_ref,
                 "instruction": (
                     "Independently review the pinned Master result and record "
