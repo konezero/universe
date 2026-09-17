@@ -56,6 +56,11 @@ const state = {
   fleetHomeRefreshInFlight: false,
   /** Interval handle for Fleet home soft refresh (todos/automation/roster). */
   fleetHomeRefreshTimer: null,
+  /** Last-rendered todos/goals signatures, so an unchanged soft poll skips
+   * the full renderIntegratedHome() rebuild instead of flickering the DOM
+   * every tick. */
+  fleetHomeRefreshTodoSignature: null,
+  fleetHomeRefreshGoalSignature: null,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
@@ -4993,13 +4998,32 @@ async function refreshFleetHomeSoft() {
     if (state.selectedProject?.project_id !== projectId) return;
     // Re-check after awaits: an edit or dialog may have started mid-flight.
     if (!fleetHomeSoftRefreshActive()) return;
-    if (Array.isArray(todoResult?.todos)) state.todos = todoResult.todos;
-    if (goalPlan) {
-      state.goals = goalPlan.goals || state.goals || [];
-      state.unassignedTodos = (goalPlan.unassigned_todos || []).filter(
-        (todo) => todo.state !== "DONE"
-      );
+    // renderIntegratedHome() replaceChildren()s the whole Fleet home tree,
+    // so calling it every 4s regardless of content visibly flickers the
+    // page. Only rebuild when the fetched todos/goals actually differ from
+    // what is already rendered.
+    let changed = false;
+    if (Array.isArray(todoResult?.todos)) {
+      const signature = JSON.stringify(todoResult.todos);
+      if (signature !== state.fleetHomeRefreshTodoSignature) {
+        state.fleetHomeRefreshTodoSignature = signature;
+        state.todos = todoResult.todos;
+        changed = true;
+      }
     }
+    if (goalPlan) {
+      const signature = JSON.stringify(goalPlan);
+      if (signature !== state.fleetHomeRefreshGoalSignature) {
+        state.fleetHomeRefreshGoalSignature = signature;
+        state.goals = goalPlan.goals || state.goals || [];
+        state.unassignedTodos = (goalPlan.unassigned_todos || []).filter(
+          (todo) => todo.state !== "DONE"
+        );
+        changed = true;
+      }
+    }
+    void refreshFleetProjectConductorProjection(projectId).catch(() => {});
+    if (!changed) return;
     const featureId = homeNodeRefKey(homeSelectedNode()?.node_id || "");
     if (featureId) {
       if (state.fleetAutomationByNode?.[featureId]) {
@@ -5009,7 +5033,6 @@ async function refreshFleetHomeSoft() {
         delete state.fleetWorkerAssignmentsByNode[featureId];
       }
     }
-    void refreshFleetProjectConductorProjection(projectId).catch(() => {});
     if (typeof renderIntegratedHome === "function") renderIntegratedHome();
   } finally {
     state.fleetHomeRefreshInFlight = false;
