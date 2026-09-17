@@ -35890,6 +35890,26 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "error_code": error.code,
                     "detail": error.detail,
                 }
+            else:
+                # record_master_completion leaves the run WAITING on an
+                # Independent Reviewer verdict but, unlike RUN_STARTED/kick,
+                # never queues the next control turn itself. A node-bound
+                # Master that finishes its own turn right after completing
+                # (the common case) then has nothing telling it -- or a
+                # later-reconnected Master -- to come back and review its
+                # own result, so the run stalls in WAITING forever (2026-09-17
+                # incident: persona_run_f928b72114614bc5b8ce8a99 stuck ~16h
+                # after MASTER_RESULT_RECORDED with no queued follow-up).
+                # Mirror the same enqueue+wake RUN_STARTED/kick use so the
+                # review step is reachable the same way the work step was.
+                run = automation_result.get("run") if isinstance(automation_result, Mapping) else None
+                if isinstance(run, Mapping):
+                    try:
+                        self._enqueue_persona_automation_driver(
+                            run, driver_key=f"post-result-r{int(run.get('revision') or 0)}"
+                        )
+                    except PersonaAutomationError:
+                        pass  # project-wide (node_ref-less) runs have no node driver; harmless
         result_delivery = self._publish_master_completion_results()
         return {
             "schema": MASTER_COMPLETE_RESULT_SCHEMA,
