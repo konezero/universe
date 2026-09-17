@@ -891,8 +891,21 @@ fn apply_request(
             if let Err(response)=require_attached_supervisor(state,&request) { return *response; }
             let payload=request.channel.unwrap_or_else(||json!({}));
             if request.action=="turn_offer" {
+                // A fresh, typed Persona Worker has an authenticated Host and
+                // exact Session Anchor before a provider-native session ref
+                // exists.  The Universe server may authorize this narrow
+                // Session Bus reply path after validating the persisted run,
+                // assignment revision, and message lineage.  Keep the normal
+                // provider-session binding requirement for every other turn.
+                let explicit_session_bus_reply =
+                    payload["delivery_mode"].as_str() == Some("EXPLICIT_SESSION_BUS_REPLY")
+                    && payload["awaits_authoritative_reply"].as_bool() == Some(true)
+                    && payload["provider_session_ref"].as_str().unwrap_or("").is_empty()
+                    && payload["session_anchor_ref"].as_str() == Some(state.anchor_ref.as_str())
+                    && state.provider.as_deref() == payload["provider"].as_str();
                 if state.provider.as_deref()!=payload["provider"].as_str()
-                    || state.provider_session_ref.as_deref()!=payload["provider_session_ref"].as_str() {
+                    || (!explicit_session_bus_reply
+                        && state.provider_session_ref.as_deref()!=payload["provider_session_ref"].as_str()) {
                     return failure("HOST_TURN_BINDING_MISMATCH", "delivery must match the bound provider session");
                 }
                 let mut payload=payload;
@@ -1552,6 +1565,79 @@ mod tests {
         assert_eq!(response.error_code, Some("HOST_UNAUTHORIZED"));
         assert_eq!(state.attachment_generation, 0);
         assert!(state.attached_supervisor_id.is_none());
+    }
+
+    #[test]
+    fn explicit_session_bus_reply_requires_exact_anchor_and_flag() {
+        let mut state = snapshot();
+        state.provider = Some("CLAUDE".to_owned());
+        state.provider_session_ref = None;
+        let shutdown = AtomicBool::new(false);
+        let attach = HostRequest {
+            token: "token".to_owned(),
+            action: "attach".to_owned(),
+            supervisor_id: Some("supervisor-a".to_owned()),
+            input: None,
+            input_base64: None,
+            after_cursor: None,
+            cols: None,
+            rows: None,
+            channel: None,
+            provider: None,
+            provider_session_ref: None,
+            mode: None,
+        };
+        assert_eq!(apply_request(&mut state, attach, &shutdown, None, None).status, "OK");
+
+        let offer = |anchor: &str, delivery_mode: Option<&str>| HostRequest {
+            token: "token".to_owned(),
+            action: "turn_offer".to_owned(),
+            supervisor_id: Some("supervisor-a".to_owned()),
+            input: None,
+            input_base64: None,
+            after_cursor: None,
+            cols: None,
+            rows: None,
+            channel: Some(json!({
+                "message_id": "msg-explicit-reply",
+                "text": "bounded reply",
+                "session_anchor_ref": anchor,
+                "provider": "CLAUDE",
+                "provider_session_ref": "",
+                "delivery_mode": delivery_mode,
+                "awaits_authoritative_reply": delivery_mode.is_some(),
+            })),
+            provider: None,
+            provider_session_ref: None,
+            mode: None,
+        };
+
+        let accepted = apply_request(
+            &mut state,
+            offer("anchor-test", Some("EXPLICIT_SESSION_BUS_REPLY")),
+            &shutdown,
+            None,
+            None,
+        );
+        assert_eq!(accepted.status, "OK");
+
+        let wrong_anchor = apply_request(
+            &mut state,
+            offer("different-anchor", Some("EXPLICIT_SESSION_BUS_REPLY")),
+            &shutdown,
+            None,
+            None,
+        );
+        assert_eq!(wrong_anchor.error_code, Some("HOST_TURN_BINDING_MISMATCH"));
+
+        let missing_flag = apply_request(
+            &mut state,
+            offer("anchor-test", None),
+            &shutdown,
+            None,
+            None,
+        );
+        assert_eq!(missing_flag.error_code, Some("HOST_TURN_BINDING_MISMATCH"));
     }
 
     #[test]

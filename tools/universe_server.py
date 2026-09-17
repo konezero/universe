@@ -42358,6 +42358,107 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         self._session_bus_recovery_last_run = result
         return result
 
+    def _persona_automation_host_input_allowed(
+        self, message: Mapping[str, Any]
+    ) -> bool:
+        """Authorize the narrow fresh-Worker Host input exception.
+
+        A new Fleet Worker has a real Rust Host and Session Anchor before a
+        provider-native session reference exists.  Ordinary Session Bus work
+        must remain observer-gated, but the bounded Persona Worker prompt can
+        use the Worker itself to send its exact Session Bus result.  This
+        method accepts that path only when the persisted automation run and
+        assignment match every envelope coordinate; a caller-supplied
+        ``persona_automation`` flag alone is never sufficient.
+        """
+
+        metadata = message.get("persona_automation")
+        if not isinstance(metadata, Mapping):
+            lifecycle = message.get("lifecycle")
+            metadata = lifecycle.get("persona_automation") if isinstance(lifecycle, Mapping) else None
+        if not isinstance(metadata, Mapping):
+            return False
+        if str(metadata.get("schema") or "") != "universe.persona-automation-session-bus.v1":
+            return False
+        run_id = str(metadata.get("run_id") or "").strip()
+        dispatch_id = str(metadata.get("dispatch_id") or "").strip()
+        worker_role = str(metadata.get("worker_role") or "").strip().upper()
+        worker_assignment_id = str(metadata.get("worker_assignment_id") or "").strip()
+        worker_anchor_ref = str(metadata.get("worker_anchor_ref") or "").strip()
+        if (
+            not run_id
+            or not dispatch_id
+            or worker_role not in {"IMPLEMENTER", "REVIEWER"}
+            or not worker_assignment_id
+            or not worker_anchor_ref
+        ):
+            return False
+        try:
+            run = self.persona_automation.get_run(run_id)
+        except Exception:
+            return False
+        if not isinstance(run, Mapping):
+            return False
+        assignment = run.get("current_assignment")
+        if not isinstance(assignment, Mapping):
+            return False
+        expected_state = (
+            "WORKER_ASSIGNED" if worker_role == "IMPLEMENTER" else "REVIEWER_ASSIGNED"
+        )
+        if (
+            str(assignment.get("state") or "").upper() != expected_state
+            or str(assignment.get("dispatch_id") or "") != dispatch_id
+            or str(assignment.get("worker_assignment_id") or assignment.get("reviewer_assignment_id") or "")
+            != worker_assignment_id
+            or str(assignment.get("worker_anchor_ref") or assignment.get("reviewer_anchor_ref") or "")
+            != worker_anchor_ref
+        ):
+            return False
+        current_key = "current_worker" if worker_role == "IMPLEMENTER" else "current_reviewer"
+        current = run.get(current_key)
+        current_assignment = current.get("assignment") if isinstance(current, Mapping) else None
+        if not isinstance(current_assignment, Mapping):
+            return False
+        if (
+            str(current_assignment.get("assignment_id") or "") != worker_assignment_id
+            or str(current_assignment.get("session_anchor_ref") or "") != worker_anchor_ref
+            or str(current_assignment.get("worker_role") or "").upper() != worker_role
+        ):
+            return False
+        try:
+            if int(current_assignment.get("assignment_revision") or 0) != int(
+                metadata.get("worker_assignment_revision") or 0
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+        target = message.get("to")
+        target = target if isinstance(target, Mapping) else {}
+        source = message.get("from")
+        source = source if isinstance(source, Mapping) else {}
+        if (
+            str(message.get("recipient_anchor_ref") or target.get("session_anchor_ref") or "")
+            != worker_anchor_ref
+            or str(source.get("session_anchor_ref") or "")
+            != str(run.get("session_anchor_ref") or "")
+            or str(target.get("project_id") or "") != str(run.get("project_id") or "")
+            or str(target.get("mode") or "").upper() != "WORKER"
+        ):
+            return False
+        if str(metadata.get("project_id") or "") != str(run.get("project_id") or ""):
+            return False
+        if str(metadata.get("node_ref") or "") != str(run.get("node_ref") or ""):
+            return False
+        if str(metadata.get("todo_id") or "") != str(assignment.get("todo_id") or ""):
+            return False
+        if str(metadata.get("task_frame_id") or "") != str(assignment.get("task_frame_id") or ""):
+            return False
+        expected_idempotency = (
+            f"persona-automation:{run_id}:{dispatch_id}:{worker_role}:"
+            f"{worker_assignment_id}:{int(metadata.get('worker_assignment_revision') or 0)}"
+        )
+        return str(metadata.get("idempotency_key") or "") == expected_idempotency
+
     def _dispatch_live_posted_session_instructions(
         self, posted: Mapping[str, Any]
     ) -> list[dict[str, Any]]:
@@ -42475,11 +42576,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 project_id = str(terminal.get("project_id") or "").strip()
                 if not project_id:
                     continue
+                # Persona automation Worker instructions are created by the
+                # typed automation store and carry an exact assignment
+                # envelope.  A fresh Worker Host intentionally has no
+                # provider_session_ref yet, so it cannot satisfy the passive
+                # provider-observer contract used by ordinary bus work.  The
+                # Worker prompt itself contains the authenticated Session Bus
+                # reply route; allow only that authoritative, lineage-checked
+                # automation envelope to use Host input while keeping ordinary
+                # messages observer-gated.
+                allow_unobserved_host_input = (
+                    self._persona_automation_host_input_allowed(message)
+                )
                 dispatch = self._dispatch_pending_session_instruction(
                     project_id=project_id,
                     session=session,
                     trigger="TURN_IDLE",
                     message_id=posted_message_id,
+                    allow_unobserved_host_input=allow_unobserved_host_input,
                 )
                 dispatches.append({**dispatch, "message_id": posted_message_id})
                 self.session_bus.record_dispatch_attempt(posted_message_id, dispatch)
@@ -47749,6 +47863,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         trigger: str,
         message_id: str = "",
         terminal: Mapping[str, Any] | None = None,
+        allow_unobserved_host_input: bool = False,
     ) -> dict[str, Any]:
         """Claim and deliver one anchor-bound bus instruction at a safe point.
 
@@ -48003,11 +48118,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # 32-hex reference.  A Session Bus message id is intentionally
             # shorter; hashing it gives a stable retry-safe correlation key
             # without exposing or truncating the message identity.
-            bus_dispatch_ref = (
-                "dispatch_" + hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:32]
-                if provider == "CODEX"
-                else ""
-            )
+            bus_dispatch_ref = ""
+            observer_source: Mapping[str, Any] | None = None
             try:
                 observer_source = self._register_exact_provider_observer_source(
                     provider=provider,
@@ -48015,25 +48127,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     project_id=project_id,
                 )
             except UniverseError as error:
-                self.session_bus.release_instruction_claim(
-                    terminal_id=terminal_id,
-                    message_id=message_id,
-                    session_anchor_ref=session_anchor_ref,
-                )
-                return {
-                    "status": "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
-                    "error_code": error.code,
-                    "detail": error.detail,
-                    "delivery_mode": "RUST_HOST_INPUT",
-                    "provider": provider,
-                    "message_id": message_id,
-                    "session_anchor_ref": session_anchor_ref,
+                observer_gap = error.code in {
+                    "PROVIDER_OBSERVER_IDENTITY_UNAVAILABLE",
+                    "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
                 }
+                if not (allow_unobserved_host_input and observer_gap):
+                    self.session_bus.release_instruction_claim(
+                        terminal_id=terminal_id,
+                        message_id=message_id,
+                        session_anchor_ref=session_anchor_ref,
+                    )
+                    return {
+                        "status": "PROVIDER_OBSERVER_SOURCE_UNAVAILABLE",
+                        "error_code": error.code,
+                        "detail": error.detail,
+                        "delivery_mode": "RUST_HOST_INPUT",
+                        "provider": provider,
+                        "message_id": message_id,
+                        "session_anchor_ref": session_anchor_ref,
+                    }
+            if observer_source is not None and provider == "CODEX":
+                # A Codex dispatch reference is valid only when the exact
+                # observer source was registered.  Persona Worker replies
+                # are explicit Session Bus results until that source exists.
+                bus_dispatch_ref = (
+                    "dispatch_"
+                    + hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:32]
+                )
             try:
                 body_text = str(delivery["body_text"])
                 instruction_ref = str(delivery.get("instruction_ref") or "").strip()
                 if instruction_ref and not body_text.startswith("instruction_ref:"):
                     body_text = f"instruction_ref: {instruction_ref}\n{body_text}"
+                if not bus_dispatch_ref and not body_text.startswith("instruction_ref:"):
+                    body_text = f"instruction_ref: session-bus:{message_id}\n{body_text}"
                 if bus_dispatch_ref:
                     body_text = (f"universe_dispatch_ref: {bus_dispatch_ref}\n"
                                  f"instruction_ref: session-bus:{message_id}\n"
@@ -48055,6 +48182,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "message_id": message_id, "text": body_text,
                     "session_anchor_ref": session_anchor_ref, "provider": provider,
                     "provider_session_ref": provider_session_ref,
+                    # The Rust Host accepts this empty provider ref only for
+                    # the exact, lineage-checked Persona automation envelope
+                    # authorized above. Ordinary delivery remains bound to
+                    # the persisted provider session.
+                    "delivery_mode": (
+                        "EXPLICIT_SESSION_BUS_REPLY"
+                        if observer_source is None
+                        else "PROVIDER_SESSION"
+                    ),
+                    "awaits_authoritative_reply": observer_source is None,
                 })
                 if host_delivery.get("capability") != "HOST_TURN_DELIVERY_V1":
                     raise TerminalHostError("HOST_TURN_DELIVERY_UNAVAILABLE", "Host capability not observed")
@@ -48064,13 +48201,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     terminal_id=terminal_id,
                     message_id=str(delivery["message_id"]),
                     session_anchor_ref=session_anchor_ref,
-                    observer_source_id=str(observer_source["source_id"]),
+                    observer_source_id=(
+                        str(observer_source["source_id"])
+                        if observer_source is not None
+                        else ""
+                    ),
                     bus_dispatch_ref=bus_dispatch_ref,
                     delivery_channel="HOST_TURN_DELIVERY",
-                    # The label identifies the Rust Host transport. It does
-                    # not carry a final provider reply; the exact Codex/Grok
-                    # observer source below is the completion authority.
-                    awaits_authoritative_reply=False,
+                    # With an observer source the provider activity ledger is
+                    # the completion authority.  A fresh Persona Worker has
+                    # no provider ref yet; its explicit Session Bus reply is
+                    # the only authoritative completion for this instruction.
+                    awaits_authoritative_reply=observer_source is None,
                 )
             except (SessionBusError, TerminalHostError, UnicodeError) as error:
                 self.session_bus.release_instruction_claim(
@@ -48085,7 +48227,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "prompt_delivery": prompt_delivery,
                 "host_turn_state": host_delivery.get("state"),
                 "provider": provider,
-                "observer_source_id": observer_source["source_id"],
+                "observer_source_id": (
+                    observer_source["source_id"]
+                    if observer_source is not None
+                    else None
+                ),
+                "provider_observation": (
+                    "EXACT_SOURCE"
+                    if observer_source is not None
+                    else "EXPLICIT_SESSION_BUS_REPLY"
+                ),
                 "message_id": completed["message_id"],
                 "session_anchor_ref": session_anchor_ref,
                 "hook_stdout": outcome.get("hook_stdout"),

@@ -3802,6 +3802,86 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PENDING", pending[0]["delivery_state"])
         self.assertEqual("QUEUED", pending[0]["lifecycle_state"])
 
+    def test_persona_worker_host_input_uses_explicit_bus_reply_without_observer(self) -> None:
+        terminal = {
+            "terminal_id": "term-persona-worker-unobserved-001",
+            "project_id": "GCS",
+            "mode": "WORKER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": "session-persona-worker-unobserved-001",
+            "supervisor_session_id": "supervisor-persona-worker-unobserved-001",
+            "backend_owner": "RUST_RECONNECTION_HOST",
+            "launch_profile": "INTERACTIVE",
+        }
+        self.server.terminal_host.find_live = Mock(return_value=terminal)
+        self.server.terminal_host.get = Mock(return_value=terminal)
+        self.server.store.discover_provider_session_sources = Mock(return_value=[])
+        self.server.terminal_host.offer_turn = Mock(
+            return_value={
+                "capability": "HOST_TURN_DELIVERY_V1",
+                "state": "WORKING",
+                "messages": [],
+            }
+        )
+        posted = self.server.session_bus.deliver_to_terminal(
+            self.server.terminal_host,
+            terminal=terminal,
+            source={
+                "project_id": "GCS",
+                "mode": "MASTER",
+                "provider": "UNIVERSE",
+                "session_anchor_ref": "session-master-001",
+            },
+            to={
+                "project_id": "GCS",
+                "mode": "WORKER",
+                "provider": "CODEX",
+                "session_anchor_ref": terminal["session_anchor_ref"],
+            },
+            kind="INSTRUCTION",
+            notify="NONE",
+            body="Return one bounded result through the Session Bus reply route.",
+        )
+
+        dispatched = self.server._dispatch_pending_session_instruction(
+            project_id="GCS",
+            session={
+                "session_id": terminal["supervisor_session_id"],
+                "session_anchor_ref": terminal["session_anchor_ref"],
+                "provider": "CODEX",
+                "provider_session_ref": "",
+                "mode": "WORKER",
+            },
+            trigger="TURN_IDLE",
+            message_id=posted["message_id"],
+            allow_unobserved_host_input=True,
+        )
+
+        self.assertEqual("DISPATCHED", dispatched["status"])
+        self.assertIsNone(dispatched["observer_source_id"])
+        self.assertEqual("EXPLICIT_SESSION_BUS_REPLY", dispatched["provider_observation"])
+        self.server.terminal_host.offer_turn.assert_called_once()
+        offered_payload = self.server.terminal_host.offer_turn.call_args.args[1]
+        self.assertEqual("EXPLICIT_SESSION_BUS_REPLY", offered_payload["delivery_mode"])
+        self.assertTrue(offered_payload["awaits_authoritative_reply"])
+        self.assertEqual("", offered_payload["provider_session_ref"])
+        offered_text = self.server.terminal_host.offer_turn.call_args.args[1]["text"]
+        self.assertIn(
+            f"instruction_ref: session-bus:{posted['message_id']}",
+            offered_text,
+        )
+        activity = self.server.session_bus.inbox(
+            self.server.terminal_host,
+            session_anchor_ref=terminal["session_anchor_ref"],
+            projection="ACTIVITY",
+        )["messages"]
+        message = next(item for item in activity if item["message_id"] == posted["message_id"])
+        self.assertEqual("DISPATCHED", message["delivery_state"])
+        self.assertEqual("STARTED", message["lifecycle_state"])
+        self.assertTrue(message["lifecycle"]["awaits_authoritative_reply"])
+        self.assertNotIn("bus_dispatch_ref", message["lifecycle"])
+
     def test_interactive_rust_host_accepted_waiting_prompt_never_requeues(self) -> None:
         terminal = {
             "terminal_id": "term-rust-host-stalled-001",
