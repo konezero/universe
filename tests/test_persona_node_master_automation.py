@@ -531,7 +531,12 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "node_ref": own_node,
         })
         self.assertEqual(200, status, assigned)
-        own_goal = self.make_node_goal(own_node, "Dispatch Node Goal")
+        own_todo = self.server.store.create_todo({
+            "scope_kind": "NODE", "project_id": "TEST", "node_ref": own_node,
+            "title": "Dispatch Node Todo", "detail": "bounded node work",
+            "priority": "P0", "state": "READY", "source_kind": "MASTER",
+            "sort_order": 0,
+        })
         status, started = self.act("persona.automation.start", {
             "project_id": "TEST", "session_anchor_ref": anchor, "scope": "x", "instruction": "x",
         })
@@ -541,11 +546,13 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "dispatch-node-scoped-tick",
         })
         self.assertEqual(200, status, tick)
-        status, decided = self.act("persona.automation.decide", {
-            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "dispatch-node-scoped-decision",
-            "kind": "EXECUTE", "rationale": "bounded node-scoped test work", "evidence_refs": [own_goal["goal_id"]],
+        status, decided = self.act("persona.automation.plan", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "decision_id": "dispatch-node-scoped-decision",
         })
         self.assertEqual(200, status, decided)
+        self.assertEqual("EXECUTE", decided["decision"]["kind"])
+        self.assertEqual(own_todo["todo_id"], decided["decision"]["target"]["todo_id"])
         status, dispatched = self.act("persona.automation.dispatch", {
             "run_id": run["run_id"], "owner_ref": anchor, "dispatch_id": "dispatch-node-scoped-dispatch",
             "title": "node scoped bounded task", "instruction": "run the isolated node-scoped check",
@@ -554,6 +561,9 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(201, status, dispatched)
         message = self.server.store.get_master_message(dispatched["message"]["message_id"])
         self.assertEqual(own_node, message["node_ref"])
+        self.assertEqual(own_todo["todo_id"], message["todo_id"])
+        self.assertEqual(own_todo["todo_id"], dispatched["dispatch"]["todo_id"])
+        self.assertEqual(own_todo["todo_id"], message["metadata"]["todo_id"])
         self.assertEqual(anchor, message["node_owner_session_anchor_ref"])
         self.assertEqual(assigned["assignment"]["assignment_revision"], message["node_owner_assignment_revision"])
         # And it is claimable only by the owning node Master -- an
@@ -575,6 +585,71 @@ class NodeMasterAutomationTests(unittest.TestCase):
         })
         self.assertEqual(200, claim_status, claim_result)
         self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claim_result["status"])
+
+    def test_node_plan_waits_for_result_review_instead_of_redispatching_todo(self):
+        anchor = self.register("MASTER", "node-master-review-cursor")
+        persona = self.make_persona("node review cursor")
+        node_ref = self.make_feature_node("review-cursor-node")
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"],
+            "expected_assignment_revision": 0, "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
+        todo = self.server.store.create_todo({
+            "scope_kind": "NODE", "project_id": "TEST", "node_ref": node_ref,
+            "title": "Review cursor Todo", "detail": "one bounded result",
+            "priority": "P0", "state": "READY", "source_kind": "MASTER",
+            "sort_order": 0,
+        })
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor,
+            "scope": "review cursor", "instruction": "run one bounded task",
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        status, tick = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "tick_id": "review-cursor-tick",
+        })
+        self.assertEqual(200, status, tick)
+        status, planned = self.act("persona.automation.plan", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "decision_id": "review-cursor-plan",
+        })
+        self.assertEqual(200, status, planned)
+        self.assertEqual("EXECUTE", planned["decision"]["kind"])
+        self.assertEqual(todo["todo_id"], planned["decision"]["target"]["todo_id"])
+        status, dispatched = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "dispatch_id": "review-cursor-dispatch", "title": "cursor task",
+            "instruction": "return evidence", "completion_conditions": ["result"],
+        })
+        self.assertEqual(201, status, dispatched)
+        assignment = dispatched["dispatch"]
+        self.server.persona_automation.record_master_completion({
+            "run_id": run["run_id"], "dispatch_id": assignment["dispatch_id"],
+            "assignment_revision": assignment["assignment_revision"],
+            "source_message_id": assignment["message_id"],
+            "result_ref": "result://review-cursor",
+            "body_text_utf8_sha256": "a" * 64,
+            "completed_at": "2026-09-17T00:00:00Z",
+        })
+        status, waiting = self.act("persona.automation.plan", {
+            "run_id": run["run_id"], "owner_ref": anchor,
+            "decision_id": "review-cursor-wait",
+        })
+        self.assertEqual(200, status, waiting)
+        self.assertEqual("WAIT", waiting["decision"]["kind"])
+        self.assertEqual(
+            "RESULT_READY_FOR_REVIEW",
+            waiting["decision"]["target"]["assignment"]["state"],
+        )
+        self.assertEqual(
+            todo["todo_id"],
+            waiting["decision"]["target"]["assignment"]["todo_id"],
+        )
 
     # -- regression: the existing project-wide CONDUCTOR path is unchanged -
 

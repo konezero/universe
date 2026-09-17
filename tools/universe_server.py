@@ -4839,6 +4839,14 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
     # Master queue items).
     raw_node_ref = value.get("node_ref")
     node_ref = _identifier(raw_node_ref, "node_ref") if raw_node_ref is not None else None
+    raw_todo_id = value.get("todo_id")
+    todo_id = _identifier(raw_todo_id, "todo_id") if raw_todo_id is not None else None
+    raw_task_frame_id = value.get("task_frame_id")
+    task_frame_id = (
+        _identifier(raw_task_frame_id, "task_frame_id")
+        if raw_task_frame_id is not None
+        else None
+    )
     # Project-wide work may be deliberately addressed to one exact Master
     # Session Anchor.  This is a claim boundary, not a provider preference:
     # a preferred provider in metadata remains only a hint, while this field
@@ -4856,6 +4864,8 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
         "instruction": instruction,
         "metadata": metadata,
         "node_ref": node_ref,
+        "todo_id": todo_id,
+        "task_frame_id": task_frame_id,
         "target_session_anchor_ref": target_session_anchor_ref,
     }
     return {
@@ -4867,6 +4877,8 @@ def normalize_master_message(project_id: str, value: Any) -> dict[str, Any]:
         "instruction": instruction,
         "metadata": metadata,
         "node_ref": node_ref,
+        "todo_id": todo_id,
+        "task_frame_id": task_frame_id,
         "target_session_anchor_ref": target_session_anchor_ref,
         # Stamped by create_master_message from the real current assignment,
         # never trusted from this request -- see there.
@@ -34429,6 +34441,90 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             owner_alignment == "RUN_ANCHOR_BOUND"
             and scope_alignment != "MISMATCH"
         )
+        # One automation run has one authoritative assignment cursor.  Once a
+        # node Master has queued work, submitted a result, or received a PASS,
+        # the next control tick must advance that cursor through the explicit
+        # review/complete routes instead of selecting the same node Todo again.
+        # This is the boundary that previously left node runs oscillating at
+        # RESULT_READY_FOR_REVIEW -> EXECUTE -> ASSIGNMENT_ACTIVE.
+        current_assignment = run.get("current_assignment")
+        current_review = run.get("current_review")
+        assignment_gate: dict[str, Any] | None = None
+        if isinstance(current_assignment, Mapping):
+            assignment_state = str(
+                current_assignment.get("state") or ""
+            ).strip().upper()
+            review_outcome = (
+                str(current_review.get("outcome") or "").strip().upper()
+                if isinstance(current_review, Mapping)
+                else ""
+            )
+            if assignment_state in {
+                "DISPATCHED",
+                "WORKER_ASSIGNED",
+                "REVIEWER_ASSIGNED",
+                "RESULT_READY_FOR_REVIEW",
+            }:
+                assignment_gate = {
+                    "state": assignment_state,
+                    "assignment_id": current_assignment.get("assignment_id"),
+                    "assignment_revision": current_assignment.get("assignment_revision"),
+                    "dispatch_id": current_assignment.get("dispatch_id"),
+                    "message_id": current_assignment.get("message_id"),
+                    "project_id": current_assignment.get("project_id") or project_id,
+                    "node_ref": current_assignment.get("node_ref") or run_node_ref,
+                    "todo_id": current_assignment.get("todo_id"),
+                    "task_frame_id": current_assignment.get("task_frame_id"),
+                    "result_ref": current_assignment.get("result_ref"),
+                    "review_id": current_assignment.get("review_id"),
+                }
+                if assignment_state == "DISPATCHED":
+                    assignment_gate["next_condition"] = (
+                        "the bound Master queue assignment reaches RESULT_READY_FOR_REVIEW"
+                    )
+                elif assignment_state in {"WORKER_ASSIGNED", "REVIEWER_ASSIGNED"}:
+                    assignment_gate["next_condition"] = (
+                        "the bound Worker assignment submits its typed result and review verdict"
+                    )
+                else:
+                    assignment_gate["next_condition"] = (
+                        "record persona.automation.review for this exact result, then complete after PASS"
+                    )
+            elif assignment_state == "REVIEWED" and review_outcome == "PASS":
+                assignment_gate = {
+                    "state": assignment_state,
+                    "assignment_id": current_assignment.get("assignment_id"),
+                    "assignment_revision": current_assignment.get("assignment_revision"),
+                    "dispatch_id": current_assignment.get("dispatch_id"),
+                    "message_id": current_assignment.get("message_id"),
+                    "project_id": current_assignment.get("project_id") or project_id,
+                    "node_ref": current_assignment.get("node_ref") or run_node_ref,
+                    "todo_id": current_assignment.get("todo_id"),
+                    "task_frame_id": current_assignment.get("task_frame_id"),
+                    "result_ref": current_assignment.get("result_ref"),
+                    "review_id": current_assignment.get("review_id"),
+                    "next_condition": "complete this exact assignment through persona.automation.complete",
+                }
+            elif (
+                assignment_state == "REVIEWED"
+                and review_outcome
+                and review_outcome != "PASS"
+                and pending_followup is None
+            ):
+                assignment_gate = {
+                    "state": assignment_state,
+                    "assignment_id": current_assignment.get("assignment_id"),
+                    "assignment_revision": current_assignment.get("assignment_revision"),
+                    "dispatch_id": current_assignment.get("dispatch_id"),
+                    "message_id": current_assignment.get("message_id"),
+                    "project_id": current_assignment.get("project_id") or project_id,
+                    "node_ref": current_assignment.get("node_ref") or run_node_ref,
+                    "todo_id": current_assignment.get("todo_id"),
+                    "task_frame_id": current_assignment.get("task_frame_id"),
+                    "result_ref": current_assignment.get("result_ref"),
+                    "review_id": current_assignment.get("review_id"),
+                    "next_condition": "the durable review follow-up Todo becomes available in this node scope",
+                }
         selected_plan = next(
             (item for item in work_plans if item.get("goal_id") == (selected_goal or {}).get("goal_id")),
             None,
@@ -34437,6 +34533,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if not selection_ready:
             decision_kind = "WAIT"
             rationale = "The requested scope or work owner does not match this automation run."
+        elif assignment_gate is not None:
+            decision_kind = "WAIT"
+            target.update({"assignment": assignment_gate})
+            rationale = (
+                "The current bounded assignment must advance through its authoritative "
+                "result/review lifecycle before another Todo can be selected."
+            )
+            next_condition = requested_next or str(
+                assignment_gate.get("next_condition")
+                or "the current assignment advances through its next typed route"
+            )
         elif executable_todos:
             decision_kind = "EXECUTE"
             todo = executable_todos[0]
@@ -35397,6 +35504,40 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             if action_id == "persona.automation.dispatch":
                 value = _exact_object_fields(request, field="persona_automation_dispatch", required=frozenset({"run_id", "owner_ref", "dispatch_id", "title", "instruction", "completion_conditions"}), optional=frozenset({"todo_id", "task_frame_id"}))
                 run = self.persona_automation.get_run(value["run_id"])
+                decision = run.get("current_decision")
+                target = decision.get("target") if isinstance(decision, Mapping) else None
+                target = target if isinstance(target, Mapping) else {}
+                selected_todo_id = str(
+                    value.get("todo_id") or target.get("todo_id") or ""
+                ).strip()
+                if selected_todo_id:
+                    try:
+                        selected_todo = self.store.get_todo(selected_todo_id)
+                    except UniverseError as error:
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_TODO_NOT_FOUND",
+                            "the dispatch Todo is not present in the authoritative Todo store",
+                            404,
+                        ) from error
+                    if selected_todo.get("project_id") != run.get("project_id"):
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_TODO_SCOPE_MISMATCH",
+                            "the dispatch Todo belongs to another project",
+                            409,
+                        )
+                    run_node_ref = str(run.get("node_ref") or "").strip()
+                    if run_node_ref and str(selected_todo.get("node_ref") or "") != run_node_ref:
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_TODO_SCOPE_MISMATCH",
+                            "the dispatch Todo is outside the automation run node",
+                            409,
+                        )
+                    if str(selected_todo.get("state") or "").upper() not in {"READY", "IN_PROGRESS"}:
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_TODO_STATE_INVALID",
+                            "the dispatch Todo must still be READY or IN_PROGRESS",
+                            409,
+                        )
                 create_worker = None
                 if str(run.get("execution_mode") or "MASTER_DIRECT").upper() == "WORKER_REVIEW":
                     create_worker = lambda spec: self._create_persona_automation_worker(spec, context)

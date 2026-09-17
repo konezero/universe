@@ -854,6 +854,57 @@ class PersonaAutomationStore:
             decision = _load(row["current_decision_json"], {})
             if decision.get("kind") != "EXECUTE":
                 raise PersonaAutomationError("PERSONA_AUTOMATION_EXECUTE_DECISION_REQUIRED", "an EXECUTE decision with evidence is required before dispatch", 409)
+            decision_target = (
+                decision.get("target")
+                if isinstance(decision.get("target"), Mapping)
+                else {}
+            )
+            decision_todo_id = str(
+                decision_target.get("todo_id") or ""
+            ).strip()
+            requested_todo_id = str(value.get("todo_id") or "").strip()
+            if (
+                requested_todo_id
+                and decision_todo_id
+                and requested_todo_id != decision_todo_id
+            ):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_TODO_SELECTION_CONFLICT",
+                    "todo_id does not match the Todo selected by the current plan",
+                    409,
+                )
+            todo_id = requested_todo_id or decision_todo_id or None
+            decision_node_ref = str(
+                decision_target.get("node_ref") or ""
+            ).strip()
+            run_node_ref = str(row["node_ref"] or "").strip()
+            if run_node_ref and decision_node_ref and decision_node_ref != run_node_ref:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_NODE_SELECTION_CONFLICT",
+                    "the selected Todo is outside the automation run node",
+                    409,
+                )
+            if run_node_ref and not todo_id:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_TODO_REQUIRED",
+                    "a node-scoped dispatch requires the exact Todo selected by persona.automation.plan",
+                    409,
+                )
+            decision_task_frame_id = str(
+                decision_target.get("task_frame_id") or ""
+            ).strip()
+            requested_task_frame_id = str(value.get("task_frame_id") or "").strip()
+            if (
+                requested_task_frame_id
+                and decision_task_frame_id
+                and requested_task_frame_id != decision_task_frame_id
+            ):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_TASK_FRAME_SELECTION_CONFLICT",
+                    "task_frame_id does not match the Task Frame selected by the current plan",
+                    409,
+                )
+            task_frame_id = requested_task_frame_id or decision_task_frame_id or None
             existing = connection.execute("SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?", (run_id, "dispatch:" + dispatch_id)).fetchone()
             if existing is not None:
                 payload = _load(existing["payload_json"], {})
@@ -883,9 +934,12 @@ class PersonaAutomationStore:
             # fell back to the project-wide queue bucket).
             execution_mode = str(row["execution_mode"] or "MASTER_DIRECT").upper()
             if execution_mode == "WORKER_REVIEW":
-                target = decision.get("target") if isinstance(decision.get("target"), Mapping) else {}
-                todo_id = _text(value.get("todo_id") or target.get("todo_id"), "todo_id")
-                task_frame_id = str(value.get("task_frame_id") or target.get("task_frame_id") or "").strip() or None
+                if not todo_id:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_TODO_REQUIRED",
+                        "WORKER_REVIEW dispatch requires the exact Todo selected by persona.automation.plan",
+                        409,
+                    )
                 worker_config = _load(row["worker_config_json"], {})
                 if not isinstance(worker_config, Mapping):
                     worker_config = {}
@@ -992,7 +1046,28 @@ class PersonaAutomationStore:
                     "event": event,
                 }
 
-            message_value = {"idempotency_key": f"persona-automation:{run_id}:{dispatch_id}", "title": title, "instruction": instruction, "node_ref": row["node_ref"], "metadata": {"persona_automation_run_id": run_id, "persona_automation_assignment_id": assignment_id, "persona_automation_assignment_revision": assignment_revision, "dispatch_id": dispatch_id, "session_anchor_ref": row["session_anchor_ref"], "persona_id": row["persona_id"], "persona_revision": int(row["persona_revision"]), "completion_conditions": conditions, "provider_invocation": "DEFERRED_TO_MASTER_QUEUE", "completion_route": "PERSONA_AUTOMATION_STORE"}}
+            message_value = {
+                "idempotency_key": f"persona-automation:{run_id}:{dispatch_id}",
+                "title": title,
+                "instruction": instruction,
+                "node_ref": row["node_ref"],
+                "todo_id": todo_id,
+                "task_frame_id": task_frame_id,
+                "metadata": {
+                    "persona_automation_run_id": run_id,
+                    "persona_automation_assignment_id": assignment_id,
+                    "persona_automation_assignment_revision": assignment_revision,
+                    "dispatch_id": dispatch_id,
+                    "session_anchor_ref": row["session_anchor_ref"],
+                    "persona_id": row["persona_id"],
+                    "persona_revision": int(row["persona_revision"]),
+                    "completion_conditions": conditions,
+                    "provider_invocation": "DEFERRED_TO_MASTER_QUEUE",
+                    "completion_route": "PERSONA_AUTOMATION_STORE",
+                    "todo_id": todo_id,
+                    "task_frame_id": task_frame_id,
+                },
+            }
             # The callback is the existing Master queue gateway.  No provider
             # call is made here; delivery and result review remain separate.
             try:
@@ -1003,7 +1078,24 @@ class PersonaAutomationStore:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_QUEUE_ENQUEUE_FAILED", "Master queue enqueue failed; retry the same dispatch idempotency key", 503) from error
             if not isinstance(message, Mapping) or not str(message.get("message_id") or "").strip():
                 raise PersonaAutomationError("PERSONA_AUTOMATION_QUEUE_RECEIPT_INVALID", "Master queue did not return a message receipt", 502)
-            assignment = {"assignment_id": assignment_id, "assignment_revision": assignment_revision, "state": "DISPATCHED", "dispatch_id": dispatch_id, "message_id": message.get("message_id"), "created": bool(created), "title": title, "completion_conditions": conditions, "result_ref": None, "review_id": None}
+            assignment = {
+                "assignment_id": assignment_id,
+                "assignment_revision": assignment_revision,
+                "state": "DISPATCHED",
+                "execution_mode": execution_mode,
+                "dispatch_id": dispatch_id,
+                "message_id": message.get("message_id"),
+                "created": bool(created),
+                "title": title,
+                "instruction": instruction,
+                "completion_conditions": conditions,
+                "project_id": row["project_id"],
+                "node_ref": row["node_ref"],
+                "todo_id": todo_id,
+                "task_frame_id": task_frame_id,
+                "result_ref": None,
+                "review_id": None,
+            }
             now = _timestamp()
             cursor = connection.execute("UPDATE persona_automation_run SET current_assignment_json = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?", (_json(assignment), now, run_id, int(row["revision"])))
             if cursor.rowcount != 1:
