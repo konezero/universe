@@ -8922,12 +8922,16 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .terminal-attention-chip[data-state="COMPLETED"] { color: var(--green, #7eb68a); }
 
 .fleet-node-team { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(122, 124, 130, .16); }
+.fleet-node-team-summary-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fleet-node-team-detail { display: flex; flex-direction: column; gap: 5px; }
 .fleet-node-team-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .fleet-node-team-controls select { min-width: 130px; max-width: 240px; }
 .fleet-node-team-status { margin: 0; color: var(--muted, #9aa4b2); font-size: 10px; overflow-wrap: anywhere; }
 .fleet-node-team-status.is-unknown { color: var(--amber, #d8ad61); }
 .fleet-project-conductor { display: flex; flex-direction: column; gap: 5px; margin: 8px 0 10px; padding: 10px 12px; border: 1px solid rgba(111, 155, 147, .34); border-radius: 7px; background: rgba(16, 27, 39, .42); }
+.fleet-project-conductor-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .fleet-project-conductor-head { color: var(--text, #e8edf5); font-size: 12px; font-weight: 700; }
+.fleet-project-conductor-dialog-content { display: flex; flex-direction: column; gap: 5px; }
 .fleet-project-conductor-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .fleet-project-conductor-controls select { min-width: 180px; max-width: 300px; }
 .fleet-project-conductor-status, .fleet-project-conductor-detail { margin: 0; color: var(--muted, #9aa4b2); font-size: 10px; overflow-wrap: anywhere; }

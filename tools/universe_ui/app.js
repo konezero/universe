@@ -48,6 +48,12 @@ const state = {
   /** Project-wide Conductor Persona Action state; separate from node Master UI. */
   fleetProjectConductorActionStatus: "IDLE",
   fleetProjectConductorActionError: "",
+  /** Project-wide Conductor automation projection (persona.automation.status). */
+  fleetConductorAutomation: null,
+  /** Whether the Conductor "Manage" modal is open, for refresh-while-open. */
+  fleetConductorDialogOpen: false,
+  /** featureId of the node whose "Manage" modal is open, or null. */
+  openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
   fleetWorkerAssignmentsByNode: {},
   /** Authoritative node-scoped Persona automation projections. */
@@ -5225,7 +5231,7 @@ async function refreshFleetProjectConductorProjection(projectId) {
   if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
 }
 
-function assignFleetProjectConductorPersona(personaId) {
+function assignFleetProjectConductorPersona(personaId, sessionAnchorRef) {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   const projection = fleetProjectConductorProjection(projectId);
   const persona = fleetProjectConductorActivePersona(personaId);
@@ -5236,11 +5242,21 @@ function assignFleetProjectConductorPersona(personaId) {
   if (projection.terminals.status !== "READY") {
     return Promise.reject(new Error(projection.terminals.error || "Authoritative Conductor Host projection is unavailable."));
   }
-  if (live.length !== 1) {
-    return Promise.reject(new Error(live.length ? "Multiple live project Conductor sessions are available; resolve the authoritative conflict first." : "A live project Conductor session is required."));
+  const requestedAnchor = String(sessionAnchorRef || "").trim();
+  // An explicit anchor (the session-select control) picks among any number
+  // of live Conductor terminals instead of requiring exactly one -- the old
+  // implicit live[0] behaviour is kept only when no anchor is named, so
+  // existing callers are unaffected.
+  const terminalAnchor = requestedAnchor
+    || (live.length === 1 ? String(live[0].session_anchor_ref || "").trim() : "");
+  if (!terminalAnchor || !live.some((item) => String(item.session_anchor_ref || "").trim() === terminalAnchor)) {
+    return Promise.reject(new Error(
+      requestedAnchor
+        ? "The selected Session Anchor is not a live project Conductor terminal."
+        : live.length ? "Multiple live project Conductor sessions are available; pick one to assign." : "A live project Conductor session is required."
+    ));
   }
   if (!persona) return Promise.reject(new Error("An active Persona is required."));
-  const terminalAnchor = String(live[0].session_anchor_ref || "").trim();
   const targetExisting = projection.assignments.all.find((item) =>
     String(item.session_anchor_ref || "").trim() === terminalAnchor
   );
@@ -5317,17 +5333,71 @@ async function retryFleetProjectConductorProjection(projectId) {
   ]);
 }
 
+function openFleetConductorDialog(projectId) {
+  state.fleetConductorDialogOpen = true;
+  renderFleetConductorDialogBody(projectId);
+  const dialog = document.querySelector("#fleet-conductor-dialog");
+  if (dialog && !dialog.open) dialog.showModal();
+}
+
+function renderFleetConductorDialogBody(projectId) {
+  const body = document.querySelector("#fleet-conductor-dialog-body");
+  if (!body) return;
+  body.replaceChildren();
+  body.append(renderFleetConductorDialogContent(projectId));
+}
+
+// Compact summary shown inline on the Fleet home screen. Session selection,
+// persona assign/unassign and automation controls all live behind "Manage"
+// in the modal (renderFleetConductorDialogContent) -- this used to render
+// everything inline, which is what made the panel look broken whenever the
+// ambiguity check below tripped (2026-09-17 finding, see
+// fleetProjectConductorAssignments).
 function renderFleetProjectConductor(projectId) {
   const target = document.querySelector("#home-conductor-persona");
   if (!target) return;
   target.replaceChildren();
   const wrap = node("section", "fleet-project-conductor");
-  wrap.append(node("div", "fleet-project-conductor-head", "Project Team / Conductor Persona"));
-  wrap.append(node("p", "fleet-project-conductor-detail", "Project-wide Conductor binding. node_ref is reserved for a node Master."));
+  const headRow = node("div", "fleet-project-conductor-head-row");
+  headRow.append(node("span", "fleet-project-conductor-head", "Project Team / Conductor Persona"));
+  const manageButton = node("button", "secondary-button compact-action", "Manage");
+  manageButton.type = "button";
+  manageButton.addEventListener("click", () => openFleetConductorDialog(projectId));
+  headRow.append(manageButton);
+  wrap.append(headRow);
   if (!projectId) {
     wrap.append(node("p", "fleet-project-conductor-status is-unknown", "UNKNOWN: select a project."));
     target.append(wrap);
     return;
+  }
+  const projection = fleetProjectConductorProjection(projectId);
+  const assignment = projection.assignment;
+  const assignmentStatus = String(projection.assignments.status || "UNKNOWN").toUpperCase();
+  const summaryLine = node("p", "fleet-project-conductor-status");
+  if (assignmentStatus === "ERROR") {
+    summaryLine.classList.add("is-error");
+    summaryLine.textContent = `ERROR: ${projection.assignments.error || "PERSONA_ASSIGNMENTS_READ_FAILED"}`;
+  } else if (assignmentStatus === "LOADING" || assignmentStatus === "UNKNOWN") {
+    summaryLine.classList.add("is-unknown");
+    summaryLine.textContent = `${assignmentStatus}: loading authoritative Persona assignment...`;
+  } else if (assignment) {
+    const persona = (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(assignment.persona_id || ""));
+    summaryLine.textContent = `Persona: ${persona?.title || assignment.persona_id || "UNKNOWN"}`;
+  } else {
+    summaryLine.classList.add("is-unknown");
+    summaryLine.textContent = "Persona assignment: UNASSIGNED (project scope)";
+  }
+  wrap.append(summaryLine);
+  target.append(wrap);
+  if (state.fleetConductorDialogOpen) renderFleetConductorDialogBody(projectId);
+}
+
+function renderFleetConductorDialogContent(projectId) {
+  const wrap = node("div", "fleet-project-conductor-dialog-content");
+  wrap.append(node("p", "fleet-project-conductor-detail", "Project-wide Conductor binding. node_ref is reserved for a node Master."));
+  if (!projectId) {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", "UNKNOWN: select a project."));
+    return wrap;
   }
   const projection = fleetProjectConductorProjection(projectId);
   const assignment = projection.assignment;
@@ -5402,6 +5472,20 @@ function renderFleetProjectConductor(projectId) {
   const activePersonas = state.personaLibraryStatus === "READY"
     ? (state.personaLibrary || []).filter((item) => String(item.state || "").toUpperCase() === "ACTIVE")
     : [];
+  // A session select (mirroring the node Master's Bind existing session
+  // control) instead of the old implicit "the one live Conductor" -- lets
+  // an operator pick among several live Conductor terminals rather than
+  // being hard-blocked whenever more than one exists (2026-09-17).
+  const sessionSelect = document.createElement("select");
+  sessionSelect.setAttribute("aria-label", "Conductor session");
+  for (const terminal of live) {
+    const option = document.createElement("option");
+    option.value = terminal.session_anchor_ref;
+    option.textContent = fleetTerminalLabel(terminal);
+    if (assignment && terminal.session_anchor_ref === assignment.session_anchor_ref) option.selected = true;
+    sessionSelect.append(option);
+  }
+  if (!live.length) controls.append(node("span", "fleet-project-conductor-status is-unknown", "UNKNOWN: no live Conductor session"));
   const personaSelect = document.createElement("select");
   personaSelect.setAttribute("aria-label", "Project Conductor Persona");
   for (const item of activePersonas) {
@@ -5418,14 +5502,14 @@ function renderFleetProjectConductor(projectId) {
   }
   const assign = node("button", "secondary-button compact-action", assignment ? "Change Conductor Persona" : "Assign Conductor Persona");
   assign.type = "button";
-  assign.disabled = !activePersonas.length || assignmentStatus !== "READY" || terminalStatus !== "READY" || live.length !== 1 || actionStatus === "SAVING";
+  assign.disabled = !activePersonas.length || !live.length || assignmentStatus !== "READY" || terminalStatus !== "READY" || actionStatus === "SAVING";
   assign.addEventListener("click", () => {
     assign.disabled = true;
-    assignFleetProjectConductorPersona(personaSelect.value)
+    assignFleetProjectConductorPersona(personaSelect.value, sessionSelect.value)
       .catch((error) => toast(error.message, true))
       .finally(() => { assign.disabled = false; });
   });
-  controls.append(personaSelect, assign);
+  controls.append(sessionSelect, personaSelect, assign);
   if (assignment && assignmentStatus === "READY") {
     const unassign = node("button", "secondary-button compact-action", "Unassign Conductor Persona");
     unassign.type = "button";
@@ -5439,7 +5523,11 @@ function renderFleetProjectConductor(projectId) {
     controls.append(unassign);
   }
   wrap.append(controls);
-  target.append(wrap);
+  wrap.append(renderFleetConductorAutomationControls(
+    projectId,
+    String(assignment?.session_anchor_ref || (live.length === 1 ? live[0].session_anchor_ref : "") || "").trim()
+  ));
+  return wrap;
 }
 
 // Zero-or-more Worker (IMPLEMENTER) / Reviewer bindings per node, read from
@@ -5577,6 +5665,94 @@ function renderFleetAutomationControls(featureId, owner) {
     return b;
   };
   if (!run || ["COMPLETED", "STOPPED", "FAILED"].includes(stateLabel)) controls.append(button("Start bounded run", "start"));
+  if (run && ["RUNNING", "WAITING"].includes(stateLabel)) controls.append(button("Pause", "pause"));
+  if (run && stateLabel === "PAUSED") controls.append(button("Resume", "resume"));
+  if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Stop", "stop"));
+  wrap.append(controls);
+  return wrap;
+}
+
+// Project-wide Conductor automation is the same typed persona.automation
+// Actions as node automation, keyed by the Conductor's own Anchor instead
+// of a featureId -- the run's node_ref comes from the Conductor's own
+// assignment server-side (never a request field), mirroring
+// ensureFleetAutomation/mutateFleetAutomation for a node Master.
+async function ensureFleetConductorAutomation(projectId, anchor) {
+  if (!projectId || !anchor) return;
+  const existing = state.fleetConductorAutomation;
+  if (existing && existing.projectId === projectId && existing.anchor === anchor && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetConductorAutomation = { projectId, anchor, status: "LOADING", run: null, error: "" };
+  try {
+    const result = await invokeServerAction("persona.automation.status", {
+      project_id: projectId, session_anchor_ref: anchor,
+    });
+    state.fleetConductorAutomation = {
+      projectId, anchor, status: "READY", run: result.run || result.last_run || null, error: "",
+    };
+  } catch (error) {
+    state.fleetConductorAutomation = { projectId, anchor, status: "ERROR", run: null, error: error.message };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId && typeof renderIntegratedHome === "function") renderIntegratedHome();
+}
+
+async function mutateFleetConductorAutomation(projectId, anchor, operation, run) {
+  if (!projectId || !anchor) throw new Error("A live project Conductor Anchor is required.");
+  if (operation === "start") {
+    await invokeServerAction("persona.automation.start", {
+      project_id: projectId, session_anchor_ref: anchor,
+      scope: "project-wide design/goal facilitation",
+      instruction: "Review the current Goal/Todo backlog. Surface unclear or conflicting points as questions; propose node, plan, or Todo candidates for the user or a node Master to adopt. Do not execute or dispatch work directly -- adoption and execution stay with Master and the user.",
+      request_id: fleetProjectConductorRequestId(`automation-${operation}`),
+      idempotency_key: fleetProjectConductorRequestId(`automation-${operation}`),
+    });
+  } else {
+    if (!run?.run_id) throw new Error("No authoritative automation run is available.");
+    await invokeServerAction(`persona.automation.${operation}`, {
+      run_id: run.run_id, request_id: fleetProjectConductorRequestId(`automation-${operation}`),
+      expected_revision: run.revision,
+      ...(operation === "pause" || operation === "stop" ? { reason: `Fleet Conductor control: ${operation}` } : {}),
+    });
+  }
+  state.fleetConductorAutomation = null;
+  await ensureFleetConductorAutomation(projectId, anchor);
+}
+
+function renderFleetConductorAutomationControls(projectId, anchor) {
+  const wrap = node("div", "fleet-node-automation");
+  if (!anchor) {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", "Automation: no live Conductor Anchor to run it under"));
+    return wrap;
+  }
+  const projection = state.fleetConductorAutomation;
+  if (!projection || projection.projectId !== projectId || projection.anchor !== anchor || projection.status === "LOADING") {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", "Automation: loading authoritative Conductor run..."));
+    void ensureFleetConductorAutomation(projectId, anchor);
+    return wrap;
+  }
+  if (projection.status === "ERROR") {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Automation: ERROR - ${projection.error || "read failed"}`));
+    return wrap;
+  }
+  const run = projection.run;
+  const stateLabel = String(run?.state || "IDLE").toUpperCase();
+  if (run?.execution_mode) wrap.append(node("p", "fleet-project-conductor-status", `Execution: ${run.execution_mode}`));
+  wrap.append(node("p", "fleet-project-conductor-status", `Automation: ${stateLabel}${run?.next_condition ? ` - next ${run.next_condition}` : ""}`));
+  if (run?.owner_availability && run.owner_availability !== "LIVE") {
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Owner Anchor: ${run.owner_availability}`));
+  }
+  const controls = node("div", "fleet-project-conductor-controls");
+  const button = (label, op) => {
+    const b = node("button", "secondary-button compact-action", label);
+    b.type = "button";
+    b.addEventListener("click", () => {
+      b.disabled = true;
+      mutateFleetConductorAutomation(projectId, anchor, op, run)
+        .catch((error) => toast(error.message, true))
+        .finally(() => { b.disabled = false; });
+    });
+    return b;
+  };
+  if (!run || ["COMPLETED", "STOPPED", "FAILED"].includes(stateLabel)) controls.append(button("Start automation", "start"));
   if (run && ["RUNNING", "WAITING"].includes(stateLabel)) controls.append(button("Pause", "pause"));
   if (run && stateLabel === "PAUSED") controls.append(button("Resume", "resume"));
   if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Stop", "stop"));
@@ -5926,18 +6102,74 @@ function startFleetNewMasterSession(featureId, personaId) {
   openSessionSummaryForNew({ project, nodeId: projectId, mode: "MASTER" });
 }
 
-function renderFleetNodeTeamControls(graphNode) {
+function openFleetNodeTeamDialog(graphNode) {
+  const featureId = homeNodeRefKey(graphNode.node_id);
+  state.openFleetNodeTeamFeatureId = featureId;
+  const title = document.querySelector("#fleet-node-team-dialog-title");
+  if (title) title.textContent = graphNode.title || featureId;
+  renderFleetNodeTeamDialogBody(graphNode);
+  const dialog = document.querySelector("#fleet-node-team-dialog");
+  if (dialog && !dialog.open) dialog.showModal();
+}
+
+function renderFleetNodeTeamDialogBody(graphNode) {
+  const body = document.querySelector("#fleet-node-team-dialog-body");
+  if (!body) return;
+  body.replaceChildren();
+  const content = renderFleetNodeTeamDialogContent(graphNode);
+  if (content) body.append(content);
+}
+
+// Compact card summary. Session bind/new/unassign, Worker roster,
+// automation, coordination and the orphan queue all move behind "Manage"
+// in the modal (renderFleetNodeTeamDialogContent) so a Fleet screen with
+// several nodes does not stack five-plus <select> controls per card
+// (2026-09-17 declutter, per operator request).
+function renderFleetNodeTeamSummary(graphNode) {
   if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") return null;
   const featureId = homeNodeRefKey(graphNode.node_id);
   const section = node("section", "fleet-node-team");
   section.dataset.nodeRef = featureId;
-  section.append(node("strong", "", "Team"));
+  const headRow = node("div", "fleet-node-team-summary-head");
+  headRow.append(node("strong", "", "Team"));
+  const manageButton = node("button", "secondary-button compact-action", "Manage");
+  manageButton.type = "button";
+  manageButton.addEventListener("click", () => openFleetNodeTeamDialog(graphNode));
+  headRow.append(manageButton);
+  section.append(headRow);
   const projection = fleetNodeAssignments(featureId);
   if (projection.status === "UNKNOWN" || projection.status === "ERROR") {
     section.append(node("p", "fleet-node-team-status is-unknown", projection.status === "ERROR"
       ? "ERROR: MULTIPLE_ACTIVE_MASTERS"
       : `UNKNOWN: ${fleetNodeAssignmentError()}`));
     void ensureHomeNodeOwners();
+    return section;
+  }
+  const owner = projection.active[0] || null;
+  const persona = owner && (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(owner.persona_id || ""));
+  const ownerLine = node("p", "fleet-node-team-status");
+  if (owner) {
+    const ownerLive = fleetAuthoritativeTerminals().some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
+    ownerLine.append(
+      node("span", "fleet-node-role", "Master"),
+      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${ownerLive ? "LIVE" : "OFFLINE"}`),
+    );
+  } else {
+    ownerLine.append(node("span", "fleet-node-role", "Master"), document.createTextNode(" UNASSIGNED"));
+  }
+  section.append(ownerLine);
+  if (state.openFleetNodeTeamFeatureId === featureId) renderFleetNodeTeamDialogBody(graphNode);
+  return section;
+}
+
+function renderFleetNodeTeamDialogContent(graphNode) {
+  const featureId = homeNodeRefKey(graphNode.node_id);
+  const section = node("div", "fleet-node-team-detail");
+  const projection = fleetNodeAssignments(featureId);
+  if (projection.status === "UNKNOWN" || projection.status === "ERROR") {
+    section.append(node("p", "fleet-node-team-status is-unknown", projection.status === "ERROR"
+      ? "ERROR: MULTIPLE_ACTIVE_MASTERS"
+      : `UNKNOWN: ${fleetNodeAssignmentError()}`));
     return section;
   }
   const owner = projection.active[0] || null;
@@ -6276,7 +6508,7 @@ function openFleetNodeFromTerminal(session) {
 }
 
 function renderHomeNodeOwnerRow(graphNode) {
-  const controls = renderFleetNodeTeamControls(graphNode);
+  const controls = renderFleetNodeTeamSummary(graphNode);
   if (!controls) return null;
   void ensureHomeNodeOwners();
   return controls;
@@ -20974,6 +21206,12 @@ refreshLawStrip = function () {
   document.querySelector("#room-dialog")?.addEventListener("close", () => {
     state.roomObsId = null;
     closeRoomObsStream();
+  });
+  document.querySelector("#fleet-conductor-dialog")?.addEventListener("close", () => {
+    state.fleetConductorDialogOpen = false;
+  });
+  document.querySelector("#fleet-node-team-dialog")?.addEventListener("close", () => {
+    state.openFleetNodeTeamFeatureId = null;
   });
 
   // Graph mode lives on top primary nav (showGraphView). Legacy [data-view]
