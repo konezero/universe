@@ -21011,6 +21011,23 @@ class UniverseStore:
     def _task_worker_assignment_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
         if row is None:
             return None
+        # Worker/Reviewer is a Persona responsibility, not a Runtime Mode.
+        # Persistent Fleet sessions have their own Host Anchor; ephemeral
+        # Task Frame turns deliberately reuse the owning Master Anchor.  Keep
+        # that transport distinction authoritative in the projection so UI
+        # and automation never infer a fake WORKER Mode from this row.
+        execution_shape = (
+            "TASK_FRAME"
+            if str(row["session_anchor_ref"] or "")
+            == str(row["assigned_by_session_anchor_ref"] or "")
+            else "FLEET_SESSION"
+        )
+        runtime_role = "WORKER"
+        persona_task_kind = (
+            "REVIEW"
+            if str(row["worker_role"] or "").upper() == "REVIEWER"
+            else "IMPLEMENTATION"
+        )
         return {
             "schema": "universe.task-worker-assignment.v1",
             "assignment_id": row["assignment_id"],
@@ -21028,6 +21045,9 @@ class UniverseStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "ended_at": row["ended_at"],
+            "execution_shape": execution_shape,
+            "runtime_role": runtime_role,
+            "persona_task_kind": persona_task_kind,
         }
 
     def assign_task_worker(self, value: Mapping[str, Any], actor: Mapping[str, Any]) -> dict[str, Any]:
@@ -33914,33 +33934,445 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "automation_instruction": persona_delivery.get("automation_instruction"),
         }
 
+    def _create_persona_automation_task_frame_worker(
+        self, spec: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Reserve an ephemeral Task Frame Worker for Persona automation.
+
+        A node Worker is a Task Frame role, not a third Runtime Mode.  The
+        durable Fleet row remains useful for exact Todo/Frame lineage and
+        CAS/history, but it points at the owning Master Anchor and records
+        ``execution_shape=TASK_FRAME`` instead of spawning a persistent
+        ``mode=WORKER`` Supervisor session.  Provider execution happens in
+        ``_run_persona_automation_task_frame`` after the automation CAS has
+        committed, using the existing Runtime Host/ephemeral turn route.
+        """
+
+        project_id = _project_id(spec.get("project_id"))
+        run_id = _required_text(spec.get("run_id"), "run_id")
+        dispatch_id = _required_text(spec.get("dispatch_id"), "dispatch_id")
+        worker_role = _required_text(spec.get("worker_role"), "worker_role").upper()
+        if worker_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_WORKER_ROLE_INVALID",
+                "automation Worker role must be IMPLEMENTER or REVIEWER",
+                409,
+            )
+        assigned_by = _required_text(
+            spec.get("assigned_by_session_anchor_ref"),
+            "assigned_by_session_anchor_ref",
+        )
+        self._validate_persona_assignment_anchor(project_id, assigned_by)
+        if "MASTER" not in self._anchor_modes(assigned_by):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_MASTER_REQUIRED",
+                "Task Frame automation must remain owned by the node Master Anchor",
+                409,
+            )
+
+        requested_frame = str(spec.get("task_frame_id") or "").strip()
+        frame_id = requested_frame or (
+            "persona_tf_"
+            + hashlib.sha256(
+                f"{run_id}:{dispatch_id}:{worker_role}".encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        try:
+            frame = self.task_frame_lineage.get_task_frame(frame_id)
+        except TaskFrameLineageError as error:
+            if error.code != "TASK_FRAME_NOT_FOUND" or requested_frame:
+                raise PersonaAutomationError(error.code, error.detail, error.status) from error
+            try:
+                frame, _created = self.task_frame_lineage.create_task_frame(
+                    frame_ref=frame_id,
+                    origin_session_anchor_ref=assigned_by,
+                    target_session_anchor_ref=assigned_by,
+                )
+            except TaskFrameLineageError as create_error:
+                raise PersonaAutomationError(
+                    create_error.code, create_error.detail, create_error.status
+                ) from create_error
+        if str(frame.get("origin_session_anchor_ref") or "") != assigned_by:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_TASK_FRAME_ORIGIN_MISMATCH",
+                "Task Frame origin must remain the owning Master Anchor",
+                409,
+            )
+        target_anchor = str(frame.get("target_session_anchor_ref") or "").strip()
+        if target_anchor and target_anchor != assigned_by:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_TASK_FRAME_TARGET_MISMATCH",
+                "Task Frame target must remain the owning Master Anchor",
+                409,
+            )
+
+        # attach_master_reviewer expects the exact frame coordinate to be
+        # present in its reviewer spec when it was originally omitted.
+        if isinstance(spec, dict):
+            spec["task_frame_id"] = frame_id
+        assignment_result = self.store.assign_task_worker(
+            {
+                "project_id": project_id,
+                "node_ref": spec.get("node_ref"),
+                "todo_id": spec.get("todo_id"),
+                "task_frame_id": frame_id,
+                "worker_role": worker_role,
+                "session_anchor_ref": assigned_by,
+                "persona_id": spec.get("persona_id"),
+                "assigned_by_session_anchor_ref": assigned_by,
+            },
+            self._persona_actor(context),
+        )
+        assignment = dict(assignment_result.get("assignment") or {})
+        assignment.update(
+            {
+                "execution_shape": "TASK_FRAME",
+                "runtime_role": "WORKER",
+                "persona_task_kind": (
+                    "REVIEW" if worker_role == "REVIEWER" else "IMPLEMENTATION"
+                ),
+                "provider": str(spec.get("provider") or "CODEX").strip().upper(),
+                "model_ref": str(spec.get("model_ref") or "gpt-5.6-luna").strip(),
+                "effort": str(spec.get("effort") or "LOW").strip().upper(),
+            }
+        )
+        self._record_worker_assignment_event(
+            project_id=project_id, outcome="ASSIGNED", assignment=assignment
+        )
+        return {
+            "schema": "universe.persona-automation-task-frame-worker-result.v1",
+            "status": "PERSONA_AUTOMATION_TASK_FRAME_WORKER_ASSIGNED",
+            "assignment": assignment,
+            "task_frame": frame,
+            "execution_shape": "TASK_FRAME",
+        }
+
     def _create_persona_automation_worker(
         self, spec: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Create an automation Worker through the public Fleet Action path.
+        """Create an automation Worker through the Task Frame route.
 
-        Persona automation owns orchestration state; Fleet owns the live Host
-        and assignment receipt.  Keeping this adapter at the server boundary
-        means the automation store never creates a terminal or invents an
-        Anchor, while retries continue to use the same typed route.
+        Explicit Fleet UI sessions continue to use
+        ``fleet.worker-session-start``.  Persona automation instead uses an
+        ephemeral Task Frame under the node Master so it cannot register a
+        fake persistent WORKER Mode or leave a stale provider Session Anchor.
         """
 
-        request: dict[str, Any] = {
-            "project_id": spec.get("project_id"),
-            "worker_role": spec.get("worker_role"),
-            "assigned_by_session_anchor_ref": spec.get("assigned_by_session_anchor_ref"),
-            "node_ref": spec.get("node_ref"),
-            "todo_id": spec.get("todo_id"),
-            "task_frame_id": spec.get("task_frame_id"),
-        }
-        for field in ("persona_id", "provider", "model_ref", "effort"):
-            if spec.get(field) not in (None, ""):
-                request[field] = spec[field]
-        return self._handle_fleet_worker_session_start_action(
-            request,
-            context,
-            automation_task=spec,
+        return self._create_persona_automation_task_frame_worker(spec, context)
+
+    def _run_persona_automation_task_frame(
+        self,
+        run: Mapping[str, Any],
+        *,
+        worker_role: str,
+        current: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Execute one assigned Worker/Reviewer Task Frame and record it.
+
+        This is the provider boundary for node automation.  The durable run
+        and assignment are already CAS-committed when this method is called;
+        the Host invocation is therefore a bounded ephemeral turn whose
+        receipt/result is recorded separately from the assignment phase.
+        """
+
+        normalized_role = _required_text(worker_role, "worker_role").upper()
+        if normalized_role not in {"IMPLEMENTER", "REVIEWER"}:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_WORKER_ROLE_INVALID",
+                "automation Worker role must be IMPLEMENTER or REVIEWER",
+                HTTPStatus.CONFLICT,
+            )
+        worker_info = current.get("assignment")
+        if not isinstance(worker_info, Mapping):
+            raise UniverseError(
+                "PERSONA_AUTOMATION_WORKER_RECEIPT_INVALID",
+                "Task Frame Worker assignment is missing",
+                HTTPStatus.CONFLICT,
+            )
+        if str(worker_info.get("execution_shape") or "").upper() != "TASK_FRAME":
+            raise UniverseError(
+                "PERSONA_AUTOMATION_EXECUTION_SHAPE_INVALID",
+                "Task Frame execution requires an explicit TASK_FRAME assignment",
+                HTTPStatus.CONFLICT,
+            )
+        run_id = _required_text(run.get("run_id"), "run_id")
+        dispatch_id = _required_text(
+            run.get("current_assignment", {}).get("dispatch_id")
+            if isinstance(run.get("current_assignment"), Mapping)
+            else None,
+            "dispatch_id",
         )
+        assignment_id = _required_text(
+            worker_info.get("assignment_id"), "worker_assignment.assignment_id"
+        )
+        assignment_revision = int(worker_info.get("assignment_revision") or 0)
+        if assignment_revision < 1:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_ASSIGNMENT_INVALID",
+                "Task Frame assignment revision must be positive",
+                HTTPStatus.CONFLICT,
+            )
+        frame_id = _required_text(
+            worker_info.get("task_frame_id"), "worker_assignment.task_frame_id"
+        )
+        provider = str(
+            worker_info.get("provider")
+            or (run.get("worker_config") or {}).get("provider")
+            or "CODEX"
+        ).strip().upper()
+        capability = self.runtime_host.provider_capability(provider)
+        if capability.get("status") != "AVAILABLE":
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_UNAVAILABLE",
+                str(capability.get("reason") or "selected provider is unavailable"),
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if provider == "CODEX" and str(capability.get("model") or "").casefold() != "gpt-5.6-luna":
+            raise UniverseError(
+                "PERSONA_AUTOMATION_LUNA_UNAVAILABLE",
+                "the bounded node Worker route requires gpt-5.6-luna",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        source_ref = (
+            f"universe://projects/{run.get('project_id')}/persona-automation/"
+            f"{run_id}/task-frame/{frame_id}/{normalized_role.lower()}"
+        )
+        invocation_id = f"persona-worker:{run_id}:{dispatch_id}:{normalized_role.lower()}"
+        turn_id = "worker" if normalized_role == "IMPLEMENTER" else "reviewer"
+        instruction = str(
+            current.get("instruction")
+            or (run.get("current_worker") or {}).get("instruction")
+            or (run.get("current_reviewer") or {}).get("instruction")
+            or "Complete the exact bounded automation task and report the result."
+        ).strip()
+        assignment = run.get("current_assignment")
+        assignment = assignment if isinstance(assignment, Mapping) else {}
+        master_result = current.get("master_result")
+        master_result = master_result if isinstance(master_result, Mapping) else {}
+        worker_result = run.get("current_worker")
+        worker_result = worker_result if isinstance(worker_result, Mapping) else {}
+        context_pack = {
+            "schema": "universe.persona-automation-task-frame-context.v1",
+            "semantic_role": normalized_role,
+            "runtime_role": "WORKER",
+            "execution_shape": "TASK_FRAME",
+            "run_id": run_id,
+            "dispatch_id": dispatch_id,
+            "project_id": run.get("project_id"),
+            "node_ref": run.get("node_ref"),
+            "todo_id": assignment.get("todo_id"),
+            "task_frame_id": frame_id,
+            "assignment_id": assignment_id,
+            "assignment_revision": assignment_revision,
+            "instruction": instruction,
+            "completion_conditions": current.get("completion_conditions") or assignment.get("completion_conditions") or [],
+            "master_result": master_result,
+            "worker_result": worker_result.get("result") if isinstance(worker_result.get("result"), Mapping) else {},
+            "constraints": [
+                "Use only the supplied Goal/Todo/Task Frame evidence.",
+                "Do not claim Todo completion from a delivery receipt.",
+                "Return the bounded provider result separately from transport state.",
+            ],
+        }
+        if normalized_role == "REVIEWER":
+            output_contract = {
+                "schema": "universe.persona-automation-reviewer-output.v1",
+                "format": "STRUCTURED_JSON",
+                "required": ["verdict", "evidence_refs", "note", "next_action"],
+                "json_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["verdict", "evidence_refs", "note", "next_action"],
+                    "properties": {
+                        "verdict": {"type": "string", "minLength": 4, "maxLength": 32},
+                        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                        "note": {"type": "string", "maxLength": 4000},
+                        "next_action": {"type": "string", "maxLength": 1000},
+                    },
+                },
+                "instruction": (
+                    "Review the exact supplied Master/Worker result. Return one JSON object with "
+                    "verdict PASS, NEEDS_REVISION, or BLOCKED and cite evidence_refs."
+                ),
+            }
+        else:
+            output_contract = {
+                "schema": "universe.persona-automation-worker-output.v1",
+                "format": "STRUCTURED_JSON",
+                "required": ["outcome", "result_text", "evidence_refs", "validation_state"],
+                "json_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["outcome", "result_text", "evidence_refs", "validation_state"],
+                    "properties": {
+                        "outcome": {"type": "string", "minLength": 3, "maxLength": 32},
+                        "result_text": {"type": "string", "minLength": 1, "maxLength": 16000},
+                        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                        "validation_state": {"type": "string", "minLength": 3, "maxLength": 32},
+                    },
+                },
+                "instruction": (
+                    "Complete the exact bounded task and return one JSON object. Keep the task "
+                    "result separate from CLI or delivery state."
+                ),
+            }
+        try:
+            runtime_binding = self._persona_automation_runtime_binding(run)
+            provider_result = self.runtime_host.invoke_structured_task(
+                runtime_binding=runtime_binding,
+                provider=provider,
+                invocation_id=invocation_id,
+                frame_id=frame_id,
+                turn_id=turn_id,
+                source_ref=source_ref,
+                instruction=output_contract["instruction"],
+                context_pack=context_pack,
+                output_contract=output_contract,
+            )
+        except RuntimeHostError as error:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_FAILED",
+                f"{error.code}: {error.detail}",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from error
+        structured = provider_result.get("structured_result")
+        if not isinstance(structured, Mapping):
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
+                "Task Frame Host returned no structured provider result",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        receipt = str(provider_result.get("result_receipt_ref") or "").strip()
+        if not receipt:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_RECEIPT_MISSING",
+                "Task Frame Host returned no provider receipt",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        evidence_refs = [
+            f"provider-result:{receipt}",
+            *[
+                str(item).strip()
+                for item in (structured.get("evidence_refs") or [])
+                if isinstance(item, str) and item.strip()
+            ],
+        ]
+        evidence_refs = list(dict.fromkeys(evidence_refs))[:48]
+        provider_evidence = {
+            "provider": provider,
+            "model_ref": provider_result.get("model_ref"),
+            "result_receipt_ref": receipt,
+            "task_frame_result_status": provider_result.get("task_frame_result_status"),
+            "terminal_result_verified": provider_result.get("terminal_result_verified") is True,
+            "execution_shape": "TASK_FRAME",
+            "frame_id": frame_id,
+            "turn_id": turn_id,
+        }
+        provider_result_ref = (
+            f"task-frame-result://{frame_id}/{turn_id}/{assignment_revision}"
+        )
+        try:
+            self.task_frame_lineage.attach_result(
+                result_ref=provider_result_ref,
+                frame_ref=frame_id,
+                origin_session_anchor_ref=str(
+                    run.get("session_anchor_ref") or worker_info.get("assigned_by_session_anchor_ref") or ""
+                ),
+                result={
+                    "provider_execution": provider_evidence,
+                    "structured_result": dict(structured),
+                },
+            )
+        except TaskFrameLineageError as error:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_TASK_FRAME_RESULT_LINEAGE_FAILED",
+                f"{error.code}: {error.detail}",
+                HTTPStatus.CONFLICT,
+            ) from error
+        evidence_refs.append(f"task-frame-result:{provider_result_ref}")
+        provider_evidence["task_frame_result_ref"] = provider_result_ref
+        if normalized_role == "IMPLEMENTER":
+            outcome = str(structured.get("outcome") or "").strip().upper()
+            if outcome not in {"SUCCEEDED", "FAILED", "BLOCKED", "NOT_RUN"}:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
+                    "Worker outcome must be SUCCEEDED, FAILED, BLOCKED or NOT_RUN",
+                    HTTPStatus.BAD_GATEWAY,
+                )
+            result_ref = provider_result_ref
+            recorded = self.persona_automation.record_worker_result(
+                {
+                    "run_id": run_id,
+                    "dispatch_id": dispatch_id,
+                    "worker_assignment_id": assignment_id,
+                    "worker_assignment_revision": assignment_revision,
+                    "worker_anchor_ref": worker_info.get("session_anchor_ref"),
+                    "result_ref": result_ref,
+                    "outcome": outcome,
+                    "evidence_refs": evidence_refs,
+                    "result_digest": _json_sha256(structured),
+                    "result_text": str(structured.get("result_text") or "").strip(),
+                    "validation_state": str(structured.get("validation_state") or "NOT_RUN").strip().upper(),
+                },
+                lambda reviewer_spec: self._create_persona_automation_worker(
+                    reviewer_spec, {"actor": {"kind": "USER", "actor_ref": run.get("session_anchor_ref")}}
+                ),
+            )
+            recorded["provider_execution"] = provider_evidence
+            current_run = recorded.get("run")
+            reviewer = recorded.get("reviewer")
+            if isinstance(reviewer, Mapping) and isinstance(current_run, Mapping):
+                recorded["reviewer_execution"] = self._ensure_persona_automation_worker_instruction(
+                    current_run, context={"actor": {"kind": "USER", "actor_ref": run.get("session_anchor_ref")}}
+                )
+            return recorded
+
+        verdict = str(
+            structured.get("verdict") or structured.get("outcome") or ""
+        ).strip().upper()
+        if verdict not in {"PASS", "NEEDS_REVISION", "BLOCKED"}:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
+                "Reviewer verdict must be PASS, NEEDS_REVISION or BLOCKED",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        master_result_ref = str(master_result.get("result_ref") or "").strip()
+        worker_result_ref = str(
+            current.get("worker_result_ref") or master_result_ref
+        ).strip()
+        if not worker_result_ref:
+            raise UniverseError(
+                "PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH",
+                "Reviewer has no exact source result reference",
+                HTTPStatus.CONFLICT,
+            )
+        verdict_result = self.persona_automation.record_reviewer_verdict(
+            {
+                "run_id": run_id,
+                "dispatch_id": dispatch_id,
+                "reviewer_assignment_id": assignment_id,
+                "reviewer_assignment_revision": assignment_revision,
+                "reviewer_anchor_ref": worker_info.get("session_anchor_ref"),
+                "worker_result_ref": worker_result_ref,
+                "outcome": verdict,
+                "acceptance_status": "VERIFIED_EVIDENCE" if verdict == "PASS" else "PENDING",
+                "evidence_refs": evidence_refs,
+                "note": str(structured.get("note") or "").strip() or None,
+                "next_action": str(structured.get("next_action") or "").strip() or None,
+            }
+        )
+        verdict_result["provider_execution"] = provider_evidence
+        followup = self._create_persona_review_followup_todo(verdict_result)
+        verdict_result["followup"] = followup
+        updated_run = verdict_result.get("run")
+        if isinstance(updated_run, Mapping) and str(updated_run.get("node_ref") or "").strip() and (
+            verdict == "PASS" or followup.get("todo") is not None
+        ):
+            verdict_result["driver"] = self._enqueue_persona_automation_driver(
+                updated_run,
+                driver_key=f"review-{verdict_result['review']['review_id']}",
+            )
+        return verdict_result
 
     def _ensure_persona_automation_master_reviewer(
         self,
@@ -33991,14 +34423,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _ensure_persona_automation_worker_instruction(
         self, run: Mapping[str, Any], *, context: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Post one exact Worker/Reviewer task for a committed automation run.
+        """Run one exact Worker/Reviewer phase for a committed automation run.
 
         ``persona.automation.dispatch`` creates the Fleet assignment first.
-        This method is the missing second half: it addresses that assignment's
-        Session Anchor through the durable Session Bus and stores the message
-        id against the same assignment. The Bus result observer can therefore
-        route the reply into the typed Worker-result or Reviewer-verdict
-        Action without scanning terminals, recency or browser state.
+        Task Frame assignments execute through the owner Master Runtime Host
+        and record a provider result packet. Explicit Fleet sessions use the
+        durable Session Bus branch below, which stores the message id against
+        the same assignment. Neither branch scans terminals, recency or
+        browser state.
         """
 
         del context  # identity is already pinned in the durable run/assignment
@@ -34026,6 +34458,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         worker_assignment_revision = int(worker_assignment.get("assignment_revision") or 0)
         if not worker_assignment_id or not worker_anchor_ref or worker_assignment_revision < 1:
             return {"status": "ERROR", "reason": "Worker assignment coordinates are incomplete"}
+        if str(worker_assignment.get("execution_shape") or "").upper() == "TASK_FRAME":
+            # Task Frame turns are ephemeral provider executions under the
+            # node Master Anchor.  They do not have a live Worker terminal or
+            # a Session Bus inbox; run the exact turn through the Host after
+            # the assignment CAS and record its provider result separately.
+            return self._run_persona_automation_task_frame(
+                run, worker_role=worker_role, current=current
+            )
         config = run.get("worker_config")
         config = config if isinstance(config, Mapping) else {}
         provider = str(config.get("provider") or "CODEX").strip().upper()
@@ -36301,11 +36741,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     str(run.get("execution_mode") or "MASTER_DIRECT").upper() == "WORKER_REVIEW"
                     and callable(getattr(self, "_ensure_persona_automation_worker_instruction", None))
                 ):
-                    # Creating a Fleet Worker and delivering its Persona is
-                    # not the bounded task itself. Send exactly one typed
-                    # Session Bus instruction after the run transaction has
-                    # committed. Replays repair a missing post without
-                    # creating another Worker or assignment.
+                    # Creating the durable Worker assignment is not the
+                    # bounded task itself. The Task Frame branch executes one
+                    # exact Host turn after the run transaction has committed;
+                    # the explicit Fleet branch posts one typed Session Bus
+                    # instruction. Replays repair only the missing phase
+                    # without creating another Worker or assignment.
                     current_run = self.persona_automation.get_run(value["run_id"])
                     result["worker_instruction"] = self._ensure_persona_automation_worker_instruction(
                         current_run, context=context
@@ -37518,13 +37959,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _persona_automation_runtime_binding(
         self, run: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Resolve a Task Frame Runtime bound to the run's Conductor Anchor.
+        """Resolve a Task Frame Runtime bound to the run's owner Anchor.
 
         The ordinary detached Conductor binding is reusable only when its
-        origin Anchor is exactly the run owner.  Otherwise attach the
-        run-owned Conductor session through the existing session-runtime
-        route; this keeps the user Conductor and an automation run from
-        silently sharing a frame coordinate.
+        origin Anchor is exactly the run owner. Node Master automation instead
+        attaches the run-owned Master session through the same session-runtime
+        route; this keeps a user Conductor, node Master and automation turn
+        from silently sharing a frame coordinate.
         """
 
         project_id = _identifier(run.get("project_id"), "run.project_id")
@@ -37541,6 +37982,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if planning is not None and planning.get("origin_anchor_ref") == anchor:
             return planning
 
+        anchor_modes = self._anchor_modes(anchor)
+        # Node Master automation owns its own Task Frame turns.  Those turns
+        # must attach to the Master Host Anchor; requiring CONDUCTOR here
+        # strands node runs even though the same Runtime Host contract is
+        # valid for both live project modes.  Prefer the exact MASTER anchor
+        # when present and retain CONDUCTOR for project-wide runs.
+        runtime_mode = "MASTER" if "MASTER" in anchor_modes else "CONDUCTOR"
         sessions = [
             item
             for item in self.session_supervisor.list_sessions(include_hidden=True)
@@ -37548,12 +37996,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and str(item.get("mode") or item.get("current_mode") or "")
             .strip()
             .upper()
-            == "CONDUCTOR"
+            == runtime_mode
         ]
         if len(sessions) != 1:
             raise UniverseError(
                 "PERSONA_AUTOMATION_RUNTIME_ANCHOR_UNAVAILABLE",
-                "the run owner Anchor does not resolve to one Conductor session",
+                f"the run owner Anchor does not resolve to one {runtime_mode} session",
                 HTTPStatus.CONFLICT,
             )
         session = dict(sessions[0])

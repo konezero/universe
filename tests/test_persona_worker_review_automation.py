@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from persona_automation import PersonaAutomationError, PersonaAutomationStore  # noqa: E402
+from task_frame_lineage import TaskFrameLineageError  # noqa: E402
 from universe_server import UniverseHTTPServer  # noqa: E402
+from universe_server import UniverseStore  # noqa: E402
 
 
 class PersonaWorkerReviewAutomationTests(unittest.TestCase):
@@ -32,6 +34,272 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_task_frame_assignment_is_worker_role_without_worker_mode(self):
+        persistent = UniverseStore._task_worker_assignment_row(
+            {
+                "assignment_id": "fleet-1",
+                "project_id": "project-worker-review",
+                "node_ref": "feature-worker-review",
+                "todo_id": "todo-worker",
+                "task_frame_id": "frame-fleet",
+                "worker_role": "REVIEWER",
+                "session_anchor_ref": "worker-anchor",
+                "persona_id": None,
+                "state": "ACTIVE",
+                "assignment_revision": 1,
+                "assigned_by_session_anchor_ref": "master-anchor",
+                "ended_reason": None,
+                "created_at": "now",
+                "updated_at": "now",
+                "ended_at": None,
+            }
+        )
+        self.assertEqual("FLEET_SESSION", persistent["execution_shape"])
+        self.assertEqual("WORKER", persistent["runtime_role"])
+        self.assertEqual("REVIEW", persistent["persona_task_kind"])
+
+        ephemeral = UniverseStore._task_worker_assignment_row(
+            {
+                "assignment_id": "task-frame-1",
+                "project_id": "project-worker-review",
+                "node_ref": "feature-worker-review",
+                "todo_id": "todo-worker",
+                "task_frame_id": "frame-task",
+                "worker_role": "IMPLEMENTER",
+                "session_anchor_ref": "master-anchor",
+                "persona_id": None,
+                "state": "ACTIVE",
+                "assignment_revision": 1,
+                "assigned_by_session_anchor_ref": "master-anchor",
+                "ended_reason": None,
+                "created_at": "now",
+                "updated_at": "now",
+                "ended_at": None,
+            }
+        )
+        self.assertEqual("TASK_FRAME", ephemeral["execution_shape"])
+        self.assertEqual("WORKER", ephemeral["runtime_role"])
+        self.assertEqual("IMPLEMENTATION", ephemeral["persona_task_kind"])
+
+    def test_automation_worker_mints_task_frame_under_master_anchor(self):
+        calls = []
+
+        class Lineage:
+            def get_task_frame(self, _frame_id):
+                raise TaskFrameLineageError(
+                    "TASK_FRAME_NOT_FOUND", "not created", status=404
+                )
+
+            def create_task_frame(self, **kwargs):
+                calls.append(("frame", kwargs))
+                return {
+                    "frame_ref": kwargs["frame_ref"],
+                    "origin_session_anchor_ref": kwargs["origin_session_anchor_ref"],
+                    "target_session_anchor_ref": kwargs["target_session_anchor_ref"],
+                }, True
+
+        class Store:
+            def assign_task_worker(self, value, _actor):
+                calls.append(("assignment", dict(value)))
+                return {
+                    "assignment": {
+                        "assignment_id": "task-frame-assignment",
+                        "project_id": value["project_id"],
+                        "node_ref": value["node_ref"],
+                        "todo_id": value["todo_id"],
+                        "task_frame_id": value["task_frame_id"],
+                        "worker_role": value["worker_role"],
+                        "session_anchor_ref": value["session_anchor_ref"],
+                        "persona_id": value.get("persona_id"),
+                        "state": "ACTIVE",
+                        "assignment_revision": 1,
+                        "assigned_by_session_anchor_ref": value[
+                            "assigned_by_session_anchor_ref"
+                        ],
+                    }
+                }
+
+        server = SimpleNamespace(
+            store=Store(),
+            task_frame_lineage=Lineage(),
+            _validate_persona_assignment_anchor=lambda _project, _anchor: None,
+            _anchor_modes=lambda _anchor: {"MASTER"},
+            _persona_actor=UniverseHTTPServer._persona_actor,
+            _record_worker_assignment_event=lambda **kwargs: calls.append(
+                ("event", kwargs)
+            ),
+        )
+        result = UniverseHTTPServer._create_persona_automation_task_frame_worker(
+            server,
+            {
+                "run_id": "run-task-frame",
+                "dispatch_id": "dispatch-task-frame",
+                "project_id": "project-worker-review",
+                "node_ref": "feature-worker-review",
+                "todo_id": "todo-worker",
+                "worker_role": "REVIEWER",
+                "assigned_by_session_anchor_ref": "master-anchor",
+                "provider": "CODEX",
+                "model_ref": "gpt-5.6-luna",
+            },
+            {"actor": {"kind": "USER", "actor_ref": "master-anchor"}},
+        )
+        assignment = result["assignment"]
+        self.assertEqual("TASK_FRAME", result["execution_shape"])
+        self.assertEqual("TASK_FRAME", assignment["execution_shape"])
+        self.assertEqual("WORKER", assignment["runtime_role"])
+        self.assertEqual("REVIEW", assignment["persona_task_kind"])
+        self.assertEqual("master-anchor", assignment["session_anchor_ref"])
+        self.assertEqual("master-anchor", assignment["assigned_by_session_anchor_ref"])
+        self.assertEqual("frame", calls[0][0])
+        self.assertEqual("assignment", calls[1][0])
+
+    def test_master_reviewer_task_frame_records_provider_verdict(self):
+        run = self.store.start_run(
+            {
+                "project_id": self.assignment["project_id"],
+                "session_anchor_ref": self.assignment["session_anchor_ref"],
+                "scope": "master direct review",
+                "instruction": "review one bounded Master result",
+                "request_id": "master-direct-start",
+                "execution_mode": "MASTER_DIRECT",
+                "worker_persona_id": "persona-reviewer",
+                "worker_provider": "CODEX",
+                "worker_model_ref": "gpt-5.6-luna",
+            },
+            self.assignment,
+        )["run"]
+        self.store.claim_tick(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": self.assignment["session_anchor_ref"],
+                "tick_id": "master-direct-tick",
+            }
+        )
+        self.store.record_decision(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": self.assignment["session_anchor_ref"],
+                "decision_id": "master-direct-decision",
+                "kind": "EXECUTE",
+                "rationale": "exact Todo is ready",
+                "evidence_refs": ["todo:master"],
+                "target": {"todo_id": "todo-master-review", "node_ref": self.assignment["node_ref"]},
+            }
+        )
+        dispatched = self.store.dispatch_work(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": self.assignment["session_anchor_ref"],
+                "dispatch_id": "master-direct-dispatch",
+                "title": "bounded Master result",
+                "instruction": "complete the bounded result",
+                "completion_conditions": ["result evidence"],
+            },
+            lambda _project_id, value: (
+                {
+                    "message_id": "master-message-1",
+                    "target_session_anchor_ref": self.assignment["session_anchor_ref"],
+                },
+                True,
+            ),
+        )
+        assignment = dispatched["dispatch"]
+        completed = self.store.record_master_completion(
+            {
+                "run_id": run["run_id"],
+                "dispatch_id": assignment["dispatch_id"],
+                "assignment_revision": assignment["assignment_revision"],
+                "source_message_id": "master-message-1",
+                "result_ref": "master-result-1",
+                "body_text_utf8_sha256": "digest-master-result",
+                "completed_at": "2026-09-18T00:00:00Z",
+                "result_text": "bounded Master result",
+            }
+        )
+        reviewer_assignment = {
+            "assignment_id": "task-frame-reviewer",
+            "project_id": self.assignment["project_id"],
+            "node_ref": self.assignment["node_ref"],
+            "todo_id": assignment["todo_id"],
+            "task_frame_id": "frame-master-review",
+            "worker_role": "REVIEWER",
+            "session_anchor_ref": self.assignment["session_anchor_ref"],
+            "assignment_revision": 1,
+            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
+            "execution_shape": "TASK_FRAME",
+        }
+        attached = self.store.attach_master_reviewer(
+            {
+                "run_id": run["run_id"],
+                "dispatch_id": assignment["dispatch_id"],
+                "assignment_revision": assignment["assignment_revision"],
+                "source_message_id": "master-message-1",
+                "result_ref": "master-result-1",
+                "body_text_utf8_sha256": "digest-master-result",
+                "result_text": "bounded Master result",
+            },
+            create_reviewer=lambda spec: (
+                spec.__setitem__("task_frame_id", "frame-master-review")
+                or {"assignment": reviewer_assignment}
+            ),
+        )
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED", attached["status"])
+        run_with_reviewer = attached["run"]
+
+        class Runtime:
+            def provider_capability(self, provider):
+                return {"provider": provider, "status": "AVAILABLE", "model": "gpt-5.6-luna"}
+
+            def invoke_structured_task(self, **_kwargs):
+                return {
+                    "result_receipt_ref": "receipt-reviewer",
+                    "model_ref": "provider://CODEX/model/gpt-5.6-luna",
+                    "task_frame_result_status": "TASK_COMPLETED",
+                    "terminal_result_verified": True,
+                    "structured_result": {
+                        "verdict": "PASS",
+                        "evidence_refs": ["review:bounded"],
+                        "note": "result is independently verified",
+                        "next_action": "continue",
+                    },
+                }
+
+        lineage_results = []
+
+        class Lineage:
+            def attach_result(self, **kwargs):
+                lineage_results.append(dict(kwargs))
+                return {"result_ref": kwargs["result_ref"]}, True
+
+        server = SimpleNamespace(
+            runtime_host=Runtime(),
+            persona_automation=self.store,
+            task_frame_lineage=Lineage(),
+            _persona_automation_runtime_binding=lambda _run: {
+                "endpoint": "http://127.0.0.1:1",
+                "token": "opaque",
+                "session_id": "master-runtime",
+                "origin_anchor_ref": self.assignment["session_anchor_ref"],
+                "origin_frame_id": "current",
+                "parent_actor_ref": "master-runtime",
+                "parent_evidence_ref": "anchor://master",
+            },
+            _create_persona_review_followup_todo=lambda _result: {"todo": None},
+            _enqueue_persona_automation_driver=lambda _run, **_kwargs: {"status": "QUEUED"},
+        )
+        result = UniverseHTTPServer._run_persona_automation_task_frame(
+            server,
+            run_with_reviewer,
+            worker_role="REVIEWER",
+            current=run_with_reviewer["current_reviewer"],
+        )
+        self.assertEqual("PERSONA_AUTOMATION_REVIEW_RECORDED", result["status"])
+        self.assertEqual("PASS", result["review"]["outcome"])
+        self.assertEqual("TASK_FRAME", result["provider_execution"]["execution_shape"])
+        self.assertEqual("task-frame-result://frame-master-review/reviewer/1", lineage_results[0]["result_ref"])
+        self.assertEqual("frame-master-review", lineage_results[0]["frame_ref"])
 
     def _prepared_run(self):
         run = self.store.start_run(

@@ -218,8 +218,27 @@ Task Frame Worker는 raw sub-agent spawn이 아니라 Host가
 돌아온다. Fleet Worker Session은 장기 실행, 사용자 관찰, Provider Resume가
 필요할 때만 사용하는 별도 실행 표면이다.
 
-현재 구현의 `fleet.worker-session-start` 및 Persona automation 경로는
-대부분의 Worker/Reviewer 작업을 먼저 Host terminal로 만들고 있다. 이는
-Career 계약의 선택적 실행 형태와 맞지 않는 구현 잔여다. 후속 구현은
-Task Frame Worker 경로와 durable Fleet Session 경로를 분리하고,
-`mode=WORKER`를 Runtime Mode로 등록하지 않아야 한다.
+`fleet.worker-session-start`는 사용자가 장기 관찰·재개를 명시적으로
+요청한 경우에만 쓰는 `FLEET_SESSION` 표면이다. 자동 Node Persona
+automation은 이 Action이나 persistent Worker Host를 만들지 않고, 아래의
+Task Frame 경로를 사용한다. 따라서 Worker/Reviewer는 assignment 역할이며
+새 authority나 Runtime Mode가 아니다. 호환성을 위해 명시적 Fleet terminal이
+운영하는 transport mode 표기는 자동화 경로의 Mode Registry와 분리해
+취급해야 한다.
+
+## Automation transport correction (2026-09-18)
+
+Node Persona automation now reserves automatic IMPLEMENTER and REVIEWER turns
+as `execution_shape=TASK_FRAME` assignments. The durable assignment keeps the
+exact project, node, Todo, Task Frame, parent Master Anchor, assignment
+revision, Persona task kind, and provider phase, but it does not create a
+persistent `WORKER` Supervisor Mode or a provider Session Anchor. The Runtime
+Host executes the bounded ephemeral turn after the run CAS commits and returns
+a provider receipt/result packet to the Master-owned automation projection.
+
+`execution_shape=FLEET_SESSION` remains available for an explicit Fleet UI
+request that needs a long-lived Worker terminal, but that route is separate
+from automatic node control. A queue receipt or assignment state is never a
+provider result, Reviewer verdict, or Todo completion. The automation driver
+must observe the Task Frame result, record `PASS`/`NEEDS_REVISION`/`BLOCKED`,
+and only then continue the node Todo lifecycle.

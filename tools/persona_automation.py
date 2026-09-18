@@ -1137,6 +1137,23 @@ class PersonaAutomationStore:
                         "Fleet Worker session route did not return a durable assignment",
                         502,
                     )
+                # A Task Frame Worker has no resident provider Session Anchor.
+                # Its durable assignment still carries the exact Frame minted
+                # by the Host, so bind that coordinate before checking the
+                # remaining dispatch lineage.  The old Fleet route supplied a
+                # caller Task Frame (or None); the ephemeral route may mint
+                # one after the dispatch request was validated.
+                worker_task_frame_id = str(
+                    worker_assignment.get("task_frame_id") or ""
+                ).strip() or None
+                if task_frame_id is None:
+                    task_frame_id = worker_task_frame_id
+                elif worker_task_frame_id != task_frame_id:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_WORKER_PROVENANCE_MISMATCH",
+                        "Fleet Worker assignment does not preserve exact task_frame_id lineage",
+                        409,
+                    )
                 expected_scope = {
                     "project_id": row["project_id"],
                     "node_ref": row["node_ref"],
@@ -1460,7 +1477,15 @@ class PersonaAutomationStore:
                     )
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVIEWER_PROVENANCE_MISMATCH", f"Fleet Reviewer assignment does not preserve exact {field} lineage", 409)
         reviewer_anchor = _text(reviewer_assignment.get("session_anchor_ref"), "reviewer_assignment.session_anchor_ref")
-        if reviewer_anchor == worker_anchor_ref:
+        reviewer_is_task_frame = str(
+            reviewer_assignment.get("execution_shape") or ""
+        ).upper() == "TASK_FRAME"
+        worker_is_task_frame = str(
+            worker_assignment.get("execution_shape") or ""
+        ).upper() == "TASK_FRAME"
+        if reviewer_anchor == worker_anchor_ref and not (
+            reviewer_is_task_frame and worker_is_task_frame
+        ):
             with self._connection() as connection:
                 now = _timestamp()
                 connection.execute(
@@ -1491,7 +1516,22 @@ class PersonaAutomationStore:
             if not isinstance(existing_reviewer, Mapping) or str(existing_reviewer.get("state") or "").upper() != "CREATING":
                 return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_REVIEWER_CREATION_PENDING", "run": self._row(row), "worker_result": result_payload, "reviewer": existing_reviewer}
             assignment = _load(row["current_assignment_json"], {})
-            updated_assignment = {**dict(assignment), "state": "REVIEWER_ASSIGNED", "reviewer_assignment_id": reviewer_assignment.get("assignment_id"), "reviewer_assignment_revision": reviewer_revision, "reviewer_anchor_ref": reviewer_anchor}
+            updated_assignment = {
+                **dict(assignment),
+                "state": "REVIEWER_ASSIGNED",
+                "reviewer_assignment_id": reviewer_assignment.get("assignment_id"),
+                "reviewer_assignment_revision": reviewer_revision,
+                "reviewer_anchor_ref": reviewer_anchor,
+            }
+            # Ephemeral Task Frame reviewers run under the owning Master
+            # Anchor.  Persist the Host-minted Frame on the automation
+            # assignment so the later verdict CAS checks the same lineage.
+            if not updated_assignment.get("task_frame_id") and reviewer_assignment.get(
+                "task_frame_id"
+            ):
+                updated_assignment["task_frame_id"] = reviewer_assignment.get(
+                    "task_frame_id"
+                )
             now = _timestamp()
             cursor = connection.execute(
                 "UPDATE persona_automation_run SET current_assignment_json = ?, current_reviewer_json = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
@@ -1675,6 +1715,17 @@ class PersonaAutomationStore:
                 # still authoritative; no anchor, cache, or message scan is
                 # consulted to fill a missing revision.
                 assignment_revision = current_assignment_revision
+            # ``master.complete`` permits an omitted result_ref for ordinary
+            # queue work. Persona automation still needs a stable source
+            # coordinate before it can create an independent Reviewer. Derive
+            # that coordinate only from the authenticated completion message
+            # and exact assignment revision; never substitute a delivery
+            # receipt or infer a result from recency.
+            if not result_ref:
+                result_ref = (
+                    "master-result://"
+                    f"{source_message_id}/{int(assignment_revision or 0)}"
+                )
             payload = {
                 "dispatch_id": dispatch_id,
                 "assignment_revision": int(assignment_revision),
@@ -2030,7 +2081,10 @@ class PersonaAutomationStore:
             reviewer_assignment.get("session_anchor_ref"),
             "reviewer_assignment.session_anchor_ref",
         )
-        if reviewer_anchor == str(reviewer_spec["assigned_by_session_anchor_ref"]):
+        reviewer_is_task_frame = str(
+            reviewer_assignment.get("execution_shape") or ""
+        ).upper() == "TASK_FRAME"
+        if reviewer_anchor == str(reviewer_spec["assigned_by_session_anchor_ref"]) and not reviewer_is_task_frame:
             return mark_failed(
                 "Reviewer must use a distinct Worker Session Anchor",
                 "PERSONA_AUTOMATION_REVIEWER_MUST_BE_INDEPENDENT",
@@ -2080,6 +2134,12 @@ class PersonaAutomationStore:
                 "reviewer_assignment_revision": reviewer_revision,
                 "reviewer_anchor_ref": reviewer_anchor,
             }
+            if not updated_assignment.get("task_frame_id") and reviewer_assignment.get(
+                "task_frame_id"
+            ):
+                updated_assignment["task_frame_id"] = reviewer_assignment.get(
+                    "task_frame_id"
+                )
             now = _timestamp()
             cursor = connection.execute(
                 "UPDATE persona_automation_run SET current_assignment_json = ?, "

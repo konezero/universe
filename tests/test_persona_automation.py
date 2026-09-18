@@ -394,6 +394,58 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PersonaAutomationError, "differs"):
             self.store.record_master_completion({**completion, "result_ref": "result:changed"})
 
+    def test_master_completion_derives_a_stable_result_ref_when_omitted(self):
+        run = self.start("master-completion-derived-ref")
+        owner = self.assignment["session_anchor_ref"]
+        self.store.claim_tick(
+            {"run_id": run["run_id"], "owner_ref": owner, "tick_id": "derived-ref-tick"}
+        )
+        self.store.record_decision(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": owner,
+                "decision_id": "derived-ref-decision",
+                "kind": "EXECUTE",
+                "rationale": "the exact Todo is inside scope",
+                "evidence_refs": ["todo:derived-ref"],
+                "target": {"todo_id": "todo-derived-ref"},
+            }
+        )
+        dispatched = self.store.dispatch_work(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": owner,
+                "dispatch_id": "derived-ref-dispatch",
+                "title": "derived result reference",
+                "instruction": "complete the bounded result",
+                "completion_conditions": ["result evidence"],
+            },
+            lambda _project_id, _value: (
+                {"message_id": "derived-ref-message"},
+                True,
+            ),
+        )
+        assignment = dispatched["dispatch"]
+        recorded = self.store.record_master_completion(
+            {
+                "run_id": run["run_id"],
+                "dispatch_id": assignment["dispatch_id"],
+                "assignment_revision": assignment["assignment_revision"],
+                "source_message_id": assignment["message_id"],
+                "result_ref": "",
+                "body_text_utf8_sha256": "d" * 64,
+                "completed_at": "2026-09-18T00:00:00Z",
+            }
+        )
+        self.assertEqual(
+            f"master-result://derived-ref-message/{assignment['assignment_revision']}",
+            recorded["result"]["result_ref"],
+        )
+        self.assertEqual(
+            f"master-result://derived-ref-message/{assignment['assignment_revision']}",
+            recorded["run"]["current_assignment"]["result_ref"],
+        )
+
     def test_master_completion_creates_distinct_reviewer_worker_and_accepts_verdict(self):
         assignment = {**self.assignment, "node_ref": "feature_master_review"}
         run = self.store.start_run(

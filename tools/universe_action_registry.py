@@ -1008,12 +1008,14 @@ def build_default_action_registry(
             side_effect_class="LOCAL_DATABASE_MUTATION",
             metadata={
                 "statement": (
-                    "Creates a real, live Worker/Reviewer terminal through the "
-                    "same Host-launch route as session.new (mode=WORKER, never "
-                    "a guessed session.new target), then records the durable "
-                    "Fleet Worker/Reviewer binding only once that terminal "
-                    "actually exists (2026-09-16 -- closes the 'no eligible "
-                    "Worker/Reviewer terminal exists' blocker)."
+                    "Creates an explicit long-lived Fleet Worker/Reviewer "
+                    "terminal through the supported Host-launch route, then "
+                    "records the durable binding only after the exact Host "
+                    "receipt exists. This is the FLEET_SESSION observation "
+                    "surface: Worker/Reviewer are assignment roles, not a "
+                    "new authority or automatic node Runtime Mode. Persona "
+                    "automation uses its separate TASK_FRAME route under the "
+                    "node Master and must not call this Action."
                 ),
             },
         ),
