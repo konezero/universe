@@ -21,6 +21,7 @@ from universe_app.terminal_host import (  # noqa: E402
     _ANSI_ESCAPE_RE,
     _DEV_CHANNEL_PROMPT_RE,
     MANAGED_SHELL_IDENTITY_MISSING,
+    AttachEvidence,
     ManagedShell,
     ProcessIdentity,
     ShellObservation,
@@ -2191,3 +2192,42 @@ class TerminalHostTests(unittest.TestCase):
         exit_events = exited_host.audit_events(terminal_id=exited["terminal_id"])
         self.assertEqual("BACKEND_EXITED", exit_events[0]["event_type"])
         self.assertEqual("PTY_MONITOR", exit_events[0]["source"])
+
+class AttachBootstrapGateTests(unittest.TestCase):
+    def test_cli_attach_sealed_requires_session_start_receipt(self) -> None:
+        host = TerminalHost()
+        session = TerminalSession(
+            terminal_id="term-attach-gate",
+            project_id="universe",
+            mode="WORKER",
+            provider="CODEX",
+            supervisor_session_id="session-attach-gate",
+            cwd=str(ROOT),
+            executable="codex.exe",
+            created_at="2026-09-17T15:12:29Z",
+            session_anchor_ref="session_anchor_attach_gate",
+            state="LIVE",
+            backend=FakePty(),
+            managed_shell=ManagedShell(
+                terminal_id="term-attach-gate",
+                session_anchor_ref="session_anchor_attach_gate",
+                provider="CODEX",
+                shell=ProcessIdentity(pid=11, started_at=1.0),
+            ),
+        )
+        host._sessions[session.terminal_id] = session
+        self.assertFalse(host.cli_attach_sealed(session.terminal_id))
+        session.managed_shell.record_attach_evidence(
+            AttachEvidence(
+                terminal_id=session.terminal_id,
+                shell=ProcessIdentity(pid=11, started_at=1.0),
+                cli=ProcessIdentity(pid=12, started_at=1.1),
+                provider="CODEX",
+                session_anchor_ref=session.session_anchor_ref,
+            )
+        )
+        self.assertTrue(host.cli_attach_sealed(session.terminal_id))
+
+
+if __name__ == "__main__":
+    unittest.main()

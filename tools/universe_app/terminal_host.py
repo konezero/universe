@@ -30,6 +30,7 @@ from universe_app.managed_shell import (
     CLI_STARTING,
     DEFAULT_INTERRUPT_GRACE_SECONDS,
     HOOK_TIMEOUT,
+    MANAGED_SHELL_STARTUP_GRACE_SECONDS,
     PROCESS_INSPECTION_UNAVAILABLE,
     PTY_RESPONSIVENESS_UNKNOWN,
     PTY_UNRESPONSIVE,
@@ -448,7 +449,8 @@ MANAGED_SHELL_RECLAIM_STATES = frozenset(
 # mid-prompt and the reconcile loop would respawn it into the same wall. Hold a
 # grace window, measured from the spawned shell's own start time, during which a
 # MISSING identity on a still-live shell is reported as CLI_STARTING.
-MANAGED_SHELL_STARTUP_GRACE_SECONDS = 180.0
+# Duration lives in managed_shell.MANAGED_SHELL_STARTUP_GRACE_SECONDS (shared
+# with HOOK_TIMEOUT) so Worker/Reviewer cannot be Ctrl+C'd inside that window.
 
 
 def managed_shell_identity_path(root: Path, terminal_id: str) -> Path:
@@ -3279,6 +3281,18 @@ class TerminalHost:
             session.pump_thread = thread
         thread.start()
 
+    def cli_attach_sealed(self, terminal_id: str) -> bool:
+        """True once SessionStart AttachEvidence sealed this managed shell.
+
+        Used to keep SESSION_READY bootstrap and persona Worker/Reviewer
+        instructions behind the same gate a healthy UI new-session already
+        waits for implicitly.
+        """
+
+        session = self.get(terminal_id)
+        managed = getattr(session, "managed_shell", None)
+        return bool(managed is not None and getattr(managed, "cli_ever_attached", False))
+
     def _submit_session_bootstrap(self, session: TerminalSession) -> None:
         """Use the same composer-settle and effect verification as bus turns."""
         status = "unknown"
@@ -3371,7 +3385,18 @@ class TerminalHost:
                 continue
             if awaiting_bootstrap:
                 bootstrap_tail = (bootstrap_tail + chunk)[-16384:]
-                if provider_cli_ready_for_bootstrap(session.provider, bootstrap_tail):
+                # Match a healthy UI new-session: SessionStart AttachEvidence must
+                # seal before SESSION_READY is injected. Banner-only readiness
+                # (e.g. "OpenAI Codex") used to fire bootstrap ~2s after spawn and
+                # could race the hook; HOOK_TIMEOUT then killed unsealed CLIs.
+                managed = getattr(session, "managed_shell", None)
+                sealed = bool(
+                    managed is not None
+                    and getattr(managed, "cli_ever_attached", False)
+                )
+                if sealed and provider_cli_ready_for_bootstrap(
+                    session.provider, bootstrap_tail
+                ):
                     awaiting_bootstrap = False
                     # Keep the output pump running while the common submitter
                     # waits for composer commit and verifies the resulting turn.

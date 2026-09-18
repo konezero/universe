@@ -2048,6 +2048,18 @@ class PersonaAutomationStore:
             "master_result": master_result,
             "instruction": reviewer_spec["instruction"],
         }
+        # The Fleet route may have already posted and claimed the exact
+        # Reviewer instruction while combining it with the Persona native
+        # queue turn. Persist that receipt on the automation projection so a
+        # subsequent kick replays the same message instead of posting a second
+        # body (which would be rejected by Session Bus idempotency).
+        precreated_instruction = (
+            reviewer_result.get("automation_instruction")
+            if isinstance(reviewer_result, Mapping)
+            else None
+        )
+        if isinstance(precreated_instruction, Mapping):
+            reviewer_payload["precreated_instruction"] = dict(precreated_instruction)
         with self._connection() as connection:
             current = self._get(connection, run_id)
             existing = _load(current["current_reviewer_json"], None)

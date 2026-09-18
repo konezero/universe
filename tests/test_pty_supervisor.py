@@ -111,6 +111,7 @@ class PtySupervisorTests(unittest.TestCase):
                 {
                     "persona_text": persona,
                     "message_id": "persona-test",
+                    "continuation_text": "dispatch continuation",
                     "timeout_seconds": 12.5,
                 },
             )
@@ -118,7 +119,7 @@ class PtySupervisorTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(delivery, payload["persona_delivery"])
         deliver.assert_called_once_with(
-            "term_one", persona, message_id="persona-test", timeout_seconds=12.5
+            "term_one", persona, message_id="persona-test", continuation_text="dispatch continuation", timeout_seconds=12.5
         )
 
     def test_supervised_host_persona_native_queue_uses_bounded_receipt_timeout(self) -> None:
@@ -136,6 +137,7 @@ class PtySupervisorTests(unittest.TestCase):
                 "term-supervised",
                 '한글\nwith a "quote"',
                 message_id="persona-test",
+                continuation_text="continuation\nwith a \"quote\"",
                 timeout_seconds=12.5,
             )
 
@@ -146,6 +148,7 @@ class PtySupervisorTests(unittest.TestCase):
             payload={
                 "persona_text": '한글\nwith a "quote"',
                 "message_id": "persona-test",
+                "continuation_text": "continuation\nwith a \"quote\"",
                 "timeout_seconds": 12.5,
             },
             timeout=35.0,

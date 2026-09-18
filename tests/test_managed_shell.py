@@ -23,6 +23,8 @@ from universe_app.managed_shell import (  # noqa: E402
     CLI_STARTING,
     CLI_START_FAILED,
     HOOK_TIMEOUT,
+    MANAGED_SHELL_STARTUP_GRACE_SECONDS,
+    DEFAULT_HOOK_TIMEOUT_SECONDS,
     MANAGED_SHELL_LIVE_STATES,
     MANAGED_SHELL_STATES,
     PTY_UNRESPONSIVE,
@@ -425,6 +427,31 @@ class CurrentnessBoundaryTests(unittest.TestCase):
             self.assertNotIn("CURRENT", state)
             self.assertNotIn("AUTHORITY", state)
             self.assertNotIn("MASTER", state)
+
+class HandshakeTimeoutAlignmentTests(unittest.TestCase):
+    def test_hook_timeout_shares_startup_grace_constant(self) -> None:
+        self.assertEqual(DEFAULT_HOOK_TIMEOUT_SECONDS, MANAGED_SHELL_STARTUP_GRACE_SECONDS)
+        self.assertGreaterEqual(DEFAULT_HOOK_TIMEOUT_SECONDS, 180.0)
+
+    def test_default_shell_stays_starting_inside_shared_grace(self) -> None:
+        shell = _shell(hook_timeout_seconds=DEFAULT_HOOK_TIMEOUT_SECONDS)
+        shell.record_cli_launch(at=1000.0)
+        # Former 45s kill window: still CLI_STARTING with shared 180s grace.
+        state = shell.evaluate(
+            ShellObservation(shell_alive=True, shell=SHELL, cli_children=(CLI,)),
+            now=1050.0,
+        )
+        self.assertEqual(state, CLI_STARTING)
+
+    def test_default_shell_hook_timeouts_only_after_shared_grace(self) -> None:
+        shell = _shell(hook_timeout_seconds=DEFAULT_HOOK_TIMEOUT_SECONDS)
+        shell.record_cli_launch(at=1000.0)
+        state = shell.evaluate(
+            ShellObservation(shell_alive=True, shell=SHELL, cli_children=(CLI,)),
+            now=1000.0 + DEFAULT_HOOK_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(state, HOOK_TIMEOUT)
+
 
 
 if __name__ == "__main__":

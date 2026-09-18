@@ -77,7 +77,16 @@ MANAGED_SHELL_LIVE_STATES = frozenset(
     {SHELL_READY, CLI_STARTING, CLI_ATTACHED, CLI_RUNNING, SHELL_IDLE}
 )
 
-DEFAULT_HOOK_TIMEOUT_SECONDS = 45.0
+# The CLI clears its own startup prompts (folder trust, dev-channel confirm)
+# and runs its SessionStart hook before any attach evidence can land -- the
+# UI's own new-session path already gives it this long
+# (terminal_host._within_startup_grace). HOOK_TIMEOUT used to fire at a
+# separate, disconnected 45s and could Ctrl+C/close a Worker or Reviewer CLI
+# that was still legitimately inside that same window (2026-09-17 incident:
+# a Reviewer was interrupted ~53s after launch, well before its identity
+# ever sealed). Sharing one constant makes that impossible by construction.
+MANAGED_SHELL_STARTUP_GRACE_SECONDS = 180.0
+DEFAULT_HOOK_TIMEOUT_SECONDS = MANAGED_SHELL_STARTUP_GRACE_SECONDS
 DEFAULT_PTY_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_INTERRUPT_GRACE_SECONDS = 5.0
 

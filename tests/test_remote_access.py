@@ -319,6 +319,41 @@ class RemoteGatewayTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, response.status)
         self.assertEqual("CONSUMED", again["state"])
 
+    def test_pairing_status_accepts_request_token_query_param(self) -> None:
+        invitation = self.store.create_pairing(
+            public_base_url=self.endpoint, ttl_seconds=600
+        )
+        request = Request(
+            self.endpoint + "/pair/request",
+            data=json.dumps(
+                {"code": invitation["code"], "device_name": "query-token browser"}
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": self.user_agent,
+            },
+        )
+        with urlopen(request, timeout=5) as response:
+            issued = json.loads(response.read().decode("utf-8"))
+        request_token = issued["request_token"]
+        pairing_id = issued["pairing_id"]
+        # Cookie-less poll: token only in the query string (wait-page fallback).
+        poll = Request(
+            self.endpoint
+            + f"/pair/status?id={pairing_id}&request_token={request_token}",
+            headers={"User-Agent": self.user_agent},
+        )
+        with urlopen(poll, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        self.assertEqual("AWAITING_APPROVAL", body["state"])
+        self.store.decide_pairing(pairing_id, approve=True)
+        with urlopen(poll, timeout=5) as response:
+            consumed = json.loads(response.read().decode("utf-8"))
+        self.assertEqual("CONSUMED", consumed["state"])
+        self.assertTrue(consumed.get("session_token"))
+
     def test_pairing_status_without_a_token_is_a_named_client_error(self) -> None:
         invitation = self.store.create_pairing(
             public_base_url=self.endpoint, ttl_seconds=600

@@ -869,6 +869,7 @@ class Handler(BaseHTTPRequestHandler):
                     terminal_id,
                     str(body.get("persona_text") or ""),
                     message_id=str(body.get("message_id") or ""),
+                    continuation_text=str(body.get("continuation_text") or ""),
                     timeout_seconds=body.get("timeout_seconds", 20.0),
                 )
             except TerminalHostError as error:

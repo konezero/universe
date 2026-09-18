@@ -494,6 +494,8 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
                 "worker_role": "IMPLEMENTER",
                 "worker_assignment_id": "task-worker-combined",
                 "worker_assignment_revision": 3,
+                "todo_id": "todo-worker-combined",
+                "task_frame_id": "frame-worker-combined",
                 "provider": "CODEX",
                 "node_ref": "feature-worker-review",
                 "assigned_by_session_anchor_ref": "master-anchor",
@@ -506,6 +508,8 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         self.assertEqual("CLAIMED", result["automation_instruction"]["claim_state"])
         self.assertIn("inspect the fixture", calls["queue_kwargs"]["continuation_text"])
         self.assertEqual("worker-combined-anchor", calls["claim"]["session_anchor_ref"])
+        self.assertIn("todo-worker-combined", calls["posted"]["body_text"])
+        self.assertIn("frame-worker-combined", calls["posted"]["body_text"])
 
 
 if __name__ == "__main__":

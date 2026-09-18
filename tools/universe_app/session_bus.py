@@ -911,6 +911,31 @@ class SessionBus:
             "messages": delivered,
         }
 
+    def find_message_by_idempotency(
+        self, *, idempotency_key: str, recipient_anchor_ref: str
+    ) -> dict[str, Any] | None:
+        """Read one exact idempotency match for a typed replay/repair.
+
+        A cancelled instruction remains immutable history.  Automation may
+        reissue a corrected body only after that explicit cancellation, so the
+        server boundary needs to distinguish that case from an active content
+        conflict without scanning terminals or recency.
+        """
+
+        key = _text(idempotency_key, "idempotency_key", required=True, limit=256)
+        anchor = _text(
+            recipient_anchor_ref, "recipient_anchor_ref", required=True, limit=256
+        )
+        with self._lock:
+            for message in self._messages.values():
+                lifecycle = message.get("lifecycle") or {}
+                if (
+                    str(lifecycle.get("idempotency_key") or "") == key
+                    and str(message.get("recipient_anchor_ref") or "") == anchor
+                ):
+                    return self._public_message(message, headers_only=False)
+        return None
+
     def deliver_to_terminal(
         self,
         host: Any,

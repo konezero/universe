@@ -450,21 +450,47 @@ universes</strong>, use the public list.</p>
                     "pairing_id": result["pairing_id"],
                     "request_token": result["request_token"],
                     "expires_at": result["expires_at"],
-                    "status_path": "/pair/status?" + urlencode({"id": result["pairing_id"]}),
+                    "status_path": "/pair/status?"
+                    + urlencode(
+                        {
+                            "id": result["pairing_id"],
+                            "request_token": result["request_token"],
+                        }
+                    ),
                 },
                 cookies=[cookie],
             )
             return
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Set-Cookie", cookie)
+        # Put request_token in the wait URL too: some browsers (automation /
+        # partitioned cookie contexts) drop the pairing cookie across the
+        # redirect, and the wait page must still be able to poll /pair/status.
         self.send_header(
-            "Location", "/pair/wait?" + urlencode({"id": result["pairing_id"]})
+            "Location",
+            "/pair/wait?"
+            + urlencode(
+                {
+                    "id": result["pairing_id"],
+                    "request_token": result["request_token"],
+                }
+            ),
         )
         self.end_headers()
 
     def _pairing_wait(self) -> None:
-        pairing_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
+        query = parse_qs(urlsplit(self.path).query)
+        pairing_id = query.get("id", [""])[0]
+        request_token = query.get("request_token", [""])[0]
+        # Prefer the query token, but fall back to the pairing cookie so a
+        # cookie-only client that landed on /pair/wait?id=... still works.
+        if not request_token:
+            request_token = self._cookies().get(PAIRING_COOKIE, "")
         safe_id = html.escape(pairing_id, quote=True)
+        # Token is short-lived pairing secret; embed for the poller so
+        # cookie-less browsers can send X-Request-Token / query token.
+        token_js = json.dumps(request_token)
+        id_js = json.dumps(pairing_id)
         self._send_html(
             HTTPStatus.OK,
             f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -472,16 +498,28 @@ universes</strong>, use the public list.</p>
 <title>Approve Universe device</title><style>{PAIRING_STYLE}</style></head>
 <body><main><span class="kicker">APPROVAL REQUIRED</span><h1>Check your desktop</h1>
 <p id="state">Waiting for the Universe desktop to approve this browser.</p>
-<p id="hint" hidden><a class="link" href="/pair">← 다시 페어링하기 / pair again</a></p>
+<p id="hint" hidden><a class="link" href="/pair">다시 페어링하기 / pair again</a></p>
 <small>You may close this page if you did not request access.</small></main>
-<script>const id={json.dumps(safe_id)};
+<script>
+const id={id_js};
+const requestToken={token_js};
 async function poll(){{
   let r,p={{}};
   try{{
-    r=await fetch('/pair/status?id='+encodeURIComponent(id),{{cache:'no-store',credentials:'include'}});
+    const q=new URLSearchParams({{id}});
+    if(requestToken) q.set('request_token', requestToken);
+    const headers={{}};
+    if(requestToken) headers['X-Request-Token']=requestToken;
+    r=await fetch('/pair/status?'+q.toString(),{{cache:'no-store',credentials:'include',headers}});
     p=await r.json();
   }}catch(_e){{setTimeout(poll,1500);return;}}
-  if(r.ok&&p.state==='CONSUMED'){{location.replace('/?paired=1');return;}}
+  if(r.ok&&p.state==='CONSUMED'){{
+    if(p.session_token){{
+      try{{sessionStorage.setItem('universe_session_token', p.session_token);}}catch(_e){{}}
+    }}
+    location.replace('/?paired=1');
+    return;
+  }}
   if(p.state==='DENIED'||p.state==='EXPIRED'){{document.querySelector('#state').textContent=p.state;return;}}
   if(r.status>=400&&r.status<500){{
     document.querySelector('#state').textContent=
@@ -491,26 +529,26 @@ async function poll(){{
   }}
   setTimeout(poll,1200);
 }}
-poll();</script>
+poll();
+</script>
 </body></html>""",
         )
 
     def _pairing_status(self) -> None:
-        pairing_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
+        query = parse_qs(urlsplit(self.path).query)
+        pairing_id = query.get("id", [""])[0]
+        query_token = (query.get("request_token", [""])[0] or "").strip()
         cookie_token = self._cookies().get(PAIRING_COOKIE, "")
         header_token = (self.headers.get("X-Request-Token") or "").strip()
-        if (
-            cookie_token
-            and header_token
-            and not secrets.compare_digest(cookie_token, header_token)
-        ):
+        presented = [t for t in (cookie_token, header_token, query_token) if t]
+        if len(set(presented)) > 1:
             self._send_error_payload(
                 400,
                 "REMOTE_PAIRING_TOKEN_CONFLICT",
-                "cookie and X-Request-Token pairing tokens disagree",
+                "cookie, X-Request-Token, and query request_token disagree",
             )
             return
-        request_token = cookie_token or header_token
+        request_token = cookie_token or header_token or query_token
         try:
             result = self.server.remote_access.pairing_status(
                 pairing_id,

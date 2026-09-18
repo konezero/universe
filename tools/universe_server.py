@@ -34179,6 +34179,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             f"persona-automation:{run_id}:{dispatch_id}:{worker_role}:"
             f"{worker_assignment_id}:{worker_assignment_revision}"
         )
+        # An explicitly cancelled instruction is immutable history.  A
+        # corrected replay for the same exact assignment gets one deterministic
+        # repair key; active or completed content conflicts still fail closed.
+        prior_message = self.session_bus.find_message_by_idempotency(
+            idempotency_key=idempotency_key,
+            recipient_anchor_ref=worker_anchor_ref,
+        )
+        repair_of_message_id = ""
+        if isinstance(prior_message, Mapping):
+            prior_state = str(prior_message.get("lifecycle_state") or "").upper()
+            if prior_state == "CANCELLED":
+                repair_of_message_id = str(prior_message.get("message_id") or "")
+                idempotency_key = f"{idempotency_key}:repair"
         automation_context = {
             "schema": "universe.persona-automation-session-bus.v1",
             "run_id": run_id,
@@ -34193,6 +34206,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "todo_id": todo_id,
             "task_frame_id": task_frame_id,
             "idempotency_key": idempotency_key,
+            **(
+                {"replaces_message_id": repair_of_message_id}
+                if repair_of_message_id
+                else {}
+            ),
         }
         host = self._session_anchor_terminal_host()
         terminal = host.find_live(
@@ -34202,6 +34220,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             session_anchor_ref=worker_anchor_ref,
         )
         terminal_id = str((terminal or {}).get("terminal_id") or "").strip()
+        if not terminal_id:
+            return {
+                "status": "NOT_RUN",
+                "reason": "Worker terminal is not live yet",
+                "worker_role": worker_role,
+                "session_anchor_ref": worker_anchor_ref,
+            }
+        # Same handshake gate as UI new-session: do not post INSTRUCTION onto a
+        # CLI that has not sealed SessionStart AttachEvidence (2026-09-17
+        # Reviewer got WORKER_INSTRUCTION_POSTED minutes after HOOK_TIMEOUT).
+        attach_check = getattr(host, "cli_attach_sealed", None)
+        if callable(attach_check) and not bool(attach_check(terminal_id)):
+            return {
+                "status": "NOT_RUN",
+                "reason": "Worker CLI SessionStart attach has not sealed yet",
+                "worker_role": worker_role,
+                "terminal_id": terminal_id,
+                "session_anchor_ref": worker_anchor_ref,
+            }
         to = {
             "project_id": project_id,
             "mode": "WORKER",
@@ -34496,6 +34533,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             automation_task.get("worker_assignment_revision")
                             or assignment.get("assignment_revision")
                             or 0
+                        ),
+                        # The Persona assignment row and the Fleet Worker
+                        # assignment are separate records. Preserve the
+                        # authoritative Task Frame/Todo lineage from the
+                        # automation task when constructing the combined
+                        # Session Bus message; otherwise the first native
+                        # turn is emitted with ``<none>`` and a later replay
+                        # correctly detects a content/idempotency conflict.
+                        "todo_id": str(
+                            automation_task.get("todo_id")
+                            or assignment.get("todo_id")
+                            or ""
+                        ),
+                        "task_frame_id": str(
+                            automation_task.get("task_frame_id")
+                            or assignment.get("task_frame_id")
+                            or ""
                         ),
                     },
                     project_id=project_id,
