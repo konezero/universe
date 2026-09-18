@@ -1054,3 +1054,30 @@ history and is never rebound. The Action defaults provider execution to
 `NOT_RUN`; an operator must explicitly request execution, so quota/offline
 conditions cannot become a fabricated review verdict. `persona.automation.kick`
 uses the same narrow repair when it encounters this legacy shape.
+
+### Node Master control boundary (2026-09-18, Codex Master)
+
+Node Master automation is a direct Todo loop owned by the node's exact Master
+Session Anchor. The project Master queue is reserved for Conductor/project-wide
+work and reporting. A node run therefore never creates a queue message whose
+target is its own Master Anchor and never emits a `MASTER_QUEUE_WAKE` for that
+control cycle. Start, retry, and review follow-up record an idempotent direct
+control receipt (`NODE_MASTER_DIRECT_ACTIONS`) with the exact run/node/Anchor
+coordinates and the next typed Actions.
+
+For `MASTER_DIRECT` node work, `persona.automation.dispatch` records a durable
+`NODE_MASTER_ACTION` assignment instead of a `project_master_message`. The
+owning Master submits the bounded result through
+`persona.automation.master-result`, which validates the bound Anchor, dispatch
+id, assignment revision, and direct assignment id before recording the result.
+The result then uses the existing independent Reviewer Worker route; neither a
+direct result nor a queue receipt is acceptance. Project-wide Conductor queue
+dispatch and `master.complete` remain unchanged.
+
+Queue reader eligibility is separated at the store boundary as well: only a
+live Master with no ACTIVE node-scoped Persona assignment may claim project-wide
+queue work. A Node Master with an assigned `node_ref` receives no queue wake and
+cannot claim even a project-wide item; it runs its node Todo loop through the
+typed `persona.automation.*` Actions. Old node-scoped queue rows remain
+addressable only by the typed orphan cancel/reissue repair path so they do not
+become zombie leases or a source of `QUEUE_EMPTY` kicks.

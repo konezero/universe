@@ -1249,6 +1249,82 @@ class PersonaAutomationStore:
                     "task_frame_id": task_frame_id,
                 },
             }
+            # A node-bound MASTER_DIRECT run is completed by the owning Node
+            # Master through the typed ``persona.automation.master-result``
+            # Action. It must not create a project Master queue item whose
+            # recipient is the same Anchor (self-ping). Keep the exact
+            # assignment tuple durable so that Action can apply CAS and
+            # reviewer provenance checks just like the queue route.
+            if execution_mode == "MASTER_DIRECT" and str(row["node_ref"] or "").strip():
+                direct_message_id = f"persona-direct:{run_id}:{dispatch_id}"
+                direct = {
+                    "message_id": direct_message_id,
+                    "project_id": row["project_id"],
+                    "node_ref": row["node_ref"],
+                    "todo_id": todo_id,
+                    "task_frame_id": task_frame_id,
+                    "target_session_anchor_ref": row["session_anchor_ref"],
+                    "delivery_state": "DIRECT",
+                    "route": "NODE_MASTER_ACTION",
+                    "metadata": {
+                        "persona_automation_run_id": run_id,
+                        "persona_automation_assignment_id": assignment_id,
+                        "persona_automation_assignment_revision": assignment_revision,
+                        "dispatch_id": dispatch_id,
+                        "session_anchor_ref": row["session_anchor_ref"],
+                        "persona_id": row["persona_id"],
+                        "persona_revision": int(row["persona_revision"]),
+                        "completion_route": "PERSONA_AUTOMATION_STORE",
+                        "provider_invocation": "NODE_MASTER_ACTION",
+                        "todo_id": todo_id,
+                        "task_frame_id": task_frame_id,
+                    },
+                }
+                assignment = {
+                    "assignment_id": assignment_id,
+                    "assignment_revision": assignment_revision,
+                    "state": "DISPATCHED",
+                    "execution_mode": execution_mode,
+                    "dispatch_id": dispatch_id,
+                    "message_id": direct_message_id,
+                    "delivery_route": "NODE_MASTER_ACTION",
+                    "created": True,
+                    "title": title,
+                    "instruction": instruction,
+                    "completion_conditions": conditions,
+                    "project_id": row["project_id"],
+                    "node_ref": row["node_ref"],
+                    "todo_id": todo_id,
+                    "task_frame_id": task_frame_id,
+                    "result_ref": None,
+                    "review_id": None,
+                }
+                now = _timestamp()
+                cursor = connection.execute(
+                    "UPDATE persona_automation_run SET current_assignment_json = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
+                    (_json(assignment), now, run_id, int(row["revision"])),
+                )
+                if cursor.rowcount != 1:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                        "automation run changed while recording direct Master dispatch",
+                        409,
+                    )
+                event, _ = self._event(
+                    connection,
+                    run_id,
+                    "MASTER_DIRECT_DISPATCHED",
+                    "dispatch:" + dispatch_id,
+                    {"dispatch": assignment, "direct": direct},
+                )
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_MASTER_DIRECT_DISPATCHED",
+                    "run": self._row(self._get(connection, run_id)),
+                    "dispatch": assignment,
+                    "direct": direct,
+                    "event": event,
+                }
             # The callback is the existing Master queue gateway.  No provider
             # call is made here; delivery and result review remain separate.
             try:
@@ -1699,6 +1775,13 @@ class PersonaAutomationStore:
         result_ref = str(value.get("result_ref") or "").strip()
         body_digest = _text(value.get("body_text_utf8_sha256"), "body_text_utf8_sha256")
         completed_at = _text(value.get("completed_at"), "completed_at")
+        completion_route = (
+            "MASTER_DIRECT_ACTION"
+            if value.get("direct_master") is True
+            else "LEGACY_SELF_REPLY_MIGRATION"
+            if legacy_self_reply_migration
+            else "AUTOMATION_STORE"
+        )
         with self._connection() as connection:
             row = self._get(connection, run_id)
             assignment = _load(row["current_assignment_json"], None)
@@ -1733,7 +1816,7 @@ class PersonaAutomationStore:
                 "result_ref": result_ref,
                 "body_text_utf8_sha256": body_digest,
                 "completed_at": completed_at,
-                "route": "LEGACY_SELF_REPLY_MIGRATION" if legacy_self_reply_migration else "AUTOMATION_STORE",
+                "route": completion_route,
             }
             existing = connection.execute(
                 "SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
@@ -2207,6 +2290,60 @@ class PersonaAutomationStore:
                 "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
                 "run": self._row(self._get(connection, run_id)),
                 "reviewer": reviewer_payload,
+                "event": event,
+            }
+
+    def record_driver_control(
+        self,
+        run_id: str,
+        *,
+        driver_key: str,
+        control: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record a node-Master control cycle without creating a queue item.
+
+        Node Masters own their node Todo loop. The project Master queue is a
+        Conductor/reporting transport, so a node run must never enqueue a
+        message addressed back to its own Master Anchor. This event is the
+        durable idempotency boundary for the direct Action route; the owning
+        Master performs the returned typed Actions in its current session.
+        """
+
+        run_id = _text(run_id, "run_id")
+        driver_key = _text(driver_key, "driver_key")
+        if not isinstance(control, Mapping):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_DRIVER_CONTROL_INVALID",
+                "control must be an object",
+            )
+        control_id = _text(control.get("control_id"), "control.control_id")
+        payload = {
+            "driver_key": driver_key,
+            "control_id": control_id,
+            "route": "NODE_MASTER_DIRECT_ACTIONS",
+            "target_session_anchor_ref": control.get("target_session_anchor_ref"),
+            "node_ref": control.get("node_ref"),
+            "next_actions": list(control.get("next_actions") or []),
+            "created": True,
+        }
+        with self._connection() as connection:
+            row = self._get(connection, run_id)
+            event, created = self._event(
+                connection,
+                run_id,
+                "DRIVER_CONTROL_RECORDED",
+                "driver-control:" + driver_key,
+                payload,
+            )
+            return {
+                "schema": SCHEMA,
+                "status": (
+                    "PERSONA_AUTOMATION_DRIVER_READY"
+                    if created
+                    else "PERSONA_AUTOMATION_DRIVER_REPLAYED"
+                ),
+                "run": self._row(row),
+                "driver": payload,
                 "event": event,
             }
 

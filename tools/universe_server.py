@@ -24409,6 +24409,11 @@ class UniverseStore:
                 stored["created_at"] = existing["created_at"]
                 return stored, False
             if message["node_ref"] is not None:
+                # Keep validating/stamping legacy node rows so the typed
+                # orphan cancel/reissue Actions retain exact historical
+                # ownership. New Node Todo automation does not use this
+                # queue, and the claimant predicate below intentionally
+                # excludes every node-scoped row.
                 if not self.node_owner_uniqueness_enforced:
                     # Without the DB-level exclusivity guarantee, the
                     # fetchone() below would pick an arbitrary row if
@@ -24421,10 +24426,9 @@ class UniverseStore:
                         "uniqueness index is not currently enforced (see schema_migration_diagnostic)",
                         HTTPStatus.CONFLICT,
                     )
-                # The server derives the current owner at creation time --
+                # The server derives the legacy owner at creation time --
                 # never trusted from the request. A node with no ACTIVE
-                # Master assignment cannot receive node-scoped work (there
-                # would be no eligible claimant at all).
+                # Master assignment cannot receive a repairable legacy row.
                 node = self.get_feature_node(message["node_ref"])
                 if str(node.get("project_id") or "") != project["project_id"]:
                     raise UniverseError(
@@ -24520,11 +24524,12 @@ class UniverseStore:
         return json.loads(row["message_json"]) if row is not None else None
 
     def has_queued_master_message(self, project_id: str) -> bool:
-        """Cheap existence check reused by the session-ready wake retry
-        (see UniverseHTTPServer._wake_master_queue_on_session_ready) and by
-        claim_master_message's own candidate query - same
-        json_extract(...) = 'QUEUED' predicate as claim_master_message uses,
-        so "has work to wake for" and "would actually be claimable" agree.
+        """Return whether project-wide Conductor work is waiting.
+
+        Node-bound Todo automation is owned by its assigned Node Master and
+        uses typed Persona Actions. It is deliberately excluded from this
+        queue check so SessionStart recovery cannot emit a wake that no
+        eligible queue reader may claim.
         """
 
         with self._connection() as connection:
@@ -24533,6 +24538,7 @@ class UniverseStore:
                 SELECT 1 FROM project_master_message
                 WHERE project_id = ?
                   AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
+                  AND json_extract(message_json, '$.node_ref') IS NULL
                 LIMIT 1
                 """,
                 (project_id,),
@@ -24542,11 +24548,13 @@ class UniverseStore:
     def has_queued_master_message_for(
         self, project_id: str, claimant_anchor: str
     ) -> bool:
-        """Same live-join eligibility rule claim_master_message's candidate
-        query and its actual atomic UPDATE both use, so a wake nudge and a
-        real claimable item always agree -- used to avoid waking a Master
-        that could not actually claim anything (2026-09-15: node-scoped
-        Master queue items)."""
+        """Return whether this *unassigned* Master can claim project work.
+
+        An ACTIVE node-scoped Persona assignment makes the Anchor a Node
+        Master. Its Todo loop uses the Persona automation Actions and must
+        not poll the Conductor queue. This query is kept identical to the
+        atomic claim predicate so wake and claim never disagree.
+        """
 
         with self._connection() as connection:
             row = connection.execute(
@@ -24557,60 +24565,28 @@ class UniverseStore:
                   AND ({self._MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL})
                 LIMIT 1
                 """,
-                (project_id, claimant_anchor, claimant_anchor, claimant_anchor),
+                (project_id, claimant_anchor, claimant_anchor),
             ).fetchone()
         return row is not None
 
-    # A targeted item's exact Anchor and a node-scoped item's ownership both
-    # join live in this single eligibility predicate.  It is used for queue
-    # polling, wake eligibility, and inside the atomic claim UPDATE: no
-    # Master can race in merely because it sees a project-wide queued row.
-    #
-    # A node-scoped item's ownership check joins live against this exact
-    # SELECT on session_persona_assignment, keyed only by the claiming
-    # Anchor's own identity -- assignment_revision is a per-Anchor counter
-    # (session_anchor_ref is session_persona_assignment's primary key), so a
-    # fresh Anchor newly assigned to the same node can coincidentally start
-    # at the same revision number a different, older Anchor once had;
-    # matching revision alone would let a brand-new assignee silently
-    # inherit a predecessor's still-queued item, so the Anchor identity is
-    # the join key, not a separately-compared field. Used both as a
-    # candidate pre-filter (SELECT, cheap and approximate) and, baked into
-    # the actual UPDATE's WHERE clause, as the real authorization -- re-
-    # evaluated live at the exact moment of the atomic state transition, not
-    # merely against a value resolved earlier by the caller. That earlier
-    # two-step shape (HTTP handler resolves the claimant's assignment, then
-    # a separate call attempts the transition) left a real TOCTOU window: a
-    # reassignment/unassignment landing in between meant the transition
-    # still proceeded on stale authority (2026-09-15 Conductor review
-    # finding). A project-wide item (node_ref NULL) needs no such check --
-    # unnarrowed, claimable by any live project Master, unchanged.
+    # Queue eligibility is intentionally project-wide only. A Node Master is
+    # identified by its ACTIVE node-scoped Persona assignment and must run its
+    # Todo loop through persona.automation.* Actions, never by polling this
+    # queue. The same predicate is used by candidate selection, wake
+    # eligibility and the atomic QUEUED->PROCESSING CAS, so assignment changes
+    # cannot create a TOCTOU window or a misleading wake.
     _MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL = """
-        (json_extract(message_json, '$.target_session_anchor_ref') IS NULL
-         OR json_extract(message_json, '$.target_session_anchor_ref') = ?)
+        json_extract(message_json, '$.node_ref') IS NULL
         AND (
-          json_extract(message_json, '$.node_ref') IS NULL
-          OR (
-          -- The message's OWN stamped owner Anchor must be the exact
-          -- claimant -- required in addition to the live revision check
-          -- below, because assignment_revision is a per-Anchor counter
-          -- (session_anchor_ref is session_persona_assignment's primary
-          -- key): a brand-new Anchor freshly assigned to this same node can
-          -- coincidentally start at the same revision number a different,
-          -- unrelated Anchor once had. Matching revision alone (without
-          -- also pinning identity) let a new assignee silently inherit a
-          -- predecessor's still-queued item -- caught by
-          -- test_reassigning_the_node_does_not_transfer_the_old_queued_item.
-          json_extract(message_json, '$.node_owner_session_anchor_ref') = ?
-          AND EXISTS (
-            SELECT 1 FROM session_persona_assignment spa
-            WHERE spa.session_anchor_ref = ?
-              AND spa.state = 'ACTIVE'
-              AND spa.project_id = project_master_message.project_id
-              AND spa.node_ref = json_extract(project_master_message.message_json, '$.node_ref')
-              AND spa.assignment_revision = json_extract(project_master_message.message_json, '$.node_owner_assignment_revision')
-          )
-          )
+          json_extract(message_json, '$.target_session_anchor_ref') IS NULL
+          OR json_extract(message_json, '$.target_session_anchor_ref') = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM session_persona_assignment claimant_assignment
+          WHERE claimant_assignment.session_anchor_ref = ?
+            AND claimant_assignment.project_id = project_master_message.project_id
+            AND claimant_assignment.state = 'ACTIVE'
+            AND claimant_assignment.node_ref IS NOT NULL
         )
     """
 
@@ -24652,7 +24628,7 @@ class UniverseStore:
                   AND json_extract(message_json, '$.delivery_state') = 'QUEUED'
                   AND ({self._MASTER_MESSAGE_CLAIMANT_ELIGIBILITY_SQL})
                 """,
-                (_canonical_json(message), message_id, session_anchor_ref, session_anchor_ref, session_anchor_ref),
+                (_canonical_json(message), message_id, session_anchor_ref, session_anchor_ref),
             )
             if cursor.rowcount != 1:
                 return None
@@ -24728,7 +24704,7 @@ class UniverseStore:
                     ORDER BY created_at, rowid
                     LIMIT 8
                     """,
-                    (project["project_id"], session_anchor_ref, session_anchor_ref, session_anchor_ref),
+                    (project["project_id"], session_anchor_ref, session_anchor_ref),
                 ).fetchall()
         for row in candidates:
             claimed = self._claim_master_message_atomic(
@@ -31558,6 +31534,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.judge",
                     "persona.automation.decide",
                     "persona.automation.dispatch",
+                    "persona.automation.master-result",
                     "persona.automation.worker-result",
                     "persona.automation.reviewer-verdict",
                     "persona.automation.review",
@@ -32525,6 +32502,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "PERSONA_AUTOMATION_RUN_STARTED",
                 "PERSONA_AUTOMATION_WORK_DISPATCHED",
                 "PERSONA_AUTOMATION_WORKER_DISPATCHED",
+                "PERSONA_AUTOMATION_MASTER_DIRECT_DISPATCHED",
             }
             else HTTPStatus.OK
         )
@@ -34423,6 +34401,75 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             lambda spec: self._create_persona_automation_worker(spec, context),
         )
 
+    def _finalize_persona_automation_master_result(
+        self,
+        automation_result: Mapping[str, Any],
+        *,
+        body_text: str,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Attach the independent Reviewer after a Master result.
+
+        Both the Conductor queue completion and the node Master's direct
+        result Action use this one boundary. A result is never treated as a
+        PASS; the typed Reviewer route remains the acceptance gate. If that
+        route is temporarily unavailable, the durable direct-control receipt
+        records a retry for a node Master without creating a self-queue item.
+        """
+
+        result = dict(automation_result)
+        run = result.get("run")
+        reviewer_result = None
+        if (
+            isinstance(run, Mapping)
+            and str(run.get("node_ref") or "").strip()
+            and str(run.get("execution_mode") or "MASTER_DIRECT").upper()
+            == "MASTER_DIRECT"
+        ):
+            try:
+                reviewer_result = self._ensure_persona_automation_master_reviewer(
+                    run,
+                    context=context,
+                    result_text=body_text,
+                )
+                result["reviewer"] = reviewer_result.get("reviewer")
+                result["reviewer_result"] = reviewer_result
+                reviewer_run = reviewer_result.get("run")
+                reviewer = reviewer_result.get("reviewer")
+                if (
+                    isinstance(reviewer_run, Mapping)
+                    and isinstance(reviewer, Mapping)
+                    and str(reviewer.get("state") or "").upper() == "ASSIGNED"
+                ):
+                    result["reviewer_instruction"] = (
+                        self._ensure_persona_automation_worker_instruction(
+                            reviewer_run, context=context
+                        )
+                    )
+            except PersonaAutomationError as error:
+                result["reviewer_result"] = {
+                    "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_NOT_CREATED",
+                    "error_code": error.code,
+                    "detail": str(error),
+                }
+        if isinstance(run, Mapping) and (
+            not isinstance(reviewer_result, Mapping)
+            or str((reviewer_result.get("status") or "")).upper()
+            not in {
+                "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
+                "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
+                "PERSONA_AUTOMATION_MASTER_REVIEWER_CREATION_PENDING",
+            }
+        ):
+            try:
+                result["driver"] = self._enqueue_persona_automation_driver(
+                    run,
+                    driver_key=f"post-result-r{int(run.get('revision') or 0)}",
+                )
+            except PersonaAutomationError:
+                pass
+        return result
+
     def _repair_persona_automation_legacy_reviewer(
         self,
         value: Mapping[str, Any],
@@ -36199,15 +36246,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _enqueue_persona_automation_driver(
         self, run: Mapping[str, Any], *, driver_key: str = "initial-v1"
     ) -> dict[str, Any]:
-        """Queue exactly one bounded control turn for a node Master run.
+        """Record one direct control cycle for a node Master.
 
-        A run is durable state, but it is not a scheduler.  The actual
-        automation owner is the Master bound to the node, so starting or
-        recovering a node run creates a targeted Master-queue message rather
-        than polling every run or silently invoking a provider in the web
-        process.  The queue's exact target binding and its idempotency key are
-        the delivery boundary; a completed control turn never causes a second
-        wake merely because the UI refreshed.
+        The project Master queue is the Conductor/reporting transport. A
+        node-scoped Master already owns the current Session Anchor, so putting
+        a control message into that same Anchor's queue only creates a
+        self-ping loop. The durable driver event below is an idempotent Action
+        receipt; the owning Master performs the listed typed Actions in its
+        current turn.
         """
 
         run_id = _required_text(run.get("run_id"), "run_id")
@@ -36231,64 +36277,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if not node_ref:
             raise PersonaAutomationError(
                 "PERSONA_AUTOMATION_DRIVER_NODE_REQUIRED",
-                "automatic Master control is available only for a node-bound Master run",
+                "direct node-Master control is available only for a node-bound Master run",
                 409,
             )
         driver_key = _required_text(driver_key, "driver_key")
-        message, created = self.store.create_master_message(
-            project_id,
-            {
-                "idempotency_key": f"persona-automation-driver:{run_id}:{driver_key}",
-                "target_session_anchor_ref": anchor,
-                "node_ref": node_ref,
-                "title": f"Run bounded node automation: {node_ref}",
-                "instruction": (
-                    "You are the exact Master bound to this Feature Node. "
-                    f"Run one bounded automation control cycle for {run_id}. "
-                    "Use the typed persona.automation Actions in this order: "
-                    "persona.automation.tick to claim one tick using your own Session Anchor; "
-                    "persona.automation.plan to select and record one Todo from your bound scope (Goal evidence is optional); "
-                    "if and only if the decision is EXECUTE, use persona.automation.dispatch "
-                    "for one bounded Master work item with explicit completion conditions. "
-                    "When the current assignment is REVIEWED with a PASS verdict, "
-                    "call persona.automation.complete for that exact run, then use the "
-                    "typed todo.state Action with the freshly read Todo revision to mark "
-                    "the same Todo DONE only with PASSED validation evidence. "
-                    "When the current assignment is RESULT_READY_FOR_REVIEW and no Reviewer "
-                    "assignment exists, repair the exact Reviewer route before selecting "
-                    "another Todo. "
-                    "A non-PASS review with a durable follow-up Todo is not a pause gate: "
-                    "continue with the next bounded control cycle and do not call persona.automation.pause. "
-                    "For MEETING, ESCALATE, or WAIT, do not invent work or adopt a plan; "
-                    "record the next condition and finish this control message with evidence."
-                ),
-                "metadata": {
-                    "kind": "PERSONA_AUTOMATION_CONTROL",
-                    "persona_automation_run_id": run_id,
-                    "session_anchor_ref": anchor,
-                    "node_ref": node_ref,
-                    "control_cycle": "ONE_BOUNDED_TICK",
-                },
-            },
-        )
-        receipt = dict(message)
-        receipt["created"] = bool(created)
-        recorded = self.persona_automation.record_driver_message(
-            run_id,
-            driver_key=driver_key,
-            message=receipt,
-        )
-        # Replaying an idempotent driver whose queue item is already DONE or
-        # PROCESSING must not emit another wake.  A queued item may still need
-        # a nudge after a transient transport failure, while a newly created
-        # item always needs its first wake.
-        message_state = str(message.get("delivery_state") or "").strip().upper()
-        if created or message_state in {"QUEUED", "PENDING"}:
-            self._wake_live_master_sessions(
-                project_id,
-                reason="PERSONA_AUTOMATION_CONTROL_QUEUED",
+        control = {
+            "control_id": f"persona-control:{run_id}:{driver_key}",
+            "target_session_anchor_ref": anchor,
+            "node_ref": node_ref,
+            "next_actions": [
+                "persona.automation.tick",
+                "persona.automation.plan",
+                "persona.automation.dispatch",
+                "persona.automation.master-result",
+            ],
+        }
+        record_control = getattr(self.persona_automation, "record_driver_control", None)
+        if not callable(record_control):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_DRIVER_CONTROL_UNAVAILABLE",
+                "the direct node-Master control Action is unavailable",
+                503,
             )
-        return recorded
+        return record_control(run_id, driver_key=driver_key, control=control)
 
     def _persona_automation_node_has_executable_todo(
         self, project_id: str, node_ref: str
@@ -36710,6 +36721,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         ),
                     }
                 if isinstance(assignment, Mapping) and assignment.get("state") == "DISPATCHED":
+                    if str(assignment.get("delivery_route") or "").upper() == "NODE_MASTER_ACTION":
+                        return {
+                            "schema": "universe.persona-automation.v1",
+                            "status": "PERSONA_AUTOMATION_MASTER_DIRECT_WORK_REPLAYED",
+                            "run": run,
+                            "dispatch": dict(assignment),
+                            "next_action": "persona.automation.master-result",
+                            "woken_master_sessions": 0,
+                        }
                     return {
                         "schema": "universe.persona-automation.v1",
                         "status": "PERSONA_AUTOMATION_WORK_WAKE_REPLAYED",
@@ -36901,6 +36921,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     actor=context.get("actor"),
                 )
                 return result
+            if action_id == "persona.automation.master-result":
+                return self._handle_persona_automation_master_result_action(
+                    request, context
+                )
             if action_id == "persona.automation.worker-result":
                 value = _exact_object_fields(
                     request,
@@ -37419,64 +37443,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "detail": error.detail,
                 }
             else:
-                run = automation_result.get("run") if isinstance(automation_result, Mapping) else None
-                reviewer_result = None
-                if (
-                    isinstance(run, Mapping)
-                    and str(run.get("node_ref") or "").strip()
-                    and str(run.get("execution_mode") or "MASTER_DIRECT").upper()
-                    == "MASTER_DIRECT"
-                ):
-                    # A direct Master result is still a result, not an
-                    # acceptance.  The node Master owns the orchestration,
-                    # so it immediately creates a distinct Reviewer Worker
-                    # through the typed Fleet route instead of waiting for a
-                    # human or an unrelated queue consumer to do so.
-                    try:
-                        reviewer_result = self._ensure_persona_automation_master_reviewer(
-                            run,
-                            context=context,
-                            result_text=body_text,
-                        )
-                        automation_result["reviewer"] = reviewer_result.get("reviewer")
-                        automation_result["reviewer_result"] = reviewer_result
-                        reviewer_run = reviewer_result.get("run")
-                        reviewer = reviewer_result.get("reviewer")
-                        if (
-                            isinstance(reviewer_run, Mapping)
-                            and isinstance(reviewer, Mapping)
-                            and str(reviewer.get("state") or "").upper() == "ASSIGNED"
-                        ):
-                            automation_result["reviewer_instruction"] = (
-                                self._ensure_persona_automation_worker_instruction(
-                                    reviewer_run, context=context
-                                )
-                            )
-                    except PersonaAutomationError as error:
-                        automation_result["reviewer_result"] = {
-                            "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_NOT_CREATED",
-                            "error_code": error.code,
-                            "detail": error.detail,
-                        }
-                if isinstance(run, Mapping) and (
-                    not isinstance(reviewer_result, Mapping)
-                    or str((reviewer_result.get("status") or "")).upper()
-                    not in {
-                        "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
-                        "PERSONA_AUTOMATION_MASTER_REVIEWER_REPLAYED",
-                        "PERSONA_AUTOMATION_MASTER_REVIEWER_CREATION_PENDING",
-                    }
-                ):
-                    # Preserve a recoverable control receipt when the typed
-                    # Reviewer route is unavailable or the old assignment
-                    # lacks an exact Todo/Task Frame.  This is a repair path,
-                    # not a substitute for the Reviewer assignment.
-                    try:
-                        self._enqueue_persona_automation_driver(
-                            run, driver_key=f"post-result-r{int(run.get('revision') or 0)}"
-                        )
-                    except PersonaAutomationError:
-                        pass
+                automation_result = self._finalize_persona_automation_master_result(
+                    automation_result,
+                    body_text=body_text,
+                    context=context,
+                )
         result_delivery = self._publish_master_completion_results()
         return {
             "schema": MASTER_COMPLETE_RESULT_SCHEMA,
@@ -37487,6 +37458,97 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "result_delivery": result_delivery,
             "body_text_utf8_sha256": utf8_sha256(body_text),
             "action_request_digest": action_request_digest,
+        }
+
+    def _handle_persona_automation_master_result_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Record a node Master's direct result without using Master queue.
+
+        The owner Anchor, run revision and deterministic direct assignment id
+        are resolved from the durable automation projection. The Action never
+        accepts a caller-selected queue message or another node's result
+        coordinate; it then enters the same independent Reviewer gate as the
+        normal Conductor completion route.
+        """
+
+        value = _exact_object_fields(
+            request,
+            field="persona_automation_master_result",
+            required=frozenset(
+                {
+                    "run_id",
+                    "owner_ref",
+                    "dispatch_id",
+                    "assignment_revision",
+                    "body_text",
+                    "request_id",
+                }
+            ),
+            optional=frozenset({"result_ref", "completed_at"}),
+        )
+        run = self.persona_automation.get_run(value["run_id"])
+        owner_ref = _required_text(value["owner_ref"], "owner_ref")
+        if str(run.get("session_anchor_ref") or "").strip() != owner_ref:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_OWNER_MISMATCH",
+                "the direct Master result owner is not the run's bound Session Anchor",
+                409,
+            )
+        if not str(run.get("node_ref") or "").strip() or str(
+            run.get("execution_mode") or "MASTER_DIRECT"
+        ).upper() != "MASTER_DIRECT":
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_MASTER_DIRECT_REQUIRED",
+                "direct Master results require a node-scoped MASTER_DIRECT run",
+                409,
+            )
+        assignment = run.get("current_assignment")
+        if not isinstance(assignment, Mapping):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_ASSIGNMENT_REQUIRED",
+                "a current direct Master assignment is required",
+                409,
+            )
+        source_message_id = str(assignment.get("message_id") or "").strip()
+        if (
+            str(assignment.get("delivery_route") or "").upper()
+            != "NODE_MASTER_ACTION"
+            or not source_message_id.startswith("persona-direct:")
+        ):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_DIRECT_ASSIGNMENT_REQUIRED",
+                "the current assignment is not a node Master direct Action",
+                409,
+            )
+        body_text = self._action_text(value.get("body_text"), "body_text")
+        completed_at = self._action_text(value.get("completed_at"), "completed_at")
+        if not completed_at:
+            completed_at = utc_now()
+        result = self.persona_automation.record_master_completion(
+            {
+                "run_id": run.get("run_id"),
+                "dispatch_id": value.get("dispatch_id"),
+                "assignment_revision": value.get("assignment_revision"),
+                "source_message_id": source_message_id,
+                "result_ref": self._action_text(value.get("result_ref"), "result_ref"),
+                "body_text_utf8_sha256": utf8_sha256(body_text),
+                "result_text": body_text,
+                "completed_at": completed_at,
+                "direct_master": True,
+            }
+        )
+        result = self._finalize_persona_automation_master_result(
+            result,
+            body_text=body_text,
+            context=context,
+        )
+        return {
+            "schema": "universe.persona-automation.v1",
+            "status": "PERSONA_AUTOMATION_MASTER_RESULT_RECORDED",
+            "action_id": "persona.automation.master-result",
+            "automation_result": result,
+            "body_text_utf8_sha256": utf8_sha256(body_text),
         }
 
     def _handle_session_bus_reply_action(
@@ -44049,9 +44111,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         return True
 
     def _wake_live_master_sessions(self, project_id: str, *, reason: str) -> int:
-        """Best-effort nudge: tell every live Master session for this
-        project that work is waiting, so an idle one notices instead of
-        depending only on its own next poll.
+        """Best-effort nudge to eligible project-queue readers.
+
+        Only live Masters without an ACTIVE node-scoped Persona assignment
+        are queue readers. Assigned Node Masters own their Todo automation
+        loop and are intentionally skipped by ``has_queued_master_message_for``
+        below; waking them with a project queue prompt caused the mixed-path
+        QUEUE_EMPTY/kick loop.
 
         session_bus.post()/resolve_direct_targets treats 2+ matching live
         terminals (no specific anchor given) as BUS_TARGET_AMBIGUOUS and
@@ -44188,10 +44254,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         unlike run_session_bus_recovery_once) and from
         _dispatch_pending_session_instruction, which never touches it.
 
-        Only MASTER mode has a master-messages queue to wake for. Re-sending
-        the nudge on every ready/reconnect while an item is still QUEUED is
-        the intended retry, not a duplicate-execution bug: this never claims
-        or executes the item (_wake_live_master_sessions's own contract) -
+        Only MASTER mode has a master-messages queue to wake for, and the
+        downstream eligibility predicate limits that wake to unassigned
+        project Masters. Re-sending the nudge on every ready/reconnect while
+        an eligible item is still QUEUED is the intended retry, not a
+        duplicate-execution bug: this never claims or executes the item
+        (_wake_live_master_sessions's own contract) --
         claim_master_message's per-item state transition is what actually
         prevents two Masters from running the same item twice. Never raises.
         """

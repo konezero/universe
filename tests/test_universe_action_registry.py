@@ -239,6 +239,9 @@ class UniverseActionRegistryTests(unittest.TestCase):
                 "todo.bind_node",
                 "todo.priority",
                 "todo.reorder",
+                "todo.move_project",
+                "todo.archive",
+                "todo.restore",
             ),
             IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
         )

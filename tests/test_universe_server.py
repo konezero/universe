@@ -19534,6 +19534,19 @@ class UniverseLocalServiceTests(unittest.TestCase):
         ]
         fake_host = FakeMasterHost(live_master_terminals)
 
+        self.server.store.register_project(self.registration())
+        # Queue wakes are only for unassigned project Masters. Seed one
+        # project-wide item so this test exercises the delivery fan-out; a
+        # direct call with no queued work must now return zero.
+        self.server.store.create_master_message(
+            "GCS",
+            {
+                "idempotency_key": "wake-fanout-project-work",
+                "title": "Conductor project work",
+                "instruction": "bounded queue wake fixture",
+            },
+        )
+
         with patch.object(
             self.server, "_session_anchor_terminal_host", return_value=fake_host
         ):

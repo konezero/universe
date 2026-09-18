@@ -48,16 +48,17 @@ import test_memory_candidates_and_delegations as fixtures  # noqa: E402
 
 
 class NodeScopedMasterQueueTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.fixture = fixtures.MemoryCandidateApiTests()
-        cls.fixture.setUp()
-        cls.server = cls.fixture.server
-        cls.request = cls.fixture.request
+    def setUp(self):
+        # Queue eligibility is stateful; each case gets a fresh project/DB so
+        # a prior Conductor item cannot make a later test appear to claim a
+        # different message or hide the assigned-vs-unassigned boundary.
+        self.fixture = fixtures.MemoryCandidateApiTests()
+        self.fixture.setUp()
+        self.server = self.fixture.server
+        self.request = self.fixture.request
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.fixture.tearDown()
+    def tearDown(self):
+        self.fixture.tearDown()
 
     def act(self, action_id, request):
         body = dict(request)
@@ -156,6 +157,43 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         self.assertEqual(200, status, claimed)
         self.assertEqual(message["message_id"], claimed["message"]["message_id"])
 
+    def test_node_assigned_master_cannot_claim_project_wide_conductor_work(self):
+        node_ref = self.make_feature_node("queue-node-assigned-not-reader")
+        assigned = self.register("assigned-not-reader")
+        self.assign_master_to_node(assigned, node_ref)
+        message, _ = self.queue_message("project-wide-for-unassigned", node_ref=None)
+        self.set_terminal_host([self.live_master_terminal("term-assigned-not-reader", assigned)])
+        status, result = self.claim("term-assigned-not-reader", assigned)
+        self.assertEqual(200, status, result)
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", result["status"])
+        self.assertEqual(
+            "QUEUED",
+            self.server.store.get_master_message(message["message_id"])["delivery_state"],
+        )
+
+    def test_unassigned_master_can_claim_project_wide_conductor_work(self):
+        message, _ = self.queue_message("project-wide-unassigned-reader", node_ref=None)
+        unassigned = self.register("unassigned-reader")
+        self.set_terminal_host([self.live_master_terminal("term-unassigned-reader", unassigned)])
+        status, result = self.claim("term-unassigned-reader", unassigned)
+        self.assertEqual(200, status, result)
+        self.assertEqual(message["message_id"], result["message"]["message_id"])
+
+    def test_queue_wake_skips_a_node_assigned_master(self):
+        node_ref = self.make_feature_node("queue-wake-assigned-skip")
+        assigned = self.register("wake-assigned-skip")
+        self.assign_master_to_node(assigned, node_ref)
+        self.queue_message("queue-wake-project-work", node_ref=None)
+        self.set_terminal_host([
+            self.live_master_terminal("term-wake-assigned-skip", assigned)
+        ])
+        self.assertEqual(
+            0,
+            self.server._wake_live_master_sessions(
+                "TEST", reason="assigned node must stay on Todo automation"
+            ),
+        )
+
     def test_targeted_project_message_is_claimable_only_by_its_exact_master_anchor(self):
         target = self.register("targeted-master")
         other = self.register("other-master")
@@ -225,7 +263,7 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
             created["message"]["target_session_anchor_ref"],
         )
 
-    def test_correct_node_master_can_claim_its_own_item(self):
+    def test_node_master_does_not_poll_a_node_scoped_legacy_item(self):
         anchor = self.register("claim-correct")
         node_ref = self.make_feature_node("queue-node-claim-correct")
         self.assign_master_to_node(anchor, node_ref)
@@ -233,7 +271,11 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         self.set_terminal_host([self.live_master_terminal("term-claim-correct", anchor)])
         status, claimed = self.claim("term-claim-correct", anchor)
         self.assertEqual(200, status, claimed)
-        self.assertEqual(message["message_id"], claimed["message"]["message_id"])
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claimed["status"])
+        self.assertEqual(
+            "QUEUED",
+            self.server.store.get_master_message(message["message_id"])["delivery_state"],
+        )
 
     def test_unassigned_master_polling_does_not_receive_a_node_scoped_item(self):
         node_ref = self.make_feature_node("queue-node-poll-hidden")
@@ -309,11 +351,10 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         self.assertEqual(1, message["node_owner_assignment_revision"])
         self.assertNotEqual(new_anchor, message["node_owner_session_anchor_ref"])
 
-    def test_second_claim_of_an_already_claimed_item_finds_nothing(self):
-        # Documents that the existing atomic CAS transition is reused
-        # unchanged -- this test's two calls are sequential (not truly
-        # concurrent), but the second call observes PROCESSING left by the
-        # first exactly as two racing Masters would.
+    def test_node_master_explicit_claim_is_rejected_even_for_legacy_item(self):
+        # A node Master cannot opt back into the queue with an explicit
+        # message_id either. The old row remains QUEUED for typed orphan
+        # repair, but no queue claim path may execute it.
         anchor = self.register("single-winner")
         node_ref = self.make_feature_node("queue-node-single-winner")
         self.assign_master_to_node(anchor, node_ref)
@@ -321,10 +362,10 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         self.set_terminal_host([self.live_master_terminal("term-single-winner", anchor)])
         status1, claimed1 = self.claim("term-single-winner", anchor)
         self.assertEqual(200, status1, claimed1)
-        self.assertEqual(message["message_id"], claimed1["message"]["message_id"])
+        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claimed1["status"])
         status2, claimed2 = self.claim("term-single-winner", anchor, message_id=message["message_id"])
-        self.assertEqual(200, status2, claimed2)
-        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claimed2["status"])
+        self.assertEqual(409, status2, claimed2)
+        self.assertEqual("MASTER_MESSAGE_NODE_OWNER_MISMATCH", claimed2["error_code"])
 
     def test_reassignment_race_is_closed_by_the_atomic_recheck(self):
         # Deterministic reproduction of the exact race the Conductor
@@ -340,9 +381,10 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         node_ref = self.make_feature_node("queue-node-race-window")
         assignment = self.assign_master_to_node(anchor, node_ref)
         message, _ = self.queue_message("race-window-msg", node_ref=node_ref)
-        # Confirm eligibility exists right now (what the old design would
-        # have resolved and then trusted for the rest of the call).
-        self.assertTrue(self.server.store.has_queued_master_message_for("TEST", anchor))
+        # Node Masters never become queue readers, even while their old
+        # node-scoped row is still present. The row remains legacy evidence
+        # for the typed orphan cancel/reissue route.
+        self.assertFalse(self.server.store.has_queued_master_message_for("TEST", anchor))
         # Unassign lands "during" the race window, before the claim below.
         status, unassigned = self.act("persona.unassign", {
             "session_anchor_ref": anchor, "expected_assignment_revision": assignment["assignment_revision"],
@@ -364,7 +406,7 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         node_ref = self.make_feature_node("queue-node-wake-eligibility")
         assignment = self.assign_master_to_node(self.register("wake-eligible"), node_ref)
         self.queue_message("wake-eligibility-msg", node_ref=node_ref)
-        self.assertTrue(
+        self.assertFalse(
             self.server.store.has_queued_master_message_for("TEST", assignment["session_anchor_ref"])
         )
         self.assertFalse(
@@ -386,7 +428,7 @@ class NodeScopedMasterQueueTests(unittest.TestCase):
         node_ref = self.make_feature_node("queue-node-live-recheck")
         assignment = self.assign_master_to_node(anchor, node_ref)
         self.queue_message("live-recheck-msg", node_ref=node_ref)
-        self.assertTrue(self.server.store.has_queued_master_message_for("TEST", anchor))
+        self.assertFalse(self.server.store.has_queued_master_message_for("TEST", anchor))
         status, unassigned = self.act("persona.unassign", {
             "session_anchor_ref": anchor, "expected_assignment_revision": assignment["assignment_revision"],
         })

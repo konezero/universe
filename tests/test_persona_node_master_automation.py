@@ -48,6 +48,7 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "persona.create", "persona.assign", "persona.unassign", "persona.automation.start",
             "persona.automation.pause", "persona.automation.resume",
             "persona.automation.stop", "persona.automation.complete",
+            "persona.automation.master-result",
         }:
             body.setdefault("request_id", f"node-master-{action_id.replace('.', '-')}-{uuid.uuid4().hex}")
         return self.request("POST", "/v1/actions", {"action_id": action_id, "request": body})
@@ -514,14 +515,11 @@ class NodeMasterAutomationTests(unittest.TestCase):
             own_goal["goal_id"], planned["decision"]["target"]["selection"]["selected_goal_id"]
         )
 
-    def test_dispatch_from_a_node_scoped_run_creates_a_node_scoped_queue_item(self):
-        # 2026-09-15 follow-up (Conductor review): dispatch_work's
-        # message_value never carried node_ref, so a node-scoped run's
-        # actual dispatched work silently fell into the project-wide queue
-        # bucket -- any live Master for the project could claim it, not
-        # just the owning node Master. Fixed in
-        # tools/persona_automation.py::dispatch_work (node_ref copied from
-        # the run's own immutable column, never from the dispatch request).
+    def test_dispatch_from_a_node_scoped_run_uses_direct_master_action(self):
+        # A node Master owns its Todo loop in the current Session Anchor. The
+        # project Master queue is reserved for Conductor/reporting work, so a
+        # direct node dispatch must never create a queue item addressed back
+        # to that same Master.
         anchor = self.register("MASTER", "node-master-dispatch-node-scoped")
         persona = self.make_persona()
         own_node = self.make_feature_node("dispatch-node-scoped")
@@ -559,32 +557,25 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "completion_conditions": ["result evidence"],
         })
         self.assertEqual(201, status, dispatched)
-        message = self.server.store.get_master_message(dispatched["message"]["message_id"])
-        self.assertEqual(own_node, message["node_ref"])
-        self.assertEqual(own_todo["todo_id"], message["todo_id"])
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_DIRECT_DISPATCHED", dispatched["status"])
+        self.assertEqual(0, dispatched["woken_master_sessions"])
+        direct = dispatched["direct"]
+        self.assertEqual("DIRECT", direct["delivery_state"])
+        self.assertEqual("NODE_MASTER_ACTION", direct["route"])
+        self.assertEqual(anchor, direct["target_session_anchor_ref"])
+        self.assertTrue(direct["message_id"].startswith("persona-direct:"))
         self.assertEqual(own_todo["todo_id"], dispatched["dispatch"]["todo_id"])
-        self.assertEqual(own_todo["todo_id"], message["metadata"]["todo_id"])
-        self.assertEqual(anchor, message["node_owner_session_anchor_ref"])
-        self.assertEqual(assigned["assignment"]["assignment_revision"], message["node_owner_assignment_revision"])
-        # And it is claimable only by the owning node Master -- an
-        # unrelated Master's anonymous poll must not see it.
-        outsider = self.register("MASTER", "node-master-dispatch-outsider")
-        outsider_status, outsider_result = self.act("persona.automation.status", {"run_id": run["run_id"]})
-        self.assertEqual(200, outsider_status, outsider_result)  # sanity: run itself is readable
-        from unittest.mock import Mock
-        host = Mock()
-        host.list_sessions.return_value = [{
-            "terminal_id": "term-dispatch-outsider", "session_anchor_ref": outsider,
-            "project_id": "TEST", "provider": "CLAUDE", "mode": "MASTER", "state": "LIVE",
-        }]
-        host.get.return_value = host.list_sessions.return_value[0]
-        host.list_hosts.return_value = []
-        self.server.terminal_host = host
-        claim_status, claim_result = self.request("POST", "/v1/projects/TEST/master-messages/claim", {
-            "provider": "CLAUDE", "terminal_id": "term-dispatch-outsider", "session_anchor_ref": outsider,
+        status, completed = self.act("persona.automation.master-result", {
+            "run_id": run["run_id"],
+            "owner_ref": anchor,
+            "dispatch_id": dispatched["dispatch"]["dispatch_id"],
+            "assignment_revision": dispatched["dispatch"]["assignment_revision"],
+            "body_text": "direct Master result with exact Todo evidence",
+            "result_ref": "universe://tests/node-master-direct-result",
+            "completed_at": "2026-09-18T00:00:00Z",
         })
-        self.assertEqual(200, claim_status, claim_result)
-        self.assertEqual("MASTER_MESSAGE_QUEUE_EMPTY", claim_result["status"])
+        self.assertEqual(200, status, completed)
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_RESULT_RECORDED", completed["status"])
 
     def test_node_plan_waits_for_result_review_instead_of_redispatching_todo(self):
         anchor = self.register("MASTER", "node-master-review-cursor")
