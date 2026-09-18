@@ -4410,6 +4410,145 @@ class UniverseLocalServiceTests(unittest.TestCase):
             message_id=message["message_id"],
         )
 
+    def test_terminal_persona_run_cancels_queued_instruction_before_reconnect(self) -> None:
+        """A STOPPED Persona run must not revive its old prompt on recovery."""
+
+        terminal = {
+            "terminal_id": "term-stale-persona-001",
+            "project_id": "GCS",
+            "mode": "WORKER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": "anchor-stale-persona-001",
+        }
+        host = self._fake_master_host([terminal])
+        posted = self.server.session_bus.post(
+            host,
+            {
+                "to": {
+                    "project_id": "GCS",
+                    "mode": "WORKER",
+                    "provider": "CODEX",
+                    "terminal_id": terminal["terminal_id"],
+                    "session_anchor_ref": terminal["session_anchor_ref"],
+                },
+                "from": {
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "provider": "UNIVERSE",
+                    "session_anchor_ref": "anchor-master-001",
+                },
+                "kind": "INSTRUCTION",
+                "body_text": "stale Persona task must not run",
+                "persona_automation": {
+                    "schema": "universe.persona-automation-session-bus.v1",
+                    "run_id": "persona_run_stopped_001",
+                    "dispatch_id": "dispatch-stopped-001",
+                    "worker_role": "REVIEWER",
+                    "worker_assignment_id": "task_worker_stopped_001",
+                    "worker_assignment_revision": 1,
+                    "worker_anchor_ref": terminal["session_anchor_ref"],
+                    "project_id": "GCS",
+                    "node_ref": "feature-stopped-001",
+                    "todo_id": "todo-stopped-001",
+                    "task_frame_id": "",
+                    "idempotency_key": "persona-stopped-idempotency",
+                },
+            },
+        )
+        message = posted["messages"][0]
+        self.server.persona_automation.get_run = Mock(
+            return_value={"run_id": "persona_run_stopped_001", "state": "STOPPED"}
+        )
+        self.server._dispatch_pending_session_instruction = Mock(
+            return_value={"status": "DISPATCHED"}
+        )
+
+        dispatches = self.server._dispatch_live_posted_session_instructions(
+            {"messages": [message]}
+        )
+
+        self.assertEqual(
+            "PERSONA_AUTOMATION_INSTRUCTION_CANCELLED", dispatches[0]["status"]
+        )
+        self.assertEqual("CANCELLED", dispatches[0]["lifecycle_state"])
+        self.server._dispatch_pending_session_instruction.assert_not_called()
+        activity = self.server.session_bus.inbox(
+            host,
+            session_anchor_ref=terminal["session_anchor_ref"],
+            projection="ACTIVITY",
+        )["messages"]
+        stored = next(item for item in activity if item["message_id"] == message["message_id"])
+        self.assertEqual("CANCELLED", stored["lifecycle_state"])
+
+    def test_session_start_cannot_deliver_stopped_persona_instruction(self) -> None:
+        """The hook path must apply the same terminal-run guard as recovery."""
+
+        terminal = {
+            "terminal_id": "term-stale-persona-hook-001",
+            "project_id": "GCS",
+            "mode": "WORKER",
+            "provider": "CODEX",
+            "state": "LIVE",
+            "session_anchor_ref": "anchor-stale-persona-hook-001",
+        }
+        host = self._fake_master_host([terminal])
+        posted = self.server.session_bus.post(
+            host,
+            {
+                "to": {
+                    "project_id": "GCS",
+                    "mode": "WORKER",
+                    "provider": "CODEX",
+                    "terminal_id": terminal["terminal_id"],
+                    "session_anchor_ref": terminal["session_anchor_ref"],
+                },
+                "from": {
+                    "project_id": "GCS",
+                    "mode": "MASTER",
+                    "provider": "UNIVERSE",
+                    "session_anchor_ref": "anchor-master-hook-001",
+                },
+                "kind": "INSTRUCTION",
+                "body_text": "stale hook prompt must not run",
+                "persona_automation": {
+                    "schema": "universe.persona-automation-session-bus.v1",
+                    "run_id": "persona_run_stopped_hook_001",
+                    "dispatch_id": "dispatch-stopped-hook-001",
+                    "worker_role": "IMPLEMENTER",
+                    "worker_assignment_id": "task_worker_stopped_hook_001",
+                    "worker_assignment_revision": 1,
+                    "worker_anchor_ref": terminal["session_anchor_ref"],
+                    "project_id": "GCS",
+                    "node_ref": "feature-stopped-hook-001",
+                    "todo_id": "todo-stopped-hook-001",
+                    "task_frame_id": "",
+                    "idempotency_key": "persona-stopped-hook-idempotency",
+                },
+            },
+        )
+        message_id = posted["messages"][0]["message_id"]
+        self.server.persona_automation.get_run = Mock(
+            return_value={"run_id": "persona_run_stopped_hook_001", "state": "COMPLETED"}
+        )
+        session = {
+            "session_id": "supervisor-stale-persona-hook-001",
+            "session_anchor_ref": terminal["session_anchor_ref"],
+            "provider": "CODEX",
+            "mode": "WORKER",
+        }
+        with patch.object(self.server, "_session_anchor_terminal_host", return_value=host):
+            result = self.server._dispatch_pending_session_instruction(
+                project_id="GCS",
+                session=session,
+                trigger="SESSION_START",
+                message_id=message_id,
+                terminal=terminal,
+            )
+
+        self.assertEqual("PERSONA_AUTOMATION_INSTRUCTION_CANCELLED", result["status"])
+        self.assertEqual("CANCELLED", result["lifecycle_state"])
+
     def test_recovery_rebinds_changed_terminal_id_by_current_anchor(self) -> None:
         anchor = "session-anchor-rebound-001"
         rebound = {

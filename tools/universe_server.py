@@ -43345,6 +43345,18 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return False
         if not isinstance(run, Mapping):
             return False
+        # A stopped/completed/failed run may still have an older queued
+        # Session Bus instruction in its immutable inbox history.  The run
+        # state is authoritative: a reconnect must never turn that stale
+        # instruction into another provider turn.  PAUSED remains resumable,
+        # while RUNNING/WAITING are the only states that may accept a fresh
+        # Worker/Reviewer result.
+        if str(run.get("state") or "").strip().upper() not in {
+            "RUNNING",
+            "WAITING",
+            "PAUSED",
+        }:
+            return False
         assignment = run.get("current_assignment")
         if not isinstance(assignment, Mapping):
             return False
@@ -43405,6 +43417,47 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         return str(metadata.get("idempotency_key") or "") == expected_idempotency
 
+    def _persona_automation_stale_instruction(
+        self, message: Mapping[str, Any]
+    ) -> dict[str, str] | None:
+        """Return a terminal-run reason for a queued automation instruction.
+
+        Session Bus messages are immutable evidence, but an unclaimed
+        instruction is still executable transport.  Once its pinned run is
+        terminal, the message must be closed through the typed Bus lifecycle
+        before recovery/reattach can offer it to a Host again.  This helper
+        deliberately handles only terminal run state; WAITING/PAUSED are
+        preserved for their supported resume path.
+        """
+
+        lifecycle = message.get("lifecycle")
+        metadata = message.get("persona_automation")
+        if not isinstance(metadata, Mapping) and isinstance(lifecycle, Mapping):
+            metadata = lifecycle.get("persona_automation")
+        if not isinstance(metadata, Mapping):
+            return None
+        if str(metadata.get("schema") or "") != "universe.persona-automation-session-bus.v1":
+            return None
+        run_id = str(metadata.get("run_id") or "").strip()
+        if not run_id:
+            return None
+        try:
+            run = self.persona_automation.get_run(run_id)
+        except Exception:
+            # The run store is the same durable boundary as the message
+            # metadata.  A missing run cannot be safely executed or repaired.
+            return {
+                "error_code": "PERSONA_AUTOMATION_RUN_NOT_FOUND",
+                "detail": f"pinned Persona automation run {run_id} no longer exists",
+            }
+        state = str(run.get("state") or "").strip().upper()
+        if state in {"STOPPED", "COMPLETED", "FAILED"}:
+            return {
+                "error_code": "PERSONA_AUTOMATION_RUN_TERMINAL",
+                "detail": f"pinned Persona automation run {run_id} is {state}",
+            }
+        return None
+
     def _dispatch_live_posted_session_instructions(
         self, posted: Mapping[str, Any]
     ) -> list[dict[str, Any]]:
@@ -43436,6 +43489,39 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 or ""
             ).strip()
             if not terminal_id and not target_anchor:
+                continue
+            posted_message_id = str(message.get("message_id") or "").strip()
+            lifecycle_state = str(message.get("lifecycle_state") or "").upper()
+            stale = self._persona_automation_stale_instruction(message)
+            if stale is not None and lifecycle_state in {"QUEUED", "ACCEPTED"}:
+                # Do not dispatch a terminal run's old prompt.  Closing it via
+                # Session Bus preserves exact history and gives a later
+                # repair a deterministic cancelled predecessor to reference.
+                try:
+                    cancelled = self.session_bus.transition(
+                        posted_message_id,
+                        state="CANCELLED",
+                        session_anchor_ref=target_anchor,
+                        error_code=stale["error_code"],
+                    )
+                    cancelled_result = {
+                        "status": "PERSONA_AUTOMATION_INSTRUCTION_CANCELLED",
+                        "message_id": posted_message_id,
+                        "lifecycle_state": cancelled.get("lifecycle_state"),
+                        "error_code": stale["error_code"],
+                        "detail": stale["detail"],
+                    }
+                except (SessionBusError, UniverseError) as error:
+                    cancelled_result = {
+                        "status": "PERSONA_AUTOMATION_STALE_CANCEL_FAILED",
+                        "message_id": posted_message_id,
+                        "error_code": getattr(error, "code", "BUS_CANCEL_FAILED"),
+                        "detail": str(error),
+                    }
+                dispatches.append(cancelled_result)
+                self.session_bus.record_dispatch_attempt(
+                    posted_message_id, cancelled_result
+                )
                 continue
             try:
                 host = self._session_anchor_terminal_host()
@@ -43495,7 +43581,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     # bound Master may claim work, including UNKNOWN/STALE peers.
                     selected = (terminal, session)
                     break
-                posted_message_id = str(message.get("message_id") or "").strip()
                 if selected is None:
                     unavailable = {
                         "status": "BOUND_TERMINAL_UNAVAILABLE",
@@ -48889,6 +48974,37 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return {"status": "CLAIM_UNAVAILABLE", "detail": str(error)}
         if claim is None:
             return {"status": "NO_PENDING_INSTRUCTION"}
+        stale = self._persona_automation_stale_instruction(claim)
+        if stale is not None:
+            # The instruction was claimed only to validate its current Bus
+            # lifecycle.  A terminal automation run cannot be revived by a
+            # SessionStart/RECONNECT hook, even when the provider session
+            # itself is still live.  Keep the exact message as cancelled
+            # history and never offer its body to a provider adapter.
+            try:
+                cancelled = self.session_bus.transition(
+                    str(claim.get("message_id") or ""),
+                    state="CANCELLED",
+                    terminal_id=terminal_id,
+                    session_anchor_ref=session_anchor_ref,
+                    error_code=stale["error_code"],
+                )
+                return {
+                    "status": "PERSONA_AUTOMATION_INSTRUCTION_CANCELLED",
+                    "message_id": str(claim.get("message_id") or ""),
+                    "lifecycle_state": cancelled.get("lifecycle_state"),
+                    "error_code": stale["error_code"],
+                    "detail": stale["detail"],
+                    "session_anchor_ref": session_anchor_ref,
+                }
+            except (SessionBusError, UniverseError) as error:
+                return {
+                    "status": "PERSONA_AUTOMATION_STALE_CANCEL_FAILED",
+                    "message_id": str(claim.get("message_id") or ""),
+                    "error_code": getattr(error, "code", "BUS_CANCEL_FAILED"),
+                    "detail": str(error),
+                    "session_anchor_ref": session_anchor_ref,
+                }
         try:
             runtime_root = Path(__file__).resolve().parents[1] / ".ai" / "runtime"
             if str(runtime_root) not in sys.path:

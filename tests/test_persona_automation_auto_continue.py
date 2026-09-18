@@ -180,9 +180,14 @@ class PersonaAutomationAutoContinueTests(unittest.TestCase):
             "state": "READY", "source_kind": "MASTER", "sort_order": 0,
         })
         run = self._run_one_bounded_cycle_to_reviewed(anchor, node_ref, "empty")
+        # Planning/dispatch moves the selected Todo READY -> IN_PROGRESS via
+        # the typed todo.state Action, so the fixture must re-read the
+        # authoritative revision before marking it DONE.  Passing the create
+        # response's revision here intentionally exercised a stale CAS input.
+        current_todo = self.server.store.get_todo(only_todo["todo_id"])
         status, marked_done = self.act("todo.state", {
             "todo_id": only_todo["todo_id"], "project_id": "TEST",
-            "expected_revision": only_todo["revision"], "state": "DONE",
+            "expected_revision": current_todo["revision"], "state": "DONE",
             "validation": {"status": "PASSED", "evidence_ref": "test:auto-continue-empty"},
         })
         self.assertEqual(200, status, marked_done)
