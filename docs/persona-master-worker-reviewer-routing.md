@@ -34,14 +34,19 @@ Rust Host가 Provider 세션을 생성할 때 이미 Session Anchor를 알고 �
 | Mode Anchor | 자신의 현재 Mode Anchor | 생성하지 않음 |
 | Session Anchor | Rust Host가 만든 세션 Anchor | Rust Host가 만든 child Session Anchor |
 | 부모 연결 | 프로젝트/노드 소유 관계 | `parent_anchor_ref`로 Master Anchor를 가리킴 |
-| 역할 판정 | Conductor 또는 Master | assignment의 `IMPLEMENTER` 또는 `REVIEWER` |
+| Task Frame 실행 역할 | Parent/Master 또는 Conductor | `BOSS` 또는 `WORKER` |
+| Persona·작업 유형 | Master/Conductor Persona | 구현 Persona, 검토 Persona, 기타 bounded 작업 유형 |
 | 범위 | 프로젝트 또는 Feature Node | 정확한 project/node/Todo/Task Frame |
 | Provider 실행 | 직접 실행하거나 Worker를 배정 | 필요한 경우 자신의 Host 경로에서 실행 |
 
-Worker와 Reviewer가 같은 Session Anchor를 재사용할 수 있는지는 typed
-assignment 계약으로 결정한다. Reviewer는 Worker와 동일한 assignment나
-동일한 역할로 가장하면 안 되며, 독립 검토가 필요한 경우에는 별도
-Reviewer assignment와 독립 Anchor를 사용한다.
+Career Task Frame에서 `BOSS`와 `WORKER`가 실제 실행 역할이다. Reviewer는
+별도 Mode나 Role이 아니라 검토 Persona를 가진 Worker turn이며, Career
+정책의 `SUB_REVIEWER` 경로로 표현한다. `IMPLEMENTER`와 `REVIEWER`는
+Persona 또는 작업 유형을 설명하는 값이지 Task Frame Role이 아니다.
+
+Reviewer가 독립 검토를 해야 하는 경우에는 별도 Worker actor/run과 독립
+검토 turn을 사용한다. 이것이 반드시 영속 Fleet 세션을 새로 만든다는
+뜻은 아니다.
 
 ## 올바른 메시지 흐름
 
@@ -51,8 +56,8 @@ Node Master는 자기 노드의 authoritative Todo projection을 읽고 다음 �
 하나를 선택한다.
 
 - 작은 작업: `MASTER_DIRECT`로 직접 실행
-- 작업자 필요: Worker assignment 생성
-- 결과 검토 필요: Reviewer assignment 생성
+- 작업자 필요: Task Frame Worker turn 생성 (Boss는 필요할 때만 사용)
+- 결과 검토 필요: `SUB_REVIEWER` Worker turn과 검토 Persona 지정
 
 선택에는 정확한 project, node, Todo, optional Task Frame, assignment
 revision, Master Anchor, Persona revision, completion 조건이 고정된다.
@@ -188,3 +193,33 @@ Worker/Reviewer 레코드에서 `provider_session_ref`가 비어 보이는 경�
 이 문서의 목적은 Worker/Reviewer를 새로운 Mode로 만드는 것이 아니라,
 Master가 노드 Todo를 소유하고 typed Session Bus로 하위 작업을 지시·검토한
 뒤 결과를 다시 받아 완료하는 제품 계약을 명확히 하는 것이다.
+
+## Career Task Frame 실행 형태
+
+모든 작업에 독립 Provider 세션을 만들지 않는다. Master는 Todo의 크기와
+관찰·재개 요구를 보고 실행 형태를 선택한다.
+
+```text
+작은 bounded 작업
+  -> MASTER_DIRECT
+
+서브에이전트로 충분한 bounded 작업 또는 독립 검토
+  -> Task Frame
+  -> BOSS(선택) -> WORKER / SUB_REVIEWER
+  -> Result Packet -> Master Parent
+
+오래 실행되거나 사용자가 터미널에서 관찰·재개해야 하는 작업
+  -> durable Fleet Worker Session
+```
+
+Task Frame Worker는 raw sub-agent spawn이 아니라 Host가
+`WORKER_INVOCATION_READY`를 확인한 뒤 Worker actor와 `worker_run_ref`를
+가진 bounded turn으로 실행한다. 결과는 Master Parent의 Result Packet으로
+돌아온다. Fleet Worker Session은 장기 실행, 사용자 관찰, Provider Resume가
+필요할 때만 사용하는 별도 실행 표면이다.
+
+현재 구현의 `fleet.worker-session-start` 및 Persona automation 경로는
+대부분의 Worker/Reviewer 작업을 먼저 Host terminal로 만들고 있다. 이는
+Career 계약의 선택적 실행 형태와 맞지 않는 구현 잔여다. 후속 구현은
+Task Frame Worker 경로와 durable Fleet Session 경로를 분리하고,
+`mode=WORKER`를 Runtime Mode로 등록하지 않아야 한다.
