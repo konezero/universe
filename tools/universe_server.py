@@ -43456,6 +43456,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "error_code": "PERSONA_AUTOMATION_RUN_TERMINAL",
                 "detail": f"pinned Persona automation run {run_id} is {state}",
             }
+        # Before the Task Frame route existed, MASTER_DIRECT runs could leave
+        # a long-lived FLEET_SESSION Reviewer instruction behind.  If that
+        # old message has no Task Frame, retrying it forever only repeats the
+        # provider-observer identity failure (often with no provider session
+        # reference at all).  Automatic node control now has one supported
+        # shape: TASK_FRAME.  Keep explicit WORKER_REVIEW Fleet sessions
+        # resumable; close only this historical automatic transport.
+        assignment = run.get("current_assignment")
+        assignment = assignment if isinstance(assignment, Mapping) else {}
+        execution_mode = str(run.get("execution_mode") or "").strip().upper()
+        task_frame_id = str(
+            assignment.get("task_frame_id") or metadata.get("task_frame_id") or ""
+        ).strip()
+        if (
+            execution_mode == "MASTER_DIRECT"
+            and not task_frame_id
+            and str(assignment.get("state") or "").upper()
+            in {"WORKER_ASSIGNED", "REVIEWER_ASSIGNED"}
+        ):
+            return {
+                "error_code": "PERSONA_AUTOMATION_LEGACY_FLEET_SESSION_UNSUPPORTED",
+                "detail": (
+                    f"MASTER_DIRECT run {run_id} has a legacy FLEET_SESSION instruction; "
+                    "automatic node turns require a Task Frame"
+                ),
+            }
         return None
 
     def _dispatch_live_posted_session_instructions(

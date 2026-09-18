@@ -4549,6 +4549,40 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("PERSONA_AUTOMATION_INSTRUCTION_CANCELLED", result["status"])
         self.assertEqual("CANCELLED", result["lifecycle_state"])
 
+    def test_legacy_master_direct_fleet_instruction_is_not_retried_without_task_frame(self) -> None:
+        metadata = {
+            "schema": "universe.persona-automation-session-bus.v1",
+            "run_id": "persona_run_legacy_fleet_001",
+            "dispatch_id": "dispatch-legacy-fleet-001",
+            "worker_role": "REVIEWER",
+            "worker_assignment_id": "task_worker_legacy_fleet_001",
+            "worker_assignment_revision": 1,
+            "worker_anchor_ref": "anchor-legacy-fleet-001",
+            "project_id": "GCS",
+            "node_ref": "feature-legacy-fleet-001",
+            "todo_id": "todo-legacy-fleet-001",
+            "task_frame_id": "",
+            "idempotency_key": "legacy-fleet-idempotency",
+        }
+        self.server.persona_automation.get_run = Mock(
+            return_value={
+                "run_id": "persona_run_legacy_fleet_001",
+                "state": "WAITING",
+                "execution_mode": "MASTER_DIRECT",
+                "current_assignment": {
+                    "state": "REVIEWER_ASSIGNED",
+                    "task_frame_id": None,
+                },
+            }
+        )
+        stale = self.server._persona_automation_stale_instruction(
+            {"lifecycle": {"persona_automation": metadata}}
+        )
+        self.assertEqual(
+            "PERSONA_AUTOMATION_LEGACY_FLEET_SESSION_UNSUPPORTED",
+            stale["error_code"],
+        )
+
     def test_recovery_rebinds_changed_terminal_id_by_current_anchor(self) -> None:
         anchor = "session-anchor-rebound-001"
         rebound = {
