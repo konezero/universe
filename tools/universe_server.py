@@ -31552,6 +31552,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.stop",
                     "persona.automation.status",
                     "persona.automation.kick",
+                    "persona.automation.repair-reviewer",
                     "persona.automation.tick",
                     "persona.automation.plan",
                     "persona.automation.judge",
@@ -34422,6 +34423,87 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             lambda spec: self._create_persona_automation_worker(spec, context),
         )
 
+    def _repair_persona_automation_legacy_reviewer(
+        self,
+        value: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Replace one stale FLEET Reviewer with a Task Frame Reviewer.
+
+        This is deliberately a narrow recovery route for old MASTER_DIRECT
+        runs.  It reserves the replacement with a run CAS, ends the old Fleet
+        assignment through the existing typed assignment gateway, and only
+        then attaches the new Task Frame Reviewer.  Provider execution is
+        opt-in so quota/offline state remains explicit rather than becoming a
+        fabricated verdict.
+        """
+
+        prepared = self.persona_automation.prepare_legacy_reviewer_repair(value)
+        run = prepared.get("run") if isinstance(prepared, Mapping) else None
+        if not isinstance(run, Mapping):
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_REPAIR_RUN_MISSING",
+                "legacy Reviewer repair did not return the automation run",
+                500,
+            )
+        assignment_id = str(value.get("legacy_reviewer_assignment_id") or "").strip()
+        expected_assignment_revision = int(value.get("expected_reviewer_assignment_revision") or 0)
+        reason = str(value.get("reason") or "LEGACY_AUTOMATION_TASK_FRAME_REPAIR").strip()[:200]
+        old_assignment = self.store.get_task_worker_assignment(assignment_id)
+        if str(old_assignment.get("state") or "").upper() == "ACTIVE":
+            ended = self.store.end_task_worker_assignment(
+                {
+                    "assignment_id": assignment_id,
+                    "expected_assignment_revision": expected_assignment_revision,
+                    "reason": reason,
+                },
+                self._persona_actor(context),
+            )
+            ended_assignment = ended.get("assignment") or {}
+            self._record_worker_assignment_event(
+                project_id=str(ended_assignment.get("project_id") or ""),
+                outcome="ENDED",
+                assignment=ended_assignment,
+            )
+        elif str(old_assignment.get("state") or "").upper() == "ENDED":
+            ended_reason = str(old_assignment.get("ended_reason") or "")
+            if ended_reason != reason:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_ASSIGNMENT_CONFLICT",
+                    "the legacy Reviewer assignment was ended for another reason",
+                    409,
+                )
+        else:
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_REPAIR_ASSIGNMENT_INVALID",
+                "the legacy Reviewer assignment is not ACTIVE or an acknowledged repair history row",
+                409,
+            )
+        refreshed = self.persona_automation.get_run(str(run.get("run_id") or ""))
+        reviewer = self._ensure_persona_automation_master_reviewer(
+            refreshed, context=context
+        )
+        reviewer_run = reviewer.get("run") if isinstance(reviewer, Mapping) else None
+        execute_reviewer = value.get("execute_reviewer") is True
+        if execute_reviewer and isinstance(reviewer_run, Mapping):
+            reviewer["reviewer_instruction"] = self._ensure_persona_automation_worker_instruction(
+                reviewer_run, context=context
+            )
+        else:
+            reviewer["reviewer_execution"] = {
+                "status": "NOT_RUN",
+                "reason": "provider execution was not requested by the repair Action",
+            }
+        return {
+            "schema": "universe.persona-automation.v1",
+            "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIRED",
+            "prepared": prepared,
+            "ended_assignment": self.store.get_task_worker_assignment(assignment_id),
+            "reviewer": reviewer,
+            "run": reviewer.get("run") if isinstance(reviewer, Mapping) else refreshed,
+        }
+
     def _ensure_persona_automation_worker_instruction(
         self, run: Mapping[str, Any], *, context: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -36589,6 +36671,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                                     repaired_run, context=context
                                 )
                         return repaired
+                    reviewer_assignment = reviewer.get("assignment") if isinstance(reviewer, Mapping) else None
+                    if (
+                        isinstance(reviewer_assignment, Mapping)
+                        and str(reviewer_assignment.get("worker_role") or "").upper() == "REVIEWER"
+                        and str(reviewer_assignment.get("execution_shape") or "").upper() != "TASK_FRAME"
+                        and not str(reviewer_assignment.get("task_frame_id") or "").strip()
+                    ):
+                        return self._repair_persona_automation_legacy_reviewer(
+                            {
+                                "run_id": run.get("run_id"),
+                                "request_id": f"kick-legacy-reviewer-repair:{run.get('run_id')}:{int(run.get('revision') or 0)}:{reviewer_assignment.get('assignment_id')}:{int(reviewer_assignment.get('assignment_revision') or 0)}",
+                                "expected_revision": int(run.get("revision") or 0),
+                                "legacy_reviewer_assignment_id": reviewer_assignment.get("assignment_id"),
+                                "expected_reviewer_assignment_revision": int(reviewer_assignment.get("assignment_revision") or 0),
+                                "reason": "LEGACY_AUTOMATION_TASK_FRAME_REPAIR",
+                                "execute_reviewer": False,
+                            },
+                            context=context,
+                        )
                 if isinstance(assignment, Mapping) and str(assignment.get("state") or "").upper() in {
                     "WORKER_ASSIGNED",
                     "REVIEWER_ASSIGNED",
@@ -36618,6 +36719,27 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 # decision can never collide with the initial driver.
                 return self._enqueue_persona_automation_driver(
                     run, driver_key=f"kick-r{int(run.get('revision') or 0)}"
+                )
+            if action_id == "persona.automation.repair-reviewer":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_repair_reviewer",
+                    required=frozenset({
+                        "run_id",
+                        "request_id",
+                        "expected_revision",
+                        "legacy_reviewer_assignment_id",
+                        "expected_reviewer_assignment_revision",
+                    }),
+                    optional=frozenset({"reason", "execute_reviewer"}),
+                )
+                if value.get("execute_reviewer") is not None and type(value["execute_reviewer"]) is not bool:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_EXECUTION_FLAG_INVALID",
+                        "execute_reviewer must be a boolean when provided",
+                    )
+                return self._repair_persona_automation_legacy_reviewer(
+                    value, context=context
                 )
             if action_id == "persona.automation.pause":
                 value = _exact_object_fields(request, field="persona_automation_pause", required=frozenset({"run_id", "request_id"}), optional=frozenset({"expected_revision", "reason"}))

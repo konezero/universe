@@ -1040,3 +1040,17 @@ An older `MASTER_DIRECT` Fleet instruction without a Task Frame is closed as
 `PERSONA_AUTOMATION_LEGACY_FLEET_SESSION_UNSUPPORTED` rather than retried
 without a provider observer identity; explicit `WORKER_REVIEW` Fleet sessions
 remain eligible for their declared long-lived route.
+
+### Legacy Reviewer Task Frame repair (2026-09-18)
+
+An old `MASTER_DIRECT` run can retain a persistent `FLEET_SESSION` Reviewer
+assignment after the automatic node route has moved to Task Frames. The typed
+`persona.automation.repair-reviewer` Action is the only repair path: it pins
+the exact run revision, dispatch/result coordinates, old assignment id and
+assignment revision, records a CAS `REPAIRING` reservation, ends the old Fleet
+assignment through the normal Fleet gateway, and attaches a new Reviewer
+Task Frame under the owning Master Anchor. The old assignment remains ended
+history and is never rebound. The Action defaults provider execution to
+`NOT_RUN`; an operator must explicitly request execution, so quota/offline
+conditions cannot become a fabricated review verdict. `persona.automation.kick`
+uses the same narrow repair when it encounters this legacy shape.

@@ -1847,6 +1847,7 @@ class PersonaAutomationStore:
         reviewer_spec: dict[str, Any]
         reservation_id: str
         replaces_historical_review = False
+        replaces_legacy_reviewer = False
         with self._connection() as connection:
             row = self._get(connection, run_id)
             assignment = _load(row["current_assignment_json"], None)
@@ -1925,6 +1926,16 @@ class PersonaAutomationStore:
                         "run": self._row(row),
                         "reviewer": existing,
                     }
+                if existing_state == "REPAIRING":
+                    replaced_assignment = existing.get("replaced_assignment")
+                    replaces_legacy_reviewer = (
+                        isinstance(replaced_assignment, Mapping)
+                        and str(replaced_assignment.get("worker_role") or "").upper()
+                        == "REVIEWER"
+                        and str(replaced_assignment.get("execution_shape") or "").upper()
+                        != "TASK_FRAME"
+                        and not str(replaced_assignment.get("task_frame_id") or "").strip()
+                    )
             worker_config = _load(row["worker_config_json"], {})
             if not isinstance(worker_config, Mapping):
                 worker_config = {}
@@ -2072,6 +2083,19 @@ class PersonaAutomationStore:
                 "assigned_by_session_anchor_ref"
             ],
         }.items():
+            # A legacy MASTER_DIRECT run may have been left with a persistent
+            # FLEET_SESSION Reviewer.  The typed repair reservation permits a
+            # narrow upgrade to a Host-minted Task Frame; all other reviewer
+            # creation remains exact-field CAS validation.
+            if (
+                field == "task_frame_id"
+                and replaces_legacy_reviewer
+                and not str(expected_value or "").strip()
+                and str(reviewer_assignment.get(field) or "").strip()
+                and str(reviewer_assignment.get("execution_shape") or "").upper()
+                == "TASK_FRAME"
+            ):
+                continue
             if reviewer_assignment.get(field) != expected_value:
                 return mark_failed(
                     f"Fleet Reviewer assignment does not preserve exact {field} lineage",
@@ -2175,6 +2199,190 @@ class PersonaAutomationStore:
                 "status": "PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED",
                 "run": self._row(self._get(connection, run_id)),
                 "reviewer": reviewer_payload,
+                "event": event,
+            }
+
+    def prepare_legacy_reviewer_repair(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Reserve a CAS-scoped replacement for an old FLEET Reviewer.
+
+        Early MASTER_DIRECT runs used a persistent FLEET_SESSION Reviewer.
+        Those assignments are immutable history and must be ended through the
+        Fleet Action before a Task Frame Reviewer is attached.  This method
+        only moves the automation pointer to ``REPAIRING``; the server action
+        then performs the supported assignment end and calls
+        :meth:`attach_master_reviewer`.  The reservation makes a retry safe
+        if the process stops between those two guarded transitions.
+        """
+
+        run_id = _text(value.get("run_id"), "run_id")
+        expected_revision = _positive_int(value.get("expected_revision"), "expected_revision")
+        assignment_id = _text(value.get("legacy_reviewer_assignment_id"), "legacy_reviewer_assignment_id")
+        expected_assignment_revision = _positive_int(
+            value.get("expected_reviewer_assignment_revision"),
+            "expected_reviewer_assignment_revision",
+        )
+        request_id = _text(value.get("request_id"), "request_id")
+        reason = str(value.get("reason") or "LEGACY_AUTOMATION_TASK_FRAME_REPAIR").strip()[:200]
+        event_key = "legacy-reviewer-repair:" + assignment_id + ":" + str(expected_assignment_revision)
+        event_payload = {
+            "run_id": run_id,
+            "legacy_reviewer_assignment_id": assignment_id,
+            "expected_reviewer_assignment_revision": expected_assignment_revision,
+            "reason": reason,
+            "request_id": request_id,
+        }
+        with self._connection() as connection:
+            prior_event = connection.execute(
+                "SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, event_key),
+            ).fetchone()
+            if prior_event is not None:
+                stored = _load(prior_event["payload_json"], {})
+                if any(stored.get(key) != value for key, value in event_payload.items()):
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REPAIR_IDEMPOTENCY_CONFLICT",
+                        "legacy Reviewer repair request conflicts with its recorded reservation",
+                        409,
+                    )
+                return {
+                    "schema": SCHEMA,
+                    "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED",
+                    "run": self._row(self._get(connection, run_id)),
+                    "repair": dict(stored),
+                }
+            row = self._get(connection, run_id)
+            if int(row["revision"]) != expected_revision:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    f"automation run revision changed; current revision is {row['revision']}",
+                    409,
+                )
+            if str(row["execution_mode"] or "MASTER_DIRECT").upper() != "MASTER_DIRECT":
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_MODE_INVALID",
+                    "legacy Reviewer repair is only valid for MASTER_DIRECT runs",
+                    409,
+                )
+            if str(row["state"] or "").upper() not in {"RUNNING", "WAITING", "PAUSED"}:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_STATE_INVALID",
+                    "a terminal automation run cannot be repaired",
+                    409,
+                )
+            assignment = _load(row["current_assignment_json"], None)
+            reviewer = _load(row["current_reviewer_json"], None)
+            if not isinstance(assignment, Mapping) or str(assignment.get("state") or "").upper() not in {
+                "RESULT_READY_FOR_REVIEW",
+                "REVIEWER_ASSIGNED",
+            }:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_ASSIGNMENT_INVALID",
+                    "the current Master result must be waiting for a Reviewer",
+                    409,
+                )
+            if not isinstance(reviewer, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_REVIEWER_REQUIRED",
+                    "the legacy Reviewer assignment is missing",
+                    409,
+                )
+            reviewer_state = str(reviewer.get("state") or "").upper()
+            if reviewer_state == "REPAIRING":
+                replaced = reviewer.get("replaced_assignment")
+                if isinstance(replaced, Mapping) and str(replaced.get("assignment_id") or "") == assignment_id:
+                    return {
+                        "schema": SCHEMA,
+                        "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED",
+                        "run": self._row(row),
+                        "repair": dict(reviewer),
+                    }
+            if reviewer_state != "ASSIGNED":
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_REVIEWER_STATE_INVALID",
+                    "only an assigned legacy Reviewer can be repaired",
+                    409,
+                )
+            reviewer_assignment = reviewer.get("assignment")
+            if not isinstance(reviewer_assignment, Mapping):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_REVIEWER_REQUIRED",
+                    "the legacy Reviewer assignment receipt is missing",
+                    409,
+                )
+            expected_fields = {
+                "assignment_id": assignment_id,
+                "assignment_revision": expected_assignment_revision,
+                "worker_role": "REVIEWER",
+            }
+            for field, expected_value in expected_fields.items():
+                actual = reviewer_assignment.get(field)
+                if (int(actual) if field == "assignment_revision" and isinstance(actual, int) else actual) != expected_value:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REPAIR_PROVENANCE_MISMATCH",
+                        f"legacy Reviewer does not preserve exact {field} lineage",
+                        409,
+                    )
+            if str(reviewer_assignment.get("execution_shape") or "").upper() == "TASK_FRAME" or str(reviewer_assignment.get("task_frame_id") or "").strip():
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_NOT_LEGACY",
+                    "the current Reviewer is already a Task Frame assignment",
+                    409,
+                )
+            if str(reviewer_assignment.get("session_anchor_ref") or "") == str(row["session_anchor_ref"] or ""):
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_ANCHOR_INVALID",
+                    "a same-anchor Reviewer without a Task Frame cannot be repaired",
+                    409,
+                )
+            result_ref = str(assignment.get("result_ref") or "").strip()
+            if not result_ref or str(reviewer.get("worker_result_ref") or "") != result_ref:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REPAIR_RESULT_MISMATCH",
+                    "legacy Reviewer is not pinned to the current Master result",
+                    409,
+                )
+            repair_payload = {
+                **event_payload,
+                "worker_result_ref": result_ref,
+                "dispatch_id": assignment.get("dispatch_id"),
+                "source_message_id": assignment.get("message_id"),
+                "replaced_assignment": dict(reviewer_assignment),
+                "state": "REPAIRING",
+            }
+            replacement = {
+                "state": "REPAIRING",
+                "reservation_id": event_key,
+                "worker_result_ref": result_ref,
+                "source_role": "MASTER",
+                "master_result": reviewer.get("master_result") or {},
+                "reason": reason,
+                "legacy_reviewer_assignment_id": assignment_id,
+                "legacy_reviewer_assignment_revision": expected_assignment_revision,
+                "replaced_assignment": dict(reviewer_assignment),
+            }
+            now = _timestamp()
+            cursor = connection.execute(
+                "UPDATE persona_automation_run SET current_reviewer_json = ?, next_condition = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
+                (
+                    _json(replacement),
+                    "replace the legacy Reviewer with a Task Frame Reviewer",
+                    now,
+                    run_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                    "automation run changed while reserving legacy Reviewer repair",
+                    409,
+                )
+            event, _ = self._event(connection, run_id, "LEGACY_REVIEWER_REPAIR_RESERVED", event_key, repair_payload)
+            return {
+                "schema": SCHEMA,
+                "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_RESERVED",
+                "run": self._row(self._get(connection, run_id)),
+                "repair": replacement,
                 "event": event,
             }
 

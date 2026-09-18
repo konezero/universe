@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -300,6 +301,123 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME", result["provider_execution"]["execution_shape"])
         self.assertEqual("task-frame-result://frame-master-review/reviewer/1", lineage_results[0]["result_ref"])
         self.assertEqual("frame-master-review", lineage_results[0]["frame_ref"])
+
+    def test_legacy_master_reviewer_repair_is_cas_pinned_and_upgrades_to_task_frame(self):
+        run = self.store.start_run(
+            {
+                "project_id": self.assignment["project_id"],
+                "session_anchor_ref": self.assignment["session_anchor_ref"],
+                "scope": "legacy repair",
+                "instruction": "repair one historical reviewer assignment",
+                "request_id": "legacy-repair-start",
+                "execution_mode": "MASTER_DIRECT",
+                "worker_persona_id": "persona-reviewer",
+                "worker_provider": "CODEX",
+                "worker_model_ref": "gpt-5.6-luna",
+            },
+            self.assignment,
+        )["run"]
+        self.store.claim_tick({
+            "run_id": run["run_id"],
+            "owner_ref": self.assignment["session_anchor_ref"],
+            "tick_id": "legacy-repair-tick",
+        })
+        self.store.record_decision({
+            "run_id": run["run_id"],
+            "owner_ref": self.assignment["session_anchor_ref"],
+            "decision_id": "legacy-repair-decision",
+            "kind": "EXECUTE",
+            "rationale": "repair the exact historical reviewer",
+            "evidence_refs": ["fixture:legacy-reviewer"],
+            "target": {"todo_id": "todo-legacy-repair", "node_ref": self.assignment["node_ref"]},
+        })
+        dispatched = self.store.dispatch_work(
+            {
+                "run_id": run["run_id"],
+                "owner_ref": self.assignment["session_anchor_ref"],
+                "dispatch_id": "legacy-repair-dispatch",
+                "title": "legacy result",
+                "instruction": "record a historical Master result",
+                "completion_conditions": ["result evidence"],
+            },
+            lambda _project_id, _value: ({"message_id": "legacy-master-message"}, True),
+        )
+        assignment = dispatched["dispatch"]
+        completed = self.store.record_master_completion({
+            "run_id": run["run_id"],
+            "dispatch_id": assignment["dispatch_id"],
+            "assignment_revision": assignment["assignment_revision"],
+            "source_message_id": assignment["message_id"],
+            "result_ref": "legacy-master-result",
+            "body_text_utf8_sha256": "legacy-digest",
+            "completed_at": "2026-09-18T00:00:00Z",
+            "result_text": "historical result",
+        })
+        old_assignment = {
+            "assignment_id": "legacy-fleet-reviewer",
+            "project_id": self.assignment["project_id"],
+            "node_ref": self.assignment["node_ref"],
+            "todo_id": assignment["todo_id"],
+            "task_frame_id": None,
+            "worker_role": "REVIEWER",
+            "session_anchor_ref": "legacy-reviewer-anchor",
+            "assignment_revision": 1,
+            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
+            "execution_shape": "FLEET_SESSION",
+        }
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE persona_automation_run SET current_reviewer_json = ? WHERE run_id = ?",
+                (json.dumps({
+                    "state": "ASSIGNED",
+                    "assignment": old_assignment,
+                    "worker_result_ref": "legacy-master-result",
+                    "source_role": "MASTER",
+                    "master_result": {"result_ref": "legacy-master-result", "result_text": "historical result"},
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":")), run["run_id"]),
+            )
+        current = self.store.get_run(run["run_id"])
+        prepared = self.store.prepare_legacy_reviewer_repair({
+            "run_id": run["run_id"],
+            "request_id": "legacy-repair-request",
+            "expected_revision": current["revision"],
+            "legacy_reviewer_assignment_id": old_assignment["assignment_id"],
+            "expected_reviewer_assignment_revision": 1,
+        })
+        self.assertEqual("PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_RESERVED", prepared["status"])
+        repaired_assignment = {
+            **old_assignment,
+            "task_frame_id": "frame-legacy-repair",
+            "session_anchor_ref": self.assignment["session_anchor_ref"],
+            "execution_shape": "TASK_FRAME",
+        }
+        attached = self.store.attach_master_reviewer(
+            {
+                "run_id": run["run_id"],
+                "dispatch_id": assignment["dispatch_id"],
+                "assignment_revision": assignment["assignment_revision"],
+                "source_message_id": assignment["message_id"],
+                "result_ref": "legacy-master-result",
+                "body_text_utf8_sha256": "legacy-digest",
+                "result_text": "historical result",
+            },
+            create_reviewer=lambda spec: (
+                spec.__setitem__("task_frame_id", "frame-legacy-repair")
+                or {"assignment": repaired_assignment}
+            ),
+        )
+        self.assertEqual("PERSONA_AUTOMATION_MASTER_REVIEWER_ASSIGNED", attached["status"])
+        self.assertEqual("TASK_FRAME", attached["run"]["current_reviewer"]["assignment"]["execution_shape"])
+        self.assertEqual(self.assignment["session_anchor_ref"], attached["run"]["current_reviewer"]["assignment"]["session_anchor_ref"])
+        self.assertEqual("frame-legacy-repair", attached["run"]["current_assignment"]["task_frame_id"])
+        replay = self.store.prepare_legacy_reviewer_repair({
+            "run_id": run["run_id"],
+            "request_id": "legacy-repair-request",
+            "expected_revision": current["revision"],
+            "legacy_reviewer_assignment_id": old_assignment["assignment_id"],
+            "expected_reviewer_assignment_revision": 1,
+        })
+        self.assertEqual("PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED", replay["status"])
 
     def _prepared_run(self):
         run = self.store.start_run(
