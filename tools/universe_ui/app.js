@@ -61,6 +61,7 @@ const state = {
    * every tick. */
   fleetHomeRefreshTodoSignature: null,
   fleetHomeRefreshGoalSignature: null,
+  fleetHomeRefreshAssignmentSignature: null,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
@@ -4987,13 +4988,17 @@ async function refreshFleetHomeSoft() {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   state.fleetHomeRefreshInFlight = true;
   try {
-    const [todoResult, goalPlan] = await Promise.all([
+    const refetchAssignments = state.personaAssignmentsProjectId === projectId;
+    const [todoResult, goalPlan, assignmentResult] = await Promise.all([
       api("/v1/todos").catch(() => null),
       apiWithTimeout(
         `/v1/projects/${encodeURIComponent(projectId)}/goals`,
         {},
         8000
       ).catch(() => null),
+      refetchAssignments
+        ? invokeServerAction("persona.assignments-list", { project_id: projectId }).catch(() => null)
+        : Promise.resolve(null),
     ]);
     if (state.selectedProject?.project_id !== projectId) return;
     // Re-check after awaits: an edit or dialog may have started mid-flight.
@@ -5019,6 +5024,22 @@ async function refreshFleetHomeSoft() {
         state.unassignedTodos = (goalPlan.unassigned_todos || []).filter(
           (todo) => todo.state !== "DONE"
         );
+        changed = true;
+      }
+    }
+    // Node ownership ("Master X / LIVE" vs "Master UNASSIGNED") reads from
+    // state.personaAssignments, which ensureHomeNodeOwners() fetches only
+    // once per project and then never again -- a handoff, a new assignment,
+    // or a stale UNASSIGNED node never updates without this, even though
+    // the automation underneath keeps running. Refetch it on the same poll,
+    // in place (never through loadPersonaProjectProjection, which nulls the
+    // array first and would itself flicker the owner rows every tick).
+    if (Array.isArray(assignmentResult?.assignments)) {
+      const signature = JSON.stringify(assignmentResult.assignments);
+      if (signature !== state.fleetHomeRefreshAssignmentSignature) {
+        state.fleetHomeRefreshAssignmentSignature = signature;
+        state.personaAssignments = assignmentResult.assignments;
+        state.personaAssignmentsStatus = "READY";
         changed = true;
       }
     }
