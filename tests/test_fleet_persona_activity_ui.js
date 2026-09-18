@@ -252,6 +252,9 @@ test("Fleet Worker controls use live project Worker/Reviewer sessions and active
   assert.match(roster, /workerPersonaSelect/);
   assert.match(roster, /personaId: workerPersonaSelect\.value/);
   assert.match(roster, /UNKNOWN: no live Worker\/Reviewer session available to assign/);
+  assert.match(roster, /assignment\.execution_shape/);
+  assert.match(roster, /Task Frame \/ Master Host/);
+  assert.match(roster, /Fleet Session Host/);
   assert.match(appSource, /function fleetAuthoritativeTerminals\(\)/);
   assert.match(appSource, /state\.supervisorTerminals/);
 });

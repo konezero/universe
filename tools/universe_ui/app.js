@@ -6416,10 +6416,18 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
         : String(personaAssignment?.delivery_status || "UNKNOWN").toUpperCase();
       const personaPhase = personaAssignment?.applied_phase || personaAssignment?.queued_phase || "";
       const personaHostSync = String(personaAssignment?.host_sync_status || "UNKNOWN").toUpperCase();
+      const executionShape = String(assignment.execution_shape || "UNKNOWN").toUpperCase();
+      const personaTaskKind = String(assignment.persona_task_kind || "UNKNOWN").toUpperCase();
+      const hostStateLabel = executionShape === "TASK_FRAME"
+        ? `Task Frame / Master Host ${liveState}`
+        : executionShape === "FLEET_SESSION"
+          ? `Fleet Session Host ${liveState}`
+          : `Host ${liveState}`;
       row.append(
         node("span", "fleet-node-role", assignment.worker_role === "REVIEWER" ? "Reviewer" : "Worker"),
         document.createTextNode(
-          ` ${persona?.title || assignment.persona_id || "No Persona"} / ${assignment.session_anchor_ref} / ${liveState}`
+          ` ${persona?.title || assignment.persona_id || "No Persona"} / ${assignment.session_anchor_ref} / ${hostStateLabel}`
+          + ` / ${executionShape} ${personaTaskKind}`
           + ` / Persona ${personaDelivery}${personaPhase ? ` (${personaPhase})` : ""} / Host sync ${personaHostSync}`
           + ` / Todo ${assignment.todo_id || assignment.task_frame_id || "UNKNOWN"} / rev ${assignment.assignment_revision}`
         ),
