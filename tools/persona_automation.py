@@ -2231,6 +2231,8 @@ class PersonaAutomationStore:
             "reason": reason,
             "request_id": request_id,
         }
+        recovery_from_stale_reservation = False
+        prior_event_record: dict[str, Any] | None = None
         with self._connection() as connection:
             prior_event = connection.execute(
                 "SELECT * FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
@@ -2244,14 +2246,48 @@ class PersonaAutomationStore:
                         "legacy Reviewer repair request conflicts with its recorded reservation",
                         409,
                     )
-                return {
-                    "schema": SCHEMA,
-                    "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED",
-                    "run": self._row(self._get(connection, run_id)),
-                    "repair": dict(stored),
+                prior_event_record = {
+                    "event_id": prior_event["event_id"],
+                    "event_type": prior_event["event_type"],
+                    "idempotency_key": prior_event["idempotency_key"],
+                    **dict(stored),
                 }
+                existing_row = self._get(connection, run_id)
+                existing_reviewer = _load(existing_row["current_reviewer_json"], None)
+                existing_assignment = _load(existing_row["current_assignment_json"], None)
+                existing_reviewer_state = (
+                    str(existing_reviewer.get("state") or "").upper()
+                    if isinstance(existing_reviewer, Mapping)
+                    else ""
+                )
+                existing_task_frame = (
+                    str(existing_assignment.get("task_frame_id") or "").strip()
+                    if isinstance(existing_assignment, Mapping)
+                    else ""
+                )
+                existing_reviewer_id = (
+                    str(existing_assignment.get("reviewer_assignment_id") or "").strip()
+                    if isinstance(existing_assignment, Mapping)
+                    else ""
+                )
+                if not (
+                    existing_reviewer_state == "CREATING"
+                    and existing_reviewer_id == assignment_id
+                    and not existing_task_frame
+                ):
+                    return {
+                        "schema": SCHEMA,
+                        "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED",
+                        "run": self._row(existing_row),
+                        "repair": dict(stored),
+                    }
+                # A process/reconnect can leave the first repair creator in
+                # CREATING after the Fleet row was ended. Re-enter the same
+                # reservation with its original request coordinates and let
+                # the CAS path finish the Task Frame replacement.
+                recovery_from_stale_reservation = True
             row = self._get(connection, run_id)
-            if int(row["revision"]) != expected_revision:
+            if int(row["revision"]) != expected_revision and not recovery_from_stale_reservation:
                 raise PersonaAutomationError(
                     "PERSONA_AUTOMATION_REVISION_CONFLICT",
                     f"automation run revision changed; current revision is {row['revision']}",
@@ -2296,13 +2332,28 @@ class PersonaAutomationStore:
                         "run": self._row(row),
                         "repair": dict(reviewer),
                     }
-            if reviewer_state != "ASSIGNED":
+            if reviewer_state == "CREATING" and recovery_from_stale_reservation:
+                reviewer_assignment = None
+            elif reviewer_state != "ASSIGNED":
                 raise PersonaAutomationError(
                     "PERSONA_AUTOMATION_REPAIR_REVIEWER_STATE_INVALID",
                     "only an assigned legacy Reviewer can be repaired",
                     409,
                 )
-            reviewer_assignment = reviewer.get("assignment")
+            reviewer_assignment = reviewer.get("assignment") if isinstance(reviewer, Mapping) else None
+            if reviewer_state == "CREATING" and recovery_from_stale_reservation:
+                reviewer_assignment = {
+                    "assignment_id": assignment_id,
+                    "assignment_revision": expected_assignment_revision,
+                    "worker_role": "REVIEWER",
+                    "project_id": row["project_id"],
+                    "node_ref": row["node_ref"],
+                    "todo_id": assignment.get("todo_id"),
+                    "task_frame_id": assignment.get("task_frame_id"),
+                    "session_anchor_ref": assignment.get("reviewer_anchor_ref"),
+                    "assigned_by_session_anchor_ref": row["session_anchor_ref"],
+                    "execution_shape": "FLEET_SESSION",
+                }
             if not isinstance(reviewer_assignment, Mapping):
                 raise PersonaAutomationError(
                     "PERSONA_AUTOMATION_REPAIR_REVIEWER_REQUIRED",
@@ -2377,7 +2428,10 @@ class PersonaAutomationStore:
                     "automation run changed while reserving legacy Reviewer repair",
                     409,
                 )
-            event, _ = self._event(connection, run_id, "LEGACY_REVIEWER_REPAIR_RESERVED", event_key, repair_payload)
+            if recovery_from_stale_reservation and prior_event_record is not None:
+                event = prior_event_record
+            else:
+                event, _ = self._event(connection, run_id, "LEGACY_REVIEWER_REPAIR_RESERVED", event_key, repair_payload)
             return {
                 "schema": SCHEMA,
                 "status": "PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_RESERVED",
