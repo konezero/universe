@@ -34268,6 +34268,34 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "frame_id": frame_id,
             "turn_id": turn_id,
         }
+        if normalized_role == "IMPLEMENTER":
+            outcome = str(structured.get("outcome") or "").strip().upper()
+            if outcome not in {"SUCCEEDED", "FAILED", "BLOCKED", "NOT_RUN"}:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
+                    "Worker outcome must be SUCCEEDED, FAILED, BLOCKED or NOT_RUN",
+                    HTTPStatus.BAD_GATEWAY,
+                )
+        else:
+            verdict = str(
+                structured.get("verdict") or structured.get("outcome") or ""
+            ).strip().upper()
+            if verdict not in {"PASS", "NEEDS_REVISION", "BLOCKED"}:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
+                    "Reviewer verdict must be PASS, NEEDS_REVISION or BLOCKED",
+                    HTTPStatus.BAD_GATEWAY,
+                )
+            master_result_ref = str(master_result.get("result_ref") or "").strip()
+            worker_result_ref = str(
+                current.get("worker_result_ref") or master_result_ref
+            ).strip()
+            if not worker_result_ref:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH",
+                    "Reviewer has no exact source result reference",
+                    HTTPStatus.CONFLICT,
+                )
         provider_result_ref = (
             f"task-frame-result://{frame_id}/{turn_id}/{assignment_revision}"
         )
@@ -34292,13 +34320,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         evidence_refs.append(f"task-frame-result:{provider_result_ref}")
         provider_evidence["task_frame_result_ref"] = provider_result_ref
         if normalized_role == "IMPLEMENTER":
-            outcome = str(structured.get("outcome") or "").strip().upper()
-            if outcome not in {"SUCCEEDED", "FAILED", "BLOCKED", "NOT_RUN"}:
-                raise UniverseError(
-                    "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
-                    "Worker outcome must be SUCCEEDED, FAILED, BLOCKED or NOT_RUN",
-                    HTTPStatus.BAD_GATEWAY,
-                )
             result_ref = provider_result_ref
             recorded = self.persona_automation.record_worker_result(
                 {
@@ -34327,25 +34348,6 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 )
             return recorded
 
-        verdict = str(
-            structured.get("verdict") or structured.get("outcome") or ""
-        ).strip().upper()
-        if verdict not in {"PASS", "NEEDS_REVISION", "BLOCKED"}:
-            raise UniverseError(
-                "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
-                "Reviewer verdict must be PASS, NEEDS_REVISION or BLOCKED",
-                HTTPStatus.BAD_GATEWAY,
-            )
-        master_result_ref = str(master_result.get("result_ref") or "").strip()
-        worker_result_ref = str(
-            current.get("worker_result_ref") or master_result_ref
-        ).strip()
-        if not worker_result_ref:
-            raise UniverseError(
-                "PERSONA_AUTOMATION_REVIEW_PROVENANCE_MISMATCH",
-                "Reviewer has no exact source result reference",
-                HTTPStatus.CONFLICT,
-            )
         verdict_result = self.persona_automation.record_reviewer_verdict(
             {
                 "run_id": run_id,
