@@ -1027,3 +1027,12 @@ this automatic route. Provider execution starts only after the run assignment
 CAS commits, and its receipt/result packet is recorded separately from the
 assignment and review phases. Explicit Fleet UI requests may still opt into a
 long-lived `FLEET_SESSION` Worker when observation or Resume is required.
+
+### Stale automation instruction cancellation (2026-09-18)
+
+Recovery and SessionStart compare a queued Persona Worker/Reviewer instruction
+with its durable run before offering it to a Host. `RUNNING`, `WAITING`, and
+`PAUSED` remain resumable. A `STOPPED`, `COMPLETED`, or `FAILED` run closes its
+queued instruction as typed Session Bus `CANCELLED` evidence, so reconnect does
+not re-invoke work that the user already stopped or completed. An already
+`STARTED` provider turn is left observable and is not rewritten as cancellation.

@@ -242,3 +242,14 @@ from automatic node control. A queue receipt or assignment state is never a
 provider result, Reviewer verdict, or Todo completion. The automation driver
 must observe the Task Frame result, record `PASS`/`NEEDS_REVISION`/`BLOCKED`,
 and only then continue the node Todo lifecycle.
+
+### Stale automation instruction cancellation (2026-09-18)
+
+An instruction retained for a Persona run is executable transport until its
+Session Bus lifecycle is closed. Recovery and SessionStart therefore read the
+authoritative run state before dispatch: `RUNNING`, `WAITING`, and `PAUSED`
+remain resumable, while `STOPPED`, `COMPLETED`, and `FAILED` cancel the queued
+instruction through the typed Bus lifecycle. Cancellation preserves the exact
+message and assignment history and prevents a reconnect from invoking a stale
+Worker or Reviewer prompt. It does not cancel an already `STARTED` provider
+turn; that turn remains separately observable.
