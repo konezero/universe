@@ -2412,6 +2412,7 @@ class PersonaAutomationStore:
                 "replaced_assignment": dict(reviewer_assignment),
             }
             now = _timestamp()
+            cas_revision = int(row["revision"]) if recovery_from_stale_reservation else expected_revision
             cursor = connection.execute(
                 "UPDATE persona_automation_run SET current_reviewer_json = ?, next_condition = ?, revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
                 (
@@ -2419,7 +2420,7 @@ class PersonaAutomationStore:
                     "replace the legacy Reviewer with a Task Frame Reviewer",
                     now,
                     run_id,
-                    expected_revision,
+                    cas_revision,
                 ),
             )
             if cursor.rowcount != 1:
