@@ -2184,11 +2184,19 @@ class PersonaAutomationStore:
                     "automation run changed while recording Master Reviewer assignment",
                     409,
                 )
+            reviewer_event_key = "master-reviewer:" + result_ref
+            if replaces_legacy_reviewer:
+                reviewer_event_key = (
+                    "master-reviewer-repair:"
+                    + result_ref
+                    + ":"
+                    + str(reviewer_assignment.get("assignment_id") or "")
+                )
             event, _ = self._event(
                 connection,
                 run_id,
                 "MASTER_REVIEWER_ASSIGNED",
-                "master-reviewer:" + result_ref,
+                reviewer_event_key,
                 {
                     "reviewer": reviewer_payload,
                     "master_result_ref": result_ref,
