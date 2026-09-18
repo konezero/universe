@@ -36460,6 +36460,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         decision = run.get("current_decision")
         target = decision.get("target") if isinstance(decision, Mapping) else None
         source_todo_id = str(target.get("todo_id") or "").strip() if isinstance(target, Mapping) else ""
+        # Node planner decisions carry the authoritative Todo under the exact
+        # assignment target. Preserve the direct shape for older runs, but do
+        # not scan project Todos or infer a follow-up from review prose.
+        if not source_todo_id and isinstance(target, Mapping):
+            assignment_target = target.get("assignment")
+            if isinstance(assignment_target, Mapping):
+                source_todo_id = str(assignment_target.get("todo_id") or "").strip()
         if not source_todo_id:
             return {
                 "status": "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_SOURCE_UNAVAILABLE",

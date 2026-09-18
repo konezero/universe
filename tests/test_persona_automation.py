@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -1494,6 +1495,68 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
             "run_id": run["run_id"], "reason": "explicit operator stop", "force": True,
         })
         self.assertEqual(200, status, stopped)
+
+    def test_non_passing_review_uses_nested_assignment_todo_target(self):
+        """Node planner targets keep the exact Todo under assignment."""
+        material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-review-nested-target-session",
+            "node": "TEST",
+            "mode": "CONDUCTOR",
+            "provider": "CODEX",
+        })
+        anchor = material["session_anchor_ref"]
+        status, persona_result = self.act("persona.create", {
+            "title": "nested target lead", "body": "Preserve the assignment Todo lineage."
+        })
+        self.assertEqual(200, status, persona_result)
+        persona = persona_result["persona"]
+        status, assignment = self.act("persona.assign", {
+            "session_anchor_ref": anchor,
+            "project_id": "TEST",
+            "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"],
+            "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assignment)
+        source = self.server.store.create_todo({
+            "scope_kind": "PROJECT", "project_id": "TEST",
+            "title": "Nested target source", "detail": "source",
+            "priority": "P1", "state": "IN_PROGRESS", "source_kind": "MASTER",
+            "sort_order": 42,
+        })
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor,
+            "scope": "nested target follow-up", "instruction": "review one Todo",
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        run["current_decision"] = {
+            "target": {
+                "assignment": {"todo_id": source["todo_id"], "node_ref": "feature_nested"},
+                "selection": {"todo_id": source["todo_id"]},
+            }
+        }
+        with patch.object(
+            self.server.persona_automation,
+            "record_review_followup",
+            return_value={"status": "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_RECORDED"},
+        ) as record_followup:
+            followup = self.server._create_persona_review_followup_todo({
+                "run": run,
+                "review": {
+                    "review_id": "persona_review_nested_target",
+                    "outcome": "NEEDS_REVISION",
+                    "result_ref": "nested-target-result",
+                    "next_action": "repair the exact assignment",
+                    "note": "nested target evidence",
+                    "evidence_refs": ["test:nested-target"],
+                },
+            })
+            recorded_payload = record_followup.call_args.args[0]
+        self.assertEqual(source["todo_id"], recorded_payload["source_todo_id"])
+        self.assertEqual("P1", followup["todo"]["priority"])
+        self.assertEqual("READY", followup["todo"]["state"])
+        self.assertIn(source["todo_id"], followup["todo"]["detail"])
 
 
 if __name__ == "__main__":
