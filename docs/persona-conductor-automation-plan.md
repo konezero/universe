@@ -1036,3 +1036,7 @@ with its durable run before offering it to a Host. `RUNNING`, `WAITING`, and
 queued instruction as typed Session Bus `CANCELLED` evidence, so reconnect does
 not re-invoke work that the user already stopped or completed. An already
 `STARTED` provider turn is left observable and is not rewritten as cancellation.
+An older `MASTER_DIRECT` Fleet instruction without a Task Frame is closed as
+`PERSONA_AUTOMATION_LEGACY_FLEET_SESSION_UNSUPPORTED` rather than retried
+without a provider observer identity; explicit `WORKER_REVIEW` Fleet sessions
+remain eligible for their declared long-lived route.

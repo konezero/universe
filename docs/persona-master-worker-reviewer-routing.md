@@ -253,3 +253,7 @@ instruction through the typed Bus lifecycle. Cancellation preserves the exact
 message and assignment history and prevents a reconnect from invoking a stale
 Worker or Reviewer prompt. It does not cancel an already `STARTED` provider
 turn; that turn remains separately observable.
+Historical `MASTER_DIRECT` Fleet instructions without a Task Frame are also
+closed as `PERSONA_AUTOMATION_LEGACY_FLEET_SESSION_UNSUPPORTED` instead of
+retrying a missing provider observer identity. Explicit `WORKER_REVIEW`
+Fleet sessions remain on their declared long-lived transport.
