@@ -312,6 +312,7 @@ PERSONA_AUTOMATION_ACTION_IDS = (
     "persona.automation.host-status",
     "persona.automation.collect-frame",
     "persona.automation.host-permission",
+    "persona.automation.host-binding",
 )
 
 LEGACY_CLI_TERMINAL_HTTP_SURFACE = "/v1/terminals"
@@ -1191,6 +1192,7 @@ def build_default_action_registry(
         "persona.automation.host-status": ("READ_ONLY", "host_status"),
         "persona.automation.collect-frame": ("LOCAL_DATABASE_MUTATION", "collect_frame"),
         "persona.automation.host-permission": ("LOCAL_DATABASE_MUTATION", "host_permission"),
+        "persona.automation.host-binding": ("READ_ONLY", "host_binding"),
     }
     for action_id in PERSONA_AUTOMATION_ACTION_IDS:
         side_effect, operation = automation_specs[action_id]

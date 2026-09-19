@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 from task_frame_host import RoleResult
 from task_frame_host_permission import HostPermissionEscalator
-from task_frame_host_transport import HttpBusPort, HttpRoomPort, HttpTodoPort
+from task_frame_host_transport import HttpBusPort, HttpRoomPort, HttpTodoPort, fetch_runtime_binding
 from universe_runtime_host import RuntimeHostError, UniverseRuntimeHost
 
 WORKER_OUTPUT_CONTRACT = {
@@ -78,14 +78,28 @@ class RuntimeHostRoleRunner:
         *,
         runtime_host: Any | None = None,
         permission_escalator: Any | None = None,
+        binding_provider: Any | None = None,
     ) -> None:
         self.spec = spec
+        self.binding_provider = binding_provider
         self.host = runtime_host or UniverseRuntimeHost(Path(str(spec["repository_root"])))
         self.last_worker_result: Mapping[str, Any] | None = None
         self.escalator = permission_escalator
         dispatcher = getattr(self.host, "worker_dispatcher", None)
         if permission_escalator is not None and dispatcher is not None:
             dispatcher.permission_escalator = permission_escalator
+
+    def _current_binding(self) -> Mapping[str, Any]:
+        """The server's current frame runtime binding, else the one the Host started with."""
+
+        if self.binding_provider is not None:
+            try:
+                fresh = self.binding_provider()
+            except Exception:  # noqa: BLE001 - the launch-time binding is the fallback
+                fresh = None
+            if isinstance(fresh, Mapping) and fresh.get("endpoint") and fresh.get("token"):
+                return fresh
+        return self.spec["runtime_binding"]
 
     def run(self, role: str, *, attempt: int, feedback: str | None) -> RoleResult:
         spec = self.spec
@@ -124,7 +138,7 @@ class RuntimeHostRoleRunner:
         )
         try:
             provider_result = self.host.invoke_structured_task(
-                runtime_binding=spec["runtime_binding"],
+                runtime_binding=self._current_binding(),
                 provider=str(spec["provider"]),
                 invocation_id=f"host:{frame_id}",
                 frame_id=frame_id,
@@ -180,4 +194,7 @@ def make(spec: Mapping[str, Any]) -> RuntimeHostRoleRunner:
         timeout_seconds=(float(spec["permission_timeout_seconds"]) if spec.get("permission_timeout_seconds") else None),
         alive=lambda: _live(room, todo),
     )
-    return RuntimeHostRoleRunner(spec, permission_escalator=escalator)
+    provider = None
+    if spec.get("run_id"):
+        provider = lambda: fetch_runtime_binding(base, str(spec["run_id"]), str(spec["task_frame_id"]))  # noqa: E731
+    return RuntimeHostRoleRunner(spec, permission_escalator=escalator, binding_provider=provider)

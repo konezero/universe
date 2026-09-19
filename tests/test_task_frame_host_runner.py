@@ -80,6 +80,23 @@ class RoleRunnerTests(unittest.TestCase):
         self.assertEqual("changed a.py", call["context_pack"]["worker_result"]["result_text"])
         self.assertEqual("COMPLETED", result.status)
 
+    def test_each_role_uses_the_servers_current_binding_and_falls_back_to_the_launch_one(self):
+        host = FakeRuntimeHost(GOOD)
+        fresh = {"endpoint": "http://127.0.0.1:2", "token": "new"}
+        runner = RuntimeHostRoleRunner(SPEC, runtime_host=host, binding_provider=lambda: fresh)
+        runner.run("WORKER", attempt=1, feedback=None)
+        self.assertEqual(fresh, host.calls[0]["runtime_binding"])
+
+        def down():
+            raise ConnectionError("server restarting")
+
+        fallback = RuntimeHostRoleRunner(SPEC, runtime_host=FakeRuntimeHost(GOOD), binding_provider=down)
+        fallback.run("WORKER", attempt=1, feedback=None)
+        self.assertEqual(SPEC["runtime_binding"], fallback.host.calls[0]["runtime_binding"])
+        incomplete = RuntimeHostRoleRunner(SPEC, runtime_host=FakeRuntimeHost(GOOD), binding_provider=lambda: {"endpoint": "x"})
+        incomplete.run("WORKER", attempt=1, feedback=None)
+        self.assertEqual(SPEC["runtime_binding"], incomplete.host.calls[0]["runtime_binding"])
+
     def test_provider_failures_and_bad_results_are_failed_roles(self):
         error = RuntimeHostError("WORKER_TRANSPORT_FAILED", "codex down")
         failed = RuntimeHostRoleRunner(SPEC, runtime_host=FakeRuntimeHost(error=error))

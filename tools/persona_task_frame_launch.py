@@ -159,6 +159,7 @@ def launch_frame(
         "base_url": base_url,
         "room_id": room["room_id"],
         "task_frame_id": frame_id,
+        "run_id": run_id,
         "todo_id": todo["todo_id"],
         "first_role": first_role,
         "bus_to": dict(bus_to),

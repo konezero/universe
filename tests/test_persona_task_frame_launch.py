@@ -88,6 +88,7 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual("BOUNDED", spec["worker_write_scope"]["repository_write_scope"])
         self.assertEqual([str(self.project / "a.py")], spec["worker_write_scope"]["mutation_scope"]["targets"])
         self.assertEqual("room_1", spec["room_id"])
+        self.assertEqual("run_1", spec["run_id"])
         self.assertEqual("task_frame_host_runner:make", spec["runner"])
         self.assertEqual(1, len(self.rooms.created))
 

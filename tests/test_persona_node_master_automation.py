@@ -1146,6 +1146,24 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "directive": "RUN_ROLE", "request_id": "tr-2"})
         self.assertEqual("TASK_FRAME_ROLE_INVALID", missing["error_code"])
 
+    def test_a_host_can_fetch_the_current_runtime_binding_for_its_own_frame_only(self):
+        from unittest import mock
+
+        anchor, node_ref, run = self._start_driven_run("frame-binding")
+        todo = self._frame_todo(node_ref, "Binding Todo")
+        status, launched, _spawned = self._launch(anchor, run, todo, request_id="binding-1")
+        frame = launched["task_frame_id"]
+        current = {"endpoint": "http://127.0.0.1:9", "token": "fresh", "session_id": "s"}
+        with mock.patch.object(self.server, "_persona_automation_runtime_binding", return_value=current):
+            status, result = self.act("persona.automation.host-binding", {
+                "run_id": run["run_id"], "task_frame_id": frame})
+            self.assertEqual(200, status, result)
+            self.assertEqual(current, result["runtime_binding"])
+            status, foreign = self.act("persona.automation.host-binding", {
+                "run_id": run["run_id"], "task_frame_id": "host_not_mine"})
+        self.assertEqual(404, status, foreign)
+        self.assertEqual("TASK_FRAME_NOT_LAUNCHED_BY_RUN", foreign["error_code"])
+
     # -- out-of-scope write requests: Master decides, destructive goes to the Conductor --
 
     def _ask_permission(self, frame_id, *, operations, destructive, key):

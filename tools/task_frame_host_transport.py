@@ -121,3 +121,20 @@ class HttpTodoPort:
             if isinstance(todo, Mapping) and todo.get("todo_id") == self._todo_id:
                 return str(todo.get("state") or ""), bool(todo.get("archived_at"))
         return "", True
+
+
+def fetch_runtime_binding(base_url: str, run_id: str, task_frame_id: str) -> Mapping[str, Any]:
+    """The server's current frame runtime binding for this Host's own frame."""
+
+    payload = _Http(base_url, timeout=30.0).request(
+        "POST",
+        "/v1/actions",
+        {
+            "action_id": "persona.automation.host-binding",
+            "request": {"run_id": run_id, "task_frame_id": task_frame_id},
+        },
+    )
+    binding = payload.get("runtime_binding")
+    if not isinstance(binding, Mapping):
+        raise TransportError("host-binding returned no runtime_binding")
+    return binding

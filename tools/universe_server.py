@@ -31732,6 +31732,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.host-status",
                     "persona.automation.collect-frame",
                     "persona.automation.host-permission",
+                    "persona.automation.host-binding",
                 )
             },
             # Shared operator commands resolve identity at the authenticated transport.
@@ -37374,6 +37375,23 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     task_frame_id=value["task_frame_id"],
                     value=value,
                 )
+            if action_id == "persona.automation.host-binding":
+                # A Host outlives server restarts, and the frame runtime endpoint and
+                # token die with the server process that made them: a Host asks for
+                # the current binding each time it starts a role.
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_host_binding",
+                    required=frozenset({"run_id", "task_frame_id"}),
+                    optional=frozenset(),
+                )
+                require_launched(value["run_id"], value["task_frame_id"])
+                run = self.persona_automation.get_run(value["run_id"])
+                return {
+                    "status": "TASK_FRAME_HOST_BINDING",
+                    "task_frame_id": value["task_frame_id"],
+                    "runtime_binding": self._persona_automation_runtime_binding(run),
+                }
             if action_id == "persona.automation.host-permission":
                 return self._handle_persona_host_permission(request, state_root, require_owner, require_launched)
             if action_id == "persona.automation.collect-frame":
@@ -37834,6 +37852,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "persona.automation.host-status",
                 "persona.automation.collect-frame",
                 "persona.automation.host-permission",
+                "persona.automation.host-binding",
             }:
                 return self._handle_persona_task_frame_host_action(action_id, request)
             if action_id == "persona.automation.master-result":
