@@ -2379,6 +2379,35 @@ class PersonaAutomationStore:
                 },
             )
 
+    def record_host_event(self, run_id: str, event_type: str, task_frame_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Record a Task Frame Host launch or collection on the run's own history.
+
+        The event is the run's proof that a frame belongs to it; it grants
+        nothing and carries no Host credentials.
+        """
+
+        if event_type not in {"TASK_FRAME_HOST_LAUNCHED", "TASK_FRAME_COLLECTED"}:
+            raise PersonaAutomationError("PERSONA_AUTOMATION_HOST_EVENT_INVALID", "unsupported Host event type")
+        run_id = _text(run_id, "run_id")
+        frame = _text(task_frame_id, "task_frame_id")
+        suffix = ":" + str(payload.get("status")) if event_type == "TASK_FRAME_COLLECTED" else ""
+        with self._connection() as connection:
+            self._get(connection, run_id)
+            event, _created = self._event(
+                connection, run_id, event_type, f"frame-host:{event_type}:{frame}{suffix}",
+                {"task_frame_id": frame, **dict(payload)},
+            )
+            return event
+
+    def host_frame_launched(self, run_id: str, task_frame_id: str) -> dict[str, Any] | None:
+        run_id = _text(run_id, "run_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM persona_automation_event WHERE run_id = ? AND event_type = 'TASK_FRAME_HOST_LAUNCHED' AND idempotency_key = ?",
+                (run_id, f"frame-host:TASK_FRAME_HOST_LAUNCHED:{_text(task_frame_id, 'task_frame_id')}"),
+            ).fetchone()
+        return _load(row["payload_json"], {}) if row is not None else None
+
     def driver_control_recorded(self, run_id: str, driver_key: str) -> bool:
         run_id = _text(run_id, "run_id")
         with self._connection() as connection:

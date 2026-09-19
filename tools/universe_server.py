@@ -63,6 +63,12 @@ from session_anchor_transport import (
 )
 from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
 from session_anchor_cycle import append_cycle_result
+from persona_task_frame_launch import (
+    LaunchError,
+    host_status as task_frame_host_status,
+    launch_frame as launch_task_frame_host,
+    post_directive as post_task_frame_directive,
+)
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -31721,6 +31727,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.reviewer-verdict",
                     "persona.automation.review",
                     "persona.automation.complete",
+                    "persona.automation.launch-frame",
+                    "persona.automation.host-directive",
+                    "persona.automation.host-status",
+                    "persona.automation.collect-frame",
                 )
             },
             # Shared operator commands resolve identity at the authenticated transport.
@@ -36733,7 +36743,24 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "evidence_refs, next_condition: the exact decision or event you are waiting for}. "
             "That moves the run to WAITING and shows the reason in Fleet. If your tick lease "
             "(90s) expired, call tick again first. Also say it in your report. "
-            "Do not edit source files directly; use the Worker/Reviewer route for that.",
+            "Before you start a Todo, survey its scope and choose the route yourself: handle a "
+            "small bounded change directly and verify it yourself, or launch an independent "
+            "Task Frame Host for work that needs a separate Worker or an independent Reviewer. "
+            "To launch: persona.automation.launch-frame {run_id, owner_ref, request_id, todo_id, "
+            "provider, persona_id?, worker_write_scope?: {repository_write_scope: BOUNDED, "
+            "mutation_scope: {operations: [CREATE|MODIFY], targets: [exact absolute files inside "
+            "the project]}}, first_role?: WORKER|REVIEWER}; you decide the write scope (none "
+            "means read-only) and DELETE/MOVE are never delegated. The Host runs the role, "
+            "reports to its Boss room and to you over the Session Bus, then WAITS for you. "
+            "Direct it with persona.automation.host-directive {run_id, owner_ref, task_frame_id, "
+            "directive: RUN_ROLE|REWORK|DONE, role, feedback, request_id} (RUN_ROLE REVIEWER "
+            "after the Worker; REWORK with your feedback; DONE when the Todo is finished) and "
+            "read persona.automation.host-status. When the result is in, collect it yourself with "
+            "persona.automation.collect-frame {run_id, owner_ref, task_frame_id, status: "
+            "COMPLETED|FAILED|CANCELLED, result_ref, result_digest, request_id}; that appends the "
+            "cycle to your Session Anchor. A failed role is reported to you and the Host waits: "
+            "you decide whether to rework, change scope, or end it. Sub-agents are not available "
+            "to Workers. Do not edit source files outside these routes.",
         ])
         posted = self.session_bus.post(
             host,
@@ -37129,6 +37156,180 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "event_created": event_created,
         }
 
+    def _persona_task_frame_state_root(self) -> Path:
+        return self.store.database_path.parent / "task_frame_hosts"
+
+    def _handle_persona_task_frame_host_action(
+        self, action_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Master-side control of an independent Task Frame Host.
+
+        The Master decides the route, persona and write scope; the server only
+        checks that they are mechanically valid, creates the Boss room, starts
+        the detached Host and records the launch on the run.  Collection is the
+        Master's act: it appends the finished cycle to the Master's own Session
+        Anchor.
+        """
+
+        state_root = self._persona_task_frame_state_root()
+
+        def require_launched(run_id: str, task_frame_id: str) -> None:
+            if self.persona_automation.host_frame_launched(run_id, task_frame_id) is None:
+                raise PersonaAutomationError(
+                    "TASK_FRAME_NOT_LAUNCHED_BY_RUN",
+                    "no Host was launched for this run and Task Frame",
+                    404,
+                )
+
+        def require_owner(run: Mapping[str, Any], owner_ref: str, what: str) -> None:
+            if str(run.get("session_anchor_ref") or "") != owner_ref:
+                raise PersonaAutomationError(
+                    "TASK_FRAME_OWNER_MISMATCH",
+                    f"only the run's owning Session Anchor may {what}",
+                    409,
+                )
+
+        try:
+            if action_id == "persona.automation.host-status":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_host_status",
+                    required=frozenset({"run_id", "task_frame_id"}),
+                    optional=frozenset(),
+                )
+                require_launched(value["run_id"], value["task_frame_id"])
+                return {
+                    "status": "TASK_FRAME_HOST_STATUS",
+                    **task_frame_host_status(state_root, value["task_frame_id"]),
+                }
+            if action_id == "persona.automation.host-directive":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_host_directive",
+                    required=frozenset({"run_id", "owner_ref", "task_frame_id", "directive", "request_id"}),
+                    optional=frozenset({"role", "feedback"}),
+                )
+                run = self.persona_automation.get_run(value["run_id"])
+                require_owner(run, value["owner_ref"], "direct its Host")
+                require_launched(value["run_id"], value["task_frame_id"])
+                return post_task_frame_directive(
+                    rooms=self.multi_rooms,
+                    state_root=state_root,
+                    task_frame_id=value["task_frame_id"],
+                    value=value,
+                )
+            if action_id == "persona.automation.collect-frame":
+                value = _exact_object_fields(
+                    request,
+                    field="persona_automation_collect_frame",
+                    required=frozenset({"run_id", "owner_ref", "task_frame_id", "status", "request_id"}),
+                    optional=frozenset({"result_ref", "result_digest", "detail"}),
+                )
+                run = self.persona_automation.get_run(value["run_id"])
+                require_owner(run, value["owner_ref"], "collect its Task Frame")
+                require_launched(value["run_id"], value["task_frame_id"])
+                status = str(value["status"]).upper()
+                if status not in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    raise PersonaAutomationError(
+                        "TASK_FRAME_COLLECT_STATUS_INVALID",
+                        "status must be COMPLETED, FAILED or CANCELLED",
+                    )
+                cycle = self._append_task_frame_cycle(
+                    run,
+                    value["task_frame_id"],
+                    value["owner_ref"],
+                    status,
+                    result_ref=value.get("result_ref"),
+                    result_digest=value.get("result_digest"),
+                    detail=value.get("detail") if isinstance(value.get("detail"), Mapping) else None,
+                )
+                event = self.persona_automation.record_host_event(
+                    value["run_id"],
+                    "TASK_FRAME_COLLECTED",
+                    value["task_frame_id"],
+                    {"status": status, "result_ref": value.get("result_ref"), "cycle": cycle.get("status")},
+                )
+                return {
+                    "status": "TASK_FRAME_COLLECTED",
+                    "task_frame_id": value["task_frame_id"],
+                    "collected_status": status,
+                    "cycle": cycle,
+                    "event_id": event.get("event_id"),
+                }
+            value = _exact_object_fields(
+                request,
+                field="persona_automation_launch_frame",
+                required=frozenset({"run_id", "owner_ref", "request_id", "todo_id", "provider"}),
+                optional=frozenset({"persona_id", "worker_write_scope", "first_role", "idle_timeout_seconds"}),
+            )
+            run = self.persona_automation.get_run(value["run_id"])
+            todo = self.store.get_todo(value["todo_id"])
+            project_id = str(run.get("project_id") or "")
+            anchor = str(run.get("session_anchor_ref") or "")
+            node_ref = str(run.get("node_ref") or "")
+            project_root = Path(self.store.get_project(project_id)["project_root"])
+            terminal = self._session_anchor_terminal_host().find_live(
+                project_id=project_id, mode="MASTER", session_anchor_ref=anchor
+            )
+            terminal_id = str((terminal or {}).get("terminal_id") or "").strip()
+            if not terminal_id:
+                raise PersonaAutomationError(
+                    "TASK_FRAME_MASTER_TERMINAL_NOT_LIVE",
+                    "the run's Master has no live terminal to notify",
+                    409,
+                )
+            persona_id = str(value.get("persona_id") or "").strip()
+            persona_text = (
+                str(self.store.get_persona(persona_id).get("body") or "") if persona_id else ""
+            )
+            result = launch_task_frame_host(
+                run=run,
+                value=value,
+                todo=todo,
+                project_root=project_root,
+                repository_root=Path(__file__).resolve().parents[1],
+                persona_text=persona_text,
+                runtime_binding=self._persona_automation_runtime_binding(run),
+                base_url=self._loopback_endpoint_url(),
+                rooms=self.multi_rooms,
+                bus_to={
+                    "project_id": project_id,
+                    "mode": "MASTER",
+                    "provider": str((terminal or {}).get("provider") or "").upper(),
+                    "terminal_id": terminal_id,
+                    "session_anchor_ref": anchor,
+                    "node_ref": node_ref,
+                },
+                bus_from={
+                    "project_id": project_id,
+                    "mode": "MASTER",
+                    "provider": "UNIVERSE",
+                    "session_anchor_ref": anchor,
+                    "node_ref": node_ref,
+                },
+                state_root=state_root,
+            )
+            if result["status"] == "TASK_FRAME_HOST_LAUNCHED":
+                self.persona_automation.record_host_event(
+                    value["run_id"],
+                    "TASK_FRAME_HOST_LAUNCHED",
+                    result["task_frame_id"],
+                    {
+                        "todo_id": value["todo_id"],
+                        "room_id": result["room_id"],
+                        "pid": result["pid"],
+                        "first_role": result["first_role"],
+                        "repository_write_scope": result["repository_write_scope"],
+                        "mutation_scope": result["mutation_scope"],
+                        "persona_id": persona_id or None,
+                    },
+                )
+            else:
+                require_launched(value["run_id"], result["task_frame_id"])
+            return result
+        except LaunchError as error:
+            raise PersonaAutomationError(error.code, error.detail, error.status) from error
+
     def _handle_persona_automation_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -37469,6 +37670,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     actor=context.get("actor"),
                 )
                 return result
+            if action_id in {
+                "persona.automation.launch-frame",
+                "persona.automation.host-directive",
+                "persona.automation.host-status",
+                "persona.automation.collect-frame",
+            }:
+                return self._handle_persona_task_frame_host_action(action_id, request)
             if action_id == "persona.automation.master-result":
                 return self._handle_persona_automation_master_result_action(
                     request, context

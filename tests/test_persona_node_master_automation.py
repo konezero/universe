@@ -1016,5 +1016,116 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(node_ref, new_owner_events[0]["payload"]["node_ref"])
 
 
+    # -- independent Task Frame Host: Master-side launch / direct / collect --
+
+    def _frame_todo(self, node_ref, title="Frame Todo"):
+        return self.server.store.create_todo({
+            "scope_kind": "NODE", "project_id": "TEST", "node_ref": node_ref,
+            "title": title, "detail": "bounded frame work", "priority": "P0",
+            "state": "READY", "source_kind": "MASTER", "sort_order": 0,
+        })
+
+    def _launch(self, anchor, run, todo, *, request_id="launch-1", **extra):
+        from functools import partial
+        from unittest import mock
+
+        import persona_task_frame_launch as launch_module
+        import universe_server as server_module
+
+        spawned = []
+
+        def fake_launcher(spec, spec_path, heartbeat_path):
+            spawned.append(spec)
+            return 4242
+
+        class FakeHost:
+            def find_live(self, **kwargs):
+                return {"terminal_id": "t-master", "provider": "CLAUDE"}
+
+        real = launch_module.launch_frame
+        body = {
+            "run_id": run["run_id"], "owner_ref": anchor, "request_id": request_id,
+            "todo_id": todo["todo_id"], "provider": "codex",
+        }
+        body.update(extra)
+        with mock.patch.object(self.server, "_session_anchor_terminal_host", return_value=FakeHost()), \
+                mock.patch.object(self.server, "_persona_automation_runtime_binding",
+                                  return_value={"endpoint": "http://127.0.0.1:1", "token": "t"}), \
+                mock.patch.object(server_module, "launch_task_frame_host",
+                                  side_effect=lambda **kw: partial(real, launcher=fake_launcher)(**kw)):
+            status, result = self.act("persona.automation.launch-frame", body)
+        return status, result, spawned
+
+    def test_master_launches_a_host_and_the_run_records_it(self):
+        anchor, node_ref, run = self._start_driven_run("frame-launch")
+        todo = self._frame_todo(node_ref)
+        status, result, spawned = self._launch(anchor, run, todo)
+        self.assertEqual(200, status, result)
+        self.assertEqual("TASK_FRAME_HOST_LAUNCHED", result["status"])
+        self.assertEqual("NONE", result["repository_write_scope"])
+        self.assertEqual(1, len(spawned))
+        self.assertEqual("t-master", spawned[0]["bus_to"]["terminal_id"])
+        self.assertEqual(todo["todo_id"], spawned[0]["todo_id"])
+        launched = self.server.persona_automation.host_frame_launched(run["run_id"], result["task_frame_id"])
+        self.assertEqual(result["room_id"], launched["room_id"])
+        # The same request is a replay: no second Host.
+        status, again, spawned_again = self._launch(anchor, run, todo)
+        self.assertEqual(200, status, again)
+        self.assertEqual("TASK_FRAME_HOST_REPLAYED", again["status"])
+        self.assertEqual([], spawned_again)
+
+    def test_launch_refuses_another_sessions_run_and_scopes_outside_the_project(self):
+        anchor, node_ref, run = self._start_driven_run("frame-launch-refuse")
+        todo = self._frame_todo(node_ref)
+        status, refused, spawned = self._launch(anchor, run, todo, request_id="x1", owner_ref="session_anchor_other")
+        self.assertEqual(409, status, refused)
+        self.assertEqual("TASK_FRAME_OWNER_MISMATCH", refused["error_code"])
+        status, refused, spawned = self._launch(
+            anchor, run, todo, request_id="x2",
+            worker_write_scope={"repository_write_scope": "BOUNDED",
+                                "mutation_scope": {"operations": ["DELETE"], "targets": [str(ROOT / "a.py")]}},
+        )
+        self.assertEqual(409, status, refused)
+        self.assertEqual("TASK_FRAME_SCOPE_INVALID", refused["error_code"])
+        self.assertEqual([], spawned)
+
+    def test_direct_collect_and_status_only_work_for_a_frame_the_run_launched(self):
+        anchor, node_ref, run = self._start_driven_run("frame-collect")
+        for action, body in (
+            ("persona.automation.host-status", {}),
+            ("persona.automation.host-directive", {"directive": "DONE", "request_id": "d1", "owner_ref": anchor}),
+            ("persona.automation.collect-frame", {"status": "COMPLETED", "request_id": "c1", "owner_ref": anchor}),
+        ):
+            status, result = self.act(action, {"run_id": run["run_id"], "task_frame_id": "host_never", **body})
+            self.assertEqual(404, status, result)
+            self.assertEqual("TASK_FRAME_NOT_LAUNCHED_BY_RUN", result["error_code"])
+
+        todo = self._frame_todo(node_ref, "Collect Todo")
+        status, launched, _spawned = self._launch(anchor, run, todo, request_id="collect-1")
+        frame = launched["task_frame_id"]
+        status, wrong = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": "session_anchor_other", "task_frame_id": frame,
+            "status": "COMPLETED", "request_id": "c2"})
+        self.assertEqual(409, status, wrong)
+        status, bad = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+            "status": "STARTED", "request_id": "c3"})
+        self.assertEqual("TASK_FRAME_COLLECT_STATUS_INVALID", bad["error_code"])
+        status, collected = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
+            "result_ref": "task-frame-result://x", "request_id": "c4"})
+        self.assertEqual(200, status, collected)
+        self.assertEqual("TASK_FRAME_COLLECTED", collected["status"])
+        status, again = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
+            "result_ref": "task-frame-result://x", "request_id": "c5"})
+        self.assertEqual(200, status, again)
+        self.assertEqual(collected["event_id"], again["event_id"])
+        status, host_status = self.act("persona.automation.host-status", {
+            "run_id": run["run_id"], "task_frame_id": frame})
+        self.assertEqual(200, status, host_status)
+        self.assertTrue(host_status["known"])
+
+
 if __name__ == "__main__":
     unittest.main()

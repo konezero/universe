@@ -307,6 +307,10 @@ PERSONA_AUTOMATION_ACTION_IDS = (
     "persona.automation.reviewer-verdict",
     "persona.automation.review",
     "persona.automation.complete",
+    "persona.automation.launch-frame",
+    "persona.automation.host-directive",
+    "persona.automation.host-status",
+    "persona.automation.collect-frame",
 )
 
 LEGACY_CLI_TERMINAL_HTTP_SURFACE = "/v1/terminals"
@@ -1181,6 +1185,10 @@ def build_default_action_registry(
         "persona.automation.reviewer-verdict": ("LOCAL_DATABASE_MUTATION", "reviewer_verdict"),
         "persona.automation.review": ("LOCAL_DATABASE_MUTATION", "review"),
         "persona.automation.complete": ("LOCAL_DATABASE_MUTATION", "complete"),
+        "persona.automation.launch-frame": ("LOCAL_DATABASE_MUTATION", "launch_frame"),
+        "persona.automation.host-directive": ("LOCAL_DATABASE_MUTATION", "host_directive"),
+        "persona.automation.host-status": ("READ_ONLY", "host_status"),
+        "persona.automation.collect-frame": ("LOCAL_DATABASE_MUTATION", "collect_frame"),
     }
     for action_id in PERSONA_AUTOMATION_ACTION_IDS:
         side_effect, operation = automation_specs[action_id]

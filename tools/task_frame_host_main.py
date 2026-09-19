@@ -38,6 +38,7 @@ def _write_heartbeat(path: Path, spec: Mapping[str, Any], phase: str, extra: Map
         "pid": os.getpid(),
         "task_frame_id": spec["task_frame_id"],
         "todo_id": spec["todo_id"],
+        "room_id": spec["room_id"],
         "phase": phase,
         "updated_at": _now(),
         **dict(extra or {}),
@@ -45,6 +46,29 @@ def _write_heartbeat(path: Path, spec: Mapping[str, Any], phase: str, extra: Map
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(body, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def pid_alive(pid: int) -> bool:
+    """True while a process with this pid exists (never signals it)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def validate_spec(spec: Mapping[str, Any]) -> None:
@@ -102,7 +126,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spec", required=True)
     parser.add_argument("--heartbeat", required=True)
     args = parser.parse_args(argv)
-    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    spec_path = Path(args.spec)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    # The spec carries the runtime token: read it once, then remove it.
+    try:
+        spec_path.unlink()
+    except OSError:
+        pass
     return run_host(spec, Path(args.heartbeat))
 
 
