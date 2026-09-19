@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -431,7 +431,39 @@ class UniverseRuntimeHost:
         return self._invocation_result(request, response)
 
     def invoke_structured(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        request = normalize_read_only_request(value)
+        return self._invoke_structured_request(normalize_read_only_request(value))
+
+    def invoke_structured_bounded(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Structured turn that may write inside an exact CREATE/MODIFY scope.
+
+        Read-only requests take the ordinary path.  A BOUNDED request must name
+        at least one operation and one absolute target, and DELETE/MOVE are
+        never delegated to a Worker; the dispatcher still enforces each target
+        at the provider's permission request.
+        """
+
+        if str(value.get("repository_write_scope") or "").upper() != "BOUNDED":
+            return self.invoke_structured(value)
+        mutation = _mapping(value.get("mutation_scope"), "mutation_scope")
+        operations = [str(item).upper() for item in mutation.get("operations") or []]
+        targets = [str(item) for item in mutation.get("targets") or []]
+        if not operations or not targets or set(operations) - {"CREATE", "MODIFY"}:
+            raise RuntimeHostError(
+                "BOUNDED_SCOPE_INVALID",
+                "BOUNDED scope needs CREATE/MODIFY operations and exact targets",
+            )
+        request = normalize_read_only_request(
+            {
+                **value,
+                "repository_write_scope": "NONE",
+                "mutation_scope": {"operations": [], "targets": []},
+            }
+        )
+        request["repository_write_scope"] = "BOUNDED"
+        request["mutation_scope"] = {"operations": operations, "targets": targets}
+        return self._invoke_structured_request(request)
+
+    def _invoke_structured_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if request["result_mode"] != "STRUCTURED_JSON":
             raise RuntimeHostError(
                 "RUNTIME_WORKER_REQUEST_INVALID",
@@ -461,6 +493,9 @@ class UniverseRuntimeHost:
         instruction: str,
         context_pack: Mapping[str, Any],
         output_contract: Mapping[str, Any],
+        repository_write_scope: str = "NONE",
+        mutation_scope: Mapping[str, Any] | None = None,
+        constraints: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Run one bounded structured turn through the existing Task Frame Host.
 
@@ -488,6 +523,28 @@ class UniverseRuntimeHost:
                 capability.get("reason", "selected provider is unavailable"),
             )
         model = _capability_model(capability)
+        write_scope = _required_text(repository_write_scope, "repository_write_scope").upper()
+        scope = (
+            {
+                "operations": list(mutation_scope.get("operations", [])),
+                "targets": list(mutation_scope.get("targets", [])),
+            }
+            if isinstance(mutation_scope, Mapping)
+            else {"operations": [], "targets": []}
+        )
+        if write_scope == "NONE":
+            scope = {"operations": [], "targets": []}
+        frame_constraints = (
+            list(constraints)
+            if constraints is not None
+            else [
+                "READ_ONLY",
+                "NO_REPOSITORY_ACCESS",
+                "NO_SOURCE_MUTATION",
+                "NO_SUBAGENTS",
+                "STRUCTURED_JSON_ONLY",
+            ]
+        )
         execution_plan = {
             "profile_id": "task-frame-debate-v1",
             "requested_shape": "DEBATE",
@@ -511,8 +568,8 @@ class UniverseRuntimeHost:
             "commander_surface": "universe-ui",
             "execution_assignment_ref": "UNASSIGNED",
             "host_worker_capability": "AVAILABLE",
-            "repository_write_scope": "NONE",
-            "mutation_scope": {"operations": [], "targets": []},
+            "repository_write_scope": write_scope,
+            "mutation_scope": scope,
             "fallback_reason": "NONE",
             "transcript_policy": "BOUNDED_RETURNED_MESSAGES_ONLY",
             "turns": [
@@ -561,16 +618,10 @@ class UniverseRuntimeHost:
                         "parent_instruction": {
                             "instruction_id": f"instruction:{invocation}",
                             "user_instruction_raw": prompt,
-                            "constraints": [
-                                "READ_ONLY",
-                                "NO_REPOSITORY_ACCESS",
-                                "NO_SOURCE_MUTATION",
-                                "NO_SUBAGENTS",
-                                "STRUCTURED_JSON_ONLY",
-                            ],
+                            "constraints": frame_constraints,
                             "expected_output": contract,
-                            "repository_write_scope": "NONE",
-                            "mutation_scope": {"operations": [], "targets": []},
+                            "repository_write_scope": write_scope,
+                            "mutation_scope": scope,
                         },
                         "parent_observation": {
                             "status": "MATCHED",
@@ -612,7 +663,7 @@ class UniverseRuntimeHost:
                     "TASK_FRAME_TURN_DECLARATION_FAILED",
                     "Task Frame turn declaration failed",
                 )
-            result = self.invoke_structured(
+            result = self.invoke_structured_bounded(
                 {
                     "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
                     "invocation_id": invocation,
@@ -623,8 +674,8 @@ class UniverseRuntimeHost:
                     "frame_id": frame,
                     "turn_id": turn,
                     "invoker_actor_ref": execution_plan["parent_actor_ref"],
-                    "repository_write_scope": "NONE",
-                    "mutation_scope": {"operations": [], "targets": []},
+                    "repository_write_scope": write_scope,
+                    "mutation_scope": scope,
                     "context_pack": context,
                     "output_contract": contract,
                     "result_mode": "STRUCTURED_JSON",

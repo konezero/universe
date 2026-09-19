@@ -271,6 +271,50 @@ class UniverseRuntimeHostTests(unittest.TestCase):
         )
         self.assertEqual("STRUCTURED_JSON", dispatcher.dispatch_calls[0]["result_mode"])
 
+    def test_bounded_structured_invocation_forwards_the_exact_scope(self) -> None:
+        target = str((ROOT / "scratch" / "out.txt").resolve())
+        dispatcher = FakeWorkerDispatcher(
+            response={
+                "status": "TURN_COMPLETED",
+                "model_ref": "provider://GROK/model/grok-build",
+                "worker_id": "w1",
+                "result_receipt_ref": "r1",
+                "structured_result": {"outcome": "DONE"},
+            }
+        )
+        host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
+        request = self.request()
+        request["result_mode"] = "STRUCTURED_JSON"
+        request["repository_write_scope"] = "BOUNDED"
+        request["mutation_scope"] = {"operations": ["modify", "CREATE"], "targets": [target]}
+        result = host.invoke_structured_bounded(request)
+        self.assertEqual({"outcome": "DONE"}, result["structured_result"])
+        sent = dispatcher.dispatch_calls[0]
+        self.assertEqual("BOUNDED", sent["repository_write_scope"])
+        self.assertEqual({"operations": ["MODIFY", "CREATE"], "targets": [target]}, sent["mutation_scope"])
+
+    def test_bounded_scope_refuses_delete_and_incomplete_scopes_before_dispatch(self) -> None:
+        dispatcher = FakeWorkerDispatcher()
+        host = UniverseRuntimeHost(ROOT, worker_dispatcher=dispatcher)
+        for scope in (
+            {"operations": ["DELETE"], "targets": ["C:/x"]},
+            {"operations": ["MODIFY"], "targets": []},
+            {"operations": [], "targets": ["C:/x"]},
+        ):
+            request = self.request()
+            request["result_mode"] = "STRUCTURED_JSON"
+            request["repository_write_scope"] = "BOUNDED"
+            request["mutation_scope"] = scope
+            with self.assertRaises(RuntimeHostError) as caught:
+                host.invoke_structured_bounded(request)
+            self.assertEqual("BOUNDED_SCOPE_INVALID", caught.exception.code)
+        self.assertEqual([], dispatcher.dispatch_calls)
+        # The ordinary read-only entry point still refuses any write scope.
+        request = self.request()
+        request["repository_write_scope"] = "BOUNDED"
+        with self.assertRaises(RuntimeHostError):
+            host.invoke_structured(request)
+
     def test_planning_proposal_is_built_by_installed_task_frame_cli(self) -> None:
         commands: list[list[str]] = []
 

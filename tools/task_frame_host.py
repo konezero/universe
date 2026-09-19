@@ -123,6 +123,7 @@ class TaskFrameHost:
         todo: TodoPort,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        on_tick: Callable[[str], None] | None = None,
     ) -> None:
         if config.first_role not in ROLES:
             raise ValueError("first_role must be WORKER or REVIEWER")
@@ -133,6 +134,7 @@ class TaskFrameHost:
         self.todo = todo
         self._clock = clock
         self._sleep = sleep
+        self._on_tick = on_tick
         self._cursor = 0
         self._attempts: dict[str, int] = {}
         self._outbox: list[dict[str, Any]] = []
@@ -144,6 +146,7 @@ class TaskFrameHost:
         self._run_role(self.config.first_role, feedback=None)
         reason = ""
         while not reason:
+            self._tick("WAITING")
             reason = self._terminal_reason()
             if reason:
                 break
@@ -160,10 +163,20 @@ class TaskFrameHost:
             self._announce_exit(reason, failed=False)
         self._flush_outbox()
         self.outcome.exit_reason = reason
+        self._tick("EXITED:" + reason)
         return self.outcome
+
+    def _tick(self, phase: str) -> None:
+        if self._on_tick is None:
+            return
+        try:
+            self._on_tick(phase)
+        except Exception:  # noqa: BLE001 - a heartbeat failure must not stop the Host
+            self.outcome.port_errors += 1
 
     # ---------------------------------------------------------------- roles
     def _run_role(self, role: str, *, feedback: str | None) -> None:
+        self._tick(f"RUNNING_{role}")
         attempt = self._attempts.get(role, 0) + 1
         self._attempts[role] = attempt
         try:
