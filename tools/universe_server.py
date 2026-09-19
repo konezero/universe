@@ -23,7 +23,7 @@ import time
 import unicodedata
 import uuid
 import webbrowser
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -31731,6 +31731,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.host-directive",
                     "persona.automation.host-status",
                     "persona.automation.collect-frame",
+                    "persona.automation.host-permission",
                 )
             },
             # Shared operator commands resolve identity at the authenticated transport.
@@ -36759,8 +36760,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "persona.automation.collect-frame {run_id, owner_ref, task_frame_id, status: "
             "COMPLETED|FAILED|CANCELLED, result_ref, result_digest, request_id}; that appends the "
             "cycle to your Session Anchor. A failed role is reported to you and the Host waits: "
-            "you decide whether to rework, change scope, or end it. Sub-agents are not available "
-            "to Workers. Do not edit source files outside these routes.",
+            "you decide whether to rework, change scope, or end it. If a Worker needs a write "
+            "outside its granted files, the Host pauses that turn and you receive a PERMISSION "
+            "notice with a permission_request_id. Any non-destructive request is yours to approve: "
+            "persona.automation.host-permission {run_id, owner_ref, task_frame_id, "
+            "permission_request_id, decision: APPROVE|DENY, request_id, note?}. A request that "
+            "deletes or moves files is destructive: decision ESCALATE sends it to the Conductor "
+            "over the Session Bus; when the Conductor replies in that thread, APPROVE with "
+            "conductor_approval_ref set to that reply's message id (without it the server refuses), "
+            "or DENY. No decision means the Worker's write is denied when the Host's wait ends. "
+            "Sub-agents are not available to Workers. Do not edit source files outside these routes.",
         ])
         posted = self.session_bus.post(
             host,
@@ -37159,6 +37168,153 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _persona_task_frame_state_root(self) -> Path:
         return self.store.database_path.parent / "task_frame_hosts"
 
+    def _bus_message_row(self, message_id: str) -> dict[str, Any] | None:
+        with closing(self.session_bus._db_connect()) as connection:
+            row = connection.execute(
+                "SELECT message_id, thread_id, kind, from_json, in_reply_to FROM session_bus_message WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _handle_persona_host_permission(
+        self,
+        request: Mapping[str, Any],
+        state_root: Path,
+        require_owner: Callable[[Mapping[str, Any], str, str], None],
+        require_launched: Callable[[str, str], None],
+    ) -> dict[str, Any]:
+        """The Master's decision on a Worker's out-of-scope write.
+
+        A non-destructive write is the Master's to approve.  DELETE and MOVE are
+        destructive and go up to the Conductor: the Master first ESCALATEs, and
+        may APPROVE only with the Conductor's reply in that escalation thread.
+        The first decision recorded for a request stands.
+        """
+
+        value = _exact_object_fields(
+            request,
+            field="persona_automation_host_permission",
+            required=frozenset({"run_id", "owner_ref", "task_frame_id", "permission_request_id", "decision", "request_id"}),
+            optional=frozenset({"note", "conductor_approval_ref"}),
+        )
+        run = self.persona_automation.get_run(value["run_id"])
+        require_owner(run, value["owner_ref"], "decide its Host's permission requests")
+        require_launched(value["run_id"], value["task_frame_id"])
+        decision = str(value["decision"]).upper()
+        if decision not in {"APPROVE", "DENY", "ESCALATE"}:
+            raise PersonaAutomationError(
+                "TASK_FRAME_PERMISSION_DECISION_INVALID", "decision must be APPROVE, DENY or ESCALATE"
+            )
+        host = task_frame_host_status(state_root, value["task_frame_id"])
+        room_id = str(host.get("room_id") or "")
+        permission_id = str(value["permission_request_id"])
+        asked: dict[str, Any] | None = None
+        for event in self.multi_rooms.list_room_events(room_id, after_sequence=0, limit=500):
+            message = event.get("message") if isinstance(event, Mapping) else None
+            if not isinstance(message, Mapping):
+                continue
+            try:
+                body = json.loads(str(message.get("body_text") or ""))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(body, Mapping)
+                and body.get("schema") == "universe.task-frame-host-permission-request.v1"
+                and body.get("request_id") == permission_id
+                and str(message.get("author_role") or "").upper() == "WORKER"
+            ):
+                asked = dict(body)
+                break
+        if asked is None:
+            raise PersonaAutomationError(
+                "TASK_FRAME_PERMISSION_REQUEST_UNKNOWN", "no such permission request in this Task Frame's room", 404
+            )
+        destructive = bool(asked.get("destructive"))
+        project_id = str(run.get("project_id") or "")
+        thread_id = f"persona-{value['run_id']}-perm-{permission_id}"
+
+        if decision == "ESCALATE":
+            conductor = self._session_anchor_terminal_host().find_live(project_id=project_id, mode="CONDUCTOR")
+            terminal_id = str((conductor or {}).get("terminal_id") or "").strip()
+            conductor_anchor = str(
+                (conductor or {}).get("active_session_anchor_ref") or (conductor or {}).get("session_anchor_ref") or ""
+            ).strip()
+            if not terminal_id or not conductor_anchor:
+                raise PersonaAutomationError(
+                    "TASK_FRAME_CONDUCTOR_NOT_LIVE",
+                    "no live Conductor to decide this request; it stays pending",
+                    409,
+                )
+            posted = self.session_bus.post(
+                self._session_anchor_terminal_host(),
+                {
+                    "to": {
+                        "project_id": project_id, "mode": "CONDUCTOR",
+                        "provider": str(conductor.get("provider") or "").upper(),
+                        "terminal_id": terminal_id, "session_anchor_ref": conductor_anchor,
+                    },
+                    "from": {
+                        "project_id": project_id, "mode": "MASTER", "provider": "UNIVERSE",
+                        "session_anchor_ref": str(run.get("session_anchor_ref") or ""),
+                        "node_ref": str(run.get("node_ref") or ""),
+                    },
+                    "kind": "INSTRUCTION",
+                    "protocol": "WORK",
+                    "notify": "NONE",
+                    "thread_id": thread_id,
+                    "idempotency_key": f"host-permission-escalation:{permission_id}",
+                    "body_text": (
+                        "A node Master asks you to decide a Worker's destructive write.\n"
+                        f"run_id: {value['run_id']}\ntask_frame_id: {value['task_frame_id']}\n"
+                        f"permission_request_id: {permission_id}\n"
+                        f"operations: {asked.get('operations')}\ntargets: {asked.get('targets')}\n"
+                        f"note: {value.get('note') or '<none>'}\n"
+                        "Reply in this thread with session-bus.reply: say APPROVE or DENY and why."
+                    ),
+                },
+            )
+            self._dispatch_live_posted_session_instructions(posted)
+            return {"status": "TASK_FRAME_PERMISSION_ESCALATED", "permission_request_id": permission_id,
+                    "thread_id": thread_id, "destructive": destructive}
+
+        if decision == "APPROVE" and destructive:
+            reference = str(value.get("conductor_approval_ref") or "").strip()
+            row = self._bus_message_row(reference) if reference else None
+            sender = {}
+            if row is not None:
+                try:
+                    sender = json.loads(str(row.get("from_json") or "{}"))
+                except ValueError:
+                    sender = {}
+            if (
+                row is None
+                or row.get("thread_id") != thread_id
+                or str(sender.get("mode") or "").upper() != "CONDUCTOR"
+                or str(sender.get("project_id") or "") != project_id
+            ):
+                raise PersonaAutomationError(
+                    "TASK_FRAME_CONDUCTOR_APPROVAL_REQUIRED",
+                    "a destructive write needs the Conductor's reply in the escalation thread "
+                    "(ESCALATE first, then pass that reply's message id as conductor_approval_ref)",
+                    409,
+                )
+        message = self.multi_rooms.post_message(
+            room_id,
+            {
+                "author_role": "MASTER",
+                "body_text": json.dumps(
+                    {
+                        "schema": "universe.task-frame-host-permission-decision.v1",
+                        "request_id": permission_id,
+                        "decision": decision,
+                    }
+                ),
+                "idempotency_key": f"perm-decision:{permission_id}",
+            },
+        )
+        return {"status": "TASK_FRAME_PERMISSION_DECIDED", "permission_request_id": permission_id,
+                "decision": decision, "destructive": destructive, "message_id": message.get("message_id")}
+
     def _handle_persona_task_frame_host_action(
         self, action_id: str, request: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -37218,6 +37374,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     task_frame_id=value["task_frame_id"],
                     value=value,
                 )
+            if action_id == "persona.automation.host-permission":
+                return self._handle_persona_host_permission(request, state_root, require_owner, require_launched)
             if action_id == "persona.automation.collect-frame":
                 value = _exact_object_fields(
                     request,
@@ -37675,6 +37833,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "persona.automation.host-directive",
                 "persona.automation.host-status",
                 "persona.automation.collect-frame",
+                "persona.automation.host-permission",
             }:
                 return self._handle_persona_task_frame_host_action(action_id, request)
             if action_id == "persona.automation.master-result":

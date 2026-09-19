@@ -1127,5 +1127,114 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertTrue(host_status["known"])
 
 
+    # -- out-of-scope write requests: Master decides, destructive goes to the Conductor --
+
+    def _ask_permission(self, frame_id, *, operations, destructive, key):
+        import json as _json
+
+        room_id = self.server.persona_automation.host_frame_launched(
+            self._run_for_frame[frame_id], frame_id)["room_id"]
+        request_id = "perm_" + key
+        self.server.multi_rooms.worker_report(room_id, {
+            "body_text": _json.dumps({
+                "schema": "universe.task-frame-host-permission-request.v1", "request_id": request_id,
+                "operations": operations, "targets": ["C:/x/a.py"], "destructive": destructive, "role": "WORKER",
+            }),
+            "severity": "PERMISSION", "idempotency_key": "ask-" + key,
+        })
+        return room_id, request_id
+
+    def _decide(self, anchor, run, frame_id, request_id, decision, request_key, **extra):
+        return self.act("persona.automation.host-permission", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame_id,
+            "permission_request_id": request_id, "decision": decision, "request_id": request_key, **extra,
+        })
+
+    def _frame_with_worker(self, key):
+        anchor, node_ref, run = self._start_driven_run(key)
+        todo = self._frame_todo(node_ref, key)
+        status, launched, _spawned = self._launch(anchor, run, todo, request_id=key)
+        self.assertEqual(200, status, launched)
+        self._run_for_frame = {launched["task_frame_id"]: run["run_id"]}
+        return anchor, run, launched["task_frame_id"]
+
+    def test_master_approves_a_non_destructive_request_and_the_host_can_read_it(self):
+        from task_frame_host_permission import parse_permission_decision
+
+        anchor, run, frame = self._frame_with_worker("perm-approve")
+        room_id, request_id = self._ask_permission(frame, operations=["CREATE"], destructive=False, key="a1")
+        status, refused = self._decide(anchor, run, frame, request_id, "APPROVE", "d0")
+        self.assertEqual(200, status, refused)
+        self.assertEqual("TASK_FRAME_PERMISSION_DECIDED", refused["status"])
+        events = self.server.multi_rooms.list_room_events(room_id, after_sequence=0, limit=50)
+        decisions = [parse_permission_decision(e, request_id) for e in events]
+        self.assertIn("APPROVE", decisions)
+        # The first decision stands: a later DENY replays the same message.
+        status, again = self._decide(anchor, run, frame, request_id, "APPROVE", "d1")
+        self.assertEqual(refused["message_id"], again["message_id"])
+
+    def test_only_the_owner_decides_and_the_request_must_exist(self):
+        anchor, run, frame = self._frame_with_worker("perm-owner")
+        _room, request_id = self._ask_permission(frame, operations=["MODIFY"], destructive=False, key="o1")
+        status, wrong = self._decide("session_anchor_other", run, frame, request_id, "APPROVE", "o2")
+        self.assertEqual(409, status, wrong)
+        self.assertEqual("TASK_FRAME_OWNER_MISMATCH", wrong["error_code"])
+        status, unknown = self._decide(anchor, run, frame, "perm_never_asked", "APPROVE", "o3")
+        self.assertEqual(404, status, unknown)
+        self.assertEqual("TASK_FRAME_PERMISSION_REQUEST_UNKNOWN", unknown["error_code"])
+        status, bad = self._decide(anchor, run, frame, request_id, "MAYBE", "o4")
+        self.assertEqual("TASK_FRAME_PERMISSION_DECISION_INVALID", bad["error_code"])
+
+    def test_a_destructive_request_needs_the_conductors_reply(self):
+        from unittest import mock
+
+        anchor, run, frame = self._frame_with_worker("perm-destructive")
+        _room, request_id = self._ask_permission(frame, operations=["DELETE"], destructive=True, key="x1")
+        status, refused = self._decide(anchor, run, frame, request_id, "APPROVE", "x2")
+        self.assertEqual(409, status, refused)
+        self.assertEqual("TASK_FRAME_CONDUCTOR_APPROVAL_REQUIRED", refused["error_code"])
+
+        posted = []
+
+        class Host:
+            def find_live(self, **kwargs):
+                return {"terminal_id": "t-cond", "provider": "CODEX", "session_anchor_ref": "session_anchor_cond"}
+
+        class Bus:
+            def post(self, host, value):
+                posted.append(dict(value))
+                return {"messages": []}
+
+        thread = f"persona-{run['run_id']}-perm-{request_id}"
+        with mock.patch.object(self.server, "_session_anchor_terminal_host", return_value=Host()), \
+                mock.patch.object(self.server, "session_bus", Bus()), \
+                mock.patch.object(self.server, "_dispatch_live_posted_session_instructions", return_value=[]):
+            status, escalated = self._decide(anchor, run, frame, request_id, "ESCALATE", "x3")
+        self.assertEqual(200, status, escalated)
+        self.assertEqual("TASK_FRAME_PERMISSION_ESCALATED", escalated["status"])
+        self.assertEqual("CONDUCTOR", posted[0]["to"]["mode"])
+        self.assertEqual(thread, posted[0]["thread_id"])
+
+        def conductor_reply(mode, thread_id=thread, project="TEST"):
+            import json as _json
+            return {"message_id": "msg_reply", "thread_id": thread_id, "kind": "RESULT",
+                    "from_json": _json.dumps({"mode": mode, "project_id": project}), "in_reply_to": None}
+
+        for row in (conductor_reply("MASTER"), conductor_reply("CONDUCTOR", thread_id="other-thread"), None):
+            with mock.patch.object(self.server, "_bus_message_row", return_value=row):
+                status, still = self._decide(anchor, run, frame, request_id, "APPROVE", "x4",
+                                             conductor_approval_ref="msg_reply")
+            self.assertEqual("TASK_FRAME_CONDUCTOR_APPROVAL_REQUIRED", still["error_code"])
+        with mock.patch.object(self.server, "_bus_message_row", return_value=conductor_reply("CONDUCTOR")):
+            status, approved = self._decide(anchor, run, frame, request_id, "APPROVE", "x5",
+                                            conductor_approval_ref="msg_reply")
+        self.assertEqual(200, status, approved)
+        self.assertTrue(approved["destructive"])
+        # A Master may always deny, with no Conductor involved.
+        _room, second = self._ask_permission(frame, operations=["MOVE"], destructive=True, key="x6")
+        status, denied = self._decide(anchor, run, frame, second, "DENY", "x7")
+        self.assertEqual(200, status, denied)
+
+
 if __name__ == "__main__":
     unittest.main()

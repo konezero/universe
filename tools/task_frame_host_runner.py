@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from task_frame_host import RoleResult
+from task_frame_host_permission import HostPermissionEscalator
+from task_frame_host_transport import HttpBusPort, HttpRoomPort, HttpTodoPort
 from universe_runtime_host import RuntimeHostError, UniverseRuntimeHost
 
 WORKER_OUTPUT_CONTRACT = {
@@ -70,13 +72,25 @@ def _digest(value: Mapping[str, Any]) -> str:
 
 
 class RuntimeHostRoleRunner:
-    def __init__(self, spec: Mapping[str, Any], *, runtime_host: Any | None = None) -> None:
+    def __init__(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        runtime_host: Any | None = None,
+        permission_escalator: Any | None = None,
+    ) -> None:
         self.spec = spec
         self.host = runtime_host or UniverseRuntimeHost(Path(str(spec["repository_root"])))
         self.last_worker_result: Mapping[str, Any] | None = None
+        self.escalator = permission_escalator
+        dispatcher = getattr(self.host, "worker_dispatcher", None)
+        if permission_escalator is not None and dispatcher is not None:
+            dispatcher.permission_escalator = permission_escalator
 
     def run(self, role: str, *, attempt: int, feedback: str | None) -> RoleResult:
         spec = self.spec
+        if self.escalator is not None:
+            self.escalator.current_role = role
         frame_id = f"{spec['task_frame_id']}_{role.lower()}_{attempt}"
         turn_id = f"{role.lower()}-turn"
         is_worker = role == "WORKER"
@@ -144,5 +158,26 @@ class RuntimeHostRoleRunner:
         )
 
 
+def _live(room: Any, todo: Any) -> bool:
+    state, archived = todo.state()
+    return not archived and state.upper() not in {"DONE", "BLOCKED"} and room.is_open()
+
+
 def make(spec: Mapping[str, Any]) -> RuntimeHostRoleRunner:
-    return RuntimeHostRoleRunner(spec)
+    base = str(spec["base_url"])
+    room = HttpRoomPort(base, str(spec["room_id"]), author_binding_id=spec.get("author_binding_id"))
+    todo = HttpTodoPort(base, str(spec["todo_id"]))
+    escalator = HostPermissionEscalator(
+        task_frame_id=str(spec["task_frame_id"]),
+        todo_id=str(spec["todo_id"]),
+        room=room,
+        bus=HttpBusPort(
+            base,
+            to=spec["bus_to"],
+            sender=spec["bus_from"],
+            thread_id=str(spec.get("thread_id") or f"task-frame-{spec['task_frame_id']}"),
+        ),
+        timeout_seconds=(float(spec["permission_timeout_seconds"]) if spec.get("permission_timeout_seconds") else None),
+        alive=lambda: _live(room, todo),
+    )
+    return RuntimeHostRoleRunner(spec, permission_escalator=escalator)

@@ -240,6 +240,9 @@ class RuntimeWorkerDispatcher:
         self.project_id = str(project_id or "").strip()
         self.mode = str(mode or "MASTER").strip().upper()
         self.worker_host_coordinate_resolver = worker_host_coordinate_resolver
+        # Optional callable(description) -> "APPROVE" | "DENY".  When set, a write the
+        # declared scope does not cover is asked upward instead of refused outright.
+        self.permission_escalator: Callable[[Mapping[str, Any]], str] | None = None
         self.worker_response_timeout_seconds = _worker_response_timeout_seconds(
             worker_response_timeout_seconds
         )
@@ -1580,12 +1583,24 @@ class RuntimeWorkerDispatcher:
             if RuntimeWorkerDispatcher._is_qa_reviewer(request)
             else ""
         )
+        bounded_note = ""
+        if str(request.get("repository_write_scope") or "").upper() == "BOUNDED":
+            mutation = request.get("mutation_scope")
+            targets = mutation.get("targets") if isinstance(mutation, Mapping) else []
+            bounded_note = (
+                "\n\nWrite Scope: you may create or modify only these files: "
+                + ", ".join(str(item) for item in (targets or []))
+                + ". Make each change with the provider's file-change request; the Host "
+                "checks every request against this scope. A change outside it is not "
+                "refused for you: the Host asks the Master, so request it and wait for "
+                "the answer instead of skipping the work. Never delete or move files."
+            )
         return (
             f"Task Frame ID: "
             f"{_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
             f"Turn ID: {_required_text(request.get('turn_id'), 'turn_id')}\n\n"
             f"Context Pack:\n{context_pack}\n\n"
-            f"Output Contract:\n{output_contract}{format_instruction}{role_scope}"
+            f"Output Contract:\n{output_contract}{format_instruction}{role_scope}{bounded_note}"
         )
 
     @staticmethod
@@ -1613,8 +1628,103 @@ class RuntimeWorkerDispatcher:
             return self.repository_root
         return Path(tempfile.gettempdir())
 
+    _WRITE_TOOLS = frozenset(
+        {"write", "edit", "notebookedit", "item/filechange/requestapproval"}
+    )
+    _CHANGE_OPERATIONS = {"add": "CREATE", "update": "MODIFY", "delete": "DELETE"}
+
     @classmethod
+    def describe_write_permission(
+        cls, permission: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """What a provider's write approval request wants, or None if it is not a write."""
+
+        tool_call = permission.get("tool_call")
+        if not isinstance(tool_call, Mapping):
+            return None
+        tool = str(tool_call.get("toolName") or tool_call.get("title") or "").strip()
+        lowered = tool.casefold()
+        if lowered not in cls._WRITE_TOOLS:
+            return None
+        cwd = Path(str(tool_call.get("cwd") or Path.cwd()))
+
+        def absolute(value: Any) -> str:
+            raw = str(value or "").strip()
+            if not raw:
+                return ""
+            path = Path(raw)
+            return str((path if path.is_absolute() else cwd / path).resolve(strict=False))
+
+        targets: list[str] = []
+        operations: list[str] = []
+        changes = tool_call.get("fileChanges")
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, Mapping):
+                    continue
+                if change.get("move_path"):
+                    operations.append("MOVE")
+                else:
+                    operations.append(
+                        cls._CHANGE_OPERATIONS.get(str(change.get("type") or "").casefold(), "UNKNOWN")
+                    )
+                targets.append(absolute(change.get("path")))
+        else:
+            tool_input = tool_call.get("input") if isinstance(tool_call.get("input"), Mapping) else {}
+            targets.append(
+                absolute(
+                    tool_call.get("path")
+                    or tool_input.get("file_path")
+                    or tool_input.get("notebook_path")
+                )
+            )
+            operations.append("CREATE" if lowered == "write" else "MODIFY")
+        targets = [item for item in targets if item]
+        return {
+            "tool": tool,
+            "targets": list(dict.fromkeys(targets)),
+            "operations": list(dict.fromkeys(operations)),
+            "destructive": bool({"DELETE", "MOVE", "UNKNOWN"} & set(operations)),
+        }
+
     def _task_frame_permission(
+        self, task_request: Mapping[str, Any], permission: Mapping[str, Any]
+    ) -> str | None:
+        """Scope decision, then ask upward for a write the scope does not cover."""
+
+        option = self._task_frame_permission_decision(task_request, permission)
+        escalator = self.permission_escalator
+        if escalator is None:
+            return option
+        if str(task_request.get("repository_write_scope") or "").upper() != "BOUNDED":
+            return option
+        rejected = {
+            item.get("optionId")
+            for item in permission.get("options", [])
+            if isinstance(item, Mapping) and item.get("kind") in {"reject_once", "reject_always"}
+        }
+        if option is not None and option not in rejected:
+            return option
+        description = self.describe_write_permission(permission)
+        if description is None:
+            return option
+        try:
+            verdict = str(escalator(description) or "").upper()
+        except Exception:  # noqa: BLE001 - an escalation failure is a refusal, never an approval
+            verdict = "DENY"
+        if verdict != "APPROVE":
+            return option
+        for item in permission.get("options", []):
+            if (
+                isinstance(item, Mapping)
+                and item.get("kind") == "allow_once"
+                and isinstance(item.get("optionId"), str)
+            ):
+                return item["optionId"]
+        return option
+
+    @classmethod
+    def _task_frame_permission_decision(
         cls, task_request: Mapping[str, Any], permission: Mapping[str, Any]
     ) -> str | None:
         tool_call = permission.get("tool_call")
