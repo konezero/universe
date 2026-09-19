@@ -27,6 +27,12 @@ REVIEW_OUTCOMES = frozenset({"PASS", "NEEDS_REVISION", "BLOCKED", "NOT_RUN"})
 EXECUTION_MODES = frozenset({"MASTER_DIRECT", "WORKER_REVIEW"})
 WORKER_RESULT_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "NOT_RUN"})
 
+# surface()'s node_ref default: a caller must be able to ask for
+# node_ref IS NULL explicitly (a project-wide Conductor run) without that
+# request being indistinguishable from "no node_ref filter at all" -- a
+# plain `None` default cannot tell those apart. See surface() below.
+_NODE_REF_UNSET = object()
+
 
 class PersonaAutomationError(ValueError):
     """A typed, safe-to-expose domain error from the automation store."""
@@ -739,17 +745,26 @@ class PersonaAutomationStore:
             # CONDUCTOR bucket (node_ref IS NULL) keeps its original
             # single-active-run behaviour.
             active = connection.execute(
-                "SELECT run_id FROM persona_automation_run WHERE project_id = ? "
+                "SELECT run_id, state, session_anchor_ref FROM persona_automation_run WHERE project_id = ? "
                 "AND (node_ref IS ?) AND state IN ('RUNNING','WAITING','PAUSED') "
                 "ORDER BY updated_at DESC LIMIT 1",
                 (project_id, node_ref),
             ).fetchone()
             if active is not None:
-                raise PersonaAutomationError(
-                    "PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS",
+                scope_text = (
                     "this node already has an active persona automation run"
                     if node_ref
-                    else "project already has an active persona automation run",
+                    else "project already has an active persona automation run"
+                )
+                held_by = (
+                    "the requesting Anchor"
+                    if active["session_anchor_ref"] == anchor
+                    else f"a different Anchor ({active['session_anchor_ref']})"
+                )
+                raise PersonaAutomationError(
+                    "PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS",
+                    f"{scope_text}: run {active['run_id']} is {active['state']} and owned by {held_by}; "
+                    "stop it (persona.automation.stop) before starting a new run",
                     409,
                 )
             connection.execute(
@@ -1015,6 +1030,7 @@ class PersonaAutomationStore:
                 decision_target.get("todo_id") or ""
             ).strip()
             requested_todo_id = str(value.get("todo_id") or "").strip()
+
             if (
                 requested_todo_id
                 and decision_todo_id
@@ -2293,6 +2309,104 @@ class PersonaAutomationStore:
                 "event": event,
             }
 
+    def list_active_node_runs(self) -> list[dict[str, Any]]:
+        """RUNNING node-scoped runs across projects, for the Host-side driver.
+
+        Only ``RUNNING`` qualifies: PAUSED/WAITING/STOPPED/COMPLETED runs must
+        never be advanced, and project-wide (CONDUCTOR) runs are not driven by
+        the node-Master loop.
+        """
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM persona_automation_run WHERE state = 'RUNNING' "
+                "AND node_ref IS NOT NULL ORDER BY updated_at ASC, run_id ASC"
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def list_waiting_node_runs(self) -> list[dict[str, Any]]:
+        """WAITING node-scoped runs.  The driver advances these only when the
+        server has recorded a control receipt that was never delivered (for
+        example after a Reviewer PASS); an ordinary wait is left alone."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM persona_automation_run WHERE state = 'WAITING' "
+                "AND node_ref IS NOT NULL ORDER BY updated_at ASC, run_id ASC"
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def recent_completed_todo_ids(
+        self, project_id: str, node_ref: str, limit: int = 2
+    ) -> list[str]:
+        """Todo ids of a node's newest COMPLETED runs, newest first ('' if the
+        run never dispatched a Todo).  Used to detect a continuation chain that
+        keeps re-running the same unfinished Todo."""
+
+        project_id = _text(project_id, "project_id")
+        node_ref = _text(node_ref, "node_ref")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT current_assignment_json FROM persona_automation_run "
+                "WHERE project_id = ? AND node_ref = ? AND state = 'COMPLETED' "
+                "ORDER BY updated_at DESC, run_id DESC LIMIT ?",
+                (project_id, node_ref, max(1, int(limit))),
+            ).fetchall()
+        ids: list[str] = []
+        for row in rows:
+            assignment = _load(row["current_assignment_json"], None)
+            ids.append(
+                str(assignment.get("todo_id") or "")
+                if isinstance(assignment, Mapping)
+                else ""
+            )
+        return ids
+
+    def record_continuation_stalled(self, run_id: str, todo_id: str) -> None:
+        """Make a stopped continuation chain visible on the run's own history."""
+
+        run_id = _text(run_id, "run_id")
+        with self._connection() as connection:
+            self._get(connection, run_id)
+            self._event(
+                connection,
+                run_id,
+                "CONTINUATION_STALLED",
+                "continuation-stalled:" + _text(todo_id, "todo_id"),
+                {
+                    "todo_id": todo_id,
+                    "reason": "the same Todo completed consecutive runs without changing state",
+                },
+            )
+
+    def driver_control_recorded(self, run_id: str, driver_key: str) -> bool:
+        run_id = _text(run_id, "run_id")
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
+                (run_id, "driver-control:" + _text(driver_key, "driver_key")),
+            ).fetchone() is not None
+
+    def latest_driver_control_key(self, run_id: str) -> str:
+        """driver_key of the newest server-recorded control receipt, or ''.
+
+        ``auto-r<revision>`` events are the driver's own nudge ledger, not
+        receipts owed a delivery, so they are excluded.
+        """
+
+        run_id = _text(run_id, "run_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT idempotency_key FROM persona_automation_event "
+                "WHERE run_id = ? AND event_type = 'DRIVER_CONTROL_RECORDED' "
+                "AND idempotency_key NOT LIKE 'driver-control:auto-%' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        prefix = "driver-control:"
+        key = str(row["idempotency_key"]) if row is not None else ""
+        return key[len(prefix):] if key.startswith(prefix) else ""
+
     def record_driver_control(
         self,
         run_id: str,
@@ -2767,14 +2881,17 @@ class PersonaAutomationStore:
             rows = connection.execute("SELECT event_id, event_type, idempotency_key, payload_json, created_at FROM persona_automation_event WHERE run_id = ? ORDER BY created_at DESC, event_id DESC LIMIT ?", (run_id, limit)).fetchall()
             return [{"event_id": row["event_id"], "event_type": row["event_type"], "idempotency_key": row["idempotency_key"], "payload": _load(row["payload_json"], {}), "created_at": row["created_at"]} for row in rows]
 
-    def surface(self, project_id: str, *, node_ref: str | None = None, session_anchor_ref: str | None = None) -> dict[str, Any]:
+    def surface(self, project_id: str, *, node_ref: str | None = _NODE_REF_UNSET, session_anchor_ref: str | None = None) -> dict[str, Any]:
         project_id = _text(project_id, "project_id")
         with self._connection() as connection:
             clauses = ["project_id = ?"]
             params: list[Any] = [project_id]
-            if node_ref is not None:
+            if node_ref is not _NODE_REF_UNSET:
+                # node_ref=None here means "project-wide only" (node_ref IS
+                # NULL), explicitly requested by the caller -- distinct from
+                # omitting the argument, which applies no node_ref filter.
                 clauses.append("node_ref IS ?")
-                params.append(str(node_ref).strip() or None)
+                params.append(str(node_ref).strip() or None if node_ref else None)
             if session_anchor_ref is not None:
                 clauses.append("session_anchor_ref = ?")
                 params.append(str(session_anchor_ref).strip())

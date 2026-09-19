@@ -268,6 +268,7 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
                 }
 
         lineage_results = []
+        cycle_appends = []
 
         class Lineage:
             def attach_result(self, **kwargs):
@@ -290,6 +291,11 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
             _create_persona_review_followup_todo=lambda _result: {"todo": None},
             _enqueue_persona_automation_driver=lambda _run, **_kwargs: {"status": "QUEUED"},
         )
+        server._append_task_frame_cycle = (
+            lambda run, frame_id, anchor, status, **kwargs: cycle_appends.append(
+                (frame_id, anchor, status, kwargs)
+            )
+        )
         result = UniverseHTTPServer._run_persona_automation_task_frame(
             server,
             run_with_reviewer,
@@ -301,6 +307,16 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME", result["provider_execution"]["execution_shape"])
         self.assertEqual("task-frame-result://frame-master-review/reviewer/1", lineage_results[0]["result_ref"])
         self.assertEqual("frame-master-review", lineage_results[0]["frame_ref"])
+        # A collected result is appended to the origin Session Anchor's own history.
+        self.assertEqual(1, len(cycle_appends))
+        frame_id, anchor, status, extra = cycle_appends[0]
+        self.assertEqual("frame-master-review", frame_id)
+        self.assertEqual(self.assignment["session_anchor_ref"], anchor)
+        self.assertEqual("COMPLETED", status)
+        self.assertEqual(
+            "task-frame-result://frame-master-review/reviewer/1", extra["result_ref"]
+        )
+        self.assertEqual(64, len(extra["result_digest"]))
 
     def test_legacy_master_reviewer_repair_is_cas_pinned_and_upgrades_to_task_frame(self):
         run = self.store.start_run(

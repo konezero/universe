@@ -351,6 +351,44 @@ class SessionSupervisorStoreTests(unittest.TestCase):
         self.assertEqual(first["session_anchor_ref"], updated["session_anchor_ref"])
         self.assertEqual(2, self.store.get_project_mode_anchor("GCS", "MASTER")["revision"])
 
+    def test_mode_anchor_references_the_session_anchor_position_without_copying_history(self) -> None:
+        first, _ = self.store.register_session(self.session("session-one"))
+        second, _ = self.store.register_session(self.session("session-two"))
+        before = self.store.get_project_mode_anchor("GCS", "MASTER")
+        self.assertEqual([None, None], [item["last_lineage_revision"] for item in before["session_anchor_refs"]])
+
+        referenced = self.store.record_session_anchor_position(
+            first["session_anchor_ref"], revision=7, observed_at="2026-09-19T03:00:00Z"
+        )
+        self.assertTrue(referenced)
+        after = self.store.get_project_mode_anchor("GCS", "MASTER")
+        by_ref = {item["session_anchor_ref"]: item for item in after["session_anchor_refs"]}
+        self.assertEqual(7, by_ref[first["session_anchor_ref"]]["last_lineage_revision"])
+        self.assertEqual("2026-09-19T03:00:00Z", by_ref[first["session_anchor_ref"]]["last_lineage_at"])
+        self.assertIsNone(by_ref[second["session_anchor_ref"]]["last_lineage_revision"])
+        # The Mode Anchor advances, but its membership revision still counts attached sessions.
+        self.assertEqual(before["revision"], after["revision"])
+        self.assertEqual("2026-09-19T03:00:00Z", after["updated_at"])
+
+        # The marker only moves forward: a stale or repeated position changes nothing.
+        self.store.record_session_anchor_position(
+            first["session_anchor_ref"], revision=5, observed_at="2026-09-19T04:00:00Z"
+        )
+        self.store.record_session_anchor_position(
+            first["session_anchor_ref"], revision=7, observed_at="2026-09-19T05:00:00Z"
+        )
+        unchanged = {
+            item["session_anchor_ref"]: item
+            for item in self.store.get_project_mode_anchor("GCS", "MASTER")["session_anchor_refs"]
+        }[first["session_anchor_ref"]]
+        self.assertEqual(7, unchanged["last_lineage_revision"])
+        self.assertEqual("2026-09-19T03:00:00Z", unchanged["last_lineage_at"])
+
+        # Unknown Session Anchors are reported, not invented.
+        self.assertFalse(self.store.record_session_anchor_position(
+            "session_anchor_unknown", revision=1, observed_at="2026-09-19T03:00:00Z"
+        ))
+
     def test_project_mode_move_creates_new_session_anchor_and_preserves_prior_lineage(self) -> None:
         session, _ = self.store.register_session(self.session())
         moved = self.store.bind_current_location(

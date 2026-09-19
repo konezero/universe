@@ -52,6 +52,7 @@ TODO_MOVE_PROJECT_ACTION_ID = "todo.move_project"
 TODO_REORDER_ACTION_ID = "todo.reorder"
 TODO_ARCHIVE_ACTION_ID = "todo.archive"
 TODO_RESTORE_ACTION_ID = "todo.restore"
+TODO_REDO_ACTION_ID = "todo.redo"
 
 # The exact shape UniverseServer._handle_todo_bind_goal_action /
 # UniverseStore.set_todo_goal_binding accept: additionalProperties is False
@@ -153,6 +154,22 @@ TODO_RESTORE_REQUEST_SCHEMA = {
         "expected_revision": {"type": "integer", "minimum": 1},
     },
 }
+TODO_REDO_REQUEST_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["todo_id", "expected_revision", "request_id"],
+    "properties": {
+        "todo_id": {"type": "string", "pattern": _IDENTIFIER_PATTERN},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "request_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{8,100}$",
+            "description": "Idempotency key. Replaying it returns the first result "
+            "instead of copying the Todo again.",
+        },
+        "reason": {"type": "string", "maxLength": 500},
+    },
+}
 TODO_DELETE_ACTION_ID = "todo.delete"
 
 TODO_ACTION_IDS = (
@@ -168,6 +185,7 @@ TODO_ACTION_IDS = (
     TODO_REORDER_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
     TODO_RESTORE_ACTION_ID,
+    TODO_REDO_ACTION_ID,
     TODO_DELETE_ACTION_ID,
 )
 
@@ -190,6 +208,7 @@ IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     TODO_MOVE_PROJECT_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
     TODO_RESTORE_ACTION_ID,
+    TODO_REDO_ACTION_ID,
 )
 PENDING_WORK_SURFACE_ACTION_IDS = (
     TODO_DELETE_ACTION_ID,
@@ -1514,6 +1533,37 @@ def build_default_action_registry(
         supplied_handlers.get(TODO_RESTORE_ACTION_ID),
         surfaces=(TODO_RESTORE_ACTION_ID,),
     )
+    registry.register(
+        ActionContract(
+            action_id=TODO_REDO_ACTION_ID,
+            request_schema_ref="universe.todo-redo-action-request.v1",
+            result_schema_ref="universe.todo-redo-receipt.v1",
+            side_effect_class="LOCAL_DATABASE_MUTATION",
+            metadata={
+                "request_schema": TODO_REDO_REQUEST_SCHEMA,
+                "credential_handling": "CREDENTIAL_REF_ONLY",
+                "session_selection": "NOT_REQUIRED",
+                "authentication": "LOCAL_READ",
+                "replay": "IDEMPOTENT_BY_REQUEST_ID",
+                "description": "Start a Todo over: copy it as a fresh READY Todo and "
+                "archive the original (history is kept on the archived row).",
+                "errors": [
+                    "REQUEST_INVALID",
+                    "IDENTIFIER_INVALID",
+                    "TODO_REDO_REQUEST_INVALID",
+                    "TODO_REDO_REQUEST_CONFLICT",
+                    "TODO_REDO_DONE_NOT_ALLOWED",
+                    "TODO_REDO_ACTIVE_RUN",
+                    "TODO_ALREADY_ARCHIVED",
+                    "TODO_REVISION_INVALID",
+                    "TODO_REVISION_CONFLICT",
+                    "TODO_NOT_FOUND",
+                ],
+            },
+        ),
+        supplied_handlers.get(TODO_REDO_ACTION_ID),
+        surfaces=(TODO_REDO_ACTION_ID,),
+    )
     from universe_todo_actions import REQUEST_SCHEMAS
     for action_id in (TODO_READ_ACTION_ID, TODO_LIST_ACTION_ID, TODO_STATE_ACTION_ID):
         registry.register(
@@ -1611,6 +1661,8 @@ __all__ = [
     "TODO_ARCHIVE_ACTION_ID",
     "TODO_ARCHIVE_REQUEST_SCHEMA",
     "TODO_RESTORE_REQUEST_SCHEMA",
+    "TODO_REDO_ACTION_ID",
+    "TODO_REDO_REQUEST_SCHEMA",
     "TODO_BIND_GOAL_ACTION_ID",
     "TODO_BIND_GOAL_REQUEST_SCHEMA",
     "TODO_BIND_NODE_ACTION_ID",

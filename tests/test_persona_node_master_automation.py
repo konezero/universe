@@ -458,6 +458,195 @@ class NodeMasterAutomationTests(unittest.TestCase):
         })
         self.assertEqual(409, status2, started2)
         self.assertEqual("PERSONA_AUTOMATION_ACTIVE_RUN_EXISTS", started2["error_code"])
+        self.assertIn(started1["run"]["run_id"], started2["detail"])
+
+    # -- Host-side driver: advance an idle node Master -------------------
+
+    def _start_driven_run(self, key):
+        persona = self.make_persona()
+        node_ref = self.make_feature_node(key)
+        anchor = self.register("MASTER", key)
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "persona_id": persona["persona_id"],
+            "expected_persona_revision": persona["revision"], "expected_assignment_revision": 0,
+            "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, assigned)
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor, "scope": "s", "instruction": "i",
+        })
+        self.assertEqual(201, status, started)
+        return anchor, node_ref, started["run"]
+
+    def _drive(self, run_id, turn_state, provider="CLAUDE"):
+        run = self.server.persona_automation.get_run(run_id)
+        return self._drive_run(run, turn_state, provider=provider)
+
+    def _drive_run(self, run, turn_state, provider="CLAUDE", allow_auto=True, bus_posted=None):
+        from unittest import mock
+
+        class FakeHost:
+            def __init__(self, anchor):
+                self.anchor = anchor
+
+            def find_live(self, **kwargs):
+                if kwargs.get("session_anchor_ref") != self.anchor:
+                    return None
+                state = {"state": turn_state} if turn_state is not None else {}
+                return {"terminal_id": "t-driver", "provider": provider, "host_turn_state": state}
+
+            def cli_attach_sealed(self, terminal_id):
+                return True
+
+        posted = bus_posted if bus_posted is not None else []
+
+        class FakeBus:
+            def find_message_by_idempotency(self, *, idempotency_key, recipient_anchor_ref):
+                return next((m for m in posted if m["idempotency_key"] == idempotency_key), None)
+
+            def post(self, host, value):
+                posted.append(dict(value))
+                return {"messages": []}
+
+        run_id = run["run_id"]
+        host = FakeHost(run["session_anchor_ref"])
+        with mock.patch.object(self.server, "_session_anchor_terminal_host", return_value=host),                 mock.patch.object(self.server, "session_bus", FakeBus()),                 mock.patch.object(self.server, "_dispatch_live_posted_session_instructions", return_value=[]):
+            first = self.server._drive_persona_automation_run(
+                self.server.persona_automation.get_run(run_id), allow_auto=allow_auto)
+            second = self.server._drive_persona_automation_run(
+                self.server.persona_automation.get_run(run_id), allow_auto=allow_auto)
+        return posted, first, second
+
+    def test_driver_advances_an_idle_node_master_once_per_revision(self):
+        _anchor, node_ref, run = self._start_driven_run("driver-idle")
+        posted, first, second = self._drive(run["run_id"], "IDLE")
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+        self.assertEqual("CONTROL_ALREADY_SENT_FOR_REVISION", second["reason"], second)
+        self.assertEqual(1, len(posted))
+        self.assertEqual(node_ref, posted[0]["to"]["node_ref"])
+        self.assertEqual("INSTRUCTION", posted[0]["kind"])
+        self.assertIn(run["run_id"], posted[0]["body_text"])
+
+    def test_driver_does_not_touch_a_working_or_unknown_master_turn(self):
+        _anchor, _node, run = self._start_driven_run("driver-busy")
+        for state, reason in (("WORKING", "MASTER_TURN_WORKING"), (None, "MASTER_TURN_UNKNOWN")):
+            posted, first, _second = self._drive(run["run_id"], state)
+            self.assertEqual("DRIVER_SKIPPED", first["status"], first)
+            self.assertEqual(reason, first["reason"])
+            self.assertEqual([], posted)
+
+    def test_driver_treats_input_active_as_idle_only_for_the_claude_channel(self):
+        _anchor, _node, run = self._start_driven_run("driver-input-active")
+        posted, first, _second = self._drive(run["run_id"], "INPUT_ACTIVE", provider="CODEX")
+        self.assertEqual("MASTER_TURN_INPUT_ACTIVE", first["reason"], first)
+        self.assertEqual([], posted)
+        posted, first, _second = self._drive(run["run_id"], "INPUT_ACTIVE", provider="CLAUDE")
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+        self.assertEqual(1, len(posted))
+
+    def test_driver_treats_a_stopped_claude_turn_as_resting_but_not_codex(self):
+        _anchor, _node, run = self._start_driven_run("driver-stopping")
+        posted, first, _second = self._drive(run["run_id"], "STOPPING", provider="CODEX")
+        self.assertEqual("MASTER_TURN_STOPPING", first["reason"], first)
+        self.assertEqual([], posted)
+        posted, first, _second = self._drive(run["run_id"], "STOPPING", provider="CLAUDE")
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+
+    def test_driver_delivers_an_owed_receipt_to_a_waiting_run_but_not_an_ordinary_wait(self):
+        _anchor, _node, run = self._start_driven_run("driver-waiting")
+        # RUNNING -> WAITING with the start receipt still undelivered: owed.
+        with self.server.persona_automation._connection() as connection:
+            connection.execute(
+                "UPDATE persona_automation_run SET state = 'WAITING' WHERE run_id = ?",
+                (run["run_id"],),
+            )
+        waiting = self.server.persona_automation.get_run(run["run_id"])
+        self.assertEqual("WAITING", waiting["state"])
+        posted, first, second = self._drive_run(waiting, "IDLE", allow_auto=False)
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+        self.assertTrue(posted[0]["idempotency_key"].endswith(":initial-v1"), posted)
+        # Delivered receipt + WAITING: an ordinary wait is left alone.
+        self.assertEqual("WAITING_NO_PENDING_CONTROL", second["reason"], second)
+        # Delivering the receipt also covers this revision: no double nudge.
+        posted, first, _second = self._drive_run(waiting, "IDLE", allow_auto=True, bus_posted=posted)
+        self.assertEqual("CONTROL_ALREADY_SENT_FOR_REVISION", first["reason"], first)
+        self.assertEqual(1, len(posted))
+
+    def test_continuation_stops_when_the_same_open_todo_keeps_completing_runs(self):
+        from unittest import mock
+        _anchor, node_ref, run = self._start_driven_run("continuation-stall")
+        completed = {
+            "run_id": run["run_id"], "project_id": "TEST", "node_ref": node_ref,
+            "current_assignment": {"todo_id": "todo_same"},
+        }
+        store = self.server.persona_automation
+        with mock.patch.object(self.server.store, "get_todo", return_value={"state": "IN_PROGRESS"}):
+            with mock.patch.object(store, "recent_completed_todo_ids", return_value=["todo_same", "todo_same"]):
+                stalled = self.server._persona_automation_continuation_stalled(completed)
+            self.assertEqual("PERSONA_AUTOMATION_CONTINUATION_STALLED", stalled["status"], stalled)
+            self.assertEqual("todo_same", stalled["todo_id"])
+            # A different Todo in the window, or too little history: keep going.
+            with mock.patch.object(store, "recent_completed_todo_ids", return_value=["todo_same", "todo_other"]):
+                self.assertIsNone(self.server._persona_automation_continuation_stalled(completed))
+            with mock.patch.object(store, "recent_completed_todo_ids", return_value=["todo_same"]):
+                self.assertIsNone(self.server._persona_automation_continuation_stalled(completed))
+        # Once the Todo is closed the chain is no longer stalled.
+        with mock.patch.object(self.server.store, "get_todo", return_value={"state": "DONE"}),                 mock.patch.object(store, "recent_completed_todo_ids", return_value=["todo_same", "todo_same"]):
+            self.assertIsNone(self.server._persona_automation_continuation_stalled(completed))
+        store.record_continuation_stalled(run["run_id"], "todo_same")
+        store.record_continuation_stalled(run["run_id"], "todo_same")  # idempotent replay
+        events = [e for e in store.events(run["run_id"], 30) if e.get("event_type") == "CONTINUATION_STALLED"]
+        self.assertEqual(1, len(events), events)
+
+    def test_driver_instruction_tells_the_master_to_close_the_todo(self):
+        _anchor, _node, run = self._start_driven_run("driver-close-todo")
+        posted, first, _second = self._drive(run["run_id"], "IDLE")
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+        body = posted[0]["body_text"]
+        self.assertIn("todo.state", body)
+        self.assertIn("does NOT close the Todo", body)
+        self.assertIn("next_condition:", body)
+        # An idle Master must park the run as WAITING via a typed decision.
+        self.assertIn("Never leave the run RUNNING while idle", body)
+        self.assertIn("persona.automation.decide", body)
+        self.assertIn("ESCALATE", body)
+        self.assertIn("lease", body)
+
+    def test_node_master_can_park_an_idle_run_as_waiting_with_a_reason(self):
+        anchor, _node, run = self._start_driven_run("driver-escalate")
+        # The Master is first woken by the start receipt, as in a real run.
+        posted, woken, _again = self._drive_run(run, "STOPPING")
+        self.assertEqual("DRIVER_CONTROL_POSTED", woken["status"], woken)
+        status, ticked = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "tick-escalate-1",
+        })
+        self.assertEqual(200, status, ticked)
+        status, decided = self.act("persona.automation.decide", {
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "decide-escalate-1",
+            "kind": "ESCALATE", "rationale": "Plan re-selects an already verified Todo.",
+            "evidence_refs": ["repo://tests/example"],
+            "next_condition": "Operator decides: close the Todo or scope more work.",
+        })
+        self.assertEqual(200, status, decided)
+        parked = self.server.persona_automation.get_run(run["run_id"])
+        self.assertEqual("WAITING", parked["state"])
+        self.assertEqual("Operator decides: close the Todo or scope more work.", parked["next_condition"])
+        # A parked run is not nudged again without a newly recorded receipt.
+        _posted, first, _second = self._drive_run(
+            parked, "STOPPING", allow_auto=False, bus_posted=posted
+        )
+        self.assertEqual("WAITING_NO_PENDING_CONTROL", first["reason"], first)
+
+    def test_driver_only_lists_running_node_runs(self):
+        _anchor, _node, run = self._start_driven_run("driver-paused")
+        listed = {item["run_id"] for item in self.server.persona_automation.list_active_node_runs()}
+        self.assertIn(run["run_id"], listed)
+        status, stopped = self.act("persona.automation.stop", {
+            "run_id": run["run_id"], "expected_revision": run["revision"], "reason": "test",
+        })
+        self.assertEqual(200, status, stopped)
+        listed = {item["run_id"] for item in self.server.persona_automation.list_active_node_runs()}
+        self.assertNotIn(run["run_id"], listed)
 
     # -- plan: Goal/Todo selection confined to the owned node -------------
 

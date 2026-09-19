@@ -226,7 +226,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
         )
 
     def test_only_implemented_work_surface_actions_are_discoverable(self) -> None:
-        self.assertEqual(13, len(TODO_ACTION_IDS))
+        self.assertEqual(14, len(TODO_ACTION_IDS))
         self.assertEqual(
             (
                 FEATURE_CREATE_ACTION_ID,
@@ -242,6 +242,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
                 "todo.move_project",
                 "todo.archive",
                 "todo.restore",
+                "todo.redo",
             ),
             IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
         )

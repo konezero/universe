@@ -62,6 +62,7 @@ from session_anchor_transport import (
     SessionAnchorTransportError,
 )
 from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
+from session_anchor_cycle import append_cycle_result
 from universe_dispatch import (
     DispatchError,
     HttpProjectMasterBridge,
@@ -201,6 +202,7 @@ from universe_action_registry import (
     TODO_MOVE_PROJECT_ACTION_ID,
     TODO_ARCHIVE_ACTION_ID,
     TODO_RESTORE_ACTION_ID,
+    TODO_REDO_ACTION_ID,
     SESSION_NEW_ACTION_ID,
     SESSION_NEW_RESULT_SCHEMA,
     SESSION_RESUME_ACTION_ID,
@@ -6318,6 +6320,14 @@ class UniverseStore:
                 ON todo_mutation_receipt(status, expires_at, receipt_id);
 
 
+
+                CREATE TABLE IF NOT EXISTS todo_redo_action (
+                    request_id TEXT PRIMARY KEY,
+                    source_todo_id TEXT NOT NULL,
+                    new_todo_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS todo_action_mutation_receipt (
                     receipt_id TEXT PRIMARY KEY,
@@ -15095,6 +15105,136 @@ class UniverseStore:
             )
         return self.get_todo(normalized_id)
 
+    def redo_todo(self, todo_id: str, value: Any) -> dict[str, Any]:
+        """Start a Todo over: copy it as a fresh READY Todo, archive the original.
+
+        The copy carries no dispatch, run or assignment history, so a node that
+        is stuck on a half-finished dispatch can proceed from a clean Todo while
+        the original keeps its full history on the archived row.  Both writes
+        happen in one transaction, and the request is idempotent by
+        ``request_id`` (a replay returns the first result).
+        """
+
+        normalized_id = _identifier(todo_id, "todo_id")
+        if not isinstance(value, Mapping) or set(value) - {
+            "expected_revision", "request_id", "reason"
+        }:
+            raise UniverseError(
+                "TODO_REDO_REQUEST_INVALID",
+                "expected_revision, request_id and an optional reason are the only accepted fields",
+            )
+        expected_revision = value.get("expected_revision")
+        if type(expected_revision) is not int or isinstance(expected_revision, bool) or expected_revision < 1:
+            raise UniverseError("TODO_REVISION_INVALID", "expected_revision must be a positive integer")
+        request_id = value.get("request_id")
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            raise UniverseError(
+                "TODO_REDO_REQUEST_INVALID",
+                "request_id must be 8-100 ASCII letters, digits, underscores or hyphens",
+            )
+        reason = value.get("reason")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 500):
+            raise UniverseError("TODO_REDO_REQUEST_INVALID", "reason must be text of at most 500 characters")
+        request_json = json.dumps(
+            {"todo_id": normalized_id, "expected_revision": expected_revision, "reason": reason},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        now = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            replay = connection.execute(
+                "SELECT * FROM todo_redo_action WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            if replay is not None:
+                if replay["request_json"] != request_json:
+                    raise UniverseError(
+                        "TODO_REDO_REQUEST_CONFLICT",
+                        "request_id already identifies a different redo request",
+                        HTTPStatus.CONFLICT,
+                    )
+                return {
+                    "replayed": True,
+                    "source_todo": self.get_todo(replay["source_todo_id"]),
+                    "todo": self.get_todo(replay["new_todo_id"]),
+                }
+            source = connection.execute(
+                "SELECT * FROM project_todo WHERE todo_id = ?", (normalized_id,)
+            ).fetchone()
+            if source is None:
+                raise UniverseError("TODO_NOT_FOUND", "Todo does not exist", HTTPStatus.NOT_FOUND)
+            if source["archived_at"]:
+                raise UniverseError(
+                    "TODO_ALREADY_ARCHIVED", "Todo is already archived", HTTPStatus.CONFLICT
+                )
+            if int(source["revision"]) != expected_revision:
+                raise UniverseError(
+                    "TODO_REVISION_CONFLICT",
+                    f"Todo revision changed; current revision is {source['revision']}",
+                    HTTPStatus.CONFLICT,
+                )
+            if str(source["state"]).upper() == "DONE":
+                raise UniverseError(
+                    "TODO_REDO_DONE_NOT_ALLOWED",
+                    "a DONE Todo is finished; create a new Todo if more work is needed",
+                    HTTPStatus.CONFLICT,
+                )
+            active_run = connection.execute(
+                """
+                SELECT run_id FROM persona_automation_run
+                WHERE state IN ('RUNNING', 'WAITING', 'PAUSED')
+                  AND json_extract(current_assignment_json, '$.todo_id') = ?
+                LIMIT 1
+                """,
+                (normalized_id,),
+            ).fetchone() if self._table_exists(connection, "persona_automation_run") else None
+            if active_run is not None:
+                raise UniverseError(
+                    "TODO_REDO_ACTIVE_RUN",
+                    f"run {active_run['run_id']} is still working on this Todo; stop it first",
+                    HTTPStatus.CONFLICT,
+                )
+            new_id = "todo_" + uuid.uuid4().hex
+            lineage_note = f"Redone from {normalized_id} (request {request_id})"
+            if reason:
+                lineage_note += f": {reason.strip()}"
+            copy = {
+                "scope_kind": source["scope_kind"],
+                "project_id": source["project_id"],
+                "node_ref": source["node_ref"],
+                "universe_goal_id": source["universe_goal_id"],
+                "goal_id": source["goal_id"],
+                "milestone_id": source["milestone_id"],
+                "title": source["title"],
+                "detail": f"{source['detail']}\n\n{lineage_note}" if source["detail"] else lineage_note,
+                "priority": source["priority"],
+                "state": "READY",
+                "source_kind": source["source_kind"],
+                "sort_order": source["sort_order"],
+            }
+            self._insert_todo(connection, new_id, copy, now)
+            connection.execute(
+                "UPDATE project_todo SET archived_at = ?, revision = revision + 1, updated_at = ? "
+                "WHERE todo_id = ? AND revision = ? AND archived_at IS NULL",
+                (now, now, normalized_id, expected_revision),
+            )
+            connection.execute(
+                "INSERT INTO todo_redo_action(request_id, source_todo_id, new_todo_id, request_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (request_id, normalized_id, new_id, request_json, now),
+            )
+        return {
+            "replayed": False,
+            "source_todo": self.get_todo(normalized_id),
+            "todo": self.get_todo(new_id),
+        }
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+        return connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone() is not None
+
     def delete_todo(self, todo_id: str) -> dict[str, Any]:
         normalized = _identifier(todo_id, "todo_id")
         with self._connection() as connection:
@@ -20923,6 +21063,48 @@ class UniverseStore:
                             "(or pass handoff_from naming that owner and its exact assignment_revision)",
                             HTTPStatus.CONFLICT,
                         )
+            elif handoff_anchor is not None:
+                # Project-wide (Conductor) handoff. There is no DB-level
+                # exclusivity for node_ref IS NULL -- any number of sessions
+                # may hold a project-wide persona (P1) -- so unlike the
+                # node-scoped branch above there is no "conflicting owner" to
+                # detect first. The caller names the exact old Anchor and
+                # revision to retire; honor it directly, CAS-guarded, in the
+                # same transaction as the new assignment. Without this branch
+                # handoff_from was silently accepted but never acted on for a
+                # Conductor handoff: the old Anchor's assignment stayed ACTIVE
+                # forever, so repeated Conductor handoffs left several ACTIVE
+                # project-wide assignments stacked up (2026-09-19 finding:
+                # this is what made the Fleet Conductor panel flip between an
+                # assignment and "ERROR: PERSONA_ASSIGNMENTS_READ_FAILED" --
+                # fleetProjectConductorAssignments() treats >1 ACTIVE
+                # project-wide assignment among live CONDUCTOR anchors as
+                # ambiguous). A project-wide assignment has no node binding to
+                # free, so retiring it means the same full UNASSIGNED
+                # transition unassign_persona performs, not a partial clear.
+                cleared = connection.execute(
+                    "UPDATE session_persona_assignment SET state = 'UNASSIGNED', "
+                    "assignment_revision = assignment_revision + 1, "
+                    "applied_at = NULL, applied_terminal_id = NULL, applied_persona_revision = NULL, "
+                    "applied_assignment_revision = NULL, applied_phase = NULL, applied_message_id = NULL, "
+                    "queued_at = NULL, queued_terminal_id = NULL, queued_provider = NULL, "
+                    "queued_message_id = NULL, queued_submission_id = NULL, queued_phase = NULL, "
+                    "queued_persona_revision = NULL, queued_assignment_revision = NULL, "
+                    "unsupported_at = NULL, unsupported_terminal_id = NULL, unsupported_provider = NULL, "
+                    "unsupported_reason = NULL, actor_ref = ?, updated_at = ? "
+                    "WHERE session_anchor_ref = ? AND assignment_revision = ? AND state = 'ACTIVE' AND node_ref IS NULL",
+                    (str(actor.get("actor_ref") or ""), now, handoff_anchor, handoff_revision),
+                )
+                if cleared.rowcount != 1:
+                    raise UniverseError(
+                        "PERSONA_ASSIGNMENT_HANDOFF_STALE",
+                        "handoff_from no longer matches the current project-wide owner; re-read and retry",
+                        HTTPStatus.CONFLICT,
+                    )
+                handoff_cleared = {
+                    "session_anchor_ref": handoff_anchor,
+                    "assignment_revision": handoff_revision + 1,
+                }
             actor_ref = str(actor.get("actor_ref") or "")
             if existing is None:
                 connection.execute(
@@ -31559,6 +31741,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 TODO_MOVE_PROJECT_ACTION_ID: self._handle_todo_move_project_action,
                 TODO_ARCHIVE_ACTION_ID: self._handle_todo_archive_action,
                 TODO_RESTORE_ACTION_ID: self._handle_todo_restore_action,
+                TODO_REDO_ACTION_ID: self._handle_todo_redo_action,
                 "todo.read": self._handle_todo_read_action,
                 "todo.list": self._handle_todo_list_action,
                 "todo.state": self._handle_todo_state_action,
@@ -31781,6 +31964,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         if self._auto_start_goal_scheduler:
             self._goal_scheduler_worker.start()
+        self._persona_automation_driver_last_run: dict[str, Any] | None = None
+        self._persona_automation_driver_worker = threading.Thread(
+            target=self._persona_automation_driver_loop,
+            name="universe-persona-automation-driver",
+            daemon=True,
+        )
+        if self._auto_start_goal_scheduler:
+            self._persona_automation_driver_worker.start()
         self.rendezvous_service: UniverseRendezvousService | None = None
         self._rendezvous_start_error: dict[str, str] | None = None
         self._remote_access_resume: dict[str, Any] | None = None
@@ -33568,10 +33759,21 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     handed_off_from_anchor=handoff_cleared["session_anchor_ref"],
                     handed_off_to_anchor=value["session_anchor_ref"],
                 )
+        elif handoff_cleared is not None:
+            # Same stranded-run problem as the node-scoped branch above, for
+            # a project-wide (Conductor) handoff: the old Conductor Anchor's
+            # automation run is never re-pointed by the handoff, so without
+            # this it keeps running/waiting under an Anchor that just lost
+            # its Persona assignment.
+            self._stop_superseded_persona_automation_run(
+                project_id=project_id, node_ref=None,
+                handed_off_from_anchor=handoff_cleared["session_anchor_ref"],
+                handed_off_to_anchor=value["session_anchor_ref"],
+            )
         return result
 
     def _stop_superseded_persona_automation_run(
-        self, *, project_id: str, node_ref: str, handed_off_from_anchor: str, handed_off_to_anchor: str
+        self, *, project_id: str, node_ref: str | None, handed_off_from_anchor: str, handed_off_to_anchor: str
     ) -> None:
         """Auto-stop the old owner's still-active automation run on handoff.
 
@@ -34039,6 +34241,64 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
         return self._create_persona_automation_task_frame_worker(spec, context)
 
+    def _append_task_frame_cycle(
+        self,
+        run: Mapping[str, Any],
+        frame_id: str,
+        origin_session_anchor_ref: str,
+        status: str,
+        *,
+        result_ref: str | None = None,
+        result_digest: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append one finished execution cycle to the origin Session Anchor.
+
+        The Session Anchor keeps its own history (appending is the revision), so
+        a later run can tell how far the session got.  Best effort by design:
+        the result is already recorded in the Task Frame's own store and the
+        run, so a store that is unavailable is reported, never raised over a
+        result that exists.
+        """
+
+        project_id = str(run.get("project_id") or "").strip()
+        try:
+            session = next(
+                (
+                    item
+                    for item in self.session_supervisor.list_sessions(
+                        node=project_id, include_hidden=True
+                    )
+                    if str(item.get("session_anchor_ref") or "").strip()
+                    == origin_session_anchor_ref
+                ),
+                None,
+            )
+            if session is None:
+                return {"status": "SESSION_ANCHOR_SESSION_UNKNOWN"}
+            repo_root = Path(self.store.get_project(project_id)["project_root"])
+            outcome = append_cycle_result(
+                repo_root,
+                session_id=str(session.get("session_id") or ""),
+                session_anchor_ref=origin_session_anchor_ref,
+                task_frame_id=frame_id,
+                status=status,
+                result_ref=result_ref,
+                result_digest=result_digest,
+                detail=detail,
+            )
+            if str(outcome.get("status") or "").startswith("SESSION_ANCHOR_CYCLE_") and outcome.get("revision"):
+                # The Mode Anchor only references its Session Anchors: point the
+                # reference at the position just appended, copy nothing.
+                self.session_supervisor.record_session_anchor_position(
+                    origin_session_anchor_ref,
+                    revision=int(outcome["revision"]),
+                    observed_at=str(outcome["observed_at"]),
+                )
+            return outcome
+        except Exception as error:  # noqa: BLE001 - never fail a recorded result
+            return {"status": "SESSION_ANCHOR_CYCLE_ERROR", "error": type(error).__name__}
+
     def _run_persona_automation_task_frame(
         self,
         run: Mapping[str, Any],
@@ -34195,6 +34455,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "result separate from CLI or delivery state."
                 ),
             }
+        origin_anchor_ref = str(
+            run.get("session_anchor_ref")
+            or worker_info.get("assigned_by_session_anchor_ref")
+            or ""
+        )
         try:
             runtime_binding = self._persona_automation_runtime_binding(run)
             provider_result = self.runtime_host.invoke_structured_task(
@@ -34209,6 +34474,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 output_contract=output_contract,
             )
         except RuntimeHostError as error:
+            self._append_task_frame_cycle(
+                run, frame_id, origin_anchor_ref, "FAILED",
+                detail={"error_code": error.code},
+            )
             raise UniverseError(
                 "PERSONA_AUTOMATION_PROVIDER_FAILED",
                 f"{error.code}: {error.detail}",
@@ -34216,6 +34485,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             ) from error
         structured = provider_result.get("structured_result")
         if not isinstance(structured, Mapping):
+            self._append_task_frame_cycle(
+                run, frame_id, origin_anchor_ref, "FAILED",
+                detail={"error_code": "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID"},
+            )
             raise UniverseError(
                 "PERSONA_AUTOMATION_PROVIDER_RESULT_INVALID",
                 "Task Frame Host returned no structured provider result",
@@ -34223,6 +34496,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         receipt = str(provider_result.get("result_receipt_ref") or "").strip()
         if not receipt:
+            self._append_task_frame_cycle(
+                run, frame_id, origin_anchor_ref, "FAILED",
+                detail={"error_code": "PERSONA_AUTOMATION_PROVIDER_RECEIPT_MISSING"},
+            )
             raise UniverseError(
                 "PERSONA_AUTOMATION_PROVIDER_RECEIPT_MISSING",
                 "Task Frame Host returned no provider receipt",
@@ -34296,6 +34573,19 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 f"{error.code}: {error.detail}",
                 HTTPStatus.CONFLICT,
             ) from error
+        self._append_task_frame_cycle(
+            run,
+            frame_id,
+            origin_anchor_ref,
+            "COMPLETED",
+            result_ref=provider_result_ref,
+            result_digest=_json_sha256(dict(structured)),
+            detail={
+                "role": normalized_role,
+                "dispatch_id": dispatch_id,
+                "result_receipt_ref": receipt,
+            },
+        )
         evidence_refs.append(f"task-frame-result:{provider_result_ref}")
         provider_evidence["task_frame_result_ref"] = provider_result_ref
         if normalized_role == "IMPLEMENTER":
@@ -36301,6 +36591,194 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             )
         return record_control(run_id, driver_key=driver_key, control=control)
 
+    def _persona_automation_driver_loop(self) -> None:
+        # The server owns only the run gate (start/pause/stop).  Progress is
+        # driven from the observed Host turn state, independently of any
+        # request, so an idle node Master is advanced without an operator.
+        while not self._supervisor_maintenance_stop.wait(10.0):
+            try:
+                self._persona_automation_driver_last_run = (
+                    self.run_persona_automation_driver_once()
+                )
+            except Exception as error:  # noqa: BLE001 - the loop must survive
+                self._persona_automation_driver_last_run = {
+                    "status": "DRIVER_FAILED",
+                    "error_code": type(error).__name__,
+                    "detail": str(error),
+                    "observed_at": utc_now(),
+                }
+
+    def run_persona_automation_driver_once(self) -> dict[str, Any]:
+        """Advance every RUNNING node run whose Master Host turn is idle.
+
+        A control turn is sent at most once per run revision: any Master action
+        bumps the revision, so an idle Master that did nothing is not nudged
+        again (no empty-queue kicks).  Every skip carries its reason.
+        """
+
+        results: list[dict[str, Any]] = []
+        candidates = [
+            (run, True) for run in self.persona_automation.list_active_node_runs()
+        ] + [
+            (run, False) for run in self.persona_automation.list_waiting_node_runs()
+        ]
+        for run, allow_auto in candidates:
+            run_id = str(run.get("run_id") or "")
+            try:
+                results.append(self._drive_persona_automation_run(run, allow_auto=allow_auto))
+            except (UniverseError, PersonaAutomationError, SessionBusError, TerminalHostError) as error:
+                results.append({
+                    "run_id": run_id,
+                    "status": "DRIVER_ERROR",
+                    "code": getattr(error, "code", type(error).__name__),
+                    "detail": str(error),
+                })
+        return {
+            "schema": "universe.persona-automation-driver.v1",
+            "status": "DRIVER_OBSERVED",
+            "observed_at": utc_now(),
+            "runs": results,
+        }
+
+    def _drive_persona_automation_run(
+        self, run: Mapping[str, Any], *, allow_auto: bool = True
+    ) -> dict[str, Any]:
+        run_id = str(run.get("run_id") or "").strip()
+        project_id = str(run.get("project_id") or "").strip()
+        node_ref = str(run.get("node_ref") or "").strip()
+        anchor = str(run.get("session_anchor_ref") or "").strip()
+        revision = int(run.get("revision") or 0)
+
+        def skip(reason: str) -> dict[str, Any]:
+            return {"run_id": run_id, "status": "DRIVER_SKIPPED", "reason": reason}
+
+        assignment = self.store.read_persona_assignment(anchor)
+        if (
+            not isinstance(assignment, Mapping)
+            or str(assignment.get("state") or "").upper() != "ACTIVE"
+            or str(assignment.get("node_ref") or "").strip() != node_ref
+        ):
+            return skip("RUN_ANCHOR_NOT_CURRENT_NODE_OWNER")
+        host = self._session_anchor_terminal_host()
+        terminal = host.find_live(project_id=project_id, mode="MASTER", session_anchor_ref=anchor)
+        terminal_id = str((terminal or {}).get("terminal_id") or "").strip()
+        if not terminal_id:
+            return skip("MASTER_TERMINAL_NOT_LIVE")
+        attach_check = getattr(host, "cli_attach_sealed", None)
+        if callable(attach_check) and not bool(attach_check(terminal_id)):
+            return skip("MASTER_ATTACH_NOT_SEALED")
+        turn = terminal.get("host_turn_state")
+        turn_state = str((turn or {}).get("state") or "").upper() if isinstance(turn, Mapping) else ""
+        provider = str(terminal.get("provider") or "").strip().upper()
+        # INPUT_ACTIVE is "no turn running, an operator draft is in the TUI"
+        # (a fresh session stays there until its first prompt).  STOPPING is
+        # the Stop hook: the model finished its turn, and Claude has no later
+        # IDLE hook, so it is the resting state after every turn.  A Claude
+        # Channel message is not typed into the PTY, so neither state can
+        # clobber a draft; PTY-typed providers still need a true IDLE.
+        # Anything else, including an unreported state, is treated as
+        # possibly mid-turn.
+        idle_states = (
+            {"IDLE", "INPUT_ACTIVE", "STOPPING"} if provider == "CLAUDE" else {"IDLE"}
+        )
+        if turn_state not in idle_states:
+            return skip(f"MASTER_TURN_{turn_state or 'UNKNOWN'}")
+
+        def delivered(key: str) -> bool:
+            return self.session_bus.find_message_by_idempotency(
+                idempotency_key=f"persona-control:{run_id}:{key}",
+                recipient_anchor_ref=anchor,
+            ) is not None
+
+        # A control receipt the server recorded (start, retry, Reviewer PASS)
+        # is owed a delivery first.  Otherwise a RUNNING run gets one nudge per
+        # revision; a WAITING run is never nudged without such a receipt.
+        latest_receipt = self.persona_automation.latest_driver_control_key(run_id)
+        receipt_pending = bool(latest_receipt) and not delivered(latest_receipt)
+        if receipt_pending:
+            driver_key = latest_receipt
+        elif allow_auto:
+            driver_key = f"auto-r{revision}"
+            if delivered(driver_key) or self.persona_automation.driver_control_recorded(
+                run_id, driver_key
+            ):
+                return skip("CONTROL_ALREADY_SENT_FOR_REVISION")
+        else:
+            return skip("WAITING_NO_PENDING_CONTROL")
+        idempotency_key = f"persona-control:{run_id}:{driver_key}"
+        short_id = node_ref.removeprefix("feature_")[:8]
+        body_text = "\n".join([
+            "Persona automation node control turn.",
+            f"run_id: {run_id}",
+            f"node_ref: {node_ref} (#{short_id})",
+            f"run_revision: {revision}",
+            f"run_state: {str(run.get('state') or '')}",
+            f"next_condition: {str(run.get('next_condition') or '<none>')}",
+            "",
+            "You are the node Master for this node. Read persona.automation.status for this run, "
+            "then act on its next_condition with the typed persona.automation.* Actions through "
+            "the Action IR CLI (tick, plan, dispatch, master-result, or complete once a Reviewer "
+            "PASS is recorded). Stop at the next review gate and report the result. "
+            "Completing the run does NOT close the Todo: after complete, if the Reviewer PASS "
+            "shows the Todo's completion condition is met, close that exact Todo with todo.read "
+            "(current revision) then todo.state {state: DONE, project_id, todo_id, "
+            "expected_revision, request_id, validation: {status: PASSED, evidence_ref: the review "
+            "or result ref}}. If the Todo is not actually finished or was already done, do not "
+            "re-run it. "
+            "Never leave the run RUNNING while idle. If you cannot or should not advance it "
+            "(for example plan re-selects an already-verified Todo, or an operator decision is "
+            "needed), record that state with persona.automation.decide {run_id, owner_ref: your "
+            "own session anchor ref (the same owner_ref as tick), decision_id: a new unique id, "
+            "kind: ESCALATE when an operator must decide or WAIT for a plain wait, rationale, "
+            "evidence_refs, next_condition: the exact decision or event you are waiting for}. "
+            "That moves the run to WAITING and shows the reason in Fleet. If your tick lease "
+            "(90s) expired, call tick again first. Also say it in your report. "
+            "Do not edit source files directly; use the Worker/Reviewer route for that.",
+        ])
+        posted = self.session_bus.post(
+            host,
+            {
+                "to": {
+                    "project_id": project_id, "mode": "MASTER",
+                    "provider": provider,
+                    "terminal_id": terminal_id, "session_anchor_ref": anchor,
+                    "node_ref": node_ref,
+                },
+                "from": {
+                    "project_id": project_id, "mode": "MASTER", "provider": "UNIVERSE",
+                    "session_anchor_ref": anchor, "node_ref": node_ref,
+                },
+                "kind": "INSTRUCTION",
+                "protocol": "WORK",
+                "notify": "NONE",
+                "thread_id": f"persona-{run_id}-master",
+                "idempotency_key": idempotency_key,
+                "body_text": body_text,
+            },
+        )
+        dispatches = self._dispatch_live_posted_session_instructions(posted)
+        # The nudge ledger is keyed by run revision.  Delivering an owed
+        # receipt also covers the current revision, so the same idle turn is
+        # not nudged a second time.
+        nudge_key = f"auto-r{revision}"
+        self.persona_automation.record_driver_control(
+            run_id,
+            driver_key=nudge_key,
+            control={
+                "control_id": f"persona-control:{run_id}:{nudge_key}",
+                "target_session_anchor_ref": anchor,
+                "node_ref": node_ref,
+                "next_actions": [
+                    "persona.automation.tick", "persona.automation.plan",
+                    "persona.automation.dispatch", "persona.automation.master-result",
+                ],
+            },
+        )
+        return {
+            "run_id": run_id, "status": "DRIVER_CONTROL_POSTED",
+            "revision": revision, "dispatches": dispatches,
+        }
+
     def _persona_automation_node_has_executable_todo(
         self, project_id: str, node_ref: str
     ) -> bool:
@@ -36313,6 +36791,54 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             and str(todo.get("state") or "").upper() in {"READY", "IN_PROGRESS"}
             for todo in self.store.list_todos()
         )
+
+    _CONTINUATION_SAME_TODO_LIMIT = 2
+
+    def _persona_automation_continuation_stalled(
+        self, completed_run: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Detect a chain that keeps completing runs on one unfinished Todo.
+
+        A completed run only closes the automation assignment; the Todo stays
+        READY/IN_PROGRESS until the Master closes it.  If that never happens,
+        auto-continuation would start a new run on the same Todo forever, each
+        burning a Master and a Reviewer turn.  Stop after
+        ``_CONTINUATION_SAME_TODO_LIMIT`` consecutive completed runs on the
+        same, still-open Todo and leave the decision to an operator.
+        """
+
+        project_id = str(completed_run.get("project_id") or "").strip()
+        node_ref = str(completed_run.get("node_ref") or "").strip()
+        assignment = completed_run.get("current_assignment")
+        todo_id = (
+            str(assignment.get("todo_id") or "").strip()
+            if isinstance(assignment, Mapping)
+            else ""
+        )
+        if not project_id or not node_ref or not todo_id:
+            return None
+        recent = self.persona_automation.recent_completed_todo_ids(
+            project_id, node_ref, self._CONTINUATION_SAME_TODO_LIMIT
+        )
+        if len(recent) < self._CONTINUATION_SAME_TODO_LIMIT or any(
+            item != todo_id for item in recent
+        ):
+            return None
+        try:
+            todo = self.store.get_todo(todo_id)
+        except Exception:  # noqa: BLE001 - a missing Todo cannot be re-run either
+            return None
+        if str(todo.get("state") or "").upper() not in {"READY", "IN_PROGRESS"}:
+            return None
+        return {
+            "status": "PERSONA_AUTOMATION_CONTINUATION_STALLED",
+            "todo_id": todo_id,
+            "todo_state": todo.get("state"),
+            "reason": (
+                f"the last {self._CONTINUATION_SAME_TODO_LIMIT} completed runs all ran "
+                "this Todo and it is still open; close, block or reprioritise it"
+            ),
+        }
 
     def _continue_persona_automation_if_work_remains(
         self, completed_run: Mapping[str, Any]
@@ -36334,6 +36860,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return {"status": "PERSONA_AUTOMATION_CONTINUATION_NOT_APPLICABLE"}
         if not self._persona_automation_node_has_executable_todo(project_id, node_ref):
             return {"status": "PERSONA_AUTOMATION_CONTINUATION_NO_EXECUTABLE_TODO"}
+        stalled = self._persona_automation_continuation_stalled(completed_run)
+        if stalled is not None:
+            try:
+                self.persona_automation.record_continuation_stalled(
+                    str(completed_run.get("run_id") or ""), str(stalled["todo_id"])
+                )
+            except PersonaAutomationError:
+                pass
+            return stalled
         request_id = f"persona-automation-auto-continue:{completed_run.get('run_id')}:r{completed_run.get('revision')}"
         start_request: dict[str, Any] = {
             "project_id": project_id,
@@ -36412,6 +36947,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             # use it only with the exact project/node boundary, never a Todo
             # text scan or heuristic.  This keeps an unresolved remediation
             # Todo actionable after an exhausted Master is replaced.
+            #
+            # run_node_ref is "" for a project-wide CONDUCTOR run, and the
+            # `not run_node_ref` escape hatch below used to treat that as "no
+            # node filter" -- matching the first PERSONA_REVIEW_FOLLOWUP_TODO_
+            # CREATED event found for the project, from ANY node. A brand-new
+            # Conductor run with no review of its own would then inherit an
+            # unrelated node Master's still-open follow-up Todo and get
+            # blocked from pause/stop by it (2026-09-19 finding). The exact
+            # boundary this comment already asks for is a straight equality
+            # check: a project-wide run matches only a project-wide event.
             project_events = getattr(self.store, "list_events", None)
             run_node_ref = str(run.get("node_ref") or "").strip()
             if callable(project_events):
@@ -36421,10 +36966,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         for event in project_events(str(run.get("project_id") or ""), 500)
                         if event.get("event_type") == "PERSONA_REVIEW_FOLLOWUP_TODO_CREATED"
                         and isinstance(event.get("payload"), Mapping)
-                        and (
-                            not run_node_ref
-                            or str(event["payload"].get("node_ref") or "") == run_node_ref
-                        )
+                        and str(event["payload"].get("node_ref") or "").strip() == run_node_ref
                     ),
                     None,
                 )
@@ -36823,10 +37365,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     result = self._annotate_persona_automation_owner_availability(result)
                     return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_STATUS_COLLECTED", "run": result}
                 if value.get("project_id"):
+                    # Only forward node_ref when the caller actually sent the
+                    # field -- an explicit null must reach surface() as an
+                    # explicit "project-wide only" filter, while an omitted
+                    # field must keep applying no node_ref filter at all (the
+                    # two collapse to the same value.get() result otherwise).
+                    node_ref_kwargs = {"node_ref": value["node_ref"]} if "node_ref" in value else {}
                     surfaced = self.persona_automation.surface(
                         _identifier(value["project_id"], "project_id"),
-                        node_ref=value.get("node_ref"),
                         session_anchor_ref=value.get("session_anchor_ref"),
+                        **node_ref_kwargs,
                     )
                     surfaced["run"] = self._annotate_persona_automation_owner_availability(
                         surfaced.get("run")
@@ -37878,6 +38426,33 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "TODO_ARCHIVED",
             "action_id": TODO_ARCHIVE_ACTION_ID,
             "todo": todo,
+        }
+
+    def _handle_todo_redo_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """todo.redo: start a Todo over as a fresh READY copy; archive the original."""
+
+        action = _exact_object_fields(
+            request,
+            field="todo_redo_action",
+            required=frozenset({"todo_id", "expected_revision", "request_id"}),
+            optional=frozenset({"reason"}),
+        )
+        todo_id = _identifier(action["todo_id"], "todo_id")
+        payload = {
+            "expected_revision": action["expected_revision"],
+            "request_id": action["request_id"],
+        }
+        if "reason" in action:
+            payload["reason"] = action["reason"]
+        outcome = self.store.redo_todo(todo_id, payload)
+        return {
+            "schema": self.action_registry.lookup(TODO_REDO_ACTION_ID).result_schema_ref,
+            "status": "TODO_REDO_REPLAYED" if outcome["replayed"] else "TODO_REDONE",
+            "action_id": TODO_REDO_ACTION_ID,
+            "source_todo": outcome["source_todo"],
+            "todo": outcome["todo"],
         }
 
     def _handle_todo_restore_action(

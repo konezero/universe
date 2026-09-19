@@ -535,6 +535,23 @@ class SessionSupervisorStore:
                 connection.execute(
                     "ALTER TABLE session_record ADD COLUMN session_anchor_ref TEXT"
                 )
+            # The Mode Anchor references its Session Anchors; these two columns
+            # point at the newest event of that Session Anchor's own Task Frame
+            # lineage (a position marker, not a copy of the history).
+            mode_session_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(project_mode_anchor_session)"
+                )
+            }
+            for name, definition in (
+                ("last_lineage_revision", "INTEGER"),
+                ("last_lineage_at", "TEXT"),
+            ):
+                if name not in mode_session_columns:
+                    connection.execute(
+                        f"ALTER TABLE project_mode_anchor_session ADD COLUMN {name} {definition}"
+                    )
             lease_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(process_lease)")
@@ -2773,6 +2790,51 @@ class SessionSupervisorStore:
             for row in rows
         ]
 
+    def record_session_anchor_position(
+        self, session_anchor_ref: str, *, revision: int, observed_at: str
+    ) -> bool:
+        """Point the Mode Anchor's reference at its Session Anchor's newest record.
+
+        The Mode Anchor references its Session Anchors and keeps no copy of their
+        history.  ``revision`` is the ordinal of the newest record the Session
+        Anchor appended to its own store; the marker only ever moves forward, and
+        the Mode Anchor's ``updated_at`` advances with it.  Returns whether any
+        Mode Anchor references this Session Anchor.
+        """
+
+        anchor = _required_text(session_anchor_ref, "session_anchor_ref")
+        if type(revision) is not int or revision < 1:
+            raise SessionSupervisorError(
+                "SESSION_ANCHOR_POSITION_INVALID", "revision must be a positive integer"
+            )
+        at = _required_text(observed_at, "observed_at")
+        with self._connection(immediate=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE project_mode_anchor_session
+                SET last_lineage_revision = ?, last_lineage_at = ?
+                WHERE session_anchor_ref = ?
+                  AND (last_lineage_revision IS NULL OR last_lineage_revision < ?)
+                """,
+                (revision, at, anchor, revision),
+            )
+            referenced = connection.execute(
+                "SELECT 1 FROM project_mode_anchor_session WHERE session_anchor_ref = ? LIMIT 1",
+                (anchor,),
+            ).fetchone() is not None
+            if cursor.rowcount:
+                connection.execute(
+                    """
+                    UPDATE project_mode_anchor SET updated_at = ?
+                    WHERE (project_id, mode) IN (
+                        SELECT project_id, mode FROM project_mode_anchor_session
+                        WHERE session_anchor_ref = ?
+                    )
+                    """,
+                    (at, anchor),
+                )
+        return referenced
+
     def get_project_mode_anchor(self, project_id: str, mode: str) -> dict[str, Any]:
         """Return the append-only Session Anchor lineage for one Project/Mode."""
 
@@ -2794,7 +2856,8 @@ class SessionSupervisorStore:
                 )
             attachments = connection.execute(
                 """
-                SELECT revision, session_anchor_ref, session_id, attached_at
+                SELECT revision, session_anchor_ref, session_id, attached_at,
+                       last_lineage_revision, last_lineage_at
                 FROM project_mode_anchor_session
                 WHERE project_id = ? AND mode = ? ORDER BY revision
                 """,
@@ -2812,6 +2875,8 @@ class SessionSupervisorStore:
                     "session_anchor_ref": item["session_anchor_ref"],
                     "session_id": item["session_id"],
                     "attached_at": item["attached_at"],
+                    "last_lineage_revision": item["last_lineage_revision"],
+                    "last_lineage_at": item["last_lineage_at"],
                 }
                 for item in attachments
             ],

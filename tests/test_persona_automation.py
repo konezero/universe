@@ -1453,6 +1453,113 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
         })
         self.assertEqual(200, status, stopped)
 
+    def test_fresh_conductor_run_is_not_blocked_by_an_unrelated_nodes_followup(self):
+        """A project-wide run's empty own-history must not "inherit" a
+        followup from an unrelated node Master's review (2026-09-19 finding:
+        _pending_persona_review_followup's project-events fallback matched
+        the first PERSONA_REVIEW_FOLLOWUP_TODO_CREATED event in the whole
+        project whenever the checking run's own node_ref was empty -- which
+        is every CONDUCTOR run -- so a brand-new Conductor run with no review
+        of its own could be blocked from pause/stop by a node Master's
+        completely unrelated open follow-up Todo)."""
+        node_material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-followup-leak-node-master",
+            "node": "TEST", "mode": "MASTER", "provider": "CODEX",
+        })
+        node_anchor = node_material["session_anchor_ref"]
+        node_ref, _ = self.server.store.create_feature_node("TEST", {
+            "idempotency_key": "followup-leak-node", "title": "followup-leak-node",
+            "intent_text": "테스트용 노드", "created_by_role": "USER",
+        })
+        node_ref = node_ref["feature_id"]
+        status, node_persona_result = self.act("persona.create", {
+            "title": "node followup lead", "body": "담당 노드 범위 안의 작업만 다룬다.",
+        })
+        self.assertEqual(200, status, node_persona_result)
+        node_persona = node_persona_result["persona"]
+        status, node_assignment = self.act("persona.assign", {
+            "session_anchor_ref": node_anchor, "project_id": "TEST",
+            "persona_id": node_persona["persona_id"],
+            "expected_persona_revision": node_persona["revision"],
+            "expected_assignment_revision": 0, "node_ref": node_ref,
+        })
+        self.assertEqual(200, status, node_assignment)
+        source = self.server.store.create_todo({
+            "scope_kind": "NODE", "project_id": "TEST", "node_ref": node_ref,
+            "title": "Node source Todo for followup leak test", "detail": "source",
+            "priority": "P0", "state": "IN_PROGRESS", "source_kind": "MASTER",
+            "sort_order": 43,
+        })
+        status, node_started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": node_anchor,
+            "scope": f"node bounded {node_ref}", "instruction": "review one Todo",
+        })
+        self.assertEqual(201, status, node_started)
+        node_run = node_started["run"]
+        status, _ = self.act("persona.automation.tick", {
+            "run_id": node_run["run_id"], "owner_ref": node_anchor, "tick_id": "leak-tick",
+        })
+        self.assertEqual(200, status)
+        status, _ = self.act("persona.automation.decide", {
+            "run_id": node_run["run_id"], "owner_ref": node_anchor,
+            "decision_id": "leak-decision", "kind": "EXECUTE",
+            "rationale": "the source Todo is in scope", "evidence_refs": ["test:source"],
+            "target": {"todo_id": source["todo_id"]},
+        })
+        self.assertEqual(200, status)
+        status, node_dispatched = self.act("persona.automation.dispatch", {
+            "run_id": node_run["run_id"], "owner_ref": node_anchor,
+            "dispatch_id": "leak-dispatch", "title": "review source Todo",
+            "instruction": "inspect source", "completion_conditions": ["review evidence"],
+        })
+        self.assertEqual(201, status, node_dispatched)
+        status, node_reviewed = self.act("persona.automation.review", {
+            "run_id": node_run["run_id"], "result_ref": "leak-result",
+            "outcome": "NEEDS_REVISION", "evidence_refs": ["test:review"],
+            "next_action": "Add the missing regression coverage.",
+            "dispatch_id": node_dispatched["dispatch"]["dispatch_id"],
+            "assignment_revision": node_dispatched["dispatch"]["assignment_revision"],
+            "source_message_id": node_dispatched["dispatch"]["message_id"],
+        })
+        self.assertEqual(200, status, node_reviewed)
+        self.assertTrue(node_reviewed["followup"]["todo_created"])
+        self.assertEqual("READY", node_reviewed["followup"]["todo"]["state"])
+
+        conductor_material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-followup-leak-conductor",
+            "node": "TEST", "mode": "CONDUCTOR", "provider": "CODEX",
+        })
+        conductor_anchor = conductor_material["session_anchor_ref"]
+        status, conductor_persona_result = self.act("persona.create", {
+            "title": "conductor followup-leak lead", "body": "프로젝트 전체를 관리한다.",
+        })
+        self.assertEqual(200, status, conductor_persona_result)
+        conductor_persona = conductor_persona_result["persona"]
+        status, conductor_assignment = self.act("persona.assign", {
+            "session_anchor_ref": conductor_anchor, "project_id": "TEST",
+            "persona_id": conductor_persona["persona_id"],
+            "expected_persona_revision": conductor_persona["revision"],
+            "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, conductor_assignment)
+        status, conductor_started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": conductor_anchor,
+            "scope": "project-wide facilitation", "instruction": "keep the backlog aligned",
+        })
+        self.assertEqual(201, status, conductor_started)
+        conductor_run = conductor_started["run"]
+
+        status, paused = self.act("persona.automation.pause", {
+            "run_id": conductor_run["run_id"], "reason": "should not be blocked by another node",
+        })
+        self.assertEqual(200, status, paused)
+        self.assertEqual("PAUSED", paused["run"]["state"])
+        status, stopped = self.act("persona.automation.stop", {
+            "run_id": conductor_run["run_id"], "reason": "should not be blocked by another node",
+        })
+        self.assertEqual(200, status, stopped)
+        self.assertEqual("STOPPED", stopped["run"]["state"])
+
     def test_non_passing_review_uses_nested_assignment_todo_target(self):
         """Node planner targets keep the exact Todo under assignment."""
         material, _ = self.server.session_supervisor.register_session({
