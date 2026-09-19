@@ -4735,6 +4735,20 @@ function renderFleetBoard() {
 // Nodes for the home column: every FEATURE node (proposed or adopted) plus any
 // other graph node a todo actually points at. Todos attach via node_ref, and
 // features carry the bare id while the graph node is "feat:<id>".
+// Short, stable handle for a node so operators can refer to it in
+// conversation ("#87a4bcc4"); titles alone are ambiguous or truncated.
+function homeNodeShortId(nodeId) {
+  const ref = homeNodeRefKey(nodeId);
+  const hex = ref.replace(/^feature_/, "");
+  return hex ? `#${hex.slice(0, 8)}` : "";
+}
+
+function homeNodeTitleWithId(graphNode) {
+  const title = graphNode?.title || graphNode?.node_id || "";
+  const shortId = homeNodeShortId(graphNode?.node_id);
+  return shortId ? `${title} ${shortId}` : title;
+}
+
 function homeNodeRefKey(nodeId) {
   const id = String(nodeId || "");
   return id.startsWith("feat:") ? id.slice(5) : id;
@@ -5312,7 +5326,13 @@ function fleetProjectConductorTerminals(projectId) {
     String(terminal.session_anchor_ref || "").trim()
   );
   const live = all.filter(fleetProjectConductorTerminalIsLive);
-  return { status: live.length > 1 ? "ERROR" : "READY", error: "", live, all };
+  // Multiple live Conductor terminals is an expected, supported state during
+  // a handoff (the old owner and the incoming session are both live at
+  // once) -- the explicit session select below is exactly what disambiguates
+  // it. Treating it as ERROR blocked the very action meant to resolve it
+  // (2026-09-19 finding: assign button stayed disabled whenever a second
+  // Conductor came up, so a handoff away from the first one was impossible).
+  return { status: "READY", error: "", live, all };
 }
 
 function fleetProjectConductorProjection(projectId) {
@@ -5340,7 +5360,17 @@ function fleetProjectConductorProjection(projectId) {
 }
 
 function fleetProjectConductorRequestId(operation) {
-  return `fleet-project-conductor:${String(state.selectedProject?.project_id || "")}:${operation}:${crypto.randomUUID()}`;
+  // persona.assign/persona.unassign enforce request_id as exactly
+  // [A-Za-z0-9_-]{8,100} server-side (tools/universe_server.py
+  // _persona_idempotent) -- the ':'-delimited form here always failed that
+  // check with PERSONA_REQUEST_INVALID (2026-09-19 finding: this is what
+  // actually blocked every Conductor assign/handoff/unassign click, even
+  // after the live-terminal-count and dead-owner-cleanup fixes). The
+  // operation name and UUID alone are enough for a readable, unique,
+  // request_id; project_id is dropped so an unusual project_id can never
+  // reintroduce an invalid character here.
+  const safeOperation = String(operation || "").replace(/[^A-Za-z0-9_-]/g, "-");
+  return `fleet-project-conductor-${safeOperation}-${crypto.randomUUID()}`;
 }
 
 function fleetProjectConductorActivePersona(personaId) {
@@ -5557,8 +5587,8 @@ function renderFleetConductorDialogContent(projectId) {
     hostLine.classList.add("is-unknown");
     hostLine.textContent = `${terminalStatus}: loading authoritative Conductor Host projection...`;
   } else if (live.length > 1) {
-    hostLine.classList.add("is-error");
-    hostLine.textContent = `ERROR: MULTIPLE_LIVE_CONDUCTORS (${live.map((item) => item.session_anchor_ref).join(", ")})`;
+    hostLine.classList.add("is-unknown");
+    hostLine.textContent = `Live Conductor Anchors: ${live.length} live (pick one below to assign/hand off) - ${live.map((item) => item.session_anchor_ref).join(", ")}`;
   } else if (live.length === 1) {
     hostLine.textContent = `Live Conductor Anchor: LIVE / ${live[0].session_anchor_ref}`;
   } else {
@@ -5602,23 +5632,33 @@ function renderFleetConductorDialogContent(projectId) {
   // being hard-blocked whenever more than one exists (2026-09-17).
   const sessionSelect = document.createElement("select");
   sessionSelect.setAttribute("aria-label", "Conductor session");
+  const draft = fleetNodeBindDraft("__project_conductor__");
+  const draftSessionValid = live.some((terminal) => terminal.session_anchor_ref === draft.session);
   for (const terminal of live) {
     const option = document.createElement("option");
     option.value = terminal.session_anchor_ref;
-    option.textContent = fleetTerminalLabel(terminal);
-    if (assignment && terminal.session_anchor_ref === assignment.session_anchor_ref) option.selected = true;
+    option.textContent = `${fleetTerminalLabel(terminal)} — ${fleetSessionBindingLabel(terminal.session_anchor_ref)}`;
+    const preferred = draftSessionValid
+      ? terminal.session_anchor_ref === draft.session
+      : Boolean(assignment && terminal.session_anchor_ref === assignment.session_anchor_ref);
+    if (preferred) option.selected = true;
     sessionSelect.append(option);
   }
+  sessionSelect.addEventListener("change", () => { draft.session = sessionSelect.value; });
   if (!live.length) controls.append(node("span", "fleet-project-conductor-status is-unknown", "UNKNOWN: no live Conductor session"));
   const personaSelect = document.createElement("select");
   personaSelect.setAttribute("aria-label", "Project Conductor Persona");
+  const draftPersonaValid = activePersonas.some((item) => item.persona_id === draft.persona);
   for (const item of activePersonas) {
     const option = document.createElement("option");
     option.value = item.persona_id;
     option.textContent = `${item.title || item.persona_id} (rev ${item.revision})`;
-    if (assignment && String(assignment.persona_id || "") === String(item.persona_id || "")) option.selected = true;
+    if (draftPersonaValid
+      ? draft.persona === item.persona_id
+      : Boolean(assignment && String(assignment.persona_id || "") === String(item.persona_id || ""))) option.selected = true;
     personaSelect.append(option);
   }
+  personaSelect.addEventListener("change", () => { draft.persona = personaSelect.value; });
   if (state.personaLibraryStatus !== "READY") {
     controls.append(node("span", "fleet-project-conductor-status is-unknown", `${state.personaLibraryStatus || "UNKNOWN"}: active Persona library unavailable`));
   } else if (!activePersonas.length) {
@@ -5630,6 +5670,7 @@ function renderFleetConductorDialogContent(projectId) {
   assign.addEventListener("click", () => {
     assign.disabled = true;
     assignFleetProjectConductorPersona(personaSelect.value, sessionSelect.value)
+      .then(() => { delete draft.session; delete draft.persona; })
       .catch((error) => toast(error.message, true))
       .finally(() => { assign.disabled = false; });
   });
@@ -5704,8 +5745,12 @@ async function ensureFleetAutomation(featureId, owner) {
   if (existing && existing.projectId === projectId && existing.anchor === anchor && ["READY", "LOADING"].includes(existing.status)) return;
   state.fleetAutomationByNode[featureId] = { projectId, anchor, status: "LOADING", run: null, error: "" };
   try {
+    // Keyed by the node alone: the server allows one active run per
+    // (project, node) regardless of which Anchor started it, so filtering by
+    // the current owner's Anchor hid a run left by a previous Master (e.g.
+    // after switching Codex -> Claude) and Start then failed with 409.
     const result = await invokeServerAction("persona.automation.status", {
-      project_id: projectId, node_ref: featureId, session_anchor_ref: anchor,
+      project_id: projectId, node_ref: featureId,
     });
     state.fleetAutomationByNode[featureId] = {
       projectId, anchor, status: "READY", run: result.run || result.last_run || null, error: "",
@@ -5775,6 +5820,11 @@ function renderFleetAutomationControls(featureId, owner) {
     wrap.append(node("p", "fleet-node-team-status", `Reviewer: ${reviewer.state || "PENDING"} - ${reviewerAssignment.session_anchor_ref || "UNKNOWN"}${verdict.outcome ? ` - ${verdict.outcome}` : ""}`));
   }
   wrap.append(node("p", "fleet-node-team-status", `Automation: ${stateLabel}${run?.next_condition ? ` · next ${run.next_condition}` : ""}`));
+  const runAnchor = String(run?.session_anchor_ref || "").trim();
+  if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel) && runAnchor && runAnchor !== String(owner.session_anchor_ref || "").trim()) {
+    wrap.append(node("p", "fleet-node-team-status is-unknown",
+      `Run owned by a previous Anchor ${runAnchor}${run.owner_availability ? ` (${run.owner_availability})` : ""} — Stop it to start a run under the current Master.`));
+  }
   if (run?.current_review) wrap.append(node("p", "fleet-node-team-status", `Review: ${run.current_review.outcome || "PENDING"} · ${run.current_review.acceptance_status || "NOT_RUN"}`));
   const controls = node("div", "fleet-node-team-controls");
   const button = (label, op, disabled = false) => {
@@ -6231,7 +6281,7 @@ function openFleetNodeTeamDialog(graphNode) {
   const featureId = homeNodeRefKey(graphNode.node_id);
   state.openFleetNodeTeamFeatureId = featureId;
   const title = document.querySelector("#fleet-node-team-dialog-title");
-  if (title) title.textContent = graphNode.title || featureId;
+  if (title) title.textContent = homeNodeTitleWithId(graphNode) || featureId;
   renderFleetNodeTeamDialogBody(graphNode);
   const dialog = document.querySelector("#fleet-node-team-dialog");
   if (dialog && !dialog.open) dialog.showModal();
@@ -6287,6 +6337,35 @@ function renderFleetNodeTeamSummary(graphNode) {
   return section;
 }
 
+// Where a session's Persona is currently bound: the ACTIVE assignment row for
+// its Anchor, resolved to the node title. A Master with an ACTIVE assignment
+// but no node_ref is project-wide (Conductor-style), not "unbound".
+function fleetSessionBindingLabel(sessionAnchorRef) {
+  const anchor = String(sessionAnchorRef || "").trim();
+  const rows = fleetAssignmentRows();
+  if (!rows) return "binding unknown";
+  const active = rows.filter((item) =>
+    String(item.session_anchor_ref || "").trim() === anchor &&
+    String(item.state || "").toUpperCase() === "ACTIVE"
+  );
+  if (!active.length) return "unbound";
+  const labels = active.map((item) => {
+    const ref = String(item.node_ref || "").trim();
+    if (!ref) return "project-wide";
+    const graphNode = homeNodes().find((n) => homeNodeRefKey(n.node_id) === ref);
+    return graphNode ? homeNodeTitleWithId(graphNode) : ref;
+  });
+  return `bound: ${[...new Set(labels)].join(", ")}`;
+}
+
+// The Manage dialog body is rebuilt on every refresh, which reset both
+// selects to the current owner a moment after the operator picked another
+// session. The pick is kept per node until it is applied or no longer valid.
+function fleetNodeBindDraft(featureId) {
+  state.fleetNodeBindDraftByNode = state.fleetNodeBindDraftByNode || {};
+  return (state.fleetNodeBindDraftByNode[featureId] = state.fleetNodeBindDraftByNode[featureId] || {});
+}
+
 function renderFleetNodeTeamDialogContent(graphNode) {
   const featureId = homeNodeRefKey(graphNode.node_id);
   const section = node("div", "fleet-node-team-detail");
@@ -6323,23 +6402,31 @@ function renderFleetNodeTeamDialogContent(graphNode) {
   const activePersonas = (state.personaLibrary || []).filter((item) => String(item.state || "").toUpperCase() === "ACTIVE");
   const sessionSelect = document.createElement("select");
   sessionSelect.setAttribute("aria-label", "Existing Master session");
+  const draft = fleetNodeBindDraft(featureId);
+  const draftSessionValid = liveMasters.some((terminal) => terminal.session_anchor_ref === draft.session);
   for (const terminal of liveMasters) {
     const option = document.createElement("option");
     option.value = terminal.session_anchor_ref;
-    option.textContent = fleetTerminalLabel(terminal);
-    if (owner && terminal.session_anchor_ref === owner.session_anchor_ref) option.selected = true;
+    option.textContent = `${fleetTerminalLabel(terminal)} — ${fleetSessionBindingLabel(terminal.session_anchor_ref)}`;
+    const preferred = draftSessionValid
+      ? terminal.session_anchor_ref === draft.session
+      : Boolean(owner && terminal.session_anchor_ref === owner.session_anchor_ref);
+    if (preferred) option.selected = true;
     sessionSelect.append(option);
   }
+  sessionSelect.addEventListener("change", () => { draft.session = sessionSelect.value; });
   if (!liveMasters.length) controls.append(node("span", "fleet-node-team-status is-unknown", "UNKNOWN: no live Master session"));
   const personaSelect = document.createElement("select");
   personaSelect.setAttribute("aria-label", "Persona for Master session");
+  const draftPersonaValid = activePersonas.some((item) => item.persona_id === draft.persona);
   for (const item of activePersonas) {
     const option = document.createElement("option");
     option.value = item.persona_id;
     option.textContent = `${item.title || item.persona_id} (rev ${item.revision})`;
-    if (persona?.persona_id === item.persona_id) option.selected = true;
+    if (draftPersonaValid ? draft.persona === item.persona_id : persona?.persona_id === item.persona_id) option.selected = true;
     personaSelect.append(option);
   }
+  personaSelect.addEventListener("change", () => { draft.persona = personaSelect.value; });
   if (!activePersonas.length) controls.append(node("span", "fleet-node-team-status is-unknown", "UNKNOWN: no active Persona"));
   const bindButton = node("button", "", "Bind existing session");
   bindButton.type = "button";
@@ -6347,6 +6434,7 @@ function renderFleetNodeTeamDialogContent(graphNode) {
   bindButton.addEventListener("click", () => {
     bindButton.disabled = true;
     bindFleetNodeMaster(featureId, sessionSelect.value, personaSelect.value)
+      .then(() => { delete draft.session; delete draft.persona; })
       .catch((error) => toast(error.message, true))
       .finally(() => { bindButton.disabled = false; });
   });
@@ -6737,7 +6825,7 @@ function renderHomeNodes(selNode) {
     const ownerRow = renderHomeNodeOwnerRow(graphNode);
     if (ownerRow) rows.push(ownerRow);
 
-    const card = homeCard(`node:${graphNode.node_id}`, graphNode.title || graphNode.node_id, {
+    const card = homeCard(`node:${graphNode.node_id}`, homeNodeTitleWithId(graphNode), {
       selected,
       blocked: blockedHere,
       unsel: true,
@@ -7897,12 +7985,28 @@ function loadProjectActivity(projectId) {
 async function loadPersonaProjectProjection(projectId, { includeArchived = true } = {}) {
   const normalizedProjectId = String(projectId || "").trim();
   if (!normalizedProjectId) return;
-  state.personaAssignmentsStatus = "LOADING";
+  // Re-reading the same project keeps the last READY projection visible until
+  // the new response lands; blanking it made every tab/Fleet owner flash
+  // UNKNOWN on each refresh. Only a project switch (or a non-READY prior read)
+  // drops to LOADING.
+  const sameProject = state.personaAssignmentsProjectId === normalizedProjectId;
+  const keepAssignments = sameProject &&
+    state.personaAssignmentsStatus === "READY" && Array.isArray(state.personaAssignments);
+  const keepLibrary = keepAssignments &&
+    state.personaLibraryStatus === "READY" && Array.isArray(state.personaLibrary);
+  const previousSignature = keepAssignments
+    ? JSON.stringify([state.personaAssignments, keepLibrary ? state.personaLibrary : null])
+    : null;
   state.personaAssignmentsError = "";
-  state.personaAssignments = null;
   state.personaAssignmentsProjectId = normalizedProjectId;
-  state.personaLibraryStatus = "LOADING";
-  state.personaLibrary = null;
+  if (!keepAssignments) {
+    state.personaAssignmentsStatus = "LOADING";
+    state.personaAssignments = null;
+  }
+  if (!keepLibrary) {
+    state.personaLibraryStatus = "LOADING";
+    state.personaLibrary = null;
+  }
   const [assignmentResult, libraryResult] = await Promise.allSettled([
     invokeServerAction("persona.assignments-list", { project_id: normalizedProjectId }),
     invokeServerAction("persona.list", { include_archived: includeArchived }),
@@ -7925,7 +8029,14 @@ async function loadPersonaProjectProjection(projectId, { includeArchived = true 
     state.personaLibraryStatus = "READY";
   } else {
     state.personaLibraryStatus = "ERROR";
+    state.personaLibrary = null;
   }
+  // Nothing observable changed: skip the full re-render.
+  const unchanged = previousSignature !== null &&
+    state.personaAssignmentsStatus === "READY" &&
+    state.personaLibraryStatus === "READY" &&
+    previousSignature === JSON.stringify([state.personaAssignments, state.personaLibrary]);
+  if (unchanged) return;
   if (String(state.selectedProject?.project_id || "") === normalizedProjectId) {
     if (typeof renderNodeModes === "function") renderNodeModes();
     if (typeof renderTerminalDock === "function") renderTerminalDock();

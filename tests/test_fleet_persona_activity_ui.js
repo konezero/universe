@@ -366,3 +366,78 @@ test("Host reconnect invalidates Fleet projections before soft refresh", () => {
   assert.match(body, /invalidateFleetAuthoritativeCaches/);
   assert.match(body, /refreshFleetHomeSoft/);
 });
+
+test("persona projection reload keeps the previous READY data and skips unchanged renders", async () => {
+  let resolveAssignments;
+  const calls = { nodeModes: 0, dock: 0, home: 0 };
+  const seenDuringReload = [];
+  const context = evaluate(
+    appSource,
+    "async function loadPersonaProjectProjection(",
+    "async function selectProject(",
+    {
+      state: {
+        selectedProject: { project_id: "p" },
+        personaAssignmentsProjectId: "p",
+        personaAssignmentsStatus: "READY",
+        personaAssignments: [{ assignment_id: "a1" }],
+        personaLibraryStatus: "READY",
+        personaLibrary: [{ persona_id: "x" }],
+      },
+      invokeServerAction: (action) => action === "persona.list"
+        ? Promise.resolve({ personas: [{ persona_id: "x" }] })
+        : new Promise((resolve) => { resolveAssignments = resolve; }),
+      renderNodeModes: () => { calls.nodeModes += 1; },
+      renderTerminalDock: () => { calls.dock += 1; },
+      renderIntegratedHome: () => { calls.home += 1; },
+    },
+  );
+  const pending = context.loadPersonaProjectProjection("p");
+  seenDuringReload.push(context.state.personaAssignmentsStatus, context.state.personaAssignments);
+  assert.equal(seenDuringReload[0], "READY");
+  assert.equal(seenDuringReload[1].length, 1);
+  resolveAssignments({ assignments: [{ assignment_id: "a1" }] });
+  await pending;
+  assert.deepEqual([calls.nodeModes, calls.dock, calls.home], [0, 0, 0]);
+
+  const changed = context.loadPersonaProjectProjection("p");
+  resolveAssignments({ assignments: [{ assignment_id: "a1" }, { assignment_id: "a2" }] });
+  await changed;
+  assert.equal(context.state.personaAssignments.length, 2);
+  assert.deepEqual([calls.nodeModes, calls.dock, calls.home], [1, 1, 1]);
+
+  const otherProject = context.loadPersonaProjectProjection("q");
+  assert.equal(context.state.personaAssignmentsStatus, "LOADING");
+  assert.equal(context.state.personaAssignments, null);
+  resolveAssignments({ assignments: [] });
+  await otherProject;
+});
+
+test("session options say where each session is bound and keep the operator's pick", () => {
+  const context = evaluate(
+    appSource,
+    "function fleetAssignmentRows()",
+    "function fleetTerminalLabel(terminal)",
+    { state: { personaAssignmentsStatus: "READY", personaAssignments: [
+      { session_anchor_ref: "a", state: "ACTIVE", node_ref: "feature_1" },
+      { session_anchor_ref: "b", state: "ACTIVE", node_ref: "" },
+      { session_anchor_ref: "c", state: "UNASSIGNED", node_ref: "feature_2" },
+    ] }, homeNodes: () => [{ node_id: "feat:feature_1", title: "Login flow" }] },
+  );
+  const start = appSource.indexOf("function fleetSessionBindingLabel(");
+  const end = appSource.indexOf("function renderFleetNodeTeamDialogContent(", start);
+  const idStart = appSource.indexOf("function homeNodeShortId(");
+  const idEnd = appSource.indexOf("function homeNodeRefKey(", idStart);
+  vm.runInContext(
+    appSource.slice(idStart, idEnd) + "\nfunction homeNodeRefKey(n){return String(n||'').replace(/^feat:/,'')}\n" + appSource.slice(start, end),
+    context,
+  );
+  assert.equal(context.fleetSessionBindingLabel("a"), "bound: Login flow #1");
+  assert.equal(context.fleetSessionBindingLabel("b"), "bound: project-wide");
+  assert.equal(context.fleetSessionBindingLabel("c"), "unbound");
+  context.state.personaAssignmentsStatus = "LOADING";
+  assert.equal(context.fleetSessionBindingLabel("a"), "binding unknown");
+  const draft = context.fleetNodeBindDraft("feature_1");
+  draft.session = "x";
+  assert.equal(context.fleetNodeBindDraft("feature_1").session, "x");
+});
