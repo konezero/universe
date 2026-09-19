@@ -2065,6 +2065,30 @@ class CodexAppServerSession:
         self.session_id = session_id
         self.session_observer(session_id)
 
+    @staticmethod
+    def _normalize_file_changes(changes: Any) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        if not isinstance(changes, list):
+            return normalized
+        for change in changes:
+            if not isinstance(change, Mapping):
+                continue
+            path = change.get("path")
+            kind = change.get("kind")
+            change_type = kind.get("type") if isinstance(kind, Mapping) else None
+            if (
+                isinstance(path, str)
+                and path.strip()
+                and isinstance(change_type, str)
+                and change_type in {"add", "update", "delete"}
+            ):
+                normalized_change = {"path": path.strip(), "type": change_type}
+                move_path = kind.get("move_path") if isinstance(kind, Mapping) else None
+                if isinstance(move_path, str) and move_path.strip():
+                    normalized_change["move_path"] = move_path.strip()
+                normalized.append(normalized_change)
+        return normalized
+
     def _handle_notification(self, method: str, params: Mapping[str, Any]) -> None:
         if method == "account/rateLimits/updated":
             self._quota_snapshot = _codex_quota_snapshot(
@@ -2085,38 +2109,21 @@ class CodexAppServerSession:
             ):
                 self._active_final_text = item["text"]
             return
+        if method == "item/started":
+            # Codex announces the exact files of a change here, before it asks for
+            # approval; patchUpdated is only sent for later revisions of it.
+            item = params.get("item")
+            if isinstance(item, Mapping) and item.get("type") == "fileChange":
+                item_id = item.get("id")
+                normalized = self._normalize_file_changes(item.get("changes"))
+                if isinstance(item_id, str) and item_id and normalized:
+                    self._pending_file_changes[item_id] = normalized
+            return
         if method == "item/fileChange/patchUpdated":
             item_id = params.get("itemId")
             changes = params.get("changes")
             if isinstance(item_id, str) and item_id and isinstance(changes, list):
-                normalized: list[dict[str, str]] = []
-                for change in changes:
-                    if not isinstance(change, Mapping):
-                        continue
-                    path = change.get("path")
-                    kind = change.get("kind")
-                    change_type = (
-                        kind.get("type") if isinstance(kind, Mapping) else None
-                    )
-                    if (
-                        isinstance(path, str)
-                        and path.strip()
-                        and isinstance(change_type, str)
-                        and change_type in {"add", "update", "delete"}
-                    ):
-                        normalized_change = {
-                            "path": path.strip(),
-                            "type": change_type,
-                        }
-                        move_path = (
-                            kind.get("move_path")
-                            if isinstance(kind, Mapping)
-                            else None
-                        )
-                        if isinstance(move_path, str) and move_path.strip():
-                            normalized_change["move_path"] = move_path.strip()
-                        normalized.append(normalized_change)
-                self._pending_file_changes[item_id] = normalized
+                self._pending_file_changes[item_id] = self._normalize_file_changes(changes)
             return
         if method != "turn/completed":
             return

@@ -199,9 +199,9 @@ def post_directive(
     directive = str(value.get("directive") or "").upper()
     if directive not in DIRECTIVES:
         raise LaunchError("TASK_FRAME_DIRECTIVE_INVALID", "directive must be RUN_ROLE, REWORK or DONE")
-    role = str(value.get("role") or "").upper() or None
+    role = str(value.get("target_role") or value.get("role") or "").upper() or None
     if directive != "DONE" and role not in ROLES:
-        raise LaunchError("TASK_FRAME_ROLE_INVALID", "RUN_ROLE and REWORK need role WORKER or REVIEWER")
+        raise LaunchError("TASK_FRAME_ROLE_INVALID", "RUN_ROLE and REWORK need target_role WORKER or REVIEWER")
     status = host_status(state_root, task_frame_id)
     if not status["known"] or not status.get("room_id"):
         raise LaunchError("TASK_FRAME_HOST_UNKNOWN", "no Host was launched for this Task Frame", 404)

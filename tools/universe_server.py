@@ -36754,7 +36754,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "means read-only) and DELETE/MOVE are never delegated. The Host runs the role, "
             "reports to its Boss room and to you over the Session Bus, then WAITS for you. "
             "Direct it with persona.automation.host-directive {run_id, owner_ref, task_frame_id, "
-            "directive: RUN_ROLE|REWORK|DONE, role, feedback, request_id} (RUN_ROLE REVIEWER "
+            "directive: RUN_ROLE|REWORK|DONE, target_role: WORKER|REVIEWER, feedback, request_id} (RUN_ROLE REVIEWER "
             "after the Worker; REWORK with your feedback; DONE when the Todo is finished) and "
             "read persona.automation.host-status. When the result is in, collect it yourself with "
             "persona.automation.collect-frame {run_id, owner_ref, task_frame_id, status: "
@@ -37363,7 +37363,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     request,
                     field="persona_automation_host_directive",
                     required=frozenset({"run_id", "owner_ref", "task_frame_id", "directive", "request_id"}),
-                    optional=frozenset({"role", "feedback"}),
+                    optional=frozenset({"target_role", "feedback"}),
                 )
                 run = self.persona_automation.get_run(value["run_id"])
                 require_owner(run, value["owner_ref"], "direct its Host")

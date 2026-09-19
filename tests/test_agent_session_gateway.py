@@ -1260,6 +1260,69 @@ class AgentSessionGatewayTests(unittest.TestCase):
             selected[0]["tool_call"]["fileChanges"],
         )
 
+    def test_codex_file_change_permission_uses_the_files_announced_by_item_started(self) -> None:
+        # Measured against codex-cli 0.146.0: the exact files arrive on the
+        # fileChange item's item/started, before the approval request.
+        selected: list[dict[str, Any]] = []
+        with patch(
+            "agent_session_gateway.JsonRpcStdioProcess",
+            FakeJsonRpcTransport,
+        ):
+            session = CodexAppServerSession(
+                executable=self.root / "codex.exe",
+                cwd=self.root,
+                environment={},
+                system_prompt="System",
+                session_id=None,
+                permission_requester=lambda request: (
+                    selected.append(dict(request)) or "accept"
+                ),
+                session_observer=lambda _session_id: None,
+            )
+            session._handle_notification(
+                "item/started",
+                {
+                    "threadId": session.session_id,
+                    "turnId": "turn-file",
+                    "item": {
+                        "type": "fileChange",
+                        "id": "exec-file",
+                        "status": "inProgress",
+                        "changes": [
+                            {"path": "C:\repo\new.txt", "kind": {"type": "add"}, "diff": "x"},
+                            {"path": "C:\repo\old.txt", "kind": {"type": "update", "move_path": "C:\repo\moved.txt"}, "diff": "x"},
+                            {"path": "C:\repo\gone.txt", "kind": {"type": "delete"}, "diff": "x"},
+                            {"path": "", "kind": {"type": "add"}},
+                            {"path": "C:\repo\odd.txt", "kind": {"type": "chmod"}},
+                        ],
+                    },
+                },
+            )
+            # Other item types never register file changes.
+            session._handle_notification(
+                "item/started",
+                {"item": {"type": "agentMessage", "id": "exec-file-2", "text": ""}},
+            )
+            session._handle_request(
+                "item/fileChange/requestApproval",
+                {"threadId": session.session_id, "turnId": "turn-file", "itemId": "exec-file", "grantRoot": None},
+            )
+            session._handle_request(
+                "item/fileChange/requestApproval",
+                {"threadId": session.session_id, "turnId": "turn-file", "itemId": "exec-file-2", "grantRoot": None},
+            )
+            session.close()
+
+        self.assertEqual(
+            [
+                {"path": "C:\repo\new.txt", "type": "add"},
+                {"path": "C:\repo\old.txt", "type": "update", "move_path": "C:\repo\moved.txt"},
+                {"path": "C:\repo\gone.txt", "type": "delete"},
+            ],
+            selected[0]["tool_call"]["fileChanges"],
+        )
+        self.assertEqual([], selected[1]["tool_call"]["fileChanges"])
+
     def test_codex_new_thread_uses_developer_bootstrap_and_passes_effort(self) -> None:
         with patch(
             "agent_session_gateway.JsonRpcStdioProcess",

@@ -1127,6 +1127,25 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertTrue(host_status["known"])
 
 
+    def test_host_directive_accepts_target_role_through_the_action_gateway(self):
+        from task_frame_host import parse_directive
+
+        anchor, node_ref, run = self._start_driven_run("frame-target-role")
+        todo = self._frame_todo(node_ref, "Target Role Todo")
+        status, launched, _spawned = self._launch(anchor, run, todo, request_id="target-role-1")
+        frame = launched["task_frame_id"]
+        status, posted = self.act("persona.automation.host-directive", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+            "directive": "RUN_ROLE", "target_role": "reviewer", "request_id": "tr-1"})
+        self.assertEqual(200, status, posted)
+        events = self.server.multi_rooms.list_room_events(launched["room_id"], after_sequence=0, limit=20)
+        parsed = [parse_directive(event) for event in events]
+        self.assertIn({"directive": "RUN_ROLE", "role": "REVIEWER", "feedback": None}, parsed)
+        status, missing = self.act("persona.automation.host-directive", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+            "directive": "RUN_ROLE", "request_id": "tr-2"})
+        self.assertEqual("TASK_FRAME_ROLE_INVALID", missing["error_code"])
+
     # -- out-of-scope write requests: Master decides, destructive goes to the Conductor --
 
     def _ask_permission(self, frame_id, *, operations, destructive, key):
