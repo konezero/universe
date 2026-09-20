@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from task_frame_host_runner import RuntimeHostRoleRunner  # noqa: E402
+from task_frame_host_runner import RuntimeHostRoleRunner, _failure_evidence_database  # noqa: E402
 from universe_runtime_host import RuntimeHostError  # noqa: E402
 
 
@@ -96,6 +96,17 @@ class RoleRunnerTests(unittest.TestCase):
         incomplete = RuntimeHostRoleRunner(SPEC, runtime_host=FakeRuntimeHost(GOOD), binding_provider=lambda: {"endpoint": "x"})
         incomplete.run("WORKER", attempt=1, feedback=None)
         self.assertEqual(SPEC["runtime_binding"], incomplete.host.calls[0]["runtime_binding"])
+
+    def test_the_host_records_worker_failures_in_a_durable_evidence_store(self):
+        # Without a store the dispatcher masks the real failure with
+        # WORKER_FAILURE_EVIDENCE_UNAVAILABLE.
+        configured = _failure_evidence_database({"failure_evidence_database": "C:/evidence/w.sqlite"})
+        self.assertEqual(Path("C:/evidence/w.sqlite"), configured)
+        default = _failure_evidence_database({})
+        self.assertEqual("worker-failure-evidence.sqlite", default.name)
+        self.assertIn("Universe", default.parts)
+        runner = RuntimeHostRoleRunner({**SPEC, "failure_evidence_database": str(ROOT / ".artifacts" / "x.sqlite")})
+        self.assertIsNotNone(runner.host.worker_dispatcher.failure_evidence_store)
 
     def test_provider_failures_and_bad_results_are_failed_roles(self):
         error = RuntimeHostError("WORKER_TRANSPORT_FAILED", "codex down")

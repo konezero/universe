@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -71,6 +73,16 @@ def _digest(value: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _failure_evidence_database(spec: Mapping[str, Any]) -> Path:
+    """Durable Host failure evidence, so a Worker claim failure is recorded, not masked."""
+
+    configured = str(spec.get("failure_evidence_database") or "").strip()
+    if configured:
+        return Path(configured)
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return Path(base) / "Universe" / "task-frame-host" / "worker-failure-evidence.sqlite"
+
+
 class RuntimeHostRoleRunner:
     def __init__(
         self,
@@ -82,7 +94,10 @@ class RuntimeHostRoleRunner:
     ) -> None:
         self.spec = spec
         self.binding_provider = binding_provider
-        self.host = runtime_host or UniverseRuntimeHost(Path(str(spec["repository_root"])))
+        self.host = runtime_host or UniverseRuntimeHost(
+            Path(str(spec["repository_root"])),
+            failure_evidence_database=_failure_evidence_database(spec),
+        )
         self.last_worker_result: Mapping[str, Any] | None = None
         self.escalator = permission_escalator
         dispatcher = getattr(self.host, "worker_dispatcher", None)
