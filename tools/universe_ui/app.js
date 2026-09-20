@@ -62,13 +62,17 @@ const state = {
   fleetHomeRefreshTodoSignature: null,
   fleetHomeRefreshGoalSignature: null,
   fleetHomeRefreshAssignmentSignature: null,
+  fleetHomeRefreshWorkerAssignmentSignature: null,
   fleetHomeRefreshWorkerSignature: null,
+  fleetHomeRefreshHostSignature: null,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
   fleetWorkerAssignmentsByNode: {},
   /** Authoritative project-wide Worker/Reviewer assignment projection. */
   fleetWorkerAssignmentsProject: null,
+  /** Read-only projection of live independent Task Frame Hosts. */
+  fleetTaskFrameHosts: null,
   /** Authoritative node-scoped Persona automation projections. */
   fleetAutomationByNode: {},
   /** Last typed coordination projection read for a node. */
@@ -4994,6 +4998,8 @@ function invalidateFleetAuthoritativeCaches() {
   // authoritative Host/Session stores again.
   state.fleetWorkerAssignmentsByNode = {};
   state.fleetWorkerAssignmentsProject = null;
+  state.fleetWorkerAssignmentsProject = null;
+  state.fleetTaskFrameHosts = null;
   state.fleetAutomationByNode = {};
   state.fleetCoordinationByNode = {};
   state.fleetOrphanMessagesByNode = {};
@@ -5007,27 +5013,18 @@ async function refreshFleetHomeSoft() {
   state.fleetHomeRefreshInFlight = true;
   try {
     const refetchAssignments = state.personaAssignmentsProjectId === projectId;
-    const loadedWorkerNodeRefs = Object.entries(state.fleetWorkerAssignmentsByNode || {})
-      .filter(([, projection]) => projection?.projectId === projectId)
-      .map(([nodeRef]) => nodeRef);
-    const [todoResult, goalPlan, assignmentResult, workerProjectResult, workerNodeResults] = await Promise.all([
+    const [todoResult, goalPlan, workerAssignmentResult, assignmentResult, hostProjection] = await Promise.all([
       api("/v1/todos").catch(() => null),
       apiWithTimeout(
         `/v1/projects/${encodeURIComponent(projectId)}/goals`,
         {},
         8000
       ).catch(() => null),
+      invokeServerAction("fleet.worker-assignments-list", { project_id: projectId }).catch(() => null),
       refetchAssignments
         ? invokeServerAction("persona.assignments-list", { project_id: projectId }).catch(() => null)
         : Promise.resolve(null),
-      invokeServerAction("fleet.worker-assignments-list", { project_id: projectId }).catch(() => null),
-      Promise.all(loadedWorkerNodeRefs.map(async (nodeRef) => [
-        nodeRef,
-        await invokeServerAction("fleet.worker-assignments-list", {
-          project_id: projectId,
-          node_ref: nodeRef,
-        }).catch(() => null),
-      ])),
+      api(`/v1/projects/${encodeURIComponent(projectId)}/task-frame-hosts`).catch(() => null),
     ]);
     if (state.selectedProject?.project_id !== projectId) return;
     // Re-check after awaits: an edit or dialog may have started mid-flight.
@@ -5072,26 +5069,23 @@ async function refreshFleetHomeSoft() {
         changed = true;
       }
     }
-    if (Array.isArray(workerProjectResult?.assignments)) {
-      const signature = JSON.stringify({
-        project: workerProjectResult.assignments,
-        nodes: workerNodeResults,
-      });
-      if (signature !== state.fleetHomeRefreshWorkerSignature) {
-        state.fleetHomeRefreshWorkerSignature = signature;
+    if (Array.isArray(workerAssignmentResult?.assignments)) {
+      const signature = JSON.stringify(workerAssignmentResult.assignments);
+      if (signature !== state.fleetHomeRefreshWorkerAssignmentSignature) {
+        state.fleetHomeRefreshWorkerAssignmentSignature = signature;
         state.fleetWorkerAssignmentsProject = {
           projectId,
           status: "READY",
-          rows: workerProjectResult.assignments,
+          rows: workerAssignmentResult.assignments,
         };
-        for (const [nodeRef, result] of workerNodeResults) {
-          if (!Array.isArray(result?.assignments)) continue;
-          state.fleetWorkerAssignmentsByNode[nodeRef] = {
-            projectId,
-            status: "READY",
-            rows: result.assignments,
-          };
-        }
+        changed = true;
+      }
+    }
+    if (Array.isArray(hostProjection?.frames)) {
+      const signature = JSON.stringify(hostProjection.frames);
+      if (signature !== state.fleetHomeRefreshWorkerSignature) {
+        state.fleetHomeRefreshWorkerSignature = signature;
+        state.fleetTaskFrameHosts = { projectId, status: "READY", rows: hostProjection.frames };
         changed = true;
       }
     }
@@ -6302,26 +6296,6 @@ function fleetWorkerTerminalState(terminal) {
     : "OFFLINE";
 }
 
-// Worker/Reviewer terminals are deliberately absent from state.terminals so
-// the normal dock stays quiet. A Fleet Peek is the explicit exception: add
-// only this authoritative session for the duration of the attach, then use
-// the existing terminal surface lifecycle. The next terminal refresh restores
-// the normal dock projection and removes the temporary peek tab.
-function peekFleetWorkerTerminal(terminal) {
-  const terminalId = String(terminal?.terminal_id || "").trim();
-  if (!terminalId || typeof selectTerminalTab !== "function") return false;
-  const current = Array.isArray(state.terminals) ? state.terminals : [];
-  if (!current.some((item) => String(item?.terminal_id || "") === terminalId)) {
-    state.terminals = [
-      ...current.filter((item) => String(item?.terminal_id || "") !== terminalId),
-      terminal,
-    ];
-  }
-  selectTerminalTab(terminalId);
-  if (typeof expandConversationLayer === "function") expandConversationLayer();
-  return true;
-}
-
 function bindFleetNodeMaster(featureId, sessionAnchorRef, personaId) {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   const anchor = String(sessionAnchorRef || "").trim();
@@ -6843,54 +6817,59 @@ function renderHomeNodeOwnerRow(graphNode) {
   return controls;
 }
 
-function fleetHomeWorkerSummary(nodes) {
-  const section = node("section", "fleet-home-worker-summary");
-  const heading = node("div", "fleet-home-worker-summary-head");
-  heading.append(node("strong", "", "Running Worker / Reviewer"));
+function fleetHomeWorkerRows(nodes) {
+  const rows = [];
   const project = state.fleetWorkerAssignmentsProject;
-  const loading = !project || project.status === "LOADING";
-  if (loading) void ensureFleetWorkerProjectAssignments();
-  const rows = fleetWorkerAssignmentProjectRows(nodes);
-  heading.append(node("span", "fleet-home-worker-count", loading && !rows.length ? "?" : String(rows.length)));
-  section.append(heading);
-  if (project?.status === "ERROR" && !rows.length) {
-    section.append(node("p", "fleet-home-worker-status is-unknown", "ERROR: Worker/Reviewer assignment read failed"));
-    return section;
+  const assignments = [];
+  const seenAssignments = new Set();
+  if (project?.status === "READY") {
+    for (const assignment of project.rows || []) {
+      if (String(assignment.state || "").toUpperCase() !== "ACTIVE") continue;
+      const key = fleetWorkerAssignmentKey(assignment);
+      if (!key || seenAssignments.has(key)) continue;
+      seenAssignments.add(key);
+      assignments.push({ kind: "legacy", ...assignment });
+    }
   }
-  if (loading && !rows.length) {
-    section.append(node("p", "fleet-home-worker-status is-unknown", "Loading authoritative Worker/Reviewer assignments..."));
-    return section;
+  const hosts = [];
+  const seenHosts = new Set();
+  const projectedHosts = state.fleetTaskFrameHosts?.status === "READY"
+    ? state.fleetTaskFrameHosts.rows || []
+    : [];
+  for (const frame of projectedHosts) {
+    const key = String(frame.task_frame_id || "").trim();
+    if (!frame.alive || !key || seenHosts.has(key)) continue;
+    seenHosts.add(key);
+    hosts.push({ kind: "host", ...frame });
   }
-  if (!rows.length) {
-    section.append(node("p", "fleet-home-worker-status", "No Worker/Reviewer sessions are running."));
-    return section;
-  }
-  const list = node("div", "fleet-home-worker-list");
-  for (const { graphNode, assignment } of rows) {
-    const row = node("div", "fleet-home-worker-row");
-    const terminal = fleetAuthoritativeTerminals().find((item) =>
-      String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || "") &&
-      String(item.project_id || "") === String(state.selectedProject?.project_id || "")
+  const aliases = (item) => [
+    item?.task_frame_id,
+    item?.assignment_id,
+    item?.worker_assignment_id,
+    item?.session_anchor_ref,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const hostAliases = hosts.map((host) => ({ host, keys: new Set(aliases(host)) }));
+  const matchedHosts = new Set();
+  for (const assignment of assignments) {
+    const assignmentKeys = aliases(assignment);
+    const match = hostAliases.find(({ host, keys }) =>
+      assignmentKeys.some((key) => keys.has(key))
     );
-    const role = String(assignment.worker_role || "IMPLEMENTER").toUpperCase() === "REVIEWER" ? "Reviewer" : "Worker";
-    row.append(
-      node("span", "fleet-home-worker-role", role),
-      node("span", "fleet-home-worker-copy", `${graphNode ? homeNodeTitleWithId(graphNode) : "Project-wide"} / ${assignment.session_anchor_ref || "UNKNOWN"}`),
-      node("span", "fleet-home-worker-state", fleetWorkerTerminalState(terminal)),
-    );
-    const peek = node("button", "secondary-button compact-action fleet-home-worker-peek", "Peek");
-    peek.type = "button";
-    peek.disabled = !terminal;
-    peek.title = terminal ? "Open this live session in the terminal dock" : "No live terminal projection is available";
-    peek.addEventListener("click", () => {
-      if (!terminal) return;
-      peekFleetWorkerTerminal(terminal);
-    });
-    row.append(peek);
-    list.append(row);
+    if (match) {
+      if (matchedHosts.has(match.host)) continue;
+      matchedHosts.add(match.host);
+      rows.push({
+        ...match.host,
+        node_ref: match.host.node_ref || assignment.node_ref || null,
+      });
+    } else {
+      rows.push(assignment);
+    }
   }
-  section.append(list);
-  return section;
+  for (const host of hosts) {
+    if (!matchedHosts.has(host)) rows.push(host);
+  }
+  return rows;
 }
 
 function renderHomeNodes(selNode) {
@@ -6900,11 +6879,26 @@ function renderHomeNodes(selNode) {
   head.textContent = `${state.selectedProject?.project_id || ""} · nodes`;
   listEl.replaceChildren();
   const nodes = homeNodes();
+  const workerRows = fleetHomeWorkerRows(nodes);
+  const nodeRefs = new Set(nodes.map((item) => String(homeNodeRefKey(item.node_id) || "")));
+  const unassignedWorkerCount = workerRows.filter((frame) => !frame.node_ref || !nodeRefs.has(String(frame.node_ref))).length;
+  if (unassignedWorkerCount) {
+    head.textContent += ` · 노드 미지정 Worker/Reviewer ${unassignedWorkerCount}`;
+  }
+  if (!state.fleetTaskFrameHosts || state.fleetTaskFrameHosts.status === "LOADING") {
+    const projectId = String(state.selectedProject?.project_id || "");
+    if (projectId) {
+      state.fleetTaskFrameHosts = { projectId, status: "LOADING", rows: [] };
+      api(`/v1/projects/${encodeURIComponent(projectId)}/task-frame-hosts`).then((result) => {
+        state.fleetTaskFrameHosts = { projectId, status: "READY", rows: result.frames || [] };
+        if (state.selectedProject?.project_id === projectId) renderIntegratedHome();
+      }).catch((error) => { state.fleetTaskFrameHosts = { projectId, status: "ERROR", rows: [], error: error.message }; });
+    }
+  }
   if (!nodes.length) {
     listEl.append(node("div", "goal-plan-empty", "No nodes in this project's projection yet."));
     return;
   }
-  listEl.append(fleetHomeWorkerSummary(nodes));
   for (const graphNode of nodes) {
     const selected = graphNode.node_id === selNode?.node_id;
     const todos = homeNodeTodos(graphNode);
@@ -6966,6 +6960,15 @@ function renderHomeNodes(selNode) {
       dot.style.background = liveExec.blocked ? "#c26b5e" : "#6f9b78";
       meta.append(dot, node("span", `home-agent ${liveExec.blocked ? "blocked" : ""}`, liveExec.label));
       rows.push(meta);
+    }
+    const nodeWorkerCount = workerRows.filter((frame) => String(frame.node_ref || "") === String(homeNodeRefKey(graphNode.node_id) || "")).length;
+    if (nodeWorkerCount) {
+      const workerRow = node("div", "home-card-meta fleet-home-node-workers");
+      workerRow.append(
+        node("span", "fleet-home-node-workers-label", "Running Worker / Reviewer"),
+        node("span", "fleet-home-node-workers-count", String(nodeWorkerCount))
+      );
+      rows.push(workerRow);
     }
     // 폐기 — proposed feature nodes can be archived (drops out of the graft).
     if (kind === "FEATURE" && !adopted && !archived && !todos.length) {
@@ -16991,7 +16994,10 @@ function renderTodoAutomationControl(todo) {
 
 function renderTodoOwnership(todo) {
   const ownership = todoOwnershipProjection(todo);
-  if (!ownership && todo.state !== "IN_PROGRESS") return null;
+  const frames = state.fleetTaskFrameHosts?.status === "READY"
+    ? (state.fleetTaskFrameHosts.rows || []).filter((frame) => frame.todo_id === todo.todo_id && frame.room_id)
+    : [];
+  if (!ownership && todo.state !== "IN_PROGRESS" && !frames.length) return null;
   const row = node("div", "todo-ownership");
   if (!ownership) {
     row.dataset.bound = "false";
@@ -16999,27 +17005,36 @@ function renderTodoOwnership(todo) {
       node("span", "todo-ownership-chip", "No Task Frame owner"),
       node("span", "todo-ownership-chip", "Host unbound")
     );
-    return row;
+  } else {
+    row.dataset.bound = "true";
+    row.dataset.hostState = ownership.host_state;
+    row.append(
+      node("span", "todo-ownership-chip", `Task Frame ${ownership.task_frame_id}`),
+      node(
+        "span",
+        "todo-ownership-chip",
+        ownership.provider
+          ? `${ownership.mode || "SESSION"} / ${ownership.provider}`
+          : ownership.anchor_ref
+            ? "Target Session Anchor"
+            : "Target owner pending"
+      ),
+      node(
+        "span",
+        "todo-ownership-chip",
+        `Host ${ownership.host_state}${ownership.host_compatibility !== "UNKNOWN" ? ` / ${ownership.host_compatibility}` : ""}`
+      )
+    );
   }
-  row.dataset.bound = "true";
-  row.dataset.hostState = ownership.host_state;
-  row.append(
-    node("span", "todo-ownership-chip", `Task Frame ${ownership.task_frame_id}`),
-    node(
-      "span",
-      "todo-ownership-chip",
-      ownership.provider
-        ? `${ownership.mode || "SESSION"} / ${ownership.provider}`
-        : ownership.anchor_ref
-          ? "Target Session Anchor"
-          : "Target owner pending"
-    ),
-    node(
-      "span",
-      "todo-ownership-chip",
-      `Host ${ownership.host_state}${ownership.host_compatibility !== "UNKNOWN" ? ` / ${ownership.host_compatibility}` : ""}`
-    )
-  );
+  for (const frame of frames.sort((a, b) => String(b.launched_at || "").localeCompare(String(a.launched_at || "")))) {
+    const button = node("button", "secondary-button compact-action todo-task-frame-room", `Task Frame ${frame.task_frame_id}`);
+    button.type = "button";
+    button.dataset.taskFrameId = String(frame.task_frame_id || "");
+    button.dataset.roomId = String(frame.room_id || "");
+    button.title = "Open Task Frame collaboration";
+    button.addEventListener("click", () => openRoomObservation(frame.room_id).catch((error) => toast(error.message, true)));
+    row.append(button);
+  }
   return row;
 }
 

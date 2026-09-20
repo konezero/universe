@@ -232,6 +232,7 @@ from universe_action_registry import (
     utf8_sha256,
 )
 from persona_automation import PersonaAutomationError, PersonaAutomationStore
+from task_frame_host_main import pid_alive as task_frame_host_pid_alive
 from persona_coordination import PersonaCoordinationError, PersonaCoordinationStore
 from universe_remote_gateway import (
     GatewayError,
@@ -37178,6 +37179,77 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _persona_task_frame_state_root(self) -> Path:
         return self.store.database_path.parent / "task_frame_hosts"
 
+    def task_frame_host_projection(self, project_id: str) -> dict[str, Any]:
+        """Read the live independent Task Frame Hosts for a project.
+
+        Launch events are the durable owner/link between a Todo and its Boss
+        room.  The heartbeat is only used to determine whether that Host is
+        still running; pid_alive never signals the process.
+        """
+        project = str(project_id or "").strip()
+        if not project:
+            raise UniverseError("PROJECT_ID_REQUIRED", "project_id is required", HTTPStatus.BAD_REQUEST)
+        frames: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        # Host launch records live in persona_automation_event, keyed by the
+        # automation run.  The project_event table is a different projection
+        # and does not contain independent Task Frame Host launches.
+        surfaced = self.persona_automation.surface(project)
+        runs = surfaced.get("runs") if isinstance(surfaced, Mapping) else []
+        if not isinstance(runs, list):
+            runs = []
+        for run in runs:
+            if not isinstance(run, Mapping):
+                continue
+            run_id = str(run.get("run_id") or "").strip()
+            if not run_id:
+                continue
+            for event in self.persona_automation.events(run_id, 500):
+                if str(event.get("event_type") or "") != "TASK_FRAME_HOST_LAUNCHED":
+                    continue
+                payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+                frame_id = str(payload.get("task_frame_id") or event.get("task_frame_id") or "").strip()
+                if not frame_id or frame_id in seen:
+                    continue
+                seen.add(frame_id)
+                todo_id = str(payload.get("todo_id") or "").strip()
+                if not todo_id:
+                    continue
+                try:
+                    todo = self.store.get_todo(todo_id)
+                except Exception:
+                    continue
+                if str(todo.get("project_id") or "") != project:
+                    continue
+                heartbeat_path = self._persona_task_frame_state_root() / frame_id / "heartbeat.json"
+                heartbeat: dict[str, Any] = {}
+                try:
+                    heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    heartbeat = {}
+                try:
+                    pid = int(heartbeat.get("pid") or payload.get("pid") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                frames.append({
+                    "task_frame_id": frame_id,
+                    "todo_id": todo_id,
+                    "room_id": str(payload.get("room_id") or heartbeat.get("room_id") or ""),
+                    "node_ref": str(todo.get("node_ref") or "").strip() or None,
+                    "first_role": str(payload.get("first_role") or heartbeat.get("first_role") or "WORKER"),
+                    "phase": str(heartbeat.get("phase") or "UNKNOWN"),
+                    "pid": pid,
+                    "alive": bool(pid and task_frame_host_pid_alive(pid)),
+                    "launched_at": str(event.get("created_at") or event.get("timestamp") or ""),
+                })
+        frames.sort(key=lambda item: (str(item.get("launched_at") or ""), str(item["task_frame_id"])), reverse=True)
+        return {
+            "schema": "universe.task-frame-host-projection.v1",
+            "status": "TASK_FRAME_HOST_PROJECTION_READY",
+            "project_id": project,
+            "frames": frames,
+        }
+
     def _bus_message_row(self, message_id: str) -> dict[str, Any] | None:
         with closing(self.session_bus._db_connect()) as connection:
             row = connection.execute(
@@ -52672,6 +52744,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in {"/", "/app.js", "/project-drafts.js", "/styles.css", "/terminals.js", "/xterm.min.js", "/xterm.min.css", "/xterm-addon-fit.min.js", "/xterm-addon-webgl.min.js", "/xterm-addon-search.min.js", "/xterm-addon-unicode11.min.js", "/xterm-addon-web-links.min.js", "/xterm-addon-serialize.min.js", "/fonts/D2Coding.woff2", "/fonts/D2Coding-Bold.woff2"}:
             self._send_static(path)
+            return
+        task_frame_hosts = re.fullmatch(r"/v1/projects/([^/]+)/task-frame-hosts", path)
+        if task_frame_hosts is not None:
+            if not self._authorize():
+                return
+            try:
+                self._send(
+                    HTTPStatus.OK,
+                    self.server.task_frame_host_projection(unquote(task_frame_hosts.group(1))),
+                )
+            except UniverseError as error:
+                self._send_error(error)
             return
         terminal_history = re.fullmatch(r"/v1/terminals/([^/]+)/history", path)
         if terminal_history is not None:
