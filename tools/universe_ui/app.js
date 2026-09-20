@@ -56,16 +56,19 @@ const state = {
   fleetHomeRefreshInFlight: false,
   /** Interval handle for Fleet home soft refresh (todos/automation/roster). */
   fleetHomeRefreshTimer: null,
-  /** Last-rendered todos/goals signatures, so an unchanged soft poll skips
+  /** Last-rendered soft-refresh signatures, so an unchanged poll skips
    * the full renderIntegratedHome() rebuild instead of flickering the DOM
    * every tick. */
   fleetHomeRefreshTodoSignature: null,
   fleetHomeRefreshGoalSignature: null,
   fleetHomeRefreshAssignmentSignature: null,
+  fleetHomeRefreshWorkerSignature: null,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
   fleetWorkerAssignmentsByNode: {},
+  /** Authoritative project-wide Worker/Reviewer assignment projection. */
+  fleetWorkerAssignmentsProject: null,
   /** Authoritative node-scoped Persona automation projections. */
   fleetAutomationByNode: {},
   /** Last typed coordination projection read for a node. */
@@ -4990,6 +4993,7 @@ function invalidateFleetAuthoritativeCaches() {
   // recovery forces the next render/read to use typed server Actions and
   // authoritative Host/Session stores again.
   state.fleetWorkerAssignmentsByNode = {};
+  state.fleetWorkerAssignmentsProject = null;
   state.fleetAutomationByNode = {};
   state.fleetCoordinationByNode = {};
   state.fleetOrphanMessagesByNode = {};
@@ -5003,7 +5007,10 @@ async function refreshFleetHomeSoft() {
   state.fleetHomeRefreshInFlight = true;
   try {
     const refetchAssignments = state.personaAssignmentsProjectId === projectId;
-    const [todoResult, goalPlan, assignmentResult] = await Promise.all([
+    const loadedWorkerNodeRefs = Object.entries(state.fleetWorkerAssignmentsByNode || {})
+      .filter(([, projection]) => projection?.projectId === projectId)
+      .map(([nodeRef]) => nodeRef);
+    const [todoResult, goalPlan, assignmentResult, workerProjectResult, workerNodeResults] = await Promise.all([
       api("/v1/todos").catch(() => null),
       apiWithTimeout(
         `/v1/projects/${encodeURIComponent(projectId)}/goals`,
@@ -5013,6 +5020,14 @@ async function refreshFleetHomeSoft() {
       refetchAssignments
         ? invokeServerAction("persona.assignments-list", { project_id: projectId }).catch(() => null)
         : Promise.resolve(null),
+      invokeServerAction("fleet.worker-assignments-list", { project_id: projectId }).catch(() => null),
+      Promise.all(loadedWorkerNodeRefs.map(async (nodeRef) => [
+        nodeRef,
+        await invokeServerAction("fleet.worker-assignments-list", {
+          project_id: projectId,
+          node_ref: nodeRef,
+        }).catch(() => null),
+      ])),
     ]);
     if (state.selectedProject?.project_id !== projectId) return;
     // Re-check after awaits: an edit or dialog may have started mid-flight.
@@ -5054,6 +5069,29 @@ async function refreshFleetHomeSoft() {
         state.fleetHomeRefreshAssignmentSignature = signature;
         state.personaAssignments = assignmentResult.assignments;
         state.personaAssignmentsStatus = "READY";
+        changed = true;
+      }
+    }
+    if (Array.isArray(workerProjectResult?.assignments)) {
+      const signature = JSON.stringify({
+        project: workerProjectResult.assignments,
+        nodes: workerNodeResults,
+      });
+      if (signature !== state.fleetHomeRefreshWorkerSignature) {
+        state.fleetHomeRefreshWorkerSignature = signature;
+        state.fleetWorkerAssignmentsProject = {
+          projectId,
+          status: "READY",
+          rows: workerProjectResult.assignments,
+        };
+        for (const [nodeRef, result] of workerNodeResults) {
+          if (!Array.isArray(result?.assignments)) continue;
+          state.fleetWorkerAssignmentsByNode[nodeRef] = {
+            projectId,
+            status: "READY",
+            rows: result.assignments,
+          };
+        }
         changed = true;
       }
     }
@@ -5706,6 +5744,58 @@ function fleetWorkerAssignments(featureId) {
   if (entry.status !== "READY") return { status: entry.status, active: [], all: [] };
   const active = entry.rows.filter((item) => String(item.state || "").toUpperCase() === "ACTIVE");
   return { status: "READY", active, all: entry.rows };
+}
+
+function fleetWorkerAssignmentKey(assignment) {
+  return String(
+    assignment?.assignment_id || assignment?.worker_assignment_id ||
+    assignment?.session_anchor_ref || ""
+  ).trim();
+}
+
+function fleetWorkerAssignmentProjectRows(nodes) {
+  const rows = [];
+  const seen = new Set();
+  const add = (graphNode, assignment) => {
+    if (String(assignment?.state || "").toUpperCase() !== "ACTIVE") return;
+    const key = fleetWorkerAssignmentKey(assignment);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    rows.push({ graphNode, assignment });
+  };
+  const project = state.fleetWorkerAssignmentsProject;
+  if (project?.status === "READY") {
+    for (const assignment of project.rows || []) {
+      const graphNode = (nodes || []).find((item) =>
+        String(homeNodeRefKey(item.node_id) || "") === String(assignment.node_ref || "")
+      ) || null;
+      add(graphNode, assignment);
+    }
+  }
+  for (const graphNode of nodes || []) {
+    if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") continue;
+    for (const assignment of fleetWorkerAssignments(homeNodeRefKey(graphNode.node_id)).active) {
+      add(graphNode, assignment);
+    }
+  }
+  return rows;
+}
+
+async function ensureFleetWorkerProjectAssignments() {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId) return;
+  const existing = state.fleetWorkerAssignmentsProject;
+  if (existing && existing.projectId === projectId && ["READY", "LOADING"].includes(existing.status)) return;
+  state.fleetWorkerAssignmentsProject = { projectId, status: "LOADING", rows: [] };
+  try {
+    const result = await invokeServerAction("fleet.worker-assignments-list", { project_id: projectId });
+    state.fleetWorkerAssignmentsProject = { projectId, status: "READY", rows: result.assignments || [] };
+  } catch (error) {
+    state.fleetWorkerAssignmentsProject = { projectId, status: "ERROR", rows: [], error: error.message };
+  }
+  if (String(state.selectedProject?.project_id || "") === projectId && typeof renderIntegratedHome === "function") {
+    renderIntegratedHome();
+  }
 }
 
 async function ensureFleetWorkerAssignments(featureId) {
@@ -6757,25 +6847,18 @@ function fleetHomeWorkerSummary(nodes) {
   const section = node("section", "fleet-home-worker-summary");
   const heading = node("div", "fleet-home-worker-summary-head");
   heading.append(node("strong", "", "Running Worker / Reviewer"));
-  const rows = [];
-  let loading = false;
-  for (const graphNode of nodes) {
-    if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") continue;
-    const featureId = homeNodeRefKey(graphNode.node_id);
-    const projection = fleetWorkerAssignments(featureId);
-    if (projection.status !== "READY") {
-      loading = true;
-      void ensureFleetWorkerAssignments(featureId);
-      continue;
-    }
-    for (const assignment of projection.active) {
-      rows.push({ graphNode, assignment });
-    }
-  }
-  heading.append(node("span", "fleet-home-worker-count", loading ? "…" : String(rows.length)));
+  const project = state.fleetWorkerAssignmentsProject;
+  const loading = !project || project.status === "LOADING";
+  if (loading) void ensureFleetWorkerProjectAssignments();
+  const rows = fleetWorkerAssignmentProjectRows(nodes);
+  heading.append(node("span", "fleet-home-worker-count", loading && !rows.length ? "?" : String(rows.length)));
   section.append(heading);
+  if (project?.status === "ERROR" && !rows.length) {
+    section.append(node("p", "fleet-home-worker-status is-unknown", "ERROR: Worker/Reviewer assignment read failed"));
+    return section;
+  }
   if (loading && !rows.length) {
-    section.append(node("p", "fleet-home-worker-status is-unknown", "Loading authoritative Worker/Reviewer assignments…"));
+    section.append(node("p", "fleet-home-worker-status is-unknown", "Loading authoritative Worker/Reviewer assignments..."));
     return section;
   }
   if (!rows.length) {
@@ -6792,7 +6875,7 @@ function fleetHomeWorkerSummary(nodes) {
     const role = String(assignment.worker_role || "IMPLEMENTER").toUpperCase() === "REVIEWER" ? "Reviewer" : "Worker";
     row.append(
       node("span", "fleet-home-worker-role", role),
-      node("span", "fleet-home-worker-copy", `${homeNodeTitleWithId(graphNode)} / ${assignment.session_anchor_ref || "UNKNOWN"}`),
+      node("span", "fleet-home-worker-copy", `${graphNode ? homeNodeTitleWithId(graphNode) : "Project-wide"} / ${assignment.session_anchor_ref || "UNKNOWN"}`),
       node("span", "fleet-home-worker-state", fleetWorkerTerminalState(terminal)),
     );
     const peek = node("button", "secondary-button compact-action fleet-home-worker-peek", "Peek");
