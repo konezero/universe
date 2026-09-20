@@ -5087,6 +5087,19 @@ async function refreshFleetHomeSoft() {
         changed = true;
       }
     }
+    const automationEntries = Object.entries(state.fleetAutomationByNode || {})
+      .filter(([, projection]) => projection?.projectId === projectId && ["RUNNING", "WAITING", "PAUSED", "STOPPED", "COMPLETED", "FAILED"].includes(String(projection.run?.state || "").toUpperCase()));
+    const automationResults = await Promise.all(automationEntries.map(async ([featureId, projection]) => {
+      try {
+        const result = await invokeServerAction("persona.automation.status", { project_id: projectId, node_ref: featureId });
+        return [featureId, { ...projection, status: "READY", run: result.run || result.last_run || null, error: "" }];
+      } catch (_error) { return [featureId, projection]; }
+    }));
+    for (const [featureId, projection] of automationResults) {
+      const before = JSON.stringify(state.fleetAutomationByNode[featureId]?.run || null);
+      state.fleetAutomationByNode[featureId] = projection;
+      if (before !== JSON.stringify(projection.run || null)) changed = true;
+    }
     void refreshFleetProjectConductorProjection(projectId).catch(() => {});
     if (!changed) return;
     const featureId = homeNodeRefKey(homeSelectedNode()?.node_id || "");
@@ -5863,6 +5876,7 @@ async function mutateFleetAutomation(featureId, owner, operation, run) {
     await invokeServerAction(`persona.automation.${operation}`, {
       run_id: run.run_id, request_id: fleetAutomationRequestId(featureId, operation),
       expected_revision: run.revision,
+      ...(operation === "resume" && run.state === "STOPPED" ? { recover_stopped: true } : {}),
       ...(operation === "pause" || operation === "stop" ? { reason: `Fleet node control: ${operation}` } : {}),
     });
   }
@@ -5870,7 +5884,22 @@ async function mutateFleetAutomation(featureId, owner, operation, run) {
   await ensureFleetAutomation(featureId, owner);
 }
 
-function renderFleetAutomationControls(featureId, owner) {
+function fleetStallAge(value) {
+  const then = Date.parse(String(value || ""));
+  return Number.isFinite(then) ? Math.max(0, Math.floor((Date.now() - then) / 60000)) : 0;
+}
+
+async function clearFleetAutomationBlocker(featureId, owner, run, item) {
+  await invokeServerAction("persona.automation.clear-blocker", {
+    run_id: run.run_id, message_id: item.message_id,
+    request_id: fleetAutomationRequestId(featureId, "clear-blocker"),
+  });
+  delete (state.fleetAutomationByNode || {})[featureId];
+  await ensureFleetAutomation(featureId, owner);
+}
+
+/* Removed duplicate legacy implementation.
+function obsoleteFleetAutomationControls(featureId, owner) {
   const wrap = node("div", "fleet-node-automation");
   if (!owner) {
     wrap.append(node("p", "fleet-node-team-status is-unknown", "Automation: UNASSIGNED (bind a Master first)"));
@@ -5907,6 +5936,30 @@ function renderFleetAutomationControls(featureId, owner) {
       `Run owned by a previous Anchor ${runAnchor}${run.owner_availability ? ` (${run.owner_availability})` : ""} — Stop it to start a run under the current Master.`));
   }
   if (run?.current_review) wrap.append(node("p", "fleet-node-team-status", `Review: ${run.current_review.outcome || "PENDING"} · ${run.current_review.acceptance_status || "NOT_RUN"}`));
+  const stall = run?.stall;
+  if (stall?.items?.length) {
+    wrap.append(node("span", "fleet-automation-stalled-chip", "STALLED"));
+    for (const item of stall.items) {
+      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at);
+      const reason = item.kind === "QUEUE_BLOCKED"
+        ? `Master가 ${item.created_at || "알림"}에 답하지 않아 알림 ${item.waiting_count || 0}개 대기 중 (${age}분)`
+        : item.kind === "HOST_PERMISSION_PENDING"
+          ? `Host 권한 요청 ${item.request_id || ""}이 ${age}분째 대기 중`
+          : `Host ${item.task_frame_id || ""}가 ${item.phase || "UNKNOWN"} 상태로 남아 있음 (${age}분)`;
+      wrap.append(node("p", "fleet-automation-stall-reason", reason));
+      if (item.kind === "QUEUE_BLOCKED" && item.message_id) {
+        const row = node("div", "fleet-automation-clear-row");
+        row.append(node("small", "", `${String(item.message_id).slice(0, 12)} · ${String(item.body || "").slice(0, 80)}`));
+        const clear = node("button", "secondary-button compact-action", "막힌 알림 정리");
+        clear.type = "button";
+        clear.addEventListener("click", () => {
+          clear.disabled = true;
+          clearFleetAutomationBlocker(featureId, owner, run, item).catch(error => toast(error.message, true)).finally(() => { clear.disabled = false; });
+        });
+        row.append(clear); wrap.append(row);
+      }
+    }
+  }
   const controls = node("div", "fleet-node-team-controls");
   const button = (label, op, disabled = false) => {
     const b = node("button", "secondary-button compact-action", label);
@@ -5921,7 +5974,101 @@ function renderFleetAutomationControls(featureId, owner) {
   };
   if (!run || ["COMPLETED", "STOPPED", "FAILED"].includes(stateLabel)) controls.append(button("Start bounded run", "start"));
   if (run && ["RUNNING", "WAITING"].includes(stateLabel)) controls.append(button("Pause", "pause"));
-  if (run && stateLabel === "PAUSED") controls.append(button("Resume", "resume"));
+  if (run && ["WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Resume", "resume"));
+  if (run && stateLabel === "STOPPED") {
+    const confirmRow = node("div", "fleet-automation-inline-confirm");
+    const recover = node("button", "secondary-button compact-action", "Resume (recover stopped run)");
+    recover.type = "button";
+    recover.addEventListener("click", () => {
+      confirmRow.replaceChildren(node("small", "", "Stopped run을 복구해 재개할까요?"));
+      const yes = button("Confirm recover", "resume");
+      const no = node("button", "secondary-button compact-action", "Cancel");
+      no.type = "button"; no.addEventListener("click", () => confirmRow.remove());
+      confirmRow.append(yes, no);
+    });
+    confirmRow.append(recover);
+    controls.append(confirmRow);
+  }
+  if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Stop", "stop"));
+  wrap.append(controls);
+  return wrap;
+}
+
+*/
+
+// Keep the Fleet diagnosis labels readable even when older bundles contain
+// localized text encoded with a legacy code page.
+function renderFleetAutomationControls(featureId, owner) {
+  const wrap = node("div", "fleet-node-automation");
+  if (!owner) {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "Automation: UNASSIGNED (bind a Master first)"));
+    return wrap;
+  }
+  const projection = (state.fleetAutomationByNode || {})[featureId];
+  if (!projection || projection.status === "LOADING") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", "Automation: loading authoritative node run..."));
+    void ensureFleetAutomation(featureId, owner);
+    return wrap;
+  }
+  if (projection.status === "ERROR") {
+    wrap.append(node("p", "fleet-node-team-status is-unknown", `Automation: ERROR — ${projection.error || "read failed"}`));
+    return wrap;
+  }
+  const run = projection.run;
+  const stateLabel = String(run?.state || "IDLE").toUpperCase();
+  if (run?.stall?.items?.length) {
+    wrap.append(node("span", "fleet-automation-stalled-chip", "STALLED"));
+    for (const item of Array.from(run.stall.items)) {
+      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at);
+      const reason = item.kind === "QUEUE_BLOCKED"
+        ? `Master did not answer message ${String(item.message_id || "").slice(0, 12)}; ${item.waiting_count || 0} notification(s) waiting (${age}m)`
+        : item.kind === "HOST_PERMISSION_PENDING"
+          ? `Host permission request ${item.request_id || ""} pending (${age}m)`
+          : `Host ${item.task_frame_id || ""} is still ${item.phase || "UNKNOWN"} (${age}m)`;
+      wrap.append(node("p", "fleet-automation-stall-reason", reason));
+      if (item.kind === "QUEUE_BLOCKED" && item.message_id) {
+        const row = node("div", "fleet-automation-clear-row");
+        row.append(node("small", "", `${String(item.message_id).slice(0, 12)} · ${String(item.body || "").slice(0, 80)}`));
+        const clear = node("button", "secondary-button compact-action", "막힌 알림 정리 (Clear blocked notification)");
+        clear.type = "button";
+        clear.addEventListener("click", () => {
+          clear.disabled = true;
+          clearFleetAutomationBlocker(featureId, owner, run, item)
+            .catch(error => toast(error.message, true))
+            .finally(() => { clear.disabled = false; });
+        });
+        row.append(clear); wrap.append(row);
+      }
+    }
+  }
+  const controls = node("div", "fleet-node-team-controls");
+  const button = (label, op) => {
+    const b = node("button", "secondary-button compact-action", label);
+    b.type = "button";
+    b.addEventListener("click", () => {
+      b.disabled = true;
+      mutateFleetAutomation(featureId, owner, op, run)
+        .catch(error => toast(error.message, true))
+        .finally(() => { b.disabled = false; });
+    });
+    return b;
+  };
+  if (!run || ["COMPLETED", "STOPPED", "FAILED"].includes(stateLabel)) controls.append(button("Start bounded run", "start"));
+  if (run && ["RUNNING", "WAITING"].includes(stateLabel)) controls.append(button("Pause", "pause"));
+  if (run && ["WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Resume", "resume"));
+  if (run && stateLabel === "STOPPED") {
+    const confirmRow = node("div", "fleet-automation-inline-confirm");
+    const recover = node("button", "secondary-button compact-action", "Resume (recover stopped run)");
+    recover.type = "button";
+    recover.addEventListener("click", () => {
+      confirmRow.replaceChildren(node("small", "", "Stopped run을 복구해 재개할까요?"));
+      const yes = button("Confirm recover", "resume");
+      const no = node("button", "secondary-button compact-action", "Cancel");
+      no.type = "button"; no.addEventListener("click", () => confirmRow.replaceChildren(recover));
+      confirmRow.append(yes, no);
+    });
+    confirmRow.append(recover); controls.append(confirmRow);
+  }
   if (run && ["RUNNING", "WAITING", "PAUSED"].includes(stateLabel)) controls.append(button("Stop", "stop"));
   wrap.append(controls);
   return wrap;

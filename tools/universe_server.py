@@ -327,6 +327,8 @@ from universe_app.session_bus import (
     fanout_meeting_bus,
     match_live_terminals,
 )
+
+STALL_SECONDS = 600
 from universe_app.terminal_host import (
     TerminalHost,
     TerminalHostError,
@@ -31727,6 +31729,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.resume",
                     "persona.automation.stop",
                     "persona.automation.status",
+                    "persona.automation.clear-blocker",
                     "persona.automation.kick",
                     "persona.automation.repair-reviewer",
                     "persona.automation.tick",
@@ -37894,6 +37897,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     result = self.persona_automation.get_run(value["run_id"])
                     result["events"] = self.persona_automation.events(value["run_id"], 30)
                     result = self._annotate_persona_automation_owner_availability(result)
+                    result["stall"] = self._persona_automation_stall(result)
                     return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_STATUS_COLLECTED", "run": result}
                 if value.get("project_id"):
                     # Only forward node_ref when the caller actually sent the
@@ -37910,8 +37914,14 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     surfaced["run"] = self._annotate_persona_automation_owner_availability(
                         surfaced.get("run")
                     )
+                    if isinstance(surfaced.get("run"), Mapping):
+                        surfaced["run"]["stall"] = self._persona_automation_stall(surfaced["run"])
                     return surfaced
                 raise PersonaAutomationError("PERSONA_AUTOMATION_STATUS_TARGET_REQUIRED", "run_id or project_id is required")
+            if action_id == "persona.automation.clear-blocker":
+                value = _exact_object_fields(request, field="persona_automation_clear_blocker",
+                    required=frozenset({"run_id", "message_id", "request_id"}), optional=frozenset())
+                return self._clear_persona_automation_blocker(value)
             if action_id == "persona.automation.tick":
                 value = _exact_object_fields(request, field="persona_automation_tick", required=frozenset({"run_id", "owner_ref", "tick_id"}), optional=frozenset({"lease_seconds", "cursor"}))
                 return self.persona_automation.claim_tick(value)
@@ -45351,6 +45361,144 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 str(annotated.get("session_anchor_ref") or "")
             )
         return annotated
+
+    @staticmethod
+    def _stall_age(value: Any, now: datetime) -> float:
+        try:
+            parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - parsed).total_seconds())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _persona_automation_stall(self, run: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Read-only operator diagnosis; it never signals or stops a Host."""
+        now = datetime.now(timezone.utc)
+        run_id = str(run.get("run_id") or "")
+        anchor = str(run.get("session_anchor_ref") or "")
+        items: list[dict[str, Any]] = []
+        try:
+            messages = self.session_bus.inbox(
+                self._session_anchor_terminal_host(), session_anchor_ref=anchor,
+                projection="ACTIVITY", headers_only=False
+            ).get("messages", [])
+        except Exception:
+            messages = []
+        def belongs_to_run(message: Mapping[str, Any]) -> bool:
+            recipient = message.get("recipient_anchor_ref")
+            # Session-bus activity is scoped to the run's Master Anchor.  A
+            # missing recipient is not evidence of ownership: accepting it
+            # here would make an unanchored instruction both look stalled and
+            # eligible for operator cancellation.
+            if str(recipient or "") != anchor:
+                return False
+            message_run_id = message.get("run_id")
+            return message_run_id is None or str(message_run_id or "") == run_id
+
+        queued = [m for m in messages if belongs_to_run(m)
+                  and str(m.get("kind") or "").upper() == "INSTRUCTION"
+                  and str(m.get("lifecycle_state") or "").upper() == "QUEUED"
+                  and self._stall_age(m.get("created_at"), now) > STALL_SECONDS]
+        blocking = [m for m in messages if belongs_to_run(m)
+                    and str(m.get("kind") or "").upper() == "INSTRUCTION"
+                    and str(m.get("lifecycle_state") or "").upper() in {"STARTED", "ACCEPTED"}
+                    and self._stall_age((m.get("lifecycle") or {}).get("started_at") or m.get("created_at"), now) > STALL_SECONDS]
+        if queued and blocking:
+            oldest = min(queued, key=lambda m: str(m.get("created_at") or ""))
+            blocker = min(blocking, key=lambda m: str((m.get("lifecycle") or {}).get("started_at") or m.get("created_at") or ""))
+            items.append({"kind": "QUEUE_BLOCKED", "message_id": blocker.get("message_id"),
+                          "previous_state": blocker.get("lifecycle_state"),
+                          "created_at": blocker.get("created_at"), "thread_id": blocker.get("thread_id"),
+                          "body": str(blocker.get("body_text") or "")[:120],
+                          "waiting_count": len(queued), "oldest_waiting_at": oldest.get("created_at")})
+        frames = self.persona_automation.list_host_frames(run_id)
+        for frame in frames:
+            task_frame_id = str(frame.get("task_frame_id") or "")
+            room_id = str(frame.get("room_id") or "")
+            if not room_id or not task_frame_id:
+                continue
+            requests: dict[str, dict[str, Any]] = {}
+            decisions: set[str] = set()
+            try:
+                events = self.multi_rooms.list_room_events(room_id, after_sequence=0, limit=1000)
+            except Exception:
+                events = []
+            for event in events:
+                message = event.get("message") if isinstance(event, Mapping) else None
+                if not isinstance(message, Mapping):
+                    continue
+                try:
+                    body = json.loads(str(message.get("body_text") or ""))
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(body, Mapping):
+                    continue
+                request_id = str(body.get("request_id") or "")
+                schema = str(body.get("schema") or "")
+                created = str(message.get("created_at") or event.get("created_at") or "")
+                if schema == "universe.task-frame-host-permission-request.v1" and request_id:
+                    requests[request_id] = {"body": body, "created_at": created}
+                elif schema == "universe.task-frame-host-permission-decision.v1" and request_id:
+                    decisions.add(request_id)
+            for request_id, record in requests.items():
+                if request_id in decisions or self._stall_age(record["created_at"], now) <= STALL_SECONDS:
+                    continue
+                body = record["body"]
+                items.append({"kind": "HOST_PERMISSION_PENDING", "task_frame_id": task_frame_id,
+                              "room_id": room_id, "role": body.get("role"),
+                              "command": body.get("command") or body.get("targets"),
+                              "requested_at": record["created_at"], "request_id": request_id})
+        if str(run.get("state") or "").upper() in {"STOPPED", "COMPLETED", "FAILED"}:
+            for frame in frames:
+                task_frame_id = str(frame.get("task_frame_id") or "")
+                try:
+                    status = task_frame_host_status(self._persona_task_frame_state_root(), task_frame_id)
+                except Exception:
+                    status = {}
+                if (status.get("pid_alive") or status.get("alive")) and self._stall_age(
+                    frame.get("launched_at"), now
+                ) > STALL_SECONDS:
+                    items.append({"kind": "HOST_ORPHANED", "task_frame_id": task_frame_id,
+                                  "phase": status.get("phase"), "started_at": frame.get("launched_at")})
+        return {"items": items} if items else None
+
+    def _clear_persona_automation_blocker(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        run = self.persona_automation.get_run(value["run_id"])
+        event_key = "blocker-cleared:" + value["request_id"]
+        with self.persona_automation._connection() as connection:
+            existing = connection.execute("SELECT payload_json FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?", (run["run_id"], event_key)).fetchone()
+        if existing is not None:
+            try:
+                payload = json.loads(str(existing["payload_json"] or "{}"))
+            except (TypeError, ValueError):
+                payload = {}
+            return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_BLOCKER_CLEARED_REPLAYED", "message": payload.get("message"), "run": run}
+        stall = self._persona_automation_stall(run) or {"items": []}
+        allowed = {str(item.get("message_id")) for item in stall["items"] if item.get("kind") == "QUEUE_BLOCKED"}
+        if value["message_id"] not in allowed:
+            raise PersonaAutomationError("PERSONA_AUTOMATION_BLOCKER_NOT_REPORTED", "message_id is not a currently reported queue blocker", 409)
+        try:
+            messages = self.session_bus.inbox(
+                self._session_anchor_terminal_host(),
+                session_anchor_ref=run["session_anchor_ref"],
+                projection="ACTIVITY",
+                headers_only=False,
+            ).get("messages", [])
+        except Exception:
+            messages = []
+        target = next(
+            (message for message in messages
+             if str(message.get("message_id") or "") == value["message_id"]),
+            None,
+        )
+        if not isinstance(target, Mapping) or str(target.get("recipient_anchor_ref") or "") != str(run["session_anchor_ref"] or ""):
+            raise PersonaAutomationError("PERSONA_AUTOMATION_BLOCKER_ANCHOR_MISMATCH", "message recipient_anchor_ref must exactly match the run session anchor", 409)
+        message = self.session_bus.transition(value["message_id"], state="CANCELLED", session_anchor_ref=run["session_anchor_ref"], error_code="OPERATOR_CLEARED_BLOCKER")
+        with self.persona_automation._connection() as connection:
+            previous_state = next((item.get("previous_state") for item in stall["items"] if item.get("message_id") == value["message_id"]), "UNKNOWN")
+            self.persona_automation._event(connection, run["run_id"], "BLOCKER_CLEARED", event_key, {"message_id": value["message_id"], "previous_state": previous_state, "request_id": value["request_id"], "message": message})
+        return {"schema": "universe.persona-automation.v1", "status": "PERSONA_AUTOMATION_BLOCKER_CLEARED", "message": message, "run": self.persona_automation.get_run(value["run_id"])}
 
     def _wake_master_queue_on_session_ready(
         self, project_id: str, mode: str, *, reason: str

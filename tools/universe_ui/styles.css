@@ -8966,6 +8966,9 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .fleet-project-conductor-status.is-unknown { color: var(--amber, #d8ad61); }
 .fleet-project-conductor-status.is-error { color: var(--red, #da756b); }
 .fleet-node-automation, .fleet-node-collaboration, .fleet-node-orphan-queue { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; padding-top: 4px; border-top: 1px solid rgba(122, 124, 130, .12); }
+.fleet-automation-stalled-chip { display: inline-block; width: fit-content; padding: 2px 6px; border-radius: 4px; color: #fff; background: #b42318; font-weight: 700; font-size: 11px; }
+.fleet-automation-stall-reason { margin: 0; color: #b42318; font-size: 12px; }
+.fleet-automation-clear-row, .fleet-automation-inline-confirm { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .fleet-node-collaboration > strong, .fleet-node-orphan-queue > strong { display: block; }
 .fleet-node-orphan-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 5px; font-size: 10px; overflow-wrap: anywhere; }
 .fleet-node-role { color: var(--text, #e8edf5); font-weight: 700; }
