@@ -5047,9 +5047,7 @@ async function refreshFleetHomeSoft() {
       if (signature !== state.fleetHomeRefreshGoalSignature) {
         state.fleetHomeRefreshGoalSignature = signature;
         state.goals = goalPlan.goals || state.goals || [];
-        state.unassignedTodos = (goalPlan.unassigned_todos || []).filter(
-          (todo) => todo.state !== "DONE"
-        );
+        state.unassignedTodos = goalPlan.unassigned_todos || [];
         changed = true;
       }
     }
@@ -6825,6 +6823,10 @@ function fleetHomeWorkerRows(nodes) {
   if (project?.status === "READY") {
     for (const assignment of project.rows || []) {
       if (String(assignment.state || "").toUpperCase() !== "ACTIVE") continue;
+      const terminal = fleetAuthoritativeTerminals().find((item) =>
+        String(item.session_anchor_ref || "").trim() === String(assignment.session_anchor_ref || "").trim()
+      );
+      if (!terminal || fleetWorkerTerminalState(terminal) !== "LIVE") continue;
       const key = fleetWorkerAssignmentKey(assignment);
       if (!key || seenAssignments.has(key)) continue;
       seenAssignments.add(key);
@@ -8264,9 +8266,7 @@ async function selectProject(
     }
     state.goals = coreGoalPlan.goals || [];
     state.universeGoals = coreUniverseGoals.goals || [];
-    state.unassignedTodos = (coreGoalPlan.unassigned_todos || []).filter(
-      (todo) => todo.state !== "DONE"
-    );
+    state.unassignedTodos = coreGoalPlan.unassigned_todos || [];
     elements.workspaceTitle.textContent = project.project_id;
     elements.workspaceSubtitle.textContent =
       state.projection?.project?.goal || project.project_root;
@@ -8434,9 +8434,7 @@ async function selectProject(
     automationEntries.filter(([, surface]) => surface)
   );
   state.universeGoals = universeGoalResult.goals || [];
-  state.unassignedTodos = (goalPlanResult.unassigned_todos || []).filter(
-    (todo) => todo.state !== "DONE"
-  );
+  state.unassignedTodos = goalPlanResult.unassigned_todos || [];
   // Rooms surface in the home detail panel; load them non-blocking.
   refreshProjectRooms()
     .then(() => {
@@ -17172,9 +17170,7 @@ async function refreshGoalPlan() {
   const universeResult = await api("/v1/universe-goals").catch(() => ({ goals: [] }));
   state.goals = result.goals || [];
   state.universeGoals = universeResult.goals || [];
-  state.unassignedTodos = (result.unassigned_todos || []).filter(
-    (todo) => todo.state !== "DONE"
-  );
+  state.unassignedTodos = result.unassigned_todos || [];
   const contextualGoals = goalsForSelectedContext();
   if (!contextualGoals.some((goal) => goal.goal_id === state.selectedGoalId)) {
     state.selectedGoalId = contextualGoals[0]?.goal_id || null;
