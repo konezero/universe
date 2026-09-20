@@ -5806,7 +5806,6 @@ function renderFleetAutomationControls(featureId, owner) {
   }
   const run = projection.run;
   const stateLabel = String(run?.state || "IDLE").toUpperCase();
-  if (run?.execution_mode) wrap.append(node("p", "fleet-node-team-status", `Execution: ${run.execution_mode}`));
   const worker = run?.current_worker;
   if (worker) {
     const workerAssignment = worker.assignment || {};
@@ -5909,7 +5908,6 @@ function renderFleetConductorAutomationControls(projectId, anchor) {
   }
   const run = projection.run;
   const stateLabel = String(run?.state || "IDLE").toUpperCase();
-  if (run?.execution_mode) wrap.append(node("p", "fleet-project-conductor-status", `Execution: ${run.execution_mode}`));
   wrap.append(node("p", "fleet-project-conductor-status", `Automation: ${stateLabel}${run?.next_condition ? ` - next ${run.next_condition}` : ""}`));
   if (run?.owner_availability && run.owner_availability !== "LIVE") {
     wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Owner Anchor: ${run.owner_availability}`));

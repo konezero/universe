@@ -435,167 +435,34 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         })
         self.assertEqual("PERSONA_AUTOMATION_LEGACY_REVIEWER_REPAIR_REPLAYED", replay["status"])
 
-    def _prepared_run(self):
-        run = self.store.start_run(
+    def test_worker_review_mode_is_retired_for_new_runs(self):
+        # Worker and Reviewer are roles in a Task Frame the Master launches, not a
+        # mode of the run: the server no longer starts or reviews Workers itself.
+        with self.assertRaises(PersonaAutomationError) as raised:
+            self.store.start_run(
+                {
+                    "project_id": self.assignment["project_id"],
+                    "session_anchor_ref": self.assignment["session_anchor_ref"],
+                    "scope": "feature-worker-review",
+                    "instruction": "run one bounded Worker task",
+                    "request_id": "worker-review-retired",
+                    "execution_mode": "WORKER_REVIEW",
+                },
+                self.assignment,
+            )
+        self.assertEqual("PERSONA_AUTOMATION_EXECUTION_MODE_RETIRED", raised.exception.code)
+        self.assertIn("launch-frame", raised.exception.detail)
+        started = self.store.start_run(
             {
                 "project_id": self.assignment["project_id"],
                 "session_anchor_ref": self.assignment["session_anchor_ref"],
                 "scope": "feature-worker-review",
-                "instruction": "run one bounded Worker task",
-                "request_id": "worker-review-start",
-                "execution_mode": "WORKER_REVIEW",
-                "worker_provider": "CODEX",
-                "worker_model_ref": "gpt-5.6-luna",
+                "instruction": "direct run",
+                "request_id": "master-direct-still-starts",
             },
             self.assignment,
         )["run"]
-        self.store.claim_tick(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "tick_id": "worker-review-tick",
-            }
-        )
-        self.store.record_decision(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "decision_id": "worker-review-decision",
-                "kind": "EXECUTE",
-                "rationale": "the exact node Todo is in scope",
-                "evidence_refs": ["todo:scope"],
-                "target": {
-                    "todo_id": "todo_worker_review",
-                    "node_ref": self.assignment["node_ref"],
-                },
-            }
-        )
-        return run
-
-    def test_worker_result_creates_distinct_reviewer_and_pass_completes(self):
-        run = self._prepared_run()
-        worker_assignment = {
-            "assignment_id": "task_worker_implementer",
-            "project_id": self.assignment["project_id"],
-            "node_ref": self.assignment["node_ref"],
-            "todo_id": "todo_worker_review",
-            "task_frame_id": None,
-            "worker_role": "IMPLEMENTER",
-            "session_anchor_ref": "worker-anchor",
-            "assignment_revision": 1,
-            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
-        }
-        dispatch = self.store.dispatch_work(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "dispatch_id": "worker-review-dispatch",
-                "title": "bounded worker task",
-                "instruction": "inspect the fixture without changing source",
-                "completion_conditions": ["result evidence"],
-            },
-            lambda _project_id, _value: self.fail("WORKER_REVIEW must not enqueue Master work"),
-            create_worker=lambda _spec: {"assignment": worker_assignment},
-        )
-        self.assertEqual("WORKER_ASSIGNED", dispatch["dispatch"]["state"])
-        self.assertEqual("todo_worker_review", dispatch["dispatch"]["todo_id"])
-
-        reviewer_assignment = {
-            **worker_assignment,
-            "assignment_id": "task_worker_reviewer",
-            "worker_role": "REVIEWER",
-            "session_anchor_ref": "reviewer-anchor",
-        }
-        result = self.store.record_worker_result(
-            {
-                "run_id": run["run_id"],
-                "dispatch_id": "worker-review-dispatch",
-                "worker_assignment_id": worker_assignment["assignment_id"],
-                "worker_assignment_revision": 1,
-                "worker_anchor_ref": worker_assignment["session_anchor_ref"],
-                "result_ref": "worker-result-1",
-                "outcome": "SUCCEEDED",
-                "evidence_refs": ["fixture:result"],
-                "result_text": "bounded fixture completed",
-            },
-            create_reviewer=lambda spec: self.assertEqual(
-                "worker-result-1", spec["worker_result"]["result_ref"]
-            ) or {"assignment": reviewer_assignment},
-        )
-        self.assertEqual("reviewer-anchor", result["reviewer"]["assignment"]["session_anchor_ref"])
-        self.assertEqual("REVIEWER_ASSIGNED", result["run"]["current_assignment"]["state"])
-        self.assertEqual("reviewer-anchor", result["run"]["current_reviewer"]["assignment"]["session_anchor_ref"])
-
-        verdict = self.store.record_reviewer_verdict(
-            {
-                "run_id": run["run_id"],
-                "dispatch_id": "worker-review-dispatch",
-                "reviewer_assignment_id": reviewer_assignment["assignment_id"],
-                "reviewer_assignment_revision": 1,
-                "reviewer_anchor_ref": reviewer_assignment["session_anchor_ref"],
-                "worker_result_ref": "worker-result-1",
-                "outcome": "PASS",
-                "acceptance_status": "VERIFIED_EVIDENCE",
-                "evidence_refs": ["review:independent-pass"],
-            }
-        )
-        self.assertEqual("PASS", verdict["review"]["outcome"])
-        completed = self.store.complete_run(
-            {"run_id": run["run_id"], "request_id": "worker-review-complete", "complete": True}
-        )
-        self.assertEqual("COMPLETED", completed["run"]["state"])
-
-        reopened = PersonaAutomationStore(self.store.database_path)
-        durable = reopened.get_run(run["run_id"])
-        self.assertEqual("WORKER_REVIEW", durable["execution_mode"])
-        self.assertEqual("worker-result-1", durable["current_worker"]["result"]["result_ref"])
-        self.assertEqual("reviewer-anchor", durable["current_reviewer"]["assignment"]["session_anchor_ref"])
-        self.assertEqual("PASS", durable["current_review"]["outcome"])
-
-    def test_lineage_and_todo_gate_reject_unbound_verdicts(self):
-        run = self._prepared_run()
-        assignment = {
-            "assignment_id": "task_worker_implementer",
-            "project_id": self.assignment["project_id"],
-            "node_ref": self.assignment["node_ref"],
-            "todo_id": "todo_worker_review",
-            "task_frame_id": None,
-            "worker_role": "IMPLEMENTER",
-            "session_anchor_ref": "worker-anchor",
-            "assignment_revision": 1,
-            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
-        }
-        dispatch = self.store.dispatch_work(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "dispatch_id": "worker-review-dispatch",
-                "title": "bounded worker task",
-                "instruction": "inspect",
-                "completion_conditions": ["evidence"],
-            },
-            lambda _project_id, _value: None,
-            create_worker=lambda _spec: {"assignment": assignment},
-        )
-        with self.assertRaisesRegex(PersonaAutomationError, "exact session_anchor_ref lineage"):
-            self.store.record_worker_result(
-                {
-                    "run_id": run["run_id"],
-                    "dispatch_id": dispatch["dispatch"]["dispatch_id"],
-                    "worker_assignment_id": assignment["assignment_id"],
-                    "worker_assignment_revision": 1,
-                    "worker_anchor_ref": "wrong-worker-anchor",
-                    "result_ref": "wrong-result",
-                    "outcome": "SUCCEEDED",
-                    "evidence_refs": ["fixture"],
-                },
-                create_reviewer=lambda _spec: {"assignment": {}},
-            )
-        self.assertIsNotNone(
-            self.store.todo_completion_gate(
-                self.assignment["project_id"], "todo_worker_review", self.assignment["node_ref"]
-            )
-        )
+        self.assertEqual("MASTER_DIRECT", started["execution_mode"])
 
     def test_server_dispatch_uses_typed_worker_adapter(self):
         calls = []
@@ -634,122 +501,6 @@ class PersonaWorkerReviewAutomationTests(unittest.TestCase):
         )
         self.assertEqual("PERSONA_AUTOMATION_WORKER_DISPATCHED", result["status"])
         self.assertEqual("IMPLEMENTER", calls[0]["assignment"]["worker_role"])
-
-    def test_worker_instruction_receipt_is_bound_and_replay_safe(self):
-        run = self._prepared_run()
-        worker_assignment = {
-            "assignment_id": "task_worker_instruction",
-            "project_id": self.assignment["project_id"],
-            "node_ref": self.assignment["node_ref"],
-            "todo_id": "todo_worker_review",
-            "task_frame_id": None,
-            "worker_role": "IMPLEMENTER",
-            "session_anchor_ref": "worker-instruction-anchor",
-            "assignment_revision": 1,
-            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
-        }
-        self.store.dispatch_work(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "dispatch_id": "worker-instruction-dispatch",
-                "title": "bounded task",
-                "instruction": "inspect fixture",
-                "completion_conditions": ["result evidence"],
-            },
-            lambda _project_id, _value: self.fail("WORKER_REVIEW must not enqueue Master work"),
-            create_worker=lambda _spec: {"assignment": worker_assignment},
-        )
-        receipt = {
-            "run_id": run["run_id"],
-            "dispatch_id": "worker-instruction-dispatch",
-            "worker_role": "IMPLEMENTER",
-            "worker_assignment_id": worker_assignment["assignment_id"],
-            "worker_assignment_revision": 1,
-            "worker_anchor_ref": worker_assignment["session_anchor_ref"],
-            "message_id": "msg_worker_instruction",
-            "idempotency_key": "persona-worker-instruction-test",
-        }
-        first = self.store.record_worker_instruction(receipt)
-        self.assertEqual(
-            "PERSONA_AUTOMATION_WORKER_INSTRUCTION_RECORDED", first["status"]
-        )
-        self.assertEqual(
-            "msg_worker_instruction",
-            self.store.get_run(run["run_id"])["current_worker"]["instruction_message_id"],
-        )
-        replay = self.store.record_worker_instruction(receipt)
-        self.assertEqual(
-            "PERSONA_AUTOMATION_WORKER_INSTRUCTION_REPLAYED", replay["status"]
-        )
-        with self.assertRaisesRegex(PersonaAutomationError, "different instruction message"):
-            self.store.record_worker_instruction({**receipt, "message_id": "msg_other"})
-
-    def test_precreated_claim_stays_claimed_until_transport_completion(self):
-        run = self._prepared_run()
-        worker_assignment = {
-            "assignment_id": "task_worker_claim",
-            "project_id": self.assignment["project_id"],
-            "node_ref": self.assignment["node_ref"],
-            "todo_id": "todo_worker_review",
-            "task_frame_id": None,
-            "worker_role": "IMPLEMENTER",
-            "session_anchor_ref": "worker-claim-anchor",
-            "assignment_revision": 1,
-            "assigned_by_session_anchor_ref": self.assignment["session_anchor_ref"],
-        }
-        precreated = {
-            "message_id": "msg_precreated_claim",
-            "terminal_id": "term-worker-claim",
-            "claim_state": "CLAIMED",
-            "metadata": {
-                "run_id": run["run_id"],
-                "dispatch_id": "worker-claim-dispatch",
-                "worker_role": "IMPLEMENTER",
-                "worker_assignment_id": worker_assignment["assignment_id"],
-                "worker_assignment_revision": 1,
-                "worker_anchor_ref": worker_assignment["session_anchor_ref"],
-                "idempotency_key": "persona-automation-claim",
-            },
-        }
-        self.store.dispatch_work(
-            {
-                "run_id": run["run_id"],
-                "owner_ref": self.assignment["session_anchor_ref"],
-                "dispatch_id": "worker-claim-dispatch",
-                "title": "bounded task",
-                "instruction": "inspect fixture",
-                "completion_conditions": ["result evidence"],
-            },
-            lambda _project_id, _value: self.fail("WORKER_REVIEW must not enqueue Master work"),
-            create_worker=lambda _spec: {
-                "assignment": worker_assignment,
-                "automation_instruction": precreated,
-            },
-        )
-        receipt = {
-            **precreated["metadata"],
-            "message_id": precreated["message_id"],
-        }
-        recorded = self.store.record_worker_instruction(receipt)
-        self.assertEqual(
-            "CLAIMED",
-            self.store.get_run(run["run_id"])["current_worker"]["precreated_instruction"]["claim_state"],
-        )
-        marked = self.store.mark_worker_instruction_claim_state(
-            run_id=run["run_id"],
-            worker_role="IMPLEMENTER",
-            message_id=precreated["message_id"],
-            expected_revision=recorded["run"]["revision"],
-        )
-        self.assertEqual("DISPATCHED", marked["claim_state"])
-        replay = self.store.mark_worker_instruction_claim_state(
-            run_id=run["run_id"],
-            worker_role="IMPLEMENTER",
-            message_id=precreated["message_id"],
-            expected_revision=marked["run"]["revision"],
-        )
-        self.assertEqual("PERSONA_AUTOMATION_WORKER_CLAIM_STATE_REPLAYED", replay["status"])
 
     def test_session_bus_worker_reply_routes_to_typed_result_action(self):
         calls = []

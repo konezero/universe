@@ -703,6 +703,16 @@ class PersonaAutomationStore:
                 "PERSONA_AUTOMATION_EXECUTION_MODE_INVALID",
                 "execution_mode must be MASTER_DIRECT or WORKER_REVIEW",
             )
+        if execution_mode == "WORKER_REVIEW":
+            # Worker and Reviewer are persona roles inside a Task Frame the Master
+            # launches (persona.automation.launch-frame), not a mode of the run.
+            # The server no longer starts or reviews Workers by itself.
+            raise PersonaAutomationError(
+                "PERSONA_AUTOMATION_EXECUTION_MODE_RETIRED",
+                "WORKER_REVIEW is retired: the Master launches Worker/Reviewer Task Frames "
+                "itself with persona.automation.launch-frame",
+                409,
+            )
         worker_config = {
             "persona_id": value.get("worker_persona_id"),
             "provider": value.get("worker_provider"),
