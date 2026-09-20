@@ -44,6 +44,23 @@ test("renders each stall kind and clears the reported queue blocker", async () =
   assert.equal(context.invokeArgs[1].message_id, "message-123456789");
 });
 
+test("a dead or silent Host is only a notice: no action button, and the wait is left to the user", () => {
+  const { view } = make({ state: "RUNNING", stall: { items: [
+    { kind: "HOST_DIED", task_frame_id: "dead-frame", phase: "RUNNING_WORKER", since: "2026-09-20T15:00:00Z" },
+    { kind: "HOST_ROLE_SILENT", task_frame_id: "quiet-frame", phase: "RUNNING_REVIEWER", since: "2026-09-20T15:00:00Z" },
+  ] } });
+  assert.match(view.textContent, /STALLED/);
+  assert.match(view.textContent, /dead-frame/);
+  assert.match(view.textContent, /died/);
+  assert.match(view.textContent, /quiet-frame/);
+  assert.match(view.textContent, /usage limit/);
+  assert.match(view.textContent, /you decide/);
+  // Only the ordinary run controls exist; nothing offers to cancel, kill or fail anything.
+  const labels = buttons(view).map(b => b.textContent);
+  assert.ok(labels.every(l => /Pause|Stop|Resume|Start/.test(l)), labels.join(","));
+  assert.ok(!labels.some(l => /Clear|kill|terminate|fail/i.test(l)), labels.join(","));
+});
+
 test("shows Resume for WAITING and requires inline confirmation for STOPPED recovery", async () => {
   const waiting = make({ state: "WAITING" });
   assert.ok(buttons(waiting.view).some(b => b.textContent === "Resume"));

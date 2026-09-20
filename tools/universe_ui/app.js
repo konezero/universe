@@ -5940,12 +5940,16 @@ function obsoleteFleetAutomationControls(featureId, owner) {
   if (stall?.items?.length) {
     wrap.append(node("span", "fleet-automation-stalled-chip", "STALLED"));
     for (const item of stall.items) {
-      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at);
+      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at || item.since);
       const reason = item.kind === "QUEUE_BLOCKED"
         ? `Master가 ${item.created_at || "알림"}에 답하지 않아 알림 ${item.waiting_count || 0}개 대기 중 (${age}분)`
         : item.kind === "HOST_PERMISSION_PENDING"
           ? `Host 권한 요청 ${item.request_id || ""}이 ${age}분째 대기 중`
-          : `Host ${item.task_frame_id || ""}가 ${item.phase || "UNKNOWN"} 상태로 남아 있음 (${age}분)`;
+          : item.kind === "HOST_DIED"
+            ? `Host ${item.task_frame_id || ""}가 ${item.phase || "UNKNOWN"} 도중 종료되어 알림을 보낼 수 없음 (마지막 신호 ${age}분 전)`
+            : item.kind === "HOST_ROLE_SILENT"
+              ? `Host ${item.task_frame_id || ""}의 ${item.phase || "UNKNOWN"} 역할이 ${age}분째 신호 없음. 사용량 한도 대기일 수 있음 — 계속 기다릴지는 사용자가 정함`
+              : `Host ${item.task_frame_id || ""}가 ${item.phase || "UNKNOWN"} 상태로 남아 있음 (${age}분)`;
       wrap.append(node("p", "fleet-automation-stall-reason", reason));
       if (item.kind === "QUEUE_BLOCKED" && item.message_id) {
         const row = node("div", "fleet-automation-clear-row");
@@ -6019,12 +6023,16 @@ function renderFleetAutomationControls(featureId, owner) {
   if (run?.stall?.items?.length) {
     wrap.append(node("span", "fleet-automation-stalled-chip", "STALLED"));
     for (const item of Array.from(run.stall.items)) {
-      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at);
+      const age = fleetStallAge(item.created_at || item.requested_at || item.started_at || item.since);
       const reason = item.kind === "QUEUE_BLOCKED"
         ? `Master did not answer message ${String(item.message_id || "").slice(0, 12)}; ${item.waiting_count || 0} notification(s) waiting (${age}m)`
         : item.kind === "HOST_PERMISSION_PENDING"
           ? `Host permission request ${item.request_id || ""} pending (${age}m)`
-          : `Host ${item.task_frame_id || ""} is still ${item.phase || "UNKNOWN"} (${age}m)`;
+          : item.kind === "HOST_DIED"
+            ? `Host ${item.task_frame_id || ""} died during ${item.phase || "UNKNOWN"} and cannot notify (last sign ${age}m ago)`
+            : item.kind === "HOST_ROLE_SILENT"
+              ? `Host ${item.task_frame_id || ""} role ${item.phase || "UNKNOWN"} has shown no sign of life for ${age}m; it may be waiting on a usage limit, so you decide whether to keep waiting`
+              : `Host ${item.task_frame_id || ""} is still ${item.phase || "UNKNOWN"} (${age}m)`;
       wrap.append(node("p", "fleet-automation-stall-reason", reason));
       if (item.kind === "QUEUE_BLOCKED" && item.message_id) {
         const row = node("div", "fleet-automation-clear-row");

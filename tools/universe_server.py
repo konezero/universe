@@ -329,6 +329,9 @@ from universe_app.session_bus import (
 )
 
 STALL_SECONDS = 600
+# A role that has shown no heartbeat this long is only reported: it may be waiting on a
+# usage limit, and whether to keep waiting is the operator's call, never automatic.
+ROLE_SILENT_SECONDS = 1800
 from universe_app.terminal_host import (
     TerminalHost,
     TerminalHostError,
@@ -45461,6 +45464,25 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 ) > STALL_SECONDS:
                     items.append({"kind": "HOST_ORPHANED", "task_frame_id": task_frame_id,
                                   "phase": status.get("phase"), "started_at": frame.get("launched_at")})
+        if str(run.get("state") or "").upper() in {"RUNNING", "WAITING", "PAUSED"}:
+            # Provider-independent and notice-only: nothing here waits for, signals or
+            # ends a Host.  A Host that died mid-role can never notify the Master, and a
+            # role with no sign of life for a long time may just be waiting on a limit.
+            for frame in frames:
+                task_frame_id = str(frame.get("task_frame_id") or "")
+                try:
+                    status = task_frame_host_status(self._persona_task_frame_state_root(), task_frame_id)
+                except Exception:
+                    continue
+                phase = str(status.get("phase") or "")
+                if not phase.startswith("RUNNING_"):
+                    continue
+                if not (status.get("pid_alive") or status.get("alive")):
+                    items.append({"kind": "HOST_DIED", "task_frame_id": task_frame_id, "phase": phase,
+                                  "since": status.get("updated_at")})
+                elif self._stall_age(status.get("updated_at"), now) > ROLE_SILENT_SECONDS:
+                    items.append({"kind": "HOST_ROLE_SILENT", "task_frame_id": task_frame_id, "phase": phase,
+                                  "since": status.get("updated_at")})
         return {"items": items} if items else None
 
     def _clear_persona_automation_blocker(self, value: Mapping[str, Any]) -> dict[str, Any]:

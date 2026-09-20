@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from persona_automation import PersonaAutomationStore, PersonaAutomationError
-from universe_server import STALL_SECONDS, UniverseHTTPServer
+from universe_server import ROLE_SILENT_SECONDS, STALL_SECONDS, UniverseHTTPServer
 
 
 def old(minutes=11):
@@ -99,6 +99,34 @@ class StallTests(unittest.TestCase):
             self.server.persona_automation.list_host_frames = lambda _run: [{"task_frame_id": "frame", "room_id": "room", "launched_at": old_seconds(STALL_SECONDS + 1)}]
             stall = self.server._persona_automation_stall(self.run_data("STOPPED"))
         self.assertEqual({"HOST_PERMISSION_PENDING", "HOST_ORPHANED"}, {i["kind"] for i in stall["items"]})
+
+    def test_a_dead_or_long_silent_running_host_is_only_reported_never_acted_on(self):
+        def stamp(seconds):
+            return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self.server.persona_automation.list_host_frames = lambda _run: [{"task_frame_id": "frame", "room_id": "room"}]
+        bus_calls = []
+        self.server.session_bus.transition = lambda *a, **k: bus_calls.append((a, k))
+
+        def diagnose(state="RUNNING", **status):
+            with patch("universe_server.task_frame_host_status", return_value=status):
+                return self.server._persona_automation_stall(self.run_data(state))
+
+        # A working role (fresh heartbeat) and an idle Host waiting for the Master are not stalls.
+        self.assertIsNone(diagnose(alive=True, phase="RUNNING_WORKER", updated_at=stamp(60)))
+        self.assertIsNone(diagnose(alive=True, phase="WAITING", updated_at=stamp(ROLE_SILENT_SECONDS + 500)))
+        # Exactly at the limit is not yet silent; past it the role is reported, with a plain reason.
+        self.assertIsNone(diagnose(alive=True, phase="RUNNING_REVIEWER", updated_at=stamp(ROLE_SILENT_SECONDS - 5)))
+        silent = diagnose(alive=True, phase="RUNNING_REVIEWER", updated_at=stamp(ROLE_SILENT_SECONDS + 30))
+        self.assertEqual(["HOST_ROLE_SILENT"], [i["kind"] for i in silent["items"]])
+        self.assertEqual(("frame", "RUNNING_REVIEWER"), (silent["items"][0]["task_frame_id"], silent["items"][0]["phase"]))
+        # A Host whose process is gone in the middle of a role can never notify: reported at once.
+        died = diagnose(alive=False, pid_alive=False, phase="RUNNING_WORKER", updated_at=stamp(30))
+        self.assertEqual(["HOST_DIED"], [i["kind"] for i in died["items"]])
+        # A finished run's Host is the existing orphan kind, not these.
+        self.assertIsNone(diagnose("STOPPED", alive=False, phase="RUNNING_WORKER", updated_at=stamp(9999)))
+        # Diagnosing never touches the bus or a Host.
+        self.assertEqual([], bus_calls)
 
     def test_clear_only_reported_blocker_and_is_idempotent(self):
         blocker = {"message_id": "blocker", "kind": "INSTRUCTION", "lifecycle_state": "STARTED", "created_at": old(11), "recipient_anchor_ref": "anchor-1", "run_id": self.run_id}
