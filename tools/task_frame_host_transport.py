@@ -89,9 +89,11 @@ class HttpBusPort:
 
     def notify(self, *, idempotency_key: str, body_text: str, payload: Mapping[str, Any]) -> None:
         # A bus INSTRUCTION must be replied to before the session receives anything
-        # else.  A clean exit needs no answer, so it is a NOTE and cannot wedge the
-        # Master's queue; results, failures and permission requests stay INSTRUCTIONs.
-        informational = payload.get("role") == "HOST" and payload.get("status") == "EXITED"
+        # else.  An unanswered Host exit (clean or not, and often for a run that was
+        # already stopped) would leave every later message SESSION_BUSY, so any Host
+        # exit is a NOTE; the Boss room report and call_master still reach the Master.
+        # Results, failures and permission requests stay INSTRUCTIONs.
+        informational = payload.get("role") == "HOST"
         self._http.request(
             "POST",
             "/v1/session-bus/messages",

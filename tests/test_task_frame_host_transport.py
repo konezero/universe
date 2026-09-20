@@ -96,12 +96,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual("thr", body["thread_id"])
         self.assertIn('"status": "COMPLETED"', body["body_text"])
 
-    def test_a_clean_host_exit_is_a_note_so_it_cannot_block_the_masters_queue(self):
+    def test_a_host_exit_is_a_note_so_it_cannot_block_the_masters_queue(self):
         bus = HttpBusPort(self.base, to={"mode": "MASTER"}, sender={"provider": "UNIVERSE"}, thread_id="thr")
         bus.notify(idempotency_key="k1", body_text="exited", payload={"role": "HOST", "status": "EXITED"})
         bus.notify(idempotency_key="k2", body_text="idle", payload={"role": "HOST", "status": "EXITED_FAILED"})
         bus.notify(idempotency_key="k3", body_text="done", payload={"role": "WORKER", "status": "COMPLETED"})
-        self.assertEqual(["NOTE", "INSTRUCTION", "INSTRUCTION"], [call[2]["kind"] for call in Stub.calls])
+        self.assertEqual(["NOTE", "NOTE", "INSTRUCTION"], [call[2]["kind"] for call in Stub.calls])
 
     def test_todo_port_reports_state_and_treats_an_absent_todo_as_archived(self):
         Stub.todos = [{"todo_id": "todo_1", "state": "IN_PROGRESS", "archived_at": None}]
