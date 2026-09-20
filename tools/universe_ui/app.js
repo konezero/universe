@@ -6212,6 +6212,26 @@ function fleetWorkerTerminalState(terminal) {
     : "OFFLINE";
 }
 
+// Worker/Reviewer terminals are deliberately absent from state.terminals so
+// the normal dock stays quiet. A Fleet Peek is the explicit exception: add
+// only this authoritative session for the duration of the attach, then use
+// the existing terminal surface lifecycle. The next terminal refresh restores
+// the normal dock projection and removes the temporary peek tab.
+function peekFleetWorkerTerminal(terminal) {
+  const terminalId = String(terminal?.terminal_id || "").trim();
+  if (!terminalId || typeof selectTerminalTab !== "function") return false;
+  const current = Array.isArray(state.terminals) ? state.terminals : [];
+  if (!current.some((item) => String(item?.terminal_id || "") === terminalId)) {
+    state.terminals = [
+      ...current.filter((item) => String(item?.terminal_id || "") !== terminalId),
+      terminal,
+    ];
+  }
+  selectTerminalTab(terminalId);
+  if (typeof expandConversationLayer === "function") expandConversationLayer();
+  return true;
+}
+
 function bindFleetNodeMaster(featureId, sessionAnchorRef, personaId) {
   const projectId = String(state.selectedProject?.project_id || "").trim();
   const anchor = String(sessionAnchorRef || "").trim();
@@ -6733,6 +6753,63 @@ function renderHomeNodeOwnerRow(graphNode) {
   return controls;
 }
 
+function fleetHomeWorkerSummary(nodes) {
+  const section = node("section", "fleet-home-worker-summary");
+  const heading = node("div", "fleet-home-worker-summary-head");
+  heading.append(node("strong", "", "Running Worker / Reviewer"));
+  const rows = [];
+  let loading = false;
+  for (const graphNode of nodes) {
+    if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") continue;
+    const featureId = homeNodeRefKey(graphNode.node_id);
+    const projection = fleetWorkerAssignments(featureId);
+    if (projection.status !== "READY") {
+      loading = true;
+      void ensureFleetWorkerAssignments(featureId);
+      continue;
+    }
+    for (const assignment of projection.active) {
+      rows.push({ graphNode, assignment });
+    }
+  }
+  heading.append(node("span", "fleet-home-worker-count", loading ? "…" : String(rows.length)));
+  section.append(heading);
+  if (loading && !rows.length) {
+    section.append(node("p", "fleet-home-worker-status is-unknown", "Loading authoritative Worker/Reviewer assignments…"));
+    return section;
+  }
+  if (!rows.length) {
+    section.append(node("p", "fleet-home-worker-status", "No Worker/Reviewer sessions are running."));
+    return section;
+  }
+  const list = node("div", "fleet-home-worker-list");
+  for (const { graphNode, assignment } of rows) {
+    const row = node("div", "fleet-home-worker-row");
+    const terminal = fleetAuthoritativeTerminals().find((item) =>
+      String(item.session_anchor_ref || "") === String(assignment.session_anchor_ref || "") &&
+      String(item.project_id || "") === String(state.selectedProject?.project_id || "")
+    );
+    const role = String(assignment.worker_role || "IMPLEMENTER").toUpperCase() === "REVIEWER" ? "Reviewer" : "Worker";
+    row.append(
+      node("span", "fleet-home-worker-role", role),
+      node("span", "fleet-home-worker-copy", `${homeNodeTitleWithId(graphNode)} / ${assignment.session_anchor_ref || "UNKNOWN"}`),
+      node("span", "fleet-home-worker-state", fleetWorkerTerminalState(terminal)),
+    );
+    const peek = node("button", "secondary-button compact-action fleet-home-worker-peek", "Peek");
+    peek.type = "button";
+    peek.disabled = !terminal;
+    peek.title = terminal ? "Open this live session in the terminal dock" : "No live terminal projection is available";
+    peek.addEventListener("click", () => {
+      if (!terminal) return;
+      peekFleetWorkerTerminal(terminal);
+    });
+    row.append(peek);
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
 function renderHomeNodes(selNode) {
   const listEl = document.querySelector("#home-node-list");
   const head = document.querySelector("#home-nodes-head");
@@ -6744,6 +6821,7 @@ function renderHomeNodes(selNode) {
     listEl.append(node("div", "goal-plan-empty", "No nodes in this project's projection yet."));
     return;
   }
+  listEl.append(fleetHomeWorkerSummary(nodes));
   for (const graphNode of nodes) {
     const selected = graphNode.node_id === selNode?.node_id;
     const todos = homeNodeTodos(graphNode);

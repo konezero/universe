@@ -3333,6 +3333,32 @@ dialog label {
 
 .fleet-feature-summary small { color: var(--muted); }
 
+.fleet-home-worker-summary {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid rgba(111, 155, 147, 0.45);
+  border-radius: 8px;
+  background: rgba(111, 155, 147, 0.06);
+}
+
+.fleet-home-worker-summary-head,
+.fleet-home-worker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fleet-home-worker-summary-head { justify-content: space-between; }
+.fleet-home-worker-count { color: #9ed0c5; font-size: 18px; font-weight: 750; }
+.fleet-home-worker-status { margin: 0; color: var(--muted); font-size: 11px; }
+.fleet-home-worker-list { display: grid; gap: 5px; }
+.fleet-home-worker-row { min-width: 0; padding: 5px 0; border-top: 1px solid var(--line); font-size: 10px; }
+.fleet-home-worker-role { color: #9ed0c5; font-weight: 700; }
+.fleet-home-worker-copy { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.fleet-home-worker-state { color: var(--muted); font-size: 9px; }
+.fleet-home-worker-peek { flex: 0 0 auto; }
+
 .fleet-feature-state {
   color: var(--muted);
   font-size: 9px;
