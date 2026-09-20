@@ -88,13 +88,17 @@ class HttpBusPort:
         self._thread_id = thread_id
 
     def notify(self, *, idempotency_key: str, body_text: str, payload: Mapping[str, Any]) -> None:
+        # A bus INSTRUCTION must be replied to before the session receives anything
+        # else.  A clean exit needs no answer, so it is a NOTE and cannot wedge the
+        # Master's queue; results, failures and permission requests stay INSTRUCTIONs.
+        informational = payload.get("role") == "HOST" and payload.get("status") == "EXITED"
         self._http.request(
             "POST",
             "/v1/session-bus/messages",
             {
                 "to": self._to,
                 "from": self._sender,
-                "kind": "INSTRUCTION",
+                "kind": "NOTE" if informational else "INSTRUCTION",
                 "protocol": "WORK",
                 "notify": "NONE",
                 "thread_id": self._thread_id,
