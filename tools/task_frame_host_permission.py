@@ -1,4 +1,5 @@
-"""Ask the Master when a Worker's write falls outside the declared scope.
+"""Ask the Master when a Worker's write falls outside the declared scope, or a
+Worker or Reviewer wants to run a command.
 
 A refusal that nobody sees stalls the work, and a silent approval defeats the
 scope.  So the Host pauses only the turn that asked: it posts a permission
@@ -91,11 +92,27 @@ class HostPermissionEscalator:
             "operations": list(description.get("operations") or []),
             "destructive": bool(description.get("destructive")),
         }
-        text = (
-            f"{self.current_role} asks to {'/'.join(payload['operations']) or 'write'} "
-            f"{', '.join(payload['targets']) or '(unknown target)'} outside its declared scope"
-            + (" [DESTRUCTIVE: needs the Conductor]" if payload["destructive"] else "")
-        )
+        if description.get("kind") == "COMMAND":
+            payload.update(
+                {
+                    "kind": "COMMAND",
+                    "command": str(description.get("command") or ""),
+                    "cwd": str(description.get("cwd") or ""),
+                    "reason": str(description.get("reason") or ""),
+                    "escalated_permissions": description.get("escalated_permissions"),
+                }
+            )
+            text = (
+                f"{self.current_role} asks to run a command: {payload['command'][:300]!r}"
+                + (" [needs more than the sandbox allows]" if payload["escalated_permissions"] else "")
+                + (" [DESTRUCTIVE: needs the Conductor]" if payload["destructive"] else "")
+            )
+        else:
+            text = (
+                f"{self.current_role} asks to {'/'.join(payload['operations']) or 'write'} "
+                f"{', '.join(payload['targets']) or '(unknown target)'} outside its declared scope"
+                + (" [DESTRUCTIVE: needs the Conductor]" if payload["destructive"] else "")
+            )
         try:
             self.room.post_report(
                 body_text=json.dumps(payload, ensure_ascii=False), severity="PERMISSION",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import re
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -1633,6 +1634,44 @@ class RuntimeWorkerDispatcher:
     )
     _CHANGE_OPERATIONS = {"add": "CREATE", "update": "MODIFY", "delete": "DELETE"}
 
+    _COMMAND_TOOLS = frozenset({"item/commandexecution/requestapproval", "bash"})
+    _DESTRUCTIVE_COMMAND = re.compile(
+        r"(?ix)(?:^|[\s;&|(])(?:rm|rmdir|del|erase|rd|mv|move|ren|rename|format|mkfs|dd|truncate|shutdown|"
+        r"remove-item|move-item|rename-item|set-content|out-file|clear-content|"
+        r"git\s+(?:reset|clean|checkout|restore|rebase|push|stash\s+drop|branch\s+-d))(?:\s|$)"
+        r"|(?<![0-9&])>{1,2}(?!&)"
+    )
+
+    @classmethod
+    def describe_command_permission(
+        cls, permission: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """What a provider's command approval request wants to run, or None if it is not one."""
+
+        tool_call = permission.get("tool_call")
+        if not isinstance(tool_call, Mapping):
+            return None
+        tool = str(tool_call.get("toolName") or tool_call.get("title") or "").strip()
+        if tool.casefold() not in cls._COMMAND_TOOLS:
+            return None
+        tool_input = tool_call.get("input") if isinstance(tool_call.get("input"), Mapping) else {}
+        command = str(tool_call.get("command") or tool_input.get("command") or "").strip()
+        extra = tool_call.get("additionalPermissions")
+        return {
+            "tool": tool,
+            "kind": "COMMAND",
+            "command": command,
+            "cwd": str(tool_call.get("cwd") or ""),
+            "reason": str(tool_call.get("reason") or ""),
+            "targets": [],
+            "operations": ["EXECUTE"],
+            "escalated_permissions": extra if extra else None,
+            # A command cannot be classified reliably from its text; this only
+            # catches the obvious deletes, moves, redirects and history rewrites.
+            # The Master reads the command itself before approving.
+            "destructive": bool(command) is False or bool(cls._DESTRUCTIVE_COMMAND.search(command)),
+        }
+
     @classmethod
     def describe_write_permission(
         cls, permission: Mapping[str, Any]
@@ -1696,7 +1735,8 @@ class RuntimeWorkerDispatcher:
         escalator = self.permission_escalator
         if escalator is None:
             return option
-        if str(task_request.get("repository_write_scope") or "").upper() != "BOUNDED":
+        command = self.describe_command_permission(permission)
+        if command is None and str(task_request.get("repository_write_scope") or "").upper() != "BOUNDED":
             return option
         rejected = {
             item.get("optionId")
@@ -1705,7 +1745,7 @@ class RuntimeWorkerDispatcher:
         }
         if option is not None and option not in rejected:
             return option
-        description = self.describe_write_permission(permission)
+        description = command if command is not None else self.describe_write_permission(permission)
         if description is None:
             return option
         try:

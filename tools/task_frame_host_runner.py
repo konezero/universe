@@ -139,6 +139,10 @@ class RuntimeHostRoleRunner:
                 "Use only the supplied Todo and repository evidence.",
                 "Report the task result separately from transport state.",
                 "Do not invoke subagents.",
+                "Run verification commands (for example tests) yourself. If a command cannot run inside "
+                "the sandbox (for example node is not found), request to run it outside the sandbox with "
+                "escalated permissions: the Host asks the Master, who approves or denies each command, so "
+                "request it and wait for the answer instead of reporting that you could not run it.",
             ],
         }
         if feedback:

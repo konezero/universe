@@ -168,6 +168,18 @@ class EscalatorTests(unittest.TestCase):
         room.events_after = events_after
         self.assertEqual("DENY", escalator(DESCRIPTION))
 
+    def test_a_command_request_carries_the_command_text_to_the_master(self):
+        room = Room()
+        escalator, bus = self.make(room, timeout=2.0)
+        escalator.current_role = "REVIEWER"
+        escalator({"tool": "item/commandExecution/requestApproval", "kind": "COMMAND", "command": "node --test tests/x.js",
+                   "cwd": "C:/repo", "reason": "verify", "targets": [], "operations": ["EXECUTE"],
+                   "destructive": False, "escalated_permissions": None})
+        payload = room.reports[0][1]
+        self.assertEqual(("COMMAND", "node --test tests/x.js", "REVIEWER"), (payload["kind"], payload["command"], payload["role"]))
+        self.assertEqual(["EXECUTE"], payload["operations"])
+        self.assertIn("node --test", room.calls[0])
+
     def test_a_destructive_request_is_marked_for_the_conductor(self):
         room = Room()
         escalator, bus = self.make(room, timeout=2.0)
@@ -228,13 +240,50 @@ class DispatcherEscalationTests(unittest.TestCase):
         self.dispatcher.permission_escalator = broken
         self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request(), self.write(self.other)))
 
-    def test_a_read_only_turn_and_non_write_tools_are_never_escalated(self):
+    def test_a_read_only_turn_never_escalates_a_write_and_other_tools_are_never_escalated(self):
         asked = []
         self.dispatcher.permission_escalator = lambda d: asked.append(d) or "APPROVE"
         self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request("NONE"), self.write(self.other)))
-        shell = {"options": self.options, "tool_call": {"toolName": "Bash", "input": {"command": "rm -rf x"}}}
-        self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request(), shell))
+        web = {"options": self.options, "tool_call": {"toolName": "WebFetch", "input": {"url": "http://x"}}}
+        self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request(), web))
         self.assertEqual([], asked)
+
+    def command(self, text, cwd=None, extra=None):
+        return {"options": self.options,
+                "tool_call": {"title": "item/commandExecution/requestApproval", "command": text,
+                              "cwd": cwd or self.temp.name, "reason": "verify",
+                              "additionalPermissions": extra}}
+
+    def test_a_command_is_asked_upward_under_any_scope_and_runs_only_on_approve(self):
+        asked = []
+        verdicts = ["APPROVE", "DENY"]
+        self.dispatcher.permission_escalator = lambda d: asked.append(d) or verdicts.pop(0)
+        for scope in ("NONE", "BOUNDED"):
+            verdicts[:] = ["APPROVE", "DENY"]
+            self.assertEqual("allow", self.dispatcher._task_frame_permission(self.request(scope), self.command("node --test tests/x.js")))
+            self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request(scope), self.command("node --test tests/y.js")))
+        self.assertEqual("COMMAND", asked[0]["kind"])
+        self.assertEqual("node --test tests/x.js", asked[0]["command"])
+        self.assertEqual(["EXECUTE"], asked[0]["operations"])
+        self.assertFalse(asked[0]["destructive"])
+        # Without an escalator a command is refused exactly as before.
+        self.dispatcher.permission_escalator = None
+        self.assertEqual("reject", self.dispatcher._task_frame_permission(self.request(), self.command("node --test x.js")))
+
+    def test_obviously_destructive_commands_are_marked_for_the_conductor(self):
+        cases = {
+            "rm -rf build": True, "del /q a.txt": True, "git reset --hard HEAD": True,
+            "Remove-Item x -Recurse": True, "git push origin main": True, "echo hi > out.txt": True,
+            "node --test tests/x.js": False, "git diff --stat": False, "python -m unittest a.b 2>&1": False,
+            "grep -rn foo tools": False, "": True,
+        }
+        for text, destructive in cases.items():
+            with self.subTest(command=text):
+                described = self.dispatcher.describe_command_permission(self.command(text))
+                self.assertEqual(destructive, described["destructive"])
+        widened = self.dispatcher.describe_command_permission(self.command("node x.js", extra={"network": True}))
+        self.assertEqual({"network": True}, widened["escalated_permissions"])
+        self.assertIsNone(self.dispatcher.describe_command_permission(self.write(self.target)))
 
     def test_delete_and_move_are_described_as_destructive(self):
         asked = []
