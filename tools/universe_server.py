@@ -14611,6 +14611,17 @@ class UniverseStore:
             row=connection.execute("SELECT * FROM goal_work_plan_application WHERE application_id = ?",(application_id,)).fetchone()
         return self._goal_work_plan_application_row(row), True
 
+    def node_open_todo_count(self, project_id: str, node_ref: str) -> int:
+        """Todos on a node that automation could still act on (READY or IN_PROGRESS)."""
+
+        with self._connection() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM project_todo WHERE project_id = ? AND node_ref = ? AND archived_at IS NULL AND state IN ('READY', 'IN_PROGRESS')",
+                    (project_id, node_ref),
+                ).fetchone()[0]
+            )
+
     def list_todos(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -36638,6 +36649,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         for run, allow_auto in candidates:
             run_id = str(run.get("run_id") or "")
             try:
+                stopped = self._auto_stop_finished_node_run(run)
+                if stopped is not None:
+                    results.append(stopped)
+                    continue
                 results.append(self._drive_persona_automation_run(run, allow_auto=allow_auto))
             except (UniverseError, PersonaAutomationError, SessionBusError, TerminalHostError) as error:
                 results.append({
@@ -36652,6 +36667,58 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "observed_at": utc_now(),
             "runs": results,
         }
+
+    _HOST_ROLE_NUDGE_SUPPRESS_SECONDS = 1800.0
+
+    def _auto_stop_finished_node_run(self, run: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Stop a node run when nothing is left for it to act on.
+
+        A node with no READY or IN_PROGRESS Todo (BACKLOG and BLOCKED are not
+        actionable) leaves an idle Master that only burns turns.  The request id is
+        fixed per run, so the stop is recorded once.
+        """
+
+        run_id = str(run.get("run_id") or "").strip()
+        project_id = str(run.get("project_id") or "").strip()
+        node_ref = str(run.get("node_ref") or "").strip()
+        if not (run_id and project_id and node_ref):
+            return None
+        if self.store.node_open_todo_count(project_id, node_ref):
+            return None
+        try:
+            self.persona_automation.stop_run({
+                "run_id": run_id,
+                "request_id": f"auto-stop-node-done:{run_id}",
+                "expected_revision": run.get("revision"),
+                "reason": "No READY or IN_PROGRESS Todo is left on this node; automation stopped.",
+            })
+        except PersonaAutomationError as error:
+            return {"run_id": run_id, "status": "DRIVER_SKIPPED", "reason": f"AUTO_STOP_NOT_APPLIED:{error.code}"}
+        return {"run_id": run_id, "status": "AUTOMATION_AUTO_STOPPED", "reason": "NO_OPEN_NODE_TODOS"}
+
+    def _run_host_role_running(self, run_id: str) -> str:
+        """The phase of a live Task Frame Host of this run that is running a role, else ''.
+
+        While a Worker or Reviewer runs, the Master has nothing to do until the Host
+        reports; a nudge would only make it re-read its whole context to poll.  A
+        role that has run longer than the suppression window is treated as stale so
+        a lost notice can never leave the run unattended.
+        """
+
+        state_root = self._persona_task_frame_state_root()
+        now = datetime.now(timezone.utc)
+        for frame in reversed(self.persona_automation.list_host_frames(run_id)):
+            status = task_frame_host_status(state_root, str(frame.get("task_frame_id") or ""))
+            phase = str(status.get("phase") or "")
+            if not (status.get("alive") and phase.startswith("RUNNING_")):
+                continue
+            try:
+                updated = datetime.fromisoformat(str(status.get("updated_at") or "").replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - updated).total_seconds() <= self._HOST_ROLE_NUDGE_SUPPRESS_SECONDS:
+                return phase
+        return ""
 
     def _drive_persona_automation_run(
         self, run: Mapping[str, Any], *, allow_auto: bool = True
@@ -36716,6 +36783,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 run_id, driver_key
             ):
                 return skip("CONTROL_ALREADY_SENT_FOR_REVISION")
+            running_phase = self._run_host_role_running(run_id)
+            if running_phase:
+                return skip(f"HOST_{running_phase}")
         else:
             return skip("WAITING_NO_PENDING_CONTROL")
         idempotency_key = f"persona-control:{run_id}:{driver_key}"
@@ -36755,6 +36825,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "the project]}}, first_role?: WORKER|REVIEWER}; you decide the write scope (none "
             "means read-only) and DELETE/MOVE are never delegated. The Host runs the role, "
             "reports to its Boss room and to you over the Session Bus, then WAITS for you. "
+            "After you launch a frame or send a directive, END YOUR TURN and wait: the Host notifies you "
+            "when the role finishes, fails or needs a permission. Do not poll host-status or re-tick "
+            "while a role is running; every extra turn re-reads your whole context. "
             "Direct it with persona.automation.host-directive {run_id, owner_ref, task_frame_id, "
             "directive: RUN_ROLE|REWORK|DONE, target_role: WORKER|REVIEWER, feedback, request_id} (RUN_ROLE REVIEWER "
             "after the Worker; REWORK with your feedback; DONE when the Todo is finished) and "

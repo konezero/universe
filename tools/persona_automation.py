@@ -2409,6 +2409,17 @@ class PersonaAutomationStore:
             )
             return event
 
+    def list_host_frames(self, run_id: str) -> list[dict[str, Any]]:
+        """Every Task Frame Host this run launched, oldest first."""
+
+        run_id = _text(run_id, "run_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM persona_automation_event WHERE run_id = ? AND event_type = 'TASK_FRAME_HOST_LAUNCHED' ORDER BY created_at ASC",
+                (run_id,),
+            ).fetchall()
+        return [_load(row["payload_json"], {}) for row in rows]
+
     def host_frame_launched(self, run_id: str, task_frame_id: str) -> dict[str, Any] | None:
         run_id = _text(run_id, "run_id")
         with self._connection() as connection:

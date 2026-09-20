@@ -19,6 +19,7 @@ MemoryCandidateApiTests fixture (project "TEST").
 """
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 import uuid
@@ -1271,6 +1272,128 @@ class NodeMasterAutomationTests(unittest.TestCase):
         _room, second = self._ask_permission(frame, operations=["MOVE"], destructive=True, key="x6")
         status, denied = self._decide(anchor, run, frame, second, "DENY", "x7")
         self.assertEqual(200, status, denied)
+
+
+    # -- token burn: no nudges while a Host role runs; stop a finished node once --
+
+    def _bump_revision(self, run_id, anchor, tick):
+        status, ticked = self.act("persona.automation.tick", {"run_id": run_id, "owner_ref": anchor, "tick_id": tick})
+        self.assertEqual(200, status, ticked)
+        return self.server.persona_automation.get_run(run_id)
+
+    def test_no_auto_nudge_while_a_host_role_is_running_but_receipts_and_idle_hosts_still_wake_the_master(self):
+        from unittest import mock
+
+        anchor, _node, run = self._start_driven_run("nudge-suppress")
+        posted, first, _ = self._drive(run["run_id"], "IDLE")          # the owed start receipt
+        self.assertEqual("DRIVER_CONTROL_POSTED", first["status"], first)
+        run = self._bump_revision(run["run_id"], anchor, "nudge-suppress-t1")
+        with mock.patch.object(self.server, "_run_host_role_running", return_value="RUNNING_WORKER"):
+            _posted, skipped, _again = self._drive_run(run, "IDLE", bus_posted=posted)
+        self.assertEqual("HOST_RUNNING_WORKER", skipped["reason"], skipped)
+        self.assertEqual(1, len(posted), "no extra turn while the Worker runs")
+        # The Host is waiting for the Master (or gone): the ordinary nudge resumes.
+        with mock.patch.object(self.server, "_run_host_role_running", return_value=""):
+            _posted, woken, _again = self._drive_run(run, "IDLE", bus_posted=posted)
+        self.assertEqual("DRIVER_CONTROL_POSTED", woken["status"], woken)
+        self.assertEqual(2, len(posted))
+
+    def test_host_role_running_needs_a_live_recent_running_host(self):
+        import json as _json
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from pathlib import Path
+        from unittest import mock
+
+        anchor, node_ref, run = self._start_driven_run("host-running-probe")
+        todo = self._frame_todo(node_ref, "Probe Todo")
+        status, launched, _spawned = self._launch(anchor, run, todo, request_id="probe-1")
+        frame = launched["task_frame_id"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / frame
+            folder.mkdir()
+
+            def heartbeat(phase, age_seconds=5, pid=None):
+                stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                (folder / "heartbeat.json").write_text(_json.dumps({
+                    "pid": pid or os.getpid(), "phase": phase, "room_id": "r", "updated_at": stamp}), encoding="utf-8")
+
+            with mock.patch.object(self.server, "_persona_task_frame_state_root", return_value=root):
+                heartbeat("RUNNING_WORKER")
+                self.assertEqual("RUNNING_WORKER", self.server._run_host_role_running(run["run_id"]))
+                heartbeat("WAITING")
+                self.assertEqual("", self.server._run_host_role_running(run["run_id"]), "waiting for the Master is not running a role")
+                heartbeat("RUNNING_REVIEWER", age_seconds=3600)
+                self.assertEqual("", self.server._run_host_role_running(run["run_id"]), "a stale heartbeat never silences the run")
+                heartbeat("RUNNING_REVIEWER", pid=2 ** 22 + 12345)
+                self.assertEqual("", self.server._run_host_role_running(run["run_id"]), "a dead Host is not running")
+                (folder / "heartbeat.json").unlink()
+                self.assertEqual("", self.server._run_host_role_running(run["run_id"]))
+
+    def _set_todo_state(self, todo_id, state, updated_at=None):
+        with self.server.store._connection() as connection:
+            if updated_at:
+                connection.execute("UPDATE project_todo SET state = ?, updated_at = ? WHERE todo_id = ?", (state, updated_at, todo_id))
+            else:
+                connection.execute("UPDATE project_todo SET state = ? WHERE todo_id = ?", (state, todo_id))
+
+    def test_a_node_run_is_stopped_once_when_no_todo_on_the_node_is_left_to_act_on(self):
+        from unittest import mock
+
+        anchor, node_ref, run = self._start_driven_run("auto-stop-done")
+        todo = self._frame_todo(node_ref, "Only Todo")
+        skip = lambda run, allow_auto=True: {"run_id": run["run_id"], "status": "DRIVER_SKIPPED", "reason": "TEST"}
+        with mock.patch.object(self.server, "_drive_persona_automation_run", side_effect=skip):
+            # A Todo is still open: the run keeps going.
+            observed = self.server.run_persona_automation_driver_once()
+            self.assertNotIn("AUTOMATION_AUTO_STOPPED", [r["status"] for r in observed["runs"] if r["run_id"] == run["run_id"]])
+            self.assertEqual("RUNNING", self.server.persona_automation.get_run(run["run_id"])["state"])
+            # The last open Todo is completed: stop, once.
+            self._set_todo_state(todo["todo_id"], "DONE")
+            observed = self.server.run_persona_automation_driver_once()
+            mine = [r for r in observed["runs"] if r["run_id"] == run["run_id"]]
+            self.assertEqual(["AUTOMATION_AUTO_STOPPED"], [r["status"] for r in mine], observed)
+            stopped = self.server.persona_automation.get_run(run["run_id"])
+            self.assertEqual("STOPPED", stopped["state"])
+            self.assertIn("No READY or IN_PROGRESS Todo is left", str(stopped.get("stop_reason")))
+            again = self.server.run_persona_automation_driver_once()
+            self.assertEqual([], [r for r in again["runs"] if r["run_id"] == run["run_id"]], "a stopped run is not touched again")
+
+    def test_a_run_started_on_a_node_with_nothing_to_do_is_stopped_at_once(self):
+        from unittest import mock
+
+        anchor, node_ref, run = self._start_driven_run("auto-stop-empty")
+        skip = lambda run, allow_auto=True: {"run_id": run["run_id"], "status": "DRIVER_SKIPPED", "reason": "TEST"}
+        with mock.patch.object(self.server, "_drive_persona_automation_run", side_effect=skip):
+            observed = self.server.run_persona_automation_driver_once()
+        self.assertEqual(
+            ["AUTOMATION_AUTO_STOPPED"],
+            [r["status"] for r in observed["runs"] if r["run_id"] == run["run_id"]],
+        )
+
+    def test_a_backlog_or_blocked_todo_does_not_keep_a_finished_node_running_but_a_ready_one_does(self):
+        from unittest import mock
+
+        anchor, node_ref, run = self._start_driven_run("auto-stop-open")
+        done = self._frame_todo(node_ref, "Done Todo")
+        idea = self._frame_todo(node_ref, "Idea Todo")
+        self._set_todo_state(done["todo_id"], "DONE")
+        self._set_todo_state(idea["todo_id"], "READY")
+        skip = lambda run, allow_auto=True: {"run_id": run["run_id"], "status": "DRIVER_SKIPPED", "reason": "TEST"}
+        with mock.patch.object(self.server, "_drive_persona_automation_run", side_effect=skip):
+            self.server.run_persona_automation_driver_once()
+            self.assertEqual("RUNNING", self.server.persona_automation.get_run(run["run_id"])["state"], "a READY Todo is left")
+            self._set_todo_state(idea["todo_id"], "BACKLOG")
+            self.server.run_persona_automation_driver_once()
+        self.assertEqual("STOPPED", self.server.persona_automation.get_run(run["run_id"])["state"])
+
+    def test_the_master_is_told_to_end_its_turn_while_a_role_runs(self):
+        anchor, _node, run = self._start_driven_run("driver-end-turn-text")
+        posted, first, _ = self._drive(run["run_id"], "IDLE")
+        body = posted[0]["body_text"]
+        self.assertIn("END YOUR TURN", body)
+        self.assertIn("Do not poll host-status", body)
 
 
 if __name__ == "__main__":
