@@ -6145,6 +6145,8 @@ class UniverseStore:
                     idempotency_key TEXT NOT NULL,
                     title TEXT NOT NULL,
                     intent_text TEXT NOT NULL,
+                    workstream_kind TEXT NOT NULL DEFAULT 'DEVELOPMENT'
+                        CHECK(workstream_kind IN ('DEVELOPMENT', 'OPERATIONS')),
                     state TEXT NOT NULL CHECK(state IN ('DRAFT', 'EXPLORING', 'ADOPTED', 'ARCHIVED')),
                     meeting_room_id TEXT,
                     created_by_role TEXT NOT NULL CHECK(created_by_role IN ('USER', 'CONDUCTOR')),
@@ -7784,6 +7786,16 @@ class UniverseStore:
                 );
                 """
             )
+            feature_node_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(feature_node)").fetchall()
+            }
+            if "workstream_kind" not in feature_node_columns:
+                connection.execute(
+                    "ALTER TABLE feature_node ADD COLUMN workstream_kind TEXT "
+                    "NOT NULL DEFAULT 'DEVELOPMENT'"
+                )
+
             todo_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(project_todo)").fetchall()
@@ -12374,6 +12386,7 @@ class UniverseStore:
             "idempotency_key": str(row["idempotency_key"]),
             "title": str(row["title"]),
             "intent_text": str(row["intent_text"]),
+            "workstream_kind": str(row["workstream_kind"] or "DEVELOPMENT").upper(),
             "state": str(row["state"]),
             "meeting_room_id": row["meeting_room_id"],
             "created_by_role": str(row["created_by_role"]),
@@ -12520,11 +12533,19 @@ class UniverseStore:
             value,
             field="feature_node",
             required=frozenset({"idempotency_key", "title", "intent_text", "created_by_role"}),
-            optional=frozenset({"meeting_room_id", "evidence_refs"}),
+            optional=frozenset({"meeting_room_id", "evidence_refs", "workstream_kind"}),
         )
         key = _identifier(request["idempotency_key"], "idempotency_key")
         title = _required_text(request["title"], "title")
         intent_text = _required_text(request["intent_text"], "intent_text")
+        workstream_kind = _identifier(
+            request.get("workstream_kind", "DEVELOPMENT"), "workstream_kind"
+        ).upper()
+        if workstream_kind not in {"DEVELOPMENT", "OPERATIONS"}:
+            raise UniverseError(
+                "FEATURE_WORKSTREAM_KIND_INVALID",
+                "workstream_kind must be DEVELOPMENT or OPERATIONS",
+            )
         role = _identifier(request["created_by_role"], "created_by_role").upper()
         if role not in {"USER", "CONDUCTOR"}:
             raise UniverseError("FEATURE_CREATOR_ROLE_INVALID", "Feature Node creator must be USER or CONDUCTOR")
@@ -12552,9 +12573,9 @@ class UniverseStore:
                 (project["project_id"], key),
             ).fetchone()
             if existing is not None:
-                material = (title, intent_text, room_id, role, refs)
+                material = (title, intent_text, workstream_kind, room_id, role, refs)
                 actual = (
-                    existing["title"], existing["intent_text"], existing["meeting_room_id"],
+                    existing["title"], existing["intent_text"], existing["workstream_kind"], existing["meeting_room_id"],
                     existing["created_by_role"], json.loads(existing["evidence_refs_json"]),
                 )
                 if actual != material:
@@ -12567,12 +12588,12 @@ class UniverseStore:
             connection.execute(
                 """
                 INSERT INTO feature_node(
-                    feature_id, project_id, idempotency_key, title, intent_text, state,
+                    feature_id, project_id, idempotency_key, title, intent_text, workstream_kind, state,
                     meeting_room_id, created_by_role, evidence_refs_json, revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
-                    feature_id, project["project_id"], key, title, intent_text,
+                    feature_id, project["project_id"], key, title, intent_text, workstream_kind,
                     "EXPLORING" if room_id else "DRAFT", room_id, role,
                     _canonical_json(refs), now, now,
                 ),
@@ -27571,7 +27592,7 @@ class UniverseStore:
                 "FEATURE_NODE", feature_id, str(feature["title"]), str(feature["state"]),
                 "FEATURE_NODE", feature_ref,
                 {key: feature.get(key) for key in (
-                    "feature_id", "project_id", "intent_text", "state", "meeting_room_id",
+                    "feature_id", "project_id", "intent_text", "state", "workstream_kind", "meeting_room_id",
                     "created_by_role", "evidence_refs", "revision", "created_at", "updated_at",
                 )} | {"work_projection": work_projection},
             )
@@ -36041,6 +36062,32 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "review_id": current_assignment.get("review_id"),
                     "next_condition": "the durable review follow-up Todo becomes available in this node scope",
                 }
+        if assignment_gate is None and not isinstance(current_assignment, Mapping):
+            # Independent Task Frame Hosts do not create a persona dispatch
+            # assignment. Their launched/collected lineage is nevertheless
+            # authoritative evidence that this open Todo must not be selected
+            # a second time while the frame awaits an explicit resolution.
+            executable_ids = {str(todo.get("todo_id") or "") for todo in executable_todos}
+            for frame in reversed(self.persona_automation.list_host_frames(run["run_id"])):
+                frame_todo_id = str(frame.get("todo_id") or "")
+                frame_id = str(frame.get("task_frame_id") or "")
+                if frame_todo_id not in executable_ids or not frame_id:
+                    continue
+                collected = self.persona_automation.host_frame_collected(run["run_id"], frame_id)
+                assignment_gate = {
+                    "state": "TASK_FRAME_COLLECTED" if collected else "TASK_FRAME_ACTIVE",
+                    "project_id": project_id,
+                    "node_ref": run_node_ref,
+                    "todo_id": frame_todo_id,
+                    "task_frame_id": frame_id,
+                    "result_ref": collected.get("result_ref") if collected else None,
+                    "collected_status": collected.get("status") if collected else None,
+                    "next_condition": (
+                        "resolve the collected Task Frame against its Todo before selecting work"
+                        if collected else "the Task Frame reports and is collected or cancelled"
+                    ),
+                }
+                break
         selected_plan = next(
             (item for item in work_plans if item.get("goal_id") == (selected_goal or {}).get("goal_id")),
             None,

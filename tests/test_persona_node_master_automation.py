@@ -1104,6 +1104,11 @@ class NodeMasterAutomationTests(unittest.TestCase):
         todo = self._frame_todo(node_ref, "Collect Todo")
         status, launched, _spawned = self._launch(anchor, run, todo, request_id="collect-1")
         frame = launched["task_frame_id"]
+        active_plan = self.server._persona_automation_plan({
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "frame-active-plan",
+        }, record=False)
+        self.assertEqual("WAIT", active_plan["decision"]["kind"])
+        self.assertEqual("TASK_FRAME_ACTIVE", active_plan["decision"]["target"]["assignment"]["state"])
         status, wrong = self.act("persona.automation.collect-frame", {
             "run_id": run["run_id"], "owner_ref": "session_anchor_other", "task_frame_id": frame,
             "status": "COMPLETED", "request_id": "c2"})
@@ -1117,6 +1122,15 @@ class NodeMasterAutomationTests(unittest.TestCase):
             "result_ref": "task-frame-result://x", "request_id": "c4"})
         self.assertEqual(200, status, collected)
         self.assertEqual("TASK_FRAME_COLLECTED", collected["status"])
+        parked = self.server.persona_automation.get_run(run["run_id"])
+        self.assertEqual("WAITING", parked["state"])
+        self.assertIsNone(parked["current_assignment"])
+        collected_plan = self.server._persona_automation_plan({
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "frame-collected-plan",
+        }, record=False)
+        self.assertEqual("WAIT", collected_plan["decision"]["kind"])
+        self.assertEqual("TASK_FRAME_COLLECTED", collected_plan["decision"]["target"]["assignment"]["state"])
+        self.assertEqual(todo["todo_id"], collected_plan["decision"]["target"]["assignment"]["todo_id"])
         status, again = self.act("persona.automation.collect-frame", {
             "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
             "result_ref": "task-frame-result://x", "request_id": "c5"})

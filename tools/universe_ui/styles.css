@@ -8985,3 +8985,9 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
   .project-activity-item { grid-template-columns: 12px minmax(0, 1fr); }
   .project-activity-item .activity-context-nav { grid-column: 2; }
 }
+.memory-ops-view {
+  padding: 32px;
+  min-height: 420px;
+}
+.memory-ops-view h1 { margin: 8px 0; }
+.memory-ops-metrics { margin-top: 24px; color: var(--muted, #9aa4b2); }

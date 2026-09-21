@@ -2402,11 +2402,29 @@ class PersonaAutomationStore:
         frame = _text(task_frame_id, "task_frame_id")
         suffix = ":" + str(payload.get("status")) if event_type == "TASK_FRAME_COLLECTED" else ""
         with self._connection() as connection:
-            self._get(connection, run_id)
+            row = self._get(connection, run_id)
             event, _created = self._event(
                 connection, run_id, event_type, f"frame-host:{event_type}:{frame}{suffix}",
                 {"task_frame_id": frame, **dict(payload)},
             )
+            # An independent Host has no persona dispatch cursor. Collection
+            # cannot be treated as a PASS review, but it must not leave an idle
+            # RUNNING run free to select and execute the same Todo again.
+            if (event_type == "TASK_FRAME_COLLECTED"
+                    and row["state"] == "RUNNING"
+                    and _load(row["current_assignment_json"], None) is None):
+                now = _timestamp()
+                cursor = connection.execute(
+                    "UPDATE persona_automation_run SET state = 'WAITING', next_condition = ?, "
+                    "revision = revision + 1, updated_at = ? WHERE run_id = ? AND revision = ?",
+                    (f"resolve collected Task Frame {frame} against its Todo before selecting work",
+                     now, run_id, int(row["revision"])),
+                )
+                if cursor.rowcount != 1:
+                    raise PersonaAutomationError(
+                        "PERSONA_AUTOMATION_REVISION_CONFLICT",
+                        "automation run changed while collecting its Task Frame", 409,
+                    )
             return event
 
     def list_host_frames(self, run_id: str) -> list[dict[str, Any]]:
@@ -2426,6 +2444,21 @@ class PersonaAutomationStore:
             row = connection.execute(
                 "SELECT payload_json FROM persona_automation_event WHERE run_id = ? AND event_type = 'TASK_FRAME_HOST_LAUNCHED' AND idempotency_key = ?",
                 (run_id, f"frame-host:TASK_FRAME_HOST_LAUNCHED:{_text(task_frame_id, 'task_frame_id')}"),
+            ).fetchone()
+        return _load(row["payload_json"], {}) if row is not None else None
+
+    def host_frame_collected(self, run_id: str, task_frame_id: str) -> dict[str, Any] | None:
+        """Return the exact frame's latest durable collection, if any."""
+
+        run_id = _text(run_id, "run_id")
+        frame_id = _text(task_frame_id, "task_frame_id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM persona_automation_event "
+                "WHERE run_id = ? AND event_type = 'TASK_FRAME_COLLECTED' "
+                "AND json_extract(payload_json, '$.task_frame_id') = ? "
+                "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                (run_id, frame_id),
             ).fetchone()
         return _load(row["payload_json"], {}) if row is not None else None
 

@@ -79,7 +79,7 @@ class HttpRoomPort:
 
 
 class HttpBusPort:
-    """Wake the Master over the Session Bus (one INSTRUCTION-free notice)."""
+    """Deliver role results and deliberate Host completion to the Master."""
 
     def __init__(self, base_url: str, *, to: Mapping[str, Any], sender: Mapping[str, Any], thread_id: str) -> None:
         self._http = _Http(base_url)
@@ -88,12 +88,14 @@ class HttpBusPort:
         self._thread_id = thread_id
 
     def notify(self, *, idempotency_key: str, body_text: str, payload: Mapping[str, Any]) -> None:
-        # A bus INSTRUCTION must be replied to before the session receives anything
-        # else.  An unanswered Host exit (clean or not, and often for a run that was
-        # already stopped) would leave every later message SESSION_BUSY, so any Host
-        # exit is a NOTE; the Boss room report and call_master still reach the Master.
-        # Results, failures and permission requests stay INSTRUCTIONs.
-        informational = payload.get("role") == "HOST"
+        # Only MASTER_DONE is an expected acknowledgement to the Master's DONE
+        # directive. It must be actionable so the Master can collect the frame.
+        # Unsolicited exits (closed room, terminal Todo, timeout) remain NOTES:
+        # an unanswered INSTRUCTION would block later session messages.
+        informational = (
+            payload.get("role") == "HOST"
+            and payload.get("exit_reason") != "MASTER_DONE"
+        )
         self._http.request(
             "POST",
             "/v1/session-bus/messages",

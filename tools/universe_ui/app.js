@@ -91,6 +91,8 @@ const state = {
   memories: [],
   memoryProposals: [],
   memoryBatchConfigs: [],
+  memoryBatchSchedules: [],
+  memoryBatchScheduler: null,
   memoryBatchRuns: [],
   memoryCandidates: [],
   memoryCandidateReviewOutcomes: {},
@@ -4333,6 +4335,7 @@ function setGraphScale(nextScale) {
 
 /** Graph canvas modes only (not inspector tabs). */
 function showGraphView(view) {
+  hideMemoryOpsView();
   closeDocumentHover();
   const allowed = new Set(["universe", "semantic", "sessions", "timeline", "documents", "implementation"]);
   if (!allowed.has(view)) view = "universe";
@@ -4377,6 +4380,7 @@ function showGraphView(view) {
 }
 
 function showGoalPlanView() {
+  hideMemoryOpsView();
   state.view = "work";
   document.body.classList.remove("graph-mode");
   document.body.classList.remove("galaxy-view");
@@ -4423,6 +4427,18 @@ function fleetShowDone() {
 }
 function fleetShowDiscarded() {
   return Boolean(state.fleetFilters?.showDiscarded);
+}
+
+function fleetTodoIsOperations(todo) {
+  const ref = String(todo?.node_ref || "");
+  const graphNode = (state.projection?.unified_graph?.nodes || []).find(
+    (item) => item.node_id === ref || item.node_id === `feat:${ref}`
+  );
+  return fleetNodeIsOperations(graphNode);
+}
+
+function fleetDevelopmentTodos(todos) {
+  return (todos || []).filter((todo) => !fleetTodoIsOperations(todo));
 }
 function bindFleetFilterControls() {
   const doneBox = document.querySelector("#fleet-filter-done");
@@ -4650,6 +4666,7 @@ function renderFleetBoard() {
     for (const m of goal.milestones || []) for (const t of m.todos || []) push(t);
   }
   for (const t of state.unassignedTodos || []) push(t);
+  const developmentTodos = fleetDevelopmentTodos(todos);
   const shipsByTodo = new Map(
     (state.projection?.ships || []).map((s) => [s.todo_id, s])
   );
@@ -4672,7 +4689,7 @@ function renderFleetBoard() {
   };
   for (const lane of FLEET_LANES) {
     const laneEl = node("div", `fleet-lane fleet-lane-${lane.id}`);
-    const items = todos.filter((t) => lane.states.includes(String(t.state || "").toUpperCase()));
+    const items = developmentTodos.filter((t) => lane.states.includes(String(t.state || "").toUpperCase()));
     laneEl.append(
       node("div", "fleet-lane-head", `${lane.label} · ${items.length}`)
     );
@@ -4803,6 +4820,15 @@ function homeArchivedFeatureNodes() {
     }));
 }
 
+// Kept adjacent to homeNodes because the Fleet visibility projection is also
+// consumed by the small, dependency-free browser regression harness.
+function fleetNodeIsOperations(graphNode) {
+  return String(
+    graphNode?.workstream_kind || graphNode?.data?.workstream_kind ||
+    graphNode?.data?.data?.workstream_kind || "DEVELOPMENT"
+  ).toUpperCase() === "OPERATIONS";
+}
+
 function homeNodes() {
   const graph = state.projection?.unified_graph?.nodes || [];
   const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
@@ -4811,6 +4837,7 @@ function homeNodes() {
   for (const n of graph) {
     const id = String(n.node_id || "");
     const kind = String(n.kind || "").toUpperCase();
+    if (fleetNodeIsOperations(n)) continue;
     const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
     const knowledge = ["DOCUMENT", "DECISION", "MEMORY"].includes(kind);
     const runtime = ["SESSION", "TODO", "TASK_FRAME", "GOAL"].includes(kind);
@@ -5161,6 +5188,58 @@ function renderIntegratedHome() {
       if (document.body.classList.contains("home-mode")) drawHomeRelations();
     });
   }
+}
+
+function renderMemoryOpsView() {
+  const view = document.querySelector("#memory-ops-view");
+  if (!view) return;
+  const configs = state.memoryBatchConfigs || [];
+  const runs = state.memoryBatchRuns || [];
+  const candidates = state.memoryCandidates || [];
+  const schedules = state.memoryBatchSchedules || [];
+  const scheduler = state.memoryBatchScheduler || {};
+  const formatTime = (value) => value ? new Date(value).toLocaleString() : "not scheduled";
+  const opsRow = (text) => node("div", "memory-ops-row", text);
+  const scheduleSection = node("section", "memory-ops-section");
+  scheduleSection.append(node("h2", "", "Schedule"), node("p", "context-copy", `Scheduler ${scheduler.status || "UNKNOWN"} · ${schedules.length} configured stage(s)`));
+  for (const item of schedules) scheduleSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.state || "UNKNOWN"} · next ${formatTime(item.next_due_at)} · last ${item.last_run_id || "none"}`));
+  if (!schedules.length) scheduleSection.append(node("p", "empty-copy", "No schedule state loaded."));
+  const quotaSection = node("section", "memory-ops-section");
+  quotaSection.append(node("h2", "", "Quota / budget"));
+  for (const config of configs) quotaSection.append(opsRow(`${config.stage || "MEMORY"} · ${config.quota_or_budget?.max_runs ?? config.quota_or_budget?.budget ?? "unlimited"} · ${config.enabled === false ? "disabled" : "enabled"}`));
+  const runsSection = node("section", "memory-ops-section");
+  runsSection.append(node("h2", "", "Recent runs"));
+  for (const item of runs.slice(0, 12)) runsSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.status || "UNKNOWN"} · ${formatTime(item.completed_at || item.finished_at || item.started_at)} · ${item.run_id || ""}`));
+  if (!runs.length) runsSection.append(node("p", "empty-copy", "No recent runs."));
+  const candidatesSection = node("section", "memory-ops-section");
+  candidatesSection.append(node("h2", "", "Review candidates"));
+  for (const item of candidates.slice(0, 12)) candidatesSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.state || "UNKNOWN"} · ${item.kind || "candidate"} · ${item.summary || item.title || item.candidate_id || ""}`));
+  if (!candidates.length) candidatesSection.append(node("p", "empty-copy", "No review candidates."));
+  view.replaceChildren(
+    node("span", "goal-plan-kicker", "Operations surface"),
+    node("h1", "", "Memory / RAG Ops"),
+    node("p", "context-copy", "FAST_EXTRACT, CONSOLIDATE and SYNTHESIZE are continuous operations, not development Todos."),
+    node("div", "memory-ops-metrics", `${configs.length} schedules · ${runs.length} recent runs · ${candidates.length} review candidates`),
+    scheduleSection, quotaSection, runsSection, candidatesSection
+  );
+}
+
+function showMemoryOpsView() {
+  restoreBenchPanel();
+  restoreProjectPanels();
+  document.body.classList.remove("graph-mode", "galaxy-view");
+  document.body.classList.add("home-mode");
+  document.querySelector("#goal-plan-workspace")?.setAttribute("hidden", "");
+  document.querySelector("#home-view")?.setAttribute("hidden", "");
+  const view = document.querySelector("#memory-ops-view");
+  if (view) view.hidden = false;
+  syncPrimaryNavSelection("memory-ops");
+  renderMemoryOpsView();
+}
+
+function hideMemoryOpsView() {
+  const view = document.querySelector("#memory-ops-view");
+  if (view) view.hidden = true;
 }
 
 function isMobileView() {
@@ -7662,6 +7741,7 @@ function restoreProjectPanels() {
 }
 
 function showProjectScreen(which) {
+  hideMemoryOpsView();
   const spec = PROJECT_SCREENS[which];
   const screen = document.querySelector("#project-screen");
   const body = document.querySelector("#project-screen-body");
@@ -7685,6 +7765,7 @@ function showProjectScreen(which) {
 }
 
 function showBenchScreen() {
+  hideMemoryOpsView();
   const panel = elements.benchPanel;
   const screen = document.querySelector("#bench-screen");
   const screenBody = document.querySelector("#bench-screen-body");
@@ -7706,6 +7787,7 @@ function showBenchScreen() {
 
 /** Open inspector tab (Memory / Future / Bench / Activity / Details). */
 function openInspectorSurface(tab) {
+  hideMemoryOpsView();
   if (tab === "memory" || tab === "activity" || tab === "persona") return showProjectScreen(tab);
   restoreBenchPanel();
   const allowed = new Set(["details", "activity", "bench", "memory", "future"]);
@@ -8568,6 +8650,8 @@ async function selectProject(
   state.memories = memoryResult.memories || [];
   state.memoryProposals = memoryProposalResult.proposals || [];
   state.memoryBatchConfigs = memoryBatchConfigResult.configs || [];
+  state.memoryBatchSchedules = memoryBatchConfigResult.schedules || [];
+  state.memoryBatchScheduler = memoryBatchConfigResult.scheduler || null;
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
   state.memoryCandidates = memoryCandidateResult.candidates || [];
   state.featureNodeProposals = featureProposalResult.proposals || [];
@@ -18582,6 +18666,7 @@ async function submitRelease(event) {
 
 
 function showInspectorTab(name) {
+  hideMemoryOpsView();
   for (const button of document.querySelectorAll("[data-tab]")) {
     button.classList.toggle("selected", button.dataset.tab === name);
   }
@@ -21474,6 +21559,10 @@ function bindEvents() {
         syncPrimaryNavSelection("fleet");
         return;
       }
+      if (view === "memory-ops") {
+        showMemoryOpsView();
+        return;
+      }
       if (view === "map" || view === "network" || view === "project" || view === "ecosystem") {
         showGraphView(state.selectedProject ? "semantic" : "universe");
         if (view === "ecosystem") {
@@ -21591,6 +21680,7 @@ function bindGoalPlanEvents() {
     else if (view === "meeting") {
       openRoomIndex().catch((error) => toast(error.message, true));
     }
+    else if (view === "memory-ops") showMemoryOpsView();
     else if (view === "bench") showBenchScreen();
     else if (view === "activity" || view === "memory" || view === "persona") showProjectScreen(view);
     else if (["details", "future"].includes(view)) openInspectorSurface("details");

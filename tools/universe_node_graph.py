@@ -36,6 +36,17 @@ KNOWLEDGE_KINDS: frozenset[str] = frozenset({"DOCUMENT", "DECISION", "MEMORY"})
 
 NODE_STATES: frozenset[str] = frozenset({"ADOPTED", "PROPOSED"})
 
+# Workstream is an orthogonal axis to the product/feature node kind.  It keeps
+# continuously-running operational pipelines out of the development Fleet.
+WORKSTREAM_KINDS: frozenset[str] = frozenset({"DEVELOPMENT", "OPERATIONS"})
+
+
+def normalize_workstream_kind(value: Any) -> str:
+    """Return the stable workstream axis used by Fleet and Ops views."""
+
+    value = _kind(value)
+    return value if value in WORKSTREAM_KINDS else "DEVELOPMENT"
+
 # Legacy functional-graph node kind -> unified kind. Legacy assets use lower or
 # kebab case; normalized seeds upper-case and keep the hyphen.
 _FUNCTIONAL_KIND_MAP: dict[str, str] = {
@@ -168,6 +179,7 @@ def unify_seed_graph(seed: Mapping[str, Any]) -> dict[str, Any]:
             "state": _node_state(raw.get("state")),
             "title": _text(raw.get("title")) or node_id,
             "refs": list(raw.get("refs") or []),
+            "workstream_kind": normalize_workstream_kind(raw.get("workstream_kind")),
         }
         if role:
             node["structure_role" if kind == "STRUCTURE" else "component_role"] = role
@@ -196,6 +208,7 @@ def unify_seed_graph(seed: Mapping[str, Any]) -> dict[str, Any]:
             "state": _node_state(raw.get("state")),
             "title": _text(raw.get("title")) or node_id,
             "refs": list(raw.get("refs") or []),
+            "workstream_kind": normalize_workstream_kind(raw.get("workstream_kind")),
         }
         if role:
             node["structure_role" if kind == "STRUCTURE" else "component_role"] = role
@@ -536,6 +549,7 @@ def graft_feature_nodes(
                 "state": "ADOPTED" if is_adopted else "PROPOSED",
                 "title": _text(raw.get("intent_text"))[:80] or feature_id,
                 "refs": [{"kind": "feature", "path": f"universe://feature-nodes/{feature_id}", "sha256": ""}],
+                "workstream_kind": normalize_workstream_kind(raw.get("workstream_kind")),
             }
         )
         if product_id:
