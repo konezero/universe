@@ -589,6 +589,8 @@ class TerminalSession:
     protocol_state: str = "UNKNOWN"
     bootstrap_input: bytes = b""
     bootstrap_delivered: bool = False
+    # Persona delivery waits for the model's explicit bootstrap acknowledgement.
+    session_ready_observed: bool = False
     prompt_generation: int = 0
     working_sequence: int = 0
     permission_sequence: int = 0
@@ -2686,6 +2688,10 @@ class TerminalHost:
                 provider_ref = str(status.get("provider_session_ref") or "").strip()
                 turn_state = status.get("turn_delivery") or {}
                 if provider_ref and bool(turn_state.get("native_queue_available")):
+                    if not session.session_ready_observed:
+                        last_reason = "Codex session has not emitted SESSION_READY"
+                        time.sleep(0.2)
+                        continue
                     accepted = self.offer_turn(
                         terminal_id,
                         {
@@ -3448,6 +3454,14 @@ class TerminalHost:
                             )
             with session.lock:
                 self._record_output(session, chunk)
+                # Codex/Grok persona injection follows an observed model reply,
+                # never merely a submitted bootstrap prompt.
+                if (str(session.provider).upper() in {"CODEX", "GROK"}
+                        and re.search(
+                            rb"(?m)^\s*SESSION_READY\s*$",
+                            _ANSI_ESCAPE_RE.sub(b"", bytes(session.screen_snapshot or b"")),
+                        )):
+                    session.session_ready_observed = True
                 waiters = list(session.subscribers)
             for waiter in waiters:
                 try:

@@ -1,5 +1,6 @@
 const assert = require('assert/strict');
 const fs = require('fs');
+const vm = require('vm');
 
 const html = fs.readFileSync('tools/universe_ui/index.html', 'utf8');
 const app = fs.readFileSync('tools/universe_ui/app.js', 'utf8');
@@ -28,11 +29,20 @@ assert.match(showMemory, /goal-plan-workspace.*setAttribute\("hidden"/s);
 assert.match(showMemory, /memory-ops-view.*hidden = false/s);
 assert.match(showMemory, /restoreBenchPanel\(\)/);
 assert.match(showMemory, /restoreProjectPanels\(\)/);
+assert.match(showMemory, /homeWorkstreamKind = "OPERATIONS"/);
+assert.match(showMemory, /renderMemoryOpsView\(\)/);
+const renderOps = app.slice(app.indexOf('function renderMemoryOpsView()'), app.indexOf('function showMemoryOpsView()'));
+assert.match(renderOps, /view.append\(board\)/, 'Ops must host the existing full node board');
+assert.match(renderOps, /renderIntegratedHome\(\)/);
+assert.doesNotMatch(renderOps, /memoryBatchConfigs|memoryBatchRuns|memoryCandidates/, 'Ops is not a copied batch summary');
 
 const hideMemoryStart = app.indexOf('function hideMemoryOpsView()');
 const hideMemoryEnd = app.indexOf('\n}', hideMemoryStart) + 2;
 const hideMemory = app.slice(hideMemoryStart, hideMemoryEnd);
 assert.match(hideMemory, /memory-ops-view/);
+assert.match(hideMemory, /workspace.insertBefore\(board/);
+assert.match(hideMemory, /homeWorkstreamKind = "DEVELOPMENT"/);
+assert.match(utilityRail, /<small>Ops<\/small>/);
 
 const showGoalStart = app.indexOf('function showGoalPlanView()');
 const showGoalEnd = app.indexOf('\n}', showGoalStart) + 2;
@@ -79,4 +89,37 @@ assert.match(inspectorTab, /hideMemoryOpsView\(\)/);
 assert.match(inspectorTab, /name !== "details"/);
 assert.match(inspectorTab, /name !== "future"/);
 
-console.log('Memory Ops is structurally independent from Goal Plan and view routing toggles both surfaces.');
+const workerStart = app.indexOf('function fleetHomeWorkerRows(nodes)');
+const workerEnd = app.indexOf('function renderHomeNodes(selNode)', workerStart);
+const workerContext = {
+  state: {
+    homeWorkstreamKind: 'DEVELOPMENT',
+    fleetWorkerAssignmentsProject: null,
+    fleetTaskFrameHosts: {status: 'READY', rows: [
+      {task_frame_id: 'dev-host', node_ref: 'dev', alive: true},
+      {task_frame_id: 'ops-host', node_ref: 'ops', alive: true},
+      {task_frame_id: 'project-host', node_ref: null, alive: true},
+    ]},
+  },
+  fleetFeatureIsOperations: ref => ref === 'ops',
+};
+vm.createContext(workerContext);
+vm.runInContext(app.slice(workerStart, workerEnd), workerContext);
+assert.deepEqual(
+  Array.from(workerContext.fleetHomeWorkerRows([]), row => row.task_frame_id).sort(),
+  ['dev-host', 'project-host'],
+  'Fleet must not show Operations hosts as unassigned development workers'
+);
+workerContext.state.homeWorkstreamKind = 'OPERATIONS';
+assert.deepEqual(
+  Array.from(workerContext.fleetHomeWorkerRows([]), row => row.task_frame_id),
+  ['ops-host'],
+  'Ops must show only hosts owned by Operations nodes'
+);
+assert.match(app, /workstream_kind: state.homeWorkstreamKind/, 'new nodes use the current board workstream');
+const bindingRoute = app.slice(app.indexOf('function goToNodeMasterBinding('), app.indexOf('function openFleetNodeFromTerminal('));
+assert.match(bindingRoute, /fleetFeatureIsOperations\(featureId\).*showMemoryOpsView\(\)/s);
+const activityTodoRoute = app.slice(app.indexOf('function openActivityTodo('), app.indexOf('function openActivityTaskFrame('));
+assert.match(activityTodoRoute, /fleetTodoIsOperations\(todo\).*showMemoryOpsView\(\)/s);
+
+console.log('Ops owns whole Operations nodes, their workers, and routes; Fleet excludes them.');

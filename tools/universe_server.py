@@ -198,6 +198,7 @@ from universe_conductor_runtime import (
 from universe_action_registry import (
     ACTION_CONTEXT_SCHEMA,
     FEATURE_CREATE_ACTION_ID,
+    FEATURE_WORKSTREAM_SET_ACTION_ID,
     FEATURE_GOAL_START_ACTION_ID,
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
@@ -12609,6 +12610,63 @@ class UniverseStore:
                 (project["project_id"],),
             ).fetchall()
         return [self._feature_row(row) for row in rows]
+
+    def set_feature_node_workstream(
+        self,
+        project_id: str,
+        feature_id: str,
+        expected_revision: int,
+        workstream_kind: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """CAS-edit only the node's development/operations classification."""
+        project = self.get_project(project_id)
+        fid = _identifier(feature_id, "feature_id")
+        kind = _identifier(workstream_kind, "workstream_kind").upper()
+        if kind not in {"DEVELOPMENT", "OPERATIONS"}:
+            raise UniverseError(
+                "FEATURE_WORKSTREAM_KIND_INVALID",
+                "workstream_kind must be DEVELOPMENT or OPERATIONS",
+            )
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise UniverseError(
+                "FEATURE_REVISION_INVALID",
+                "expected_revision must be a positive integer",
+            )
+        changed = False
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM feature_node WHERE feature_id = ? AND project_id = ?",
+                (fid, project["project_id"]),
+            ).fetchone()
+            if row is None:
+                raise UniverseError(
+                    "FEATURE_NODE_NOT_FOUND",
+                    "Feature Node does not exist in this project",
+                    HTTPStatus.NOT_FOUND,
+                )
+            if int(row["revision"]) != expected_revision:
+                raise UniverseError(
+                    "FEATURE_REVISION_CONFLICT",
+                    "Feature Node revision changed; re-read before setting workstream",
+                    HTTPStatus.CONFLICT,
+                )
+            if str(row["workstream_kind"]).upper() != kind:
+                updated = connection.execute(
+                    """
+                    UPDATE feature_node
+                    SET workstream_kind = ?, revision = revision + 1, updated_at = ?
+                    WHERE feature_id = ? AND project_id = ? AND revision = ?
+                    """,
+                    (kind, utc_now(), fid, project["project_id"], expected_revision),
+                )
+                if updated.rowcount != 1:
+                    raise UniverseError(
+                        "FEATURE_REVISION_CONFLICT",
+                        "Feature Node revision changed; re-read before setting workstream",
+                        HTTPStatus.CONFLICT,
+                    )
+                changed = True
+        return self.get_feature_node(fid), changed
 
     def list_owned_memory_candidates(
         self, project_id: str, *, limit: int = 200
@@ -31783,6 +31841,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "service.status": self._handle_service_status_action,
                 "service.restart": self._handle_service_restart_action,
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
+                FEATURE_WORKSTREAM_SET_ACTION_ID: self._handle_feature_workstream_set_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
                 TODO_BIND_GOAL_ACTION_ID: self._handle_todo_bind_goal_action,
@@ -38768,6 +38827,34 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "project_id": project_id,
             "feature": feature,
             "feature_created": created,
+        }
+
+    def _handle_feature_workstream_set_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        action = _exact_object_fields(
+            request,
+            field="feature_workstream_set_action",
+            required=frozenset({
+                "project_id", "feature_id", "expected_revision", "workstream_kind"
+            }),
+        )
+        project_id = _identifier(action["project_id"], "project_id")
+        feature, changed = self.store.set_feature_node_workstream(
+            project_id,
+            action["feature_id"],
+            action["expected_revision"],
+            action["workstream_kind"],
+        )
+        return {
+            "schema": self.action_registry.lookup(
+                FEATURE_WORKSTREAM_SET_ACTION_ID
+            ).result_schema_ref,
+            "status": "FEATURE_WORKSTREAM_SET" if changed else "FEATURE_WORKSTREAM_UNCHANGED",
+            "action_id": FEATURE_WORKSTREAM_SET_ACTION_ID,
+            "project_id": project_id,
+            "feature": feature,
+            "feature_updated": changed,
         }
 
     def _todo_action(self, handler, request, *args):

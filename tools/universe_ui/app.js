@@ -15,6 +15,8 @@ const state = {
   /** Fleet 완료/폐기 필터: a display preference, not project data — persisted
    *  per-browser via localStorage so a refresh restores the chosen toggle. */
   fleetFilters: loadFleetFilters(),
+  // The same node/Todo/automation board is scoped to Fleet or Ops by workstream.
+  homeWorkstreamKind: "DEVELOPMENT",
   /** Fleet Todo 상세의 결과(완료 근거) 캐시 — todo_id -> last todo.state action, or null when none exists. */
   homeTodoResultCache: {},
   homeTodoResultPending: new Set(),
@@ -4434,7 +4436,12 @@ function fleetTodoIsOperations(todo) {
   const graphNode = (state.projection?.unified_graph?.nodes || []).find(
     (item) => item.node_id === ref || item.node_id === `feat:${ref}`
   );
-  return fleetNodeIsOperations(graphNode);
+  const feature = (state.projectFeatures || []).find((item) => item.feature_id === ref);
+  return fleetNodeIsOperations(graphNode || feature);
+}
+
+function fleetFeatureIsOperations(nodeRef) {
+  return fleetTodoIsOperations({ node_ref: homeNodeRefKey(nodeRef) });
 }
 
 function fleetDevelopmentTodos(todos) {
@@ -4562,7 +4569,8 @@ async function submitHomeNode(event) {
   try {
     const result = await invokeServerAction("feature.create", {
       project_id: projectId,
-      feature: { idempotency_key: crypto.randomUUID(), title, intent_text: intent },
+      feature: { idempotency_key: crypto.randomUUID(), title, intent_text: intent,
+        workstream_kind: state.homeWorkstreamKind || "DEVELOPMENT" },
     });
     document.querySelector("#home-node-dialog").close();
     toast("노드를 만들었어요");
@@ -4808,14 +4816,17 @@ function homeNodeFullyDone(graphNode) {
 // graft_feature_nodes in universe_node_graph.py), so revealing them for the
 // "폐기 표시" toggle needs the raw Feature Node list fetched separately
 // (state.projectFeatures, read-only — see refreshProjectRooms).
-function homeArchivedFeatureNodes() {
+function homeArchivedFeatureNodes(workstreamKind = state.homeWorkstreamKind) {
   return (state.projectFeatures || [])
-    .filter((f) => String(f?.state || "").toUpperCase() === "ARCHIVED")
+    .filter((f) => String(f?.state || "").toUpperCase() === "ARCHIVED" &&
+      String(f?.workstream_kind || "DEVELOPMENT").toUpperCase() ===
+        (workstreamKind || "DEVELOPMENT"))
     .map((f) => ({
       node_id: `feat:${f.feature_id}`,
       kind: "FEATURE",
       state: "ARCHIVED",
       title: String(f.intent_text || f.feature_id || "").slice(0, 80) || f.feature_id,
+      workstream_kind: f.workstream_kind || "DEVELOPMENT",
       data: {},
     }));
 }
@@ -4829,7 +4840,7 @@ function fleetNodeIsOperations(graphNode) {
   ).toUpperCase() === "OPERATIONS";
 }
 
-function homeNodes() {
+function homeNodes(workstreamKind = state.homeWorkstreamKind) {
   const graph = state.projection?.unified_graph?.nodes || [];
   const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
   const seen = new Set();
@@ -4837,7 +4848,7 @@ function homeNodes() {
   for (const n of graph) {
     const id = String(n.node_id || "");
     const kind = String(n.kind || "").toUpperCase();
-    if (fleetNodeIsOperations(n)) continue;
+    if (fleetNodeIsOperations(n) !== (workstreamKind === "OPERATIONS")) continue;
     const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
     const knowledge = ["DOCUMENT", "DECISION", "MEMORY"].includes(kind);
     const runtime = ["SESSION", "TODO", "TASK_FRAME", "GOAL"].includes(kind);
@@ -4849,7 +4860,7 @@ function homeNodes() {
   }
   let visible = fleetShowDone() ? out : out.filter((n) => !homeNodeFullyDone(n));
   if (fleetShowDiscarded()) {
-    for (const archived of homeArchivedFeatureNodes()) {
+    for (const archived of homeArchivedFeatureNodes(workstreamKind)) {
       if (!seen.has(archived.node_id)) {
         seen.add(archived.node_id);
         visible.push(archived);
@@ -5008,7 +5019,7 @@ function fleetHomeEditingGuarded() {
 }
 
 function fleetHomeSoftRefreshActive() {
-  if (state.view !== "work") return false;
+  if (!["work", "memory-ops"].includes(state.view)) return false;
   if (
     !document.body.classList.contains("home-mode") &&
     !document.body.classList.contains("fleet-mode")
@@ -5192,45 +5203,22 @@ function renderIntegratedHome() {
 
 function renderMemoryOpsView() {
   const view = document.querySelector("#memory-ops-view");
-  if (!view) return;
-  const configs = state.memoryBatchConfigs || [];
-  const runs = state.memoryBatchRuns || [];
-  const candidates = state.memoryCandidates || [];
-  const schedules = state.memoryBatchSchedules || [];
-  const scheduler = state.memoryBatchScheduler || {};
-  const formatTime = (value) => value ? new Date(value).toLocaleString() : "not scheduled";
-  const opsRow = (text) => node("div", "memory-ops-row", text);
-  const scheduleSection = node("section", "memory-ops-section");
-  scheduleSection.append(node("h2", "", "Schedule"), node("p", "context-copy", `Scheduler ${scheduler.status || "UNKNOWN"} · ${schedules.length} configured stage(s)`));
-  for (const item of schedules) scheduleSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.state || "UNKNOWN"} · next ${formatTime(item.next_due_at)} · last ${item.last_run_id || "none"}`));
-  if (!schedules.length) scheduleSection.append(node("p", "empty-copy", "No schedule state loaded."));
-  const quotaSection = node("section", "memory-ops-section");
-  quotaSection.append(node("h2", "", "Quota / budget"));
-  for (const config of configs) quotaSection.append(opsRow(`${config.stage || "MEMORY"} · ${config.quota_or_budget?.max_runs ?? config.quota_or_budget?.budget ?? "unlimited"} · ${config.enabled === false ? "disabled" : "enabled"}`));
-  const runsSection = node("section", "memory-ops-section");
-  runsSection.append(node("h2", "", "Recent runs"));
-  for (const item of runs.slice(0, 12)) runsSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.status || "UNKNOWN"} · ${formatTime(item.completed_at || item.finished_at || item.started_at)} · ${item.run_id || ""}`));
-  if (!runs.length) runsSection.append(node("p", "empty-copy", "No recent runs."));
-  const candidatesSection = node("section", "memory-ops-section");
-  candidatesSection.append(node("h2", "", "Review candidates"));
-  for (const item of candidates.slice(0, 12)) candidatesSection.append(opsRow(`${item.stage || "MEMORY"} · ${item.state || "UNKNOWN"} · ${item.kind || "candidate"} · ${item.summary || item.title || item.candidate_id || ""}`));
-  if (!candidates.length) candidatesSection.append(node("p", "empty-copy", "No review candidates."));
-  view.replaceChildren(
-    node("span", "goal-plan-kicker", "Operations surface"),
-    node("h1", "", "Memory / RAG Ops"),
-    node("p", "context-copy", "FAST_EXTRACT, CONSOLIDATE and SYNTHESIZE are continuous operations, not development Todos."),
-    node("div", "memory-ops-metrics", `${configs.length} schedules · ${runs.length} recent runs · ${candidates.length} review candidates`),
-    scheduleSection, quotaSection, runsSection, candidatesSection
-  );
+  const board = document.querySelector("#home-view");
+  if (!view || !board) return;
+  // Move the existing node/Todo/Team/automation board, not a copied status card.
+  if (board.parentElement !== view) view.append(board);
+  board.hidden = false;
+  renderIntegratedHome();
 }
 
 function showMemoryOpsView() {
   restoreBenchPanel();
   restoreProjectPanels();
-  document.body.classList.remove("graph-mode", "galaxy-view");
+  state.view = "memory-ops";
+  state.homeWorkstreamKind = "OPERATIONS";
+  document.body.classList.remove("graph-mode", "galaxy-view", "fleet-mode", "inspector-open");
   document.body.classList.add("home-mode");
   document.querySelector("#goal-plan-workspace")?.setAttribute("hidden", "");
-  document.querySelector("#home-view")?.setAttribute("hidden", "");
   const view = document.querySelector("#memory-ops-view");
   if (view) view.hidden = false;
   syncPrimaryNavSelection("memory-ops");
@@ -5240,6 +5228,12 @@ function showMemoryOpsView() {
 function hideMemoryOpsView() {
   const view = document.querySelector("#memory-ops-view");
   if (view) view.hidden = true;
+  const board = document.querySelector("#home-view");
+  const workspace = document.querySelector("#goal-plan-workspace");
+  if (board && workspace && board.parentElement === view) {
+    workspace.insertBefore(board, workspace.querySelector(".unassigned-work"));
+  }
+  state.homeWorkstreamKind = "DEVELOPMENT";
 }
 
 function isMobileView() {
@@ -5312,7 +5306,10 @@ function renderHomeProjects() {
         return;
       }
       selectProject(project.project_id)
-        .then(() => homeMobileAdvance("projects"))
+        .then(() => {
+          if (state.view === "memory-ops") renderIntegratedHome();
+          homeMobileAdvance("projects");
+        })
         .catch((error) => toast(error.message, true));
     });
     listEl.append(row);
@@ -6666,7 +6663,7 @@ function fleetSessionBindingLabel(sessionAnchorRef) {
   const labels = active.map((item) => {
     const ref = String(item.node_ref || "").trim();
     if (!ref) return "project-wide";
-    const graphNode = homeNodes().find((n) => homeNodeRefKey(n.node_id) === ref);
+    const graphNode = (state.projection?.unified_graph?.nodes || []).find((n) => homeNodeRefKey(n.node_id) === ref);
     return graphNode ? homeNodeTitleWithId(graphNode) : ref;
   });
   return `bound: ${[...new Set(labels)].join(", ")}`;
@@ -7021,7 +7018,8 @@ function goToNodeMasterBinding(featureId) {
   state.homeNodeId = featureId ? `feat:${featureId}` : null;
   state.homeTodoId = null;
   state.homeAgentTodoId = null;
-  showGoalPlanView();
+  if (fleetFeatureIsOperations(featureId)) showMemoryOpsView();
+  else showGoalPlanView();
 }
 
 function openFleetNodeFromTerminal(session) {
@@ -7105,7 +7103,12 @@ function fleetHomeWorkerRows(nodes) {
   for (const host of hosts) {
     if (!matchedHosts.has(host)) rows.push(host);
   }
-  return rows;
+  // A running Operations host must not reappear as an unassigned Fleet worker.
+  return rows.filter((item) => {
+    const ref = String(item.node_ref || "").trim();
+    if (!ref) return state.homeWorkstreamKind !== "OPERATIONS";
+    return fleetFeatureIsOperations(ref) === (state.homeWorkstreamKind === "OPERATIONS");
+  });
 }
 
 function renderHomeNodes(selNode) {
@@ -16380,11 +16383,14 @@ function collapseProjectActivity(events) {
 function openActivityNode(nodeRef) {
   const ref = String(nodeRef || "").trim();
   if (!ref) return;
-  const graphNode = homeNodes().find((item) => String(item.node_id || "") === ref || homeNodeRefKey(item.node_id) === ref);
-  if (!graphNode) { toast(`UNKNOWN: node ${ref} is not in the authoritative Fleet projection.`, true); return; }
+  const workstreamKind = fleetFeatureIsOperations(ref) ? "OPERATIONS" : "DEVELOPMENT";
+  const graphNode = homeNodes(workstreamKind).find((item) =>
+    String(item.node_id || "") === ref || homeNodeRefKey(item.node_id) === ref);
+  if (!graphNode) { toast(`UNKNOWN: node ${ref} is not in the authoritative node projection.`, true); return; }
   state.homeNodeId = graphNode.node_id;
   state.homeTodoId = null;
-  showGoalPlanView();
+  if (workstreamKind === "OPERATIONS") showMemoryOpsView();
+  else showGoalPlanView();
   renderIntegratedHome();
 }
 
@@ -16394,7 +16400,8 @@ function openActivityTodo(todoId) {
   if (!todo) { toast(`UNKNOWN: todo ${id} is not in the authoritative projection.`, true); return; }
   state.homeNodeId = todo.node_ref ? `feat:${todo.node_ref}` : null;
   state.homeTodoId = id;
-  showGoalPlanView();
+  if (fleetTodoIsOperations(todo)) showMemoryOpsView();
+  else showGoalPlanView();
   renderIntegratedHome();
 }
 

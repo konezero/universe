@@ -1448,6 +1448,71 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("TODO_SCOPE_COORDINATE_INVALID", invalid["error_code"])
 
+    def test_feature_workstream_set_moves_existing_node_with_revision_guard(self) -> None:
+        self.request("POST", "/v1/projects/register", self.registration())
+        status, created = self.request(
+            "POST", "/v1/actions",
+            {
+                "action_id": "feature.create",
+                "request": {
+                    "project_id": "GCS",
+                    "feature": {
+                        "idempotency_key": "operations-workstream-test",
+                        "title": "Operations pipeline",
+                        "intent_text": "Keep recurring operations out of development Fleet.",
+                    },
+                },
+            },
+        )
+        self.assertEqual(HTTPStatus.CREATED, status, created)
+        feature = created["feature"]
+        self.assertEqual("DEVELOPMENT", feature["workstream_kind"])
+        request = {
+            "project_id": "GCS",
+            "feature_id": feature["feature_id"],
+            "expected_revision": feature["revision"],
+            "workstream_kind": "OPERATIONS",
+        }
+        status, changed = self.request(
+            "POST", "/v1/actions",
+            {"action_id": "feature.workstream-set", "request": request},
+        )
+        self.assertEqual(HTTPStatus.OK, status, changed)
+        self.assertEqual("FEATURE_WORKSTREAM_SET", changed["status"])
+        self.assertEqual("OPERATIONS", changed["feature"]["workstream_kind"])
+        self.assertEqual(feature["revision"] + 1, changed["feature"]["revision"])
+        status, reread = self.request(
+            "GET", f"/v1/feature-nodes/{feature['feature_id']}"
+        )
+        self.assertEqual(HTTPStatus.OK, status, reread)
+        self.assertEqual("OPERATIONS", reread["feature"]["workstream_kind"])
+        status, stale = self.request(
+            "POST", "/v1/actions",
+            {"action_id": "feature.workstream-set", "request": request},
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status, stale)
+        self.assertEqual("FEATURE_REVISION_CONFLICT", stale["error_code"])
+        status, unchanged = self.request(
+            "POST", "/v1/actions",
+            {
+                "action_id": "feature.workstream-set",
+                "request": {**request, "expected_revision": feature["revision"] + 1},
+            },
+        )
+        self.assertEqual(HTTPStatus.OK, status, unchanged)
+        self.assertEqual("FEATURE_WORKSTREAM_UNCHANGED", unchanged["status"])
+        self.assertEqual(feature["revision"] + 1, unchanged["feature"]["revision"])
+        status, invalid = self.request(
+            "POST", "/v1/actions",
+            {
+                "action_id": "feature.workstream-set",
+                "request": {**request, "expected_revision": feature["revision"] + 1,
+                            "workstream_kind": "UNKNOWN"},
+            },
+        )
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status, invalid)
+        self.assertEqual("FEATURE_WORKSTREAM_KIND_INVALID", invalid["error_code"])
+
     def test_work_surface_actions_create_and_update_through_actions_route(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration())
 

@@ -11,11 +11,15 @@ const context = { state: {projection: {unified_graph: {nodes: [
   {node_id:'memory',kind:'MEMORY',state:'ADOPTED'},
   {node_id:'document',kind:'DOCUMENT',state:'ADOPTED'},
   {node_id:'feat:work',kind:'FEATURE',state:'ADOPTED'},
+  {node_id:'feat:ops',kind:'FEATURE',state:'ADOPTED',data:{workstream_kind:'OPERATIONS'}},
   {node_id:'app',kind:'APP',state:'ADOPTED'},
 ]}}, fleetFilters: {showDone:false, showDiscarded:false}, projectFeatures: []}, homeAllTodos:()=>[{node_ref:'work'}], homeNodeRefKey:id=>id.replace(/^feat:/,''), homeNodeTodos:n=>n.node_id==='feat:work'?[{state:'IN_PROGRESS'}]:[], fleetShowDone:()=>false, fleetShowDiscarded:()=>false };
 vm.createContext(context);
 vm.runInContext(source.slice(start,end),context);
 assert.deepEqual(Array.from(context.homeNodes(),n=>n.node_id),['feat:work','app','clinic']);
+context.state.homeWorkstreamKind = 'OPERATIONS';
+assert.deepEqual(Array.from(context.homeNodes(),n=>n.node_id),['feat:ops'], 'Ops board must own the complete Operations node');
+context.state.homeWorkstreamKind = 'DEVELOPMENT';
 assert.match(source.slice(source.indexOf('async function submitHomeNode('),source.indexOf('// + Todo',source.indexOf('async function submitHomeNode('))),/invokeServerAction\("feature.create"/);
 
 // Fleet 완료/폐기 필터: DONE-only nodes and ARCHIVED Feature Nodes hide by

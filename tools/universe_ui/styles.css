@@ -8986,8 +8986,18 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
   .project-activity-item .activity-context-nav { grid-column: 2; }
 }
 .memory-ops-view {
-  padding: 32px;
-  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  overflow: auto;
+  background: #191a1d;
 }
-.memory-ops-view h1 { margin: 8px 0; }
-.memory-ops-metrics { margin-top: 24px; color: var(--muted, #9aa4b2); }
+.memory-ops-view[hidden] { display: none; }
+.memory-ops-header {
+  padding: 16px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, .08);
+}
+.memory-ops-header h1 { margin: 4px 0; }
+.memory-ops-header p { margin: 0; color: var(--muted, #9aa4b2); }
+.memory-ops-view #home-view { flex: 1; min-height: 0; }
+.memory-ops-view #home-conductor-persona { display: none; }

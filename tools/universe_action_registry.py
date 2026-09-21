@@ -39,6 +39,9 @@ LEGACY_FEATURE_GOAL_START_STORE_SURFACE = "UniverseStore.start_feature_goal"
 FEATURE_CREATE_ACTION_ID = "feature.create"
 FEATURE_CREATE_REQUEST_SCHEMA = "universe.feature-create-action-request.v1"
 FEATURE_CREATE_RESULT_SCHEMA = "universe.feature-create-receipt.v1"
+FEATURE_WORKSTREAM_SET_ACTION_ID = "feature.workstream-set"
+FEATURE_WORKSTREAM_SET_REQUEST_SCHEMA = "universe.feature-workstream-set-action-request.v1"
+FEATURE_WORKSTREAM_SET_RESULT_SCHEMA = "universe.feature-workstream-set-receipt.v1"
 
 TODO_CREATE_ACTION_ID = "todo.create"
 TODO_UPDATE_ACTION_ID = "todo.update"
@@ -196,6 +199,7 @@ TODO_ACTION_IDS = (
 # exist. See docs/action-ir-work-surface.md for the slice-3 decision.
 IMPLEMENTED_WORK_SURFACE_ACTION_IDS = (
     FEATURE_CREATE_ACTION_ID,
+    FEATURE_WORKSTREAM_SET_ACTION_ID,
     TODO_CREATE_ACTION_ID,
     TODO_UPDATE_ACTION_ID,
     TODO_READ_ACTION_ID,
@@ -1330,6 +1334,11 @@ def build_default_action_registry(
             FEATURE_CREATE_RESULT_SCHEMA,
         ),
         (
+            FEATURE_WORKSTREAM_SET_ACTION_ID,
+            FEATURE_WORKSTREAM_SET_REQUEST_SCHEMA,
+            FEATURE_WORKSTREAM_SET_RESULT_SCHEMA,
+        ),
+        (
             TODO_CREATE_ACTION_ID,
             "universe.todo-create-action-request.v1",
             "universe.todo-create-receipt.v1",
@@ -1624,6 +1633,9 @@ __all__ = [
     "FEATURE_CREATE_ACTION_ID",
     "FEATURE_CREATE_REQUEST_SCHEMA",
     "FEATURE_CREATE_RESULT_SCHEMA",
+    "FEATURE_WORKSTREAM_SET_ACTION_ID",
+    "FEATURE_WORKSTREAM_SET_REQUEST_SCHEMA",
+    "FEATURE_WORKSTREAM_SET_RESULT_SCHEMA",
     "FEATURE_GOAL_START_ACTION_ID",
     "FEATURE_GOAL_START_ACTION_SURFACE",
     "IMPLEMENTED_WORK_SURFACE_ACTION_IDS",
