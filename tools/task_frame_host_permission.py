@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from typing import Any, Callable, Mapping
 
@@ -71,14 +72,18 @@ class HostPermissionEscalator:
         self.poll_interval_seconds = poll_interval_seconds
         self._clock = clock
         self._sleep = sleep
-        self._cursor = 0
         self._count = 0
+        self._count_lock = threading.Lock()
         self.current_role = "WORKER"
 
     def __call__(self, description: Mapping[str, Any]) -> str:
-        self._count += 1
+        with self._count_lock:
+            self._count += 1
+            count = self._count
+        # A concurrent waiter must not advance this request past its own decision.
+        cursor = 0
         digest = hashlib.sha256(
-            json.dumps([self.task_frame_id, self.current_role, self._count, dict(description)], sort_keys=True).encode("utf-8")
+            json.dumps([self.task_frame_id, self.current_role, count, dict(description)], sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         request_id = f"perm_{digest}"
         payload = {
@@ -128,11 +133,11 @@ class HostPermissionEscalator:
         deadline = None if self.timeout_seconds is None else self._clock() + self.timeout_seconds
         while True:
             try:
-                events = list(self.room.events_after(self._cursor))
+                events = list(self.room.events_after(cursor))
             except Exception:  # noqa: BLE001
                 events = []
             for event in sorted(events, key=lambda item: int(item.get("room_sequence") or 0)):
-                self._cursor = max(self._cursor, int(event.get("room_sequence") or 0))
+                cursor = max(cursor, int(event.get("room_sequence") or 0))
                 decision = parse_permission_decision(event, request_id)
                 if decision is not None:
                     return decision

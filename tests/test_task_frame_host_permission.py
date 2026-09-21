@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +103,59 @@ class EscalatorTests(unittest.TestCase):
         self.assertFalse(payload["destructive"])
         self.assertEqual(1, len(bus.notices))
         self.assertEqual(1, len(room.calls))
+
+    def test_concurrent_requests_do_not_skip_individual_approvals(self):
+        class ConcurrentRoom(Room):
+            def __init__(self):
+                super().__init__()
+                self.lock = threading.Lock()
+                self.requests = {}
+                self.all_reported = threading.Event()
+                self.last_completed = threading.Event()
+
+            def post_report(self, *, body_text, severity, idempotency_key):
+                name = threading.current_thread().name
+                with self.lock:
+                    self.requests[name] = json.loads(body_text)["request_id"]
+                    if len(self.requests) == 3:
+                        self.all_reported.set()
+                if name in {"A", "B"}:
+                    self.last_completed.wait(2)
+
+            def events_after(self, sequence):
+                if not self.all_reported.wait(2):
+                    return []
+                with self.lock:
+                    request_ids = dict(self.requests)
+                events = [
+                    decision(index, request_ids[name], "APPROVE")
+                    for index, name in enumerate(("A", "B", "C"), 1)
+                ]
+                return [event for event in events if event["room_sequence"] > sequence]
+
+        room = ConcurrentRoom()
+        escalator = HostPermissionEscalator(
+            task_frame_id="tf1", todo_id="todo_1", room=room, bus=Bus(),
+            timeout_seconds=1.0, poll_interval_seconds=0.01,
+        )
+        outcomes = {}
+
+        def ask():
+            name = threading.current_thread().name
+            try:
+                outcomes[name] = escalator(DESCRIPTION)
+            finally:
+                if name == "C":
+                    room.last_completed.set()
+
+        threads = [threading.Thread(target=ask, name=name, daemon=True) for name in ("A", "B", "C")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        self.assertFalse([thread.name for thread in threads if thread.is_alive()])
+        self.assertEqual(3, len(set(room.requests.values())))
+        self.assertEqual({"A": "APPROVE", "B": "APPROVE", "C": "APPROVE"}, outcomes)
 
     def test_deny_timeout_and_unreachable_room_are_all_denials(self):
         room = Room()
