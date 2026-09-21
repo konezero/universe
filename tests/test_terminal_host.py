@@ -2194,6 +2194,72 @@ class TerminalHostTests(unittest.TestCase):
         self.assertEqual("PTY_MONITOR", exit_events[0]["source"])
 
 class AttachBootstrapGateTests(unittest.TestCase):
+    def test_interactive_bootstrap_does_not_wait_for_session_start_attach(self) -> None:
+        class ReadyPty(FakePty):
+            def __init__(self, banner: bytes) -> None:
+                super().__init__()
+                self.banner = banner
+
+            def read(self, timeout: float = 0.2) -> bytes:
+                del timeout
+                banner, self.banner = self.banner, b""
+                return banner
+
+        for provider, banner in (
+            ("CODEX", b"OpenAI Codex"),
+            ("GROK", b"always-approve"),
+        ):
+            with self.subTest(provider=provider):
+                submitted = threading.Event()
+                session = TerminalSession(
+                    terminal_id=f"term-bootstrap-{provider.lower()}",
+                    project_id="universe",
+                    mode="MASTER",
+                    provider=provider,
+                    supervisor_session_id="session-bootstrap",
+                    cwd=str(ROOT),
+                    executable=f"{provider.lower()}.exe",
+                    created_at="2026-09-21T00:00:00Z",
+                    session_anchor_ref=TEST_ANCHOR,
+                    state="LIVE",
+                    backend=ReadyPty(banner),
+                    bootstrap_input=startup_input(provider, ""),
+                    managed_shell=SimpleNamespace(cli_ever_attached=False),
+                )
+                host = TerminalHost()
+
+                def submit(_session: TerminalSession) -> None:
+                    submitted.set()
+                    _session.pump_stop.set()
+
+                with patch.object(host, "_submit_session_bootstrap", side_effect=submit):
+                    pump = threading.Thread(
+                        target=host._pump_session,
+                        args=(session,),
+                        daemon=True,
+                    )
+                    pump.start()
+                    self.assertTrue(
+                        submitted.wait(1),
+                        f"{provider} bootstrap waited for attach evidence",
+                    )
+                    pump.join(timeout=1)
+                self.assertFalse(pump.is_alive())
+
+    def test_supervised_stdio_has_no_interactive_bootstrap(self) -> None:
+        host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
+        created = host.create(
+            project_id="universe",
+            mode="WORKER",
+            cwd=str(ROOT),
+            session_anchor_ref=TEST_ANCHOR,
+            provider="CODEX",
+            launch_profile="SUPERVISED_STDIO",
+            provider_arguments=["app-server", "--listen", "stdio://"],
+        )
+        self.assertEqual(b"", host.get(created["terminal_id"]).bootstrap_input)
+        host.close(created["terminal_id"])
+
     def test_cli_attach_sealed_requires_session_start_receipt(self) -> None:
         host = TerminalHost()
         session = TerminalSession(

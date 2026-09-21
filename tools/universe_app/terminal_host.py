@@ -3385,18 +3385,16 @@ class TerminalHost:
                 continue
             if awaiting_bootstrap:
                 bootstrap_tail = (bootstrap_tail + chunk)[-16384:]
-                # Match a healthy UI new-session: SessionStart AttachEvidence must
-                # seal before SESSION_READY is injected. Banner-only readiness
-                # (e.g. "OpenAI Codex") used to fire bootstrap ~2s after spawn and
-                # could race the hook; HOOK_TIMEOUT then killed unsealed CLIs.
-                managed = getattr(session, "managed_shell", None)
-                sealed = bool(
-                    managed is not None
-                    and getattr(managed, "cli_ever_attached", False)
-                )
-                if sealed and provider_cli_ready_for_bootstrap(
-                    session.provider, bootstrap_tail
-                ):
+                # The initial prompt is what starts the first Codex/Grok turn;
+                # their SessionStart hook runs from that terminal input and
+                # records AttachEvidence afterward.  AttachEvidence therefore
+                # cannot be a prerequisite for this bootstrap without creating
+                # a startup cycle (no prompt -> no hook -> no attach).
+                #
+                # Keep the attach gate for post-bootstrap routing/persona
+                # delivery.  It is deliberately not used for this initial
+                # interactive prompt.
+                if provider_cli_ready_for_bootstrap(session.provider, bootstrap_tail):
                     awaiting_bootstrap = False
                     # Keep the output pump running while the common submitter
                     # waits for composer commit and verifies the resulting turn.
