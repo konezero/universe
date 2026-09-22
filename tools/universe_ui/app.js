@@ -67,6 +67,8 @@ const state = {
   fleetHomeRefreshWorkerAssignmentSignature: null,
   fleetHomeRefreshWorkerSignature: null,
   fleetHomeRefreshHostSignature: null,
+  fleetHomeRefreshTerminalsSignature: null,
+  fleetNodeMonitorInFlight: false,
   /** featureId of the node whose "Manage" modal is open, or null. */
   openFleetNodeTeamFeatureId: null,
   /** Authoritative Worker/Reviewer assignment rows keyed by node_ref. */
@@ -255,6 +257,7 @@ const elements = {
   graphHint: document.querySelector("#graph-hint"),
   galaxyViewSwitch: document.querySelector("#galaxy-view-switch"),
   galaxyFullscreenToggle: document.querySelector("#galaxy-fullscreen-toggle"),
+  galaxySessionPresence: document.querySelector("#galaxy-session-presence"),
   graphTooltip: document.querySelector("#graph-node-tooltip"),
   graphZoomIn: document.querySelector("#graph-zoom-in"),
   graphZoomOut: document.querySelector("#graph-zoom-out"),
@@ -1419,18 +1422,22 @@ async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
   }
 
   const refreshPromise = (async () => {
-    const [audit, activity, chatCatalog, sessionGraph, busUnread] = await Promise.all([
+    const [audit, activity, chatCatalog, sessionGraph, busUnread, terminalResult] = await Promise.all([
       api("/v1/runtime/audit"),
       api("/v1/session-observer/sources"),
       api("/v1/session-observer/chat-rooms"),
       api("/v1/session-graph").catch(() => null),
       api("/v1/session-bus/unread").catch(() => ({ counts: {} })),
+      api("/v1/terminals").catch(() => null),
     ]);
     state.sessionBusUnread = busUnread?.counts || {};
     state.sessionBusWorking = busUnread?.working_counts || {};
     state.runtimeAudit = audit;
     state.runtimePreflight = audit.preflight || null;
     state.supervisorSessions = audit.sessions || [];
+    state.supervisorTerminals = Array.isArray(terminalResult?.terminals) ? terminalResult.terminals : [];
+    state.supervisorTerminalsStatus = Array.isArray(terminalResult?.terminals) ? "READY" : "ERROR";
+    state.supervisorTerminalsError = state.supervisorTerminalsStatus === "READY" ? "" : "TERMINAL_READ_FAILED";
     if (
       !state.selectedSupervisorAnchorKey ||
       !state.supervisorSessions.some(
@@ -1468,6 +1475,15 @@ async function refreshSupervisorSessions({ maxAgeMs = 0 } = {}) {
     renderNodeModes();
     renderProviderActivitySources();
     if (state.view === "sessions") buildSessionGraph();
+    // Session refresh is the authoritative live projection source for every
+    // work surface, not only the observatory/rail.
+    if (["work", "memory-ops"].includes(state.view)) {
+      if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+      if (typeof renderTodos === "function") renderTodos();
+      renderLiveSessionProjectionSurfaces();
+    } else if (["semantic", "universe"].includes(state.view)) {
+      buildGraph();
+    }
     state.supervisorRefreshedAt = Date.now();
     return audit;
   })();
@@ -4620,34 +4636,29 @@ function openHomeAddTodo() {
   }
 }
 
-// A live terminal working the selected project (its Master/Conductor session).
-function fleetCardSession() {
-  const pid = String(state.selectedProject?.project_id || "").toLowerCase();
-  if (!pid) return null;
-  return (
-    (state.terminals || []).find(
-      (term) => String(term.project_id || "").toLowerCase() === pid
-    ) || null
-  );
+// A Fleet card opens only the terminal bound to its exact Worker/Reviewer Todo
+// or to the Todo's node Master. A project-wide first terminal is unrelated.
+function fleetCardSession(todo) {
+  const sessions = fleetLiveSessionRows();
+  const exact = fleetTodoExecutorProjection(todo, sessions);
+  const nodeRef = String(todo?.node_ref || "").replace(/^(feat:|feature_node:)/, "");
+  const bound = exact.executor || sessions.find((item) =>
+    item.role === "MASTER" && item.nodeRef === nodeRef);
+  if (!bound?.terminalId || !bound.isLive) return null;
+  return (state.terminals || []).find((term) => term.terminal_id === bound.terminalId) || null;
 }
 
-// Fleet card session badge: jump to the live session in the dock, or open a
-// new session for this project when there is none.
 function openFleetCardSession(todo) {
-  const term = fleetCardSession();
-  if (term) {
-    if (typeof expandConversationLayer === "function") expandConversationLayer();
-    if (!document.body.classList.contains("terminal-bottom")) {
-      document.querySelector("#terminal-dock-side")?.click();
-    }
-    if (typeof selectTerminalTab === "function") selectTerminalTab(term.terminal_id);
+  const term = fleetCardSession(todo);
+  if (!term) {
+    toast("이 Todo 또는 노드에 연결된 대화 가능 세션이 없습니다.", true);
     return;
   }
-  openNewSessionDialog({
-    projectId: state.selectedProject?.project_id,
-    mode: "MASTER",
-    nodeHint: fleetNodeLabel(todo.node_ref),
-  });
+  if (typeof expandConversationLayer === "function") expandConversationLayer();
+  if (!document.body.classList.contains("terminal-bottom")) {
+    document.querySelector("#terminal-dock-side")?.click();
+  }
+  if (typeof selectTerminalTab === "function") selectTerminalTab(term.terminal_id);
 }
 
 // Open the Todo work map focused on one Todo (Fleet card → its Todo).
@@ -4666,6 +4677,61 @@ function openFleetCardTodo(todoId) {
     setTimeout(() => row.classList.remove("todo-item-flash"), 1600);
   };
   focusRow();
+}
+
+function fleetLiveSessionRows() {
+  const projectId = String(state.selectedProject?.project_id || "").trim();
+  if (!projectId || state.personaAssignmentsStatus !== "READY" ||
+      state.personaAssignmentsProjectId !== projectId) return [];
+  const workerProjection = state.fleetWorkerAssignmentsProject;
+  const workers = workerProjection?.projectId === projectId && workerProjection.status === "READY"
+    ? workerProjection.rows : [];
+  return fleetBoundSessionRows(projectId, state.personaAssignments, workers,
+    state.supervisorTerminalsStatus === "READY" ? state.supervisorTerminals : null,
+    state.supervisorSessions);
+}
+
+function renderFleetSessionProjection(todo, className = "fleet-card-session") {
+  const sessions = fleetLiveSessionRows();
+  const exact = fleetTodoExecutorProjection(todo, sessions);
+  const nodeRef = String(todo?.node_ref || "").replace(/^(feat:|feature_node:)/, "");
+  const master = sessions.find((item) => item.nodeRef === nodeRef && item.role === "MASTER");
+  if (!exact.executor && exact.status !== "CONFLICT" && !master) return null;
+  const selected = exact.executor || master;
+  const label = exact.status === "CONFLICT"
+    ? `배정 충돌 · ${exact.sessions.length}개 세션`
+    : `${exact.executor ? selected.role : "노드 Master 배정"} · ${selected.provider} · ${selected.presence} · ${selected.activity}`;
+  const badge = node("span", `${className} ${String(selected?.presence || "conflict").toLowerCase()}`, label);
+  badge.dataset.sessionStatus = exact.executor ? exact.status : master ? "NODE_MASTER" : "CONFLICT";
+  if (selected?.sessionAnchorRef) badge.dataset.sessionAnchorRef = selected.sessionAnchorRef;
+  badge.title = selected?.sessionAnchorRef
+    ? `${selected.role} ${selected.sessionAnchorRef} · ${selected.presence} · ${selected.activity}`
+    : "같은 Todo에 여러 세션이 배정됐습니다";
+  return badge;
+}
+
+function renderLiveSessionProjectionSurfaces() {
+  const sessions = fleetLiveSessionRows();
+  const galaxySurface = elements.galaxySessionPresence;
+
+  if (galaxySurface) {
+    galaxySurface.replaceChildren();
+    const graphNodes = Array.isArray(state.graph?.nodes) ? state.graph.nodes : [];
+    for (const graphNode of graphNodes) {
+      const presence = fleetGalaxySessionPresence({ node_id: graphNode.id }, sessions);
+      if (presence.marker === "NONE") continue;
+      const row = node("div", "galaxy-session-presence-row");
+      row.dataset.nodeId = graphNode.id;
+      row.dataset.sessionPresence = presence.marker;
+      row.append(
+        node("strong", "galaxy-session-node", graphNode.label || graphNode.id),
+        node("span", "galaxy-session-marker", presence.marker),
+        node("small", "galaxy-session-count", String(presence.sessions.length))
+      );
+      galaxySurface.append(row);
+    }
+    galaxySurface.dataset.nodeCount = String(galaxySurface.childElementCount);
+  }
 }
 
 function renderFleetBoard() {
@@ -4738,10 +4804,12 @@ function renderFleetBoard() {
       const nodeName = fleetNodeLabel(todo.node_ref);
       if (nodeName) meta.append(node("span", "fleet-card-node", nodeName));
       if (todo.priority) meta.append(node("span", "fleet-card-pri", String(todo.priority)));
+      const sessionProjection = renderFleetSessionProjection(todo);
+      if (sessionProjection) meta.append(sessionProjection);
       // The board only surfaces sessions that are actually running — a live
       // terminal for this work opens in the dock on click. New sessions are
       // started from the terminal dock's + , not from here.
-      const term = fleetCardSession();
+      const term = fleetCardSession(todo);
       if (term && ["ready", "executing", "verifying"].includes(lane.id)) {
         const sessBadge = node("button", "fleet-card-sess live", "▶ session");
         sessBadge.type = "button";
@@ -5072,6 +5140,39 @@ function invalidateFleetAuthoritativeCaches() {
   state.fleetConductorAutomation = null;
 }
 
+// Terminal liveness must not wait behind Todo, graph or automation polling.
+async function refreshFleetNodeSessionMonitor() {
+  if (state.fleetNodeMonitorInFlight || !fleetHomeSoftRefreshActive()) return;
+  const projectId = String(state.selectedProject?.project_id || "");
+  state.fleetNodeMonitorInFlight = true;
+  try {
+    const response = await apiWithTimeout("/v1/terminals", {}, 6000);
+    if (state.selectedProject?.project_id !== projectId || !fleetHomeSoftRefreshActive()) return;
+    if (!Array.isArray(response?.terminals)) throw new Error("TERMINAL_LIST_INVALID");
+    const signature = JSON.stringify(response.terminals.map((item) => [
+      item.terminal_id, item.session_anchor_ref, item.project_id, item.mode, item.provider,
+      item.state, item.provider_cli_alive, item.prompt_activity?.status,
+      item.host_turn_state?.state, item.host_turn_state?.input_active,
+    ]));
+    const changed = signature !== state.fleetHomeRefreshTerminalsSignature ||
+      state.supervisorTerminalsStatus !== "READY";
+    state.fleetHomeRefreshTerminalsSignature = signature;
+    state.supervisorTerminals = response.terminals;
+    state.supervisorTerminalsStatus = "READY";
+    state.supervisorTerminalsError = "";
+    if (changed) renderIntegratedHome();
+  } catch (error) {
+    if (state.selectedProject?.project_id !== projectId) return;
+    if (state.supervisorTerminalsStatus !== "ERROR") {
+      state.supervisorTerminalsStatus = "ERROR";
+      state.supervisorTerminalsError = error.message;
+      renderIntegratedHome();
+    }
+  } finally {
+    state.fleetNodeMonitorInFlight = false;
+  }
+}
+
 async function refreshFleetHomeSoft() {
   if (state.fleetHomeRefreshInFlight) return;
   if (!fleetHomeSoftRefreshActive()) return;
@@ -5215,6 +5316,7 @@ function renderIntegratedHome() {
   renderHomeKanban(selNode, visibleTodos, selTodo);
   renderHomeWorkSummary(nodeTodos);
   renderHomeMobileBar(project, selNode, selTodo);
+  renderLiveSessionProjectionSurfaces();
   // Draw after layout settles; the retry budget resets each render.
   // (setTimeout, not rAF — rAF is paused when the tab is not foregrounded.)
   homeRelRetry = 0;
@@ -6660,13 +6762,13 @@ function renderFleetNodeTeamSummary(graphNode) {
     return section;
   }
   const owner = projection.active[0] || null;
-  const persona = owner && (state.personaLibrary || []).find((item) => String(item.persona_id || "") === String(owner.persona_id || ""));
+  const persona = owner && (state.personaLibrary || []).find((item) =>
+    String(item.persona_id || "") === String(owner.persona_id || ""));
   const ownerLine = node("p", "fleet-node-team-status");
   if (owner) {
-    const ownerLive = fleetAuthoritativeTerminals().some((item) => String(item.session_anchor_ref || "") === String(owner.session_anchor_ref || ""));
     ownerLine.append(
       node("span", "fleet-node-role", "Master"),
-      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"} / ${ownerLive ? "LIVE" : "OFFLINE"}`),
+      document.createTextNode(` ${persona?.title || owner.persona_id || "UNKNOWN"}`),
     );
   } else {
     ownerLine.append(node("span", "fleet-node-role", "Master"), document.createTextNode(" UNASSIGNED"));
@@ -6691,7 +6793,9 @@ function fleetSessionBindingLabel(sessionAnchorRef) {
   const labels = active.map((item) => {
     const ref = String(item.node_ref || "").trim();
     if (!ref) return "project-wide";
-    const graphNode = (state.projection?.unified_graph?.nodes || []).find((n) => homeNodeRefKey(n.node_id) === ref);
+    const graphNodes = state.projection?.unified_graph?.nodes ||
+      (typeof homeNodes === "function" ? homeNodes() : []);
+    const graphNode = graphNodes.find((n) => homeNodeRefKey(n.node_id) === ref);
     return graphNode ? homeNodeTitleWithId(graphNode) : ref;
   });
   return `bound: ${[...new Set(labels)].join(", ")}`;
@@ -7135,8 +7239,54 @@ function fleetHomeWorkerRows(nodes) {
   return rows.filter((item) => {
     const ref = String(item.node_ref || "").trim();
     if (!ref) return state.homeWorkstreamKind !== "OPERATIONS";
-    return fleetFeatureIsOperations(ref) === (state.homeWorkstreamKind === "OPERATIONS");
+    const isOperations = typeof fleetFeatureIsOperations === "function" && fleetFeatureIsOperations(ref);
+    return isOperations === (state.homeWorkstreamKind === "OPERATIONS");
   });
+}
+
+function fleetNodeSessionRows(nodeRef, sessions) {
+  const key = String(nodeRef || "").replace(/^(feat:|feature_node:)/, "");
+  return (Array.isArray(sessions) ? sessions : []).filter((session) => session.nodeRef === key);
+}
+
+function renderFleetNodeSessions(graphNode, sessions) {
+  const nodeRef = homeNodeRefKey(graphNode.node_id);
+  const bound = fleetNodeSessionRows(nodeRef, sessions);
+  const section = node("section", "fleet-node-sessions");
+  section.dataset.nodeRef = nodeRef;
+  section.dataset.sessionCount = String(bound.length);
+  section.append(node("strong", "fleet-node-sessions-heading", `Sessions ${bound.length}`));
+  for (const session of bound) {
+    const row = node("div", "fleet-node-session");
+    row.dataset.sessionAnchorRef = session.sessionAnchorRef;
+    row.dataset.sessionPresence = session.presence;
+    row.dataset.sessionActivity = session.activity;
+    row.title = session.sessionAnchorRef;
+    row.append(
+      node("span", "fleet-node-session-role", `${session.role} · ${session.provider}`),
+      node("span", "fleet-node-session-state", `${session.presence} · ${session.activity}`),
+      node("small", "fleet-node-session-anchor", session.sessionAnchorRef)
+    );
+    const tab = (state.terminals || []).find((item) => item.terminal_id === session.terminalId);
+    if (session.presence === "LIVE" && tab) {
+      const open = node("button", "fleet-node-session-open", "Open");
+      open.type = "button";
+      open.setAttribute("aria-label", `Open ${session.role} session ${session.sessionAnchorRef}`);
+      open.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (typeof expandConversationLayer === "function") expandConversationLayer();
+        if (typeof selectTerminalTab === "function") selectTerminalTab(tab.terminal_id);
+      });
+      row.append(open);
+    }
+    section.append(row);
+  }
+  if (!bound.length && state.personaAssignmentsStatus === "READY") {
+    section.append(node("span", "fleet-node-sessions-empty", "No assigned sessions"));
+  } else if (!bound.length) {
+    section.append(node("span", "fleet-node-sessions-empty", "Session assignment unknown"));
+  }
+  return section;
 }
 
 function renderHomeNodes(selNode) {
@@ -7147,6 +7297,7 @@ function renderHomeNodes(selNode) {
   listEl.replaceChildren();
   const nodes = homeNodes();
   const workerRows = fleetHomeWorkerRows(nodes);
+  const boundSessions = fleetLiveSessionRows();
   const nodeRefs = new Set(nodes.map((item) => String(homeNodeRefKey(item.node_id) || "")));
   const unassignedWorkerCount = workerRows.filter((frame) => !frame.node_ref || !nodeRefs.has(String(frame.node_ref))).length;
   if (unassignedWorkerCount) {
@@ -7253,6 +7404,7 @@ function renderHomeNodes(selNode) {
     }
     const ownerRow = renderHomeNodeOwnerRow(graphNode);
     if (ownerRow) rows.push(ownerRow);
+    rows.push(renderFleetNodeSessions(graphNode, boundSessions));
 
     const card = homeCard(`node:${graphNode.node_id}`, homeNodeTitleWithId(graphNode), {
       selected,
@@ -7301,6 +7453,8 @@ function renderHomeTodos(selNode, nodeTodos, selTodo) {
     const stateSpan = node("span", "", planStateLabel(todo.state));
     stateSpan.style.cssText = `font-size:9px;color:${blocked ? "#c99187" : "#8a8a86"}`;
     meta.append(stateSpan);
+    const sessionProjection = renderFleetSessionProjection(todo, "home-session-projection");
+    if (sessionProjection) meta.append(sessionProjection);
     const pri = node("span", "home-chip", String(todo.priority || "P3"));
     pri.style.marginLeft = "auto";
     meta.append(pri);
@@ -7465,7 +7619,7 @@ function renderHomeDetail(selNode, selTodo) {
   openSess.type = "button";
   openSess.style.borderColor = "#43454c";
   openSess.addEventListener("click", () => openFleetCardSession(selTodo));
-  el.append(openSess);
+  if (fleetCardSession(selTodo)) el.append(openSess);
 }
 
 // Fleet Todo 상세 -> 결과 연결: a DONE/BLOCKED todo's completion evidence
@@ -13519,6 +13673,7 @@ function buildUnifiedGalaxyGraph() {
       depth: style.depth,
       proposed: n.state === "PROPOSED",
       unifiedKind: n.kind,
+      sessionPresence: fleetGalaxySessionPresence({ node_id: n.node_id }, fleetLiveSessionRows()),
       data: n,
       x: 0,
       y: 0,
@@ -13544,6 +13699,7 @@ function buildUnifiedGalaxyGraph() {
   state.graph.edges = (unified.edges || [])
     .filter((e) => (!edgeAllow || edgeAllow.has(e.edge_id)) && visible.has(e.from_node) && visible.has(e.to_node))
     .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e }));
+  renderLiveSessionProjectionSurfaces();
 
   const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
   setGraphLegend(
@@ -14769,6 +14925,17 @@ function drawGraph() {
   context.globalAlpha = 1;
   for (const item of state.graph.nodes) {
     drawGraphNodeIcon(context, item, depthStyle);
+    const presence = item.sessionPresence;
+    if (presence?.marker && presence.marker !== "NONE") {
+      const metrics = graphNodeMetrics(item);
+      context.beginPath();
+      context.arc(item.x + metrics.radius * 0.72, item.y - metrics.radius * 0.72, 4.5, 0, Math.PI * 2);
+      context.fillStyle = presence.marker === "LIVE" ? "#6f9b78" : "#a68d5b";
+      context.fill();
+      context.strokeStyle = "#1c1d20";
+      context.lineWidth = 1.5;
+      context.stroke();
+    }
   }
   drawGalaxyShips(context, byId);
   drawGalaxyRooms(context);
@@ -14820,6 +14987,10 @@ function renderGalaxyNodeCard(graphNode) {
   }
   fact("Todos", String(todos.length));
   if (rooms.length) fact("Rooms", String(rooms.length));
+  const presence = graphNode.sessionPresence || fleetGalaxySessionPresence(graphNode, fleetLiveSessionRows());
+  if (presence.marker !== "NONE") {
+    fact("Session presence", `${presence.marker} · ${presence.live.length} live`);
+  }
   card.append(grid);
 
   const actions = node("div", "galaxy-node-card-actions");
@@ -17791,6 +17962,8 @@ function renderTodos() {
     const blockedReason = renderTodoBlockedReason(todo, () => renderTodos());
     item.append(header);
     if (ownership) item.append(ownership);
+    const sessionProjection = renderFleetSessionProjection(todo, "todo-session-projection");
+    if (sessionProjection) item.append(sessionProjection);
     if (automationControl) item.append(automationControl);
     if (blockedReason) item.append(blockedReason);
     item.append(title, detail, controls);
@@ -22227,6 +22400,126 @@ refreshLawStrip = function () {
   bindGoalPlanEvents();
 }
 
+// Live session projection shared by Fleet, Kanban, and Galaxy.  These helpers
+// consume only server-owned session/task-frame identifiers; absence is
+// represented as UNASSIGNED/UNKNOWN rather than guessed from provider recency.
+// The assignment rows own node membership. Terminals only report whether the
+// assigned session is connected and currently handling input.
+function fleetBoundSessionRows(projectId, masterAssignments, workerAssignments, terminals, observedSessions) {
+  const project = String(projectId || "").trim();
+  if (!project) return [];
+  const terminalSnapshotAvailable = Array.isArray(terminals);
+  const physical = new Map((Array.isArray(terminals) ? terminals : [])
+    .filter((item) => String(item.project_id || "") === project && item.session_anchor_ref)
+    .map((item) => [String(item.session_anchor_ref), item]));
+  const observed = new Map((Array.isArray(observedSessions) ? observedSessions : [])
+    .filter((item) => item.session_anchor_ref)
+    .map((item) => [String(item.session_anchor_ref), item]));
+  const rows = [];
+  const add = (assignment, role) => {
+    if (String(assignment?.project_id || "") !== project ||
+        String(assignment?.state || "").toUpperCase() !== "ACTIVE") return;
+    const nodeRef = String(assignment.node_ref || "").trim();
+    const anchor = String(assignment.session_anchor_ref || "").trim();
+    if (!nodeRef || !anchor) return;
+    const terminal = physical.get(anchor);
+    const session = observed.get(anchor);
+    // A Task Frame review may be recorded against its owning Master Anchor.
+    // That is not a separate Reviewer session on the Master terminal.
+    if (role !== "MASTER" &&
+        String(terminal?.mode || session?.mode || "WORKER").toUpperCase() !== "WORKER") return;
+    if (role === "MASTER" &&
+        String(terminal?.mode || session?.mode || "MASTER").toUpperCase() !== "MASTER") return;
+    const terminalState = String(terminal?.state || "").toUpperCase();
+    const presence = !terminalSnapshotAvailable ? "UNKNOWN" : !terminal ? "OFFLINE"
+      : terminalState === "LIVE" && terminal.provider_cli_alive !== false ? "LIVE"
+      : ["CLOSED", "ENDED", "SESSION_ENDED"].includes(terminalState) ? "ENDED" : "DISCONNECTED";
+    const turn = terminal?.host_turn_state || {};
+    const activity = presence !== "LIVE" ? "NOT_RUNNING"
+      : String(turn.state || "").toUpperCase() === "WORKING" ||
+        (turn.input_active === true && String(terminal?.prompt_activity?.status || "").toLowerCase() === "working")
+        ? "WORKING" : "IDLE";
+    rows.push(fleetLiveSessionProjection({
+      session_anchor_ref: anchor, node_ref: nodeRef,
+      todo_id: assignment.todo_id, task_frame_id: assignment.task_frame_id,
+      terminal_id: terminal?.terminal_id,
+      provider: terminal?.provider || session?.provider || "UNKNOWN",
+      mode: role, role, state: terminalState || "OFFLINE", presence, activity,
+    }));
+  };
+  for (const assignment of Array.isArray(masterAssignments) ? masterAssignments : []) add(assignment, "MASTER");
+  for (const assignment of Array.isArray(workerAssignments) ? workerAssignments : []) {
+    add(assignment, String(assignment.worker_role || "WORKER").toUpperCase());
+  }
+  return rows;
+}
+
+function fleetLiveSessionProjection(session) {
+  const rawState = String(session?.state || session?.lifecycle_state || session?.host_state || "").toUpperCase();
+  const presence = String(session?.presence || "").toUpperCase() ||
+    (rawState === "LIVE" || rawState === "READY" || rawState === "WORKING" ? "LIVE"
+      : ["ENDED", "CLOSED", "SESSION_ENDED"].includes(rawState) ? "ENDED"
+      : rawState === "OFFLINE" ? "OFFLINE" : rawState ? "DISCONNECTED" : "UNKNOWN");
+  return {
+    sessionAnchorRef: String(session?.sessionAnchorRef || session?.session_anchor_ref || session?.anchor_ref || "").trim() || null,
+    provider: String(session?.provider || "UNKNOWN").toUpperCase(),
+    role: String(session?.role || session?.mode || "UNKNOWN").toUpperCase(),
+    mode: String(session?.mode || session?.role || "UNKNOWN").toUpperCase(),
+    state: rawState || "UNKNOWN",
+    presence,
+    activity: String(session?.activity || "UNKNOWN").toUpperCase(),
+    isLive: presence === "LIVE",
+    terminalId: String(session?.terminalId || session?.terminal_id || "").trim() || null,
+    taskFrameId: String(session?.taskFrameId || session?.task_frame_id || "").trim() || null,
+    todoId: String(session?.todoId || session?.todo_id || "").trim() || null,
+    nodeRef: String(session?.nodeRef || session?.node_ref || "").replace(/^(feat:|feature_node:)/, "").trim() || null,
+  };
+}
+
+function fleetTodoExecutorProjection(todo, sessions) {
+  const todoId = String(todo?.todo_id || "").trim();
+  const taskFrameId = String(todo?.task_frame_id || todo?.execution_task_frame_id || "").trim();
+  const candidates = (Array.isArray(sessions) ? sessions : [])
+    .map(fleetLiveSessionProjection)
+    .filter((item) => item.sessionAnchorRef && item.role !== "MASTER" && (
+      (taskFrameId && item.taskFrameId === taskFrameId) ||
+      (todoId && item.todoId === todoId)
+    ));
+  const unique = [...new Map(candidates.map((item) => [item.sessionAnchorRef, item])).values()];
+  if (unique.length > 1) return { status: "CONFLICT", executor: null, sessions: unique };
+  if (unique.length === 1) {
+    const executor = unique[0];
+    return { status: executor.presence, executor, sessions: unique };
+  }
+  return { status: "UNASSIGNED", executor: null, sessions: [] };
+}
+
+function fleetGalaxySessionPresence(graphNode, sessions) {
+  const nodeRef = String(graphNode?.node_id || graphNode?.feature_id || graphNode?.node_ref || "")
+    .replace(/^(feat:|feature_node:)/, "").trim();
+  const rows = (Array.isArray(sessions) ? sessions : [])
+    .map(fleetLiveSessionProjection)
+    .filter((item) => item.sessionAnchorRef && nodeRef && item.nodeRef === nodeRef);
+  const unique = [...new Map(rows.map((item) => [item.role + ":" + item.sessionAnchorRef, item])).values()];
+  return {
+    nodeRef: nodeRef || null,
+    sessions: unique,
+    live: unique.filter((item) => item.isLive),
+    marker: unique.length ? (unique.some((item) => item.isLive) ? "LIVE" : "OFFLINE") : "NONE",
+  };
+}
+
+function fleetTodoExecutingSessionActivity(todo, sessions) {
+  const projection = fleetTodoExecutorProjection(todo, sessions);
+  return {
+    todoId: String(todo?.todo_id || "").trim() || null,
+    lane: projection.executor?.activity === "WORKING" ? "EXECUTING" : "NOT_EXECUTING",
+    executorStatus: projection.status,
+    sessionAnchorRef: projection.executor?.sessionAnchorRef || null,
+    provider: projection.executor?.provider || null,
+    presence: projection.executor?.presence || "UNKNOWN",
+  };
+}
 bindEvents();
 // Establish the home layout before slow data requests can outlast the splash.
 renderGoalPlan();
@@ -22258,6 +22551,7 @@ state.providerTailTimer = window.setInterval(tailProviderSessions, 4000);
 // without a full page reload. 4s matches provider tail; editing/dialogs skip.
 if (!state.fleetHomeRefreshTimer) {
   state.fleetHomeRefreshTimer = window.setInterval(() => {
+    void refreshFleetNodeSessionMonitor();
     void refreshFleetHomeSoft();
   }, 4000);
 }
