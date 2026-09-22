@@ -4857,6 +4857,16 @@ function fleetNodeIsOperations(graphNode) {
   ).toUpperCase() === "OPERATIONS";
 }
 
+// A displayed work node is an explicit Feature Node registration.  Seeded
+// product/structure/knowledge records describe the repository but are not
+// operator-created nodes and must never become work-board or graph entries.
+function isRegisteredFeatureNode(graphNode) {
+  return (
+    String(graphNode?.kind || "").toUpperCase() === "FEATURE" &&
+    String(graphNode?.node_id || "").startsWith("feat:")
+  );
+}
+
 function homeNodes(workstreamKind = state.homeWorkstreamKind) {
   const graph = state.projection?.unified_graph?.nodes || [];
   const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
@@ -4865,6 +4875,7 @@ function homeNodes(workstreamKind = state.homeWorkstreamKind) {
   for (const n of graph) {
     const id = String(n.node_id || "");
     const kind = String(n.kind || "").toUpperCase();
+    if (!isRegisteredFeatureNode(n)) continue;
     if (fleetNodeIsOperations(n) !== (workstreamKind === "OPERATIONS")) continue;
     const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
     const knowledge = ["DOCUMENT", "DECISION", "MEMORY"].includes(kind);
@@ -13463,7 +13474,11 @@ function buildUnifiedGalaxyGraph() {
   renderGalaxyViewSwitch(viewName, true);
   if (elements.galaxyFullscreenToggle) elements.galaxyFullscreenToggle.hidden = false;
 
-  let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+  // The map is a node registry, not a repository topology browser.  Only
+  // explicit Feature Node registrations can become visible graph nodes.
+  let nodes = unified.nodes.filter(
+    (n) => isRegisteredFeatureNode(n) && (!nodeAllow || nodeAllow.has(n.node_id))
+  );
 
   // Focus: n-hop neighbourhood around a clicked planet.
   const focusId = state.galaxyFocus;

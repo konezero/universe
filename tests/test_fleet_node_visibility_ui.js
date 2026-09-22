@@ -16,10 +16,16 @@ const context = { state: {projection: {unified_graph: {nodes: [
 ]}}, fleetFilters: {showDone:false, showDiscarded:false}, projectFeatures: []}, homeAllTodos:()=>[{node_ref:'work'}], homeNodeRefKey:id=>id.replace(/^feat:/,''), homeNodeTodos:n=>n.node_id==='feat:work'?[{state:'IN_PROGRESS'}]:[], fleetShowDone:()=>false, fleetShowDiscarded:()=>false };
 vm.createContext(context);
 vm.runInContext(source.slice(start,end),context);
-assert.deepEqual(Array.from(context.homeNodes(),n=>n.node_id),['feat:work','app','clinic']);
+assert.deepEqual(
+  Array.from(context.homeNodes(), n => n.node_id),
+  ['feat:work'],
+  'Fleet must expose only explicit Feature Node registrations'
+);
 context.state.homeWorkstreamKind = 'OPERATIONS';
 assert.deepEqual(Array.from(context.homeNodes(),n=>n.node_id),['feat:ops'], 'Ops board must own the complete Operations node');
 context.state.homeWorkstreamKind = 'DEVELOPMENT';
+assert.match(source, /function isRegisteredFeatureNode\(graphNode\)/);
+assert.match(source, /isRegisteredFeatureNode\(n\) && \(!nodeAllow \|\| nodeAllow.has\(n.node_id\)\)/, 'Map must use the same registered-node filter');
 assert.match(source.slice(source.indexOf('async function submitHomeNode('),source.indexOf('// + Todo',source.indexOf('async function submitHomeNode('))),/invokeServerAction\("feature.create"/);
 
 // Fleet 완료/폐기 필터: DONE-only nodes and ARCHIVED Feature Nodes hide by
@@ -48,8 +54,8 @@ vm.createContext(filterContext);
 vm.runInContext(source.slice(start, end), filterContext);
 assert.deepEqual(
   Array.from(filterContext.homeNodes(), n => n.node_id).sort(),
-  ['app', 'feat:work'],
-  'a fully-DONE node and an ARCHIVED feature hide by default'
+  ['feat:work'],
+  'unregistered structural nodes, fully-DONE nodes, and archived features hide by default'
 );
 filters.showDone = true;
 assert.ok(
