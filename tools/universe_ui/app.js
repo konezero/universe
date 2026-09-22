@@ -4335,6 +4335,23 @@ function setGraphScale(nextScale) {
   drawGraph();
 }
 
+// Central workspace page registry. The navigation rail and session dock persist;
+// exactly one central content surface is visible for every primary route.
+function activateCentralPage(page) {
+  const pages = {
+    goal: document.querySelector("#goal-plan-workspace"),
+    ops: document.querySelector("#memory-ops-view"),
+    bench: document.querySelector("#bench-screen"),
+    project: document.querySelector("#project-screen"),
+    graph: document.querySelector("#universe-graph")?.closest(".canvas-wrap"),
+  };
+  for (const [id, surface] of Object.entries(pages)) {
+    if (surface) surface.hidden = id !== page;
+  }
+  const graphToolbar = document.querySelector(".graph-toolbar");
+  if (graphToolbar) graphToolbar.hidden = page !== "graph";
+}
+
 /** Graph canvas modes only (not inspector tabs). */
 function showGraphView(view) {
   hideMemoryOpsView();
@@ -7690,6 +7707,13 @@ function drawHomeRelations() {
 
 /** Highlight top nav without toast placeholders. */
 function syncPrimaryNavSelection(primaryView) {
+  const centralPage = {
+    work: "goal", fleet: "goal", "memory-ops": "ops",
+    activity: "project", memory: "project", persona: "project",
+    bench: "bench", map: "graph", documents: "graph", sessions: "graph",
+    timeline: "graph", implementation: "graph", network: "graph",
+  }[primaryView];
+  if (centralPage) activateCentralPage(centralPage);
   for (const root of [elements.primaryNav, elements.utilityRail]) {
     if (!root) continue;
     for (const item of root.querySelectorAll("[data-primary-view]")) {
@@ -7751,6 +7775,7 @@ function showProjectScreen(which) {
   const panel = spec && document.querySelector(`#${spec.panelId}`);
   if (!spec || !screen || !body || !panel) return;
   restoreBenchPanel();
+  restoreProjectPanels();
   state.view = which;
   document.body.classList.remove("graph-mode", "home-mode", "fleet-mode", "galaxy-view", "inspector-open");
   const goalWorkspace = document.querySelector("#goal-plan-workspace");
@@ -17839,6 +17864,31 @@ async function updateTodo(todo, changes) {
   }
 }
 
+function refreshTodoStateSurface(todo, currentTodo) {
+  const fleetHomeActive =
+    ["work", "memory-ops"].includes(state.view) &&
+    typeof document !== "undefined" &&
+    (document.body.classList.contains("home-mode") || document.body.classList.contains("fleet-mode"));
+  if (fleetHomeActive && typeof renderIntegratedHome === "function") {
+    // A completed selected Todo would otherwise be filtered out immediately,
+    // which clears the detail selection and makes the state picker jump.
+    if (
+      String(currentTodo?.state || "").toUpperCase() === "DONE" &&
+      state.homeTodoId === todo.todo_id &&
+      !fleetShowDone()
+    ) {
+      state.fleetFilters.showDone = true;
+      saveFleetFilters();
+    }
+    renderIntegratedHome();
+    return;
+  }
+  renderProjects();
+  renderTodos();
+  renderDetails();
+  drawGraph();
+}
+
 function pendingTodoState(todo) {
   const storageKey = `universe.todo.state.${todo.todo_id}`;
   try { return JSON.parse(sessionStorage.getItem(storageKey) || "null"); }
@@ -17870,8 +17920,7 @@ async function updateTodoState(todo, desiredState, evidence, validated) {
     const current = await invokeServerAction("todo.read", { todo_id: todo.todo_id });
     if (result.result_propagation?.status !== "PENDING") sessionStorage.removeItem(storageKey);
     state.todos = state.todos.map((item) => item.todo_id === todo.todo_id ? current.todo : item);
-    renderProjects(); renderTodos(); renderDetails(); drawGraph();
-    if (typeof renderIntegratedHome === "function") renderIntegratedHome();
+    refreshTodoStateSurface(todo, current.todo);
     elements.todoFormError.textContent = "";
     toast(result.result_propagation?.status === "PENDING" ? "상태 저장됨 · 결과 전달 대기" : "Todo 상태 저장됨");
   } catch (error) {
@@ -18674,6 +18723,11 @@ async function submitRelease(event) {
 
 function showInspectorTab(name) {
   hideMemoryOpsView();
+  // This function is also called directly by left-rail actions, so it owns
+  // clearing full-screen panels before revealing an inspector panel.
+  restoreBenchPanel();
+  restoreProjectPanels();
+  activateCentralPage("graph");
   for (const button of document.querySelectorAll("[data-tab]")) {
     button.classList.toggle("selected", button.dataset.tab === name);
   }

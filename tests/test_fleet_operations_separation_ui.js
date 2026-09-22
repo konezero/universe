@@ -36,6 +36,11 @@ assert.match(renderOps, /view.append\(board\)/, 'Ops must host the existing full
 assert.match(renderOps, /renderIntegratedHome\(\)/);
 assert.doesNotMatch(renderOps, /memoryBatchConfigs|memoryBatchRuns|memoryCandidates/, 'Ops is not a copied batch summary');
 
+assert.match(app, /function activateCentralPage\(page\)/, 'central routes must select one page surface');
+assert.match(app, /\"memory-ops\": \"ops\"/, 'Ops rail route must activate its own surface');
+assert.match(app, /timeline: \"graph\", implementation: \"graph\"/, 'all graph routes must share the graph surface');
+assert.match(app, /if \(centralPage\) activateCentralPage\(centralPage\)/, 'primary navigation must activate the selected surface');
+
 const hideMemoryStart = app.indexOf('function hideMemoryOpsView()');
 const hideMemoryEnd = app.indexOf('\n}', hideMemoryStart) + 2;
 const hideMemory = app.slice(hideMemoryStart, hideMemoryEnd);
@@ -63,6 +68,7 @@ const projectEnd = app.indexOf('\n}', projectStart) + 2;
 const showProject = app.slice(projectStart, projectEnd);
 assert.match(showProject, /goal-plan-workspace.*hidden = true/s);
 assert.match(showProject, /hideMemoryOpsView\(\)/);
+assert.match(showProject, /restoreProjectPanels\(\)/, 'switching project screens must park the prior screen panel');
 
 const benchStart = app.indexOf('function showBenchScreen()');
 const benchEnd = app.indexOf('\n}', benchStart) + 2;
@@ -86,6 +92,8 @@ const tabStart = app.indexOf('function showInspectorTab(name)');
 const tabEnd = app.indexOf('\n}', tabStart) + 2;
 const inspectorTab = app.slice(tabStart, tabEnd);
 assert.match(inspectorTab, /hideMemoryOpsView\(\)/);
+assert.match(inspectorTab, /restoreBenchPanel\(\)/, 'inspector routes must hide the dedicated Bench screen');
+assert.match(inspectorTab, /restoreProjectPanels\(\)/, 'inspector routes must hide project screens');
 assert.match(inspectorTab, /name !== "details"/);
 assert.match(inspectorTab, /name !== "future"/);
 

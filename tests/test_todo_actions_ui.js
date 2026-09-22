@@ -1,6 +1,6 @@
 const fs = require('fs'), vm = require('vm'), assert = require('assert/strict');
 const source = fs.readFileSync('tools/universe_ui/app.js','utf8');
-const start = source.indexOf('function pendingTodoState(');
+const start = source.indexOf('function refreshTodoStateSurface(');
 const end = source.indexOf('async function deleteTodo(',start);
 const stored = new Map(); let fail = null; const calls=[];
 const todo={todo_id:'todo-1',project_id:'TEST',revision:2,state:'READY'};
