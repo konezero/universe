@@ -13474,11 +13474,9 @@ function buildUnifiedGalaxyGraph() {
   renderGalaxyViewSwitch(viewName, true);
   if (elements.galaxyFullscreenToggle) elements.galaxyFullscreenToggle.hidden = false;
 
-  // The map is a node registry, not a repository topology browser.  Only
-  // explicit Feature Node registrations can become visible graph nodes.
-  let nodes = unified.nodes.filter(
-    (n) => isRegisteredFeatureNode(n) && (!nodeAllow || nodeAllow.has(n.node_id))
-  );
+  // Galaxy remains the full relationship projection.  Registration filtering
+  // applies only to Fleet/Ops work boards, not this topology view.
+  let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
 
   // Focus: n-hop neighbourhood around a clicked planet.
   const focusId = state.galaxyFocus;

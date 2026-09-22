@@ -25,7 +25,7 @@ context.state.homeWorkstreamKind = 'OPERATIONS';
 assert.deepEqual(Array.from(context.homeNodes(),n=>n.node_id),['feat:ops'], 'Ops board must own the complete Operations node');
 context.state.homeWorkstreamKind = 'DEVELOPMENT';
 assert.match(source, /function isRegisteredFeatureNode\(graphNode\)/);
-assert.match(source, /isRegisteredFeatureNode\(n\) && \(!nodeAllow \|\| nodeAllow.has\(n.node_id\)\)/, 'Map must use the same registered-node filter');
+assert.match(source, /let nodes = unified.nodes.filter\(\(n\) => !nodeAllow \|\| nodeAllow.has\(n.node_id\)\)/, 'Galaxy must retain its full topology projection');
 assert.match(source.slice(source.indexOf('async function submitHomeNode('),source.indexOf('// + Todo',source.indexOf('async function submitHomeNode('))),/invokeServerAction\("feature.create"/);
 
 // Fleet 완료/폐기 필터: DONE-only nodes and ARCHIVED Feature Nodes hide by
