@@ -4572,9 +4572,26 @@ function openHomeAddNode() {
   }
   const form = document.querySelector("#home-node-form");
   form.reset();
+  delete form.dataset.pendingGoalId;
+  delete form.dataset.predecessorGoalId;
+  delete form.dataset.pendingProjectId;
+  form.elements.intent_text.placeholder = "Describe the Goal";
   document.querySelector("#home-node-error").textContent = "";
   dialog.showModal();
   form.elements.intent_text.focus();
+}
+
+function openHomeGoalFollowup(graphNode) {
+  if (String(graphNode?.kind || "").toUpperCase() !== "FLEET_GOAL" ||
+      String(graphNode.state || "").toUpperCase() !== "DONE" ||
+      !graphNode.source_proposal_candidate_id || !graphNode.goal_id) return;
+  openHomeAddNode();
+  const form = document.querySelector("#home-node-form");
+  const dialog = document.querySelector("#home-node-dialog");
+  if (!form || !dialog?.open) return;
+  form.dataset.predecessorGoalId = graphNode.goal_id;
+  form.dataset.pendingProjectId = state.selectedProject.project_id;
+  form.elements.intent_text.placeholder = "Describe the new follow-up Goal";
 }
 
 async function archiveHomeNode(featureId) {
@@ -4610,6 +4627,11 @@ async function submitHomeNode(event) {
   submit.disabled = true;
   try {
     let newNodeId;
+    if (form.dataset.predecessorGoalId &&
+        (state.homeWorkstreamKind !== "DEVELOPMENT" ||
+         form.dataset.pendingProjectId !== projectId)) {
+      throw new Error("Follow-up Goal context changed; reopen the form");
+    }
     if (state.homeWorkstreamKind === "OPERATIONS") {
       const result = await invokeServerAction("feature.create", {
         project_id: projectId,
@@ -4619,6 +4641,10 @@ async function submitHomeNode(event) {
       newNodeId = `feat:${result.feature?.feature_id || ""}`;
       if (state.projectionsByProject) delete state.projectionsByProject[projectId];
     } else {
+      const predecessorGoalId = form.dataset.predecessorGoalId || null;
+      if (predecessorGoalId && form.dataset.pendingProjectId !== projectId) {
+        throw new Error("Follow-up Goal project changed; reopen the form");
+      }
       const goalId = form.dataset.pendingGoalId || `goal_${crypto.randomUUID().replaceAll("-", "")}`;
       form.dataset.pendingGoalId = goalId;
       const goalBody = {
@@ -4627,22 +4653,34 @@ async function submitHomeNode(event) {
       };
       let goal;
       try {
-        const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/goals`, {
-          method: "POST", body: goalBody,
-        });
-        goal = result.goal;
+        if (predecessorGoalId) {
+          const result = await invokeServerAction("goal.create-follow-up", {
+            project_id: projectId, predecessor_goal_id: predecessorGoalId,
+            goal_id: goalId, title, description: intent,
+          });
+          goal = result.goal;
+        } else {
+          const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/goals`, {
+            method: "POST", body: goalBody,
+          });
+          goal = result.goal;
+        }
       } catch (error) {
         // An uncertain response may follow a committed insert. Read the exact
         // client-chosen ID; never create another Goal on a blind retry.
         const read = await api(`/v1/goals/${encodeURIComponent(goalId)}`).catch(() => null);
         if (read?.goal?.project_id !== projectId || read.goal.title !== title ||
-            read.goal.description !== intent) throw error;
+            read.goal.description !== intent ||
+            (predecessorGoalId &&
+             read.goal.proposal_origin?.predecessor_goal_id !== predecessorGoalId)) throw error;
         goal = read.goal;
       }
       if (goal?.goal_id !== goalId || goal.project_id !== projectId) {
         throw new Error("Goal response does not match this project and request");
       }
       delete form.dataset.pendingGoalId;
+      delete form.dataset.predecessorGoalId;
+      delete form.dataset.pendingProjectId;
       newNodeId = `goal:${goalId}`;
     }
     document.querySelector("#home-node-dialog").close();
@@ -5013,6 +5051,7 @@ function homeNodes(workstreamKind = state.homeWorkstreamKind) {
       title: goal.title || goal.goal_id, goal_id: goal.goal_id,
       source_node_ref: goal.node_ref || null,
       source_proposal_candidate_id: goal.proposal_origin?.candidate_id || null,
+      predecessor_goal_id: goal.proposal_origin?.predecessor_goal_id || null,
       workstream_kind: workstream,
       data: { summary: goal.description || "" },
     });
@@ -7494,6 +7533,20 @@ function renderHomeNodes(selNode) {
     if (graphNode.source_proposal_candidate_id) {
       rows.push(node("div", "home-card-meta",
         `Galaxy source: proposal:${graphNode.source_proposal_candidate_id}`));
+    }
+    if (graphNode.predecessor_goal_id) {
+      rows.push(node("div", "home-card-meta",
+        `Follow-up to: ${graphNode.predecessor_goal_id}`));
+    }
+    if (graphNode.kind === "FLEET_GOAL" && graphNode.state === "DONE" &&
+        graphNode.source_proposal_candidate_id) {
+      const followup = node("button", "secondary-button compact-action", "New follow-up Goal");
+      followup.type = "button";
+      followup.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openHomeGoalFollowup(graphNode);
+      });
+      rows.push(followup);
     }
 
     const statusRow = node("div", "home-card-meta");

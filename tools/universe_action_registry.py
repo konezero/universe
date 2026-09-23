@@ -1336,6 +1336,11 @@ def build_default_action_registry(
             "universe.goal-accept-proposal-result.v1",
         ),
         (
+            "goal.create-follow-up",
+            "universe.goal-followup-request.v1",
+            "universe.goal-followup-result.v1",
+        ),
+        (
             FEATURE_CREATE_ACTION_ID,
             FEATURE_CREATE_REQUEST_SCHEMA,
             FEATURE_CREATE_RESULT_SCHEMA,

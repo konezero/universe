@@ -78,8 +78,12 @@ does a paged Galaxy/Knowledge proposal-node projection. The Memory menu now
 shows those same project-local proposals rather than the operational RAG queue;
 Ops retains the old manual RAG review in a labeled legacy diagnostic. Accepted
 Goals expose their source candidate ID/digest; manual Goals have no invented
-origin. The scheduled second LLM pass, automatic source-checked RAG ingestion,
-complete Galaxy lineage graph, and old
+origin. A USER-only `goal.create-follow-up` Action now creates a new Goal from a
+DONE predecessor with preserved proposal lineage and an explicit predecessor ID;
+Fleet exposes it on completed proposal-backed Goal cards. Replays with the same
+Goal ID and payload return the original Goal. This does not reopen the predecessor,
+create Todos, or start execution. The scheduled second LLM pass, automatic
+source-checked RAG ingestion, complete Galaxy lineage graph, and old
 Feature/Goal migration still require reconciliation before the full pipeline
 can be called compliant.
 Do not silently reinterpret existing IDs/states, auto-adopt historical records,

@@ -11778,6 +11778,67 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
         self.assertEqual("GOAL_PROPOSAL_KIND_INVALID", rejected["error_code"])
 
+    def test_followup_goal_keeps_proposal_lineage_without_reopening_done_goal(self) -> None:
+        self.server.store.register_project(self.registration())
+        candidate, _ = self.server.store.create_memory_candidate(
+            "GCS", {"stage": "SYNTHESIZE", "kind": "IDEA",
+                    "summary": "A useful direction that can have later work."}
+        )
+        accepted_status, accepted = self.request("POST", "/v1/actions", {
+            "action_id": "goal.accept-proposal", "request": {
+                "project_id": "GCS", "candidate_id": candidate["candidate_id"],
+                "expected_candidate_digest": candidate["candidate_digest"],
+            }}, self.token)
+        self.assertEqual(HTTPStatus.OK, accepted_status, accepted)
+        first_id = accepted["goal"]["goal_id"]
+        request = {"action_id": "goal.create-follow-up", "request": {
+            "project_id": "GCS", "predecessor_goal_id": first_id,
+            "goal_id": "goal_followup_test_1", "title": "Follow-up work",
+            "description": "Verify the next bounded outcome.",
+        }}
+        with self.assertRaises(UniverseError) as unauthorized:
+            self.server._handle_goal_followup_action(request["request"],
+                {"actor": {"kind": "WORKER"}})
+        self.assertEqual("ACTION_ACTOR_RESOLUTION_FAILED", unauthorized.exception.code)
+        status, blocked = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, blocked)
+        self.assertEqual("GOAL_FOLLOWUP_PREDECESSOR_NOT_DONE", blocked["error_code"])
+        with self.server.store._connection() as connection:
+            connection.execute("UPDATE project_goal SET state = 'DONE' WHERE goal_id = ?", (first_id,))
+        status, created = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, created)
+        self.assertTrue(created["goal_created"])
+        followup = created["goal"]
+        self.assertEqual("READY", followup["state"])
+        self.assertEqual(first_id, followup["proposal_origin"]["predecessor_goal_id"])
+        self.assertEqual(candidate["candidate_id"], followup["proposal_origin"]["candidate_id"])
+        self.assertEqual("DONE", self.server.store.get_goal(first_id)["state"])
+        self.assertEqual(followup["proposal_origin"],
+                         next(goal for goal in self.server.store.list_project_goals("GCS")
+                              if goal["goal_id"] == followup["goal_id"])["proposal_origin"])
+        status, replay = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, replay)
+        self.assertFalse(replay["goal_created"])
+        self.assertEqual(followup["goal_id"], replay["goal"]["goal_id"])
+        conflict = {"action_id": request["action_id"], "request": {
+            **request["request"], "title": "Different request"}}
+        status, rejected = self.request("POST", "/v1/actions", conflict, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
+        self.assertEqual("GOAL_FOLLOWUP_ID_CONFLICT", rejected["error_code"])
+        with self.server.store._connection() as connection:
+            connection.execute("UPDATE project_goal SET state = 'DONE' WHERE goal_id = ?",
+                               (followup["goal_id"],))
+        chained = {"action_id": request["action_id"], "request": {
+            **request["request"], "predecessor_goal_id": followup["goal_id"],
+            "goal_id": "goal_followup_test_2", "title": "Another bounded Goal"}}
+        status, next_goal = self.request("POST", "/v1/actions", chained, self.token)
+        self.assertEqual(HTTPStatus.OK, status, next_goal)
+        self.assertEqual(followup["goal_id"],
+                         next_goal["goal"]["proposal_origin"]["predecessor_goal_id"])
+        self.assertEqual(candidate["candidate_id"],
+                         next_goal["goal"]["proposal_origin"]["candidate_id"])
+        self.assertEqual(3, len(self.server.store.list_project_goals("GCS")))
+
     def test_goal_proposal_projection_pages_without_rag_review(self) -> None:
         self.server.store.register_project(self.registration())
         proposals = []

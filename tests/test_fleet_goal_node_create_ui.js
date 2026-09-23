@@ -7,9 +7,10 @@ const start = source.indexOf('async function submitHomeNode(');
 const end = source.indexOf('// + Todo', start);
 assert.ok(start >= 0 && end > start);
 
-async function run(workstream) {
+async function run(workstream, predecessorGoalId = null, expectedError = false) {
   const calls = [];
-  const form = {elements: {intent_text: {value: 'A finite Goal with Todos'}}, dataset: {}};
+  const form = {elements: {intent_text: {value: 'A finite Goal with Todos'}},
+    dataset: predecessorGoalId ? {predecessorGoalId, pendingProjectId:'universe'} : {}};
   const error = {textContent: ''};
   const submit = {disabled: false};
   const dialog = {closed: false, close() { this.closed = true; }};
@@ -26,7 +27,9 @@ async function run(workstream) {
     selectProject: async () => {},
     invokeServerAction: async (action, body) => {
       calls.push({action, body});
-      return {feature: {feature_id: 'feature_1'}};
+      return action === 'goal.create-follow-up'
+        ? {goal: {goal_id:'goal_abcdef', project_id:projectId}}
+        : {feature: {feature_id: 'feature_1'}};
     },
     api: async (path, options) => {
       calls.push({path, options});
@@ -36,9 +39,14 @@ async function run(workstream) {
   vm.createContext(context);
   vm.runInContext(source.slice(start, end), context);
   await context.submitHomeNode({preventDefault() {}, target: form});
-  assert.equal(error.textContent, '');
+  if (expectedError) {
+    assert.match(error.textContent, /context changed/);
+    assert.equal(dialog.closed, false);
+  } else {
+    assert.equal(error.textContent, '');
+    assert.equal(dialog.closed, true);
+  }
   assert.equal(submit.disabled, false);
-  assert.equal(dialog.closed, true);
   return {calls, state: context.state};
 }
 
@@ -53,5 +61,13 @@ async function run(workstream) {
   assert.equal(operations.calls[0].action, 'feature.create');
   assert.equal(operations.calls[0].body.feature.workstream_kind, 'OPERATIONS');
   assert.equal(operations.state.homeNodeId, 'feat:feature_1');
-  console.log('Fleet Goal registration and separate Operations Feature registration passed.');
+  const followup = await run('DEVELOPMENT', 'goal_prior');
+  assert.equal(followup.calls.length, 1);
+  assert.equal(followup.calls[0].action, 'goal.create-follow-up');
+  assert.equal(followup.calls[0].body.predecessor_goal_id, 'goal_prior');
+  assert.equal(followup.calls[0].body.goal_id, 'goal_abcdef');
+  assert.equal(followup.state.homeNodeId, 'goal:goal_abcdef');
+  const switched = await run('OPERATIONS', 'goal_prior', true);
+  assert.equal(switched.calls.length, 0, 'switched workstream cannot create a Feature instead');
+  console.log('Fleet Goal registration, follow-up lineage, and separate Operations registration passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

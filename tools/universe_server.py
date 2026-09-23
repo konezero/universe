@@ -7363,6 +7363,17 @@ class UniverseStore:
                     accepted_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_goal_followup (
+                    goal_id TEXT PRIMARY KEY REFERENCES project_goal(goal_id),
+                    project_id TEXT NOT NULL REFERENCES project_connection(project_id),
+                    candidate_id TEXT NOT NULL REFERENCES memory_candidate(candidate_id),
+                    candidate_digest TEXT NOT NULL,
+                    predecessor_goal_id TEXT NOT NULL REFERENCES project_goal(goal_id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS memory_goal_followup_predecessor
+                ON memory_goal_followup(predecessor_goal_id, created_at);
+
                 -- Ownership review is append-only and deliberately separate
                 -- from candidate/review/adoption history.  A reclassification
                 -- for a new candidate revision gets a new row; old evidence
@@ -11634,9 +11645,18 @@ class UniverseStore:
                 "FROM memory_goal_acceptance WHERE project_id = ?",
                 (project["project_id"],),
             ).fetchall()
+            followup_rows = connection.execute(
+                "SELECT goal_id, candidate_id, candidate_digest, predecessor_goal_id, created_at "
+                "FROM memory_goal_followup WHERE project_id = ?",
+                (project["project_id"],),
+            ).fetchall()
         origins = {row["goal_id"]: {"candidate_id": row["candidate_id"],
             "candidate_digest": row["candidate_digest"],
             "accepted_at": row["accepted_at"]} for row in origin_rows}
+        origins.update({row["goal_id"]: {"candidate_id": row["candidate_id"],
+            "candidate_digest": row["candidate_digest"],
+            "predecessor_goal_id": row["predecessor_goal_id"],
+            "linked_at": row["created_at"]} for row in followup_rows})
         todos = [self._todo_row(row) for row in todo_rows]
         milestones_by_goal: dict[str, list[dict[str, Any]]] = {}
         for row in milestone_rows:
@@ -11811,12 +11831,20 @@ class UniverseStore:
                 "SELECT candidate_id, candidate_digest, accepted_at "
                 "FROM memory_goal_acceptance WHERE goal_id = ?", (normalized,)
             ).fetchone() if row is not None else None
+            followup = connection.execute(
+                "SELECT candidate_id, candidate_digest, predecessor_goal_id, created_at "
+                "FROM memory_goal_followup WHERE goal_id = ?", (normalized,)
+            ).fetchone() if row is not None and origin is None else None
         if row is None:
             raise UniverseError("GOAL_NOT_FOUND", f"Goal does not exist: {normalized}", HTTPStatus.NOT_FOUND)
         goal = self._goal_row(row)
         goal["proposal_origin"] = ({"candidate_id": origin["candidate_id"],
             "candidate_digest": origin["candidate_digest"],
-            "accepted_at": origin["accepted_at"]} if origin is not None else None)
+            "accepted_at": origin["accepted_at"]} if origin is not None else
+            {"candidate_id": followup["candidate_id"],
+             "candidate_digest": followup["candidate_digest"],
+             "predecessor_goal_id": followup["predecessor_goal_id"],
+             "linked_at": followup["created_at"]} if followup is not None else None)
         return goal
 
     def update_goal(self, goal_id: str, value: Any) -> dict[str, Any]:
@@ -22487,6 +22515,80 @@ class UniverseStore:
             ).fetchall()
         return [self._memory_candidate_row(row) for row in rows]
 
+    def create_goal_followup(
+        self, project_id: str, predecessor_goal_id: str, value: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one explicitly requested Goal after a completed predecessor."""
+        project_id = _project_id(project_id)
+        predecessor_goal_id = _identifier(predecessor_goal_id, "predecessor_goal_id")
+        goal_id = _identifier(value.get("goal_id"), "goal_id")
+        goal = normalize_goal(project_id, {
+            "goal_id": goal_id, "title": value.get("title"),
+            "description": value.get("description"), "owner": "USER",
+            "state": "READY", "sort_order": 0, "scope_kind": "PROJECT",
+        })
+        self.get_project(project_id)
+        created = False
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            prior = connection.execute(
+                "SELECT * FROM project_goal WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+            if prior is not None:
+                lineage = connection.execute(
+                    "SELECT predecessor_goal_id FROM memory_goal_followup WHERE goal_id = ?",
+                    (goal_id,),
+                ).fetchone()
+                if (lineage is None or prior["project_id"] != project_id
+                        or lineage["predecessor_goal_id"] != predecessor_goal_id
+                        or prior["title"] != goal["title"]
+                        or prior["description"] != goal["description"]):
+                    raise UniverseError("GOAL_FOLLOWUP_ID_CONFLICT",
+                                        "goal_id already belongs to a different request",
+                                        HTTPStatus.CONFLICT)
+            else:
+                predecessor = connection.execute(
+                    "SELECT project_id, state FROM project_goal WHERE goal_id = ?",
+                    (predecessor_goal_id,),
+                ).fetchone()
+                if predecessor is None or predecessor["project_id"] != project_id:
+                    raise UniverseError("GOAL_FOLLOWUP_PREDECESSOR_NOT_FOUND",
+                                        "predecessor Goal is not in this project",
+                                        HTTPStatus.NOT_FOUND)
+                if predecessor["state"] != "DONE":
+                    raise UniverseError("GOAL_FOLLOWUP_PREDECESSOR_NOT_DONE",
+                                        "follow-up requires a completed predecessor",
+                                        HTTPStatus.CONFLICT)
+                origin = connection.execute(
+                    "SELECT candidate_id, candidate_digest FROM memory_goal_acceptance WHERE goal_id = ? "
+                    "UNION ALL SELECT candidate_id, candidate_digest FROM memory_goal_followup WHERE goal_id = ?",
+                    (predecessor_goal_id, predecessor_goal_id),
+                ).fetchone()
+                if origin is None:
+                    raise UniverseError("GOAL_FOLLOWUP_ORIGIN_REQUIRED",
+                                        "predecessor has no Galaxy proposal lineage",
+                                        HTTPStatus.CONFLICT)
+                now = utc_now()
+                connection.execute(
+                    "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, "
+                    "title, description, owner, state, sort_order, revision, created_at, updated_at) "
+                    "VALUES (?, ?, 'PROJECT', NULL, NULL, ?, ?, 'USER', 'READY', 0, 1, ?, ?)",
+                    (goal_id, project_id, goal["title"], goal["description"], now, now),
+                )
+                ensure_template_instance(
+                    connection, project_id=project_id, scope_kind="GOAL",
+                    scope_ref=goal_id, goal_id=goal_id, node_ref=None,
+                    title=goal["title"], template=project_seed_template()["work_model"], now=now,
+                )
+                connection.execute(
+                    "INSERT INTO memory_goal_followup(goal_id, project_id, candidate_id, "
+                    "candidate_digest, predecessor_goal_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (goal_id, project_id, origin["candidate_id"],
+                     origin["candidate_digest"], predecessor_goal_id, now),
+                )
+                created = True
+        return self.get_goal(goal_id), created
+
     def list_goal_proposals(
         self, project_id: str, *, limit: int = 200, offset: int = 0
     ) -> dict[str, Any]:
@@ -31963,6 +32065,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "service.restart": self._handle_service_restart_action,
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
                 "goal.accept-proposal": self._handle_goal_accept_proposal_action,
+                "goal.create-follow-up": self._handle_goal_followup_action,
                 FEATURE_WORKSTREAM_SET_ACTION_ID: self._handle_feature_workstream_set_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
@@ -39072,6 +39175,31 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "status": "GOAL_PROPOSAL_ACCEPTED" if created else "GOAL_PROPOSAL_REPLAYED",
             "action_id": "goal.accept-proposal",
             "candidate_id": action["candidate_id"],
+            "goal": goal,
+            "goal_created": created,
+            "todo_created": False,
+            "execution_assignment_created": False,
+        }
+
+    def _handle_goal_followup_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError("ACTION_ACTOR_RESOLUTION_FAILED",
+                                "follow-up Goal creation requires the server-resolved USER actor",
+                                HTTPStatus.FORBIDDEN)
+        action = _exact_object_fields(
+            request, field="goal_followup_action",
+            required=frozenset({"project_id", "predecessor_goal_id", "goal_id", "title", "description"}),
+        )
+        goal, created = self.store.create_goal_followup(
+            action["project_id"], action["predecessor_goal_id"], action
+        )
+        return {
+            "schema": "universe.goal-followup-result.v1",
+            "status": "GOAL_FOLLOWUP_CREATED" if created else "GOAL_FOLLOWUP_REPLAYED",
+            "action_id": "goal.create-follow-up",
             "goal": goal,
             "goal_created": created,
             "todo_created": False,

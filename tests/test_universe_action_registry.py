@@ -18,6 +18,7 @@ from universe_action_registry import (  # noqa: E402
     ActionRegistryError,
     DuplicateActionError,
     FEATURE_CREATE_ACTION_ID,
+    FEATURE_WORKSTREAM_SET_ACTION_ID,
     IMPLEMENTED_WORK_SURFACE_ACTION_IDS,
     PENDING_WORK_SURFACE_ACTION_IDS,
     TODO_ACTION_IDS,
@@ -230,6 +231,7 @@ class UniverseActionRegistryTests(unittest.TestCase):
         self.assertEqual(
             (
                 FEATURE_CREATE_ACTION_ID,
+                FEATURE_WORKSTREAM_SET_ACTION_ID,
                 TODO_CREATE_ACTION_ID,
                 TODO_UPDATE_ACTION_ID,
                 "todo.read",
