@@ -143,8 +143,12 @@ candidates. `CONSOLIDATE` deterministically deduplicates and records
 `SYNTHESIZE` creates review-only `IDEA`, `HYPOTHESIS`, and `PRODUCT`
 candidates with `DERIVED_FROM` relations from consolidated candidates marked
 `KEEP`. It does not fall back to raw `FAST_EXTRACT` candidates when that stage
-has no candidates. `INDEPENDENT_CHECK` reports bounded
-integrity failures without changing candidate state.
+has no candidates. A completed (not dry-run) `CONSOLIDATE` run is required
+before `SYNTHESIZE`; otherwise the stage reports `MEMORY_BATCH_UPSTREAM_REQUIRED`
+instead of recording an empty success. This only checks stage completion, not
+that the upstream run is current to the latest extraction.
+`INDEPENDENT_CHECK` reports bounded integrity failures without changing candidate
+state.
 
 Candidate records retain only a bounded summary, source-session digest, source
 range, reference digests, relations, and repetition relevance. Raw prompts,

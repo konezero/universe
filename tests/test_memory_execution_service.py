@@ -37,6 +37,13 @@ class FakeMemoryStore:
     def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]:
         raise AssertionError("the test supplies activity_batches directly")
 
+    def has_completed_memory_batch_stage(self, project_id: str, stage: str) -> bool:
+        return any(
+            item["project_id"] == project_id and item["stage"] == stage
+            and item["result"]["status"] == "COMPLETED"
+            for item in self.persisted
+        )
+
     def list_memory_batch_input_candidates(
         self, project_id: str, *, stage: str | None = None
     ) -> list[dict[str, Any]]:
@@ -163,11 +170,12 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
             {"activity_batches": [self.activity_batch]},
         )
         self.store.candidates[0]["state"] = "KEEP"
-        without_consolidation = self.service.execute(
-            "TEST", {"stage": "SYNTHESIZE", "dry_run": True}
-        )
-        self.assertEqual(0, without_consolidation["candidate_count"])
-        self.assertEqual([], without_consolidation["candidate_ids"])
+        with self.assertRaises(UniverseError) as missing:
+            self.service.execute(
+                "TEST", {"stage": "SYNTHESIZE", "dry_run": True}
+            )
+        self.assertEqual("MEMORY_BATCH_UPSTREAM_REQUIRED", missing.exception.code)
+        self.assertEqual(1, len(self.store.persisted))
 
         self.service.execute("TEST", {"stage": "CONSOLIDATE", "dry_run": False})
         consolidated = next(
@@ -184,6 +192,19 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
             for item in synthesized["candidates"]
         ))
 
+    def test_dry_run_consolidation_does_not_unlock_synthesis(self) -> None:
+        self.service.execute(
+            "TEST", {"stage": "FAST_EXTRACT", "dry_run": False},
+            {"activity_batches": [self.activity_batch]},
+        )
+        self.service.execute("TEST", {"stage": "CONSOLIDATE", "dry_run": True})
+        with self.assertRaises(UniverseError) as missing:
+            self.service.execute("TEST", {"stage": "SYNTHESIZE", "dry_run": True})
+        self.assertEqual("MEMORY_BATCH_UPSTREAM_REQUIRED", missing.exception.code)
+        self.service.execute("TEST", {"stage": "CONSOLIDATE", "dry_run": False})
+        result = self.service.execute("TEST", {"stage": "SYNTHESIZE", "dry_run": True})
+        self.assertEqual(0, result["candidate_count"])
+
     def test_downstream_stages_reject_unbounded_candidate_input(self) -> None:
         for stage, source_stage in (
             ("CONSOLIDATE", "FAST_EXTRACT"),
@@ -196,10 +217,16 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
                     for index in range(501)
                 ]
                 self.store.persisted.clear()
+                if stage == "SYNTHESIZE":
+                    self.store.persisted.append({
+                        "project_id": "TEST", "stage": "CONSOLIDATE",
+                        "result": {"status": "COMPLETED"},
+                    })
+                prior = list(self.store.persisted)
                 with self.assertRaises(UniverseError) as raised:
                     self.service.execute("TEST", {"stage": stage, "dry_run": True})
                 self.assertEqual("MEMORY_BATCH_INPUT_WINDOW_REQUIRED", raised.exception.code)
-                self.assertEqual([], self.store.persisted)
+                self.assertEqual(prior, self.store.persisted)
 
     def test_quota_is_checked_before_candidate_generation(self) -> None:
         self.store.run_count = 1

@@ -54,6 +54,10 @@ class MemoryBatchExecutionStore(Protocol):
         self, project_id: str, *, stage: str | None = None
     ) -> list[dict[str, Any]]: ...
 
+    def has_completed_memory_batch_stage(
+        self, project_id: str, stage: str
+    ) -> bool: ...
+
     def _insert_memory_candidates(
         self, project_id: str, candidates: list[Mapping[str, Any]]
     ) -> tuple[list[dict[str, Any]], int]: ...
@@ -216,6 +220,14 @@ class MemoryBatchExecutionService:
             input_material = [item["candidate_digest"] for item in existing]
             candidates = consolidate_memory_candidates(existing)
         elif stage == "SYNTHESIZE":
+            if not self.store.has_completed_memory_batch_stage(
+                project["project_id"], "CONSOLIDATE"
+            ):
+                raise UniverseError(
+                    "MEMORY_BATCH_UPSTREAM_REQUIRED",
+                    "SYNTHESIZE requires a completed CONSOLIDATE run",
+                    HTTPStatus.CONFLICT,
+                )
             existing = self._bounded_candidates(
                 project["project_id"], stage="CONSOLIDATE"
             )

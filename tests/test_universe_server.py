@@ -3261,6 +3261,37 @@ class UniverseLocalServiceTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(0, runs)
 
+    def test_synthesis_requires_persisted_completed_consolidation(self) -> None:
+        self.server.store.register_project(self.registration())
+        store = self.server.store
+        self.assertFalse(store.has_completed_memory_batch_stage("GCS", "CONSOLIDATE"))
+        for status, run_id in (
+            ("DRY_RUN_COMPLETED", "consolidation-dry-run"),
+            ("FAILED", "consolidation-failed"),
+        ):
+            store.persist_memory_batch_result(
+                run_id=run_id, project_id="GCS", stage="CONSOLIDATE",
+                result={"config_digest": "a" * 64, "status": status, "candidate_ids": []},
+                input_digest="b" * 64, output_digest="c" * 64,
+                now="2026-09-23T00:00:00Z",
+            )
+        with self.assertRaises(UniverseError) as missing:
+            store.memory_batch_execution_service.execute(
+                "GCS", {"stage": "SYNTHESIZE", "dry_run": True}
+            )
+        self.assertEqual("MEMORY_BATCH_UPSTREAM_REQUIRED", missing.exception.code)
+        store.persist_memory_batch_result(
+            run_id="consolidation-completed", project_id="GCS", stage="CONSOLIDATE",
+            result={"config_digest": "a" * 64, "status": "COMPLETED", "candidate_ids": []},
+            input_digest="b" * 64, output_digest="c" * 64,
+            now="2026-09-23T00:00:01Z",
+        )
+        self.assertTrue(store.has_completed_memory_batch_stage("GCS", "CONSOLIDATE"))
+        result = store.memory_batch_execution_service.execute(
+            "GCS", {"stage": "SYNTHESIZE", "dry_run": True}
+        )
+        self.assertEqual(0, result["candidate_count"])
+
     def test_memory_batch_completion_advances_semantic_collection_cursor(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.persist_memory_batch_result(

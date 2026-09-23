@@ -22515,6 +22515,19 @@ class UniverseStore:
             ).fetchall()
         return [self._memory_candidate_row(row) for row in rows]
 
+    def has_completed_memory_batch_stage(self, project_id: str, stage: str) -> bool:
+        project_id = _project_id(project_id)
+        self.get_project(project_id)
+        if stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is invalid")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM memory_batch_run "
+                "WHERE project_id = ? AND stage = ? AND status = 'COMPLETED' LIMIT 1",
+                (project_id, stage),
+            ).fetchone()
+        return row is not None
+
     def list_memory_batch_input_candidates(
         self, project_id: str, *, stage: str | None = None
     ) -> list[dict[str, Any]]:
