@@ -41,11 +41,14 @@ restart of a completed Goal. See the
 [Goal-node lifecycle contract](galaxy-memory-fleet-goal-lifecycle.md).
 
 Implementation status: FAST_EXTRACT uses a governed LLM. CONSOLIDATE
-now supports a governed LLM decision preview only with Codex gpt-5.6-luna MAX,
-`fallback: NONE`, and `dry_run: true`; its production candidate-writing route
-remains deterministic. SYNTHESIZE is deterministic and INDEPENDENT_CHECK is
-structural. The production second LLM noise-removal/classification pass and automatic
-source-checked operational RAG ingestion are not implemented by those names.
+supports a governed LLM noise decision pass with Codex gpt-5.6-luna MAX
+and `fallback: NONE`. With `dry_run: true`, the decisions are recorded without
+candidate writes. With `dry_run: false`, source-pinned KEEP decisions produce
+review-only CONSOLIDATE candidates atomically with the run; NOISE decisions
+produce none. The model's route is retained in run evidence, not yet a durable
+candidate-to-proposal/RAG routing edge. SYNTHESIZE is deterministic and
+INDEPENDENT_CHECK is structural. Automatic proposal generation and
+source-checked operational RAG ingestion remain unimplemented.
 Current `KEEP`/`rag.adopt` still perform legacy Memory/RAG review; the new
 `goal.accept-proposal` Action is a separate user decision for an eligible
 idea or prediction and does not remove or migrate that legacy route. Fleet Goal

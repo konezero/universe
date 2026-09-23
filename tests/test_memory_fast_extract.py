@@ -476,7 +476,9 @@ class FastExtractServerTests(unittest.TestCase):
         self.assertEqual("FAILED", failed[0]["status"])
         self.assertEqual(1, len(self.server.store.list_memory_candidates("TEST")))
 
-    def test_noise_model_cannot_write_candidates_without_atomic_completion(self):
+    def test_noise_model_commits_only_kept_review_candidates(self):
+        from memory_noise_preview import SCHEMA as NOISE_SCHEMA
+
         status, config = self.request(
             "POST", "/v1/projects/TEST/memory-batch-config",
             {"stage": "CONSOLIDATE", "provider": "CODEX",
@@ -485,13 +487,107 @@ class FastExtractServerTests(unittest.TestCase):
              "enabled": True, "dry_run": False},
         )
         self.assertEqual(HTTPStatus.OK, status, config)
+        kept, _ = self.server.store.create_memory_candidate(
+            "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                     "summary": "Preserve the user product direction as a future proposal source.",
+                     "knowledge": {"kind": "USER_IDEA", "topic": "Product direction",
+                                   "applicability": "Future planning"}},
+        )
+        self.server.store.create_memory_candidate(
+            "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                     "summary": "Routine duplicate status without reusable learning.",
+                     "knowledge": {"kind": "REUSABLE_EXPERIENCE", "topic": "Status",
+                                   "applicability": "No future use"}},
+        )
+
+        def classify(_provider, request):
+            self.dispatcher.calls.append(request)
+            decisions = [{
+                "candidate_id": item["candidate_id"],
+                "candidate_digest": item["candidate_digest"],
+                "disposition": "KEEP" if item["candidate_id"] == kept["candidate_id"] else "NOISE",
+                "route": "PROPOSAL_SOURCE" if item["candidate_id"] == kept["candidate_id"] else "NONE",
+            } for item in request["context_pack"]["candidates"]]
+            return {
+                "status": "COMPLETED", "worker_id": "codex-app-server:noise",
+                "worker_run_ref": request["worker_run_ref"],
+                "result_receipt_ref": "codex-app-server:noise:" + request["worker_run_ref"],
+                "result": {"text": json.dumps({"schema": NOISE_SCHEMA, "decisions": decisions})},
+                "session_persistence": "EPHEMERAL",
+                "persistent_session_ref": "UNKNOWN",
+                "universe_coordinate_persisted": False,
+                "provider_durable_chat_state": "NOT_PERSISTED",
+            }
+
+        self.dispatcher._invoke_provider = classify
+        binding = self.attached_binding("session-noise-write", "frame-noise-write", "temporary-test-token")
+        request = {"stage": "CONSOLIDATE", "runtime_binding": binding}
+        status, completed = self.request("POST", "/v1/projects/TEST/memory-batches/run", request)
+        self.assertEqual(HTTPStatus.OK, status, completed)
+        self.assertEqual("COMPLETED", completed["run"]["status"])
+        self.assertEqual(1, completed["run"]["candidate_count"])
+        self.assertEqual(1, completed["run"]["created_count"])
+        self.assertEqual("REVIEW_REQUIRED", completed["run"]["candidates"][0]["state"])
+        self.assertFalse(completed["run"]["effects"]["auto_adoption"])
+        self.assertTrue(self.server.store.has_completed_memory_batch_stage("TEST", "CONSOLIDATE"))
+        self.assertEqual(3, len(self.server.store.list_memory_candidates("TEST")))
+        status, replay = self.request("POST", "/v1/projects/TEST/memory-batches/run", request)
+        self.assertEqual(HTTPStatus.OK, status, replay)
+        self.assertEqual("MEMORY_BATCH_RUN_ALREADY_RECORDED", replay["status"])
+        self.assertEqual(1, len(self.dispatcher.calls))
+    def test_noise_model_source_change_leaves_no_consolidation_candidates(self):
+        from memory_noise_preview import SCHEMA as NOISE_SCHEMA
+
+        status, config = self.request(
+            "POST", "/v1/projects/TEST/memory-batch-config",
+            {"stage": "CONSOLIDATE", "provider": "CODEX",
+             "model_ref": FAST_EXTRACT_MODEL, "effort": FAST_EXTRACT_EFFORT,
+             "schedule": {"kind": "MANUAL"}, "fallback": "NONE",
+             "enabled": True, "dry_run": False},
+        )
+        self.assertEqual(HTTPStatus.OK, status, config)
+        self.server.store.create_memory_candidate(
+            "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                     "summary": "The initial user idea must remain source-pinned.",
+                     "knowledge": {"kind": "USER_IDEA", "topic": "Initial idea",
+                                   "applicability": "Future planning"}},
+        )
+
+        def source_change(_provider, request):
+            inputs = request["context_pack"]["candidates"]
+            self.server.store.create_memory_candidate(
+                "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                         "summary": "A second user idea arrived during the model call.",
+                         "knowledge": {"kind": "USER_IDEA", "topic": "Second idea",
+                                       "applicability": "Future planning"}},
+            )
+            return {
+                "status": "COMPLETED", "worker_id": "codex-app-server:noise-race",
+                "worker_run_ref": request["worker_run_ref"],
+                "result_receipt_ref": "codex-app-server:noise-race:" + request["worker_run_ref"],
+                "result": {"text": json.dumps({"schema": NOISE_SCHEMA, "decisions": [{
+                    "candidate_id": inputs[0]["candidate_id"],
+                    "candidate_digest": inputs[0]["candidate_digest"],
+                    "disposition": "KEEP", "route": "PROPOSAL_SOURCE",
+                }]})},
+                "session_persistence": "EPHEMERAL",
+                "persistent_session_ref": "UNKNOWN",
+                "universe_coordinate_persisted": False,
+                "provider_durable_chat_state": "NOT_PERSISTED",
+            }
+
+        self.dispatcher._invoke_provider = source_change
+        binding = self.attached_binding("session-noise-race", "frame-noise-race", "temporary-test-token")
         status, rejected = self.request(
-            "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "CONSOLIDATE"}
+            "POST", "/v1/projects/TEST/memory-batches/run",
+            {"stage": "CONSOLIDATE", "runtime_binding": binding},
         )
         self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
-        self.assertEqual("MEMORY_NOISE_PREVIEW_CONFIG_REQUIRED", rejected["error_code"])
-        self.assertEqual([], self.server.store.list_memory_batch_runs("TEST"))
-        self.assertEqual([], self.dispatcher.calls)
+        self.assertEqual("MEMORY_NOISE_SOURCE_CHANGED", rejected["error_code"])
+        self.assertEqual([], self.server.store.list_memory_candidates("TEST", stage="CONSOLIDATE"))
+        runs = [item for item in self.server.store.list_memory_batch_runs("TEST")
+                if item["stage"] == "CONSOLIDATE"]
+        self.assertEqual("FAILED", runs[0]["status"])
 
     def test_no_supported_lesson_completes_with_zero_candidates(self):
         self.configure()

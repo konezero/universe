@@ -162,6 +162,7 @@ from universe_memory import (
     MEMORY_CANDIDATE_STATES,
     MEMORY_SCHEMA,
     MemoryError,
+    consolidate_memory_candidates,
     filter_llm_proposals,
     memory_candidate_allowed_decisions,
     memory_candidate_decision_contract,
@@ -9560,6 +9561,156 @@ class UniverseStore:
             }
         )[:24]
         return run_id, config_digest, input_digest
+
+    def complete_noise_consolidation_run(
+        self, *, run_id: str, project_id: str,
+        source_inputs: list[dict[str, Any]],
+        candidates: list[Mapping[str, Any]], result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Pin the model's sources and commit review-only candidates with its run."""
+        normalized = []
+        for item in candidates:
+            try:
+                candidate = normalize_memory_candidate(item, project_id=project_id)
+            except MemoryError as error:
+                raise UniverseError(error.code, error.message) from error
+            if (candidate["project_id"] != project_id
+                    or candidate["stage"] != "CONSOLIDATE"
+                    or candidate["state"] not in {"REVIEW_REQUIRED", "CONFLICTED", "SUPERSEDED"}):
+                raise UniverseError(
+                    "MEMORY_NOISE_CANDIDATE_INVALID",
+                    "Model-selected candidates must remain project-scoped review candidates",
+                    HTTPStatus.CONFLICT,
+                )
+            normalized.append(candidate)
+        now = utc_now()
+        stored = []
+        created_count = 0
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT status, config_digest, input_digest, started_at "
+                "FROM memory_batch_run WHERE run_id = ?", (run_id,),
+            ).fetchone()
+            if (run is None or run["status"] != "RUNNING"
+                    or run["config_digest"] != result["config_digest"]
+                    or run["input_digest"] != result["input_digest"]):
+                raise UniverseError(
+                    "MEMORY_BATCH_RUN_NOT_RESERVED",
+                    "Consolidation run is not the pinned RUNNING reservation",
+                    HTTPStatus.CONFLICT,
+                )
+            rows = connection.execute(
+                "SELECT candidate_id, project_id, stage, kind, state, "
+                "candidate_digest, candidate_json FROM memory_candidate "
+                "WHERE project_id = ? AND stage = 'FAST_EXTRACT' "
+                "ORDER BY updated_at DESC, candidate_id DESC LIMIT ?",
+                (project_id, MemoryBatchExecutionService.MAX_STAGE_INPUTS + 1),
+            ).fetchall()
+            if len(rows) > MemoryBatchExecutionService.MAX_STAGE_INPUTS:
+                raise UniverseError(
+                    "MEMORY_BATCH_INPUT_WINDOW_REQUIRED",
+                    "Extraction input exceeded the bounded window during completion",
+                    HTTPStatus.CONFLICT,
+                )
+            current = []
+            for row in rows:
+                item = json.loads(row["candidate_json"])
+                item.update({key: row[key] for key in (
+                    "candidate_id", "project_id", "stage", "kind", "state",
+                    "candidate_digest",
+                )})
+                current.append(item)
+            try:
+                pinned = project_noise_inputs(current, project_id)
+            except NoisePreviewError as error:
+                raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+            if pinned != source_inputs:
+                raise UniverseError(
+                    "MEMORY_NOISE_SOURCE_CHANGED",
+                    "Extraction sources changed before consolidation commit",
+                    HTTPStatus.CONFLICT,
+                )
+            for candidate in normalized:
+                existing = connection.execute(
+                    "SELECT * FROM memory_candidate "
+                    "WHERE candidate_id = ? OR candidate_digest = ? "
+                    "ORDER BY candidate_id LIMIT 1",
+                    (candidate["candidate_id"], candidate["candidate_digest"]),
+                ).fetchone()
+                if existing is not None:
+                    prior = self._memory_candidate_row(existing)
+                    if (prior["candidate_id"] != candidate["candidate_id"]
+                            or prior["candidate_digest"] != candidate["candidate_digest"]):
+                        raise UniverseError(
+                            "MEMORY_CANDIDATE_IDEMPOTENCY_CONFLICT",
+                            "Consolidated candidate identity conflicts with stored evidence",
+                            HTTPStatus.CONFLICT,
+                        )
+                    stored.append(prior)
+                    continue
+                connection.execute(
+                    "INSERT INTO memory_candidate(candidate_id, project_id, stage, "
+                    "kind, state, candidate_digest, candidate_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (candidate["candidate_id"], project_id, candidate["stage"],
+                     candidate["kind"], candidate["state"], candidate["candidate_digest"],
+                     _canonical_json(candidate), now, now),
+                )
+                stored.append({**candidate, "created_at": now, "updated_at": now})
+                created_count += 1
+            for candidate in stored:
+                for relation in candidate.get("relations") or []:
+                    relation_id = "memory_relation_" + _json_sha256({
+                        "candidate_id": candidate["candidate_id"],
+                        "target_candidate_id": relation["candidate_id"],
+                        "relation": relation["relation"],
+                    })[:24]
+                    connection.execute(
+                        "INSERT OR IGNORE INTO memory_candidate_relation("
+                        "relation_id, project_id, candidate_id, target_candidate_id, "
+                        "relation, relation_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (relation_id, project_id, candidate["candidate_id"],
+                         relation["candidate_id"], relation["relation"],
+                         _canonical_json({"schema": "universe.memory-candidate-relation.v1",
+                                          **relation, "candidate_id": candidate["candidate_id"]}), now),
+                    )
+            result.update({
+                "candidate_count": len(stored), "created_count": created_count,
+                "candidate_ids": [item["candidate_id"] for item in stored],
+                "candidates": stored,
+                "output_digest": _json_sha256({
+                    "decisions": result["noise_preview"]["decisions"],
+                    "candidates": [item["candidate_digest"] for item in stored],
+                }),
+            })
+            result["effects"]["candidate_write"] = "CREATED" if created_count else "NONE"
+            updated = connection.execute(
+                "UPDATE memory_batch_run SET output_digest = ?, status = 'COMPLETED', "
+                "candidate_ids_json = ?, result_json = ?, completed_at = ? "
+                "WHERE run_id = ? AND status = 'RUNNING'",
+                (result["output_digest"], _canonical_json(result["candidate_ids"]),
+                 _canonical_json(result), now, run_id),
+            )
+            if updated.rowcount != 1:
+                raise UniverseError(
+                    "MEMORY_BATCH_RUN_NOT_RESERVED",
+                    "Consolidation reservation changed during completion",
+                    HTTPStatus.CONFLICT,
+                )
+            connection.execute(
+                "INSERT INTO semantic_collection_cursor(project_id, source_kind, "
+                "last_event_id, last_event_type, source_digest, observed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id, source_kind) DO UPDATE SET "
+                "last_event_id = excluded.last_event_id, "
+                "last_event_type = excluded.last_event_type, "
+                "source_digest = excluded.source_digest, "
+                "observed_at = excluded.observed_at, updated_at = excluded.updated_at",
+                (project_id, "MEMORY_BATCH_CONSOLIDATE", run_id, "COMPLETED",
+                 result["output_digest"], now, now),
+            )
+        return {**result, "started_at": str(run["started_at"]), "completed_at": now}
 
     def reserve_memory_batch_run(
         self,
@@ -48164,11 +48315,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             or resolved.get("model_ref") != FAST_EXTRACT_MODEL
             or resolved.get("effort") != FAST_EXTRACT_EFFORT
             or resolved.get("fallback") != "NONE"
-            or resolved.get("dry_run") is not True
         ):
             raise UniverseError(
                 "MEMORY_NOISE_PREVIEW_CONFIG_REQUIRED",
-                "LLM CONSOLIDATE currently requires Codex gpt-5.6-luna MAX, fallback NONE, dry_run true",
+                "LLM CONSOLIDATE requires Codex gpt-5.6-luna MAX and fallback NONE",
                 HTTPStatus.CONFLICT,
             )
         if not isinstance(value.get("runtime_binding"), Mapping) and config.get("persisted"):
@@ -48208,7 +48358,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             source_inputs = project_noise_inputs(candidates, project_id)
         except NoisePreviewError as error:
             raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
-        material = [item["candidate_digest"] for item in source_inputs]
+        material = [item["candidate_id"] + ":" + item["candidate_digest"] for item in source_inputs]
         material.append("noise-preview-policy:v1")
         run_id, config_digest, input_digest = self.store.memory_batch_run_id(
             project_id, "CONSOLIDATE", resolved, material
@@ -48305,6 +48455,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "auto_adoption": False, "skill_observation": "NONE",
                     },
                 }
+                if resolved.get("dry_run") is not True:
+                    selected_ids = {
+                        item["candidate_id"] for item in decisions
+                        if item["disposition"] == "KEEP"
+                    }
+                    try:
+                        selected = consolidate_memory_candidates([
+                            item for item in candidates
+                            if item["candidate_id"] in selected_ids
+                        ])
+                    except MemoryError as error:
+                        raise UniverseError(error.code, error.message) from error
+                    result["status"] = "COMPLETED"
+                    result["noise_preview"]["classification_only"] = True
+                    completed = self.store.complete_noise_consolidation_run(
+                        run_id=run_id, project_id=project_id,
+                        source_inputs=source_inputs, candidates=selected, result=result,
+                    )
+                    return {
+                        "schema": API_SCHEMA, "status": "MEMORY_BATCH_RUN_COMPLETED",
+                        "config": response_config, "execution": execution,
+                        "run": completed,
+                    }
                 self.store.persist_memory_batch_result(
                     run_id=run_id, project_id=project_id, stage="CONSOLIDATE",
                     result=result, input_digest=input_digest,
