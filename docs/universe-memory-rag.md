@@ -141,7 +141,9 @@ POST /v1/projects/{project_id}/memory-batches/run
 candidates. `CONSOLIDATE` deterministically deduplicates and records
 `DUPLICATE_OF`, `MERGED_FROM`, `CONFLICTS_WITH`, and supersede relations.
 `SYNTHESIZE` creates review-only `IDEA`, `HYPOTHESIS`, and `PRODUCT`
-candidates with `DERIVED_FROM` relations. `INDEPENDENT_CHECK` reports bounded
+candidates with `DERIVED_FROM` relations from consolidated candidates marked
+`KEEP`. It does not fall back to raw `FAST_EXTRACT` candidates when that stage
+has no candidates. `INDEPENDENT_CHECK` reports bounded
 integrity failures without changing candidate state.
 
 Candidate records retain only a bounded summary, source-session digest, source

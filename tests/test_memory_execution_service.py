@@ -157,6 +157,33 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
         self.assertEqual("DETERMINISTIC", consolidated["execution"]["mode"])
         self.assertEqual("NOT_RUN", consolidated["execution"]["provider_invocation"])
 
+    def test_synthesis_does_not_bypass_consolidation(self) -> None:
+        self.service.execute(
+            "TEST", {"stage": "FAST_EXTRACT", "dry_run": False},
+            {"activity_batches": [self.activity_batch]},
+        )
+        self.store.candidates[0]["state"] = "KEEP"
+        without_consolidation = self.service.execute(
+            "TEST", {"stage": "SYNTHESIZE", "dry_run": True}
+        )
+        self.assertEqual(0, without_consolidation["candidate_count"])
+        self.assertEqual([], without_consolidation["candidate_ids"])
+
+        self.service.execute("TEST", {"stage": "CONSOLIDATE", "dry_run": False})
+        consolidated = next(
+            item for item in self.store.candidates
+            if item["stage"] == "CONSOLIDATE"
+        )
+        consolidated["state"] = "KEEP"
+        synthesized = self.service.execute(
+            "TEST", {"stage": "SYNTHESIZE", "dry_run": True}
+        )
+        self.assertEqual(3, synthesized["candidate_count"])
+        self.assertTrue(all(
+            item["relations"][0]["candidate_id"] == consolidated["candidate_id"]
+            for item in synthesized["candidates"]
+        ))
+
     def test_downstream_stages_reject_unbounded_candidate_input(self) -> None:
         for stage, source_stage in (
             ("CONSOLIDATE", "FAST_EXTRACT"),

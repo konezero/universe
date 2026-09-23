@@ -219,10 +219,6 @@ class MemoryBatchExecutionService:
             existing = self._bounded_candidates(
                 project["project_id"], stage="CONSOLIDATE"
             )
-            if not existing:
-                existing = self._bounded_candidates(
-                    project["project_id"], stage="FAST_EXTRACT"
-                )
             input_material = [item["candidate_digest"] for item in existing]
             raw_kinds = request.get("kinds", ["IDEA", "HYPOTHESIS", "PRODUCT"])
             if not isinstance(raw_kinds, list):
