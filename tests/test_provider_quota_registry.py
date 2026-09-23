@@ -85,6 +85,23 @@ class ProviderQuotaRegistryTests(unittest.TestCase):
             all(row["state"] == "UNKNOWN" for row in registry.view()["providers"])
         )
 
+    def test_stale_codex_reading_is_not_presented_as_current(self) -> None:
+        registry = ProviderQuotaRegistry()
+        registry.record(
+            {
+                "provider": "CODEX",
+                "source": "codex-rollout-transcript",
+                "state": "AVAILABLE",
+                "windows": [{"name": "PRIMARY", "used_percent": 48}],
+                "observed_at": "2026-09-22T00:00:00Z",
+            }
+        )
+        codex = registry.view()["providers"][2]
+        self.assertEqual("UNKNOWN", codex["state"])
+        self.assertEqual([], codex["windows"])
+        self.assertTrue(codex["stale"])
+        self.assertEqual("codex-rollout-transcript", codex["source"])
+
     def test_non_mapping_input_is_safe(self) -> None:
         registry = ProviderQuotaRegistry()
         registry.record(None)

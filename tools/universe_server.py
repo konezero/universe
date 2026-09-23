@@ -42,6 +42,7 @@ from agent_session_gateway import (
     PERMISSION_REQUEST_SCHEMA,
     AgentSessionError,
     normalize_permission_request,
+    read_codex_account_quota,
 )
 from host_profile import HostProfileError, HostProfileStore
 from provider_model_catalog import (
@@ -32143,6 +32144,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             else None
         )
         self.provider_quota_registry = store.provider_quota_registry
+        self._codex_quota_refresh_lock = threading.Lock()
+        self._codex_quota_refresh_pending = False
+        self._codex_quota_refresh_due = 0.0
         self.ui_debug_trace: dict[str, Any] | None = None
         # N threads pulling from the SAME _conductor_queue (queue.Queue is
         # already safe for any number of concurrent .get() callers) - this is
@@ -42549,6 +42553,36 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         )
         self.provider_quota_registry.record(quota, session_ref=session_ref)
 
+    def _schedule_codex_quota_refresh(self) -> None:
+        """Refresh account quota off the HTTP polling path at most once/minute."""
+
+        with self._codex_quota_refresh_lock:
+            if self._codex_quota_refresh_pending or time.monotonic() < self._codex_quota_refresh_due:
+                return
+            self._codex_quota_refresh_pending = True
+            self._codex_quota_refresh_due = time.monotonic() + 60
+
+        def refresh() -> None:
+            try:
+                profile = self.host_profile.resolve("codex")
+                if profile is None:
+                    return
+                snapshot = read_codex_account_quota(
+                    executable=profile.executable,
+                    cwd=Path(__file__).resolve().parents[1],
+                    environment=profile.environment,
+                )
+                self.provider_quota_registry.record(snapshot)
+            except Exception:  # noqa: BLE001 - quota is optional, never break HTTP
+                pass
+            finally:
+                with self._codex_quota_refresh_lock:
+                    self._codex_quota_refresh_pending = False
+
+        threading.Thread(
+            target=refresh, name="universe-codex-quota-refresh", daemon=True
+        ).start()
+
     def provider_quota_view(self) -> dict[str, Any]:
         """Sweep the live conductor + master connections, then return the 3-row view.
 
@@ -42580,11 +42614,12 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 self.provider_quota_registry.record(snapshot)
         except Exception:  # noqa: BLE001 - transcript sweep is best-effort
             pass
+        self._schedule_codex_quota_refresh()
         return self.provider_quota_registry.view()
 
     @staticmethod
     def _sweep_transcript_quota() -> list[dict[str, Any]]:
-        return sweep_transcript_quota(max_age_seconds=24 * 3600)
+        return sweep_transcript_quota(max_age_seconds=6 * 60)
 
     def prepare_conductor_session(
         self,

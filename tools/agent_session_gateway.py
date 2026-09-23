@@ -114,7 +114,7 @@ def _codex_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
                 window[target_key] = field_value
         windows.append(window)
     reached = snapshot.get("rateLimitReachedType")
-    return {
+    result = {
         "schema": PROVIDER_QUOTA_SNAPSHOT_SCHEMA,
         "provider": "CODEX",
         "source": source,
@@ -122,6 +122,12 @@ def _codex_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
         "windows": windows,
         "rate_limit_reached_type": reached,
     }
+    if windows:
+        result["observed_at"] = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    return result
 
 
 def _grok_quota_snapshot(value: Any, *, source: str) -> dict[str, Any]:
@@ -1653,6 +1659,48 @@ class GrokAcpSession:
                 "optionId": option_id,
             }
         }
+
+
+def read_codex_account_quota(
+    *, executable: Path, cwd: Path, environment: Mapping[str, str]
+) -> dict[str, Any]:
+    """Read account quota through the managed Codex app-server transport.
+
+    This does not create a thread or send a model turn. The child process is
+    closed after a single bounded read, including on protocol errors.
+    """
+
+    transport = JsonRpcStdioProcess(
+        executable=executable,
+        arguments=("app-server", "--listen", "stdio://"),
+        cwd=cwd,
+        environment=environment,
+        request_handler=lambda _method, _params: None,
+        notification_handler=lambda _method, _params: None,
+    )
+    try:
+        initialized = transport.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "universe",
+                    "title": "Universe Quota Reader",
+                    "version": "1.0.0",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                    "optOutNotificationMethods": [],
+                },
+            },
+            timeout_seconds=12,
+        )
+        if not isinstance(initialized, Mapping):
+            raise AgentSessionError("CODEX_APP_INITIALIZE_INVALID")
+        transport.notify("initialized")
+        response = transport.request("account/rateLimits/read", {}, timeout_seconds=12)
+        return _codex_quota_snapshot(response, source="account/rateLimits/read")
+    finally:
+        transport.close()
 
 
 class CodexAppServerSession:

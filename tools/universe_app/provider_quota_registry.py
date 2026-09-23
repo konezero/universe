@@ -18,6 +18,7 @@ PROVIDER_QUOTA_SNAPSHOT_SCHEMA = "universe.provider-quota-snapshot.v1"
 PROVIDER_QUOTA_VIEW_SCHEMA = "universe.provider-quota-view.v1"
 KNOWN_PROVIDERS = ("CLAUDE", "GROK", "CODEX")
 _STATE_RANK = {"UNKNOWN": 0, "AVAILABLE": 1, "WARNING": 2, "EXHAUSTED": 3}
+CODEX_QUOTA_MAX_AGE_SECONDS = 6 * 60
 
 
 def _utc_now() -> str:
@@ -122,6 +123,18 @@ class ProviderQuotaRegistry:
                     }
                 )
             else:
+                if provider == "CODEX":
+                    try:
+                        observed = datetime.fromisoformat(
+                            str(entry["observed_at"]).replace("Z", "+00:00")
+                        )
+                        age = (datetime.now(timezone.utc) - observed).total_seconds()
+                    except (KeyError, TypeError, ValueError):
+                        age = float("inf")
+                    if age > CODEX_QUOTA_MAX_AGE_SECONDS:
+                        entry["state"] = "UNKNOWN"
+                        entry["windows"] = []
+                        entry["stale"] = True
                 providers.append(entry)
         return {
             "schema": PROVIDER_QUOTA_VIEW_SCHEMA,

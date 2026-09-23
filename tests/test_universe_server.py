@@ -8342,7 +8342,9 @@ class UniverseLocalServiceTests(unittest.TestCase):
             "GET", "/v1/provider-quota", token=self.token
         )
         codex = payload["providers"][2]
-        self.assertEqual("EXHAUSTED", codex["state"])
+        self.assertEqual("UNKNOWN", codex["state"])
+        self.assertEqual([], codex["windows"])
+        self.assertTrue(codex["stale"])
         self.assertEqual("codex-rollout-transcript", codex["source"])
         self.assertEqual("2026-09-04T07:00:00Z", codex["observed_at"])
 

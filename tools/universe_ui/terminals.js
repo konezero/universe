@@ -792,7 +792,7 @@ function renderProviderQuotaStrip() {
   const view = state.providerQuota;
   const rows = Array.isArray(view?.providers) ? view.providers : [];
   const known = rows.filter(
-    (row) => row && (row.state !== "UNKNOWN" || (row.windows || []).length)
+    (row) => row && (row.state !== "UNKNOWN" || (row.windows || []).length || row.stale)
   );
   if (!known.length) {
     strip.hidden = true;
@@ -807,7 +807,7 @@ function renderProviderQuotaStrip() {
     const line = node("div", "provider-quota-line");
     line.dataset.state = state_;
     const observedAt = row.observed_at ? Date.parse(row.observed_at) : NaN;
-    if (!Number.isNaN(observedAt) && Date.now() - observedAt > PROVIDER_QUOTA_STALE_MS) {
+    if (row.stale || (!Number.isNaN(observedAt) && Date.now() - observedAt > PROVIDER_QUOTA_STALE_MS)) {
       line.classList.add("is-stale");
       line.title = "quota reading is stale";
     }
@@ -824,7 +824,8 @@ function renderProviderQuotaStrip() {
     line.append(bar);
 
     let valueText;
-    if (state_ === "EXHAUSTED") valueText = "EXHAUSTED";
+    if (row.stale) valueText = "stale";
+    else if (state_ === "EXHAUSTED") valueText = "EXHAUSTED";
     else if (Number.isFinite(pct)) valueText = `${Math.round(pct)}%`;
     else if (state_ === "UNKNOWN") valueText = "—";
     else valueText = state_;

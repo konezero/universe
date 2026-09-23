@@ -174,6 +174,36 @@ class AgentSessionGatewayTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_codex_account_quota_reader_uses_app_server_without_a_thread(self) -> None:
+        from agent_session_gateway import read_codex_account_quota
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", FakeJsonRpcTransport):
+            snapshot = read_codex_account_quota(
+                executable=self.root / "codex.exe", cwd=self.root, environment={}
+            )
+        transport = FakeJsonRpcTransport.instances[-1]
+        self.assertEqual(("app-server", "--listen", "stdio://"), transport.arguments)
+        self.assertEqual(
+            ["initialize", "account/rateLimits/read"],
+            [method for method, _ in transport.requests],
+        )
+        self.assertIn(("initialized", None), transport.notifications)
+        self.assertEqual("AVAILABLE", snapshot["state"])
+        self.assertEqual(70, snapshot["windows"][1]["used_percent"])
+        self.assertIn("observed_at", snapshot)
+        self.assertTrue(transport.closed)
+
+    def test_codex_account_quota_reader_closes_transport_on_failure(self) -> None:
+        from agent_session_gateway import read_codex_account_quota
+
+        with patch("agent_session_gateway.JsonRpcStdioProcess", FakeJsonRpcTransport):
+            with patch.object(FakeJsonRpcTransport, "request", side_effect=AgentSessionError("offline")):
+                with self.assertRaises(AgentSessionError):
+                    read_codex_account_quota(
+                        executable=self.root / "codex.exe", cwd=self.root, environment={}
+                    )
+        self.assertTrue(FakeJsonRpcTransport.instances[-1].closed)
+
     def test_supervised_json_lines_rejoins_conpty_soft_wraps(self) -> None:
         waiter: queue.Queue = queue.Queue()
         waiter.put(b'\x1b]0;claude\x07{"type":"result","result":"CLAUDE_\r\n')
