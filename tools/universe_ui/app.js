@@ -13807,6 +13807,7 @@ async function loadGalaxyGoalProposals(projectId) {
   state.goalProposalLoadRevision = loadRevision;
   state.goalProposals = null;
   state.goalProposalsStatus = "LOADING";
+  state.goalProposalsError = null;
   const proposals = [];
   const seen = new Set();
   let offset = 0;
@@ -13828,6 +13829,7 @@ async function loadGalaxyGoalProposals(projectId) {
             state.goalProposalLoadRevision !== loadRevision) return;
         state.goalProposals = proposals;
         state.goalProposalsStatus = "READY";
+        state.goalProposalsError = null;
         if (state.view === "semantic") buildGraph();
         if (elements.memoryPanel && !elements.memoryPanel.classList.contains("hidden")) renderMemory();
         return;
@@ -20119,6 +20121,9 @@ async function acceptGoalCandidate(candidate) {
   if (!projectId || !candidate?.candidate_id || !candidate?.candidate_digest) {
     throw new Error("Goal proposal identity is incomplete");
   }
+  if (state.selectedProject?.project_id !== projectId) {
+    throw new Error("Goal proposal belongs to a different selected project");
+  }
   const result = await invokeServerAction("goal.accept-proposal", {
     project_id: projectId,
     candidate_id: candidate.candidate_id,
@@ -20127,14 +20132,18 @@ async function acceptGoalCandidate(candidate) {
   if (result?.goal?.project_id !== projectId || !result?.goal?.goal_id) {
     throw new Error("Goal acceptance response does not match this project");
   }
-  if (state.goalProposalsStatus === "READY") {
-    state.goalProposals = state.goalProposals.map((item) =>
-      item.candidate_id === candidate.candidate_id
-        ? {...item, goal_acceptance: {goal_id: result.goal.goal_id,
-            candidate_digest: candidate.candidate_digest}} : item);
+  if (state.selectedProject?.project_id === projectId) {
+    if (state.goalProposalsStatus === "READY" && Array.isArray(state.goalProposals)) {
+      state.goalProposals = state.goalProposals.map((item) =>
+        item.candidate_id === candidate.candidate_id
+          ? {...item, goal_acceptance: {goal_id: result.goal.goal_id,
+              candidate_digest: candidate.candidate_digest}} : item);
+    }
+    // Invalidate an in-flight projection so its pre-acceptance page cannot
+    // overwrite the committed decision. A read failure stays visible as UNKNOWN.
+    void loadGalaxyGoalProposals(projectId);
+    void refreshGoalPlan().catch(() => {});
   }
-  // A failed refresh never turns a committed acceptance into a failed action.
-  void refreshGoalPlan().catch(() => {});
   return result;
 }
 

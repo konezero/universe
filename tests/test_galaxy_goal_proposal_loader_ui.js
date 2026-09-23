@@ -7,7 +7,7 @@ const end = source.indexOf('function galaxyProposalGraphNodes(', start);
 assert.ok(start >= 0 && end > start);
 
 async function run(pages) {
-  const state = {selectedProject: {project_id: 'universe'}, view: 'semantic'};
+  const state = {selectedProject: {project_id: 'universe'}, view: 'semantic', goalProposalsError: 'prior failure'};
   const calls = [];
   let renders = 0;
   const context = {
@@ -29,6 +29,7 @@ async function run(pages) {
     proposals:[{candidate_id:'idea_2', project_id:'universe'}]};
   const ok = await run([first, second]);
   assert.equal(ok.state.goalProposalsStatus, 'READY');
+  assert.equal(ok.state.goalProposalsError, null);
   assert.deepEqual(Array.from(ok.state.goalProposals, p => p.candidate_id), ['idea_1','idea_2']);
   assert.equal(ok.calls.length, 2);
   assert.equal(ok.renders, 1);
@@ -37,5 +38,21 @@ async function run(pages) {
   assert.equal(bad.state.goalProposals, null);
   assert.match(bad.state.goalProposalsError, /transport down/);
   assert.equal(bad.renders, 1);
-  console.log('Galaxy proposal pagination and visible error state passed.');
+  const pending = [];
+  const raceState = {selectedProject:{project_id:'universe'}, view:'semantic'};
+  const raceContext = {state:raceState, encodeURIComponent, elements:{memoryPanel:null},
+    api: () => new Promise(resolve => pending.push(resolve)), buildGraph: () => {}};
+  vm.createContext(raceContext);
+  vm.runInContext(source.slice(start, end), raceContext);
+  const staleLoad = raceContext.loadGalaxyGoalProposals('universe');
+  const acceptedLoad = raceContext.loadGalaxyGoalProposals('universe');
+  pending[1]({project_id:'universe', offset:0, has_more:false, next_offset:1,
+    proposals:[{candidate_id:'idea_1', project_id:'universe', goal_acceptance:{goal_id:'goal_1'}}]});
+  await acceptedLoad;
+  pending[0]({project_id:'universe', offset:0, has_more:false, next_offset:1,
+    proposals:[{candidate_id:'idea_1', project_id:'universe', goal_acceptance:null}]});
+  await staleLoad;
+  assert.equal(raceState.goalProposals[0].goal_acceptance.goal_id, 'goal_1');
+  assert.equal(raceState.goalProposalsStatus, 'READY');
+  console.log('Galaxy proposal pagination, error state, and stale-response isolation passed.');
 })().catch(error => { console.error(error); process.exitCode=1; });
