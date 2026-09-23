@@ -50,8 +50,8 @@ class MemoryBatchExecutionStore(Protocol):
 
     def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]: ...
 
-    def list_memory_candidates(
-        self, project_id: str, *, stage: str | None = None, limit: int = 100
+    def list_memory_batch_input_candidates(
+        self, project_id: str, *, stage: str | None = None
     ) -> list[dict[str, Any]]: ...
 
     def _insert_memory_candidates(
@@ -82,6 +82,8 @@ class MemoryBatchExecutionStore(Protocol):
 class MemoryBatchExecutionService:
     """Run deterministic Memory stages and persist one durable result envelope."""
 
+    MAX_STAGE_INPUTS = 500
+
     def __init__(
         self,
         store: MemoryBatchExecutionStore,
@@ -90,6 +92,20 @@ class MemoryBatchExecutionService:
     ) -> None:
         self.store = store
         self.now = now
+
+    def _bounded_candidates(
+        self, project_id: str, *, stage: str | None = None
+    ) -> list[dict[str, Any]]:
+        candidates = self.store.list_memory_batch_input_candidates(
+            project_id, stage=stage
+        )
+        if len(candidates) > self.MAX_STAGE_INPUTS:
+            raise UniverseError(
+                "MEMORY_BATCH_INPUT_WINDOW_REQUIRED",
+                "More than 500 candidates require a paged stage-input window; no partial run was recorded",
+                HTTPStatus.CONFLICT,
+            )
+        return candidates
 
     def execute(
         self,
@@ -194,18 +210,18 @@ class MemoryBatchExecutionService:
                         item["candidate_digest"] for item in extracted
                     )
         elif stage == "CONSOLIDATE":
-            existing = self.store.list_memory_candidates(
-                project["project_id"], stage="FAST_EXTRACT", limit=500
+            existing = self._bounded_candidates(
+                project["project_id"], stage="FAST_EXTRACT"
             )
             input_material = [item["candidate_digest"] for item in existing]
             candidates = consolidate_memory_candidates(existing)
         elif stage == "SYNTHESIZE":
-            existing = self.store.list_memory_candidates(
-                project["project_id"], stage="CONSOLIDATE", limit=500
+            existing = self._bounded_candidates(
+                project["project_id"], stage="CONSOLIDATE"
             )
             if not existing:
-                existing = self.store.list_memory_candidates(
-                    project["project_id"], stage="FAST_EXTRACT", limit=500
+                existing = self._bounded_candidates(
+                    project["project_id"], stage="FAST_EXTRACT"
                 )
             input_material = [item["candidate_digest"] for item in existing]
             raw_kinds = request.get("kinds", ["IDEA", "HYPOTHESIS", "PRODUCT"])
@@ -218,9 +234,7 @@ class MemoryBatchExecutionService:
             except MemoryError as error:
                 raise UniverseError(error.code, error.message) from error
         else:
-            existing = self.store.list_memory_candidates(
-                project["project_id"], limit=500
-            )
+            existing = self._bounded_candidates(project["project_id"])
             input_material = [item["candidate_digest"] for item in existing]
             try:
                 check = independent_check_memory_candidates(existing)

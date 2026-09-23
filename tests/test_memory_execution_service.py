@@ -37,14 +37,14 @@ class FakeMemoryStore:
     def prepare_provider_activity_batch(self, source_id: str) -> dict[str, Any]:
         raise AssertionError("the test supplies activity_batches directly")
 
-    def list_memory_candidates(
-        self, project_id: str, *, stage: str | None = None, limit: int = 100
+    def list_memory_batch_input_candidates(
+        self, project_id: str, *, stage: str | None = None
     ) -> list[dict[str, Any]]:
         return [
             dict(item)
             for item in self.candidates
             if stage is None or item["stage"] == stage
-        ][:limit]
+        ][:501]
 
     def _insert_memory_candidates(
         self, project_id: str, candidates: list[Mapping[str, Any]]
@@ -143,6 +143,36 @@ class MemoryBatchExecutionServiceTests(unittest.TestCase):
         self.assertEqual([], self.store.candidates)
         self.assertEqual(1, len(self.store.persisted))
         self.assertEqual("FAST_EXTRACT", self.store.persisted[0]["stage"])
+
+    def test_small_consolidation_still_uses_complete_batch_input(self) -> None:
+        extracted = self.service.execute(
+            "TEST", {"stage": "FAST_EXTRACT", "dry_run": False},
+            {"activity_batches": [self.activity_batch]},
+        )
+        self.assertGreaterEqual(extracted["created_count"], 2)
+        consolidated = self.service.execute(
+            "TEST", {"stage": "CONSOLIDATE", "dry_run": True}
+        )
+        self.assertEqual(extracted["created_count"], consolidated["candidate_count"])
+        self.assertEqual("DETERMINISTIC", consolidated["execution"]["mode"])
+        self.assertEqual("NOT_RUN", consolidated["execution"]["provider_invocation"])
+
+    def test_downstream_stages_reject_unbounded_candidate_input(self) -> None:
+        for stage, source_stage in (
+            ("CONSOLIDATE", "FAST_EXTRACT"),
+            ("SYNTHESIZE", "CONSOLIDATE"),
+            ("INDEPENDENT_CHECK", "FAST_EXTRACT"),
+        ):
+            with self.subTest(stage=stage):
+                self.store.candidates = [
+                    {"candidate_id": f"candidate_{index}", "stage": source_stage}
+                    for index in range(501)
+                ]
+                self.store.persisted.clear()
+                with self.assertRaises(UniverseError) as raised:
+                    self.service.execute("TEST", {"stage": stage, "dry_run": True})
+                self.assertEqual("MEMORY_BATCH_INPUT_WINDOW_REQUIRED", raised.exception.code)
+                self.assertEqual([], self.store.persisted)
 
     def test_quota_is_checked_before_candidate_generation(self) -> None:
         self.store.run_count = 1

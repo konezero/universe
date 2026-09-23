@@ -53,7 +53,12 @@ graph edges, historic Feature/Goal migration, and live scheduled end-to-end
 acceptance remain pending. Galaxy proposals now have a paged project-scoped
 read model; the Memory menu shows that proposal read model and Ops retains
 a separately capped legacy operational RAG review. Ops now labels deterministic
-stages as model-not-invoked even when a provider/model is configured. Do not present the target pipeline as production-complete.
+stages as model-not-invoked even when a provider/model is configured. Downstream
+stages read a lean batch-input projection, without UI review/RAG lookups, and
+reject an input set above 500 candidates with `MEMORY_BATCH_INPUT_WINDOW_REQUIRED`
+before writing a partial run. A durable paged stage cursor is still required for
+those larger projects; this guard is not the second LLM pass. Do not present the
+target pipeline as production-complete.
 
 ## Source-grounded candidate eligibility (2026-09-13)
 

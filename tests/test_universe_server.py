@@ -3216,6 +3216,51 @@ class UniverseLocalServiceTests(unittest.TestCase):
             {item["edge_type"] for item in graph["edges"]},
         )
 
+    def test_memory_stage_overflow_probe_prevents_partial_consolidation(self) -> None:
+        self.server.store.register_project(self.registration())
+        template, _ = self.server.store.create_memory_candidate(
+            "GCS", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                    "summary": "A source-backed candidate for the batch window."}
+        )
+        with patch.object(self.server.store, "_memory_candidate_row",
+                          side_effect=AssertionError("UI projection must not run")):
+            inputs = self.server.store.list_memory_batch_input_candidates(
+                "GCS", stage="FAST_EXTRACT")
+        self.assertEqual([template["candidate_id"]],
+                         [item["candidate_id"] for item in inputs])
+        with self.server.store._connection() as connection:
+            for index in range(500):
+                candidate = dict(template)
+                candidate_id = f"memory_candidate_overflow_{index:04d}"
+                digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()
+                candidate.update(candidate_id=candidate_id, candidate_digest=digest)
+                candidate.pop("decision_contract", None)
+                candidate.pop("goal_acceptance", None)
+                connection.execute(
+                    "INSERT INTO memory_candidate(candidate_id, project_id, stage, kind, state, "
+                    "candidate_digest, candidate_json, created_at, updated_at) "
+                    "VALUES (?, 'GCS', 'FAST_EXTRACT', 'MEMORY', 'REVIEW_REQUIRED', ?, ?, ?, ?)",
+                    (candidate_id, digest, json.dumps(candidate),
+                     "2026-09-23T00:00:00Z", "2026-09-23T00:00:00Z"),
+                )
+        self.assertEqual(1, len(self.server.store.list_memory_candidates(
+            "GCS", stage="FAST_EXTRACT", limit=1)))
+        with self.assertRaises(UniverseError) as overflow:
+            self.server.store.list_memory_batch_input_candidates(
+                "GCS", stage="FAST_EXTRACT")
+        self.assertEqual("MEMORY_BATCH_INPUT_WINDOW_REQUIRED", overflow.exception.code)
+        with self.assertRaises(UniverseError) as raised:
+            self.server.store.memory_batch_execution_service.execute(
+                "GCS", {"stage": "CONSOLIDATE", "dry_run": True}
+            )
+        self.assertEqual("MEMORY_BATCH_INPUT_WINDOW_REQUIRED", raised.exception.code)
+        with self.server.store._connection() as connection:
+            runs = connection.execute(
+                "SELECT COUNT(*) FROM memory_batch_run WHERE project_id = 'GCS' "
+                "AND stage = 'CONSOLIDATE'"
+            ).fetchone()[0]
+        self.assertEqual(0, runs)
+
     def test_memory_batch_completion_advances_semantic_collection_cursor(self) -> None:
         self.request("POST", "/v1/projects/register", self.registration(), self.token)
         self.server.store.persist_memory_batch_result(

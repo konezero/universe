@@ -22515,6 +22515,38 @@ class UniverseStore:
             ).fetchall()
         return [self._memory_candidate_row(row) for row in rows]
 
+    def list_memory_batch_input_candidates(
+        self, project_id: str, *, stage: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Read an all-or-error stage window without UI review/RAG projections."""
+        project_id = _project_id(project_id)
+        self.get_project(project_id)
+        if stage is not None and stage not in MEMORY_BATCH_STAGES:
+            raise UniverseError("MEMORY_BATCH_STAGE_INVALID", "stage is invalid")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT candidate_id, project_id, stage, kind, state, candidate_digest, candidate_json "
+                "FROM memory_candidate WHERE project_id = ? "
+                + ("AND stage = ? " if stage is not None else "")
+                + "ORDER BY updated_at DESC, candidate_id DESC LIMIT ?",
+                ((project_id, stage, MemoryBatchExecutionService.MAX_STAGE_INPUTS + 1)
+                 if stage is not None else
+                 (project_id, MemoryBatchExecutionService.MAX_STAGE_INPUTS + 1)),
+            ).fetchall()
+        if len(rows) > MemoryBatchExecutionService.MAX_STAGE_INPUTS:
+            raise UniverseError(
+                "MEMORY_BATCH_INPUT_WINDOW_REQUIRED",
+                "More than 500 candidates require a paged stage-input window; no partial run was recorded",
+                HTTPStatus.CONFLICT,
+            )
+        inputs = []
+        for row in rows:
+            candidate = json.loads(row["candidate_json"])
+            candidate.update({key: row[key] for key in (
+                "candidate_id", "project_id", "stage", "kind", "state", "candidate_digest"
+            )})
+            inputs.append(candidate)
+        return inputs
     def create_goal_followup(
         self, project_id: str, predecessor_goal_id: str, value: Mapping[str, Any]
     ) -> tuple[dict[str, Any], bool]:
