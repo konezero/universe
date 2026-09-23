@@ -367,6 +367,132 @@ class FastExtractServerTests(unittest.TestCase):
             "invoker_actor_ref": "/root/boss",
         }
 
+    def test_noise_preview_uses_task_frame_receipt_without_candidate_writes(self):
+        from memory_noise_preview import SCHEMA as NOISE_SCHEMA
+
+        status, config = self.request(
+            "POST", "/v1/projects/TEST/memory-batch-config",
+            {"stage": "CONSOLIDATE", "provider": "CODEX",
+             "model_ref": FAST_EXTRACT_MODEL, "effort": FAST_EXTRACT_EFFORT,
+             "schedule": {"kind": "MANUAL"}, "fallback": "NONE",
+             "enabled": True, "dry_run": True},
+        )
+        self.assertEqual(HTTPStatus.OK, status, config)
+        source, _ = self.server.store.create_memory_candidate(
+            "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                     "summary": "Preserve a user-authored product direction for review.",
+                     "knowledge": {"kind": "USER_IDEA", "topic": "Product direction",
+                                   "applicability": "Future planning"}},
+        )
+
+        def preview(_provider, request):
+            self.dispatcher.calls.append(request)
+            inputs = request["context_pack"]["candidates"]
+            self.assertEqual([source["candidate_id"]], [item["candidate_id"] for item in inputs])
+            return {
+                "status": "COMPLETED", "worker_id": "codex-app-server:noise-preview",
+                "worker_run_ref": request["worker_run_ref"],
+                "result_receipt_ref": "codex-app-server:noise-receipt:" + request["worker_run_ref"],
+                "result": {"text": json.dumps({"schema": NOISE_SCHEMA, "decisions": [
+                    {"candidate_id": inputs[0]["candidate_id"],
+                     "candidate_digest": inputs[0]["candidate_digest"],
+                     "disposition": "KEEP", "route": "PROPOSAL_SOURCE"}
+                ]})},
+                "session_persistence": "EPHEMERAL",
+                "persistent_session_ref": "UNKNOWN",
+                "universe_coordinate_persisted": False,
+                "provider_durable_chat_state": "NOT_PERSISTED",
+            }
+
+        self.dispatcher._invoke_provider = preview
+        binding = self.attached_binding("session-noise", "frame-noise", "temporary-test-token")
+        request = {"stage": "CONSOLIDATE", "runtime_binding": binding}
+        status, completed = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", request
+        )
+        self.assertEqual(HTTPStatus.OK, status, completed)
+        self.assertEqual("DRY_RUN_COMPLETED", completed["run"]["status"])
+        self.assertEqual("CONSOLIDATE", completed["config"]["stage"])
+        self.assertEqual(1, completed["run"]["attempt"])
+        self.assertEqual("COMPLETED", completed["execution"]["provider_invocation"])
+        self.assertEqual("PROPOSAL_SOURCE", completed["run"]["noise_preview"]["decisions"][0]["route"])
+        self.assertEqual(0, completed["run"]["created_count"])
+        self.assertFalse(self.server.store.has_completed_memory_batch_stage("TEST", "CONSOLIDATE"))
+        self.assertEqual(1, len(self.server.store.list_memory_candidates("TEST")))
+        self.assertEqual(1, len(self.dispatcher.calls))
+        status, replay = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", request
+        )
+        self.assertEqual(HTTPStatus.OK, status, replay)
+        self.assertEqual("MEMORY_BATCH_RUN_ALREADY_RECORDED", replay["status"])
+        self.assertEqual(1, len(self.dispatcher.calls))
+
+    def test_noise_preview_rejects_wrong_source_digest_and_records_failure(self):
+        from memory_noise_preview import SCHEMA as NOISE_SCHEMA
+
+        status, config = self.request(
+            "POST", "/v1/projects/TEST/memory-batch-config",
+            {"stage": "CONSOLIDATE", "provider": "CODEX",
+             "model_ref": FAST_EXTRACT_MODEL, "effort": FAST_EXTRACT_EFFORT,
+             "schedule": {"kind": "MANUAL"}, "fallback": "NONE",
+             "enabled": True, "dry_run": True},
+        )
+        self.assertEqual(HTTPStatus.OK, status, config)
+        self.server.store.create_memory_candidate(
+            "TEST", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                     "summary": "Keep project ideas for a later explicit decision.",
+                     "knowledge": {"kind": "USER_IDEA", "topic": "Project ideas",
+                                   "applicability": "Future planning"}},
+        )
+
+        def invalid(_provider, request):
+            inputs = request["context_pack"]["candidates"]
+            return {
+                "status": "COMPLETED", "worker_id": "codex-app-server:noise-preview",
+                "worker_run_ref": request["worker_run_ref"],
+                "result_receipt_ref": "codex-app-server:noise-receipt:" + request["worker_run_ref"],
+                "result": {"text": json.dumps({"schema": NOISE_SCHEMA, "decisions": [
+                    {"candidate_id": inputs[0]["candidate_id"],
+                     "candidate_digest": "0" * 64,
+                     "disposition": "KEEP", "route": "PROPOSAL_SOURCE"}
+                ]})},
+                "session_persistence": "EPHEMERAL",
+                "persistent_session_ref": "UNKNOWN",
+                "universe_coordinate_persisted": False,
+                "provider_durable_chat_state": "NOT_PERSISTED",
+            }
+
+        self.dispatcher._invoke_provider = invalid
+        binding = self.attached_binding("session-noise-invalid", "frame-noise-invalid", "temporary-test-token")
+        status, rejected = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run",
+            {"stage": "CONSOLIDATE", "runtime_binding": binding},
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
+        self.assertEqual("MEMORY_NOISE_RESULT_PROVENANCE_INVALID", rejected["error_code"])
+        runs = self.server.store.list_memory_batch_runs("TEST")
+        failed = [item for item in runs if item["stage"] == "CONSOLIDATE"]
+        self.assertEqual(1, len(failed))
+        self.assertEqual("FAILED", failed[0]["status"])
+        self.assertEqual(1, len(self.server.store.list_memory_candidates("TEST")))
+
+    def test_noise_model_cannot_write_candidates_without_atomic_completion(self):
+        status, config = self.request(
+            "POST", "/v1/projects/TEST/memory-batch-config",
+            {"stage": "CONSOLIDATE", "provider": "CODEX",
+             "model_ref": FAST_EXTRACT_MODEL, "effort": FAST_EXTRACT_EFFORT,
+             "schedule": {"kind": "MANUAL"}, "fallback": "NONE",
+             "enabled": True, "dry_run": False},
+        )
+        self.assertEqual(HTTPStatus.OK, status, config)
+        status, rejected = self.request(
+            "POST", "/v1/projects/TEST/memory-batches/run", {"stage": "CONSOLIDATE"}
+        )
+        self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
+        self.assertEqual("MEMORY_NOISE_PREVIEW_CONFIG_REQUIRED", rejected["error_code"])
+        self.assertEqual([], self.server.store.list_memory_batch_runs("TEST"))
+        self.assertEqual([], self.dispatcher.calls)
+
     def test_no_supported_lesson_completes_with_zero_candidates(self):
         self.configure()
         self.server.store.register_provider_session_source({"source_id":"source-1","provider":"CODEX","provider_session_id":"session-1","source_path":str(self.source_path),"source_kind":"CODEX_ROLLOUT_JSONL"})

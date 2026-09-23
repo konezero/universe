@@ -189,6 +189,13 @@ from memory_fast_extract import (
     redact_activity_batches,
     redacted_execution_record,
 )
+from memory_noise_preview import (
+    SCHEMA as NOISE_PREVIEW_SCHEMA,
+    NoisePreviewError,
+    build_provider_request as build_noise_preview_request,
+    normalize_decisions as normalize_noise_decisions,
+    project_inputs as project_noise_inputs,
+)
 from universe_runtime_host import (
     RuntimeHostError,
     UniverseRuntimeHost,
@@ -48040,7 +48047,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def memory_batch_configs(self, project_id: str) -> dict[str, Any]:
         result = self.memory_batch_config_service.list_configs(project_id)
         for config in result.get("configs", []):
-            if config.get("stage") == "FAST_EXTRACT" and config.get("fallback") == "NONE":
+            if config.get("stage") in {"FAST_EXTRACT", "CONSOLIDATE"} and config.get("fallback") == "NONE":
                 config["runtime_preparation"] = {
                     "status": "ON_DEMAND",
                     "detail": "배치가 실행될 때 자동으로 준비하고, 끝나면 정리합니다.",
@@ -48146,6 +48153,184 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "document_written": False,
         }
 
+    def _run_memory_noise_preview(
+        self, project_id: str, value: Mapping[str, Any],
+        config: Mapping[str, Any], resolved: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        from universe_app.memory_runtime_preparation import prepared_memory_frame
+
+        if (
+            resolved.get("provider") != FAST_EXTRACT_PROVIDER
+            or resolved.get("model_ref") != FAST_EXTRACT_MODEL
+            or resolved.get("effort") != FAST_EXTRACT_EFFORT
+            or resolved.get("fallback") != "NONE"
+            or resolved.get("dry_run") is not True
+        ):
+            raise UniverseError(
+                "MEMORY_NOISE_PREVIEW_CONFIG_REQUIRED",
+                "LLM CONSOLIDATE currently requires Codex gpt-5.6-luna MAX, fallback NONE, dry_run true",
+                HTTPStatus.CONFLICT,
+            )
+        if not isinstance(value.get("runtime_binding"), Mapping) and config.get("persisted"):
+            with self._memory_batch_runtimes.execution(project_id, "CONSOLIDATE") as (binding, public):
+                with prepared_memory_frame(
+                    self.runtime_host, binding, public, config,
+                    operation="MEMORY_CONSOLIDATE_PREVIEW",
+                    result_schema=NOISE_PREVIEW_SCHEMA,
+                ) as prepared:
+                    self._memory_batch_runtimes.bind_frame(project_id, prepared)
+                    return self.run_memory_batch(
+                        project_id, {**value, "runtime_binding": prepared}
+                    )
+        if not isinstance(value.get("runtime_binding"), Mapping):
+            raise UniverseError(
+                "MEMORY_BATCH_RUNTIME_PREPARATION_REQUIRED",
+                "LLM consolidation requires a Host-prepared Task Frame",
+                HTTPStatus.CONFLICT,
+            )
+        public_binding = _exact_object_fields(
+            value["runtime_binding"], field="runtime_binding",
+            required=frozenset({
+                "task_frame_ref", "session_id", "session_anchor_ref", "frame_id",
+                "turn_id", "invoker_actor_ref", "credential_ref",
+            }),
+        )
+        transport = self.resolve_attached_runtime_connection(project_id, public_binding)
+        runtime_binding = normalize_runtime_binding({
+            **{key: item for key, item in public_binding.items()
+               if key not in {"credential_ref", "session_anchor_ref"}},
+            **transport,
+        })
+        candidates = self.store.list_memory_batch_input_candidates(
+            project_id, stage="FAST_EXTRACT"
+        )
+        try:
+            source_inputs = project_noise_inputs(candidates, project_id)
+        except NoisePreviewError as error:
+            raise UniverseError(error.code, error.detail, HTTPStatus.CONFLICT) from error
+        material = [item["candidate_digest"] for item in source_inputs]
+        material.append("noise-preview-policy:v1")
+        run_id, config_digest, input_digest = self.store.memory_batch_run_id(
+            project_id, "CONSOLIDATE", resolved, material
+        )
+        model_ref = f"provider://{FAST_EXTRACT_PROVIDER}/model/{FAST_EXTRACT_MODEL}"
+        response_config = {
+            key: resolved[key]
+            for key in ("stage", "provider", "model_ref", "fallback", "resolution")
+        }
+        execution_pending = {
+            "schema": "universe.memory-noise-preview-execution.v1",
+            "mode": "GOVERNED_TASK_FRAME", "status": "RUNNING",
+            "provider_invocation": "PENDING", "provider_attribution": model_ref,
+            "model_ref": model_ref, "effort": FAST_EXTRACT_EFFORT,
+            "invocation_id": run_id, "task_frame_ref": runtime_binding["task_frame_ref"],
+            "repository_write": False, "result_receipt_ref": "PENDING",
+        }
+        with self.memory_batch_execution_lock:
+            existing = self.store.get_memory_batch_run(run_id)
+            if existing is not None:
+                if existing["status"] == "RUNNING":
+                    raise UniverseError(
+                        "MEMORY_BATCH_RUN_IN_PROGRESS", "Noise preview is already running",
+                        HTTPStatus.CONFLICT,
+                    )
+                if existing["status"] != "FAILED":
+                    return {
+                        "schema": API_SCHEMA, "status": "MEMORY_BATCH_RUN_ALREADY_RECORDED",
+                        "config": response_config,
+                        "execution": existing["result"].get("execution", {}),
+                        "run": existing["result"],
+                    }
+                reserved = self.store.retry_memory_batch_run(
+                    run_id, execution=execution_pending
+                )
+            else:
+                reserved = self.store.reserve_memory_batch_run(
+                    run_id=run_id, project_id=project_id, stage="CONSOLIDATE",
+                    config_digest=config_digest, input_digest=input_digest,
+                    execution=execution_pending,
+                )
+            try:
+                provider_request = build_noise_preview_request(
+                    project_id=project_id, candidates=candidates,
+                    runtime_binding=runtime_binding, invocation_id=run_id,
+                    config_digest=config_digest,
+                )
+                capability = self.runtime_host.provider_capability(FAST_EXTRACT_PROVIDER)
+                if capability.get("status") != "AVAILABLE" or capability.get("model") != FAST_EXTRACT_MODEL:
+                    raise NoisePreviewError(
+                        "MEMORY_NOISE_MODEL_UNAVAILABLE", "Host did not attest configured model"
+                    )
+                provider_result = self.runtime_host.invoke_structured(provider_request)
+                if not isinstance(provider_result, Mapping) or provider_result.get("terminal_result_verified") is not True:
+                    raise NoisePreviewError(
+                        "MEMORY_NOISE_TERMINAL_RECEIPT_UNVERIFIED", "Task Frame terminal receipt is required"
+                    )
+                if provider_result.get("model_ref") != model_ref:
+                    raise NoisePreviewError("MEMORY_NOISE_MODEL_MISMATCH", "Result model differs from config")
+                decisions = normalize_noise_decisions(
+                    provider_result.get("structured_result"), candidates, project_id
+                )
+                worker_id = _required_text(provider_result.get("worker_id"), "worker_id")
+                worker_run_ref = _required_text(provider_result.get("worker_run_ref"), "worker_run_ref")
+                receipt_ref = _required_text(provider_result.get("result_receipt_ref"), "result_receipt_ref")
+                current = self.store.list_memory_batch_input_candidates(
+                    project_id, stage="FAST_EXTRACT"
+                )
+                if project_noise_inputs(current, project_id) != source_inputs:
+                    raise NoisePreviewError(
+                        "MEMORY_NOISE_SOURCE_CHANGED", "Source candidates changed during model execution"
+                    )
+                execution = {
+                    **execution_pending, "status": "COMPLETED",
+                    "provider_invocation": "COMPLETED", "worker_id": worker_id,
+                    "worker_run_ref": worker_run_ref, "result_receipt_ref": receipt_ref,
+                    "evidence_refs": [receipt_ref],
+                }
+                now = utc_now()
+                result = {
+                    "schema": MEMORY_BATCH_RUN_SCHEMA, "status": "DRY_RUN_COMPLETED",
+                    "run_id": run_id, "project_id": project_id, "stage": "CONSOLIDATE",
+                    "attempt": reserved["result"].get("attempt", 1),
+                    "config_digest": config_digest, "input_digest": input_digest,
+                    "output_digest": _json_sha256(decisions),
+                    "candidate_count": 0, "created_count": 0,
+                    "candidate_ids": [], "candidates": [], "independent_check": None,
+                    "noise_preview": {"schema": NOISE_PREVIEW_SCHEMA, "decisions": decisions},
+                    "execution": execution,
+                    "effects": {
+                        "candidate_write": "NONE", "memory_write": "NONE",
+                        "current_anchor": "NONE", "project_facts": "NONE", "seed": "NONE",
+                        "authority": "NONE", "execution_assignment": "NONE",
+                        "auto_adoption": False, "skill_observation": "NONE",
+                    },
+                }
+                self.store.persist_memory_batch_result(
+                    run_id=run_id, project_id=project_id, stage="CONSOLIDATE",
+                    result=result, input_digest=input_digest,
+                    output_digest=result["output_digest"], now=now,
+                )
+                return {
+                    "schema": API_SCHEMA, "status": "MEMORY_BATCH_RUN_COMPLETED",
+                    "config": response_config,
+                    "execution": execution,
+                    "run": {**result, "started_at": reserved["started_at"],
+                            "completed_at": now},
+                }
+            except (NoisePreviewError, FastExtractError, RuntimeHostError, UniverseError) as error:
+                error_code = getattr(error, "code", "MEMORY_NOISE_PREVIEW_FAILED")
+                self.store.fail_memory_batch_run(
+                    run_id, status="FAILED", reason=error_code,
+                    execution={**execution_pending, "status": "FAILED",
+                               "provider_invocation": "FAILED", "error_code": error_code,
+                               "result_receipt_ref": "UNKNOWN"},
+                )
+                if isinstance(error, UniverseError):
+                    raise
+                raise UniverseError(
+                    error_code, getattr(error, "detail", str(error)), HTTPStatus.CONFLICT
+                ) from error
+
     def run_memory_batch(self, project_id: str, value: Any, *, _activity_windows=None) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise UniverseError(
@@ -48205,6 +48390,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "run": result,
                 "prediction": self._propose_prediction_after_collection(project_id),
             }
+
+        if stage == "CONSOLIDATE" and resolved.get("fallback") == "NONE":
+            return self._run_memory_noise_preview(project_id, value, config, resolved)
 
         if (
             stage != "FAST_EXTRACT"

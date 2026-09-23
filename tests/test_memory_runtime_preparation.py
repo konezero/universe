@@ -103,6 +103,43 @@ class MemoryPreparationTests(unittest.TestCase):
         self.assertEqual("SCHEDULED",captured[0]["trigger"])
         self.assertTrue(self.calls[-1][0].endswith("close"))
 
+    def test_scheduled_noise_preview_prepares_and_closes_read_only_frame(self):
+        from universe_server import UniverseHTTPServer
+        from universe_batch_runtime import MemoryBatchRuntimePool
+
+        config = {**self.config(), "stage": "CONSOLIDATE", "fallback": "NONE",
+                  "dry_run": True, "resolution": {"status": "AVAILABLE"}}
+        captured = []
+        fake_runtime = SimpleNamespace(start=lambda: self.binding(), stop=lambda: None,
+                                       reconcile=lambda: "LIVE")
+        pool = MemoryBatchRuntimePool(lambda project: fake_runtime)
+        server = SimpleNamespace(
+            _memory_batch_runtimes=pool,
+            store=SimpleNamespace(get_memory_batch_config=lambda *args: config),
+            runtime_host=self.host(),
+            _resolve_memory_batch_config=lambda *args: (config, {}),
+        )
+        server._run_memory_noise_preview = lambda project, value, stored, resolved: (
+            UniverseHTTPServer._run_memory_noise_preview(
+                server, project, value, stored, resolved
+            )
+        )
+
+        def run(project, request, **kwargs):
+            if "runtime_binding" not in request:
+                return UniverseHTTPServer.run_memory_batch(server, project, request)
+            captured.append(request)
+            return {"run": {"run_id": "noise-preview-run", "status": "DRY_RUN_COMPLETED"}}
+
+        server.run_memory_batch = run
+        result = UniverseHTTPServer._run_scheduled_memory_batch(server, "p", "CONSOLIDATE")
+        self.assertEqual("noise-preview-run", result["run_id"])
+        self.assertEqual("SCHEDULED", captured[0]["trigger"])
+        self.assertEqual("NONE", self.plan["repository_write_scope"])
+        creates = [body for path, body in self.calls if path.endswith("create")]
+        self.assertIn("MEMORY_CONSOLIDATE_PREVIEW", creates[0]["frame"]["parent_instruction"]["user_instruction_raw"])
+        self.assertTrue(self.calls[-1][0].endswith("close"))
+
     def test_unpersisted_configuration_does_not_create_authority_or_frame(self):
         host=self.host()
         config=self.config();config["persisted"]=False

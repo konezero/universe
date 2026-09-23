@@ -40,9 +40,11 @@ identity and explicit origin link. A later follow-up Goal is new work, not a
 restart of a completed Goal. See the
 [Goal-node lifecycle contract](galaxy-memory-fleet-goal-lifecycle.md).
 
-Implementation status: FAST_EXTRACT currently uses a governed LLM, while
-CONSOLIDATE/SYNTHESIZE are deterministic and INDEPENDENT_CHECK is structural.
-The scheduled second LLM noise-removal/classification pass and automatic
+Implementation status: FAST_EXTRACT uses a governed LLM. CONSOLIDATE
+now supports a governed LLM decision preview only with Codex gpt-5.6-luna MAX,
+`fallback: NONE`, and `dry_run: true`; its production candidate-writing route
+remains deterministic. SYNTHESIZE is deterministic and INDEPENDENT_CHECK is
+structural. The production second LLM noise-removal/classification pass and automatic
 source-checked operational RAG ingestion are not implemented by those names.
 Current `KEEP`/`rag.adopt` still perform legacy Memory/RAG review; the new
 `goal.accept-proposal` Action is a separate user decision for an eligible
@@ -121,9 +123,14 @@ through the project configuration and Work Loop projections. Operators may
 still trigger a stage manually through the API/UI. `FAST_EXTRACT` is the
 governed exception: it may
 execute only through a claimed Task Frame, with Provider `CODEX`, model
-`gpt-5.6-luna`, effort `MAX`, and `fallback: NONE`. The remaining stages and
-an explicitly configured `DETERMINISTIC` fallback retain the deterministic
-route and report `provider_invocation: NOT_RUN`. This slice enforces total
+`gpt-5.6-luna`, effort `MAX`, and `fallback: NONE`. CONSOLIDATE may use the
+same read-only Task Frame path only as a dry-run decision preview: it validates
+one KEEP/NOISE and proposal/RAG route decision per pinned extraction candidate,
+records the terminal receipt and run, and creates no candidates or adoption.
+The preview accepts 1..32 candidates; larger inputs require a durable model
+window. It does not satisfy the completed CONSOLIDATE prerequisite for
+SYNTHESIZE. Other stages and an explicitly configured `DETERMINISTIC` fallback
+retain the deterministic route and report `provider_invocation: NOT_RUN`. This slice enforces total
 `max_runs` and `{ "max_runs": N, "window_hours": H }` quota windows. Token
 and cost budgets fail closed until Provider usage telemetry is connected.
 
