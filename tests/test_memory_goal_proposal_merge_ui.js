@@ -1,0 +1,17 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const source = fs.readFileSync('tools/universe_ui/app.js', 'utf8');
+const memoryStart = source.indexOf('function renderMemory() {');
+const memoryEnd = source.indexOf('const PERSONA_EXAMPLE_BODY', memoryStart);
+const memory = source.slice(memoryStart, memoryEnd);
+assert.ok(memory.includes('state.goalProposals'));
+assert.ok(memory.includes('acceptGoalCandidate(candidate)'));
+assert.ok(!memory.includes('/memory-candidates?'));
+assert.ok(!memory.includes('Adopt to RAG'));
+const opsStart = source.indexOf('function renderOpsMemoryAutomation() {');
+const opsEnd = source.indexOf('function renderMemoryOpsView()', opsStart);
+const ops = source.slice(opsStart, opsEnd);
+assert.ok(ops.includes('Legacy RAG candidate review'));
+assert.ok(ops.includes('/memory-candidates?kind=MEMORY&limit=200'));
+assert.ok(ops.includes('renderMemoryCandidateReview(false)'));
+console.log('Memory menu shows proposals only; legacy RAG review remains bounded in Ops.');

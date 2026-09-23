@@ -87,6 +87,7 @@ from project_seed_assets import (
     load_project_seed_assets,
     project_seed_template,
 )
+from universe_app.goal_proposal_projection import list_goal_proposals as project_goal_proposals
 from universe_node_graph import compute_views, unify_seed_graph
 from project_work_model import (
     WORK_SURFACE_SCHEMA,
@@ -7347,6 +7348,20 @@ class UniverseStore:
                 CREATE INDEX IF NOT EXISTS memory_candidate_filter
                 ON memory_candidate(project_id, stage, kind, state, updated_at, candidate_id);
 
+                CREATE INDEX IF NOT EXISTS memory_candidate_project_recent
+                ON memory_candidate(project_id, updated_at DESC, candidate_id DESC);
+
+                CREATE TABLE IF NOT EXISTS memory_goal_acceptance (
+                    candidate_id TEXT PRIMARY KEY
+                        REFERENCES memory_candidate(candidate_id),
+                    project_id TEXT NOT NULL
+                        REFERENCES project_connection(project_id),
+                    candidate_digest TEXT NOT NULL,
+                    goal_id TEXT NOT NULL UNIQUE
+                        REFERENCES project_goal(goal_id),
+                    accepted_at TEXT NOT NULL
+                );
+
                 -- Ownership review is append-only and deliberately separate
                 -- from candidate/review/adoption history.  A reclassification
                 -- for a new candidate revision gets a new row; old evidence
@@ -11613,6 +11628,14 @@ class UniverseStore:
                 "ORDER BY sort_order, updated_at, todo_id",
                 (project["project_id"],),
             ).fetchall()
+            origin_rows = connection.execute(
+                "SELECT goal_id, candidate_id, candidate_digest, accepted_at "
+                "FROM memory_goal_acceptance WHERE project_id = ?",
+                (project["project_id"],),
+            ).fetchall()
+        origins = {row["goal_id"]: {"candidate_id": row["candidate_id"],
+            "candidate_digest": row["candidate_digest"],
+            "accepted_at": row["accepted_at"]} for row in origin_rows}
         todos = [self._todo_row(row) for row in todo_rows]
         milestones_by_goal: dict[str, list[dict[str, Any]]] = {}
         for row in milestone_rows:
@@ -11624,6 +11647,7 @@ class UniverseStore:
         goals = []
         for row in goal_rows:
             goal = self._goal_row(row)
+            goal["proposal_origin"] = origins.get(goal["goal_id"])
             goal["milestones"] = milestones_by_goal.get(goal["goal_id"], [])
             goal["todos"] = [
                 todo
@@ -11782,9 +11806,17 @@ class UniverseStore:
             row = connection.execute(
                 "SELECT * FROM project_goal WHERE goal_id = ?", (normalized,)
             ).fetchone()
+            origin = connection.execute(
+                "SELECT candidate_id, candidate_digest, accepted_at "
+                "FROM memory_goal_acceptance WHERE goal_id = ?", (normalized,)
+            ).fetchone() if row is not None else None
         if row is None:
             raise UniverseError("GOAL_NOT_FOUND", f"Goal does not exist: {normalized}", HTTPStatus.NOT_FOUND)
-        return self._goal_row(row)
+        goal = self._goal_row(row)
+        goal["proposal_origin"] = ({"candidate_id": origin["candidate_id"],
+            "candidate_digest": origin["candidate_digest"],
+            "accepted_at": origin["accepted_at"]} if origin is not None else None)
+        return goal
 
     def update_goal(self, goal_id: str, value: Any) -> dict[str, Any]:
         current = self.get_goal(goal_id)
@@ -22159,6 +22191,17 @@ class UniverseStore:
         )
         from universe_app.memory_source_review import apply_contract
         candidate = apply_contract(self, candidate)
+        with self._connection() as connection:
+            accepted_goal = connection.execute(
+                "SELECT goal_id, candidate_digest, accepted_at FROM memory_goal_acceptance WHERE candidate_id = ?",
+                (candidate["candidate_id"],),
+            ).fetchone()
+        candidate["goal_acceptance"] = (
+            {"goal_id": str(accepted_goal["goal_id"]),
+             "candidate_digest": str(accepted_goal["candidate_digest"]),
+             "accepted_at": str(accepted_goal["accepted_at"])}
+            if accepted_goal is not None else None
+        )
         candidate["ownership"] = self._memory_candidate_ownership(candidate)
         return candidate
 
@@ -22442,6 +22485,79 @@ class UniverseStore:
                 tuple(params),
             ).fetchall()
         return [self._memory_candidate_row(row) for row in rows]
+
+    def list_goal_proposals(
+        self, project_id: str, *, limit: int = 200, offset: int = 0
+    ) -> dict[str, Any]:
+        project_id = _project_id(project_id)
+        self.get_project(project_id)
+        if not 1 <= limit <= 200 or offset < 0:
+            raise UniverseError("GOAL_PROPOSAL_PAGE_INVALID", "limit must be 1..200 and offset nonnegative")
+        with self._connection() as connection:
+            return project_goal_proposals(connection, project_id, limit=limit, offset=offset)
+
+    def accept_memory_goal_proposal(
+        self, project_id: str, candidate_id: str, expected_digest: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically turn one project-local idea into one distinct Goal.
+
+        This is a user decision, not RAG adoption or an execution grant. A
+        later follow-up Goal uses a separate identity and explicit lineage.
+        """
+        project_id = _project_id(project_id)
+        candidate_id = _identifier(candidate_id, "candidate_id")
+        expected_digest = _required_text(expected_digest, "expected_candidate_digest")
+        self.get_project(project_id)
+        created = False
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM memory_candidate WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise UniverseError("MEMORY_CANDIDATE_NOT_FOUND", "proposal candidate does not exist", HTTPStatus.NOT_FOUND)
+            if row["project_id"] != project_id:
+                raise UniverseError("MEMORY_CANDIDATE_PROJECT_MISMATCH", "proposal belongs to another project", HTTPStatus.CONFLICT)
+            if row["candidate_digest"] != expected_digest:
+                raise UniverseError("GOAL_PROPOSAL_DIGEST_CONFLICT", "proposal changed; refresh before accepting", HTTPStatus.CONFLICT)
+            candidate = json.loads(row["candidate_json"])
+            knowledge = candidate.get("knowledge") if isinstance(candidate.get("knowledge"), Mapping) else {}
+            if row["kind"] not in {"IDEA", "HYPOTHESIS", "PRODUCT"} and knowledge.get("kind") != "USER_IDEA":
+                raise UniverseError("GOAL_PROPOSAL_KIND_INVALID", "only an idea or predicted direction can become a Goal", HTTPStatus.CONFLICT)
+            if row["state"] in {"IGNORE", "SUPERSEDED", "CONFLICTED"}:
+                raise UniverseError("GOAL_PROPOSAL_STATE_INVALID", "excluded or conflicted proposal cannot become a Goal", HTTPStatus.CONFLICT)
+            prior = connection.execute(
+                "SELECT goal_id, candidate_digest FROM memory_goal_acceptance WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if prior is not None:
+                if prior["candidate_digest"] != expected_digest:
+                    raise UniverseError("GOAL_PROPOSAL_DIGEST_CONFLICT", "accepted proposal digest differs", HTTPStatus.CONFLICT)
+                goal_id = str(prior["goal_id"])
+            else:
+                summary = _required_text(candidate.get("summary"), "candidate.summary")
+                topic = str(knowledge.get("topic") or "").strip()
+                title = (topic or summary).strip()[:160]
+                description = summary[:4000]
+                goal_id = "goal_" + uuid.uuid4().hex
+                now = utc_now()
+                connection.execute(
+                    "INSERT INTO project_goal(goal_id, project_id, scope_kind, node_ref, universe_goal_id, title, description, owner, state, sort_order, revision, created_at, updated_at) "
+                    "VALUES (?, ?, 'PROJECT', NULL, NULL, ?, ?, 'USER', 'READY', 0, 1, ?, ?)",
+                    (goal_id, project_id, title, description, now, now),
+                )
+                ensure_template_instance(
+                    connection, project_id=project_id, scope_kind="GOAL",
+                    scope_ref=goal_id, goal_id=goal_id, node_ref=None,
+                    title=title, template=project_seed_template()["work_model"], now=now,
+                )
+                connection.execute(
+                    "INSERT INTO memory_goal_acceptance(candidate_id, project_id, candidate_digest, goal_id, accepted_at) VALUES (?, ?, ?, ?, ?)",
+                    (candidate_id, project_id, expected_digest, goal_id, now),
+                )
+                created = True
+        return self.get_goal(goal_id), created
 
     def get_memory_candidate(self, candidate_id: str) -> dict[str, Any]:
         normalized = _identifier(candidate_id, "candidate_id")
@@ -31115,6 +31231,7 @@ class UniverseStore:
             "scope_kind": row["scope_kind"],
             "node_ref": row["node_ref"],
             "universe_goal_id": row["universe_goal_id"],
+            "proposal_origin": None,
             "title": row["title"],
             "description": row["description"],
             "owner": row["owner"],
@@ -31844,6 +31961,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "service.status": self._handle_service_status_action,
                 "service.restart": self._handle_service_restart_action,
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
+                "goal.accept-proposal": self._handle_goal_accept_proposal_action,
                 FEATURE_WORKSTREAM_SET_ACTION_ID: self._handle_feature_workstream_set_action,
                 TODO_CREATE_ACTION_ID: self._handle_todo_create_action,
                 TODO_UPDATE_ACTION_ID: self._handle_todo_update_action,
@@ -38926,6 +39044,34 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "action_id": SESSION_BUS_REPLY_ACTION_ID,
             "body_text_utf8_sha256": utf8_sha256(body_text),
             "action_request_digest": action_request_digest,
+        }
+
+    def _handle_goal_accept_proposal_action(
+        self, request: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        actor = context.get("actor")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "USER":
+            raise UniverseError(
+                "ACTION_ACTOR_RESOLUTION_FAILED",
+                "Goal proposal acceptance requires the server-resolved USER actor",
+                HTTPStatus.FORBIDDEN,
+            )
+        action = _exact_object_fields(
+            request, field="goal_accept_proposal_action",
+            required=frozenset({"project_id", "candidate_id", "expected_candidate_digest"}),
+        )
+        goal, created = self.store.accept_memory_goal_proposal(
+            action["project_id"], action["candidate_id"], action["expected_candidate_digest"]
+        )
+        return {
+            "schema": "universe.goal-accept-proposal-result.v1",
+            "status": "GOAL_PROPOSAL_ACCEPTED" if created else "GOAL_PROPOSAL_REPLAYED",
+            "action_id": "goal.accept-proposal",
+            "candidate_id": action["candidate_id"],
+            "goal": goal,
+            "goal_created": created,
+            "todo_created": False,
+            "execution_assignment_created": False,
         }
 
     def _handle_feature_create_action(
@@ -53990,6 +54136,15 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        goal_detail = re.fullmatch(r"/v1/goals/([^/]+)", path)
+        if goal_detail is not None:
+            try:
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA,
+                    "status": "GOAL_COLLECTED",
+                    "goal": self.server.store.get_goal(unquote(goal_detail.group(1)))})
+            except UniverseError as error:
+                self._send_error(error)
+            return
         goal_work_plans = re.fullmatch(r"/v1/goals/([^/]+)/work-plans", path)
         if goal_work_plans is not None:
             try:
@@ -54729,6 +54884,23 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
                     self._send(HTTPStatus.OK, result)
                 except UniverseError as error:
                     self._send_error(error)
+                return
+            if suffix == "/goal-proposals":
+                query_map = parse_qs(urlsplit(self.path).query)
+                try:
+                    limit = int((query_map.get("limit") or ["200"])[0])
+                    offset = int((query_map.get("offset") or ["0"])[0])
+                    page = self.server.store.list_goal_proposals(
+                        project_id, limit=limit, offset=offset)
+                except (TypeError, ValueError):
+                    self._send_error(UniverseError(
+                        "GOAL_PROPOSAL_PAGE_INVALID", "limit and offset must be integers"))
+                    return
+                except UniverseError as error:
+                    self._send_error(error)
+                    return
+                self._send(HTTPStatus.OK, {"schema": API_SCHEMA,
+                    "status": "GOAL_PROPOSALS_COLLECTED", "project_id": project_id, **page})
                 return
             if suffix == "/memory-candidates":
                 query_map = parse_qs(urlsplit(self.path).query)
@@ -58956,6 +59128,7 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             "/memory-candidates/review",
             "/memory-candidates/reopen",
             "/memory-candidates",
+            "/goal-proposals",
             "/failure-reuse/query",
             "/failure-reuse/observations",
             "/failure-reuse/batch-attempts",

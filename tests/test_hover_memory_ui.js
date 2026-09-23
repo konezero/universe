@@ -21,6 +21,7 @@ const context = {
   Map, Set, Date, console, state: {view:"documents"}, document: {body, createElement: tag => new Element(tag)}, Option: function(text,value) {return new Element("option", "", text);},
   node: (...args) => new Element(...args), markdownBody: text => new Element('p','',text),
   closeDocumentHover() {}, toast() {},
+  memoryCandidateCanBecomeGoal: c => c.knowledge?.kind === 'USER_IDEA' || ['IDEA','HYPOTHESIS','PRODUCT'].includes(c.kind),
   memoryCandidateActionSpecs: c => c.decision_contract.allowed_actions.map(id => ({id})),
   memoryCandidateNextAction: c => c.decision_contract.next_action,
   memoryCandidateReviewPayload: (c,a) => ({candidate_id:c.candidate_id, decision:a.id}),

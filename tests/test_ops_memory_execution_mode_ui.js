@@ -1,0 +1,16 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('tools/universe_ui/app.js', 'utf8');
+const start = source.indexOf('function memoryBatchExecutionLabel(');
+const end = source.indexOf('function renderMemoryBatchStages(', start);
+assert.ok(start >= 0 && end > start);
+const context = {};
+vm.createContext(context);
+vm.runInContext(source.slice(start, end), context);
+const actual = context.memoryBatchExecutionLabel;
+assert.match(actual({stage:'CONSOLIDATE', provider:'CODEX', fallback:'DETERMINISTIC'}), /model not invoked/);
+assert.match(actual({stage:'SYNTHESIZE', provider:'CODEX', fallback:'NONE'}), /No supported/);
+assert.match(actual({stage:'FAST_EXTRACT', provider:'CODEX', model_ref:'gpt-5.6-luna', effort:'MAX', fallback:'NONE'}), /Provider-backed/);
+assert.match(actual({stage:'FAST_EXTRACT', provider:'CODEX', model_ref:'outdated', effort:'MAX', fallback:'NONE'}), /No supported/);
+console.log('Ops distinguishes configured models from actual stage execution.');

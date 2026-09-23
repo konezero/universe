@@ -124,7 +124,10 @@ assert.deepEqual(
   ['ops-host'],
   'Ops must show only hosts owned by Operations nodes'
 );
-assert.match(app, /workstream_kind: state.homeWorkstreamKind/, 'new nodes use the current board workstream');
+const newNodeRoute = app.slice(app.indexOf('async function submitHomeNode('), app.indexOf('// + Todo', app.indexOf('async function submitHomeNode(')));
+assert.match(newNodeRoute, /state.homeWorkstreamKind === "OPERATIONS"/, 'Ops uses the Operations branch');
+assert.match(newNodeRoute, /workstream_kind: "OPERATIONS"/, 'Ops retains its Operations Feature registration');
+assert.match(newNodeRoute, /scope_kind: "PROJECT"/, 'Fleet registers a project Goal instead of a Feature');
 const bindingRoute = app.slice(app.indexOf('function goToNodeMasterBinding('), app.indexOf('function openFleetNodeFromTerminal('));
 assert.match(bindingRoute, /fleetFeatureIsOperations\(featureId\).*showMemoryOpsView\(\)/s);
 const activityTodoRoute = app.slice(app.indexOf('function openActivityTodo('), app.indexOf('function openActivityTaskFrame('));

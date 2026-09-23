@@ -211,6 +211,17 @@ A selected composition can become Project Seed material and support a Project
 Master handoff in the coding domain. Generic projects do not acquire a coding
 executor merely because they have a goal.
 
+Product-model clarification (2026-09-23): the current target relationship is
+specified in [Galaxy proposals, Memory sources, and Fleet Goal nodes](galaxy-memory-fleet-goal-lifecycle.md).
+Memory and Galaxy expose the same project-local proposal and acceptance state;
+the resulting Fleet node is a separate Goal work unit linked to that Galaxy
+source, with its own Todos and terminal completion. Fleet need not display an
+unaccepted prediction, and a completed Goal is never revived merely because
+the periodic Memory/RAG collector runs again. The bullets and reconciliation
+table below record the earlier structural/Feature-node direction and current
+code; their different Goal/node identity is an implementation gap, not an
+alternative product rule.
+
 ## Fleet, Galaxy, and node entry
 
 - **Fleet** is the shared goal/plan/node/Todo work surface and its kanban view.

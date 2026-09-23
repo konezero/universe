@@ -11724,6 +11724,96 @@ class UniverseLocalServiceTests(unittest.TestCase):
         self.assertEqual("USER", context["actor"]["role"])
         self.assertNotEqual("TEST_CALLER", context["source"])
 
+    def test_goal_accept_proposal_is_project_scoped_atomic_and_idempotent(self) -> None:
+        self.server.store.register_project(self.registration())
+        with self.assertRaises(UniverseError) as unauthorized:
+            self.server._handle_goal_accept_proposal_action({}, {"actor": {"kind": "WORKER"}})
+        self.assertEqual("ACTION_ACTOR_RESOLUTION_FAILED", unauthorized.exception.code)
+        candidate, _ = self.server.store.create_memory_candidate(
+            "GCS", {"stage": "SYNTHESIZE", "kind": "IDEA",
+                    "summary": "Build a bounded Goal from this idea."}
+        )
+        request = {"action_id": "goal.accept-proposal", "request": {
+            "project_id": "GCS", "candidate_id": candidate["candidate_id"],
+            "expected_candidate_digest": candidate["candidate_digest"],
+        }}
+        status, accepted = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, accepted)
+        self.assertTrue(accepted["goal_created"])
+        goal = accepted["goal"]
+        self.assertEqual("PROJECT", goal["scope_kind"])
+        self.assertIsNone(goal["node_ref"])
+        self.assertEqual("GCS", goal["project_id"])
+        read_status, read_goal = self.request("GET", f"/v1/goals/{goal['goal_id']}", None, self.token)
+        self.assertEqual(HTTPStatus.OK, read_status, read_goal)
+        self.assertEqual(goal["goal_id"], read_goal["goal"]["goal_id"])
+        self.assertEqual(candidate["candidate_id"], goal["proposal_origin"]["candidate_id"])
+        self.assertEqual(candidate["candidate_digest"], goal["proposal_origin"]["candidate_digest"])
+        self.assertEqual(goal["proposal_origin"],
+                         self.server.store.list_project_goals("GCS")[0]["proposal_origin"])
+        refreshed = self.server.store.get_memory_candidate(candidate["candidate_id"])
+        self.assertEqual(goal["goal_id"], refreshed["goal_acceptance"]["goal_id"])
+        status, replay = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, replay)
+        self.assertFalse(replay["goal_created"])
+        self.assertEqual(goal["goal_id"], replay["goal"]["goal_id"])
+        self.assertEqual(1, len(self.server.store.list_project_goals("GCS")))
+        bad = {"action_id": "goal.accept-proposal", "request": {
+            **request["request"], "expected_candidate_digest": "0" * 64,
+        }}
+        status, conflict = self.request("POST", "/v1/actions", bad, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, conflict)
+        self.assertEqual("GOAL_PROPOSAL_DIGEST_CONFLICT", conflict["error_code"])
+        procedural, _ = self.server.store.create_memory_candidate(
+            "GCS", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                    "summary": "Check preconditions before an operation."}
+        )
+        status, rejected = self.request("POST", "/v1/actions", {
+            "action_id": "goal.accept-proposal", "request": {
+                "project_id": "GCS", "candidate_id": procedural["candidate_id"],
+                "expected_candidate_digest": procedural["candidate_digest"],
+            }}, self.token)
+        self.assertEqual(HTTPStatus.CONFLICT, status, rejected)
+        self.assertEqual("GOAL_PROPOSAL_KIND_INVALID", rejected["error_code"])
+
+    def test_goal_proposal_projection_pages_without_rag_review(self) -> None:
+        self.server.store.register_project(self.registration())
+        proposals = []
+        for kind in ("IDEA", "HYPOTHESIS", "PRODUCT"):
+            candidate, _ = self.server.store.create_memory_candidate(
+                "GCS", {"stage": "SYNTHESIZE", "kind": kind,
+                        "summary": f"Project direction {kind}"})
+            proposals.append(candidate)
+        rag, _ = self.server.store.create_memory_candidate(
+            "GCS", {"stage": "FAST_EXTRACT", "kind": "MEMORY",
+                    "summary": "Operational procedure, not a proposal"})
+        first_status, first = self.request(
+            "GET", "/v1/projects/GCS/goal-proposals?limit=2&offset=0", None, self.token)
+        self.assertEqual(HTTPStatus.OK, first_status, first)
+        self.assertEqual(2, len(first["proposals"]))
+        self.assertTrue(first["has_more"])
+        second_status, second = self.request(
+            "GET", "/v1/projects/GCS/goal-proposals?limit=2&offset=2", None, self.token)
+        self.assertEqual(HTTPStatus.OK, second_status, second)
+        self.assertEqual(1, len(second["proposals"]))
+        self.assertFalse(second["has_more"])
+        ids = [item["candidate_id"] for item in first["proposals"] + second["proposals"]]
+        self.assertEqual({item["candidate_id"] for item in proposals}, set(ids))
+        self.assertNotIn(rag["candidate_id"], ids)
+        request = {"action_id": "goal.accept-proposal", "request": {
+            "project_id": "GCS", "candidate_id": proposals[0]["candidate_id"],
+            "expected_candidate_digest": proposals[0]["candidate_digest"]}}
+        status, accepted = self.request("POST", "/v1/actions", request, self.token)
+        self.assertEqual(HTTPStatus.OK, status, accepted)
+        after = self.server.store.list_goal_proposals("GCS", limit=2, offset=0)
+        matched = next(item for item in after["proposals"]
+                       if item["candidate_id"] == proposals[0]["candidate_id"])
+        self.assertEqual(accepted["goal"]["goal_id"], matched["goal_acceptance"]["goal_id"])
+        invalid_status, invalid = self.request(
+            "GET", "/v1/projects/GCS/goal-proposals?limit=0", None, self.token)
+        self.assertEqual(HTTPStatus.BAD_REQUEST, invalid_status, invalid)
+        self.assertEqual("GOAL_PROPOSAL_PAGE_INVALID", invalid["error_code"])
+
     def test_rag_adopt_requires_keep_review_and_is_digest_pinned(self) -> None:
         self.server.store.register_project(self.registration())
         candidate, created = self.server.store.create_memory_candidate(

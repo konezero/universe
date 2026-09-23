@@ -9,6 +9,16 @@ Current product baseline:
 Coding node kinds below describe the initial domain, not a closed universal set.
 Fleet displays work and planning; prediction display belongs only to Galaxy.
 
+Product-model clarification (2026-09-23): [Galaxy proposals and Fleet Goal
+nodes](galaxy-memory-fleet-goal-lifecycle.md) are distinct identities. Galaxy
+shows predictions; Fleet's work node is the finite Goal that owns or aggregates
+its Todos and links back to the relevant Galaxy proposal when one exists.
+Acceptance from Galaxy or the project's Memory menu creates that Goal; a
+completed Goal is not reopened for a later follow-up. The structural-node
+ownership, `FEATURE` taxonomy, and view table below describe the existing
+schema/partial implementation and must be reconciled rather than silently
+treated as the target Goal-node contract.
+
 Decision lineage:
 
 - RAG `universe-unified-node-graph-rag-model` (2026-09-01) — one typed node

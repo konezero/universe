@@ -1243,7 +1243,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn('async function adoptMemoryCandidate(candidate)', APP)
         self.assertIn('invokeServerAction("rag.adopt", {', APP)
         self.assertIn("expected_candidate_digest: candidate.candidate_digest", APP)
-        review_start = APP.index("function renderMemoryCandidateReview()")
+        review_start = APP.index("function renderMemoryCandidateReview(")
         review_end = APP.index("function renderMemory()", review_start)
         review = APP[review_start:review_end]
         self.assertIn("KEEP marks a candidate only", review)
@@ -1301,7 +1301,7 @@ class SessionObservatoryUiContractTests(unittest.TestCase):
         self.assertIn("RAG_DECISION_RECORDED", render)
 
     def test_memory_batch_run_uses_the_common_action_surface(self) -> None:
-        run_start = APP.index('const run = node("button", "primary-button compact-action", "Run stage")')
+        run_start = APP.index('const run = node("button", "primary-button compact-action", "지금 실행")')
         run_end = APP.index("actions.append(save, run);", run_start)
         run_slice = APP[run_start:run_end]
         self.assertIn('invokeServerAction("memory.batch.run", {', run_slice)

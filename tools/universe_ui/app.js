@@ -99,8 +99,14 @@ const state = {
   memoryBatchScheduler: null,
   memoryBatchRuns: [],
   memoryCandidates: [],
+  memoryCandidatesStatus: "UNKNOWN",
+  memoryCandidatesError: null,
+  goalProposals: null,
+  goalProposalsStatus: "UNKNOWN",
+  goalProposalsError: null,
+  memoryCandidateLimit: 50,
   memoryCandidateReviewOutcomes: {},
-  memoryCandidateFilters: { stage: "", kind: "", state: "REVIEW_REQUIRED" },
+  memoryCandidateFilters: { stage: "", kind: "", state: "ACTION_REQUIRED" },
   workLoop: null,
   selectedNode: null,
   focusedNodeId: null,
@@ -4597,23 +4603,53 @@ async function submitHomeNode(event) {
     errEl.textContent = "노드 설명을 입력하세요";
     return;
   }
-  // The API needs a title; the projection labels the node by intent anyway.
+  // Development Fleet nodes are Goals. Operations retains its existing
+  // Feature workflow until that separate board is migrated.
   const title = intent.length > 80 ? `${intent.slice(0, 79)}…` : intent;
   const submit = document.querySelector("#home-node-submit");
   submit.disabled = true;
   try {
-    const result = await invokeServerAction("feature.create", {
-      project_id: projectId,
-      feature: { idempotency_key: crypto.randomUUID(), title, intent_text: intent,
-        workstream_kind: state.homeWorkstreamKind || "DEVELOPMENT" },
-    });
+    let newNodeId;
+    if (state.homeWorkstreamKind === "OPERATIONS") {
+      const result = await invokeServerAction("feature.create", {
+        project_id: projectId,
+        feature: { idempotency_key: crypto.randomUUID(), title, intent_text: intent,
+          workstream_kind: "OPERATIONS" },
+      });
+      newNodeId = `feat:${result.feature?.feature_id || ""}`;
+      if (state.projectionsByProject) delete state.projectionsByProject[projectId];
+    } else {
+      const goalId = form.dataset.pendingGoalId || `goal_${crypto.randomUUID().replaceAll("-", "")}`;
+      form.dataset.pendingGoalId = goalId;
+      const goalBody = {
+        goal_id: goalId, title, description: intent, owner: "USER",
+        state: "READY", sort_order: (state.goals || []).length, scope_kind: "PROJECT",
+      };
+      let goal;
+      try {
+        const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/goals`, {
+          method: "POST", body: goalBody,
+        });
+        goal = result.goal;
+      } catch (error) {
+        // An uncertain response may follow a committed insert. Read the exact
+        // client-chosen ID; never create another Goal on a blind retry.
+        const read = await api(`/v1/goals/${encodeURIComponent(goalId)}`).catch(() => null);
+        if (read?.goal?.project_id !== projectId || read.goal.title !== title ||
+            read.goal.description !== intent) throw error;
+        goal = read.goal;
+      }
+      if (goal?.goal_id !== goalId || goal.project_id !== projectId) {
+        throw new Error("Goal response does not match this project and request");
+      }
+      delete form.dataset.pendingGoalId;
+      newNodeId = `goal:${goalId}`;
+    }
     document.querySelector("#home-node-dialog").close();
-    toast("노드를 만들었어요");
-    state.homeNodeId = `feat:${result.feature?.feature_id || ""}`;
+    toast("Goal work node recorded");
+    state.homeNodeId = newNodeId;
     state.homeTodoId = null;
-    // Drop the cached projection so the re-select grafts in the new node.
-    if (state.projectionsByProject) delete state.projectionsByProject[projectId];
-    await selectProject(projectId).catch(() => {});
+    await selectProject(projectId);
     renderIntegratedHome();
   } catch (error) {
     errEl.textContent = error.message;
@@ -4625,6 +4661,14 @@ async function submitHomeNode(event) {
 // + Todo 등록 — open the todo work map, create tab, scoped to the selected node.
 function openHomeAddTodo() {
   openTodoDialog(true);
+  const selected = homeSelectedNode();
+  if (String(selected?.kind || "").toUpperCase() === "FLEET_GOAL") {
+    state.homeGoalTodoDraftId = selected.goal_id;
+    elements.todoScope.value = "PROJECT";
+    renderTodoScopeControls();
+    elements.todoProject.value = state.selectedProject?.project_id || "";
+    return;
+  }
   const nodeRef = homeNodeRefKey(state.homeNodeId || "");
   if (nodeRef && elements.todoScope && elements.todoNode) {
     elements.todoScope.value = "NODE";
@@ -4858,8 +4902,8 @@ function renderFleetBoard() {
 // conversation ("#87a4bcc4"); titles alone are ambiguous or truncated.
 function homeNodeShortId(nodeId) {
   const ref = homeNodeRefKey(nodeId);
-  const hex = ref.replace(/^feature_/, "");
-  return hex ? `#${hex.slice(0, 8)}` : "";
+  const handle = ref.replace(/^(feature_|goal_)/, "");
+  return handle ? `#${handle.slice(0, 8)}` : "";
 }
 
 function homeNodeTitleWithId(graphNode) {
@@ -4870,7 +4914,8 @@ function homeNodeTitleWithId(graphNode) {
 
 function homeNodeRefKey(nodeId) {
   const id = String(nodeId || "");
-  return id.startsWith("feat:") ? id.slice(5) : id;
+  if (id.startsWith("feat:")) return id.slice(5);
+  return id.startsWith("goal:") ? id.slice(5) : id;
 }
 
 function homeAllTodos() {
@@ -4892,6 +4937,9 @@ function homeAllTodos() {
 // A node whose every attached Todo is DONE (and it has at least one) is a
 // completed Fleet item — the officially published DONE state, not a guess.
 function homeNodeFullyDone(graphNode) {
+  if (String(graphNode?.kind || "").toUpperCase() === "FLEET_GOAL") {
+    return String(graphNode.state || "").toUpperCase() === "DONE";
+  }
   const todos = homeNodeTodos(graphNode);
   return (
     todos.length > 0 &&
@@ -4940,14 +4988,46 @@ function isRegisteredFeatureNode(graphNode) {
 function homeNodes(workstreamKind = state.homeWorkstreamKind) {
   const graph = state.projection?.unified_graph?.nodes || [];
   const refs = new Set(homeAllTodos().map((t) => String(t.node_ref || "")).filter(Boolean));
+  const goals = state.goals || [];
   const seen = new Set();
   const out = [];
+  for (const goal of goals) {
+    if (!goal?.goal_id) continue;
+    const sourceFeature = goal.node_ref
+      ? (state.projectFeatures || []).find((feature) => feature.feature_id === goal.node_ref)
+      : null;
+    const sourceGraphNode = goal.node_ref
+      ? graph.find((item) => homeNodeRefKey(item.node_id) === goal.node_ref)
+      : null;
+    const source = sourceFeature || sourceGraphNode;
+    const workstream = goal.scope_kind === "PROJECT" ? "DEVELOPMENT"
+      : source ? (fleetNodeIsOperations(source) ? "OPERATIONS" : "DEVELOPMENT")
+      : "UNKNOWN";
+    if (workstream === "UNKNOWN" && workstreamKind === "OPERATIONS") continue;
+    if (workstream !== "UNKNOWN" && (workstream === "OPERATIONS") !== (workstreamKind === "OPERATIONS")) continue;
+    const id = `goal:${goal.goal_id}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      node_id: id, kind: "FLEET_GOAL", state: goal.state,
+      title: goal.title || goal.goal_id, goal_id: goal.goal_id,
+      source_node_ref: goal.node_ref || null,
+      source_proposal_candidate_id: goal.proposal_origin?.candidate_id || null,
+      workstream_kind: workstream,
+      data: { summary: goal.description || "" },
+    });
+  }
   for (const n of graph) {
     const id = String(n.node_id || "");
     const kind = String(n.kind || "").toUpperCase();
     if (!isRegisteredFeatureNode(n)) continue;
     if (fleetNodeIsOperations(n) !== (workstreamKind === "OPERATIONS")) continue;
-    const ownsTodos = refs.has(id) || refs.has(homeNodeRefKey(id));
+    const featureRef = homeNodeRefKey(id);
+    const legacyTodos = homeAllTodos().some((todo) =>
+      !todo.goal_id && String(todo.node_ref || "") === featureRef
+    );
+    if (goals.some((goal) => goal.node_ref === featureRef) && !legacyTodos) continue;
+    const ownsTodos = refs.has(id) || refs.has(featureRef);
     const knowledge = ["DOCUMENT", "DECISION", "MEMORY"].includes(kind);
     const runtime = ["SESSION", "TODO", "TASK_FRAME", "GOAL"].includes(kind);
     const proposed = String(n.state || "ADOPTED").toUpperCase() === "PROPOSED";
@@ -4993,9 +5073,13 @@ function homeVisibleNodeTodos(node) {
 // A todo belongs to a node when its node_ref names that node (features carry
 // the bare id; the graph node is "feat:<id>").
 function homeNodeOwnsTodo(node, todo) {
-  const ref = String(todo.node_ref || "");
+  const id = String(node?.node_id || "");
+  if (String(node?.kind || "").toUpperCase() === "FLEET_GOAL") {
+    return Boolean(todo?.goal_id) && String(todo.goal_id) === String(node.goal_id || id.slice(5));
+  }
+  if (todo?.goal_id) return false;
+  const ref = String(todo?.node_ref || "");
   if (!ref) return false;
-  const id = String(node.node_id || "");
   return id === ref || id === `feat:${ref}` || (id.startsWith("feat:") && id.slice(5) === ref);
 }
 
@@ -5333,6 +5417,85 @@ function renderIntegratedHome() {
   }
 }
 
+function renderOpsMemoryAutomation() {
+  const host = document.querySelector("#ops-memory-automation");
+  if (!host) return;
+  const projectId = state.selectedProject?.project_id;
+  host.replaceChildren(node("h2", "", "메모/RAG 예약 운영"));
+  if (!projectId) {
+    host.append(node("p", "empty-copy", "프로젝트를 먼저 선택해 주세요."));
+    return;
+  }
+  host.append(node("p", "context-copy", "정기 수집과 처리 상태입니다. 운영 RAG의 기존 수동 검토는 아래 레거시 진단에 보존했습니다."));
+  const content = node("div", "rag-overview", "예약 상태를 불러오는 중…");
+  host.append(content);
+  api(`/v1/projects/${encodeURIComponent(projectId)}/memory-batch-config`)
+    .then(automation => {
+      if (state.view !== "memory-ops" || state.selectedProject?.project_id !== projectId) return;
+      state.memoryBatchConfigs = automation.configs || [];
+      const scheduler = automation.scheduler || {};
+      content.replaceChildren(node("p", "rag-counts", "스케줄러 " + (scheduler.status || "UNKNOWN")));
+      for (const config of automation.configs || []) {
+        const schedule = (automation.schedules || []).find(item => item.stage === config.stage);
+        const card = node("article", "rag-stage-card");
+        const status = config.enabled === false ? "꺼짐" : schedule?.state || "수동 실행";
+        card.append(node("h3", "", RAG_STAGE_LABELS[config.stage] || config.stage), node("strong", "knowledge-badge", status));
+        if (schedule?.next_due_at) card.append(node("small", "", `다음 예약: ${new Date(schedule.next_due_at).toLocaleString("ko-KR")}`));
+        if (schedule?.last_outcome) card.append(node("small", "", "최근 결과: " + schedule.last_outcome));
+        if (schedule?.last_error_code) card.append(node("code", "rag-error-code", schedule.last_error_code));
+        card.append(node("small", "", memoryBatchExecutionLabel(config)));
+        const run = node("button", "secondary-button compact-action", "지금 실행");
+        run.disabled = config.enabled === false ||
+          memoryBatchExecutionLabel(config).startsWith("No supported") ||
+          (config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC" &&
+           !["READY", "ON_DEMAND"].includes(config.runtime_preparation?.status));
+        run.onclick = async () => {
+          run.disabled = true;
+          try {
+            await invokeServerAction("memory.batch.run", {project_id: projectId, stage: config.stage});
+            renderOpsMemoryAutomation();
+          } catch (error) {
+            card.append(node("p", "memory-action-error", error.message));
+            run.disabled = false;
+          }
+        };
+        card.append(run);
+        content.append(card);
+      }
+      const legacy = node("details", "detail-group ops-legacy-rag-review");
+      legacy.open = Boolean(state.opsRagReviewOpen);
+      legacy.addEventListener("toggle", () => { state.opsRagReviewOpen = legacy.open; });
+      legacy.append(node("summary", "", "Legacy RAG candidate review (migration pending)"));
+      legacy.append(node("p", "context-copy",
+        "현재 수동 KEEP/채택 경로를 보존한 진단 화면입니다. 자동 출처 검증·RAG 등록은 아직 구현되지 않았습니다."));
+      const reload = node("button", "secondary-button compact-action", "운영 후보 조회");
+      reload.type = "button";
+      const reviewHost = node("div", "ops-rag-review-host");
+      reload.onclick = async () => {
+        reload.disabled = true;
+        try {
+          const response = await api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?kind=MEMORY&limit=200`);
+          if (state.selectedProject?.project_id !== projectId) return;
+          state.memoryCandidates = (response.candidates || []).filter(
+            (candidate) => !memoryCandidateCanBecomeGoal(candidate));
+          state.opsRagReviewLoaded = true;
+          reviewHost.replaceChildren(renderMemoryCandidateReview(false));
+          reviewHost.append(node("p", "context-copy", "최근 운영 후보 최대 200건만 표시합니다."));
+        } catch (error) {
+          reviewHost.replaceChildren(node("p", "memory-action-error", error.message));
+        } finally {
+          reload.disabled = false;
+        }
+      };
+      legacy.append(reload, reviewHost);
+      if (state.opsRagReviewLoaded) reviewHost.replaceChildren(renderMemoryCandidateReview(false));
+      content.append(legacy);
+      const settings = renderMemoryBatchStages();
+      content.append(settings);
+    })
+    .catch(error => content.replaceChildren(node("p", "memory-action-error", error.message)));
+}
+
 function renderMemoryOpsView() {
   const view = document.querySelector("#memory-ops-view");
   const board = document.querySelector("#home-view");
@@ -5341,6 +5504,7 @@ function renderMemoryOpsView() {
   if (board.parentElement !== view) view.append(board);
   board.hidden = false;
   renderIntegratedHome();
+  renderOpsMemoryAutomation();
 }
 
 function showMemoryOpsView() {
@@ -7327,6 +7491,10 @@ function renderHomeNodes(selNode) {
     const rows = [];
     const desc = graphNode.data?.summary || graphNode.data?.note;
     if (desc) rows.push(node("div", "", desc));
+    if (graphNode.source_proposal_candidate_id) {
+      rows.push(node("div", "home-card-meta",
+        `Galaxy source: proposal:${graphNode.source_proposal_candidate_id}`));
+    }
 
     const statusRow = node("div", "home-card-meta");
     const kind = String(graphNode.kind || "").toUpperCase();
@@ -7914,7 +8082,7 @@ function restoreBenchPanel() {
 // active and parked back after.
 const PROJECT_SCREENS = {
   activity: { panelId: "activity-panel", title: "Activity", kicker: "Timeline", render: () => renderActivity() },
-  memory: { panelId: "memory-panel", title: "메모 · RAG", kicker: "자동화와 검토", render: () => renderMemory() },
+  memory: { panelId: "memory-panel", title: "메모 후보", kicker: "검토와 채택", render: () => renderMemory() },
   persona: { panelId: "persona-panel", title: "페르소나", kicker: "정의와 세션 배정", render: () => renderPersona() },
 };
 
@@ -8647,6 +8815,12 @@ async function selectProject(
   const project = state.projects.find((item) => item.project_id === projectId);
   if (!project) return;
   state.selectedProject = project;
+  state.memoryCandidates = [];
+  state.memoryCandidatesStatus = "LOADING";
+  state.memoryCandidatesError = null;
+  state.opsRagReviewLoaded = false;
+  state.opsRagReviewOpen = false;
+  void loadGalaxyGoalProposals(projectId);
   state.memoryCandidateReviewOutcomes = {};
   state.selectedNode = null;
   state.focusedNodeId = null;
@@ -8790,7 +8964,7 @@ async function selectProject(
       `/v1/projects/${encodeURIComponent(projectId)}/memory-candidates?limit=200`,
       {},
       5000
-    ).catch(() => ({ candidates: [] })),
+    ).catch((error) => ({ status: "ERROR", error: error.message })),
     api(
       `/v1/projects/${encodeURIComponent(projectId)}/feature-node-proposals`
     ).catch(() => ({ proposals: [] })),
@@ -8812,6 +8986,15 @@ async function selectProject(
       5000
     ).catch(() => ({ nodes: [], edges: [], invariants: { projection_only: true } })),
   ]);
+  if (state.selectedProject?.project_id !== projectId) return;
+  const loadedDispatches = await Promise.all(
+    dispatchResult.dispatches.map((item) =>
+      api(
+        `/v1/dispatches/${encodeURIComponent(item.dispatch.dispatch_id)}`
+      ).catch(() => item)
+    )
+  );
+  if (state.selectedProject?.project_id !== projectId) return;
   state.projection = projectionResult?.projection || null;
   if (state.projection) {
     state.projectionsByProject = {
@@ -8819,13 +9002,7 @@ async function selectProject(
       [projectId]: state.projection,
     };
   }
-  state.dispatches = await Promise.all(
-    dispatchResult.dispatches.map((item) =>
-      api(
-        `/v1/dispatches/${encodeURIComponent(item.dispatch.dispatch_id)}`
-      ).catch(() => item)
-    )
-  );
+  state.dispatches = loadedDispatches;
   state.releaseProposals = proposalResult.proposals;
   state.roomMessages = dedupeRoomMessages(roomResult.messages);
   state.masterBridge = bridgeResult.bridge || null;
@@ -8848,11 +9025,16 @@ async function selectProject(
   state.memoryBatchSchedules = memoryBatchConfigResult.schedules || [];
   state.memoryBatchScheduler = memoryBatchConfigResult.scheduler || null;
   state.memoryBatchRuns = memoryBatchRunResult.runs || [];
-  state.memoryCandidates = memoryCandidateResult.candidates || [];
+  state.memoryCandidatesStatus = memoryCandidateResult.status === "ERROR" ? "ERROR" : "READY";
+  state.memoryCandidatesError = memoryCandidateResult.error || null;
+  if (!state.opsRagReviewLoaded) {
+    state.memoryCandidates = memoryCandidateResult.candidates || [];
+  }
   state.featureNodeProposals = featureProposalResult.proposals || [];
   state.workLoop = workLoopResult || null;
   state.semanticGraph = semanticGraphResult || null;
   await personaProjectionPromise;
+  if (state.selectedProject?.project_id !== projectId) return;
   const universeGoalResult = await fastUniverseGoalResultPromise;
   const goalPlanResult = await fastGoalPlanResultPromise;
   state.goals = goalPlanResult.goals || [];
@@ -8864,6 +9046,7 @@ async function selectProject(
       return [goal.goal_id, surface];
     })
   );
+  if (state.selectedProject?.project_id !== projectId) return;
   state.goalAutomationSurfaces = Object.fromEntries(
     automationEntries.filter(([, surface]) => surface)
   );
@@ -13575,6 +13758,7 @@ const UNIFIED_KIND_STYLE = {
   DOCUMENT: { kind: "goal", depth: 5 },
   DECISION: { kind: "goal", depth: 5 },
   MEMORY: { kind: "related", depth: 6 },
+  PROPOSAL: { kind: "predicted", depth: 3 },
 };
 
 // Which unified view drives the Galaxy render.
@@ -13618,6 +13802,70 @@ function renderGalaxyViewSwitch(active, available) {
   }
 }
 
+async function loadGalaxyGoalProposals(projectId) {
+  const loadRevision = (state.goalProposalLoadRevision || 0) + 1;
+  state.goalProposalLoadRevision = loadRevision;
+  state.goalProposals = null;
+  state.goalProposalsStatus = "LOADING";
+  const proposals = [];
+  const seen = new Set();
+  let offset = 0;
+  try {
+    for (let pageIndex = 0; pageIndex < 50; pageIndex += 1) {
+      const page = await api(`/v1/projects/${encodeURIComponent(projectId)}/goal-proposals?limit=200&offset=${offset}`);
+      if (page.project_id !== projectId || page.offset !== offset || !Array.isArray(page.proposals)) {
+        throw new Error("Goal proposal page identity mismatch");
+      }
+      for (const proposal of page.proposals) {
+        if (proposal.project_id !== projectId || !proposal.candidate_id || seen.has(proposal.candidate_id)) {
+          throw new Error("Goal proposal page contains a foreign or duplicate candidate");
+        }
+        seen.add(proposal.candidate_id);
+        proposals.push(proposal);
+      }
+      if (!page.has_more) {
+        if (state.selectedProject?.project_id !== projectId ||
+            state.goalProposalLoadRevision !== loadRevision) return;
+        state.goalProposals = proposals;
+        state.goalProposalsStatus = "READY";
+        if (state.view === "semantic") buildGraph();
+        if (elements.memoryPanel && !elements.memoryPanel.classList.contains("hidden")) renderMemory();
+        return;
+      }
+      if (page.next_offset !== offset + page.proposals.length || !page.proposals.length) {
+        throw new Error("Goal proposal pagination did not advance");
+      }
+      offset = page.next_offset;
+    }
+    throw new Error("Goal proposal page limit reached; projection is incomplete");
+  } catch (error) {
+    if (state.selectedProject?.project_id !== projectId ||
+        state.goalProposalLoadRevision !== loadRevision) return;
+    state.goalProposals = null;
+    state.goalProposalsStatus = "ERROR";
+    state.goalProposalsError = error.message;
+    if (state.view === "semantic") buildGraph();
+    if (elements.memoryPanel && !elements.memoryPanel.classList.contains("hidden")) renderMemory();
+  }
+}
+
+function galaxyProposalGraphNodes(projectId, candidates) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => {
+      if (!candidate?.candidate_id || candidate.project_id !== projectId) return false;
+      const kind = String(candidate.kind || "").toUpperCase();
+      const knowledgeKind = String(candidate.knowledge?.kind || "").toUpperCase();
+      return ["IDEA", "HYPOTHESIS", "PRODUCT"].includes(kind) || knowledgeKind === "USER_IDEA";
+    })
+    .map((candidate) => ({
+      node_id: `proposal:${candidate.candidate_id}`,
+      kind: "PROPOSAL",
+      title: String(candidate.knowledge?.topic || candidate.summary || candidate.candidate_id),
+      state: candidate.state,
+      data: {candidate},
+    }));
+}
+
 function buildUnifiedGalaxyGraph() {
   const unified = state.projection?.unified_graph;
   if (!unified || !Array.isArray(unified.nodes) || !unified.nodes.length) {
@@ -13633,6 +13881,11 @@ function buildUnifiedGalaxyGraph() {
   // Galaxy remains the full relationship projection.  Registration filtering
   // applies only to Fleet/Ops work boards, not this topology view.
   let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+  if (["galaxy", "knowledge"].includes(viewName)) {
+    nodes = nodes.concat(galaxyProposalGraphNodes(
+      state.selectedProject?.project_id, state.goalProposals));
+  }
+  const totalNodeCount = nodes.length;
 
   // Focus: n-hop neighbourhood around a clicked planet.
   const focusId = state.galaxyFocus;
@@ -13703,7 +13956,7 @@ function buildUnifiedGalaxyGraph() {
     .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e }));
   renderLiveSessionProjectionSurfaces();
 
-  const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
+  const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "PROPOSAL", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
   setGraphLegend(
     legendOrder
       .filter((k) => kindsPresent.has(k))
@@ -13721,7 +13974,9 @@ function buildUnifiedGalaxyGraph() {
       : "";
     elements.graphHint.textContent =
       `Galaxy · ${state.selectedProject?.project_id || "universe"} · ${viewName} view · ` +
-      `${graphNodes.length}/${unified.nodes.length} nodes${graftText}${focusText} · projection only`;
+      `${graphNodes.length}/${totalNodeCount} nodes${graftText}${focusText} · ` +
+      `proposals ${state.goalProposalsStatus === "READY" ? state.goalProposals.length : state.goalProposalsStatus}` +
+      `${state.goalProposalsStatus === "ERROR" ? ` (${state.goalProposalsError})` : ""} · projection only`;
   }
   fitGraphView();
   startGalaxyShipLoop();
@@ -14970,6 +15225,53 @@ function renderGalaxyNodeCard(graphNode) {
   head.append(close);
   card.append(head);
 
+  if (graphNode.unifiedKind === "PROPOSAL") {
+    const candidate = graphNode.data?.data?.candidate;
+    if (!candidate) return;
+    const summary = node("p", "galaxy-proposal-summary", candidate.summary || "");
+    card.append(summary);
+    const facts = node("dl", "galaxy-node-card-facts");
+    facts.append(node("dt", "", "Decision"), node("dd", "", candidate.state || "REVIEW_REQUIRED"));
+    facts.append(node("dt", "", "Source"), node("dd", "", candidate.candidate_id));
+    card.append(facts);
+    const actions = node("div", "galaxy-node-card-actions");
+    if (candidate.goal_acceptance?.goal_id) {
+      const goalId = candidate.goal_acceptance.goal_id;
+      const openGoal = node("button", "primary-button", `Fleet Goal ${goalId}`);
+      openGoal.type = "button";
+      openGoal.addEventListener("click", () => {
+        state.homeWorkstreamKind = "DEVELOPMENT";
+        state.homeNodeId = `goal:${goalId}`;
+        state.homeTodoId = null;
+        setGoalPlanLayout();
+        showGoalPlanView();
+      });
+      actions.append(openGoal);
+    } else if (memoryCandidateCanBecomeGoal(candidate)) {
+      const accept = node("button", "primary-button", "Accept as Fleet Goal");
+      accept.type = "button";
+      accept.addEventListener("click", async () => {
+        accept.disabled = true;
+        try {
+          const result = await acceptGoalCandidate(candidate);
+          const acceptance = {goal_id: result.goal.goal_id,
+            candidate_digest: candidate.candidate_digest};
+          state.memoryCandidates = (state.memoryCandidates || []).map((item) =>
+            item.candidate_id === candidate.candidate_id
+              ? {...item, goal_acceptance: acceptance} : item);
+          buildGraph();
+          renderGalaxyNodeCard(state.graph.nodes.find((item) => item.id === graphNode.id));
+          toast(`Fleet Goal ${result.goal.goal_id} recorded`);
+        } catch (error) {
+          accept.disabled = false;
+          toast(error.message, true);
+        }
+      });
+      actions.append(accept);
+    }
+    card.append(actions);
+    return;
+  }
   const work = featureWorkProjection(graphNode);
   const bareRef = graphNode.id?.startsWith("feat:") ? graphNode.id.slice(5) : graphNode.id;
   const todos = homeAllTodos().filter(
@@ -15478,7 +15780,8 @@ function relatedKnowledgeForNode(item, knowledge) {
     ? memory.memory_id === memoryId
     : project ? !memory.node_ref : ids.has(memory.node_ref)));
   const candidates = knowledge.candidates.filter(candidate => {
-    if (candidate.kind !== "MEMORY" || ["IGNORE", "SUPERSEDED"].includes(candidate.state)) return false;
+    if (candidate.kind !== "MEMORY" && !memoryCandidateCanBecomeGoal(candidate)) return false;
+    if (["IGNORE", "SUPERSEDED"].includes(candidate.state)) return false;
     const adopted = adoptedMemoryForCandidate(candidate, knowledge.memories);
     if (adopted) return false; // Canonical memory is the single displayed item after adoption.
     const nodeRef = candidate.node_ref;
@@ -15643,6 +15946,15 @@ async function openHoverMemory(projectId, initial, isCandidate) {
         const button = node("button", "secondary-button compact-action", ({KEEP: "채택 대상으로 확인", IGNORE: "무시", START_PRODUCT_DESIGN: "계획으로 검토"})[action.id]);
         button.onclick = () => run(button, () => api(`/v1/projects/${encodeURIComponent(projectId)}/memory-candidates/review`, { method: "POST", body: memoryCandidateReviewPayload(candidate, action) }));
         actions.append(button);
+      }
+      if (memoryCandidateCanBecomeGoal(candidate)) {
+        if (candidate.goal_acceptance?.goal_id) {
+          actions.append(node("span", "memory-candidate-state", `Fleet Goal: ${candidate.goal_acceptance.goal_id}`));
+        } else {
+          const accept = node("button", "primary-button compact-action", "Goal로 수용");
+          accept.onclick = () => run(accept, () => acceptGoalCandidate(candidate));
+          actions.append(accept);
+        }
       }
       if (memoryCandidateNextAction(candidate).kind === "RAG_ADOPT_AVAILABLE" && candidate.kind === "MEMORY" && candidate.state === "KEEP") {
         const button = node("button", "primary-button compact-action", "RAG에 채택");
@@ -16038,10 +16350,8 @@ function featureProposalEvidenceItems(proposal) {
     (state.memories || []).map((memory) => [memory.memory_id, memory])
   );
   const candidatesById = new Map(
-    (state.memoryCandidates || []).map((candidate) => [
-      candidate.candidate_id,
-      candidate,
-    ])
+    [...(state.goalProposals || []), ...(state.memoryCandidates || [])]
+      .map((candidate) => [candidate.candidate_id, candidate])
   );
   return (proposal.evidence_refs || []).map((evidenceRef) => {
     const evidenceId = String(evidenceRef || "").split("/").filter(Boolean).pop() || "";
@@ -16108,6 +16418,19 @@ function featureProposalEvidenceItems(proposal) {
         kind: "Work Loop prediction",
         title: `${predId}#${sugIdx}`,
         meta: "Kept prediction",
+        detail: String(evidenceRef),
+        hasSourceBody: false,
+      };
+    }
+    if (String(evidenceRef || "").includes("/memory-candidates/")) {
+      return {
+        kind: "Memory candidate",
+        title: evidenceId || "Unknown candidate",
+        meta: state.memoryCandidatesStatus === "ERROR"
+          ? "UNKNOWN · candidate lookup failed"
+          : state.memoryCandidatesStatus === "READY"
+            ? "UNKNOWN · outside loaded candidate page"
+            : "UNKNOWN · candidate lookup pending",
         detail: String(evidenceRef),
         hasSourceBody: false,
       };
@@ -17181,6 +17504,7 @@ function prefillTodoScope() {
 
 function openTodoDialog(prefill = false) {
   state.todoDraftSourceKind = "USER";
+  state.homeGoalTodoDraftId = null;
   elements.todoFormError.textContent = "";
   if (prefill) prefillTodoScope();
   else renderTodoScopeControls();
@@ -18001,8 +18325,13 @@ async function submitTodo(event) {
   if (scopeKind === "NODE") {
     body.node_ref = elements.todoNode.value;
   }
+  if (scopeKind === "PROJECT" && state.homeGoalTodoDraftId &&
+      body.project_id === state.selectedProject?.project_id) {
+    body.goal_id = state.homeGoalTodoDraftId;
+  }
   try {
     const result = await invokeServerAction("todo.create", { todo: body });
+    state.homeGoalTodoDraftId = null;
     state.todos = [result.todo, ...state.todos];
     elements.todoTitle.value = "";
     elements.todoDetail.value = "";
@@ -18013,6 +18342,7 @@ async function submitTodo(event) {
     drawGraph();
     setTodoTab("board");
     toast("Todo recorded");
+    void refreshGoalPlan().catch((error) => toast(error.message, true));
   } catch (error) {
     elements.todoFormError.textContent = error.message;
   }
@@ -19478,6 +19808,14 @@ function memoryBatchField(label, control) {
   return wrapper;
 }
 
+function memoryBatchExecutionLabel(config) {
+  if (config?.fallback === "DETERMINISTIC") return "Deterministic · model not invoked";
+  if (config?.stage === "FAST_EXTRACT" && config?.provider === "CODEX" &&
+      config?.model_ref === "gpt-5.6-luna" && config?.effort === "MAX" &&
+      config?.fallback === "NONE") return "Provider-backed FAST_EXTRACT";
+  return "No supported provider executor for this stage";
+}
+
 function renderMemoryBatchStages() {
   const group = node("details", "detail-group memory-batch-config");
   const summary = node("summary", "", "자동화 상세 설정");
@@ -19504,7 +19842,8 @@ function renderMemoryBatchStages() {
     const status = config.resolution?.status || "UNRESOLVED";
     heading.append(
       node("strong", "", RAG_STAGE_LABELS[config.stage] || config.stage),
-      node("span", `memory-batch-status status-${String(status).toLowerCase()}`, status)
+      node("span", `memory-batch-status status-${String(status).toLowerCase()}`, status),
+      node("span", "memory-batch-status", memoryBatchExecutionLabel(config))
     );
     row.append(heading);
 
@@ -19600,7 +19939,8 @@ function renderMemoryBatchStages() {
         state.memoryBatchConfigs = state.memoryBatchConfigs.map((item) =>
           item.stage === config.stage ? result.config : item
         );
-        renderMemory();
+        if (state.view === "memory-ops") renderOpsMemoryAutomation();
+        else renderMemory();
         toast(`${config.stage} configuration saved`);
       } catch (error) {
         toast(error.message, true);
@@ -19608,7 +19948,10 @@ function renderMemoryBatchStages() {
     });
     const run = node("button", "primary-button compact-action", "지금 실행");
     run.type = "button";
-    run.disabled = config.enabled === false || (config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC");
+    run.disabled = config.enabled === false ||
+      memoryBatchExecutionLabel(config).startsWith("No supported") ||
+      (config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC" &&
+       !["READY", "ON_DEMAND"].includes(config.runtime_preparation?.status));
     run.addEventListener("click", async () => {
       try {
         const result = await invokeServerAction("memory.batch.run", {
@@ -19616,13 +19959,10 @@ function renderMemoryBatchStages() {
           stage: config.stage,
         });
         state.memoryBatchRuns = [result.run, ...state.memoryBatchRuns];
-        const candidates = await api(
-          `/v1/projects/${encodeURIComponent(
-            state.selectedProject.project_id
-          )}/memory-candidates?limit=200`
-        );
-        state.memoryCandidates = candidates.candidates || [];
-        renderMemory();
+        state.opsRagReviewLoaded = false;
+        void loadGalaxyGoalProposals(state.selectedProject.project_id);
+        if (state.view === "memory-ops") renderOpsMemoryAutomation();
+        else renderMemory();
         toast(`${config.stage} completed`);
       } catch (error) {
         toast(error.message, true);
@@ -19633,6 +19973,11 @@ function renderMemoryBatchStages() {
     group.append(row);
   }
   return group;
+}
+
+function refreshMemoryCandidateReviewSurface() {
+  if (state.view === "memory-ops") renderOpsMemoryAutomation();
+  else renderMemory();
 }
 
 async function adoptMemoryCandidate(candidate) {
@@ -19656,7 +20001,7 @@ async function adoptMemoryCandidate(candidate) {
         ),
       ];
     }
-    renderMemory();
+    refreshMemoryCandidateReviewSurface();
     toast(
       result.status === "RAG_MEMORY_ADOPTED"
         ? "Candidate adopted to RAG"
@@ -19760,6 +20105,37 @@ function memoryCandidateDecisionContract(candidate) {
     !Array.isArray(candidate.decision_contract)
     ? candidate.decision_contract
     : {};
+}
+
+function memoryCandidateCanBecomeGoal(candidate) {
+  const kind = String(candidate?.kind || "").toUpperCase();
+  const knowledgeKind = String(candidate?.knowledge?.kind || "").toUpperCase();
+  return (["IDEA", "HYPOTHESIS", "PRODUCT"].includes(kind) || knowledgeKind === "USER_IDEA") &&
+    !["IGNORE", "SUPERSEDED", "CONFLICTED"].includes(String(candidate?.state || "").toUpperCase());
+}
+
+async function acceptGoalCandidate(candidate) {
+  const projectId = String(candidate?.project_id || state.selectedProject?.project_id || "");
+  if (!projectId || !candidate?.candidate_id || !candidate?.candidate_digest) {
+    throw new Error("Goal proposal identity is incomplete");
+  }
+  const result = await invokeServerAction("goal.accept-proposal", {
+    project_id: projectId,
+    candidate_id: candidate.candidate_id,
+    expected_candidate_digest: candidate.candidate_digest,
+  });
+  if (result?.goal?.project_id !== projectId || !result?.goal?.goal_id) {
+    throw new Error("Goal acceptance response does not match this project");
+  }
+  if (state.goalProposalsStatus === "READY") {
+    state.goalProposals = state.goalProposals.map((item) =>
+      item.candidate_id === candidate.candidate_id
+        ? {...item, goal_acceptance: {goal_id: result.goal.goal_id,
+            candidate_digest: candidate.candidate_digest}} : item);
+  }
+  // A failed refresh never turns a committed acceptance into a failed action.
+  void refreshGoalPlan().catch(() => {});
+  return result;
 }
 
 function memoryCandidateActionSpecs(candidate) {
@@ -19931,7 +20307,7 @@ function renderMemoryCandidateReopenAction(card, candidate) {
           "REOPENED"
         ),
       };
-      renderMemory();
+      refreshMemoryCandidateReviewSurface();
       toast("Candidate reopened for review");
     } catch (error) {
       toast(error.message, true);
@@ -20031,7 +20407,7 @@ function renderMemoryCandidateCard(candidate) {
             ...(state.memoryCandidateReviewOutcomes || {}),
             [candidate.candidate_id]: outcomeResult,
           };
-          renderMemory();
+          refreshMemoryCandidateReviewSurface();
           const nextKind = outcomeResult.next_action?.kind || "NONE";
           toast(`Candidate ${action.label.toLowerCase()} · next ${nextKind}`);
         } catch (error) {
@@ -20043,6 +20419,35 @@ function renderMemoryCandidateCard(candidate) {
       actionWrap.append(button);
     }
     card.append(actionWrap);
+  }
+  if (memoryCandidateCanBecomeGoal(candidate)) {
+    const actions = node("div", "memory-candidate-actions");
+    if (candidate.goal_acceptance?.goal_id) {
+      actions.append(node("span", "memory-candidate-state", `Fleet Goal: ${candidate.goal_acceptance.goal_id}`));
+    } else {
+      const accept = node("button", "primary-button compact-action", "Goal로 수용");
+      accept.type = "button";
+      accept.addEventListener("click", async () => {
+        accept.disabled = true;
+        try {
+          const result = await acceptGoalCandidate(candidate);
+          state.memoryCandidates = state.memoryCandidates.map((item) =>
+            item.candidate_id === candidate.candidate_id
+              ? {...item, goal_acceptance: {
+                  goal_id: result.goal.goal_id,
+                  candidate_digest: candidate.candidate_digest,
+                }} : item
+          );
+          renderMemory();
+          toast(`Fleet Goal ${result.goal.goal_id} recorded`);
+        } catch (error) {
+          toast(error.message, true);
+          accept.disabled = false;
+        }
+      });
+      actions.append(accept);
+    }
+    card.append(actions);
   }
   const disabledActions = memoryCandidateDisabledActions(candidate);
   if (disabledActions.length) {
@@ -20072,7 +20477,7 @@ function renderMemoryCandidateCard(candidate) {
   return card;
 }
 
-function renderMemoryCandidateReview() {
+function renderMemoryCandidateReview(showNextWork = true) {
   const group = node("div", "detail-group memory-candidate-review");
   group.append(
     node("h3", "", "Candidate review"),
@@ -20086,7 +20491,7 @@ function renderMemoryCandidateReview() {
   const filterOptions = [
     ["stage", "Stage", ["", "FAST_EXTRACT", "CONSOLIDATE", "SYNTHESIZE", "INDEPENDENT_CHECK"]],
     ["kind", "Kind", ["", "MEMORY", "IDEA", "HYPOTHESIS", "PRODUCT"]],
-    ["state", "State", ["", "REVIEW_REQUIRED", "KEEP", "IGNORE", "EXPLORE", "START_PRODUCT_DESIGN", "SUPERSEDED", "CONFLICTED"]],
+    ["state", "State", ["", "ACTION_REQUIRED", "REVIEW_REQUIRED", "KEEP", "IGNORE", "EXPLORE", "START_PRODUCT_DESIGN", "SUPERSEDED", "CONFLICTED"]],
   ];
   for (const [key, label, options] of filterOptions) {
     const select = document.createElement("select");
@@ -20099,7 +20504,7 @@ function renderMemoryCandidateReview() {
     filters.append(memoryBatchField(label, select));
   }
   group.append(filters);
-  group.append(renderReviewInboxNextWork());
+  if (showNextWork) group.append(renderReviewInboxNextWork());
 
   const outcomes = Object.values(state.memoryCandidateReviewOutcomes || {}).filter(Boolean);
   if (outcomes.length) {
@@ -20116,11 +20521,15 @@ function renderMemoryCandidateReview() {
   }
 
   const filtersState = state.memoryCandidateFilters;
-  const candidates = (state.memoryCandidates || []).filter((candidate) =>
-    (!filtersState.stage || candidate.stage === filtersState.stage) &&
-    (!filtersState.kind || candidate.kind === filtersState.kind) &&
-    (!filtersState.state || candidate.state === filtersState.state)
-  );
+  const candidates = (state.memoryCandidates || []).filter((candidate) => {
+    const actionable = candidate.state === "REVIEW_REQUIRED" ||
+      (candidate.kind === "MEMORY" && candidate.state === "KEEP" &&
+       memoryCandidateNextAction(candidate).kind === "RAG_ADOPT_AVAILABLE");
+    return (!filtersState.stage || candidate.stage === filtersState.stage) &&
+      (!filtersState.kind || candidate.kind === filtersState.kind) &&
+      (!filtersState.state || (filtersState.state === "ACTION_REQUIRED"
+        ? actionable : candidate.state === filtersState.state));
+  });
   if (!candidates.length) {
     group.append(node("p", "empty-copy", "No candidates match the current filters"));
     return group;
@@ -20337,285 +20746,76 @@ function renderMemoryRelateEditor(item, memoryById, projectId, onSaved) {
   return wrap;
 }
 
-function ragTopicFor(item) {
-  const explicit = String(item.knowledge?.topic || "").normalize("NFC").trim().replace(/\s+/g, " ");
-  if (explicit) return {name: explicit, inferred: false};
-  const text = String(item.summary || item.title || "") + " " + String(item.body || "");
-  // Legacy records have no authored topic. These are navigation suggestions,
-  // never a semantic merge, source assessment, or ownership reassignment.
-  const hints = [
-    ["RAG · 메모 · 지식 정리", /\bRAG\b|메모|memory|브레인스토밍/i],
-    ["프로젝트 · 목표 · 노드 · 작업", /Fleet|Galaxy|칸반|노드|TODO|goal|kanban|프로젝트 생성|범용|비전/i],
-    ["배포 · 설치 · 정본 관리", /release|canonical|릴리즈|릴리스|설치|배포|정본|이관/i],
-    ["세션 · 메시지 · 터미널", /세션|session|terminal|터미널|PTY|inbox|메일박스|메시지|message|provider/i],
-    ["운영 절차 · 권한 · 검증", /절차|권한|승인|검증|receipt|guard|authority|assignment|anchor/i],
-  ];
-  return {name: hints.find(([, pattern]) => pattern.test(text))?.[0] || "주제 분류 필요", inferred: true};
-}
-
-function groupRagKnowledgeTopics(candidates, memories) {
-  const topics = new Map();
-  const entries = [...candidates.map(item => ({item, candidate: true})), ...memories.map(item => ({item, candidate: false}))];
-  const created = item => {const n = Date.parse(item.created_at || ""); return Number.isFinite(n) ? n : 0;};
-  const id = entry => String(entry.item.candidate_id || entry.item.memory_id || "");
-  for (const entry of entries) {
-    const {item, candidate} = entry;
-    if (!candidate && item.retention?.decision === "IGNORE") continue;
-    if (candidate && (["IGNORE", "SUPERSEDED"].includes(item.state) || item.source_review?.bucket === "archive")) continue;
-    const topic = ragTopicFor(item);
-    const key = JSON.stringify([item.project_id || "", topic.name.toLocaleLowerCase("ko-KR")]);
-    if (!topics.has(key)) topics.set(key, {name: topic.name, inferred: topic.inferred, entries: []});
-    const group = topics.get(key); group.inferred ||= topic.inferred; group.entries.push(entry);
-  }
-  return [...topics.values()].map(topic => {
-    topic.entries.sort((a, b) => created(b.item) - created(a.item) || id(a).localeCompare(id(b)));
-    const claims = new Map();
-    for (const entry of topic.entries) {
-      const text = String(entry.item.summary || entry.item.body || entry.item.title || "").normalize("NFC").trim().replace(/\s+/g, " ");
-      const key = text || id(entry);
-      if (!claims.has(key)) claims.set(key, {text, entries: []});
-      claims.get(key).entries.push(entry);
-    }
-    const hasConflict = topic.entries.some(({item}) => item.state === "CONFLICTED" || (item.relations || []).some(r => r.relation === "CONFLICTS_WITH"));
-    // Collection time only orders the history. It cannot select canonical truth.
-    const verified = topic.entries.filter(({item, candidate}) => candidate && item.source_review?.bucket === "current");
-    return {...topic, claims: [...claims.values()], verified, hasConflict, recent: topic.entries[0]};
-  }).sort((a, b) => Number(b.hasConflict) - Number(a.hasConflict) || a.name.localeCompare(b.name, "ko-KR"));
-}
-
-function ragChangedInWindow(item, start, end) {
-  return [item.created_at, item.updated_at, item.retention?.recorded_at].some(value => {
-    const time = typeof value === "string" && value.trim() ? Date.parse(value) : NaN;
-    return Number.isFinite(time) && time >= start && time <= end;
-  });
-}
-
-function summarizeRagDay(knowledge, now = new Date()) {
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const end = now.getTime();
-  const isNew = item => ragChangedInWindow({created_at: item.created_at}, start, end);
-  const candidates = knowledge.candidates || [];
-  const memories = knowledge.memories || [];
-  const changedCandidates = candidates.filter(item => ragChangedInWindow(item, start, end));
-  return {start, end,
-    newCandidates: candidates.filter(isNew).length,
-    updatedCandidates: changedCandidates.filter(item => !isNew(item)).length,
-    newMemories: memories.filter(isNew).length,
-    updatedMemories: memories.filter(item => !isNew(item) && ragChangedInWindow(item, start, end)).length,
-    unknownDates: [...candidates, ...memories].filter(item => ![item.created_at, item.updated_at].some(value => typeof value === "string" && value.trim() && Number.isFinite(Date.parse(value)))).length,
-    changedCandidates,
-  };
-}
-
 function renderMemory() {
   if (!elements.memoryPanel) return;
-  const generation = ++ragScreenGeneration;
-  const projectId = state.selectedProject?.project_id;
   const panel = elements.memoryPanel;
-  panel.replaceChildren(node("h2", "", "RAG 메모 자동화"));
-  if (!projectId) { panel.append(node("p", "", "프로젝트를 먼저 선택해 주세요.")); return; }
-  panel.append(node("p", "context-copy", "후보 수집부터 정리까지 진행 상태를 확인하세요. 검토·RAG 채택·노드 연결 확정은 각각 직접 결정합니다."));
-  const progress = node("div", "rag-overview", "현재 상태를 불러오는 중…");
-  const lists = node("div", "rag-lists");
-  const refreshButton = node("button", "secondary-button compact-action", "새로고침");
-  refreshButton.onclick = () => renderMemory();
-  const suggest = node("button", "secondary-button compact-action", "연결 제안 만들기");
-  suggest.onclick = async () => {
-    suggest.disabled = true;
-    try {
-      const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/memories/maintain`, {method: "POST", body: {apply_proposals: true, limit: 200, per_memory: 1}});
-      toast(`연결 제안 ${result.applied_count || 0}개를 갱신했습니다. 확정은 메모에서 진행하세요.`);
-      if (state.selectedProject?.project_id === projectId) renderMemory();
-    } catch (error) { toast(error.message, true); suggest.disabled = false; }
-  };
-  panel.append(node("p", "context-copy", "소스 대조는 AI가 현재 구현과 열린 TODO를 확인합니다. 한 번에 최대 4개씩 검토하며, 기존 예약 품질 점검은 형식 검사입니다."));
-  const compare = node("button", "primary-button compact-action", "소스 대조 진행 (최대 4개)");
-  compare.onclick = async () => {
-    compare.disabled = true;
-    compare.textContent = "현재 소스와 대조 중…";
-    try {
-      const result = await api(`/v1/projects/${encodeURIComponent(projectId)}/memory-source-review`, {method: "POST", body: {}});
-      toast(result.candidates?.length ? result.candidates.length + "개 대조 완료" : "이번에 대조할 항목이 없습니다.");
-      hoverKnowledgeCache.delete(projectId);
-      if (state.selectedProject?.project_id === projectId) renderMemory();
-    } catch (error) { toast(error.message, true); compare.disabled = false; compare.textContent = "소스 대조 다시 시도"; }
-  };
-  panel.append(refreshButton, compare, suggest, progress, lists);
-  Promise.all([
-    api(`/v1/projects/${encodeURIComponent(projectId)}/memory-batch-config`),
-    loadHoverKnowledge(projectId, true),
-  ]).then(([automation, knowledge]) => {
-    if (generation !== ragScreenGeneration || state.selectedProject?.project_id !== projectId) return;
-    state.memoryBatchConfigs = automation.configs || [];
-    progress.replaceChildren();
-    const collection = automation.source_collection?.selection;
-    if (collection) {
-      progress.append(node("p", "rag-counts", "최근 수집 " + collection.selected_count + "개 · 다음 배치 " + collection.deferred_count + "개 · 제외 " + collection.skipped_count + "개"));
-      if (collection.activity_resume) progress.append(node("p", "rag-counts", collection.activity_resume.semantic_page
-        ? "긴 메시지 나눠 수집 중 · " + collection.activity_resume.semantic_page.start + "개 본문 조각까지 처리, 다음 배치에서 계속합니다."
-        : "대용량 소스 이어 수집 중 · 활동 " + collection.activity_resume.after.ordinal + "번까지 처리, 다음 배치에서 계속합니다."));
-      if (automation.source_maintenance || collection.source_maintenance) {
-        const sources = (automation.source_maintenance || collection.source_maintenance).sources || [];
-        const history = sources.filter(item => item.history?.state === "PENDING").length;
-        const blocked = sources.filter(item => item.status !== "ACTIVE" || item.history?.state === "BLOCKED").length;
-        const added = sources.reduce((count, item) => count + (item.history?.added || 0), 0);
-        progress.append(node("p", "rag-counts", "최근 원본 점검 " + sources.length + "개 · 과거 활동 추가 " + added + "개 · 과거 수집 진행 " + history + "개 · 확인 필요 " + blocked + "개"));
-        if (blocked) {
-          const issues = node("details", "rag-source-issues");
-          issues.append(node("summary", "", "원본 확인이 필요한 항목"));
-          for (const item of sources.filter(item => item.status !== "ACTIVE" || item.history?.state === "BLOCKED")) {
-            const code = item.recovery === "SOURCE_LOCATION_ALREADY_REGISTERED" ? item.recovery : item.history?.error_code || item.error_code;
-            const label = code === "SOURCE_LOCATION_ALREADY_REGISTERED" ? "보관 원본이 다른 항목으로 이미 등록됨" : code === "SOURCE_MISSING" ? "원본 파일을 찾지 못함" : code === "SOURCE_SCHEMA_UNSUPPORTED" ? "기록 형식 확인 필요" : "원본 검증 필요";
-            issues.append(node("p", "", item.provider + " · " + item.source_id + " · " + label + " (" + code + ")"));
-          }
-          progress.append(issues);
-        }
-      }
-      if (collection.skipped_count) {
-        const skipped = node("details", "rag-source-issues");
-        skipped.append(node("summary", "", "제외된 소스 원인"));
-        const reasons = {};
-        for (const item of collection.skipped || []) reasons[item.error_code] = (reasons[item.error_code] || 0) + 1;
-        const labels = {NO_ACTIVITY: "수집할 내용 없음",
-      FAST_EXTRACT_PROVIDER_INVALID: "현재 추출기가 지원하지 않는 소스",
-      FAST_EXTRACT_SOURCE_TOO_LARGE: "활동 기록이 많아 소스 분할 필요", SEMANTIC_EVIDENCE_WINDOW_LIMIT: "단일 활동 본문이 커서 추가 분할 필요", SEMANTIC_SOURCE_NOT_CURRENT: "원문 위치 재확인 필요", SEMANTIC_EVIDENCE_EMPTY: "추출할 본문 없음", SEMANTIC_ACTIVITY_NOT_ATTESTED: "수집 기록 재확인 필요", SOURCE_NOT_FOUND: "원본 소스 없음"};
-        for (const [code, count] of Object.entries(reasons)) skipped.append(node("p", "", (labels[code] || code) + ": " + count + "개"));
-        if (collection.skipped_count > (collection.skipped || []).length) skipped.append(node("small", "", "원인 표시는 최대 64개 소스 기준입니다."));
-        progress.append(skipped);
-      }
+  const projectId = state.selectedProject?.project_id;
+  panel.replaceChildren(node("h2", "", "프로젝트 제안"));
+  if (!projectId) {
+    panel.append(node("p", "empty-copy", "프로젝트를 먼저 선택해 주세요."));
+    return;
+  }
+  panel.append(node("p", "context-copy",
+    "아이디어·예측·제품 방향의 원천입니다. Galaxy와 같은 제안/채택 상태를 보여줍니다. 운영 RAG 후보는 Ops에서 관리합니다."));
+  const refresh = node("button", "secondary-button compact-action", "제안 새로고침");
+  refresh.type = "button";
+  refresh.onclick = () => void loadGalaxyGoalProposals(projectId);
+  panel.append(refresh);
+  if (state.goalProposalsStatus !== "READY") {
+    panel.append(node("p", state.goalProposalsStatus === "ERROR" ? "memory-action-error" : "context-copy",
+      state.goalProposalsStatus === "ERROR"
+        ? `제안 조회 실패: ${state.goalProposalsError || "UNKNOWN"}`
+        : "제안을 불러오는 중…"));
+    return;
+  }
+  const proposals = state.goalProposals || [];
+  panel.append(node("p", "rag-counts", `프로젝트 제안 ${proposals.length}개`));
+  if (!proposals.length) {
+    panel.append(node("p", "empty-copy", "아직 등록된 제안이 없습니다."));
+    return;
+  }
+  const list = node("div", "memory-candidate-list");
+  for (const candidate of proposals) {
+    const card = node("article", "memory-candidate-row");
+    card.append(node("h3", "", candidate.knowledge?.topic || candidate.summary || candidate.candidate_id));
+    if (candidate.knowledge?.topic && candidate.summary) {
+      card.append(node("p", "context-copy", candidate.summary));
     }
-    for (const config of automation.configs || []) {
-      const schedule = (automation.schedules || []).find(item => item.stage === config.stage);
-      const card = node("article", "rag-stage-card");
-      let status = config.enabled === false ? "꺼짐" : config.schedule?.kind === "MANUAL" ? "수동 실행" : "예약됨";
-      const usesFrame = config.stage === "FAST_EXTRACT" && config.fallback !== "DETERMINISTIC";
-      const needsFrame = usesFrame && !["READY", "ON_DEMAND"].includes(config.runtime_preparation?.status);
-      if (needsFrame && config.enabled !== false) status = "실행 세션 연결 대기";
-      else if (String(schedule?.last_outcome || "").startsWith("FAILED")) status = "최근 예약 실행 실패";
-      else if (schedule?.state === "RUNNING") status = "실행 중";
-      card.append(node("h3", "", RAG_STAGE_LABELS[config.stage] || config.stage), node("strong", needsFrame ? "knowledge-badge pending" : "knowledge-badge", status));
-      card.append(node("p", "", needsFrame ? (config.runtime_preparation?.detail || "자동 수집용 실행 세션 준비가 필요합니다.") : config.fallback === "DETERMINISTIC" ? "규칙 기반 처리 · AI 호출 없음" : (config.runtime_preparation?.detail || "AI 처리")));
-      if (schedule?.next_due_at) card.append(node("small", "", `다음 예약: ${new Date(schedule.next_due_at).toLocaleString("ko-KR")}`));
-      if (schedule?.last_error_code) card.append(node("code", "rag-error-code", schedule.last_error_code));
-      if (schedule?.last_run_id) card.append(node("small", "", `최근 결과: ${schedule.last_run_id}`));
-      const run = node("button", "secondary-button compact-action", "지금 실행");
-      run.disabled = needsFrame || config.enabled === false;
-      run.onclick = async () => {
-        run.disabled = true;
+    card.append(node("p", "memory-candidate-state",
+      `${candidate.kind} · ${candidate.state} · ${candidate.candidate_id}`));
+    const actions = node("div", "memory-candidate-actions");
+    if (candidate.goal_acceptance?.goal_id) {
+      const goalId = candidate.goal_acceptance.goal_id;
+      const open = node("button", "secondary-button compact-action", `Fleet Goal ${goalId}`);
+      open.type = "button";
+      open.onclick = () => {
+        state.homeWorkstreamKind = "DEVELOPMENT";
+        state.homeNodeId = `goal:${goalId}`;
+        state.homeTodoId = null;
+        setGoalPlanLayout();
+        showGoalPlanView();
+      };
+      actions.append(open);
+    } else if (memoryCandidateCanBecomeGoal(candidate)) {
+      const accept = node("button", "primary-button compact-action", "Goal로 수용");
+      accept.type = "button";
+      accept.onclick = async () => {
+        accept.disabled = true;
         try {
-          await invokeServerAction("memory.batch.run", {project_id: projectId, stage: config.stage});
-          if (state.selectedProject?.project_id === projectId) renderMemory();
-        } catch (error) { card.append(node("p", "memory-action-error", error.message)); run.disabled = false; }
-      };
-      card.append(run);
-      progress.append(card);
-    }
-    const candidates = knowledge.candidates.filter(item => !adoptedMemoryForCandidate(item, knowledge.memories));
-    const proposed = knowledge.memories.filter(item => item.link_state === "PROPOSED" && item.retention?.decision !== "IGNORE");
-    const triage = groupRagReviewCandidates(candidates);
-    const daily = summarizeRagDay(knowledge);
-    const digest = node("section", "rag-daily-summary");
-    digest.setAttribute("aria-label", "오늘의 메모 요약");
-    digest.append(node("h3", "", "오늘의 메모 요약"));
-    digest.append(node("p", "rag-counts", "새 후보 " + daily.newCandidates + "개 · 기존 후보 변경 " + daily.updatedCandidates + "개 · 새 저장 메모 " + daily.newMemories + "개 · 기존 메모 변경 " + daily.updatedMemories + "개"));
-    const needsDecision = triage.filter(bundle => ["current", "future"].includes(bundle.bucket)).length;
-    digest.append(node("p", "", "소스·계획 근거 확인 " + needsDecision + "묶음 · 소스 확인 대기 " + triage.filter(bundle => bundle.bucket === "pending").length + "묶음 · 연결 제안 " + proposed.length + "개 (이전 날짜 포함)"));
-    digest.append(node("small", "", new Date(daily.end).toLocaleString("ko-KR") + " 조회 · 브라우저 시간대 " + Intl.DateTimeFormat().resolvedOptions().timeZone + "의 오늘 0시부터 · 현재 불러온 목록 기준"));
-    if (daily.unknownDates) digest.append(node("p", "", "날짜를 확인할 수 없는 " + daily.unknownDates + "개는 오늘 집계에서 제외했습니다."));
-    const todayToggle = node("button", "secondary-button compact-action", "오늘 변경만 보기");
-    todayToggle.setAttribute("aria-pressed", "false");
-    digest.append(todayToggle);
-    lists.append(digest);
-    let todayOnly = false;
-    lists.append(node("p", "rag-counts", "주제 " + groupRagKnowledgeTopics(candidates, knowledge.memories).length + "개 · 후보 " + candidates.length + "개 · 활성 저장 메모 " + knowledge.memories.filter(item => item.retention?.decision !== "IGNORE").length + "개 · 연결 제안 " + proposed.length + "개"));
-    lists.append(node("p", "context-copy", "같은 주제의 후보와 저장 메모를 함께 봅니다. 동일 문장은 한 항목으로 접고 출처·검토 이력을 보존합니다. 최근 수집은 최신 유효 지식을 뜻하지 않습니다. 기존 기록의 주제는 자동 분류 제안이며, 의미 통합과 대체 여부는 검토가 필요합니다."));
-    const search = node("input", "document-list-search");
-    search.type = "search"; search.placeholder = "메모 제목·내용 검색"; search.setAttribute("aria-label", "메모 검색");
-    lists.append(search);
-    const groups = node("div", "rag-memory-groups"); lists.append(groups);
-    const memoryById = new Map(knowledge.memories.map(item => [item.memory_id, item]));
-    const draw = () => {
-      groups.replaceChildren();
-      const query = search.value?.trim().toLowerCase() || "";
-      const matches = item => (!todayOnly || ragChangedInWindow(item, daily.start, daily.end)) && ((item.title || "") + " " + (item.body || "") + " " + (item.summary || "")).toLowerCase().includes(query);
-      const appendRow = (parent, item, candidate) => {
-        const row = node("button", "rag-memory-row");
-        const status = knowledgeStatus(item, candidate, knowledge.memories);
-        row.append(node("strong", "", item.title || item.summary), node("small", "knowledge-badge " + status.tone, status.label + " · " + (candidate ? (RAG_STAGE_LABELS[item.stage] || item.kind) : memoryLinkLabel(item))));
-        row.onclick = () => openHoverMemory(projectId, item, candidate);
-        parent.append(row);
-      };
-      const topics = groupRagKnowledgeTopics(candidates, knowledge.memories);
-      for (const topic of topics.filter(topic => topic.entries.some(({item}) => matches(item)))) {
-        const section = node("section", "rag-memory-group");
-        section.append(node("h3", "", topic.name + " (" + topic.claims.length + "항목 · " + topic.entries.length + "기록)"));
-        if (topic.inferred) section.append(node("small", "", "기존 기록의 주제 분류 제안"));
-        if (topic.hasConflict) section.append(node("p", "memory-action-error", "상충하는 기록이 있습니다. 최신 유효 내용은 아직 확정할 수 없습니다."));
-        section.append(node("p", "context-copy", topic.verified.length ? "현재 소스 근거가 있는 기록 " + topic.verified.length + "개 · 주제 전체의 통합·유효성 판정과는 별개입니다." : "최신 유효 내용 미확정 · 수집 날짜만으로 이전 결정을 대체하지 않습니다."));
-        for (const claim of topic.claims) {
-          if (!claim.entries.some(({item}) => matches(item))) continue;
-          const details = node("details", "rag-review-bundle");
-          const summary = node("summary", "");
-          const confirmed = claim.entries.find(({item, candidate}) => candidate && item.source_review?.bucket === "current");
-          const saved = claim.entries.find(entry => !entry.candidate);
-          const representative = confirmed || saved || claim.entries[0];
-          const kind = RAG_KNOWLEDGE_KINDS[representative.item.knowledge?.kind] || (saved ? "저장된 지식 · 유효성 별도 검토" : "지식 종류·가치 검토 필요");
-          summary.append(node("strong", "", claim.text), node("small", "knowledge-badge", kind + " · " + claim.entries.length + "기록"));
-          details.append(summary);
-          if (representative.item.knowledge?.applicability) details.append(node("p", "context-copy", "적용 조건: " + representative.item.knowledge.applicability));
-          const relationNotes = [...new Set(
-            claim.entries.flatMap(({item}) => memoryRelationNotes(item, memoryById))
-          )];
-          for (const relationNote of relationNotes) details.append(node("p", "rag-relation-note", relationNote));
-          details.append(node("p", "context-copy", "출처·검토 이력 — 최근 수집 순 (현재 유효성 순서 아님)"));
-          for (const {item, candidate} of claim.entries) {
-            const date = Date.parse(item.created_at || "");
-            details.append(node("small", "", "수집: " + (Number.isFinite(date) ? new Date(date).toLocaleString("ko-KR") : "시각 미확인")));
-            appendRow(details, item, candidate);
-            if (!candidate) details.append(renderMemoryRelateEditor(item, memoryById, projectId, () => renderMemory()));
-          }
-          section.append(details);
+          const result = await acceptGoalCandidate(candidate);
+          renderMemory();
+          toast(`Fleet Goal ${result.goal.goal_id} recorded`);
+        } catch (error) {
+          accept.disabled = false;
+          toast(error.message, true);
         }
-        groups.append(section);
-      }
-      if (!topics.some(topic => topic.entries.some(({item}) => matches(item)))) groups.append(node("p", "empty-copy", "표시할 주제 기록이 없습니다."));
-      const linkSection = node("section", "rag-memory-group");
-      const linkItems = proposed.filter(matches);
-      linkSection.append(node("h3", "", "저장 메모의 노드 연결 제안 (" + linkItems.length + ")"), node("p", "context-copy", "기존 저장 메모의 연결 제안입니다. 소스 대조 결과와 별도로 확인합니다."));
-      for (const item of linkItems) appendRow(linkSection, item, false);
-      groups.append(linkSection);
-      const oldRecords = candidates.filter(item => !["IGNORE", "SUPERSEDED"].includes(item.state) && item.source_review?.bucket === "archive" && matches(item));
-      const oldArchive = node("details", "rag-memory-group");
-      oldArchive.append(node("summary", "", "오래되거나 틀린 기록 · 후보 제외 (" + oldRecords.length + ")"));
-      oldArchive.append(node("p", "context-copy", "원문 요약과 제외 이유, 소스 근거를 별도로 보존합니다. 소스가 바뀌면 다시 확인합니다."));
-      for (const item of oldRecords) appendRow(oldArchive, item, true);
-      groups.append(oldArchive);
-      const excludedMemories = knowledge.memories.filter(item => item.retention?.decision === "IGNORE" && matches(item));
-      const excluded = node("details", "rag-memory-group");
-      excluded.append(node("summary", "", "무시한 저장 메모 (" + excludedMemories.length + ")"));
-      excluded.append(node("p", "context-copy", "목록·RAG 검색·연결 제안에서 제외됩니다. 메모를 열어 복원할 수 있습니다."));
-      for (const item of excludedMemories) appendRow(excluded, item, false);
-      groups.append(excluded);
-      const archive = node("details", "rag-memory-group");
-      const reviewed = candidates.filter(item => ["IGNORE", "SUPERSEDED"].includes(item.state) && matches(item));
-      archive.append(node("summary", "", "제외·대체된 후보 이력 (" + reviewed.length + ")"));
-      for (const item of reviewed) appendRow(archive, item, true);
-      groups.append(archive);
-    };
-    todayToggle.onclick = () => {
-      todayOnly = !todayOnly;
-      todayToggle.textContent = todayOnly ? "전체 기간 보기" : "오늘 변경만 보기";
-      todayToggle.setAttribute("aria-pressed", String(todayOnly));
-      draw();
-    };
-    search.oninput = draw; draw();
-    if (knowledge.candidates.length >= 200) lists.append(node("p", "", "최근 후보 최대 200개를 기준으로 묶었습니다. 전체 이력의 분류 결과는 아닙니다."));
-    const settings = renderMemoryBatchStages();
-    settings.querySelector("summary").textContent = "자동화 상세 설정";
-    lists.append(settings);
-  }).catch(error => {
-    if (generation === ragScreenGeneration) progress.replaceChildren(node("p", "memory-action-error", error.message));
-  });
+      };
+      actions.append(accept);
+    }
+    card.append(actions);
+    list.append(card);
+  }
+  panel.append(list);
 }
 
 const PERSONA_EXAMPLE_BODY = (

@@ -7,6 +7,54 @@ node link/unlink, search, and propose-links
 Not: automatic Candidate adoption, Seed mutation, automatic Bench/Future promotion,
 Career promotion, or raw transcript storage
 
+Product-model clarification (2026-09-23): [Galaxy proposals, Memory sources,
+and Fleet Goal nodes](galaxy-memory-fleet-goal-lifecycle.md) separates project
+Memory ideas/predictions from operational RAG references. The target
+collection and LLM noise-removal pipeline recurs under Ops configuration
+independently of Goal/Todo completion; the second LLM pass is not live yet.
+Memory and Galaxy share each proposal's decision state; accepting
+from either creates a separate, linked Fleet Goal. RAG stores source-checked
+Bench/development/operational references without a per-item forecast-adoption
+decision. The candidate `KEEP` and `rag.adopt` contract below is current
+implementation, not this target Goal acceptance or RAG ingestion contract.
+
+## Target project pipeline and current stage mapping (2026-09-23)
+
+```text
+Ops: assign LLM/model, recurrence, quota and failure policy per project
+  -> scheduled LLM collection
+  -> LLM noise removal and classification
+  -> Memory proposal source (idea, prediction, possible Goal/product)
+       -> same proposal and acceptance state in Memory and Galaxy
+       -> user accepts from either surface
+       -> distinct Fleet Goal work node -> Todos -> outcome -> terminal DONE
+  -> RAG operational reference (Bench, development docs, cautions)
+       -> source/currentness/applicability validation -> retrieval
+```
+
+Collection is periodic and does not wait for Goal completion, Todo reopening,
+or a human KEEP decision for each batch. Goal automation is finite and stops
+when that Goal is complete. RAG evidence is not a forecast to accept as a Goal.
+The Memory source and Galaxy proposal are project-scoped; a Goal has its own
+identity and explicit origin link. A later follow-up Goal is new work, not a
+restart of a completed Goal. See the
+[Goal-node lifecycle contract](galaxy-memory-fleet-goal-lifecycle.md).
+
+Implementation status: FAST_EXTRACT currently uses a governed LLM, while
+CONSOLIDATE/SYNTHESIZE are deterministic and INDEPENDENT_CHECK is structural.
+The scheduled second LLM noise-removal/classification pass and automatic
+source-checked operational RAG ingestion are not implemented by those names.
+Current `KEEP`/`rag.adopt` still perform legacy Memory/RAG review; the new
+`goal.accept-proposal` Action is a separate user decision for an eligible
+idea or prediction and does not remove or migrate that legacy route. Fleet Goal
+projection is now distinct in the UI, and project-local proposal candidates are
+projected as separate nodes in Galaxy/Knowledge views. Full proposal lineage
+graph edges, historic Feature/Goal migration, and live scheduled end-to-end
+acceptance remain pending. Galaxy proposals now have a paged project-scoped
+read model; the Memory menu shows that proposal read model and Ops retains
+a separately capped legacy operational RAG review. Ops now labels deterministic
+stages as model-not-invoked even when a provider/model is configured. Do not present the target pipeline as production-complete.
+
 ## Source-grounded candidate eligibility (2026-09-13)
 
 Current implementation evidence is now required before KEEP/adoption. Open TODO-backed future work is kept separate from current facts; outdated or contradicted records are retained in a separate archive. Unverified or stale assessments block adoption. See [source eligibility contract and live verification](rag-source-eligibility-20260913.md). Semantic comparison currently runs explicitly in bounded batches; scheduled INDEPENDENT_CHECK remains a structural check.

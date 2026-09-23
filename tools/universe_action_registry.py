@@ -1331,6 +1331,11 @@ def build_default_action_registry(
     # of their own.
     implemented_specs = (
         (
+            "goal.accept-proposal",
+            "universe.goal-accept-proposal-request.v1",
+            "universe.goal-accept-proposal-result.v1",
+        ),
+        (
             FEATURE_CREATE_ACTION_ID,
             FEATURE_CREATE_REQUEST_SCHEMA,
             FEATURE_CREATE_RESULT_SCHEMA,

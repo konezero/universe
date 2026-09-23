@@ -11,6 +11,14 @@ work surface; prediction display belongs only to Galaxy. Manual, LLM, and
 Memory-derived node entry coexist. Domain-specific schemas remain an extension
 task; the coding-domain implementation is not the definition of the Core.
 
+Product relationship clarification (2026-09-23): [Galaxy proposals, Memory
+sources, and Fleet Goal nodes](galaxy-memory-fleet-goal-lifecycle.md) distinguishes
+the predicted Galaxy node from the finite Fleet Goal work node that may be
+created when a user accepts it in Galaxy or the project's Memory view. A
+completed Goal stays complete; later work creates a new linked Goal. The
+description below is the north-star causal and forecasting model, not a claim
+that today's Feature Node and Goal implementation already matches that mapping.
+
 Universe is not a coding-only harness. Coding is the first experiment
 domain. The long-term target is a **general causal knowledge and work
 world** applicable across domains (research, design, social/economic

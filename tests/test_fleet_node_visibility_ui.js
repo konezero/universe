@@ -73,5 +73,50 @@ assert.deepEqual(
   [{feature_id:'gone', state:'ARCHIVED', intent_text:'Retired feature'}],
   'revealing a discarded node must not mutate the underlying Feature Node record'
 );
+
+// Goal work nodes are separate from Galaxy/Feature nodes. A DONE Todo does not
+// complete a Goal; only the Goal's own terminal state hides it by default.
+const goalFilters = {showDone: false, showDiscarded: false};
+const goalContext = {
+  state: {
+    projection: {unified_graph: {nodes: [
+      {node_id:'feat:source', kind:'FEATURE', state:'ADOPTED'},
+    ]}},
+    goals: [
+      {goal_id:'goal_active', title:'Follow-up work', state:'ACTIVE', node_ref:'source', description:'Finite work'},
+      {goal_id:'goal_done', title:'Previous work', state:'DONE', node_ref:'source'},
+    ],
+    fleetFilters: goalFilters,
+    projectFeatures: [],
+  },
+  homeAllTodos: () => [
+    {todo_id:'t1', goal_id:'goal_active', node_ref:'source', state:'DONE'},
+    {todo_id:'t2', goal_id:'goal_done', node_ref:'source', state:'DONE'},
+  ],
+  homeNodeRefKey: id => id.replace(/^(feat:|goal:)/, ''),
+  homeNodeTodos: n => n.goal_id === 'goal_active' ? [{state:'DONE'}]
+    : n.goal_id === 'goal_done' ? [{state:'DONE'}] : [],
+  fleetShowDone: () => goalFilters.showDone,
+  fleetShowDiscarded: () => goalFilters.showDiscarded,
+};
+vm.createContext(goalContext);
+vm.runInContext(source.slice(start, end), goalContext);
+assert.deepEqual(Array.from(goalContext.homeNodes(), n => n.node_id), ['goal:goal_active']);
+assert.equal(goalContext.homeNodeFullyDone(goalContext.homeNodes()[0]), false);
+goalFilters.showDone = true;
+assert.deepEqual(Array.from(goalContext.homeNodes(), n => n.node_id).sort(),
+  ['goal:goal_active', 'goal:goal_done']);
+const ownershipStart = source.indexOf('function homeNodeOwnsTodo(');
+const ownershipEnd = source.indexOf('function homeSelectedNode()', ownershipStart);
+vm.runInContext(source.slice(ownershipStart, ownershipEnd), goalContext);
+assert.equal(goalContext.homeNodeOwnsTodo(
+  {node_id:'goal:goal_active',kind:'FLEET_GOAL',goal_id:'goal_active'},
+  {goal_id:'goal_active',node_ref:'source'}), true);
+assert.equal(goalContext.homeNodeOwnsTodo(
+  {node_id:'feat:source',kind:'FEATURE'},
+  {goal_id:'goal_active',node_ref:'source'}), false);
+assert.equal(goalContext.homeNodeOwnsTodo(
+  {node_id:'feat:source',kind:'FEATURE'},
+  {node_ref:'source'}), true);
 console.log('Fleet structural/domain visibility, prediction exclusion, work ranking, duplicate suppression and manual Action routing passed.');
 console.log('Fleet 완료/폐기 필터: default-hidden, toggle-revealed, no data mutation passed.');

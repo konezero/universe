@@ -4,6 +4,15 @@ Status: approved Goal direction; proposal, planning-context, Expected Path v2, a
 Owner: Universe Conductor for proposal coordination; Project Master for implementation
 Scope: project-local conversation, Memory, semantic graph, Feature Node planning, and governed Goal automation
 
+Product-model clarification (2026-09-23): this document describes the existing
+software-domain Memory-to-Feature implementation path. The target relationship
+is now [Galaxy proposal -> distinct Fleet Goal node](galaxy-memory-fleet-goal-lifecycle.md):
+the proposal is shared by Memory and Galaxy, acceptance is available from
+either view, and the accepted direction creates a linked Goal work node whose
+Todos drive a finite lifecycle. The Feature Node is not a mandatory additional
+work node in that target. Existing proposal, `rag.adopt`, Feature, and Goal
+Actions have not been migrated by this documentation change.
+
 ## Product outcome
 
 Product alignment — 2026-09-13:
