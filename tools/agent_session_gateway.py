@@ -1659,6 +1659,8 @@ class CodexAppServerSession:
     def __init__(
         self,
         *,
+        dynamic_tools: list[dict[str, Any]] | None = None,
+        dynamic_tool_handler: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         executable: Path,
         cwd: Path,
         environment: Mapping[str, str],
@@ -1679,6 +1681,10 @@ class CodexAppServerSession:
         self.cwd = cwd
         self.system_prompt = system_prompt
         self.session_id = session_id
+        self._dynamic_tools = list(dynamic_tools or [])
+        self._dynamic_tool_handler = dynamic_tool_handler
+        if self._dynamic_tools and (not ephemeral or dynamic_tool_handler is None):
+            raise AgentSessionError("CODEX_DYNAMIC_TOOLS_REQUIRE_EPHEMERAL_HANDLER")
         self._supervisor_transport = {
             "terminal_host": terminal_host,
             "project_id": project_id,
@@ -2054,6 +2060,7 @@ class CodexAppServerSession:
                     "developerInstructions": self.system_prompt,
                     "runtimeWorkspaceRoots": [str(self.cwd)],
                     "ephemeral": self.ephemeral,
+                    **({"dynamicTools": self._dynamic_tools} if self._dynamic_tools else {}),
                 },
                 timeout_seconds=30,
             )
@@ -2140,6 +2147,23 @@ class CodexAppServerSession:
         self._turn_events.setdefault(turn_id, threading.Event()).set()
 
     def _handle_request(self, method: str, params: Mapping[str, Any]) -> Any:
+        if method == "item/tool/call":
+            names = {tool["name"] for tool in self._dynamic_tools}
+            if (self._active_delta is None or params.get("threadId") != self.session_id
+                    or not params.get("turnId") or not params.get("callId")
+                    or params.get("namespace") not in (None, "")
+                    or params.get("tool") not in names
+                    or not isinstance(params.get("arguments"), Mapping)
+                    or self._dynamic_tool_handler is None):
+                return {"success": False, "contentItems": [{"type": "inputText",
+                        "text": "HOST_DYNAMIC_TOOL_REJECTED"}]}
+            try:
+                result = dict(self._dynamic_tool_handler(params))
+                return {"success": result.get("status") in {"HOST_EDIT_READ", "HOST_JOURNAL_READ", "FILE_MUTATION_APPLIED"},
+                        "contentItems": [{"type": "inputText", "text": json.dumps(result, ensure_ascii=True)}]}
+            except Exception:
+                return {"success": False, "contentItems": [{"type": "inputText",
+                        "text": "HOST_DYNAMIC_TOOL_FAILED"}]}
         if method == "item/commandExecution/requestApproval":
             return self._codex_approval(
                 method,

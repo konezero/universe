@@ -233,6 +233,8 @@ const state = {
     adoption: null,
     handoff: null,
   },
+  /** Draft-to-project registration attempts keyed by draft id/revision. */
+  projectDraftRegistrations: {},
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
   graphPan: null,
   /** Hovered graph node id (for icon map tooltips). */
@@ -18337,12 +18339,115 @@ function showFreshProjectPanel(name) {
   elements.freshProjectError.textContent = "";
 }
 
+function projectDraftProjectId(title) {
+  const slug = String(title || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || `project-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function projectDraftRegistrationControls() {
+  const panel = document.querySelector("#project-draft-panel");
+  if (!panel || document.querySelector("#project-draft-register")) return;
+  const actions = panel.querySelector(".dialog-actions");
+  if (!actions) return;
+  const register = document.createElement("button");
+  register.id = "project-draft-register";
+  register.type = "button";
+  register.className = "primary-button";
+  register.textContent = "초안 채택 · 프로젝트 등록";
+  register.addEventListener("click", () =>
+    registerAcceptedProjectDraft().catch((error) => toast(error.message, true))
+  );
+  actions.append(register);
+  panel.dataset.registrationControlsReady = "true";
+}
+
+async function registerAcceptedProjectDraft() {
+  const current = projectDraftEditor?.current;
+  if (!current) throw new Error("먼저 프로젝트 초안을 여세요.");
+  if (current.project_id) {
+    throw new Error("기존 프로젝트 초안은 현재 프로젝트 범위를 변경하지 않습니다.");
+  }
+  if (current.dirty) {
+    await saveProjectDraft();
+  }
+  if (!current.revision) throw new Error("프로젝트 등록 전에 초안을 저장하세요.");
+  const projectRoot = String(current.fields.project_root || "").trim();
+  if (!projectRoot) throw new Error("프로젝트 폴더를 선택한 뒤 초안을 저장하세요.");
+  const projectId = projectDraftProjectId(current.fields.title);
+  // The request id is keyed by the immutable draft revision. Retries reuse it,
+  // while a new revision receives a new server idempotency key.
+  const key = `${current.draft_id}:${current.revision}:${projectId}:${projectRoot}`;
+  const prior = state.projectDraftRegistrations[key] || {
+    requestId: crypto.randomUUID(),
+  };
+  const requestId = prior.requestId;
+  state.projectDraftRegistrations[key] = {
+    ...prior,
+    status: "REGISTERING",
+    requestId,
+  };
+  const register = document.querySelector("#project-draft-register");
+  if (register) register.disabled = true;
+  projectDraftNotice("프로젝트 초안을 서버 Action으로 등록하는 중입니다…");
+  try {
+    const request = {
+      draft_id: current.draft_id,
+      expected_revision: current.revision,
+      request_id: requestId,
+      idempotency_key: requestId,
+      project_id: projectId,
+      project_root: projectRoot,
+      release_id: state.releases[0]?.release_id || null,
+      // The gateway materializes the accepted revision, rather than relying on
+      // a browser-side snapshot or the generic connection lifecycle.
+      accepted_fields: { ...current.fields },
+    };
+    const result = await invokeServerAction("project.draft.register", request);
+    state.projectDraftRegistrations[key] = {
+      ...prior,
+      status: "COMPLETED",
+      requestId,
+      projectId,
+      result,
+    };
+    projectDraftNotice(`프로젝트 등록 완료 · ${projectId}`);
+    if (typeof refresh === "function") await refresh({ syncSelectedProject: true });
+    if (state.projects.some((project) => project.project_id === projectId)) {
+      await selectProject(projectId);
+    }
+    toast(`Project registered from draft · ${projectId}`);
+  } catch (error) {
+    // Keep the same request id so a retry exercises the server's durable replay
+    // or conflict contract instead of creating a second registration.
+    state.projectDraftRegistrations[key] = {
+      ...prior,
+      status: "RETRYABLE_ERROR",
+      requestId,
+      error: error.message,
+    };
+    projectDraftNotice(`등록 실패: ${error.message} · 같은 요청으로 다시 시도할 수 있습니다.`);
+    throw error;
+  } finally {
+    if (register) register.disabled = false;
+  }
+}
+
 function openFreshProjectWizard() {
+  // New-project authoring is draft-first. Keep the legacy prediction/composition
+  // dialog available for recorded history, but do not make route prediction a
+  // prerequisite for writing the shared project goal/plan draft.
   if (typeof openProjectDraft !== "function") {
-    toast("서버 업데이트 적용 후 프로젝트 초안을 작성할 수 있습니다.", true);
+    toast("Project draft authoring is unavailable until the server update is applied.", true);
     return;
   }
-  openProjectDraft().catch(error => toast(error.message, true));
+  openProjectDraft()
+    .then(() => projectDraftRegistrationControls())
+    .catch((error) => toast(error.message, true));
 }
 
 function renderFreshProjectRoutes() {

@@ -9,7 +9,7 @@ queue callbacks and validates the Session Anchor before a run is started.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -18,6 +18,97 @@ import sqlite3
 import uuid
 from typing import Any, Callable, Mapping
 
+
+
+def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, todo_id, value,
+                          *, launch_reference=None, run_id=None, current_todo=None):
+    """Validate immutable role evidence and journal-pinned rework lineage."""
+    def reject(detail):
+        raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", detail, 409)
+
+    root = (Path(repository_root) / ".ai/runtime/task_frames").resolve()
+    if not root.is_relative_to(Path(repository_root).resolve()) or not root.is_dir():
+        reject("Task Frame store is missing or outside the project")
+    attempts = {'worker':1,'reviewer':1}
+    expected = {f"{frame_id}_worker_1", f"{frame_id}_reviewer_1"}
+    journal_verified = False
+    if launch_reference is not None:
+        from task_frame_review_provenance import select_journal_review
+        selection = select_journal_review(Path(repository_root),run_id=run_id,frame_id=frame_id,
+            todo_id=todo_id,owner_ref=anchor_ref,launch_reference=launch_reference,
+            value=value,current_todo=current_todo)
+        attempts, expected = selection['attempts'], selection['expected_frames']
+        journal_verified = selection['completion_provenance_verified']
+    observed = set()
+    for path in root.glob("*.sqlite3"):
+        if not path.resolve().is_relative_to(root):
+            reject("Task Frame store path escapes its root")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='task_frame_context'").fetchone():
+                continue
+            context = db.execute("SELECT frame_id, origin_session_id FROM task_frame_context").fetchone()
+            if context and context[0].startswith(frame_id + "_"):
+                if context[1] != session_id:
+                    reject("Host result belongs to a different session")
+                observed.add(context[0])
+    if observed != expected:
+        reject("Observed role attempts differ from the supported legacy pair or pinned journal lineage")
+
+    records = {}
+    for role in ("worker", "reviewer"):
+        role_frame = f"{frame_id}_{role}_{attempts[role]}"
+        key = hashlib.sha256(f"{session_id}\0{role_frame}".encode("utf-8")).hexdigest()[:24]
+        path = root / (key + ".sqlite3")
+        if not path.is_file() or not path.resolve().is_relative_to(root):
+            reject("Result store unavailable")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            context = db.execute("SELECT * FROM task_frame_context").fetchone()
+            turn = db.execute("SELECT * FROM task_turns WHERE turn_id=?", (role + "-turn",)).fetchone()
+            execution = db.execute("SELECT * FROM worker_execution_state WHERE turn_id=?", (role + "-turn",)).fetchone()
+            instruction = db.execute("SELECT * FROM task_instructions ORDER BY instruction_ordinal DESC LIMIT 1").fetchone()
+        if not all((context, turn, execution, instruction)):
+            reject("Incomplete durable result provenance")
+        if (context["frame_id"] != role_frame or context["origin_session_id"] != session_id
+                or context["origin_anchor_ref"] != anchor_ref
+                or context["source_ref"] != f"universe://todo/{todo_id}"
+                or context["task_state"] != "COMPLETED" or turn["state"] != "COMPLETED"):
+            reject("Result frame, owner, Todo or terminal state mismatch")
+        contract = json.loads(instruction["expected_output_json"])
+        if contract.get("schema") != f"universe.task-frame-host-{role}-output.v1":
+            reject("Result role contract mismatch")
+        if role == "reviewer" and instruction["repository_write_scope"] != "NONE":
+            reject("Reviewer was not read-only")
+        envelope = json.loads(execution["worker_result_envelope_json"])
+        result = json.loads(turn["result_json"])
+        receipt = execution["result_receipt_ref"]
+        ref = f"task-frame-result://{role_frame}/{role}-turn/{receipt}"
+        digest = hashlib.sha256(json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        if (ref != value[role + "_result_ref"] or digest != value[role + "_result_digest"]
+                or envelope.get("result") != result or envelope.get("status") != "COMPLETED"
+                or envelope.get("turn_id") != role + "-turn"
+                or envelope.get("result_receipt_ref") != receipt
+                or envelope.get("worker_id") != turn["claimed_by"]
+                or execution["worker_actor_ref"] != turn["claimed_by"]):
+            reject("Result reference, digest or execution envelope mismatch")
+        records[role] = {"result": result, "result_ref": ref, "result_digest": digest,
+                         "actor": turn["claimed_by"], "created_at": turn["created_at"],
+                         "completed_at": turn["completed_at"], "source_commit": context["source_commit"]}
+    worker, reviewer = records["worker"], records["reviewer"]
+    if (worker["actor"] == reviewer["actor"] or not worker["completed_at"]
+            or reviewer["created_at"] < worker["completed_at"]
+            or worker["source_commit"] != reviewer["source_commit"]):
+        reject("Reviewer independence, sequence or source provenance mismatch")
+    verdict = reviewer["result"].get("verdict")
+    if verdict not in {"PASS", "NEEDS_REVISION", "BLOCKED"}:
+        reject("Unsupported persisted Reviewer verdict")
+    if verdict == "PASS" and (
+            worker["result"].get("outcome") not in {"SUCCEEDED", "COMPLETED"}
+            or worker["result"].get("validation_state") not in {"PASS", "PASSED", "VERIFIED"}
+            or not reviewer["result"].get("evidence_refs")):
+        reject("PASS cannot complete an incomplete or unverified Worker result")
+    records['completion_provenance_verified'] = journal_verified
+    return records
 
 SCHEMA = "universe.persona-automation.v1"
 RUN_SCHEMA = "universe.persona-automation-run.v1"
@@ -2401,10 +2492,27 @@ class PersonaAutomationStore:
         run_id = _text(run_id, "run_id")
         frame = _text(task_frame_id, "task_frame_id")
         suffix = ":" + str(payload.get("status")) if event_type == "TASK_FRAME_COLLECTED" else ""
+        # A Host can finish several roles and rework attempts. Their immutable
+        # result references are distinct even when the frame and status match.
+        # Keep the digest in the payload, not the key: a changed digest for the
+        # same result must remain an idempotency conflict, not a new collection.
+        if event_type == "TASK_FRAME_COLLECTED" and payload.get("result_ref"):
+            suffix += ":result:" + _digest(str(payload["result_ref"]))
         with self._connection() as connection:
             row = self._get(connection, run_id)
+            event_key = f"frame-host:{event_type}:{frame}{suffix}"
+            if event_type == "TASK_FRAME_COLLECTED" and payload.get("result_ref"):
+                legacy_key = f"frame-host:{event_type}:{frame}:{payload.get('status')}"
+                legacy = connection.execute(
+                    "SELECT payload_json FROM persona_automation_event WHERE run_id = ? AND idempotency_key = ?",
+                    (run_id, legacy_key),
+                ).fetchone()
+                if legacy is not None and _load(legacy["payload_json"], {}).get("result_ref") == payload["result_ref"]:
+                    # Preserve an existing collection's identity on upgrade.
+                    # _event still rejects conflicting payloads for that result.
+                    event_key = legacy_key
             event, _created = self._event(
-                connection, run_id, event_type, f"frame-host:{event_type}:{frame}{suffix}",
+                connection, run_id, event_type, event_key,
                 {"task_frame_id": frame, **dict(payload)},
             )
             # An independent Host has no persona dispatch cursor. Collection
@@ -2930,6 +3038,113 @@ class PersonaAutomationStore:
                 "followup": payload,
                 "event": event,
             }
+
+
+    def recover_host_review(self, value, *, repository_root, session_id,
+                            completion_provenance_verified=False, current_todo=None):
+        """Bind immutable legacy Host evidence atomically, without promoting it."""
+        run_id = _text(value.get("run_id"), "run_id")
+        frame = _text(value.get("task_frame_id"), "task_frame_id")
+        run = self.get_run(run_id)
+        if run["session_anchor_ref"] != value.get("owner_ref"):
+            raise PersonaAutomationError("TASK_FRAME_OWNER_MISMATCH", "the run owner is required", 409)
+        frames = self.list_host_frames(run_id)
+        if not frames or frames[-1]["task_frame_id"] != frame:
+            raise PersonaAutomationError("TASK_FRAME_RECOVERY_STALE", "only the latest launched Host is recoverable", 409)
+        todo_id = frames[-1]["todo_id"]
+        try:
+            pair = read_host_review_pair(repository_root, session_id, run["session_anchor_ref"],
+                                         frame, todo_id, value, run_id=run_id,
+                                         launch_reference=frames[-1].get('todo_journal'), current_todo=current_todo)
+        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
+            if isinstance(error, PersonaAutomationError):
+                raise
+            raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID",
+                                         "durable Host evidence could not be validated", 409) from error
+        if (pair["reviewer"]["result"]["verdict"] == "PASS"
+                and completion_provenance_verified is not True
+                and pair.get('completion_provenance_verified') is not True):
+            raise PersonaAutomationError("TASK_FRAME_RECOVERY_COMPLETION_PROVENANCE_MISSING",
+                                         "PASS requires the original unchanged Todo content", 409)
+        identity = {key: value[key] for key in (
+            "task_frame_id", "worker_result_ref", "worker_result_digest",
+            "reviewer_result_ref", "reviewer_result_digest")}
+        event_key = "recover-host-review:" + _text(value.get("request_id"), "request_id")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._get(connection, run_id)
+            prior = connection.execute(
+                "SELECT payload_json FROM persona_automation_event WHERE run_id=? AND idempotency_key=?",
+                (run_id, event_key)).fetchone()
+            if prior is not None:
+                saved = _load(prior["payload_json"], {})
+                if saved.get("identity") != identity:
+                    raise PersonaAutomationError("PERSONA_AUTOMATION_EVENT_IDEMPOTENCY_CONFLICT",
+                                                 "recovery request refers to different evidence", 409)
+                return {"status": "TASK_FRAME_REVIEW_RECOVERY_REPLAYED", "run": self._row(row),
+                        "review": saved["review"]}
+            latest = connection.execute(
+                "SELECT payload_json FROM persona_automation_event WHERE run_id=? "
+                "AND event_type='TASK_FRAME_HOST_LAUNCHED' ORDER BY rowid DESC LIMIT 1",
+                (run_id,)).fetchone()
+            if latest is None or _load(latest["payload_json"], {}).get("task_frame_id") != frame:
+                raise PersonaAutomationError("TASK_FRAME_RECOVERY_STALE", "a newer Host superseded this result", 409)
+            if row["state"] not in {"WAITING", "RUNNING"}:
+                raise PersonaAutomationError("TASK_FRAME_RECOVERY_STATE_INVALID", "run is not recoverable", 409)
+            if type(value.get("expected_revision")) is not int or row["revision"] != value["expected_revision"]:
+                raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "run revision changed", 409)
+            if _load(row["current_assignment_json"], None) is not None or _load(row["current_review_json"], None) is not None:
+                raise PersonaAutomationError("TASK_FRAME_RECOVERY_ASSIGNMENT_EXISTS",
+                                             "recovery cannot replace an existing assignment/review", 409)
+            collections = [_load(item[0], {}) for item in connection.execute(
+                "SELECT payload_json FROM persona_automation_event WHERE run_id=? AND event_type='TASK_FRAME_COLLECTED'",
+                (run_id,))]
+            for role in ("worker", "reviewer"):
+                evidence = pair[role]
+                if not any(item.get("task_frame_id") == frame and item.get("status") == "COMPLETED"
+                           and item.get("result_ref") == evidence["result_ref"]
+                           and item.get("result_digest") in {None, evidence["result_digest"]}
+                           for item in collections):
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_COLLECTION_REQUIRED",
+                                                 "both exact results must already be collected", 409)
+            verdict = pair["reviewer"]["result"]
+            outcome = verdict["verdict"]
+            review_id = "persona_review_" + uuid.uuid4().hex[:24]
+            dispatch_id = "host-recovery:" + _digest(identity)[:24]
+            source_message_id = "task-frame://" + frame
+            now = _timestamp()
+            refs = [pair["worker"]["result_ref"], pair["reviewer"]["result_ref"]]
+            acceptance = "VERIFIED_EVIDENCE" if outcome == "PASS" else "PENDING"
+            next_action = (verdict.get("next_action") or
+                           ("complete the verified run" if outcome == "PASS" else "resolve the persisted review findings"))
+            review = {"review_id": review_id, "result_ref": pair["worker"]["result_ref"],
+                      "reviewer_result_ref": pair["reviewer"]["result_ref"], "outcome": outcome,
+                      "acceptance_status": acceptance, "evidence_refs": refs,
+                      "note": verdict.get("note"), "next_action": next_action,
+                      "dispatch_id": dispatch_id, "assignment_revision": row["assignment_revision"],
+                      "source_message_id": source_message_id, "source_project_id": row["project_id"],
+                      "route": "TASK_FRAME_RECOVERY", "identity": identity}
+            assignment = {"state": "REVIEWED", "route": "TASK_FRAME_RECOVERY", "todo_id": todo_id,
+                          "task_frame_id": frame, "dispatch_id": dispatch_id,
+                          "assignment_revision": row["assignment_revision"],
+                          "message_id": source_message_id, "result_ref": review["result_ref"],
+                          "review_id": review_id, "review_outcome": outcome}
+            connection.execute(
+                "INSERT INTO persona_automation_review(review_id,run_id,result_ref,outcome,acceptance_status,"
+                "evidence_refs_json,note,next_action,dispatch_id,assignment_revision,source_message_id,"
+                "source_project_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (review_id,run_id,review["result_ref"],outcome,acceptance,_json(refs),review["note"],
+                 next_action,dispatch_id,row["assignment_revision"],source_message_id,row["project_id"],now))
+            changed = connection.execute(
+                "UPDATE persona_automation_run SET current_assignment_json=?, current_review_json=?,"
+                "state='WAITING', next_condition=?, revision=revision+1, updated_at=? WHERE run_id=? AND revision=?",
+                (_json(assignment),_json(review),next_action,now,run_id,value["expected_revision"]))
+            if changed.rowcount != 1:
+                raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "run changed during recovery", 409)
+            event, _ = self._event(connection, run_id, "TASK_FRAME_REVIEW_RECOVERED", event_key,
+                                   {"identity": identity, "review": review})
+            return {"status": "TASK_FRAME_REVIEW_RECOVERED", "run": self._row(self._get(connection, run_id)),
+                    "review": review, "event_id": event["event_id"]}
 
     def complete_run(self, value: Mapping[str, Any]) -> dict[str, Any]:
         run_id = _text(value.get("run_id"), "run_id")

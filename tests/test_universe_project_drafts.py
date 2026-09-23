@@ -63,6 +63,51 @@ class ProjectDraftTests(unittest.TestCase):
         self.assertEqual([], self.drafts.list())
 
 
+    def _accepted_request(self, **overrides):
+        value = {
+            'draft_id': 'draft_test',
+            'revision': 1,
+            'request_id': 'register_1',
+            'idempotency_key': 'register_key_1',
+            'project_id': 'TEST',
+            'project_root': 'C:/projects/TEST',
+            'accepted_fields': ['title', 'goal'],
+        }
+        value.update(overrides)
+        return value
+
+    def test_register_replays_by_idempotency_request_and_revision(self):
+        self.drafts.save(self.request, {'kind': 'USER'})
+        calls = []
+        def materialize(draft, request, actor):
+            calls.append((draft['draft_id'], draft['revision']))
+            return {'status': 'PROJECT_DRAFT_REGISTERED', 'project': {'project_id': request['project_id']}}
+
+        first = self.drafts.accept(self._accepted_request(), {'kind': 'USER'}, materialize)
+        self.assertEqual(first, self.drafts.accept(self._accepted_request(), {'kind': 'USER'}, materialize))
+        self.assertEqual(first, self.drafts.accept(self._accepted_request(request_id='register_2', idempotency_key='register_key_2'), {'kind': 'USER'}, materialize))
+        self.assertEqual([('draft_test', 1)], calls)
+        with self.assertRaisesRegex(DraftError, 'different content'):
+            self.drafts.accept(self._accepted_request(project_root='C:/other'), {'kind': 'USER'}, materialize)
+
+    def test_register_retry_recovers_after_materialization_failure(self):
+        self.drafts.save(self.request, {'kind': 'USER'})
+        calls = []
+        def materialize(draft, request, actor):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError('simulated partial failure')
+            return {'status': 'PROJECT_DRAFT_REGISTERED', 'project': {'project_id': request['project_id']}}
+
+        with self.assertRaisesRegex(DraftError, 'simulated partial failure'):
+            self.drafts.accept(self._accepted_request(), {'kind': 'USER'}, materialize)
+        result = self.drafts.accept(self._accepted_request(), {'kind': 'USER'}, materialize)
+        self.assertEqual('PROJECT_DRAFT_REGISTERED', result['status'])
+        self.assertEqual([1, 1], calls)
+        with self.drafts.connection() as connection:
+            self.assertEqual(1, connection.execute('SELECT COUNT(*) FROM project_draft_acceptance').fetchone()[0])
+
+
 class ProjectDraftApiTests(unittest.TestCase):
     def test_resident_provider_prompts_receive_the_shared_snapshot(self):
         from project_master_host import CodexProjectMasterRuntime, GrokProjectMasterRuntime

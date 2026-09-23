@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import re
 from datetime import datetime, timezone
 import json
+import ntpath
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -28,6 +30,7 @@ from claude_resident_session import ClaudeResidentError, ClaudeResidentSession
 from host_profile import resolve_host_tool
 from universe_app.terminal_host import TerminalHostError
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
+from task_frame_file_editor import TaskFrameFileEditor, TOOL as HOST_EDIT_TOOL
 from worker_failure_evidence import (
     WorkerFailureEvidenceError,
     WorkerFailureEvidenceStore,
@@ -193,11 +196,44 @@ def _resolve_grok() -> tuple[Path | None, dict[str, str], str]:
     return resolved.executable, dict(resolved.environment), resolved.model
 
 
+def _codex_windows_runtime_environment(
+    environment: Mapping[str, str], *, version: str, platform: str,
+    inherited: Mapping[str, str],
+) -> dict[str, str]:
+    """Version-scoped transport fix for Codex #46388; not a sandbox fallback.
+
+    Owner: Windows Codex Worker adapter. Remove after the replacement upstream
+    release passes the elevated-sandbox long-runtime-path regression probe.
+    Preserve the same LOCALAPPDATA directory, ACLs and sandbox policy; only its
+    Win32 path spelling changes, in the child environment, for tested 0.155.1.
+    """
+    result = dict(environment)
+    if platform != "nt" or version != "codex-cli 0.155.1":
+        return result
+    local = result.get("LOCALAPPDATA", inherited.get("LOCALAPPDATA", ""))
+    if not local or local.startswith(("\\\\?\\", "\\\\.\\")):
+        return result
+    normalized = ntpath.normpath(local)
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\"):
+        return result
+    result["LOCALAPPDATA"] = (
+        "\\\\?\\UNC\\" + normalized[2:]
+        if normalized.startswith("\\\\")
+        else "\\\\?\\" + normalized
+    )
+    return result
+
+
 def _resolve_codex() -> tuple[Path | None, dict[str, str], str]:
     resolved = resolve_host_tool("codex")
     if resolved is None:
         return None, {}, "UNKNOWN"
-    return resolved.executable, dict(resolved.environment), resolved.model
+    environment = _codex_windows_runtime_environment(
+        resolved.environment, version=resolved.version,
+        platform=os.name, inherited=os.environ,
+    )
+    return resolved.executable, environment, resolved.model
 
 
 def _resolve_claude() -> tuple[Path | None, dict[str, str], str]:
@@ -244,6 +280,7 @@ class RuntimeWorkerDispatcher:
         # Optional callable(description) -> "APPROVE" | "DENY".  When set, a write the
         # declared scope does not cover is asked upward instead of refused outright.
         self.permission_escalator: Callable[[Mapping[str, Any]], str] | None = None
+        self._host_editors: dict[str, TaskFrameFileEditor] = {}
         self.worker_response_timeout_seconds = _worker_response_timeout_seconds(
             worker_response_timeout_seconds
         )
@@ -430,7 +467,21 @@ class RuntimeWorkerDispatcher:
 
         try:
             started = time.monotonic()
-            worker = self._invoke_provider(provider, worker_request)
+            if provider == "CODEX" and worker_request["repository_write_scope"] == "BOUNDED":
+                def verify_claim():
+                    observation = self.post(request["endpoint"], request["token"],
+                        "/v1/task-frame/operation", {"session_id": request["session_id"],
+                        "frame_id": request["frame_id"],
+                        "operation": {"operation": "turn_snapshot", "turn_id": request["turn_id"]}})
+                    return observation.get("output")
+                self._host_editors[worker_run_ref] = TaskFrameFileEditor(self.repository_root,
+                    session_id=request["session_id"], frame_id=request["frame_id"],
+                    turn_id=request["turn_id"], worker_id=worker_id,
+                    scope=request["mutation_scope"], verify_claim=verify_claim)
+            try:
+                worker = self._invoke_provider(provider, worker_request)
+            finally:
+                self._host_editors.pop(worker_run_ref, None)
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             if worker.get("status") != "COMPLETED":
                 raise WorkerDispatchError(
@@ -1184,6 +1235,25 @@ class RuntimeWorkerDispatcher:
         supervisor_transport = self._request_supervisor_transport(request)
         session_ids: list[str] = []
         host_session_ref = ""
+        editor = self._host_editors.get(str(request.get("worker_run_ref") or ""))
+        dynamic_tools = [HOST_EDIT_TOOL] if editor is not None else []
+        context = request.get("context_pack")
+        pinned = context.get("journal_assignment") if isinstance(context, Mapping) else None
+        if isinstance(pinned, Mapping):
+            from todo_execution_journal import READ_TOOL, read_assignment_tool
+            pinned = dict(pinned)
+            journal_root = Path(str(context.get("journal_project_root") or self.repository_root)).resolve()
+            dynamic_tools.append(READ_TOOL)
+
+        def handle_tool(params):
+            if params["tool"] == "universe_read_assignment" and isinstance(pinned, Mapping):
+                if not journal_root.is_relative_to(self.repository_root.resolve()):
+                    return {"status": "HOST_JOURNAL_BLOCKED", "error_code": "TODO_JOURNAL_PATH_INVALID", "repository_write": False}
+                return read_assignment_tool(params["arguments"], project_root=journal_root, reference=pinned)
+            if params["tool"] == "universe_edit" and editor is not None:
+                return editor(params["arguments"], params["callId"])
+            return {"status": "HOST_DYNAMIC_TOOL_REJECTED", "repository_write": False}
+
         try:
             gateway = UniverseAcpGateway(
                 CodexAppServerSession(
@@ -1203,6 +1273,8 @@ class RuntimeWorkerDispatcher:
                     # cancellation, or Host/provider failure. Their bounded
                     # assignment is not a wall-clock execution estimate.
                     response_timeout_seconds=None,
+                    **({"dynamic_tools": dynamic_tools, "dynamic_tool_handler": handle_tool}
+                       if dynamic_tools else {}),
                     **supervisor_transport,
                 )
             )
@@ -1584,6 +1656,13 @@ class RuntimeWorkerDispatcher:
             if RuntimeWorkerDispatcher._is_qa_reviewer(request)
             else ""
         )
+        pinned_note = ""
+        context = request.get("context_pack")
+        if (request.get("schema") == "universe.codex-worker-request.v1"
+                and isinstance(context, Mapping) and isinstance(context.get("journal_assignment"), Mapping)):
+            pinned_note = ("\n\nRead the pinned assignment FIRST with universe_read_assignment({}). "
+                           "The Host owns the exact reference and verifies its SHA. Do not retype "
+                           "the Base64 reference or use a shell reader when this tool is supplied.")
         bounded_note = ""
         if str(request.get("repository_write_scope") or "").upper() == "BOUNDED":
             mutation = request.get("mutation_scope")
@@ -1591,17 +1670,21 @@ class RuntimeWorkerDispatcher:
             bounded_note = (
                 "\n\nWrite Scope: you may create or modify only these files: "
                 + ", ".join(str(item) for item in (targets or []))
-                + ". Make each change with the provider's file-change request; the Host "
-                "checks every request against this scope. A change outside it is not "
-                "refused for you: the Host asks the Master, so request it and wait for "
-                "the answer instead of skipping the work. Never delete or move files."
+                + (". Use the supplied universe_edit tool for source reads/edits: read first, then "
+                   "replace/create with the returned exact preimage SHA. The Host checks the live "
+                   "claimed turn, exact scope and current Work Receipt and records the write. "
+                   "If blocked, report the exact code; do not use native apply_patch, guessed "
+                   "helper paths, shell/Python writes, or encoded exec as fallback. "
+                   if request.get("schema") == "universe.codex-worker-request.v1" else
+                   ". Make changes with the provider file-change request within this scope. ")
+                + "Never delete or move files or expand the assignment."
             )
         return (
             f"Task Frame ID: "
             f"{_required_text(request.get('task_frame_id'), 'task_frame_id')}\n"
             f"Turn ID: {_required_text(request.get('turn_id'), 'turn_id')}\n\n"
             f"Context Pack:\n{context_pack}\n\n"
-            f"Output Contract:\n{output_contract}{format_instruction}{role_scope}{bounded_note}"
+            f"Output Contract:\n{output_contract}{format_instruction}{role_scope}{pinned_note}{bounded_note}"
         )
 
     @staticmethod
@@ -1731,6 +1814,10 @@ class RuntimeWorkerDispatcher:
     ) -> str | None:
         """Scope decision, then ask upward for a write the scope does not cover."""
 
+        if (str(task_request.get("worker_run_ref") or "") in self._host_editors
+                and self.describe_write_permission(permission) is not None):
+            # Host-owned edits must pass the receipt gateway, not native approval.
+            return self._reject_task_frame_permission(permission)
         option = self._task_frame_permission_decision(task_request, permission)
         escalator = self.permission_escalator
         if escalator is None:

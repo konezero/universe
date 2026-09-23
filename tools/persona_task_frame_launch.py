@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from todo_execution_journal import JournalError, append as append_journal, append_directive_assignment, collected_context, journal_path
 from task_frame_host import DIRECTIVE_SCHEMA, DIRECTIVES, ROLES
 from task_frame_host_main import launch as launch_host
 from task_frame_host_main import pid_alive
@@ -74,6 +75,8 @@ def validate_write_scope(scope: Any, project_root: Path) -> dict[str, Any]:
         if not path.is_absolute():
             raise LaunchError("TASK_FRAME_SCOPE_INVALID", f"targets must be absolute paths: {target}")
         resolved = path.resolve(strict=False)
+        if resolved == root or resolved.is_dir() or resolved.is_relative_to(root / '.ai/runtime/todo_journals'):
+            raise LaunchError("TASK_FRAME_SCOPE_INVALID", "targets must be files outside Master-owned Todo journals")
         if resolved != root and root not in resolved.parents:
             raise LaunchError("TASK_FRAME_SCOPE_OUTSIDE_PROJECT", f"target is outside the project: {target}")
         if str(resolved) not in normalized:
@@ -150,6 +153,19 @@ def launch_frame(
         # A replay never starts a second Host or re-runs directives; a new
         # request_id is a new frame.
         return {"status": "TASK_FRAME_HOST_REPLAYED", **existing}
+    path = journal_path(project_root, str(todo['todo_id']))
+    previous_results = collected_context(path)
+    if first_role == 'REVIEWER' and 'WORKER' not in previous_results:
+        raise JournalError('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED', 'review needs a collected Worker result')
+    journal_ref = append_journal(
+        path, todo_id=str(todo['todo_id']), owner_ref=str(value['owner_ref']),
+        run_id=run_id, task_frame_id=frame_id, event_id=f'{frame_id}:launch',
+        kind='ASSIGNED', payload={
+            'role': first_role, 'attempt': 1,
+            'todo': {'title': todo.get('title'), 'detail': todo.get('detail')},
+            'persona': persona_text, 'worker_write_scope': scope,
+            'feedback': None, 'collected_results': previous_results,
+        })
     room = rooms.create_boss_room(
         project_id=str(run["project_id"]),
         task_frame_id=frame_id,
@@ -167,6 +183,8 @@ def launch_frame(
         "thread_id": f"persona-{run_id}-host-{frame_id}",
         "runner": "task_frame_host_runner:make",
         "repository_root": str(repository_root),
+        "project_root": str(project_root),
+        "todo_journal": journal_ref,
         "provider": str(value["provider"]).upper(),
         "runtime_binding": dict(runtime_binding),
         "source_ref": f"universe://todo/{todo['todo_id']}",
@@ -181,10 +199,12 @@ def launch_frame(
     pid = launcher(spec, folder / "spec.json", folder / "heartbeat.json")
     # Written at once so a replay before the first heartbeat is still a replay.
     (folder / "launched.json").write_text(
-        json.dumps({"pid": pid, "room_id": room["room_id"], "task_frame_id": frame_id}), encoding="utf-8"
+        json.dumps({"pid": pid, "room_id": room["room_id"], "task_frame_id": frame_id,
+                    "todo_journal": journal_ref, "project_root": str(project_root)}), encoding="utf-8"
     )
     return {
         "status": "TASK_FRAME_HOST_LAUNCHED",
+        "todo_journal": journal_ref,
         "task_frame_id": frame_id,
         "room_id": room["room_id"],
         "pid": pid,
@@ -211,6 +231,17 @@ def post_directive(
         body["role"] = role
     if isinstance(value.get("feedback"), str) and value["feedback"].strip():
         body["feedback"] = value["feedback"]
+    marker_path = host_dir(state_root, task_frame_id) / 'launched.json'
+    marker = json.loads(marker_path.read_text(encoding='utf-8'))
+    if marker.get('todo_journal'):
+        ref = marker['todo_journal']
+        path = journal_path(Path(marker['project_root']), ref['todo_id'])
+        body['journal_assignment'] = append_directive_assignment(
+            path, frame_id=task_frame_id, request_id=str(value['request_id']),
+            directive=directive, role=role, feedback=body.get('feedback'))
+    elif directive != 'DONE':
+        raise LaunchError('TODO_JOURNAL_MIGRATION_REQUIRED',
+                          'legacy Host must finish; launch a journal-backed follow-up')
     message = rooms.post_message(
         str(status["room_id"]),
         {

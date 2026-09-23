@@ -80,3 +80,78 @@ class ProjectDrafts:
             record = {**current, 'project_id': request['project_id'], 'revision': revision + 1, 'fields': dict(fields), 'actor': dict(actor), 'updated_at': datetime.now(timezone.utc).isoformat()}
             connection.execute('INSERT INTO project_authoring_revision VALUES (?, ?, ?, ?, ?)', (draft_id, revision + 1, request_id, digest, json.dumps(record, ensure_ascii=False)))
             return record
+
+    def accept(self, request, actor, materialize):
+        required = {'draft_id', 'revision', 'request_id', 'idempotency_key',
+                    'project_id', 'project_root', 'accepted_fields'}
+        if set(request) != required:
+            raise DraftError('PROJECT_DRAFT_INVALID',
+                             'register requires draft_id, revision, request_id, idempotency_key, project_id, project_root and accepted_fields')
+        draft_id = identifier(request['draft_id'])
+        request_id = identifier(request['request_id'])
+        idempotency_key = identifier(request['idempotency_key'])
+        revision = request['revision']
+        if type(revision) is not int or revision < 1:
+            raise DraftError('PROJECT_DRAFT_INVALID', 'revision must be a positive integer')
+        if not isinstance(request['project_id'], str) or not request['project_id'].strip():
+            raise DraftError('PROJECT_DRAFT_INVALID', 'project_id is required for registration')
+        if not isinstance(request['project_root'], str) or not request['project_root'].strip():
+            raise DraftError('PROJECT_DRAFT_INVALID', 'project_root is required for registration')
+        accepted = request['accepted_fields']
+        if not isinstance(accepted, list) or not accepted or any(
+            not isinstance(item, str) or item not in FIELDS for item in accepted
+        ):
+            raise DraftError('PROJECT_DRAFT_INVALID', 'accepted_fields must name draft fields')
+        content = {key: value for key, value in request.items() if key not in {'request_id', 'idempotency_key'}}
+        digest = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        with self.connection() as connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS project_draft_acceptance (draft_id TEXT NOT NULL, revision INTEGER NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, request_id TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, result TEXT NOT NULL, accepted_at TEXT NOT NULL, PRIMARY KEY(draft_id, revision))')
+            connection.commit()
+
+            # Check every durable replay coordinate before materialization.  The
+            # request id and draft/revision pair are idempotency coordinates too:
+            # a client retry must not register the project a second time merely
+            # because it regenerated one transport key.
+            prior = connection.execute(
+                'SELECT request_digest, result FROM project_draft_acceptance WHERE idempotency_key=?',
+                (idempotency_key,),
+            ).fetchone()
+            if prior:
+                if prior[0] != digest:
+                    raise DraftError('PROJECT_DRAFT_REPLAY_CONFLICT', 'idempotency_key was already used for different content')
+                return json.loads(prior[1])
+            prior = connection.execute(
+                'SELECT request_digest, result FROM project_draft_acceptance WHERE request_id=?',
+                (request_id,),
+            ).fetchone()
+            if prior:
+                if prior[0] != digest:
+                    raise DraftError('PROJECT_DRAFT_REPLAY_CONFLICT', 'request_id was already used for different content')
+                return json.loads(prior[1])
+            prior = connection.execute(
+                'SELECT request_digest, result FROM project_draft_acceptance WHERE draft_id=? AND revision=?',
+                (draft_id, revision),
+            ).fetchone()
+            if prior:
+                if prior[0] != digest:
+                    raise DraftError('PROJECT_DRAFT_REPLAY_CONFLICT', 'draft revision was already accepted with different content')
+                return json.loads(prior[1])
+            row = connection.execute('SELECT record FROM project_authoring_revision WHERE draft_id=? AND revision=?', (draft_id, revision)).fetchone()
+            if row is None:
+                raise DraftError('PROJECT_DRAFT_REVISION_CONFLICT', 'accepted revision is not the current saved draft')
+            draft = json.loads(row[0])
+            latest = connection.execute('SELECT revision FROM project_authoring_revision WHERE draft_id=? ORDER BY revision DESC LIMIT 1', (draft_id,)).fetchone()
+            if latest is None or latest[0] != revision:
+                raise DraftError('PROJECT_DRAFT_REVISION_CONFLICT', 'accepted revision is not the current saved draft')
+            if draft.get('project_id') not in (None, request['project_id']):
+                raise DraftError('PROJECT_DRAFT_SCOPE_CONFLICT', 'draft is already scoped to another project')
+            try:
+                result = materialize(draft, request, actor)
+            except DraftError:
+                raise
+            except Exception as error:
+                raise DraftError('PROJECT_DRAFT_MATERIALIZATION_FAILED', str(error)) from error
+            result = dict(result)
+            result.update({'draft_id': draft_id, 'revision': revision, 'idempotency_key': idempotency_key, 'accepted_fields': list(accepted)})
+            connection.execute('INSERT INTO project_draft_acceptance VALUES (?, ?, ?, ?, ?, ?, ?)', (draft_id, revision, idempotency_key, request_id, digest, json.dumps(result, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+            return result

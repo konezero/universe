@@ -31,6 +31,61 @@ class FakeGateway:
         return
 
 
+class CodexWindowsRuntimeEnvironmentTests(unittest.TestCase):
+    def resolve_environment(self, local, version="codex-cli 0.155.1",
+                            platform="nt", override=None):
+        from universe_runtime_worker_dispatch import _codex_windows_runtime_environment
+        inherited = {} if local is None else {"LOCALAPPDATA": local, "PATH": "keep"}
+        original = dict(inherited)
+        environment = {} if override is None else {"LOCALAPPDATA": override}
+        result = _codex_windows_runtime_environment(
+            environment, version=version, platform=platform, inherited=inherited,
+        )
+        self.assertEqual(original, inherited)
+        self.assertEqual({} if override is None else {"LOCALAPPDATA": override}, environment)
+        self.assertNotIn("PATH", result)
+        return result
+
+    def test_drive_path_preserves_directory_with_extended_spelling(self):
+        self.assertEqual(
+            {"LOCALAPPDATA": r"\\?\C:\Users\user\AppData\Local"},
+            self.resolve_environment(r"C:\Users\user\AppData\Local"),
+        )
+
+    def test_unc_path_and_explicit_child_override(self):
+        self.assertEqual(
+            {"LOCALAPPDATA": r"\\?\UNC\server\share\Local"},
+            self.resolve_environment(r"C:\ignored", override=r"\\server\share\Local"),
+        )
+
+    def test_already_extended_is_not_prefixed_again(self):
+        value = r"\\?\C:\Users\user\AppData\Local"
+        self.assertEqual({}, self.resolve_environment(value))
+        self.assertEqual({"LOCALAPPDATA": value},
+                         self.resolve_environment(None, override=value))
+
+    def test_other_versions_platforms_and_missing_relative_paths_unchanged(self):
+        for version in ["codex-cli 0.154.0", "codex-cli 0.155.2", "UNKNOWN"]:
+            self.assertEqual({}, self.resolve_environment(r"C:\Local", version=version))
+        self.assertEqual({}, self.resolve_environment("/tmp/local", platform="posix"))
+        for value in [None, "", "relative", r"C:relative", r"\rooted"]:
+            self.assertEqual({}, self.resolve_environment(value))
+
+    def test_host_profile_resolution_applies_child_environment(self):
+        import os
+        from types import SimpleNamespace
+        from universe_runtime_worker_dispatch import _resolve_codex
+        selected = SimpleNamespace(executable=Path("codex.exe"), environment={},
+                                   model="test-model", version="codex-cli 0.155.1")
+        with patch("universe_runtime_worker_dispatch.resolve_host_tool", return_value=selected), \
+             patch("universe_runtime_worker_dispatch.os.name", "nt"), \
+             patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Local"}):
+            executable, environment, model = _resolve_codex()
+        self.assertEqual(selected.executable, executable)
+        self.assertEqual("test-model", model)
+        self.assertEqual({"LOCALAPPDATA": r"\\?\C:\Local"}, environment)
+
+
 class RuntimeWorkerDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

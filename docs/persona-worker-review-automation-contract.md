@@ -1,5 +1,53 @@
 ﻿# Persona Worker/Reviewer automation contract
 
+## Recover an already-closed independent Host
+
+POST `/v1/actions` with `action_id: persona.automation.recover-frame-review`.
+The request contains `run_id`, `owner_ref`, `task_frame_id`, `request_id`,
+`expected_revision`, plus either `worker_attempt` and `reviewer_attempt` (positive
+integers) or all four exact `worker_result_ref`, `worker_result_digest`,
+`reviewer_result_ref`, and `reviewer_result_digest` fields. Never mix selectors
+and evidence. The server resolves canonical evidence; it accepts no verdict.
+
+Recovery requires the latest launched Host to be EXITED/MASTER_DONE, unchanged
+Todo project/node scope, the exact owning session, and both results already
+collected. Legacy Hosts without a launch journal still require exactly the
+original Worker and read-only Reviewer. Journal-backed Hosts support rework:
+select the latest assigned attempt of each role, verify contiguous attempts,
+unchanged Todo content/write scope, exact subsequent collections, and a closed
+Master journal. The Reviewer assignment must pin the selected collected Worker
+ref/digest. Missing, stale, orphaned or differently reviewed attempts are rejected.
+The server reads the project-owned Task Frame SQLite stores in read-only mode,
+verifies source/owner/role/sequence/independence, compares immutable result refs
+and SHA-256 digests, and cross-checks execution envelopes.
+
+The Action atomically records the actual persisted verdict and binds a
+TASK_FRAME_RECOVERY assignment and review. It never creates a dispatch or runs a
+provider. Same-request retries replay; conflicting evidence, stale revisions,
+and replacement of an existing assignment/review are rejected. A PASS with an
+incomplete or unverified Worker result is rejected (the explicit completed Worker
+validation values are PASS, PASSED and VERIFIED). PASS additionally requires
+retained original Host input or validated Master journal lineage proving unchanged
+Todo title/detail. Missing transient input alone never authorizes PASS; without
+either content proof, immutable NEEDS_REVISION/BLOCKED may be bound but cannot
+complete. Malformed or conflicting input is rejected.
+NEEDS_REVISION and BLOCKED
+remain non-passing. Recovery leaves the run WAITING with the actual next action;
+it does not close a Todo or mark a run complete. A valid PASS can subsequently use
+the existing complete and Todo validation routes.
+
+## Canonical role collection
+
+For a journal-backed Host, `persona.automation.collect-frame` accepts
+`result_role: WORKER|REVIEWER` and a positive integer `result_attempt` alongside
+`run_id`, `owner_ref`, `task_frame_id`, `status: COMPLETED`, and `request_id`.
+Do not mix these selectors with `result_ref`/`result_digest`. The server reads the
+exact owning role store, computes canonical evidence and applies the same strict
+owner, Todo, terminal-state and execution-envelope checks as explicit evidence.
+The response returns `result_ref` and `result_digest`; deterministic collection
+replay remains unchanged. The selector's COMPLETED status means result collection,
+not Worker acceptance: PARTIAL_VERIFICATION and NEEDS_REVISION remain non-passing.
+
 ## Purpose
 
 A node Master orchestrates work. It may complete a bounded operational item directly,

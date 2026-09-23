@@ -316,6 +316,7 @@ PERSONA_AUTOMATION_ACTION_IDS = (
     "persona.automation.host-directive",
     "persona.automation.host-status",
     "persona.automation.collect-frame",
+    "persona.automation.recover-frame-review",
     "persona.automation.host-permission",
     "persona.automation.host-binding",
 )
@@ -1197,6 +1198,7 @@ def build_default_action_registry(
         "persona.automation.host-directive": ("LOCAL_DATABASE_MUTATION", "host_directive"),
         "persona.automation.host-status": ("READ_ONLY", "host_status"),
         "persona.automation.collect-frame": ("LOCAL_DATABASE_MUTATION", "collect_frame"),
+        "persona.automation.recover-frame-review": ("LOCAL_DATABASE_MUTATION", "recover_frame_review"),
         "persona.automation.host-permission": ("LOCAL_DATABASE_MUTATION", "host_permission"),
         "persona.automation.host-binding": ("READ_ONLY", "host_binding"),
     }
@@ -1305,13 +1307,13 @@ def build_default_action_registry(
                               "request_fields": ["operation_id?"] if action_id == "service.status" else ["request_id", "expected_pid"]},
                 ), supplied_handlers[action_id], surfaces=(action_id,),
             )
-    for action_id in ("project.draft.read", "project.draft.list", "project.draft.save"):
+    for action_id in ("project.draft.read", "project.draft.list", "project.draft.save", "project.draft.register"):
         if action_id in supplied_handlers:
             registry.register(ActionContract(
                 action_id=action_id,
                 request_schema_ref=f"universe.{action_id}-request.v1",
-                result_schema_ref="universe.project-draft-action.v1",
-                side_effect_class="LOCAL_DATABASE_MUTATION" if action_id.endswith("save") else "READ_ONLY",
+                result_schema_ref="universe.project-draft-register.v1" if action_id == "project.draft.register" else "universe.project-draft-action.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION" if action_id in ("project.draft.save", "project.draft.register") else "READ_ONLY",
                 metadata={"ownership": "PROJECT_AUTHORING", "revision_control": "EXPECTED_REVISION",
                           "fields": ["title", "domain", "description", "goal", "target_users", "scenarios", "structure", "capabilities", "validation", "constraints", "project_root"]},
             ), supplied_handlers[action_id], surfaces=(action_id,))

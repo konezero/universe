@@ -17,6 +17,7 @@ All calls use POST /v1/actions with action_id and request.
 - project.draft.read: `{ "draft_id": "draft_example" }`. An unknown id returns revision 0 with empty fields; it creates no draft record.
 - project.draft.list: `{}` or `{ "project_id": "TEST" }` returns current revisions.
 - project.draft.save: `{ "draft_id": "draft_example", "project_id": null, "expected_revision": 0, "request_id": "unique-request", "fields": { ...all fields... } }`.
+- project.draft.register: `{ "draft_id": "draft_example", "revision": 1, "request_id": "register-request", "idempotency_key": "register-key", "project_id": "PROJECT", "project_root": "C:/project", "accepted_fields": ["title", "goal"] }`. The server reads the canonical revision, materializes through the project registration gateway, and records acceptance only after success. Replays return the durable result; changed keys and stale revisions conflict.
 
 An exact repeated request returns its original revision without another write. Reusing its request id with different content fails. A stale expected_revision returns PROJECT_DRAFT_REVISION_CONFLICT (409). Earlier revisions remain available in the database audit history.
 

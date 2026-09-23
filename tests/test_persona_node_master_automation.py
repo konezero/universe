@@ -1057,6 +1057,32 @@ class NodeMasterAutomationTests(unittest.TestCase):
             status, result = self.act("persona.automation.launch-frame", body)
         return status, result, spawned
 
+    def _journal_result_fixture(self, anchor, frame, todo_id, role="worker"):
+        import hashlib, json, sqlite3
+        from todo_execution_journal import digest
+        sessions = [s for s in self.server.session_supervisor.list_sessions(include_hidden=True)
+                    if s.get("session_anchor_ref") == anchor]
+        session = sessions[0]["session_id"]
+        root = Path(self.server.store.get_project("TEST")["project_root"])
+        role_frame = frame + "_" + role + "_1"
+        path = root / ".ai/runtime/task_frames" / (hashlib.sha256(
+            (session + "\0" + role_frame).encode()).hexdigest()[:24] + ".sqlite3")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        result = {"outcome": "PARTIAL", "result_text": "fixture", "evidence_refs": [], "validation_state": "NOT_RUN"} if role == "worker" else {
+            "verdict": "NEEDS_REVISION", "note": "fixture", "next_action": "verify", "evidence_refs": []}
+        receipt = "fixture-" + role
+        envelope = {"worker_id": role, "result": result, "status": "COMPLETED", "result_receipt_ref": receipt}
+        from contextlib import closing
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE TABLE task_frame_context(frame_id, origin_session_id, origin_anchor_ref, source_ref)")
+            db.execute("INSERT INTO task_frame_context VALUES(?,?,?,?)", (role_frame, session, anchor, "universe://todo/" + todo_id))
+            db.execute("CREATE TABLE task_turns(turn_id, state, result_json, claimed_by)")
+            db.execute("INSERT INTO task_turns VALUES(?,?,?,?)", (role+"-turn", "COMPLETED", json.dumps(result), role))
+            db.execute("CREATE TABLE worker_execution_state(turn_id, result_receipt_ref, worker_result_envelope_json)")
+            db.execute("INSERT INTO worker_execution_state VALUES(?,?,?)", (role+"-turn", receipt, json.dumps(envelope)))
+        return {"result_ref": "task-frame-result://" + role_frame + "/" + role + "-turn/" + receipt,
+                "result_digest": digest(result)}
+
     def test_master_launches_a_host_and_the_run_records_it(self):
         anchor, node_ref, run = self._start_driven_run("frame-launch")
         todo = self._frame_todo(node_ref)
@@ -1104,6 +1130,8 @@ class NodeMasterAutomationTests(unittest.TestCase):
         todo = self._frame_todo(node_ref, "Collect Todo")
         status, launched, _spawned = self._launch(anchor, run, todo, request_id="collect-1")
         frame = launched["task_frame_id"]
+        worker_result = self._journal_result_fixture(anchor, frame, todo["todo_id"])
+        reviewer_result = self._journal_result_fixture(anchor, frame, todo["todo_id"], "reviewer")
         active_plan = self.server._persona_automation_plan({
             "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "frame-active-plan",
         }, record=False)
@@ -1119,7 +1147,7 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME_COLLECT_STATUS_INVALID", bad["error_code"])
         status, collected = self.act("persona.automation.collect-frame", {
             "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
-            "result_ref": "task-frame-result://x", "request_id": "c4"})
+            **worker_result, "request_id": "c4"})
         self.assertEqual(200, status, collected)
         self.assertEqual("TASK_FRAME_COLLECTED", collected["status"])
         parked = self.server.persona_automation.get_run(run["run_id"])
@@ -1133,14 +1161,102 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual(todo["todo_id"], collected_plan["decision"]["target"]["assignment"]["todo_id"])
         status, again = self.act("persona.automation.collect-frame", {
             "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
-            "result_ref": "task-frame-result://x", "request_id": "c5"})
+            **worker_result, "request_id": "c5"})
         self.assertEqual(200, status, again)
         self.assertEqual(collected["event_id"], again["event_id"])
+        status, reviewed = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
+            **reviewer_result, "request_id": "c-review"})
+        self.assertEqual(200, status, reviewed)
+        self.assertNotEqual(collected["event_id"], reviewed["event_id"])
+        status, conflict = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame, "status": "COMPLETED",
+            **reviewer_result, "result_digest": "c" * 64, "request_id": "c-conflict"})
+        self.assertEqual(409, status, conflict)
+        self.assertEqual("TODO_JOURNAL_RESULT_INVALID", conflict["error_code"])
         status, host_status = self.act("persona.automation.host-status", {
             "run_id": run["run_id"], "task_frame_id": frame})
         self.assertEqual(200, status, host_status)
         self.assertTrue(host_status["known"])
 
+
+
+    def test_collect_role_selector_resolves_exact_evidence_and_replays(self):
+        anchor,node,run=self._start_driven_run('canonical-result-selector')
+        todo=self._frame_todo(node,'Canonical result collection')
+        status,launched,_=self._launch(anchor,run,todo,request_id='canonical-1')
+        self.assertEqual(200,status,launched)
+        frame=launched['task_frame_id']
+        exact=self._journal_result_fixture(anchor,frame,todo['todo_id'])
+        body=dict(run_id=run['run_id'],owner_ref=anchor,task_frame_id=frame,
+                  status='COMPLETED',request_id='canonical-collect',result_role='WORKER',result_attempt=1)
+        status,result=self.act('persona.automation.collect-frame',body)
+        self.assertEqual(200,status,result)
+        self.assertEqual(exact['result_ref'],result['result_ref'])
+        self.assertEqual(exact['result_digest'],result['result_digest'])
+        status,replay=self.act('persona.automation.collect-frame',{**body,'request_id':'canonical-replay'})
+        self.assertEqual(200,status,replay)
+        self.assertEqual(result['event_id'],replay['event_id'])
+        for changes in ({'result_ref':exact['result_ref']},{'result_attempt':True},{'result_role':'MASTER'},
+                        {'status':'FAILED'},{'result_attempt':0}):
+            status,blocked=self.act('persona.automation.collect-frame',{**body,**changes})
+            self.assertEqual(409,status,blocked)
+            self.assertEqual('TODO_JOURNAL_RESULT_SELECTOR_INVALID',blocked['error_code'])
+        status,blocked=self.act('persona.automation.collect-frame',{**body,'owner_ref':'other'})
+        self.assertEqual(409,status,blocked)
+
+    def test_recover_frame_review_action_validates_owner_and_closed_host(self):
+        import json
+        from unittest import mock
+        import universe_server as server_module
+        anchor, node_ref, run = self._start_driven_run("frame-review-recovery")
+        todo = self._frame_todo(node_ref, "Recover reviewed Todo")
+        status, launched, spawned = self._launch(anchor, run, todo, request_id="recover-1")
+        self.assertEqual(200, status, launched)
+        frame = launched["task_frame_id"]
+        spec_path = self.server._persona_task_frame_state_root() / frame / "spec.json"
+        spec_path.write_text(json.dumps(spawned[0]), encoding="utf-8")
+        body = {"run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+                "request_id": "recover", "expected_revision": run["revision"],
+                "worker_result_ref": "task-frame-result://worker", "worker_result_digest": "a"*64,
+                "reviewer_result_ref": "task-frame-result://reviewer", "reviewer_result_digest": "b"*64}
+        with mock.patch.object(server_module, "task_frame_host_status",
+                               return_value={"alive":False,"phase":"EXITED","exit_reason":"MASTER_DONE"}), \
+             mock.patch.object(self.server.persona_automation,"recover_host_review",
+                               return_value={"status":"TASK_FRAME_REVIEW_RECOVERED"}) as recover:
+            status, wrong = self.act("persona.automation.recover-frame-review",
+                                     {**body,"owner_ref":"other"})
+            self.assertEqual(409,status,wrong)
+            recover.assert_not_called()
+            status, invalid = self.act("persona.automation.recover-frame-review",
+                                       {**body,"outcome":"PASS"})
+            self.assertEqual(400,status,invalid)
+            recover.assert_not_called()
+            status, result = self.act("persona.automation.recover-frame-review",body)
+            self.assertEqual(200,status,result)
+            recover.assert_called_once()
+            self.assertEqual(anchor,recover.call_args.args[0]["owner_ref"])
+            self.assertTrue(recover.call_args.kwargs["session_id"])
+            self.assertTrue(recover.call_args.kwargs["completion_provenance_verified"])
+            spec_path.unlink()  # Production Hosts delete this transient input on exit.
+            status, result = self.act("persona.automation.recover-frame-review",body)
+            self.assertEqual(200,status,result)
+            self.assertFalse(recover.call_args.kwargs["completion_provenance_verified"])
+            worker=self._journal_result_fixture(anchor,frame,todo['todo_id'])
+            reviewer=self._journal_result_fixture(anchor,frame,todo['todo_id'],'reviewer')
+            selected={k:v for k,v in body.items() if k not in {'worker_result_ref','worker_result_digest','reviewer_result_ref','reviewer_result_digest'}}
+            selected.update(worker_attempt=1,reviewer_attempt=1)
+            status,result=self.act('persona.automation.recover-frame-review',selected)
+            self.assertEqual(200,status,result)
+            self.assertEqual(worker['result_ref'],recover.call_args.args[0]['worker_result_ref'])
+            self.assertEqual(reviewer['result_digest'],recover.call_args.args[0]['reviewer_result_digest'])
+            status,blocked=self.act('persona.automation.recover-frame-review',{**selected,'worker_result_ref':'supplied'})
+            self.assertEqual(409,status,blocked)
+        with mock.patch.object(server_module,"task_frame_host_status",
+                               return_value={"alive":True,"phase":"RUNNING_WORKER"}):
+            status, rejected = self.act("persona.automation.recover-frame-review",body)
+            self.assertEqual(409,status,rejected)
+            self.assertEqual("TASK_FRAME_RECOVERY_HOST_NOT_CLOSED",rejected["error_code"])
 
     def test_host_directive_accepts_target_role_through_the_action_gateway(self):
         from task_frame_host import parse_directive
@@ -1149,6 +1265,15 @@ class NodeMasterAutomationTests(unittest.TestCase):
         todo = self._frame_todo(node_ref, "Target Role Todo")
         status, launched, _spawned = self._launch(anchor, run, todo, request_id="target-role-1")
         frame = launched["task_frame_id"]
+        status, blocked = self.act("persona.automation.host-directive", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+            "directive": "RUN_ROLE", "target_role": "reviewer", "request_id": "before-collect"})
+        self.assertEqual("TODO_JOURNAL_WORKER_COLLECTION_REQUIRED", blocked["error_code"])
+        worker_result = self._journal_result_fixture(anchor, frame, todo["todo_id"])
+        status, collected = self.act("persona.automation.collect-frame", {
+            "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
+            "status": "COMPLETED", "request_id": "before-review", **worker_result})
+        self.assertEqual(200, status, collected)
         status, posted = self.act("persona.automation.host-directive", {
             "run_id": run["run_id"], "owner_ref": anchor, "task_frame_id": frame,
             "directive": "RUN_ROLE", "target_role": "reviewer", "request_id": "tr-1"})

@@ -91,6 +91,200 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         )
         return result["run"]
 
+    def test_host_collections_distinguish_role_and_attempt_results(self):
+        run = self.start()
+        frame = "host_collection_test"
+        worker = {"status": "COMPLETED", "result_ref": "task-frame-result://worker_1/result",
+                  "result_digest": "a" * 64, "cycle": "SESSION_ANCHOR_CYCLE_APPENDED"}
+        reviewer = {**worker, "result_ref": "task-frame-result://reviewer_1/result",
+                    "result_digest": "b" * 64}
+        first = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, worker)
+        second = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, reviewer)
+        self.assertNotEqual(first["event_id"], second["event_id"])
+        replay = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, reviewer)
+        self.assertEqual(second["event_id"], replay["event_id"])
+        rework = {**worker, "result_ref": "task-frame-result://worker_2/result"}
+        third = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, rework)
+        self.assertNotEqual(first["event_id"], third["event_id"])
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame,
+                                         {**reviewer, "result_digest": "c" * 64})
+        self.assertEqual("PERSONA_AUTOMATION_EVENT_IDEMPOTENCY_CONFLICT", error.exception.code)
+        current = self.store.get_run(run["run_id"])
+        self.assertEqual("WAITING", current["state"])
+        self.assertIsNone(current["current_review"])
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.complete_run({"run_id": run["run_id"], "complete": True, "request_id": "no-pass"})
+        self.assertEqual("PERSONA_AUTOMATION_REVIEW_REQUIRED", error.exception.code)
+
+    def test_host_collection_replays_pre_upgrade_result_without_duplication(self):
+        run = self.start()
+        frame = "host_legacy"
+        payload = {"status": "COMPLETED", "result_ref": "task-frame-result://legacy-worker"}
+        with self.store._connection() as connection:
+            original, _ = self.store._event(
+                connection, run["run_id"], "TASK_FRAME_COLLECTED",
+                f"frame-host:TASK_FRAME_COLLECTED:{frame}:COMPLETED",
+                {"task_frame_id": frame, **payload})
+        replay = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, payload)
+        self.assertEqual(original["event_id"], replay["event_id"])
+        reviewer = self.store.record_host_event(
+            run["run_id"], "TASK_FRAME_COLLECTED", frame,
+            {**payload, "result_ref": "task-frame-result://new-reviewer"})
+        self.assertNotEqual(original["event_id"], reviewer["event_id"])
+
+    def test_host_collection_without_result_keeps_legacy_replay_key(self):
+        run = self.start()
+        payload = {"status": "FAILED"}
+        first = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", "host_failed", payload)
+        again = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", "host_failed", payload)
+        self.assertEqual(first["event_id"], again["event_id"])
+
+
+    def _recovery_fixture(self, verdict="NEEDS_REVISION", outcome="INCOMPLETE", validation="PARTIAL"):
+        import hashlib
+        import json
+        from contextlib import closing
+        run = self.start()
+        root = Path(self.tmp.name) / "project"
+        frames = root / ".ai/runtime/task_frames"
+        frames.mkdir(parents=True)
+        session = "session_recovery"
+        frame = "host_recovery"
+        todo = "todo_recovery"
+        self.store.record_host_event(run["run_id"], "TASK_FRAME_HOST_LAUNCHED", frame, {"todo_id": todo})
+        value = {"run_id": run["run_id"], "owner_ref": run["session_anchor_ref"],
+                 "task_frame_id": frame, "request_id": "recover-one"}
+        for role in ("worker", "reviewer"):
+            role_frame = f"{frame}_{role}_1"
+            digest = hashlib.sha256(f"{session}\0{role_frame}".encode()).hexdigest()[:24]
+            result = ({"outcome": outcome, "validation_state": validation,
+                       "result_text": "actual result", "evidence_refs": ["test://verification"]}
+                      if role == "worker" else
+                      {"verdict": verdict, "note": "persisted verdict", "next_action": "follow actual verdict",
+                       "evidence_refs": ["test://independent"]})
+            receipt = "provider:" + role
+            actor = "actor:" + role
+            turn = role + "-turn"
+            envelope = {"status": "COMPLETED", "turn_id": turn, "result": result,
+                        "result_receipt_ref": receipt, "worker_id": actor}
+            with closing(sqlite3.connect(frames / (digest + ".sqlite3"))) as db, db:
+                db.executescript("""
+                    CREATE TABLE task_frame_context(frame_id,origin_session_id,origin_anchor_ref,
+                        source_ref,task_state,source_commit);
+                    CREATE TABLE task_turns(turn_id,state,claimed_by,result_json,created_at,completed_at);
+                    CREATE TABLE worker_execution_state(turn_id,result_receipt_ref,
+                        worker_result_envelope_json,worker_actor_ref);
+                    CREATE TABLE task_instructions(instruction_ordinal,expected_output_json,repository_write_scope);
+                """)
+                db.execute("INSERT INTO task_frame_context VALUES (?,?,?,?,?,?)",
+                           (role_frame,session,run["session_anchor_ref"],"universe://todo/"+todo,"COMPLETED","source-one"))
+                db.execute("INSERT INTO task_turns VALUES (?,?,?,?,?,?)",
+                           (turn,"COMPLETED",actor,json.dumps(result),
+                            "2026-09-22T01:00:00Z" if role == "worker" else "2026-09-22T02:00:00Z",
+                            "2026-09-22T01:30:00Z" if role == "worker" else "2026-09-22T02:30:00Z"))
+                db.execute("INSERT INTO worker_execution_state VALUES (?,?,?,?)",
+                           (turn,receipt,json.dumps(envelope),actor))
+                db.execute("INSERT INTO task_instructions VALUES (?,?,?)",
+                           (1,json.dumps({"schema":f"universe.task-frame-host-{role}-output.v1"}),"NONE"))
+            value[role+"_result_ref"] = f"task-frame-result://{role_frame}/{turn}/{receipt}"
+            value[role+"_result_digest"] = hashlib.sha256(json.dumps(
+                result,ensure_ascii=True,separators=(",",":"),sort_keys=True).encode()).hexdigest()
+            self.store.record_host_event(run["run_id"],"TASK_FRAME_COLLECTED",frame,
+                {"status":"COMPLETED","result_ref":value[role+"_result_ref"],
+                 "result_digest":value[role+"_result_digest"]})
+        value["expected_revision"] = self.store.get_run(run["run_id"])["revision"]
+        return root, session, value
+
+    def test_recover_fourth_journal_pair_binds_and_completes_without_transient_spec(self):
+        from test_task_frame_review_provenance import ReworkProvenanceTests
+        evidence=ReworkProvenanceTests();evidence.setUp();self.addCleanup(evidence.doCleanups)
+        run=self.start();evidence.owner=run['session_anchor_ref'];evidence.run=run['run_id']
+        evidence.identity.update(owner_ref=evidence.owner,run_id=evidence.run)
+        evidence.build()
+        self.store.record_host_event(run['run_id'],'TASK_FRAME_HOST_LAUNCHED',evidence.frame,
+            {'todo_id':evidence.todo,'todo_journal':evidence.launch})
+        for role in ('worker','reviewer'):
+            result=evidence.latest[role.upper()]
+            self.store.record_host_event(run['run_id'],'TASK_FRAME_COLLECTED',evidence.frame,
+                {k:result[k] for k in ('status','result_ref','result_digest')})
+        value=dict(run_id=run['run_id'],owner_ref=run['session_anchor_ref'],task_frame_id=evidence.frame,
+                   request_id='fourth-review',expected_revision=self.store.get_run(run['run_id'])['revision'],**evidence.pairs[4])
+        result=self.store.recover_host_review(value,repository_root=evidence.root,session_id=evidence.session,
+                                              current_todo=evidence.content)
+        self.assertEqual('PASS',result['review']['outcome'])
+        self.assertEqual('REVIEWED',result['run']['current_assignment']['state'])
+        replay=self.store.recover_host_review(value,repository_root=evidence.root,session_id=evidence.session,current_todo=evidence.content)
+        self.assertEqual('TASK_FRAME_REVIEW_RECOVERY_REPLAYED',replay['status'])
+        completed=self.store.complete_run(dict(run_id=run['run_id'],complete=True,request_id='complete-fourth',
+                                               expected_revision=result['run']['revision']))
+        self.assertEqual('COMPLETED',completed['run']['state'])
+
+    def test_recover_host_review_preserves_needs_revision_and_replays(self):
+        root, session, value = self._recovery_fixture()
+        result = self.store.recover_host_review(value,repository_root=root,session_id=session)
+        self.assertEqual("TASK_FRAME_REVIEW_RECOVERED",result["status"])
+        self.assertEqual("NEEDS_REVISION",result["review"]["outcome"])
+        self.assertEqual("REVIEWED",result["run"]["current_assignment"]["state"])
+        replay = self.store.recover_host_review(value,repository_root=root,session_id=session)
+        self.assertEqual("TASK_FRAME_REVIEW_RECOVERY_REPLAYED",replay["status"])
+        self.assertEqual(result["run"]["revision"],replay["run"]["revision"])
+        with self.assertRaises(PersonaAutomationError):
+            self.store.complete_run({"run_id":value["run_id"],"complete":True,"request_id":"cannot-complete"})
+
+    def test_recover_host_review_pass_allows_existing_complete_contract(self):
+        root, session, value = self._recovery_fixture("PASS","SUCCEEDED","PASSED")
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.recover_host_review(value,repository_root=root,session_id=session)
+        self.assertEqual("TASK_FRAME_RECOVERY_COMPLETION_PROVENANCE_MISSING", error.exception.code)
+        self.assertIsNone(self.store.get_run(value["run_id"])["current_review"])
+        result = self.store.recover_host_review(value,repository_root=root,session_id=session,
+                                                completion_provenance_verified=True)
+        completed = self.store.complete_run({"run_id":value["run_id"],"complete":True,
+                                            "expected_revision":result["run"]["revision"],"request_id":"complete"})
+        self.assertEqual("COMPLETED",completed["run"]["state"])
+
+    def test_recover_host_review_does_not_promote_partial_worker_to_pass(self):
+        root, session, value = self._recovery_fixture("PASS")
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.recover_host_review(value,repository_root=root,session_id=session)
+        self.assertEqual("TASK_FRAME_RECOVERY_EVIDENCE_INVALID",error.exception.code)
+        self.assertIsNone(self.store.get_run(value["run_id"])["current_assignment"])
+
+    def test_recover_host_review_rejects_wrong_owner_digest_revision_and_overwrite(self):
+        root, session, value = self._recovery_fixture()
+        cases = [
+            ({"owner_ref":"other"},"TASK_FRAME_OWNER_MISMATCH"),
+            ({"reviewer_result_digest":"f"*64},"TASK_FRAME_RECOVERY_EVIDENCE_INVALID"),
+            ({"expected_revision":-1},"PERSONA_AUTOMATION_REVISION_CONFLICT"),
+        ]
+        for override, code in cases:
+            with self.subTest(code=code), self.assertRaises(PersonaAutomationError) as error:
+                self.store.recover_host_review({**value,**override},repository_root=root,session_id=session)
+            self.assertEqual(code,error.exception.code)
+        result = self.store.recover_host_review(value,repository_root=root,session_id=session)
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.recover_host_review({**value,"request_id":"other","expected_revision":result["run"]["revision"]},
+                                          repository_root=root,session_id=session)
+        self.assertEqual("TASK_FRAME_RECOVERY_ASSIGNMENT_EXISTS",error.exception.code)
+
+    def test_recover_host_review_rejects_tampered_envelope_and_foreign_todo(self):
+        import hashlib
+        from contextlib import closing
+        root, session, value = self._recovery_fixture()
+        frame = value["task_frame_id"]+"_reviewer_1"
+        digest = hashlib.sha256(f"{session}\0{frame}".encode()).hexdigest()[:24]
+        path = root/".ai/runtime/task_frames"/(digest+".sqlite3")
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE task_frame_context SET source_ref='universe://todo/foreign'")
+        with self.assertRaises(PersonaAutomationError):
+            self.store.recover_host_review(value,repository_root=root,session_id=session)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE task_frame_context SET source_ref='universe://todo/todo_recovery'")
+            db.execute("UPDATE worker_execution_state SET worker_result_envelope_json='{}'")
+        with self.assertRaises(PersonaAutomationError):
+            self.store.recover_host_review(value,repository_root=root,session_id=session)
+
     def test_start_is_assignment_pinned_and_idempotent(self):
         run = self.start()
         self.assertEqual("RUNNING", run["state"])
@@ -689,6 +883,9 @@ class PersonaAutomationStoreTests(unittest.TestCase):
                 }
 
         class Automation:
+            def list_host_frames(self, run_id):
+                return []
+
             def get_run(self, run_id):
                 return dict(run)
 
@@ -807,6 +1004,9 @@ class PersonaAutomationStoreTests(unittest.TestCase):
                 return {"feature_id": feature_id, "meeting_room_id": "room-design"}
 
         class MeetingAutomation:
+            def list_host_frames(self, run_id):
+                return []
+
             def get_run(self, run_id):
                 return dict(run)
 

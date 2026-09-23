@@ -63,6 +63,7 @@ from session_anchor_transport import (
 )
 from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
 from session_anchor_cycle import append_cycle_result
+from todo_execution_journal import JournalError, append as append_todo_journal, journal_path, read_role_result, resolve_role_result
 from persona_task_frame_launch import (
     LaunchError,
     host_status as task_frame_host_status,
@@ -31828,6 +31829,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.host-directive",
                     "persona.automation.host-status",
                     "persona.automation.collect-frame",
+                    "persona.automation.recover-frame-review",
                     "persona.automation.host-permission",
                     "persona.automation.host-binding",
                 )
@@ -31838,6 +31840,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "project.draft.read": self._handle_project_draft_read_action,
                 "project.draft.list": self._handle_project_draft_list_action,
                 "project.draft.save": self._handle_project_draft_save_action,
+                "project.draft.register": self._handle_project_draft_register_action,
                 "service.status": self._handle_service_status_action,
                 "service.restart": self._handle_service_restart_action,
                 FEATURE_CREATE_ACTION_ID: self._handle_feature_create_action,
@@ -36946,7 +36949,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "read persona.automation.host-status. When the result is in, collect it yourself with "
             "persona.automation.collect-frame {run_id, owner_ref, task_frame_id, status: "
             "COMPLETED|FAILED|CANCELLED, result_ref, result_digest, request_id}; that appends the "
-            "cycle to your Session Anchor. Defects a Reviewer finds inside the Todo's own scope are "
+            "cycle to your Session Anchor and appends verified evidence to the Master-owned Todo journal. "
+            "Collect EACH Worker/Reviewer result before issuing the next role directive. New Hosts read "
+            "pinned journal assignments, not bulk history in their prompt. Workers must never write that journal. "
+            "Defects a Reviewer finds inside the Todo's own scope are "
             "yours to get fixed, not the operator's: send REWORK to the Worker with the Reviewer's "
             "findings as feedback, then RUN_ROLE REVIEWER again, and repeat until the Reviewer reports "
             "no defect and the tests it ran pass. Send DONE to the Host only after that (a Host that "
@@ -37660,12 +37666,69 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 }
             if action_id == "persona.automation.host-permission":
                 return self._handle_persona_host_permission(request, state_root, require_owner, require_launched)
+            if action_id == "persona.automation.recover-frame-review":
+                value = _exact_object_fields(
+                    request, field="persona_automation_recover_frame_review",
+                    required=frozenset({"run_id", "owner_ref", "task_frame_id", "request_id", "expected_revision"}),
+                    optional=frozenset({"worker_result_ref", "worker_result_digest",
+                                        "reviewer_result_ref", "reviewer_result_digest",
+                                        "worker_attempt", "reviewer_attempt"}))
+                run = self.persona_automation.get_run(value["run_id"])
+                require_owner(run, value["owner_ref"], "recover its Host review")
+                require_launched(value["run_id"], value["task_frame_id"])
+                frame = _identifier(value["task_frame_id"], "task_frame_id")
+                observed = task_frame_host_status(state_root, frame)
+                if observed.get("alive") or observed.get("phase") != "EXITED" or observed.get("exit_reason") != "MASTER_DONE":
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_HOST_NOT_CLOSED",
+                                                 "recovery requires an already-closed Host", 409)
+                launched = self.persona_automation.host_frame_launched(value["run_id"], frame)
+                todo = self.store.get_todo(launched["todo_id"])
+                spec_path = (state_root / frame / "spec.json").resolve()
+                if not spec_path.is_relative_to(state_root.resolve()):
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", "invalid Host spec path", 409)
+                spec = None
+                try:
+                    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    pass  # Exited Hosts remove transient input; never infer PASS.
+                except (OSError, ValueError) as error:
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", "Host spec unreadable", 409) from error
+                if (todo.get("project_id") != run["project_id"]
+                        or todo.get("node_ref") != run.get("node_ref") or todo.get("archived_at")):
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_SCOPE_CHANGED", "Todo scope changed", 409)
+                if spec is not None and (not isinstance(spec, dict)
+                        or spec.get("run_id") != run["run_id"] or spec.get("todo_id") != todo["todo_id"]
+                        or spec.get("task_frame_id") != frame
+                        or spec.get("todo") != {"title": todo.get("title"), "detail": todo.get("detail")}):
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_SCOPE_CHANGED",
+                                                 "Todo content or Host identity changed", 409)
+                sessions = [item for item in self.session_supervisor.list_sessions(include_hidden=True)
+                            if item.get("session_anchor_ref") == run["session_anchor_ref"]]
+                if len(sessions) != 1:
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_SESSION_UNAVAILABLE",
+                                                 "owner must resolve to one durable session", 409)
+                project_root = Path(self.store.get_project(run["project_id"])["project_root"])
+                selector_keys = {"worker_attempt", "reviewer_attempt"}
+                evidence_keys = {"worker_result_ref", "worker_result_digest", "reviewer_result_ref", "reviewer_result_digest"}
+                if selector_keys & value.keys():
+                    if not selector_keys <= value.keys() or evidence_keys & value.keys():
+                        raise JournalError("TODO_JOURNAL_RESULT_SELECTOR_INVALID", "use attempts or exact evidence, never both")
+                    for role in ("worker", "reviewer"):
+                        resolved = resolve_role_result(project_root,sessions[0]["session_id"],run["session_anchor_ref"],
+                            frame,todo["todo_id"],role.upper(),value.pop(role+"_attempt"))
+                        value[role+"_result_ref"], value[role+"_result_digest"] = resolved["result_ref"], resolved["result_digest"]
+                elif not evidence_keys <= value.keys():
+                    raise JournalError("TODO_JOURNAL_RESULT_SELECTOR_INVALID", "complete role evidence or attempts required")
+                return self.persona_automation.recover_host_review(
+                    value, repository_root=project_root, session_id=sessions[0]["session_id"],
+                    completion_provenance_verified=spec is not None,
+                    current_todo={"title":todo.get("title"),"detail":todo.get("detail")})
             if action_id == "persona.automation.collect-frame":
                 value = _exact_object_fields(
                     request,
                     field="persona_automation_collect_frame",
                     required=frozenset({"run_id", "owner_ref", "task_frame_id", "status", "request_id"}),
-                    optional=frozenset({"result_ref", "result_digest", "detail"}),
+                    optional=frozenset({"result_ref", "result_digest", "detail", "result_role", "result_attempt"}),
                 )
                 run = self.persona_automation.get_run(value["run_id"])
                 require_owner(run, value["owner_ref"], "collect its Task Frame")
@@ -37676,6 +37739,41 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "TASK_FRAME_COLLECT_STATUS_INVALID",
                         "status must be COMPLETED, FAILED or CANCELLED",
                     )
+                launched = self.persona_automation.host_frame_launched(value["run_id"], value["task_frame_id"])
+                journal_ref = None
+                if {"result_role","result_attempt"} & value.keys():
+                    if (not {"result_role","result_attempt"} <= value.keys() or status != "COMPLETED"
+                            or {"result_ref","result_digest"} & value.keys() or not launched.get("todo_journal")):
+                        raise JournalError("TODO_JOURNAL_RESULT_SELECTOR_INVALID", "use a completed journal role/attempt or exact evidence, never both")
+                    sessions = [s for s in self.session_supervisor.list_sessions(include_hidden=True)
+                                if s.get("session_anchor_ref") == run["session_anchor_ref"]]
+                    if len(sessions) != 1:
+                        raise JournalError("TODO_JOURNAL_OWNER_UNAVAILABLE", "one durable owner session required")
+                    resolved = resolve_role_result(Path(self.store.get_project(run["project_id"])["project_root"]),
+                        sessions[0]["session_id"],run["session_anchor_ref"],value["task_frame_id"],
+                        launched["todo_id"],value["result_role"],value["result_attempt"])
+                    value["result_ref"], value["result_digest"] = resolved["result_ref"], resolved["result_digest"]
+                if launched.get("todo_journal"):
+                    project_root = Path(self.store.get_project(run["project_id"])["project_root"])
+                    todo_id = launched["todo_id"]
+                    payload = {"status": status, "result_ref": value.get("result_ref"),
+                               "result_digest": value.get("result_digest")}
+                    if status == "COMPLETED" and value.get("result_ref"):
+                        sessions = [s for s in self.session_supervisor.list_sessions(include_hidden=True)
+                                    if s.get("session_anchor_ref") == run["session_anchor_ref"]]
+                        if len(sessions) != 1:
+                            raise JournalError("TODO_JOURNAL_OWNER_UNAVAILABLE", "one durable owner session required")
+                        payload.update(read_role_result(
+                            project_root, sessions[0]["session_id"], run["session_anchor_ref"],
+                            value["task_frame_id"], todo_id, value["result_ref"],
+                            str(value.get("result_digest") or "")))
+                    journal_ref = append_todo_journal(
+                        journal_path(project_root, todo_id), todo_id=todo_id,
+                        owner_ref=value["owner_ref"], run_id=value["run_id"],
+                        task_frame_id=value["task_frame_id"],
+                        event_id=value["task_frame_id"] + ":collect:" + hashlib.sha256(
+                            str(value.get("result_ref") or value["request_id"]).encode()).hexdigest(),
+                        kind="RESULT_COLLECTED", payload=payload)
                 cycle = self._append_task_frame_cycle(
                     run,
                     value["task_frame_id"],
@@ -37689,12 +37787,16 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     value["run_id"],
                     "TASK_FRAME_COLLECTED",
                     value["task_frame_id"],
-                    {"status": status, "result_ref": value.get("result_ref"), "cycle": cycle.get("status")},
+                    {"status": status, "result_ref": value.get("result_ref"),
+                     **({"result_digest": value["result_digest"]} if value.get("result_digest") is not None else {}), "cycle": cycle.get("status")},
                 )
                 return {
                     "status": "TASK_FRAME_COLLECTED",
                     "task_frame_id": value["task_frame_id"],
                     "collected_status": status,
+                    "result_ref": value.get("result_ref"),
+                    "result_digest": value.get("result_digest"),
+                    "todo_journal": journal_ref,
                     "cycle": cycle,
                     "event_id": event.get("event_id"),
                 }
@@ -37764,12 +37866,13 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         "repository_write_scope": result["repository_write_scope"],
                         "mutation_scope": result["mutation_scope"],
                         "persona_id": persona_id or None,
+                        "todo_journal": result["todo_journal"],
                     },
                 )
             else:
                 require_launched(value["run_id"], result["task_frame_id"])
             return result
-        except LaunchError as error:
+        except (LaunchError, JournalError) as error:
             raise PersonaAutomationError(error.code, error.detail, error.status) from error
 
     def _handle_persona_automation_action(
@@ -38124,6 +38227,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 "persona.automation.host-directive",
                 "persona.automation.host-status",
                 "persona.automation.collect-frame",
+                "persona.automation.recover-frame-review",
                 "persona.automation.host-permission",
                 "persona.automation.host-binding",
             }:
@@ -38547,6 +38651,29 @@ class UniverseHTTPServer(ThreadingHTTPServer):
 
     def _handle_project_draft_save_action(self, request, context):
         return self._project_draft_action(request, context, "save")
+
+    def _handle_project_draft_register_action(self, request, context):
+        from universe_project_drafts import ProjectDrafts, DraftError
+        self._require_session_action_user(context, "project.draft.register")
+        drafts = ProjectDrafts(self.store._connection)
+        def materialize(draft, action, actor):
+            fields = draft["fields"]
+            metadata = {key: fields[key] for key in action["accepted_fields"] if fields.get(key)}
+            metadata["display_name"] = fields.get("title") or action["project_id"]
+            metadata["accepted_draft_id"] = draft["draft_id"]
+            metadata["accepted_draft_revision"] = draft["revision"]
+            metadata["accepted_by"] = actor.get("kind", "USER")
+            project, created = self.store.register_project({
+                "project_id": action["project_id"], "project_root": action["project_root"],
+                "install_mode": "PROJECT_STANDALONE", "metadata": metadata,
+            })
+            return {"status": "PROJECT_DRAFT_REGISTERED" if created else "PROJECT_DRAFT_REPLAYED", "project": project, "created": created}
+        try:
+            result = drafts.accept(request, context["actor"], materialize)
+            return {"schema": "universe.project-draft-register.v1", **result}
+        except DraftError as error:
+            status = HTTPStatus.CONFLICT if error.code.endswith("CONFLICT") or error.code == "PROJECT_DRAFT_MATERIALIZATION_FAILED" else HTTPStatus.BAD_REQUEST
+            raise UniverseError(error.code, error.detail, status) from error
 
     def _service_action(self, request, context, *, restart=False):
         from universe_service_actions import ServiceActions, ServiceActionError
