@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" type="image/png" href="/assets/universe-icon.png">
   <title>Universe</title>
-  <link rel="stylesheet" href="/styles.css?v=work-spine-25-delivery-issue">
+  <link rel="stylesheet" href="/styles.css?v=global-conductor-ops-1">
   <link rel="stylesheet" href="/xterm.min.css?v=xterm-6.1.0-beta.303">
   <style>
     /* Boot splash — painted before app.js so a reconnecting browser never
@@ -193,7 +193,7 @@
             <label class="home-fleet-filter"><input type="checkbox" id="fleet-filter-done" /> 완료 표시</label>
             <label class="home-fleet-filter"><input type="checkbox" id="fleet-filter-discarded" /> 폐기 표시</label>
           </div>
-          <section id="home-conductor-persona" class="fleet-project-conductor" aria-label="Project Conductor Persona"></section>
+          <section id="home-conductor-status" class="fleet-project-conductor" aria-label="Global Conductor status"></section>
           <div class="home-col home-col-projects">
             <div class="home-col-head">Projects</div>
             <button id="home-add-project" class="home-add" type="button">+ 프로젝트</button>
@@ -241,6 +241,7 @@
           <h1>Ops</h1>
           <p>Operational nodes, their Todos, assigned Master, and automation.</p>
         </header>
+        <section id="ops-conductor" class="fleet-project-conductor" aria-label="Global Conductor operations"></section>
         <section id="ops-memory-automation" class="ops-memory-automation" aria-label="Memory RAG schedule"></section>
       </section>
       <section id="bench-screen" class="bench-screen" aria-label="Bench" hidden>
@@ -1583,6 +1584,6 @@
   <script src="/xterm-addon-serialize.min.js?v=0.15.0-beta.300"></script>
   <script src="/terminals.js?v=term-59-delivery-issue" defer></script>
   <script src="/project-drafts.js?v=1" defer></script>
-  <script src="/app.js?v=work-spine-36-owner-soft-refresh" defer></script>
+  <script src="/app.js?v=global-conductor-ops-1" defer></script>
 </body>
 </html>

@@ -5,6 +5,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const appSource = fs.readFileSync(path.join(__dirname, "../tools/universe_ui/app.js"), "utf8");
+const htmlSource = fs.readFileSync(path.join(__dirname, "../tools/universe_ui/index.html"), "utf8");
 const terminalSource = fs.readFileSync(path.join(__dirname, "../tools/universe_ui/terminals.js"), "utf8");
 
 function evaluate(source, startMarker, endMarker, globals) {
@@ -138,15 +139,15 @@ test("Fleet binding status never turns an unavailable assignment read into UNASS
   assert.equal(context.fleetNodeAssignments("feature-1").active.length, 0);
 });
 
-test("Project Conductor projection stays project-scoped and separates saved and live state", () => {
+test("Global Conductor projection stays independent of selected-project owners", () => {
   const context = evaluate(
     appSource,
     "function fleetAssignmentRows()",
     "function fleetTerminalLabel(terminal)",
     {
       state: {
-        personaAssignmentsStatus: "READY",
-        personaAssignments: [
+        globalConductorAssignmentsStatus: "READY",
+        globalConductorAssignments: [
           {
             project_id: "universe", node_ref: null, state: "ACTIVE",
             session_anchor_ref: "conductor-anchor", persona_id: "conductor-persona",
@@ -226,6 +227,22 @@ test("Project Conductor actions use typed project scope without node_ref or term
   assert.match(renderSource, /Host apply/);
   assert.match(renderSource, /Retry authoritative projection/);
   assert.match(renderSource, /Unassign Conductor Persona/);
+});
+
+test("global Conductor controls live in Ops and do not follow selected Fleet project", () => {
+  assert.match(htmlSource, /id="ops-conductor"/);
+  assert.match(htmlSource, /id="home-conductor-status"/);
+  assert.doesNotMatch(htmlSource, /id="home-conductor-persona"/);
+  const homeStart = appSource.indexOf("function renderIntegratedHome()");
+  const homeEnd = appSource.indexOf("function renderHomeNodes(", homeStart);
+  assert.ok(homeStart >= 0 && homeEnd > homeStart);
+  assert.match(appSource.slice(homeStart, homeEnd), /renderFleetConductorStatusLink\(\)/);
+  assert.doesNotMatch(appSource.slice(homeStart, homeEnd), /renderFleetProjectConductor\(project\.project_id\)/);
+  const refreshStart = appSource.indexOf("async function refreshFleetProjectConductorProjection(");
+  const refreshEnd = appSource.indexOf("function assignFleetProjectConductorPersona(", refreshStart);
+  assert.match(appSource.slice(refreshStart, refreshEnd), /state\.globalConductorAssignments = result\.assignments/);
+  assert.doesNotMatch(appSource.slice(refreshStart, refreshEnd), /loadPersonaProjectProjection\(projectId\)/);
+  assert.match(appSource, /renderFleetProjectConductor\("universe"\)/);
 });
 
 test("Activity labels authoritative lifecycle events and exposes explicit navigation hooks", () => {

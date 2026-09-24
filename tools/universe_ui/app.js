@@ -47,7 +47,11 @@ const state = {
   /** Authoritative Supervisor terminal projection used by Fleet Team rows. */
   supervisorTerminalsStatus: "UNKNOWN",
   supervisorTerminalsError: "",
-  /** Project-wide Conductor Persona Action state; separate from node Master UI. */
+  /** Global Conductor assignment projection; never replace selected-project owners. */
+  globalConductorAssignments: null,
+  globalConductorAssignmentsStatus: "UNKNOWN",
+  globalConductorAssignmentsError: "",
+  /** Global Conductor Persona Action state; separate from node Master UI. */
   fleetProjectConductorActionStatus: "IDLE",
   fleetProjectConductorActionError: "",
   /** Project-wide Conductor automation projection (persona.automation.status). */
@@ -5397,7 +5401,7 @@ async function refreshFleetHomeSoft() {
       state.fleetAutomationByNode[featureId] = projection;
       if (before !== JSON.stringify(projection.run || null)) changed = true;
     }
-    void refreshFleetProjectConductorProjection(projectId).catch(() => {});
+    if (state.view === "memory-ops") void refreshFleetProjectConductorProjection("universe").catch(() => {});
     if (!changed) return;
     const featureId = homeNodeRefKey(homeSelectedNode()?.node_id || "");
     if (featureId) {
@@ -5421,7 +5425,7 @@ function renderIntegratedHome() {
   const project = state.selectedProject;
   renderHomeProjects();
   if (!project) {
-    const conductorTarget = document.querySelector("#home-conductor-persona");
+    const conductorTarget = document.querySelector("#home-conductor-status");
     if (conductorTarget) conductorTarget.replaceChildren();
     document.querySelector("#home-node-list").replaceChildren(
       node("div", "goal-plan-empty", "Choose a project.")
@@ -5439,7 +5443,7 @@ function renderIntegratedHome() {
   const selTodo = homeSelectedTodo(visibleTodos);
   state.homeTodoId = selTodo?.todo_id || null;
 
-  renderFleetProjectConductor(project.project_id);
+  renderFleetConductorStatusLink();
   renderHomeNodes(selNode);
   renderHomeTodos(selNode, visibleTodos, selTodo);
   renderHomeDetail(selNode, selTodo);
@@ -5639,6 +5643,7 @@ function renderMemoryOpsView() {
   if (board.parentElement !== view) view.append(board);
   board.hidden = false;
   renderIntegratedHome();
+  renderFleetProjectConductor("universe");
   renderOpsMemoryAutomation();
 }
 
@@ -5654,6 +5659,9 @@ function showMemoryOpsView() {
   if (view) view.hidden = false;
   syncPrimaryNavSelection("memory-ops");
   renderMemoryOpsView();
+  void refreshFleetProjectConductorProjection("universe").then(() => {
+    if (state.view === "memory-ops") renderFleetProjectConductor("universe");
+  }).catch(() => {});
 }
 
 function hideMemoryOpsView() {
@@ -5818,12 +5826,13 @@ function fleetNodeAssignmentError() {
 // first-session heuristic.
 function fleetProjectConductorAssignments(projectId) {
   const normalizedProjectId = String(projectId || "").trim();
-  const rows = fleetAssignmentRows();
+  const rows = state.globalConductorAssignmentsStatus === "READY" &&
+    Array.isArray(state.globalConductorAssignments) ? state.globalConductorAssignments : null;
   if (!rows) {
-    const readStatus = String(state.personaAssignmentsStatus || "UNKNOWN").toUpperCase();
+    const readStatus = String(state.globalConductorAssignmentsStatus || "UNKNOWN").toUpperCase();
     return {
       status: readStatus === "ERROR" ? "ERROR" : readStatus === "LOADING" ? "LOADING" : "UNKNOWN",
-      error: state.personaAssignmentsError || "PERSONA_ASSIGNMENTS_UNKNOWN",
+      error: state.globalConductorAssignmentsError || "PERSONA_ASSIGNMENTS_UNKNOWN",
       active: [], all: [],
     };
   }
@@ -5931,12 +5940,33 @@ function fleetProjectConductorActivePersona(personaId) {
 }
 
 async function refreshFleetProjectConductorProjection(projectId) {
-  await loadPersonaProjectProjection(projectId);
+  state.globalConductorAssignmentsStatus = "LOADING";
+  try {
+    const result = await invokeServerAction("persona.assignments-list", { project_id: projectId });
+    if (!Array.isArray(result?.assignments)) throw new Error("PERSONA_ASSIGNMENTS_SCHEMA_INVALID");
+    state.globalConductorAssignments = result.assignments;
+    state.globalConductorAssignmentsStatus = "READY";
+    state.globalConductorAssignmentsError = "";
+  } catch (error) {
+    state.globalConductorAssignmentsStatus = "ERROR";
+    state.globalConductorAssignmentsError = error?.message || "PERSONA_ASSIGNMENTS_READ_FAILED";
+  }
+  if (state.personaLibraryStatus !== "READY") {
+    try {
+      const result = await invokeServerAction("persona.list", { include_archived: true });
+      state.personaLibrary = result.personas;
+      state.personaLibraryStatus = Array.isArray(result.personas) ? "READY" : "ERROR";
+    } catch (_error) {
+      state.personaLibraryStatus = "ERROR";
+    }
+  }
   if (typeof loadTerminalTabs === "function") await loadTerminalTabs();
+  if (state.view === "memory-ops") renderFleetProjectConductor(projectId);
+  else if (typeof renderFleetConductorStatusLink === "function") renderFleetConductorStatusLink();
 }
 
 function assignFleetProjectConductorPersona(personaId, sessionAnchorRef) {
-  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const projectId = "universe";
   const projection = fleetProjectConductorProjection(projectId);
   const persona = fleetProjectConductorActivePersona(personaId);
   const live = projection.terminals.live;
@@ -5998,7 +6028,7 @@ function assignFleetProjectConductorPersona(personaId, sessionAnchorRef) {
 }
 
 function unassignFleetProjectConductor() {
-  const projectId = String(state.selectedProject?.project_id || "").trim();
+  const projectId = "universe";
   const projection = fleetProjectConductorProjection(projectId);
   const assignment = projection.assignment;
   if (projection.assignments.status !== "READY") {
@@ -6051,19 +6081,37 @@ function renderFleetConductorDialogBody(projectId) {
   body.append(renderFleetConductorDialogContent(projectId));
 }
 
-// Compact summary shown inline on the Fleet home screen. Session selection,
-// persona assign/unassign and automation controls all live behind "Manage"
-// in the modal (renderFleetConductorDialogContent) -- this used to render
-// everything inline, which is what made the panel look broken whenever the
-// ambiguity check below tripped (2026-09-17 finding, see
-// fleetProjectConductorAssignments).
+// Fleet only links to the global operator control; project selection never
+// changes Conductor ownership or its automation scope.
+function renderFleetConductorStatusLink() {
+  const target = document.querySelector("#home-conductor-status");
+  if (!target) return;
+  target.replaceChildren();
+  target.hidden = state.view === "memory-ops";
+  if (target.hidden) return;
+  if (state.globalConductorAssignmentsStatus === "UNKNOWN") {
+    void refreshFleetProjectConductorProjection("universe").catch(() => {});
+  }
+  const projection = fleetProjectConductorProjection("universe");
+  const label = projection.status !== "READY" ? "status unavailable"
+    : projection.assignment ? "assigned" : "unassigned";
+  const link = node("button", "secondary-button compact-action", `Global Conductor · ${label} → Ops`);
+  link.type = "button";
+  link.addEventListener("click", () => {
+    showMemoryOpsView();
+    document.querySelector("#ops-conductor")?.scrollIntoView?.({ block: "start" });
+  });
+  target.append(link);
+}
+
+// Global Conductor controls live in Ops, independently of selectedProject.
 function renderFleetProjectConductor(projectId) {
-  const target = document.querySelector("#home-conductor-persona");
+  const target = document.querySelector("#ops-conductor");
   if (!target) return;
   target.replaceChildren();
   const wrap = node("section", "fleet-project-conductor");
   const headRow = node("div", "fleet-project-conductor-head-row");
-  headRow.append(node("span", "fleet-project-conductor-head", "Project Team / Conductor Persona"));
+  headRow.append(node("span", "fleet-project-conductor-head", "Global Conductor"));
   const manageButton = node("button", "secondary-button compact-action", "Manage");
   manageButton.type = "button";
   manageButton.addEventListener("click", () => openFleetConductorDialog(projectId));
@@ -6098,7 +6146,7 @@ function renderFleetProjectConductor(projectId) {
 
 function renderFleetConductorDialogContent(projectId) {
   const wrap = node("div", "fleet-project-conductor-dialog-content");
-  wrap.append(node("p", "fleet-project-conductor-detail", "Project-wide Conductor binding. node_ref is reserved for a node Master."));
+  wrap.append(node("p", "fleet-project-conductor-detail", "Global Conductor binding. Project and node Masters are managed in Fleet."));
   if (!projectId) {
     wrap.append(node("p", "fleet-project-conductor-status is-unknown", "UNKNOWN: select a project."));
     return wrap;

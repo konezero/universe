@@ -9061,6 +9061,8 @@ body.galaxy-view .app-shell.mockup-shell > .graph-workspace {
 .fleet-node-team-status { margin: 0; color: var(--muted, #9aa4b2); font-size: 10px; overflow-wrap: anywhere; }
 .fleet-node-team-status.is-unknown { color: var(--amber, #d8ad61); }
 .fleet-project-conductor { display: flex; flex-direction: column; gap: 5px; margin: 8px 0 10px; padding: 10px 12px; border: 1px solid rgba(111, 155, 147, .34); border-radius: 7px; background: rgba(16, 27, 39, .42); }
+#home-conductor-status { display: block; margin: 4px 0; padding: 0; border: 0; background: transparent; }
+#home-conductor-status[hidden] { display: none; }
 .fleet-project-conductor-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .fleet-project-conductor-head { color: var(--text, #e8edf5); font-size: 12px; font-weight: 700; }
 .fleet-project-conductor-dialog-content { display: flex; flex-direction: column; gap: 5px; }
