@@ -281,6 +281,9 @@ class RuntimeWorkerDispatcher:
         # declared scope does not cover is asked upward instead of refused outright.
         self.permission_escalator: Callable[[Mapping[str, Any]], str] | None = None
         self._host_editors: dict[str, TaskFrameFileEditor] = {}
+        # Host-only bindings returned by the existing Runtime API. These never
+        # enter the provider context or get accepted from a Worker request.
+        self.frame_work: dict[tuple[str, str], Mapping[str, Any]] = {}
         self.worker_response_timeout_seconds = _worker_response_timeout_seconds(
             worker_response_timeout_seconds
         )
@@ -467,6 +470,7 @@ class RuntimeWorkerDispatcher:
 
         try:
             started = time.monotonic()
+            repository_write = False
             if provider == "CODEX" and worker_request["repository_write_scope"] == "BOUNDED":
                 def verify_claim():
                     observation = self.post(request["endpoint"], request["token"],
@@ -474,14 +478,26 @@ class RuntimeWorkerDispatcher:
                         "frame_id": request["frame_id"],
                         "operation": {"operation": "turn_snapshot", "turn_id": request["turn_id"]}})
                     return observation.get("output")
+                bound_work = self.frame_work.get((request["session_id"], request["frame_id"]))
+                edit_transport = {}
+                if bound_work is not None:
+                    edit_transport = {
+                        "load_receipt": lambda: bound_work,
+                        "apply_file": lambda payload: self.post(
+                            request["endpoint"], request["token"],
+                            "/v1/mutation-gateway/apply-file", payload),
+                    }
                 self._host_editors[worker_run_ref] = TaskFrameFileEditor(self.repository_root,
                     session_id=request["session_id"], frame_id=request["frame_id"],
                     turn_id=request["turn_id"], worker_id=worker_id,
-                    scope=request["mutation_scope"], verify_claim=verify_claim)
+                    scope=request["mutation_scope"], verify_claim=verify_claim, **edit_transport)
             try:
                 worker = self._invoke_provider(provider, worker_request)
             finally:
-                self._host_editors.pop(worker_run_ref, None)
+                editor = self._host_editors.pop(worker_run_ref, None)
+                if editor is not None:
+                    repository_write = (None if editor.effect_uncertain else any(
+                        value.get("repository_write") is True for _, value in editor.calls.values()))
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             if worker.get("status") != "COMPLETED":
                 raise WorkerDispatchError(
@@ -564,7 +580,7 @@ class RuntimeWorkerDispatcher:
                     "result": recorded_result,
                     "structured_result": structured_result,
                     "skill_run_observation_count": len(observations),
-                    "repository_write": False,
+                    "repository_write": repository_write,
                     "session_persistence": worker["session_persistence"],
                     "persistent_session_ref": worker["persistent_session_ref"],
                     "universe_coordinate_persisted": worker[
@@ -628,7 +644,7 @@ class RuntimeWorkerDispatcher:
             "duration_ms": duration_ms,
             "result": recorded_result,
             "skill_run_observation_count": len(observations),
-            "repository_write": False,
+            "repository_write": repository_write,
             "session_persistence": worker["session_persistence"],
             "persistent_session_ref": worker["persistent_session_ref"],
             "universe_coordinate_persisted": worker[
@@ -1722,7 +1738,7 @@ class RuntimeWorkerDispatcher:
         r"(?ix)(?:^|[\s;&|(])(?:rm|rmdir|del|erase|rd|mv|move|ren|rename|format|mkfs|dd|truncate|shutdown|"
         r"remove-item|move-item|rename-item|set-content|out-file|clear-content|"
         r"git\s+(?:reset|clean|checkout|restore|rebase|push|stash\s+drop|branch\s+-d))(?:\s|$)"
-        r"|(?<![0-9&])>{1,2}(?!&)"
+        r"|(?<![0-9&=])>{1,2}(?!&)"
     )
 
     @classmethod

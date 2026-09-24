@@ -28,6 +28,9 @@ RESULT_MODES = frozenset({"REDACTED", "STRUCTURED_JSON"})
 PLANNING_PROFILE = Path(
     ".ai/runtime/reference_runtime/profiles/task-frame-debate-v1.json"
 )
+INSTRUCTION_PROFILE = Path(
+    ".ai/runtime/reference_runtime/profiles/task-frame-instruction-v2.json"
+)
 CONDUCTOR_INTENT_GATE_STATUSES = frozenset(
     {
         "INTENT_GATE_PASSED",
@@ -501,8 +504,9 @@ class UniverseRuntimeHost:
 
         Persona automation uses this narrow adapter so a provider judgment has
         the same frame creation, turn claim, result packet, and ephemeral
-        session boundary as the other Runtime Host paths.  The adapter never
-        grants repository mutation scope and always closes the transient frame.
+        session boundary as the other Runtime Host paths. Bounded source work
+        binds the supplied instruction through the existing Runtime and uses
+        that same Runtime's file gateway. The transient frame always closes.
         """
 
         normalized_provider = _required_text(provider, "provider").upper()
@@ -545,8 +549,42 @@ class UniverseRuntimeHost:
                 "STRUCTURED_JSON_ONLY",
             ]
         )
+        work_snapshot = None
+        instruction_id = f"instruction:{invocation}"
+        assignment_ref = "UNASSIGNED"
+        profile = PLANNING_PROFILE
+        if write_scope == "BOUNDED":
+            if not scope["targets"] or not scope["operations"] or set(scope["operations"]) - {"CREATE", "MODIFY"}:
+                raise RuntimeHostError("BOUNDED_SCOPE_INVALID", "exact CREATE/MODIFY scope is required")
+            roots = set()
+            for target in scope["targets"]:
+                path = Path(target)
+                if not path.is_absolute() or not path.resolve().is_relative_to(self.repository_root):
+                    raise RuntimeHostError("BOUNDED_SCOPE_INVALID", "target is outside the project")
+                parent = path.resolve().parent
+                while not parent.is_dir() and parent != self.repository_root:
+                    parent = parent.parent
+                roots.add(str(parent))
+            # Reuse the owning Runtime's instruction binding. A Goal/Todo
+            # handoff supplies the instruction; the Host narrows it to this
+            # frame. No second approval or standalone Anchor receipt is needed.
+            bound = self._post_runtime(endpoint, token, "/v1/execution-binding/begin-local-work", {
+                "session_id": session_id,
+                "work": {"scope_kind": "LOCAL_INSTRUCTION_WORK",
+                         "instruction_id": instruction_id, "instruction_ref": source,
+                         "write_roots": sorted(roots), "write_operations": scope["operations"],
+                         "boundary": f"task-frame:{frame}", "task_summary": prompt},
+            })
+            if bound.get("status") != "WORK_RECEIPT_ACTIVATED" or not isinstance(bound.get("snapshot"), Mapping):
+                raise RuntimeHostError("TASK_FRAME_WORK_BINDING_FAILED", str(bound.get("error_code") or bound.get("status")))
+            stored_work = bound["snapshot"]
+            work_snapshot = dict(stored_work.get("snapshot", stored_work))
+            if work_snapshot.get("session_id") != session_id:
+                raise RuntimeHostError("TASK_FRAME_WORK_BINDING_FAILED", "work binding belongs to another session")
+            assignment_ref = _required_text(bound.get("work_receipt", {}).get("work_receipt_id"), "work_receipt_id")
+            profile = INSTRUCTION_PROFILE
         execution_plan = {
-            "profile_id": "task-frame-debate-v1",
+            "profile_id": "task-frame-instruction-v2" if work_snapshot is not None else "task-frame-debate-v1",
             "requested_shape": "DEBATE",
             "resolved_shape": "DEBATE",
             "model_mode": "EXPLICIT",
@@ -566,7 +604,7 @@ class UniverseRuntimeHost:
                 runtime_binding.get("parent_actor_ref"), "parent_actor_ref"
             ),
             "commander_surface": "universe-ui",
-            "execution_assignment_ref": "UNASSIGNED",
+            "execution_assignment_ref": assignment_ref,
             "host_worker_capability": "AVAILABLE",
             "repository_write_scope": write_scope,
             "mutation_scope": scope,
@@ -587,7 +625,7 @@ class UniverseRuntimeHost:
             ],
         }
         proposal = self._build_task_frame_proposal(
-            execution_plan, prefix="persona-automation-judge-proposal-"
+            execution_plan, prefix="persona-automation-judge-proposal-", profile=profile
         )
         approval = {
             "status": "APPROVED",
@@ -604,7 +642,7 @@ class UniverseRuntimeHost:
                 "/v1/task-frame/create",
                 {
                     "session_id": session_id,
-                    "profile": str(PLANNING_PROFILE),
+                    "profile": str(profile),
                     "frame": {
                         "frame_id": frame,
                         "origin_anchor_ref": execution_plan["origin_anchor_ref"],
@@ -612,11 +650,12 @@ class UniverseRuntimeHost:
                         "origin_frame_id": execution_plan["origin_frame_id"],
                         "task_summary_ref": source,
                         "source_ref": source,
-                        "execution_assignment_ref": "UNASSIGNED",
+                        "execution_assignment_ref": assignment_ref,
                         "task_frame_execution_proposal": proposal,
-                        "task_frame_execution_approval": approval,
+                        "task_frame_execution_approval": None if work_snapshot is not None else approval,
                         "parent_instruction": {
-                            "instruction_id": f"instruction:{invocation}",
+                            "instruction_id": instruction_id,
+                            **({"instruction_ref": source} if work_snapshot is not None else {}),
                             "user_instruction_raw": prompt,
                             "constraints": frame_constraints,
                             "expected_output": contract,
@@ -663,6 +702,8 @@ class UniverseRuntimeHost:
                     "TASK_FRAME_TURN_DECLARATION_FAILED",
                     "Task Frame turn declaration failed",
                 )
+            if work_snapshot is not None:
+                self.worker_dispatcher.frame_work[(session_id, frame)] = work_snapshot
             result = self.invoke_structured_bounded(
                 {
                     "schema": RUNTIME_WORKER_REQUEST_SCHEMA,
@@ -712,6 +753,8 @@ class UniverseRuntimeHost:
             )
             return result
         finally:
+            if work_snapshot is not None:
+                self.worker_dispatcher.frame_work.pop((session_id, frame), None)
             if created:
                 try:
                     self._post_runtime(
@@ -1413,7 +1456,7 @@ class UniverseRuntimeHost:
             ),
             "duration_ms": response.get("duration_ms", 0),
             "skill_run_observation_count": observation_count,
-            "repository_write": False,
+            "repository_write": response.get("repository_write", False),
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",
             "universe_coordinate_persisted": False,

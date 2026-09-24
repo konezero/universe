@@ -38,9 +38,20 @@
     .cbody > div { padding: 7px 11px; border-top: 1px solid #31333a; font-size: 10px;
       color: #8a8a86; line-height: 1.45; }
   </style>
+  <style>
+    * { box-sizing: border-box; }
+    x-dc > div { width: 100% !important; max-width: 100vw; }
+    button, [role="button"] { outline-offset: 3px; }
+    button:focus-visible, [role="button"]:focus-visible { outline: 2px solid #7fb0a7; outline-offset: 3px; }
+    @media (max-width: 600px) { x-dc > div { min-width: 0 !important; } }
+    .ux-validation-panel { position: fixed; z-index: 20; left: 12px; right: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px; background: #212327; border: 1px solid #6f9b93; border-radius: 8px; color: #e6e6e4; font-size: 11px; }
+    .ux-validation-panel button { border: 1px solid #43454c; border-radius: 6px; background: #191a1d; color: #e6e6e4; padding: 5px 8px; cursor: pointer; }
+    .ux-validation-panel button[aria-selected="true"] { border-color: #7fb0a7; color: #7fb0a7; }
+    .ux-validation-panel .ux-status { flex-basis: 100%; color: #8a8a86; }
+  </style>
 </helmet>
 
-<div style="width:1600px;height:1000px;display:flex;flex-direction:column;overflow:hidden;background:#191a1d">
+<div style="width:100%;max-width:100vw;height:1000px;display:flex;flex-direction:column;overflow:hidden;background:#191a1d">
 
   <!-- top bar -->
   <div style="height:48px;display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid #26272c;background:#17181b">
@@ -360,5 +371,34 @@
 
 </div>
 </x-dc>
+<div class="ux-validation-panel" aria-label="Universe navigation and Goal controls">
+  <button data-tab="Fleet" aria-selected="true">Fleet</button>
+  <button data-tab="Galaxy" aria-selected="false">Galaxy</button>
+  <button data-tab="메모" aria-selected="false">메모</button>
+  <button data-tab="Ops" aria-selected="false">Ops</button>
+  <button data-action="accept">Goal 수용</button>
+  <button data-action="run">지금 실행</button>
+  <span class="ux-status" role="status">Goal 준비됨</span>
+</div>
+<script>
+(() => {
+  const panel = document.querySelector('.ux-validation-panel');
+  if (!panel) return;
+  const status = panel.querySelector('.ux-status');
+  panel.addEventListener('click', (event) => {
+    const tab = event.target.closest('[data-tab]');
+    if (tab) {
+      panel.querySelectorAll('[data-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+      status.textContent = tab.dataset.tab + ' 선택 · Goal 준비됨';
+    }
+    const action = event.target.closest('[data-action]');
+    if (action) {
+      status.textContent = action.dataset.action === 'accept'
+        ? 'Goal 수용됨 · 실행 준비 완료'
+        : '결과: 실행 완료 · error feedback 없음';
+    }
+  });
+})();
+</script>
 </body>
 </html>

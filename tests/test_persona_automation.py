@@ -244,6 +244,24 @@ class PersonaAutomationStoreTests(unittest.TestCase):
                                             "expected_revision":result["run"]["revision"],"request_id":"complete"})
         self.assertEqual("COMPLETED",completed["run"]["state"])
 
+    def test_recover_host_review_pass_accepts_test_passed_worker(self):
+        root, session, value = self._recovery_fixture("PASS", "COMPLETED", "TEST_PASSED")
+        result = self.store.recover_host_review(
+            value, repository_root=root, session_id=session,
+            completion_provenance_verified=True,
+        )
+        self.assertEqual("PASS", result["review"]["outcome"])
+        self.assertEqual("REVIEWED", result["run"]["current_assignment"]["state"])
+
+    def test_recover_host_review_pass_rejects_failed_worker_validation(self):
+        root, session, value = self._recovery_fixture("PASS", "COMPLETED", "TEST_FAILED")
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.recover_host_review(
+                value, repository_root=root, session_id=session,
+                completion_provenance_verified=True,
+            )
+        self.assertEqual("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", error.exception.code)
+
     def test_recover_host_review_does_not_promote_partial_worker_to_pass(self):
         root, session, value = self._recovery_fixture("PASS")
         with self.assertRaises(PersonaAutomationError) as error:
@@ -896,6 +914,10 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             store=Store(),
             persona_automation=Automation(),
             multi_rooms=SimpleNamespace(list_bindings=lambda room_id: []),
+            _persona_fleet_goal_scope=lambda project_id, node_ref: None,
+            _persona_todo_in_run_scope=lambda current_run, todo: (
+                todo.get("project_id") == current_run.get("project_id")
+                and todo.get("node_ref") == current_run.get("node_ref")),
         )
 
     def test_plan_selects_node_scoped_todo_without_goal_pin(self):
@@ -1021,6 +1043,7 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             store=MeetingStore(),
             persona_automation=MeetingAutomation(),
             multi_rooms=SimpleNamespace(list_bindings=lambda room_id: bindings),
+            _persona_fleet_goal_scope=lambda project_id, node_ref: None,
         )
         planned = UniverseHTTPServer._persona_automation_plan(server, {
             "run_id": run["run_id"], "owner_ref": run["session_anchor_ref"], "decision_id": "plan-meeting",
@@ -1166,6 +1189,7 @@ class PersonaAutomationStoreTests(unittest.TestCase):
             store=GoalStore(),
             persona_automation=self.store,
             multi_rooms=SimpleNamespace(list_bindings=lambda room_id: []),
+            _persona_fleet_goal_scope=lambda project_id, node_ref: None,
             runtime_host=runtime,
             _persona_automation_runtime_binding=lambda _run: {
                 "endpoint": "http://127.0.0.1:1", "token": "opaque",
@@ -1259,6 +1283,7 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         server = SimpleNamespace(
             store=GoalStore(), persona_automation=self.store,
             multi_rooms=SimpleNamespace(list_bindings=lambda room_id: bindings),
+            _persona_fleet_goal_scope=lambda project_id, node_ref: None,
             runtime_host=FakeRuntime(),
             run_goal_work_plan_meeting=lambda goal_id, request: (
                 meeting_calls.append((goal_id, request))
@@ -1397,6 +1422,68 @@ class PersonaAutomationActionIntegrationTests(unittest.TestCase):
         if action_id in {"persona.create", "persona.assign", "persona.automation.start", "persona.automation.pause", "persona.automation.resume", "persona.automation.stop", "persona.automation.complete"}:
             body.setdefault("request_id", f"integration-{action_id.replace('.', '-')}-{id(request)}")
         return self.request("POST", "/v1/actions", {"action_id": action_id, "request": body})
+
+    def test_fleet_goal_master_owns_only_its_goal_todos(self):
+        material, _ = self.server.session_supervisor.register_session({
+            "session_id": "persona-fleet-goal-master", "node": "TEST",
+            "mode": "MASTER", "provider": "GROK",
+        })
+        anchor = material["session_anchor_ref"]
+        goal = self.server.store.create_goal("TEST", {
+            "goal_id": "goal_persona_fleet_test", "title": "Improve UX",
+            "description": "Review and improve the interface", "owner": "USER",
+            "state": "READY", "sort_order": 0, "scope_kind": "PROJECT",
+        })
+        owned = self.server.store.create_todo({
+            "scope_kind": "PROJECT", "project_id": "TEST", "goal_id": goal["goal_id"],
+            "title": "Improve candidate review", "detail": "Use evidence", "priority": "P1",
+            "state": "READY", "source_kind": "USER", "sort_order": 0,
+        })
+        other_goal = self.server.store.create_goal("TEST", {
+            "goal_id": "goal_persona_other_test", "title": "Unrelated Goal",
+            "description": "Must stay out of the UX run", "owner": "USER",
+            "state": "READY", "sort_order": 1, "scope_kind": "PROJECT",
+        })
+        other = self.server.store.create_todo({
+            "scope_kind": "PROJECT", "project_id": "TEST", "goal_id": other_goal["goal_id"],
+            "title": "Unrelated work", "detail": "Must not be selected", "priority": "P0",
+            "state": "READY", "source_kind": "USER", "sort_order": 0,
+        })
+        status, created = self.act("persona.create", {"title": "UX Master", "body": "Handle bounded UX work"})
+        self.assertEqual(200, status, created)
+        persona = created["persona"]
+        status, assigned = self.act("persona.assign", {
+            "session_anchor_ref": anchor, "project_id": "TEST", "node_ref": goal["goal_id"],
+            "persona_id": persona["persona_id"], "expected_persona_revision": persona["revision"],
+            "expected_assignment_revision": 0,
+        })
+        self.assertEqual(200, status, assigned)
+        status, started = self.act("persona.automation.start", {
+            "project_id": "TEST", "session_anchor_ref": anchor,
+            "scope": f"goal:{goal['goal_id']}", "instruction": "Complete one bounded UX Todo",
+            "goal_ref": goal["goal_id"], "goal_version": str(goal["revision"]),
+        })
+        self.assertEqual(201, status, started)
+        run = started["run"]
+        self.assertEqual(goal["goal_id"], run["node_ref"])
+        status, _ = self.act("persona.automation.tick", {
+            "run_id": run["run_id"], "owner_ref": anchor, "tick_id": "fleet-goal-tick",
+        })
+        self.assertEqual(200, status)
+        status, planned = self.act("persona.automation.plan", {
+            "run_id": run["run_id"], "owner_ref": anchor, "decision_id": "fleet-goal-plan",
+        })
+        self.assertEqual(200, status, planned)
+        self.assertEqual("EXECUTE", planned["decision"]["kind"])
+        self.assertEqual(owned["todo_id"], planned["decision"]["target"]["todo_id"])
+        self.assertNotIn(other["todo_id"], [item["todo_id"] for item in planned["planning_context"]["scoped_todos"]])
+        status, dispatched = self.act("persona.automation.dispatch", {
+            "run_id": run["run_id"], "owner_ref": anchor, "dispatch_id": "fleet-goal-dispatch",
+            "title": "Improve candidate review", "instruction": "Implement the bounded improvement",
+            "completion_conditions": ["Verified UI result"],
+        })
+        self.assertEqual(201, status, dispatched)
+        self.assertEqual(owned["todo_id"], dispatched["dispatch"]["todo_id"])
 
     def test_action_run_surface_and_master_queue_dispatch(self):
         material, _ = self.server.session_supervisor.register_session({

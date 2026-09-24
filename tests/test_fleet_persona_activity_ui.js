@@ -79,7 +79,25 @@ test("terminal attention projection preserves quota, failure, waiting and unknow
       last_event: "IDLE",
       latest_delivery: { phase: "NATIVE_UNCONFIRMED", error_code: "HOST_TURN_BINDING_MISMATCH" },
     },
-  }).state, "FAILED");
+  }).state, "DELIVERY_ISSUE");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    provider_cli_alive: true,
+    host_turn_state: {
+      state: "WORKING",
+      last_event: "PROMPT_SUBMITTED",
+      latest_delivery: { phase: "NATIVE_UNCONFIRMED", error_code: "HOST_NATIVE_QUEUE_UNCONFIRMED" },
+    },
+  }).state, "WORKING");
+  assert.equal(context.terminalAttentionProjection({
+    provider: "CODEX",
+    state: "LIVE",
+    host_turn_state: {
+      state: "SESSION_ENDED",
+      latest_delivery: { phase: "NATIVE_UNCONFIRMED", error_code: "HOST_NATIVE_QUEUE_UNCONFIRMED" },
+    },
+  }).state, "ENDED");
   assert.equal(context.terminalAttentionProjection({
     provider: "CODEX",
     state: "LIVE",

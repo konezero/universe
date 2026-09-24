@@ -21,7 +21,8 @@ from typing import Any, Callable, Mapping
 
 
 def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, todo_id, value,
-                          *, launch_reference=None, run_id=None, current_todo=None):
+                          *, launch_reference=None, run_id=None, current_todo=None,
+                          expected_source_ref=None):
     """Validate immutable role evidence and journal-pinned rework lineage."""
     def reject(detail):
         raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", detail, 409)
@@ -71,7 +72,7 @@ def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, tod
             reject("Incomplete durable result provenance")
         if (context["frame_id"] != role_frame or context["origin_session_id"] != session_id
                 or context["origin_anchor_ref"] != anchor_ref
-                or context["source_ref"] != f"universe://todo/{todo_id}"
+                or context["source_ref"] != (expected_source_ref or f"universe://todo/{todo_id}")
                 or context["task_state"] != "COMPLETED" or turn["state"] != "COMPLETED"):
             reject("Result frame, owner, Todo or terminal state mismatch")
         contract = json.loads(instruction["expected_output_json"])
@@ -104,7 +105,7 @@ def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, tod
         reject("Unsupported persisted Reviewer verdict")
     if verdict == "PASS" and (
             worker["result"].get("outcome") not in {"SUCCEEDED", "COMPLETED"}
-            or worker["result"].get("validation_state") not in {"PASS", "PASSED", "VERIFIED"}
+            or worker["result"].get("validation_state") not in {"PASS", "PASSED", "TEST_PASSED", "VERIFIED"}
             or not reviewer["result"].get("evidence_refs")):
         reject("PASS cannot complete an incomplete or unverified Worker result")
     records['completion_provenance_verified'] = journal_verified
@@ -3041,8 +3042,16 @@ class PersonaAutomationStore:
 
 
     def recover_host_review(self, value, *, repository_root, session_id,
-                            completion_provenance_verified=False, current_todo=None):
-        """Bind immutable legacy Host evidence atomically, without promoting it."""
+                            completion_provenance_verified=False, current_todo=None,
+                            expected_source_ref=None, reconcile_existing=False):
+        """Bind immutable Host evidence atomically.
+
+        A normal recovery requires an empty current assignment/review.  A
+        journal-backed follow-up may explicitly reconcile a newer, fully
+        collected Host cycle over a prior non-PASS review.  The prior state is
+        retained in the new review payload; no journal or audit row is
+        overwritten, and a prior PASS can never be replaced.
+        """
         run_id = _text(value.get("run_id"), "run_id")
         frame = _text(value.get("task_frame_id"), "task_frame_id")
         run = self.get_run(run_id)
@@ -3055,7 +3064,9 @@ class PersonaAutomationStore:
         try:
             pair = read_host_review_pair(repository_root, session_id, run["session_anchor_ref"],
                                          frame, todo_id, value, run_id=run_id,
-                                         launch_reference=frames[-1].get('todo_journal'), current_todo=current_todo)
+                                         launch_reference=frames[-1].get('todo_journal'),
+                                         current_todo=current_todo,
+                                         expected_source_ref=expected_source_ref)
         except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
             if isinstance(error, PersonaAutomationError):
                 raise
@@ -3093,9 +3104,21 @@ class PersonaAutomationStore:
                 raise PersonaAutomationError("TASK_FRAME_RECOVERY_STATE_INVALID", "run is not recoverable", 409)
             if type(value.get("expected_revision")) is not int or row["revision"] != value["expected_revision"]:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "run revision changed", 409)
-            if _load(row["current_assignment_json"], None) is not None or _load(row["current_review_json"], None) is not None:
-                raise PersonaAutomationError("TASK_FRAME_RECOVERY_ASSIGNMENT_EXISTS",
-                                             "recovery cannot replace an existing assignment/review", 409)
+            prior_assignment = _load(row["current_assignment_json"], None)
+            prior_review = _load(row["current_review_json"], None)
+            superseded = None
+            if prior_assignment is not None or prior_review is not None:
+                if not reconcile_existing:
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_ASSIGNMENT_EXISTS",
+                                                 "recovery cannot replace an existing assignment/review", 409)
+                if str((prior_review or {}).get("outcome") or "").upper() == "PASS":
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_PASS_IMMUTABLE",
+                                                 "a PASS assignment cannot be reconciled", 409)
+                superseded = {
+                    "assignment": prior_assignment,
+                    "review": prior_review,
+                    "reason": "journal-backed follow-up cycle reconciliation",
+                }
             collections = [_load(item[0], {}) for item in connection.execute(
                 "SELECT payload_json FROM persona_automation_event WHERE run_id=? AND event_type='TASK_FRAME_COLLECTED'",
                 (run_id,))]
@@ -3124,11 +3147,19 @@ class PersonaAutomationStore:
                       "dispatch_id": dispatch_id, "assignment_revision": row["assignment_revision"],
                       "source_message_id": source_message_id, "source_project_id": row["project_id"],
                       "route": "TASK_FRAME_RECOVERY", "identity": identity}
+            if superseded is not None:
+                review["supersedes"] = superseded
             assignment = {"state": "REVIEWED", "route": "TASK_FRAME_RECOVERY", "todo_id": todo_id,
                           "task_frame_id": frame, "dispatch_id": dispatch_id,
                           "assignment_revision": row["assignment_revision"],
                           "message_id": source_message_id, "result_ref": review["result_ref"],
                           "review_id": review_id, "review_outcome": outcome}
+            if superseded is not None:
+                assignment["supersedes"] = {
+                    "task_frame_id": (prior_assignment or {}).get("task_frame_id"),
+                    "dispatch_id": (prior_assignment or {}).get("dispatch_id"),
+                    "review_id": (prior_review or {}).get("review_id"),
+                }
             connection.execute(
                 "INSERT INTO persona_automation_review(review_id,run_id,result_ref,outcome,acceptance_status,"
                 "evidence_refs_json,note,next_action,dispatch_id,assignment_revision,source_message_id,"

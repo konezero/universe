@@ -614,8 +614,8 @@ function terminalAttentionProjection(session) {
   ).toUpperCase();
   const deliveryError = String(latestDelivery.error_code || "").trim();
   const lifecycle = String(session?.state || "").toUpperCase();
-  if (deliveryError || ["FAILED", "ERROR"].includes(turn) || ["FAILED", "ERROR"].includes(lifecycle)) {
-    return { state: "FAILED", detail: deliveryError || turn || lifecycle };
+  if (["FAILED", "ERROR"].includes(turn) || ["FAILED", "ERROR"].includes(lifecycle)) {
+    return { state: "FAILED", detail: turn || lifecycle };
   }
   if (["DISCONNECTED", "OFFLINE", "STOPPED"].includes(lifecycle) || session?.provider_cli_alive === false) {
     return { state: "DISCONNECTED", detail: lifecycle || "CLI_UNAVAILABLE" };
@@ -633,10 +633,19 @@ function terminalAttentionProjection(session) {
       ["WAITING_INPUT", "WAITING_APPROVAL", "AWAITING_INPUT", "AWAITING_APPROVAL"].includes(turnEvent)) {
     return { state: "WAITING_INPUT", detail: turn || turnEvent };
   }
+  // A failed message delivery is not a failed terminal. Preserve the
+  // authoritative ended/waiting state above; an older queue error must not
+  // replace a newer interactive WORKING turn with FAILED.
+  if (deliveryError && lifecycle === "LIVE" &&
+      !["WORKING", "STARTED", "PROMPT_SUBMITTED"].includes(turn) &&
+      !["PROMPT_SUBMITTED", "STARTED"].includes(turnEvent)) {
+    return { state: "DELIVERY_ISSUE", detail: deliveryError };
+  }
   if (["WORKING", "STARTED", "PROMPT_SUBMITTED", "NATIVE_QUEUED", "DELIVERED"].includes(turn) ||
       ["PROMPT_SUBMITTED", "STARTED"].includes(turnEvent) ||
       ["NATIVE_QUEUED", "NATIVE_SUBMITTING", "PROMPT_SUBMITTED", "STARTED", "SUBMITTED", "DELIVERED"].includes(delivery)) {
-    return { state: "WORKING", detail: turn || turnEvent || delivery };
+    const detail = turn || turnEvent || delivery;
+    return { state: "WORKING", detail: deliveryError ? `${detail}; earlier delivery issue: ${deliveryError}` : detail };
   }
   if (["COMPLETED", "DONE"].includes(turn) || ["COMPLETED", "DONE"].includes(lifecycle)) {
     return { state: "COMPLETED", detail: turn || lifecycle };
@@ -1539,7 +1548,8 @@ function terminalInjectionProjection(session, messages) {
     (m.recipient_anchor_ref || m.session_anchor_ref) === anchor &&
     ["INSTRUCTION", "COORDINATION"].includes(m.kind));
   const pending = rows.filter(m => ["QUEUED", "ACCEPTED", "STARTED"].includes(m.lifecycle_state));
-  const message = rows.find(m => m.message_id === receipt.message_id) || pending[0];
+  const message = pending.find(m => m.message_id === receipt.message_id) || pending[0] ||
+    rows.find(m => m.message_id === receipt.message_id);
   if (!message) return { status: "대기", body: "", detail: "자동 메시지가 들어오면 여기에 표시됩니다." };
   const same = message.message_id === receipt.message_id;
   const phase = same ? receipt.phase : "";
@@ -1557,10 +1567,10 @@ function terminalInjectionProjection(session, messages) {
         : "\uCD08\uAE30\uD654 \uC2DC\uAC01 \uBBF8\uD655\uC778: \uC790\uB3D9 \uC7AC\uC2DC\uB3C4 \uC5C6\uC774 \uC791\uC5C5\uC744 \uBCF4\uC874\uD569\uB2C8\uB2E4." };
   }
   const dispatchError = lifecycle.dispatch_attempt?.error_code;
-  const failed = dispatchError || lifecycle.failed_at || message.lifecycle_state === "FAILED" ||
-    ["WRITE_UNCERTAIN", "INPUT_UNCONFIRMED", "SUBMIT_UNCONFIRMED", "NATIVE_UNCONFIRMED"].includes(phase);
-  const acknowledged = ["PROMPT_SUBMITTED", "STARTED"].includes(phase) || lifecycle.execution_phase === "RUNNING";
   const finished = ["DONE", "COMPLETED", "REPLIED"].includes(message.lifecycle_state);
+  const failed = !finished && (dispatchError || lifecycle.failed_at || message.lifecycle_state === "FAILED" ||
+    ["WRITE_UNCERTAIN", "INPUT_UNCONFIRMED", "SUBMIT_UNCONFIRMED", "NATIVE_UNCONFIRMED"].includes(phase));
+  const acknowledged = ["PROMPT_SUBMITTED", "STARTED"].includes(phase) || lifecycle.execution_phase === "RUNNING";
   let status = "대기";
   if (failed) status = "실패 · 확인 필요";
   else if (finished) status = "처리됨";

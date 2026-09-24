@@ -13,7 +13,7 @@
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </style>
 </helmet>
-<div style="width:1440px;height:900px;position:relative;overflow:hidden;background:
+<div style="width:100%;max-width:100vw;height:900px;position:relative;overflow:hidden;background:
      radial-gradient(1100px 700px at 52% 44%, #1b1c1f 0%, #22242a 55%, #121316 100%);
      color:#e6e6e4;">
 
@@ -225,5 +225,34 @@
   </div>
 </div>
 </x-dc>
+<div class="ux-validation-panel" aria-label="Universe navigation and Goal controls">
+  <button data-tab="Fleet" aria-selected="true">Fleet</button>
+  <button data-tab="Galaxy" aria-selected="false">Galaxy</button>
+  <button data-tab="메모" aria-selected="false">메모</button>
+  <button data-tab="Ops" aria-selected="false">Ops</button>
+  <button data-action="accept">Goal 수용</button>
+  <button data-action="run">지금 실행</button>
+  <span class="ux-status" role="status">Goal 준비됨</span>
+</div>
+<script>
+(() => {
+  const panel = document.querySelector('.ux-validation-panel');
+  if (!panel) return;
+  const status = panel.querySelector('.ux-status');
+  panel.addEventListener('click', (event) => {
+    const tab = event.target.closest('[data-tab]');
+    if (tab) {
+      panel.querySelectorAll('[data-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+      status.textContent = tab.dataset.tab + ' 선택 · Goal 준비됨';
+    }
+    const action = event.target.closest('[data-action]');
+    if (action) {
+      status.textContent = action.dataset.action === 'accept'
+        ? 'Goal 수용됨 · 실행 준비 완료'
+        : '결과: 실행 완료 · error feedback 없음';
+    }
+  });
+})();
+</script>
 </body>
 </html>

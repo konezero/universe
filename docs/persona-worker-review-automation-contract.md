@@ -80,6 +80,44 @@ must use the Worker/Reviewer route.
 - Direct Master work remains available only when explicitly selected; the server does
   not infer safety from Todo wording.
 
+### Source execution uses the owning Runtime
+
+A Fleet Goal's bounded instruction is carried through its Todo and Task Frame.
+For source work, the common Host binds that instruction with the existing
+`execution-binding/begin-local-work` API, creates the existing
+`task-frame-instruction-v2` frame with the returned assignment, and submits edits
+to the same Runtime's `mutation-gateway/apply-file` API. This is execution of the
+Goal instruction, not another user approval. The Worker receives neither tokens
+nor the Host's work snapshot. Its editor checks the live turn claim, exact files,
+operations and preimage; each gateway request pins the frame's work boundary.
+Replacing the active binding therefore invalidates an older editor.
+
+The standalone `.ai/runtime/state/anchor_work` file is not the receipt store for
+an attached Task Frame. Mixing its local lookup with a server-owned Runtime
+caused `ANCHOR_WORK_RECEIPT_REQUIRED` despite a valid Goal/Todo assignment.
+Integration coverage must execute the installed Runtime and file gateway with
+no local Anchor receipt file; injecting a fake receipt cannot verify this path.
+
+### Conductor rework requests
+
+For a journal-backed Task Frame, a Conductor uses
+`persona.automation.request-rework` with `run_id`, `task_frame_id`, its
+registered `conductor_anchor_ref`, stable `request_id`, `feedback`, and the
+`based_on_result_ref`/`based_on_result_digest` of the latest collected Worker
+result. The server checks the frame and Conductor's project, appends a
+`CONDUCTOR_REWORK_REQUESTED` entry to that Todo's journal, then sends the
+Master a Session Bus instruction containing the pinned journal reference.
+The Bus body is a notification; the journal is the request history. A replay
+reuses the same entry and Bus idempotency key. The Bus queues the message for
+the Master's Anchor when its terminal is offline.
+
+The Master reads the pinned entry and, if rework is still needed, sends
+`persona.automation.host-directive` with `directive: REWORK`, `target_role:
+WORKER`, matching `feedback`, and `conductor_request_ref` set to that journal
+reference. The Host directive adapter rejects the request if a newer Worker
+result has since been collected. Directives still enter the Todo journal before
+the Host's Boss room receives them.
+
 ## Implementation status
 
 `WORKER_REVIEW` now routes through the typed Fleet Worker session Action. The

@@ -22,8 +22,8 @@ const RESPONSE_SCHEMA: &str = "universe.reconnection-host-response.v1";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const OUTPUT_CAPACITY_BYTES: usize = 256 * 1024;
 const CHANNEL_QUEUE_CAPACITY: usize = 64;
-const STATE_WRITE_RETRIES: usize = 40;
-const STATE_WRITE_RETRY_DELAY_MS: u64 = 10;
+const STATE_WRITE_RETRIES: usize = 100;
+const STATE_WRITE_RETRY_DELAY_MS: u64 = 20;
 
 #[derive(Debug)]
 struct Config {
@@ -736,7 +736,7 @@ fn retryable_state_write_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
-    )
+    ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)))
 }
 
 fn success(state: &HostSnapshot) -> HostResponse {
@@ -1422,8 +1422,10 @@ mod tests {
 
     #[test]
     fn state_write_retry_policy_is_bounded_to_sharing_errors() {
-        assert_eq!(STATE_WRITE_RETRIES, 40);
-        assert_eq!(STATE_WRITE_RETRY_DELAY_MS, 10);
+        assert_eq!(STATE_WRITE_RETRIES, 100);
+        assert_eq!(STATE_WRITE_RETRY_DELAY_MS, 20);
+        #[cfg(windows)]
+        assert!(retryable_state_write_error(&std::io::Error::from_raw_os_error(32)));
         assert!(retryable_state_write_error(&std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "sharing violation",

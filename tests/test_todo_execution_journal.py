@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from todo_execution_journal import (JournalError, append, append_directive_assignment,
+    append_conductor_rework_request, validate_conductor_rework_request,
     assignment_reference, journal_path, read_reference, records)
 
 
@@ -63,13 +64,26 @@ class JournalTests(unittest.TestCase):
             append_directive_assignment(self.path, **args)
         self.assertEqual('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED', caught.exception.code)
         append(self.path, **self.identity, event_id='result', kind='RESULT_COLLECTED',
-               payload={'role': 'WORKER', 'result': {'outcome': 'PARTIAL'}})
+               payload={'role': 'WORKER', 'attempt': 1, 'status': 'COMPLETED',
+                        'result_ref': 'result-worker-1', 'result_digest': 'digest-worker-1',
+                        'result': {'outcome': 'PARTIAL'}})
         ref = append_directive_assignment(self.path, **args)
         self.assertEqual(ref, append_directive_assignment(self.path, **args))
         self.assertEqual(1, read_reference(ref, project_root=self.root)['payload']['attempt'])
         self.assertEqual('PARTIAL', read_reference(ref, project_root=self.root)['payload']['collected_results']['WORKER']['result']['outcome'])
         rework = append_directive_assignment(self.path, frame_id='frame_1', request_id='rework', directive='REWORK', role='WORKER', feedback='fix')
         self.assertEqual(2, read_reference(rework, project_root=self.root)['payload']['attempt'])
+
+    def test_previous_host_worker_result_cannot_authorize_this_host_review(self):
+        self.payload['collected_results'] = {'WORKER': {
+            'role': 'WORKER', 'status': 'COMPLETED', 'attempt': 2,
+            'result_ref': 'previous-host-worker', 'result_digest': 'old-digest'}}
+        self.start()
+        with self.assertRaises(JournalError) as caught:
+            append_directive_assignment(self.path, frame_id='frame_1',
+                                        request_id='review', directive='RUN_ROLE',
+                                        role='REVIEWER', feedback=None)
+        self.assertEqual('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED', caught.exception.code)
 
     def test_partial_tail_is_preserved_and_blocks_new_assignments(self):
         ref = self.start()
@@ -96,6 +110,39 @@ class JournalTests(unittest.TestCase):
         latest = collected_context(self.path)
         self.assertEqual(1, len(latest))
         self.assertEqual(3, latest['WORKER']['attempt'])
+
+    def test_conductor_rework_requires_latest_collected_worker_evidence(self):
+        self.start()
+        args = dict(frame_id='frame_1', request_id='request_1',
+                    conductor_anchor_ref='conductor_1', feedback='fix the empty state',
+                    based_on_result_ref='worker-result-1', based_on_result_digest='digest-1')
+        with self.assertRaises(JournalError) as missing:
+            append_conductor_rework_request(self.path, **args)
+        self.assertEqual('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED', missing.exception.code)
+        append(self.path, **self.identity, event_id='collect-1', kind='RESULT_COLLECTED',
+               payload={'role': 'WORKER', 'result_ref': 'worker-result-1',
+                        'result_digest': 'digest-1'})
+        ref = append_conductor_rework_request(self.path, **args)
+        self.assertEqual('CONDUCTOR_REWORK_REQUESTED',
+                         read_reference(ref, project_root=self.root)['kind'])
+        self.assertEqual('CONDUCTOR_REWORK_REQUESTED',
+                         validate_conductor_rework_request(
+                             self.path, ref, frame_id='frame_1',
+                             feedback='fix the empty state')['kind'])
+        self.assertEqual(ref, append_conductor_rework_request(self.path, **args))
+        append(self.path, **self.identity, event_id='collect-2', kind='RESULT_COLLECTED',
+               payload={'role': 'WORKER', 'result_ref': 'worker-result-2',
+                        'result_digest': 'digest-2'})
+        with self.assertRaises(JournalError) as stale:
+            append_conductor_rework_request(self.path, **{**args, 'request_id': 'request_2'})
+        self.assertEqual('TODO_JOURNAL_REWORK_EVIDENCE_STALE', stale.exception.code)
+        with self.assertRaises(JournalError) as stale_directive:
+            validate_conductor_rework_request(
+                self.path, ref, frame_id='frame_1', feedback='fix the empty state')
+        self.assertEqual('TODO_JOURNAL_REWORK_EVIDENCE_STALE', stale_directive.exception.code)
+        with self.assertRaises(JournalError) as conflict:
+            append_conductor_rework_request(self.path, **{**args, 'feedback': 'different'})
+        self.assertEqual('TODO_JOURNAL_REPLAY_CONFLICT', conflict.exception.code)
 
     def test_base64_reader_cli_preserves_reference_without_json_shell_quotes(self):
         import base64, subprocess

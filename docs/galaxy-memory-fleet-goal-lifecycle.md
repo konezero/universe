@@ -86,5 +86,13 @@ create Todos, or start execution. The scheduled second LLM pass, automatic
 source-checked RAG ingestion, complete Galaxy lineage graph, and old
 Feature/Goal migration still require reconciliation before the full pipeline
 can be called compliant.
+
+Fleet Goal IDs can now own a Master Persona assignment and a bounded Persona
+automation run directly. The run selects Todos by the exact `goal_id`; existing
+Feature-bound runs continue to select by `node_ref`. Goal-scoped runs do not
+grant a project-wide Master scope. This is distinct from the older Feature
+Expected Path / Work Plan Goal automation surface, which still requires an
+adopted plan and must not be presented as the state of the Persona run.
+
 Do not silently reinterpret existing IDs/states, auto-adopt historical records,
 reopen completed Goals, or migrate live data based on this document alone.

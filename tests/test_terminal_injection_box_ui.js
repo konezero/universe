@@ -20,7 +20,11 @@ assert.equal(project(session,[message]).status,"실패 · 확인 필요");
 session.host_turn_state.latest_delivery.phase="AWAITING_START";
 session.host_turn_state.latest_delivery.submit_write_attempted_at_ms=Date.now()-31000;
 assert.equal(project(session,[message]).status,"제출 확인 지연");
-assert.equal(project(session,[{...message,lifecycle_state:"REPLIED",lifecycle:{failed_at:"now"}}]).body,message.body_text);
+assert.equal(project(session,[{...message,lifecycle_state:"REPLIED",lifecycle:{failed_at:"now"}}]).body,"");
+assert.equal(project(session,[{...message,lifecycle_state:"DONE",lifecycle:{failed_at:"now"}}]).statusCode,"COMPLETED");
+const nextMessage={...message,message_id:"m3",body_text:"next instruction",lifecycle_state:"QUEUED",lifecycle:{}};
+assert.equal(project(session,[{...message,lifecycle_state:"DONE"},nextMessage]).messageId,"m3",
+  "a completed stale receipt must not hide pending work");
 const surface={injectionStatus:{},injectionBody:{},injectionDetail:{},injectionBox:{dataset:{}}};
 ctx.paintTerminalInjectionBox(surface,project(session,[message]));
 assert.equal(surface.injectionBody.value,message.body_text);

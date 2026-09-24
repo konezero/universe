@@ -20,6 +20,7 @@ from persona_task_frame_launch import (  # noqa: E402
     validate_write_scope,
 )
 from task_frame_host import parse_directive  # noqa: E402
+from todo_execution_journal import append, append_conductor_rework_request, journal_path  # noqa: E402
 
 ANCHOR = "session_anchor_master1"
 
@@ -96,6 +97,16 @@ class LaunchTests(unittest.TestCase):
         self.launch()
         self.assertEqual("NONE", self.launched[0]["worker_write_scope"]["repository_write_scope"])
 
+    def test_fleet_goal_run_accepts_only_its_goal_todo(self):
+        self.run.update(node_ref="goal_ux", goal_ref="goal_ux")
+        self.todo.update(node_ref=None, goal_id="goal_ux")
+        self.assertEqual("TASK_FRAME_HOST_LAUNCHED", self.launch()["status"])
+        self.reset_records()
+        self.run.update(node_ref="goal_ux", goal_ref="goal_ux")
+        self.todo.update(node_ref=None, goal_id="goal_other")
+        with self.assertRaisesRegex(LaunchError, "not on the run's node"):
+            self.launch()
+
     def test_a_replay_never_starts_a_second_host(self):
         self.launch()
         again = self.launch()
@@ -162,6 +173,34 @@ class LaunchTests(unittest.TestCase):
             post_directive(rooms=self.rooms, state_root=self.state, task_frame_id="host_none",
                            value={"directive": "DONE", "request_id": "d3"})
         self.assertEqual("TASK_FRAME_HOST_UNKNOWN", unknown.exception.code)
+
+    def test_conductor_rework_directive_rechecks_latest_worker_result(self):
+        frame = self.launch()["task_frame_id"]
+        path = journal_path(self.project, self.todo["todo_id"])
+        identity = dict(todo_id=self.todo["todo_id"], owner_ref=ANCHOR,
+                        run_id=self.run["run_id"], task_frame_id=frame)
+        append(path, **identity, event_id="collect-1", kind="RESULT_COLLECTED",
+               payload={"role": "WORKER", "result_ref": "result-1",
+                        "result_digest": "digest-1"})
+        ref = append_conductor_rework_request(
+            path, frame_id=frame, request_id="conductor-1",
+            conductor_anchor_ref="conductor_1", feedback="fix empty state",
+            based_on_result_ref="result-1", based_on_result_digest="digest-1")
+        value = {"directive": "REWORK", "role": "WORKER",
+                 "feedback": "fix empty state", "request_id": "master-1",
+                 "conductor_request_ref": ref}
+        self.assertEqual("TASK_FRAME_DIRECTIVE_POSTED", post_directive(
+            rooms=self.rooms, state_root=self.state, task_frame_id=frame,
+            value=value)["status"])
+        append(path, **identity, event_id="collect-2", kind="RESULT_COLLECTED",
+               payload={"role": "WORKER", "result_ref": "result-2",
+                        "result_digest": "digest-2"})
+        before = len(self.rooms.posted)
+        with self.assertRaisesRegex(ValueError, "newer Worker result"):
+            post_directive(rooms=self.rooms, state_root=self.state,
+                           task_frame_id=frame,
+                           value={**value, "request_id": "master-2"})
+        self.assertEqual(before, len(self.rooms.posted))
 
     def test_status_reads_the_heartbeat_over_the_launch_marker(self):
         frame = self.launch()["task_frame_id"]

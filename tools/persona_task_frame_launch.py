@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from todo_execution_journal import JournalError, append as append_journal, append_directive_assignment, collected_context, journal_path
+from todo_execution_journal import JournalError, append as append_journal, append_directive_assignment, collected_context, journal_path, validate_conductor_rework_request
 from task_frame_host import DIRECTIVE_SCHEMA, DIRECTIVES, ROLES
 from task_frame_host_main import launch as launch_host
 from task_frame_host_main import pid_alive
@@ -97,7 +97,8 @@ def check_run_and_todo(run: Mapping[str, Any], owner_ref: str, todo: Mapping[str
     if str(todo.get("project_id") or "") != str(run.get("project_id") or ""):
         raise LaunchError("TASK_FRAME_TODO_PROJECT_MISMATCH", "the Todo belongs to another project")
     node = str(run.get("node_ref") or "")
-    if node and str(todo.get("node_ref") or "") != node:
+    goal_owned = str(run.get("goal_ref") or "") == node and str(todo.get("goal_id") or "") == node
+    if node and str(todo.get("node_ref") or "") != node and not goal_owned:
         raise LaunchError("TASK_FRAME_TODO_NODE_MISMATCH", "the Todo is not on the run's node")
 
 
@@ -187,7 +188,8 @@ def launch_frame(
         "todo_journal": journal_ref,
         "provider": str(value["provider"]).upper(),
         "runtime_binding": dict(runtime_binding),
-        "source_ref": f"universe://todo/{todo['todo_id']}",
+        "source_ref": (f"universe://goals/{todo['goal_id']}"
+                       if todo.get("goal_id") else f"universe://todo/{todo['todo_id']}"),
         "todo": {"title": todo.get("title"), "detail": todo.get("detail")},
         "persona_text": persona_text,
         "worker_write_scope": scope,
@@ -236,6 +238,14 @@ def post_directive(
     if marker.get('todo_journal'):
         ref = marker['todo_journal']
         path = journal_path(Path(marker['project_root']), ref['todo_id'])
+        conductor_ref = value.get('conductor_request_ref')
+        if conductor_ref is not None:
+            if directive != 'REWORK' or role != 'WORKER' or not isinstance(conductor_ref, Mapping):
+                raise LaunchError('TASK_FRAME_CONDUCTOR_REWORK_INVALID',
+                                  'Conductor request reference applies only to Worker REWORK')
+            validate_conductor_rework_request(path, conductor_ref,
+                                              frame_id=task_frame_id,
+                                              feedback=str(body.get('feedback') or ''))
         body['journal_assignment'] = append_directive_assignment(
             path, frame_id=task_frame_id, request_id=str(value['request_id']),
             directive=directive, role=role, feedback=body.get('feedback'))

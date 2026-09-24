@@ -152,6 +152,11 @@ class TaskFrameFileEditor:
         if snapshot.get('session_id') != self.session_id:
             raise EditBlocked('HOST_EDIT_RECEIPT_OWNER_MISMATCH')
         request = {k:snapshot[k] for k in ('session_id','frame_id','anchor_id','source_commit')}
+        assignment = snapshot.get('execution_assignment')
+        if isinstance(assignment, Mapping):
+            # A newer frame may replace the session's active work binding.
+            # Pin this boundary so the live gateway rejects the older editor.
+            request['boundary'] = assignment.get('boundary')
         request.update({'validation_ref':snapshot['evidence_refs']['validation'],
             'operation':required,'target':str(target),'payload_sha256':hashlib.sha256(after).hexdigest(),
             'target_preimage':{'status':'PRESENT' if before is not None else 'ABSENT',

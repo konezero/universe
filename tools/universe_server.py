@@ -64,7 +64,7 @@ from session_anchor_transport import (
 )
 from task_frame_lineage import TaskFrameLineageError, TaskFrameLineageStore
 from session_anchor_cycle import append_cycle_result
-from todo_execution_journal import JournalError, append as append_todo_journal, journal_path, read_role_result, resolve_role_result
+from todo_execution_journal import JournalError, append as append_todo_journal, append_conductor_rework_request, journal_path, read_role_result, resolve_role_result
 from persona_task_frame_launch import (
     LaunchError,
     host_status as task_frame_host_status,
@@ -32250,6 +32250,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "persona.automation.complete",
                     "persona.automation.launch-frame",
                     "persona.automation.host-directive",
+                    "persona.automation.request-rework",
                     "persona.automation.host-status",
                     "persona.automation.collect-frame",
                     "persona.automation.recover-frame-review",
@@ -34181,7 +34182,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
     def _validate_persona_assignment_node_ref(
         self, project_id: str, node_ref: str | None
     ) -> str | None:
-        """A supplied node_ref must name a real feature_node in this project.
+        """A supplied node_ref names one Feature or Fleet Goal in this project.
 
         This does not require or forbid node_ref by Anchor mode -- ordinary
         persona assignment (P1: natural-language persona applied to a
@@ -34195,14 +34196,69 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if node_ref is None:
             return None
         normalized = _identifier(node_ref, "node_ref")
-        node = self.store.get_feature_node(normalized)
-        if str(node.get("project_id") or "") != project_id:
+        feature = None
+        goal = None
+        try:
+            feature = self.store.get_feature_node(normalized)
+        except UniverseError as error:
+            if error.code != "FEATURE_NODE_NOT_FOUND":
+                raise
+        try:
+            goal = self.store.get_goal(normalized)
+        except UniverseError as error:
+            if error.code != "GOAL_NOT_FOUND":
+                raise
+        matches = [item for item in (feature, goal) if item is not None and item["project_id"] == project_id]
+        if len(matches) != 1:
             raise UniverseError(
-                "PERSONA_ASSIGNMENT_NODE_PROJECT_MISMATCH",
-                "node_ref belongs to a different project",
+                "PERSONA_ASSIGNMENT_NODE_INVALID",
+                "node_ref must identify exactly one Feature or Fleet Goal in this project",
+                HTTPStatus.CONFLICT,
+            )
+        if goal is not None and goal["project_id"] == project_id and goal["state"] == "DONE":
+            raise UniverseError(
+                "PERSONA_ASSIGNMENT_GOAL_DONE",
+                "a completed Fleet Goal cannot receive a new Master assignment",
                 HTTPStatus.CONFLICT,
             )
         return normalized
+
+    def _persona_fleet_goal_scope(self, project_id: str, node_ref: str | None) -> dict[str, Any] | None:
+        """Resolve an assigned Fleet Goal without treating Feature scopes as Goals."""
+        if not node_ref:
+            return None
+        try:
+            goal = self.store.get_goal(node_ref)
+        except UniverseError as error:
+            if error.code == "GOAL_NOT_FOUND":
+                return None
+            raise
+        if goal["project_id"] != project_id:
+            return None
+        try:
+            feature = self.store.get_feature_node(node_ref)
+        except UniverseError as error:
+            if error.code != "FEATURE_NODE_NOT_FOUND":
+                raise
+        else:
+            if feature["project_id"] == project_id:
+                raise UniverseError(
+                    "PERSONA_AUTOMATION_NODE_AMBIGUOUS",
+                    "the assigned node_ref identifies both a Feature and a Fleet Goal",
+                    HTTPStatus.CONFLICT,
+                )
+        return goal
+
+    def _persona_todo_in_run_scope(self, run: Mapping[str, Any], todo: Mapping[str, Any]) -> bool:
+        if todo.get("project_id") != run.get("project_id"):
+            return False
+        node_ref = str(run.get("node_ref") or "").strip()
+        if not node_ref:
+            return True
+        goal = self._persona_fleet_goal_scope(str(run["project_id"]), node_ref)
+        if goal is not None:
+            return goal["state"] != "DONE" and str(todo.get("goal_id") or "") == goal["goal_id"]
+        return str(todo.get("node_ref") or "") == node_ref
 
     def _validate_persona_automation_anchor(self, project_id: str, session_anchor_ref: str) -> None:
         """Automation runs are owned by a project CONDUCTOR Anchor (project-wide
@@ -36245,15 +36301,15 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         run_owner = str(run.get("session_anchor_ref") or "").strip()
         requested_next = str(value.get("next_condition") or "").strip()
 
-        # A node-scoped MASTER run (run.node_ref set) may only see and
-        # select this project's Goals/Todos already scoped to that same
-        # feature_node -- the real Goal.node_ref/Todo.node_ref graph
-        # contract, not a new field or enum. A project-wide CONDUCTOR run
-        # (node_ref is None) keeps its original, unrestricted project view
-        # (2026-09-15: node Master automation ownership).
+        # A Master may own either a Feature's NODE-scoped work or a Fleet
+        # Goal's PROJECT-scoped Todos. Resolve the assigned identity before
+        # selecting work; never broaden a Goal run to all project Todos.
         run_node_ref = str(run.get("node_ref") or "").strip() or None
+        run_fleet_goal = self._persona_fleet_goal_scope(project_id, run_node_ref)
         goals = self.store.list_project_goals(project_id)
-        if run_node_ref is not None:
+        if run_fleet_goal is not None:
+            goals = [goal for goal in goals if goal["goal_id"] == run_fleet_goal["goal_id"]]
+        elif run_node_ref is not None:
             goals = [
                 goal for goal in goals
                 if str(goal.get("scope_kind") or "") == "NODE"
@@ -36391,7 +36447,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         if run_node_ref is not None:
             selected_todos = [
                 todo for todo in selected_todos
-                if str(todo.get("node_ref") or "") == run_node_ref
+                if self._persona_todo_in_run_scope(run, todo)
             ]
         if requested_goal:
             selected_todos = [
@@ -37226,7 +37282,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         node_ref = str(run.get("node_ref") or "").strip()
         if not (run_id and project_id and node_ref):
             return None
-        if self.store.node_open_todo_count(project_id, node_ref):
+        goal = self._persona_fleet_goal_scope(project_id, node_ref)
+        if goal is not None:
+            open_count = 0 if goal["state"] == "DONE" else sum(
+                todo.get("goal_id") == goal["goal_id"]
+                and todo.get("state") in {"READY", "IN_PROGRESS"}
+                and not todo.get("archived_at")
+                for todo in self.store.list_todos()
+            )
+        else:
+            open_count = self.store.node_open_todo_count(project_id, node_ref)
+        if open_count:
             return None
         try:
             self.persona_automation.stop_run({
@@ -37451,9 +37517,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         """READY or IN_PROGRESS counts as executable, same as the plan step's
         own backlog/executable split -- BACKLOG alone never does."""
 
+        fleet_goal = self._persona_fleet_goal_scope(project_id, node_ref)
+        if fleet_goal is not None and fleet_goal["state"] == "DONE":
+            return False
         return any(
-            todo.get("project_id") == project_id
-            and todo.get("node_ref") == node_ref
+            self._persona_todo_in_run_scope({"project_id": project_id, "node_ref": node_ref}, todo)
             and str(todo.get("state") or "").upper() in {"READY", "IN_PROGRESS"}
             for todo in self.store.list_todos()
         )
@@ -37700,7 +37768,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 409,
             )
         run_node_ref = str(run.get("node_ref") or "").strip()
-        if run_node_ref and source.get("node_ref") != run_node_ref:
+        if run_node_ref and not self._persona_todo_in_run_scope(run, source):
             raise PersonaAutomationError(
                 "PERSONA_AUTOMATION_REVIEW_FOLLOWUP_SCOPE_MISMATCH",
                 "the reviewed Todo is outside the node-bound automation run",
@@ -37782,7 +37850,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     "todo_id": todo_id,
                     "outcome": outcome,
                     "priority": todo["priority"],
-                    "node_ref": todo["node_ref"],
+                    "node_ref": run_node_ref or todo["node_ref"],
                 },
             },
         )
@@ -38046,6 +38114,11 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     409,
                 )
 
+        def todo_source_ref(todo_id: str) -> str:
+            todo = self.store.get_todo(todo_id)
+            return (f"universe://goals/{todo['goal_id']}" if todo.get("goal_id")
+                    else f"universe://todo/{todo_id}")
+
         try:
             if action_id == "persona.automation.host-status":
                 value = _exact_object_fields(
@@ -38064,7 +38137,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     request,
                     field="persona_automation_host_directive",
                     required=frozenset({"run_id", "owner_ref", "task_frame_id", "directive", "request_id"}),
-                    optional=frozenset({"target_role", "feedback"}),
+                    optional=frozenset({"target_role", "feedback", "conductor_request_ref"}),
                 )
                 run = self.persona_automation.get_run(value["run_id"])
                 require_owner(run, value["owner_ref"], "direct its Host")
@@ -38100,7 +38173,10 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     required=frozenset({"run_id", "owner_ref", "task_frame_id", "request_id", "expected_revision"}),
                     optional=frozenset({"worker_result_ref", "worker_result_digest",
                                         "reviewer_result_ref", "reviewer_result_digest",
-                                        "worker_attempt", "reviewer_attempt"}))
+                                        "worker_attempt", "reviewer_attempt", "reconcile_existing"}))
+                if value.get("reconcile_existing") is not None and type(value["reconcile_existing"]) is not bool:
+                    raise PersonaAutomationError("TASK_FRAME_RECOVERY_RECONCILE_INVALID",
+                                                 "reconcile_existing must be boolean", 400)
                 run = self.persona_automation.get_run(value["run_id"])
                 require_owner(run, value["owner_ref"], "recover its Host review")
                 require_launched(value["run_id"], value["task_frame_id"])
@@ -38121,8 +38197,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     pass  # Exited Hosts remove transient input; never infer PASS.
                 except (OSError, ValueError) as error:
                     raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", "Host spec unreadable", 409) from error
-                if (todo.get("project_id") != run["project_id"]
-                        or todo.get("node_ref") != run.get("node_ref") or todo.get("archived_at")):
+                if (not self._persona_todo_in_run_scope(run, todo) or todo.get("archived_at")):
                     raise PersonaAutomationError("TASK_FRAME_RECOVERY_SCOPE_CHANGED", "Todo scope changed", 409)
                 if spec is not None and (not isinstance(spec, dict)
                         or spec.get("run_id") != run["run_id"] or spec.get("todo_id") != todo["todo_id"]
@@ -38136,6 +38211,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     raise PersonaAutomationError("TASK_FRAME_RECOVERY_SESSION_UNAVAILABLE",
                                                  "owner must resolve to one durable session", 409)
                 project_root = Path(self.store.get_project(run["project_id"])["project_root"])
+                expected_source_ref = (f"universe://goals/{todo['goal_id']}"
+                                       if todo.get("goal_id") else f"universe://todo/{todo['todo_id']}")
                 selector_keys = {"worker_attempt", "reviewer_attempt"}
                 evidence_keys = {"worker_result_ref", "worker_result_digest", "reviewer_result_ref", "reviewer_result_digest"}
                 if selector_keys & value.keys():
@@ -38143,14 +38220,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         raise JournalError("TODO_JOURNAL_RESULT_SELECTOR_INVALID", "use attempts or exact evidence, never both")
                     for role in ("worker", "reviewer"):
                         resolved = resolve_role_result(project_root,sessions[0]["session_id"],run["session_anchor_ref"],
-                            frame,todo["todo_id"],role.upper(),value.pop(role+"_attempt"))
+                            frame,todo["todo_id"],role.upper(),value.pop(role+"_attempt"),
+                            expected_source_ref=expected_source_ref)
                         value[role+"_result_ref"], value[role+"_result_digest"] = resolved["result_ref"], resolved["result_digest"]
                 elif not evidence_keys <= value.keys():
                     raise JournalError("TODO_JOURNAL_RESULT_SELECTOR_INVALID", "complete role evidence or attempts required")
                 return self.persona_automation.recover_host_review(
                     value, repository_root=project_root, session_id=sessions[0]["session_id"],
                     completion_provenance_verified=spec is not None,
-                    current_todo={"title":todo.get("title"),"detail":todo.get("detail")})
+                    current_todo={"title":todo.get("title"),"detail":todo.get("detail")},
+                    expected_source_ref=expected_source_ref,
+                    reconcile_existing=value.get("reconcile_existing") is True)
             if action_id == "persona.automation.collect-frame":
                 value = _exact_object_fields(
                     request,
@@ -38179,7 +38259,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         raise JournalError("TODO_JOURNAL_OWNER_UNAVAILABLE", "one durable owner session required")
                     resolved = resolve_role_result(Path(self.store.get_project(run["project_id"])["project_root"]),
                         sessions[0]["session_id"],run["session_anchor_ref"],value["task_frame_id"],
-                        launched["todo_id"],value["result_role"],value["result_attempt"])
+                        launched["todo_id"],value["result_role"],value["result_attempt"],
+                        expected_source_ref=todo_source_ref(launched["todo_id"]))
                     value["result_ref"], value["result_digest"] = resolved["result_ref"], resolved["result_digest"]
                 if launched.get("todo_journal"):
                     project_root = Path(self.store.get_project(run["project_id"])["project_root"])
@@ -38194,7 +38275,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                         payload.update(read_role_result(
                             project_root, sessions[0]["session_id"], run["session_anchor_ref"],
                             value["task_frame_id"], todo_id, value["result_ref"],
-                            str(value.get("result_digest") or "")))
+                            str(value.get("result_digest") or ""),
+                            expected_source_ref=todo_source_ref(todo_id)))
                     journal_ref = append_todo_journal(
                         journal_path(project_root, todo_id), todo_id=todo_id,
                         owner_ref=value["owner_ref"], run_id=value["run_id"],
@@ -38303,6 +38385,65 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         except (LaunchError, JournalError) as error:
             raise PersonaAutomationError(error.code, error.detail, error.status) from error
 
+    def _request_conductor_rework(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        value = _exact_object_fields(
+            request, field="persona_automation_request_rework",
+            required=frozenset({"run_id", "task_frame_id", "conductor_anchor_ref",
+                                "request_id", "feedback", "based_on_result_ref",
+                                "based_on_result_digest"}), optional=frozenset())
+        run = self.persona_automation.get_run(value["run_id"])
+        project_id = str(run["project_id"])
+        conductor_anchor = _required_text(value["conductor_anchor_ref"], "conductor_anchor_ref")
+        self._validate_persona_assignment_anchor(project_id, conductor_anchor)
+        if "CONDUCTOR" not in self._anchor_modes(conductor_anchor):
+            raise PersonaAutomationError("PERSONA_AUTOMATION_CONDUCTOR_REQUIRED",
+                                         "rework requests require a registered Conductor Anchor", 409)
+        launched = self.persona_automation.host_frame_launched(
+            value["run_id"], value["task_frame_id"])
+        if not launched or not launched.get("todo_journal"):
+            raise PersonaAutomationError("TASK_FRAME_NOT_LAUNCHED_BY_RUN",
+                                         "a journal-backed Host must belong to this run", 404)
+        todo_id = str(launched["todo_id"])
+        project_root = Path(self.store.get_project(project_id)["project_root"])
+        try:
+            journal_ref = append_conductor_rework_request(
+                journal_path(project_root, todo_id), frame_id=value["task_frame_id"],
+                request_id=value["request_id"], conductor_anchor_ref=conductor_anchor,
+                feedback=_required_text(value["feedback"], "feedback"),
+                based_on_result_ref=_required_text(value["based_on_result_ref"], "based_on_result_ref"),
+                based_on_result_digest=_required_text(value["based_on_result_digest"], "based_on_result_digest"))
+        except JournalError as error:
+            raise PersonaAutomationError(error.code, error.detail, error.status) from error
+        master_anchor = str(run["session_anchor_ref"])
+        terminal_host = self._session_anchor_terminal_host()
+        terminal = terminal_host.find_live(
+            project_id=project_id, mode="MASTER", session_anchor_ref=master_anchor)
+        destination = {"project_id": project_id, "mode": "MASTER",
+                       "session_anchor_ref": master_anchor}
+        if terminal is not None:
+            destination["terminal_id"] = terminal["terminal_id"]
+        posted = self.session_bus.post(terminal_host, {
+            "to": destination,
+            "from": {"project_id": project_id, "mode": "CONDUCTOR",
+                     "session_anchor_ref": conductor_anchor},
+            "kind": "INSTRUCTION", "protocol": "WORK", "notify": "NONE",
+            "thread_id": f"persona-{value['run_id']}-host-{value['task_frame_id']}",
+            "idempotency_key": f"conductor-rework:{journal_ref['event_id']}",
+            "body_text": (
+                "Conductor rework request recorded. Read the pinned Todo journal entry "
+                "and compare its Worker evidence with the latest collected result. "
+                "If rework is still needed, call persona.automation.host-directive "
+                "with conductor_request_ref set to this journal reference.\n"
+                + json.dumps({"run_id": value["run_id"],
+                              "task_frame_id": value["task_frame_id"],
+                              "todo_id": todo_id, "todo_journal": journal_ref},
+                             ensure_ascii=False, sort_keys=True)),
+        })
+        self._dispatch_live_posted_session_instructions(posted)
+        return {"status": "TASK_FRAME_REWORK_REQUESTED", "todo_journal": journal_ref,
+                "todo_id": todo_id, "task_frame_id": value["task_frame_id"],
+                "messages": posted.get("messages", [])}
+
     def _handle_persona_automation_action(
         self, request: Mapping[str, Any], context: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -38339,6 +38480,17 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     # happens to sit on its assignment row (which ordinary
                     # persona.assign leaves optional for any mode).
                     assignment = {**assignment, "node_ref": None}
+                fleet_goal = self._persona_fleet_goal_scope(project_id, (assignment or {}).get("node_ref"))
+                if fleet_goal is not None:
+                    if fleet_goal["state"] == "DONE":
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_GOAL_DONE", "a completed Fleet Goal cannot start automation", 409,
+                        )
+                    if value.get("goal_ref") and value["goal_ref"] != fleet_goal["goal_id"]:
+                        raise PersonaAutomationError(
+                            "PERSONA_AUTOMATION_GOAL_SELECTION_CONFLICT", "goal_ref differs from the owned Fleet Goal", 409,
+                        )
+                    value = {**value, "goal_ref": fleet_goal["goal_id"], "goal_version": str(fleet_goal["revision"])}
                 result = self.persona_automation.start_run(value, assignment or {})
                 # A node-bound Master run must immediately have one bounded
                 # control message to execute.  Do not turn a successful state
@@ -38562,6 +38714,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 value = _exact_object_fields(request, field="persona_automation_clear_blocker",
                     required=frozenset({"run_id", "message_id", "request_id"}), optional=frozenset())
                 return self._clear_persona_automation_blocker(value)
+            if action_id == "persona.automation.request-rework":
+                return self._request_conductor_rework(request)
             if action_id == "persona.automation.tick":
                 value = _exact_object_fields(request, field="persona_automation_tick", required=frozenset({"run_id", "owner_ref", "tick_id"}), optional=frozenset({"lease_seconds", "cursor"}))
                 return self.persona_automation.claim_tick(value)
@@ -38599,7 +38753,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                             409,
                         )
                     run_node_ref = str(run.get("node_ref") or "").strip()
-                    if run_node_ref and str(selected_todo.get("node_ref") or "") != run_node_ref:
+                    if run_node_ref and not self._persona_todo_in_run_scope(run, selected_todo):
                         raise PersonaAutomationError(
                             "PERSONA_AUTOMATION_TODO_SCOPE_MISMATCH",
                             "the dispatch Todo is outside the automation run node",

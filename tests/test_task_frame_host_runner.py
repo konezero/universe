@@ -56,7 +56,10 @@ class RoleRunnerTests(unittest.TestCase):
         self.assertEqual(64, len(result.result_digest))
 
     def test_reviewer_reads_master_collected_worker_result_after_runner_restart(self):
-        append(self.path, **self.identity, event_id='collect', kind='RESULT_COLLECTED', payload={'role': 'WORKER', 'result': GOOD['structured_result']})
+        append(self.path, **self.identity, event_id='collect', kind='RESULT_COLLECTED',
+               payload={'role': 'WORKER', 'attempt': 1, 'status': 'COMPLETED',
+                        'result_ref': 'worker-result-1', 'result_digest': 'worker-digest-1',
+                        'result': GOOD['structured_result']})
         ref = append_directive_assignment(self.path, frame_id='tf1', request_id='review', directive='RUN_ROLE', role='REVIEWER', feedback=None)
         host = FakeRuntimeHost()
         result = RuntimeHostRoleRunner(self.spec, runtime_host=host).run('REVIEWER', attempt=1, feedback=None)

@@ -2,7 +2,8 @@
 
 The Todo DB remains the scheduling/state authority. This journal carries bounded
 assignments and collected evidence, never credentials, permission or a new task.
-Only the Master-side launch/directive/collection adapters call append().
+Only server-owned launch/directive/collection and Conductor-request adapters
+call append(). Workers receive pinned read-only slices.
 """
 from __future__ import annotations
 
@@ -185,8 +186,23 @@ def append_directive_assignment(path: Path, *, frame_id: str, request_id: str,
         for result in collected:
             if result.get('role'):
                 latest[result['role']] = result
-        if role == 'REVIEWER' and 'WORKER' not in latest:
-            raise JournalError('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED', 'Master must collect Worker result before review')
+        if role == 'REVIEWER':
+            worker_assignments = [r for r in same if r['kind'] == 'ASSIGNED'
+                                  and r['payload'].get('role') == 'WORKER']
+            current_worker = worker_assignments[-1] if worker_assignments else None
+            current_collection = next((r for r in reversed(same)
+                                       if r['kind'] == 'RESULT_COLLECTED'
+                                       and r['payload'].get('role') == 'WORKER'
+                                       and r['payload'].get('status') == 'COMPLETED'
+                                       and r['payload'].get('attempt') ==
+                                           current_worker['payload'].get('attempt')
+                                       and r['payload'].get('result_ref')
+                                       and r['payload'].get('result_digest')),
+                                      None) if current_worker else None
+            if (current_collection is None
+                    or current_collection['sequence'] <= current_worker['sequence']):
+                raise JournalError('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED',
+                                   'Master must collect this Host Worker attempt before review')
         payload = {'directive': directive, 'role': role, 'feedback': feedback}
         if directive != 'DONE':
             payload.update({k: first['payload'][k] for k in ('todo', 'persona', 'worker_write_scope')})
@@ -197,8 +213,70 @@ def append_directive_assignment(path: Path, *, frame_id: str, request_id: str,
                       kind='MASTER_DONE' if directive == 'DONE' else 'ASSIGNED', payload=payload)
 
 
+def append_conductor_rework_request(path: Path, *, frame_id: str, request_id: str,
+                                    conductor_anchor_ref: str, feedback: str,
+                                    based_on_result_ref: str,
+                                    based_on_result_digest: str) -> dict[str, Any]:
+    """Record a Conductor request for the Master, pinned to collected Worker evidence."""
+    if not all((frame_id, request_id, conductor_anchor_ref, feedback,
+                based_on_result_ref, based_on_result_digest)):
+        raise JournalError('TODO_JOURNAL_REWORK_REQUEST_INVALID', 'complete rework evidence required')
+    event_id = f'{frame_id}:conductor-rework:{request_id}'
+    payload = {'role': 'WORKER', 'feedback': feedback,
+               'conductor_anchor_ref': conductor_anchor_ref,
+               'based_on_result_ref': based_on_result_ref,
+               'based_on_result_digest': based_on_result_digest}
+    with _LOCK:
+        same = [(record, ref) for record, ref in records(path)
+                if record['task_frame_id'] == frame_id]
+        first = next((record for record, _ in same if record['kind'] == 'ASSIGNED'), None)
+        if first is None:
+            raise JournalError('TODO_JOURNAL_ASSIGNMENT_REQUIRED', 'launch assignment missing')
+        for record, ref in same:
+            if record['event_id'] == event_id:
+                if record['kind'] != 'CONDUCTOR_REWORK_REQUESTED' or record['payload'] != payload:
+                    raise JournalError('TODO_JOURNAL_REPLAY_CONFLICT', 'rework request changed')
+                return ref
+        latest = next((record['payload'] for record, _ in reversed(same)
+                       if record['kind'] == 'RESULT_COLLECTED'
+                       and record['payload'].get('role') == 'WORKER'), None)
+        if latest is None:
+            raise JournalError('TODO_JOURNAL_WORKER_COLLECTION_REQUIRED',
+                               'Master must collect Worker evidence before rework request')
+        if (latest.get('result_ref') != based_on_result_ref
+                or latest.get('result_digest') != based_on_result_digest):
+            raise JournalError('TODO_JOURNAL_REWORK_EVIDENCE_STALE',
+                               'a newer Worker result has been collected')
+        return append(path, **{k: first[k] for k in ('todo_id', 'owner_ref', 'run_id')},
+                      task_frame_id=frame_id, event_id=event_id,
+                      kind='CONDUCTOR_REWORK_REQUESTED', payload=payload)
+
+
+def validate_conductor_rework_request(path: Path, reference: Mapping[str, Any],
+                                      *, frame_id: str, feedback: str) -> dict[str, Any]:
+    """Check that a Master directive still cites the current Worker result."""
+    with _LOCK:
+        record = read_reference(reference, project_root=path.parents[3])
+        if (record['kind'] != 'CONDUCTOR_REWORK_REQUESTED'
+                or record['task_frame_id'] != frame_id
+                or record['payload'].get('feedback') != feedback):
+            raise JournalError('TODO_JOURNAL_REWORK_REQUEST_MISMATCH',
+                               'directive does not match the pinned Conductor request')
+        latest = next((item['payload'] for item, _ in reversed(records(path))
+                       if item['task_frame_id'] == frame_id
+                       and item['kind'] == 'RESULT_COLLECTED'
+                       and item['payload'].get('role') == 'WORKER'), None)
+        if (latest is None
+                or latest.get('result_ref') != record['payload']['based_on_result_ref']
+                or latest.get('result_digest') != record['payload']['based_on_result_digest']):
+            raise JournalError('TODO_JOURNAL_REWORK_EVIDENCE_STALE',
+                               'a newer Worker result has been collected')
+        return record
+
+
 def read_role_result(repository_root: Path, session_id: str, anchor_ref: str,
-                     frame_id: str, todo_id: str, result_ref: str, result_digest: str) -> dict[str, Any]:
+                     frame_id: str, todo_id: str, result_ref: str, result_digest: str,
+                     *, expected_source_ref: str | None = None) -> dict[str, Any]:
     """Read the exact immutable Task Frame record; never trust a posted verdict."""
     match = re.fullmatch(re.escape('task-frame-result://' + frame_id) + r'_(worker|reviewer)_([1-9][0-9]*)/(worker|reviewer)-turn/(.+)', result_ref)
     if not match or match[1] != match[3]:
@@ -215,7 +293,8 @@ def read_role_result(repository_root: Path, session_id: str, anchor_ref: str,
         context = db.execute('SELECT * FROM task_frame_context').fetchone()
         turn = db.execute('SELECT * FROM task_turns WHERE turn_id=?', (turn_id,)).fetchone()
         execution = db.execute('SELECT * FROM worker_execution_state WHERE turn_id=?', (turn_id,)).fetchone()
-    if not all((context, turn, execution)) or (context['frame_id'], context['origin_session_id'], context['origin_anchor_ref'], context['source_ref'], turn['state']) != (role_frame, session_id, anchor_ref, f'universe://todo/{todo_id}', 'COMPLETED'):
+    source_ref = expected_source_ref or f'universe://todo/{todo_id}'
+    if not all((context, turn, execution)) or (context['frame_id'], context['origin_session_id'], context['origin_anchor_ref'], context['source_ref'], turn['state']) != (role_frame, session_id, anchor_ref, source_ref, 'COMPLETED'):
         raise JournalError('TODO_JOURNAL_RESULT_INVALID', 'result provenance mismatch')
     result = json.loads(turn['result_json'])
     envelope = json.loads(execution['worker_result_envelope_json'])
@@ -228,7 +307,8 @@ def read_role_result(repository_root: Path, session_id: str, anchor_ref: str,
 
 
 def resolve_role_result(repository_root: Path, session_id: str, anchor_ref: str,
-                        frame_id: str, todo_id: str, role: str, attempt: int) -> dict[str, Any]:
+                        frame_id: str, todo_id: str, role: str, attempt: int,
+                        *, expected_source_ref: str | None = None) -> dict[str, Any]:
     """Resolve coordinates server-side, then run the same strict evidence checks."""
     if role not in {'WORKER','REVIEWER'} or type(attempt) is not int or attempt < 1:
         raise JournalError('TODO_JOURNAL_RESULT_SELECTOR_INVALID','role and positive integer attempt required')
@@ -244,7 +324,8 @@ def resolve_role_result(repository_root: Path, session_id: str, anchor_ref: str,
     if not turn or not turn[0] or not execution or not execution[0]:
         raise JournalError('TODO_JOURNAL_RESULT_INVALID','terminal result receipt required')
     ref = f'task-frame-result://{role_frame}/{role.lower()}-turn/{execution[0]}'
-    return read_role_result(root,session_id,anchor_ref,frame_id,todo_id,ref,digest(json.loads(turn[0])))
+    return read_role_result(root,session_id,anchor_ref,frame_id,todo_id,ref,
+                            digest(json.loads(turn[0])), expected_source_ref=expected_source_ref)
 
 
 def main() -> None:

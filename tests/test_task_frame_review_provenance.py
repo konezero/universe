@@ -13,6 +13,7 @@ class ReworkProvenanceTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.owner='owner';self.session='session';self.frame='host_rework'
         self.todo='todo';self.run='run';self.path=journal_path(self.root,self.todo)
+        self.source_ref='universe://todo/'+self.todo
         self.content={'title':'unchanged','detail':'bounded acceptance'}
         self.scope={'repository_write_scope':'NONE','mutation_scope':{'operations':[],'targets':[]}}
         self.identity=dict(todo_id=self.todo,owner_ref=self.owner,run_id=self.run,task_frame_id=self.frame)
@@ -31,12 +32,13 @@ class ReworkProvenanceTests(unittest.TestCase):
                 CREATE TABLE task_turns(turn_id,state,claimed_by,result_json,created_at,completed_at);
                 CREATE TABLE worker_execution_state(turn_id,result_receipt_ref,worker_result_envelope_json,worker_actor_ref);
                 CREATE TABLE task_instructions(instruction_ordinal,expected_output_json,repository_write_scope);''')
-            db.execute('INSERT INTO task_frame_context VALUES(?,?,?,?,?,?)',(rf,self.session,self.owner,'universe://todo/'+self.todo,'COMPLETED','commit'))
+            db.execute('INSERT INTO task_frame_context VALUES(?,?,?,?,?,?)',(rf,self.session,self.owner,self.source_ref,'COMPLETED','commit'))
             minute=attempt*10+(0 if role=='worker' else 2)
             db.execute('INSERT INTO task_turns VALUES(?,?,?,?,?,?)',(turn,'COMPLETED',actor,json.dumps(result),f'2026-09-23T01:{minute:02}:00Z',f'2026-09-23T01:{minute+1:02}:00Z'))
             db.execute('INSERT INTO worker_execution_state VALUES(?,?,?,?)',(turn,receipt,json.dumps(envelope),actor))
             db.execute('INSERT INTO task_instructions VALUES(?,?,?)',(1,json.dumps({'schema':f'universe.task-frame-host-{role}-output.v1'}),'NONE'))
-        return resolve_role_result(self.root,self.session,self.owner,self.frame,self.todo,role.upper(),attempt)
+        return resolve_role_result(self.root,self.session,self.owner,self.frame,self.todo,
+                                   role.upper(),attempt,expected_source_ref=self.source_ref)
 
     def build(self,*,wrong_link=False,uncollected=False,closed=True):
         for attempt in range(1,5):
@@ -61,6 +63,17 @@ class ReworkProvenanceTests(unittest.TestCase):
         self.build();pair=self.read()
         self.assertEqual('PASS',pair['reviewer']['result']['verdict'])
         self.assertTrue(pair['completion_provenance_verified'])
+
+    def test_goal_bound_result_requires_exact_goal_source(self):
+        self.source_ref='universe://goals/goal_design'
+        self.build()
+        with self.assertRaises(JournalError):
+            resolve_role_result(self.root,self.session,self.owner,self.frame,self.todo,
+                                'REVIEWER',4)
+        pair=self.read(expected_source_ref=self.source_ref)
+        self.assertEqual('PASS',pair['reviewer']['result']['verdict'])
+        with self.assertRaises(PersonaAutomationError):
+            self.read(expected_source_ref='universe://goals/other_goal')
 
     def test_stale_pair_and_changed_current_todo_are_rejected(self):
         self.build()

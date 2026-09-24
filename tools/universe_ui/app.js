@@ -242,6 +242,11 @@ const state = {
   /** Draft-to-project registration attempts keyed by draft id/revision. */
   projectDraftRegistrations: {},
   graph: { nodes: [], edges: [], scale: 1, x: 0, y: 0 },
+  // Galaxy exploration controls stay client-side and never mutate the projection.
+  galaxyView: "functional",
+  galaxyFocus: null,
+  galaxySearch: "",
+  galaxyStateFilter: "ALL",
   graphPan: null,
   /** Hovered graph node id (for icon map tooltips). */
   hoveredNodeId: null,
@@ -5456,6 +5461,94 @@ function renderIntegratedHome() {
   }
 }
 
+function opsAutomationStateLabel(schedule, config) {
+  if (config?.enabled === false) return "DISABLED";
+  const raw = String(schedule?.state || "").toUpperCase();
+  if (["RUNNING", "IN_PROGRESS", "PROCESSING"].includes(raw)) return "RUNNING";
+  if (["FAILED", "ERROR", "BLOCKED"].includes(raw)) return "FAILED";
+  if (["COMPLETED", "SUCCEEDED", "SUCCESS"].includes(raw)) return "COMPLETED";
+  if (["READY", "QUEUED", "SCHEDULED"].includes(raw)) return raw;
+  return schedule ? raw || "READY" : "ON_DEMAND";
+}
+
+function opsAutomationStatusTone(status) {
+  return ["FAILED", "ERROR", "BLOCKED"].includes(String(status || "").toUpperCase())
+    ? "error"
+    : ["RUNNING", "IN_PROGRESS", "PROCESSING"].includes(String(status || "").toUpperCase())
+      ? "active"
+      : ["COMPLETED", "SUCCEEDED", "SUCCESS"].includes(String(status || "").toUpperCase())
+        ? "complete"
+        : "neutral";
+}
+
+function opsAutomationNextAction(config, schedule, status) {
+  if (status === "DISABLED") return "활성화 후 실행할 수 있습니다.";
+  if (status === "FAILED") return schedule?.last_error_code
+    ? `오류 ${schedule.last_error_code}를 확인하고 다시 실행하세요.`
+    : "실패 원인을 확인한 뒤 다시 실행하세요.";
+  if (status === "RUNNING") return "실행 중입니다. 완료될 때까지 기다려 주세요.";
+  if (schedule?.next_due_at) return `다음 예약 ${new Date(schedule.next_due_at).toLocaleString("ko-KR")}`;
+  if (config?.schedule?.kind && config.schedule.kind !== "MANUAL") return `다음 예약을 기다리는 중입니다 · ${config.schedule.kind}`;
+  return "사용자가 지금 실행할 수 있습니다.";
+}
+
+function renderOpsStatusOverview(automation) {
+  const wrap = node("div", "ops-status-overview");
+  const configs = Array.isArray(automation?.configs) ? automation.configs : [];
+  const schedules = Array.isArray(automation?.schedules) ? automation.schedules : [];
+  const rows = configs.map((config) => {
+    const schedule = schedules.find((item) => item.stage === config.stage);
+    const status = opsAutomationStateLabel(schedule, config);
+    return { config, schedule, status };
+  });
+  const counts = rows.reduce((acc, row) => {
+    acc[row.status] = (acc[row.status] || 0) + 1;
+    return acc;
+  }, {});
+  const running = rows.filter((row) => row.status === "RUNNING").length;
+  const failed = rows.filter((row) => row.status === "FAILED").length;
+  const completed = rows.filter((row) => row.status === "COMPLETED").length;
+  wrap.append(
+    node("div", "ops-status-overview-heading",
+      node("strong", "", "운영 상태 요약"),
+      node("span", "ops-status-source", "scheduler projection · read-only")
+    ),
+    node("div", "ops-status-metrics",
+      node("article", "ops-status-metric", `단계 ${rows.length}`),
+      node("article", `ops-status-metric ${running ? "is-active" : ""}`, `실행 중 ${running}`),
+      node("article", `ops-status-metric ${failed ? "is-error" : ""}`, `실패 ${failed}`),
+      node("article", `ops-status-metric ${completed ? "is-complete" : ""}`, `최근 완료 ${completed}`)
+    )
+  );
+  if (!rows.length) {
+    wrap.append(node("p", "empty-copy", "등록된 자동화 단계가 없습니다. 상세 설정에서 단계를 확인하세요."));
+    return wrap;
+  }
+  const list = node("div", "ops-status-list");
+  for (const { config, schedule, status } of rows) {
+    const outcome = schedule?.last_outcome || "아직 실행 결과 없음";
+    const throughput = schedule?.processed_count ?? schedule?.item_count ?? schedule?.result_count;
+    const throughputText = throughput == null ? "처리량 미집계" : `처리량 ${throughput}`;
+    const card = node("article", `ops-status-card tone-${opsAutomationStatusTone(status)}`);
+    card.dataset.state = status;
+    card.append(
+      node("div", "ops-status-card-heading",
+        node("strong", "", RAG_STAGE_LABELS[config.stage] || config.stage),
+        node("span", "ops-status-pill", status)
+      ),
+      node("p", "ops-status-outcome", outcome),
+      node("small", "ops-status-throughput", `${throughputText} · ${memoryBatchExecutionLabel(config)}`),
+      node("small", "ops-status-next", `다음: ${opsAutomationNextAction(config, schedule, status)}`)
+    );
+    if (status === "FAILED" && schedule?.last_error_code) {
+      card.append(node("code", "ops-status-error", schedule.last_error_code));
+    }
+    list.append(card);
+  }
+  wrap.append(list);
+  return wrap;
+}
+
 function renderOpsMemoryAutomation() {
   const host = document.querySelector("#ops-memory-automation");
   if (!host) return;
@@ -5473,7 +5566,10 @@ function renderOpsMemoryAutomation() {
       if (state.view !== "memory-ops" || state.selectedProject?.project_id !== projectId) return;
       state.memoryBatchConfigs = automation.configs || [];
       const scheduler = automation.scheduler || {};
-      content.replaceChildren(node("p", "rag-counts", "스케줄러 " + (scheduler.status || "UNKNOWN")));
+      content.replaceChildren(
+        renderOpsStatusOverview(automation),
+        node("p", "rag-counts", "스케줄러 " + (scheduler.status || "UNKNOWN"))
+      );
       for (const config of automation.configs || []) {
         const schedule = (automation.schedules || []).find(item => item.stage === config.stage);
         const card = node("article", "rag-stage-card");
@@ -6276,9 +6372,12 @@ async function mutateFleetAutomation(featureId, owner, operation, run) {
   const anchor = String(owner?.session_anchor_ref || "").trim();
   if (!projectId || !anchor) throw new Error("A current node Master Anchor is required.");
   if (operation === "start") {
+    const fleetGoal = (state.goals || []).find((item) => item.goal_id === featureId);
     await invokeServerAction("persona.automation.start", {
       project_id: projectId, session_anchor_ref: anchor,
-      scope: `node:${featureId}`, instruction: `Bounded automation for node ${featureId}; stop at the next review gate.`,
+      scope: fleetGoal ? `goal:${featureId}` : `node:${featureId}`,
+      instruction: `Bounded automation for ${fleetGoal ? "Fleet Goal" : "node"} ${featureId}; stop at the next review gate.`,
+      ...(fleetGoal ? { goal_ref: featureId, goal_version: String(fleetGoal.revision) } : {}),
       request_id: fleetAutomationRequestId(featureId, "start"),
       idempotency_key: fleetAutomationRequestId(featureId, "start"),
     });
@@ -6426,7 +6525,7 @@ function renderFleetAutomationControls(featureId, owner) {
     return wrap;
   }
   if (projection.status === "ERROR") {
-    wrap.append(node("p", "fleet-node-team-status is-unknown", `Automation: ERROR — ${projection.error || "read failed"}`));
+    wrap.append(node("p", "fleet-node-team-status is-unknown", `Automation: ERROR — ${projection.error || "read failed"}`), renderFleetAutomationGuidance(projection.error));
     return wrap;
   }
   const run = projection.run;
@@ -6551,7 +6650,7 @@ function renderFleetConductorAutomationControls(projectId, anchor) {
     return wrap;
   }
   if (projection.status === "ERROR") {
-    wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Automation: ERROR - ${projection.error || "read failed"}`));
+    wrap.append(node("p", "fleet-project-conductor-status is-unknown", `Automation: ERROR - ${projection.error || "read failed"}`), renderFleetAutomationGuidance(projection.error));
     return wrap;
   }
   const run = projection.run;
@@ -6947,7 +7046,7 @@ function renderFleetNodeTeamDialogBody(graphNode) {
 // several nodes does not stack five-plus <select> controls per card
 // (2026-09-17 declutter, per operator request).
 function renderFleetNodeTeamSummary(graphNode) {
-  if (String(graphNode.kind || "").toUpperCase() !== "FEATURE") return null;
+  if (!["FEATURE", "FLEET_GOAL"].includes(String(graphNode.kind || "").toUpperCase())) return null;
   const featureId = homeNodeRefKey(graphNode.node_id);
   const section = node("section", "fleet-node-team");
   section.dataset.nodeRef = featureId;
@@ -7104,7 +7203,9 @@ function renderFleetNodeTeamDialogContent(graphNode) {
   }
   section.append(controls);
 
-  section.append(renderFleetNodeWorkerRoster(featureId, owner));
+  if (String(graphNode.kind || "").toUpperCase() === "FEATURE") {
+    section.append(renderFleetNodeWorkerRoster(featureId, owner));
+  }
   section.append(renderFleetAutomationControls(featureId, owner));
   section.append(renderFleetCoordinationPanel(featureId, owner));
   section.append(renderFleetOrphanQueue(featureId, owner));
@@ -7352,7 +7453,8 @@ function renderFleetNodeWorkerRoster(featureId, owner) {
 
 function goToNodeMasterBinding(featureId) {
   state.pendingFleetNodeRef = featureId || null;
-  state.homeNodeId = featureId ? `feat:${featureId}` : null;
+  const fleetGoal = (state.goals || []).some((item) => item.goal_id === featureId);
+  state.homeNodeId = featureId ? `${fleetGoal ? "goal" : "feat"}:${featureId}` : null;
   state.homeTodoId = null;
   state.homeAgentTodoId = null;
   if (fleetFeatureIsOperations(featureId)) showMemoryOpsView();
@@ -7492,6 +7594,50 @@ function renderFleetNodeSessions(graphNode, sessions) {
     section.append(node("span", "fleet-node-sessions-empty", "Session assignment unknown"));
   }
   return section;
+}
+
+// Keep the hierarchy legible in narrow Fleet columns: the breadcrumb exposes
+// the current Project > Goal/Node > Todo path without forcing operators to
+// infer context from truncated card titles.
+function renderFleetHierarchyTrail(selNode, selTodo) {
+  const trail = node("nav", "fleet-hierarchy-trail");
+  trail.setAttribute("aria-label", "Fleet hierarchy");
+  const project = state.selectedProject?.project_id || "Project";
+  const goal = selNode?.data?.goal_title || selNode?.goal_title || selNode?.title || "Node";
+  const todo = selTodo?.title || selTodo?.todo_id || "Todo";
+  [["Project", project], ["Goal / Node", goal], ["Todo", todo]].forEach(([kind, value], index) => {
+    if (index) trail.append(node("span", "fleet-hierarchy-separator", "›"));
+    const item = node("span", "fleet-hierarchy-item");
+    item.title = String(value);
+    item.append(node("small", "fleet-hierarchy-kind", kind), node("strong", "", shortLabel(value, 34)));
+    trail.append(item);
+  });
+  return trail;
+}
+
+// Translate common Goal automation failures into an actionable Korean cause
+// and next step. The raw server detail remains visible for diagnostics.
+function renderFleetAutomationGuidance(errorText) {
+  const raw = String(errorText || "read failed");
+  const lower = raw.toLowerCase();
+  let cause = "자동화 상태를 확인하지 못했습니다.";
+  let next = "잠시 후 다시 조회하고, 계속되면 해당 Goal의 소유 세션과 서버 로그를 확인하세요.";
+  if (lower.includes("usage") || lower.includes("limit") || lower.includes("quota")) {
+    cause = "사용량 한도 또는 제공자 쿼터에 도달했습니다.";
+    next = "쿼터가 갱신될 때까지 기다리거나 다른 사용 가능한 모델/세션으로 다시 시도하세요.";
+  } else if (lower.includes("permission") || lower.includes("forbidden") || lower.includes("denied")) {
+    cause = "현재 세션에 자동화를 조회하거나 실행할 권한이 없습니다.";
+    next = "Goal 소유 Master/Conductor 세션으로 전환한 뒤 다시 시도하세요.";
+  } else if (lower.includes("anchor") || lower.includes("owner") || lower.includes("session")) {
+    cause = "Goal 자동화를 실행할 소유 세션 Anchor가 없거나 연결되지 않았습니다.";
+    next = "프로젝트의 Conductor 또는 노드 Master를 먼저 연결하고 상태를 다시 조회하세요.";
+  } else if (lower.includes("api") || lower.includes("provider") || lower.includes("model")) {
+    cause = "AI 제공자 또는 모델 설정이 준비되지 않았습니다.";
+    next = "설정에서 제공자 연결과 모델을 확인한 뒤 자동화를 다시 시작하세요.";
+  }
+  const box = node("div", "fleet-automation-guidance");
+  box.append(node("strong", "", cause), node("span", "", next), node("code", "fleet-automation-raw", raw));
+  return box;
 }
 
 function renderHomeNodes(selNode) {
@@ -7769,8 +7915,10 @@ function renderHomeDetail(selNode, selTodo) {
     el.append(node("div", "goal-plan-empty", "Select a todo."));
     return;
   }
-  el.append(node("div", "", selTodo.title || selTodo.todo_id));
-  el.lastChild.style.cssText = "font-size:13px;font-weight:650;line-height:1.35;color:#e6e6e4";
+  el.append(renderFleetHierarchyTrail(selNode, selTodo));
+  const detailTitle = node("div", "fleet-detail-title", selTodo.title || selTodo.todo_id);
+  detailTitle.title = selTodo.title || selTodo.todo_id;
+  el.append(detailTitle);
 
   const executor = homeTodoExecutor(selTodo);
   const grid = node("div", "home-todo-detail-grid");
@@ -7833,7 +7981,7 @@ function renderHomeDetail(selNode, selTodo) {
     const automation = renderTodoAutomationControl(selTodo);
     if (automation) {
       const sec = node("section", "home-detail-section");
-      sec.append(node("h4", "", "Goal 자동화"), automation);
+      sec.append(node("h4", "", "계획 기반 Goal 자동화 (별도 경로)"), automation);
       el.append(sec);
     }
   }
@@ -13839,17 +13987,64 @@ function renderGalaxyViewSwitch(active, available) {
   }
   el.hidden = false;
   el.replaceChildren();
+  el.setAttribute("aria-label", "Galaxy relationship views");
+
+  const controls = node("div", "galaxy-explore-controls");
+  controls.setAttribute("role", "group");
+  controls.setAttribute("aria-label", "Galaxy search and filters");
+  const search = document.createElement("input");
+  search.type = "search";
+  search.className = "galaxy-search";
+  search.placeholder = "Search nodes…";
+  search.setAttribute("aria-label", "Search Galaxy nodes");
+  search.value = state.galaxySearch || "";
+  search.addEventListener("input", () => {
+    state.galaxySearch = search.value;
+    state.galaxyFocus = null;
+    buildGraph();
+    search.focus();
+  });
+  const filter = document.createElement("select");
+  filter.className = "galaxy-state-filter";
+  filter.setAttribute("aria-label", "Filter Galaxy node state");
+  for (const value of ["ALL", "PROPOSED", "READY", "IN_PROGRESS", "DONE", "BLOCKED"]) {
+    filter.append(new Option(value === "ALL" ? "All states" : value, value));
+  }
+  filter.value = state.galaxyStateFilter || "ALL";
+  filter.addEventListener("change", () => {
+    state.galaxyStateFilter = filter.value;
+    state.galaxyFocus = null;
+    buildGraph();
+  });
+  controls.append(search, filter);
+  el.append(controls);
+
   for (const name of GALAXY_VIEWS) {
     const chip = node("button", "galaxy-view-chip");
     chip.type = "button";
     chip.textContent = GALAXY_VIEW_LABEL[name] || name;
     chip.setAttribute("role", "tab");
-    if (name === active) chip.classList.add("is-active");
+    chip.id = `galaxy-tab-${name}`;
+    chip.setAttribute("aria-selected", name === active ? "true" : "false");
+    chip.setAttribute("aria-controls", "universe-graph");
+    chip.tabIndex = name === active ? 0 : -1;
+    chip.classList.toggle("is-active", name === active);
     chip.addEventListener("click", () => {
       if (galaxyUnifiedView() === name) return;
       state.galaxyView = name;
       state.galaxyFocus = null;
       buildGraph();
+    });
+    chip.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = [...el.querySelectorAll('[role="tab"]')];
+      const index = tabs.indexOf(chip);
+      const nextIndex = event.key === "Home" ? 0
+        : event.key === "End" ? tabs.length - 1
+        : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[nextIndex].focus();
+      tabs[nextIndex].click();
     });
     el.append(chip);
   }
@@ -13940,6 +14135,16 @@ function buildUnifiedGalaxyGraph() {
     nodes = nodes.concat(galaxyProposalGraphNodes(
       state.selectedProject?.project_id, state.goalProposals));
   }
+  const query = String(state.galaxySearch || "").trim().toLowerCase();
+  const stateFilter = String(state.galaxyStateFilter || "ALL").toUpperCase();
+  nodes = nodes.filter((item) => {
+    const title = String(item.title || item.node_id || "").toLowerCase();
+    const kind = String(item.kind || "").toLowerCase();
+    const itemState = String(item.state || "UNKNOWN").toUpperCase();
+    const matchesQuery = !query || title.includes(query) || kind.includes(query);
+    const matchesState = stateFilter === "ALL" || itemState === stateFilter;
+    return matchesQuery && matchesState;
+  });
   const totalNodeCount = nodes.length;
 
   // Focus: n-hop neighbourhood around a clicked planet.
@@ -15267,6 +15472,9 @@ function renderGalaxyNodeCard(graphNode) {
   }
   card.hidden = false;
   card.replaceChildren();
+  card.setAttribute("role", "region");
+  card.setAttribute("aria-live", "polite");
+  card.setAttribute("aria-label", `Selected Galaxy node: ${graphNode.label || graphNode.id}`);
 
   const head = node("div", "galaxy-node-card-head");
   head.append(
@@ -20381,6 +20589,35 @@ function renderMemoryCandidateReopenAction(card, candidate) {
   card.append(actions);
 }
 
+function candidateDisplayTitle(candidate) {
+  const explicit = String(candidate?.title || candidate?.knowledge?.topic || "").trim();
+  if (explicit) return explicit;
+  const summary = String(candidate?.summary || "").trim().replace(/\s+/g, " ");
+  if (summary) return summary.length > 96 ? summary.slice(0, 93) + "…" : summary;
+  return "제목 없음 · 원시 ID " + String(candidate?.candidate_id || "UNKNOWN");
+}
+
+function candidateReviewEvidence(candidate) {
+  const provenance = candidate?.provenance || {};
+  const range = provenance.source_range || {};
+  const source = provenance.source_session || provenance.source_id || "UNKNOWN";
+  const generated = candidate?.created_at || candidate?.generated_at || candidate?.updated_at || "UNKNOWN";
+  const relations = Array.isArray(candidate?.relations) ? candidate.relations : [];
+  const duplicateRelations = relations.filter((relation) =>
+    ["DUPLICATE_OF", "SUPERSEDES"].includes(String(relation?.relation || "").toUpperCase())
+  );
+  return {
+    source: String(source),
+    generated: String(generated),
+    duplicateCount: duplicateRelations.length,
+    relationLabels: duplicateRelations.map((relation) => String(relation.relation)),
+    range: String(range.start ?? "-") + "-" + String(range.end ?? "-"),
+    reason: Array.isArray(candidate?.review_reasons) && candidate.review_reasons.length
+      ? candidate.review_reasons.join(" · ")
+      : candidate?.review_reason || "검토 대기: 원천·중복 관계를 확인하세요.",
+  };
+}
+
 function renderMemoryCandidateCard(candidate) {
   const card = node("article", "memory-candidate-row");
   const provenance = candidate.provenance || {};
@@ -20389,14 +20626,15 @@ function renderMemoryCandidateCard(candidate) {
     ? provenance.ref_digests.length
     : 0;
   const kind = String(candidate.kind || "UNKNOWN").toUpperCase();
+  const evidence = candidateReviewEvidence(candidate);
   card.append(
     node(
       "strong",
       "memory-candidate-heading",
-      `${memoryCandidateKindLabel(kind)} · ${kind} / ${candidate.stage || "UNKNOWN"}`
+      candidateDisplayTitle(candidate)
     ),
-    node("span", "memory-candidate-state", candidate.state || "UNKNOWN"),
-    node("p", "", candidate.summary || "No summary")
+    node("span", "memory-candidate-state", `${memoryCandidateKindLabel(kind)} · ${kind} / ${candidate.stage || "UNKNOWN"} · ${candidate.state || "UNKNOWN"}`),
+    node("p", "memory-candidate-summary", candidate.summary || "제목 없음 — 원시 ID로 확인하세요.")
   );
   const axes = node("dl", "detail-grid memory-candidate-axis-grid");
   addDetail(axes, "Kind", kind);
@@ -20421,6 +20659,17 @@ function renderMemoryCandidateCard(candidate) {
     addDetail(axes, "Review history", history.length);
   }
   card.append(axes);
+
+  const evidencePanel = node("details", "memory-candidate-evidence");
+  evidencePanel.append(node("summary", "", "검토 근거 보기"));
+  const evidenceGrid = node("dl", "detail-grid memory-candidate-evidence-grid");
+  addDetail(evidenceGrid, "원천", evidence.source);
+  addDetail(evidenceGrid, "생성 시점", evidence.generated);
+  addDetail(evidenceGrid, "원천 범위", evidence.range);
+  addDetail(evidenceGrid, "중복 관계", evidence.duplicateCount ? evidence.relationLabels.join(" · ") : "없음");
+  addDetail(evidenceGrid, "추천 이유", evidence.reason);
+  evidencePanel.append(evidenceGrid);
+  card.append(evidencePanel);
 
   const outcomeView = renderMemoryCandidateOutcome(memoryCandidateOutcome(candidate));
   if (outcomeView) card.append(outcomeView);
@@ -20592,41 +20841,59 @@ function renderMemoryCandidateReview(showNextWork = true) {
       (!filtersState.state || (filtersState.state === "ACTION_REQUIRED"
         ? actionable : candidate.state === filtersState.state));
   });
-  if (!candidates.length) {
+  const reviewGroups = groupRagReviewCandidates(candidates, { includeIgnored: filtersState.state === "IGNORE" });
+  if (!reviewGroups.length) {
     group.append(node("p", "empty-copy", "No candidates match the current filters"));
     return group;
   }
+
   const sections = [
     {
       title: "Knowledge candidates",
       note: "MEMORY candidates remain separate from product direction until the server permits a follow-up.",
-      candidates: candidates.filter((candidate) => candidate.kind === "MEMORY"),
+      groups: reviewGroups.filter((reviewGroup) => reviewGroup.items.some((candidate) => candidate.kind === "MEMORY")),
     },
     {
       title: "Idea / hypothesis / product proposals",
       note: "IDEA, HYPOTHESIS, and PRODUCT are proposal kinds; their available actions come from the server.",
-      candidates: candidates.filter((candidate) =>
-        ["IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind)
+      groups: reviewGroups.filter((reviewGroup) =>
+        reviewGroup.items.some((candidate) => ["IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind))
       ),
     },
     {
       title: "Other candidate kinds",
       note: "Unrecognized kinds are shown without client-side action policy.",
-      candidates: candidates.filter(
-        (candidate) => !["MEMORY", "IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind)
+      groups: reviewGroups.filter((reviewGroup) =>
+        reviewGroup.items.some((candidate) => !["MEMORY", "IDEA", "HYPOTHESIS", "PRODUCT"].includes(candidate.kind))
       ),
     },
   ];
   for (const section of sections) {
-    if (!section.candidates.length) continue;
+    if (!section.groups.length) continue;
     const sectionView = node("section", "memory-candidate-kind-group");
     sectionView.append(
-      node("h4", "memory-candidate-kind-heading", `${section.title} (${section.candidates.length})`),
+      node("h4", "memory-candidate-kind-heading", `${section.title} (${section.groups.length} groups · ${section.groups.reduce((count, reviewGroup) => count + reviewGroup.items.length, 0)} candidates)`),
       node("p", "context-copy", section.note)
     );
     const list = node("div", "memory-candidate-list");
-    for (const candidate of section.candidates.slice(0, 50)) {
-      list.append(renderMemoryCandidateCard(candidate));
+    for (const reviewGroup of section.groups.slice(0, 50)) {
+      const groupView = node("article", "memory-candidate-group");
+      groupView.append(
+        node("h4", "memory-candidate-group-title", reviewGroup.title),
+        node("p", "memory-candidate-group-reasons", reviewGroup.reasons.join(" · "))
+      );
+      const evidence = node("details", "memory-candidate-evidence");
+      evidence.append(node("summary", "", `그룹 근거 보기 · ${reviewGroup.items.length}개 후보`));
+      const evidenceGrid = node("dl", "detail-grid memory-candidate-evidence-grid");
+      for (const item of reviewGroup.evidence) {
+        addDetail(evidenceGrid, "원천", item.source);
+        addDetail(evidenceGrid, "생성 시점", item.generated);
+        addDetail(evidenceGrid, "중복 관계", item.duplicateCount ? String(item.duplicateCount) : "없음");
+      }
+      evidence.append(evidenceGrid);
+      groupView.append(evidence);
+      for (const candidate of reviewGroup.items) groupView.append(renderMemoryCandidateCard(candidate));
+      list.append(groupView);
     }
     sectionView.append(list);
     group.append(sectionView);
@@ -20637,13 +20904,14 @@ function renderMemoryCandidateReview(showNextWork = true) {
 const RAG_STAGE_LABELS = { FAST_EXTRACT: "후보 수집", CONSOLIDATE: "중복 정리", SYNTHESIZE: "아이디어 분류", INDEPENDENT_CHECK: "품질 점검" };
 let ragScreenGeneration = 0;
 
-function groupRagReviewCandidates(candidates) {
+function groupRagReviewCandidates(candidates, { includeIgnored = false } = {}) {
   const groups = new Map();
   for (const item of candidates) {
-    if (["IGNORE", "SUPERSEDED"].includes(item.state) || item.source_review?.bucket === "archive") continue;
+    if ((item.state === "IGNORE" && !includeIgnored) || item.state === "SUPERSEDED" || item.source_review?.bucket === "archive") continue;
     const content = String(item.summary || "").normalize("NFC").trim().replace(/\s+/g, " ");
     // Keep case and punctuation: technical identifiers can differ in meaning.
-    const key = JSON.stringify([item.project_id || "", item.kind, item.source_review?.bucket || "pending", content || item.candidate_id]);
+    const reviewBucket = item.state === "KEEP" ? "accepted" : (item.source_review?.bucket || "pending");
+    const key = JSON.stringify([item.project_id || "", item.kind, reviewBucket, content || item.candidate_id]);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(item);
   }
@@ -20660,8 +20928,20 @@ function groupRagReviewCandidates(candidates) {
     const organized = items.length > 1 || items.some(item => item.stage === "CONSOLIDATE");
     if (items.length > 1) reasons.add("동일 내용 묶음");
     else if (organized) reasons.add("통합 단계 결과");
+    if (items.some((item) => !String(item.summary || "").trim())) reasons.add("제목·요약 확인 필요");
     if (!reasons.size) reasons.add("검토 전");
-    return {items, reasons: [...reasons], bucket: items[0].source_review?.bucket || "pending"};
+    return {
+      items,
+      reasons: [...reasons],
+      bucket: items[0].source_review?.bucket || "pending",
+      title: String(items[0].title || items[0].knowledge?.topic || items[0].summary || "").trim() || "제목 없음 · 원시 ID " + String(items[0].candidate_id || "UNKNOWN"),
+      candidateIds: items.map((item) => item.candidate_id),
+      evidence: items.map((item) => ({
+        source: String(item.provenance?.source_session || item.provenance?.source_id || "UNKNOWN"),
+        generated: String(item.created_at || item.generated_at || item.updated_at || "UNKNOWN"),
+        duplicateCount: Array.isArray(item.relations) ? item.relations.filter((relation) => ["DUPLICATE_OF", "SUPERSEDES"].includes(String(relation?.relation || "").toUpperCase())).length : 0,
+      })),
+    };
   }).sort((a, b) => Number(b.reasons.includes("충돌 확인")) - Number(a.reasons.includes("충돌 확인")));
 }
 
