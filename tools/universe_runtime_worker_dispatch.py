@@ -27,6 +27,11 @@ from agent_session_gateway import (
 from claude_permission_bridge import ClaudePermissionBridge
 from claude_permission_broker import ClaudePermissionBroker
 from claude_resident_session import ClaudeResidentError, ClaudeResidentSession
+from provider_session_adapter import (
+    ProviderSession, ProviderSessionResult, SessionAdapter,
+    ProviderSessionIdentityError, GrokSessionAdapter,
+    CodexSessionAdapter, ClaudeSessionAdapter,
+)
 from host_profile import resolve_host_tool
 from universe_app.terminal_host import TerminalHostError
 from windows_native_cli import NativeCliRequest, NativeCliResult, run_native_cli
@@ -1154,6 +1159,22 @@ class RuntimeWorkerDispatcher:
             "WORKER_PROVIDER_UNSUPPORTED",
         )
 
+    def _session_coordinates(self, provider, request, transport):
+        return ProviderSession(
+            provider=provider,
+            task_frame_id=str(request.get("task_frame_id") or request.get("frame_id") or ""),
+            task_frame_turn_id=str(request.get("turn_id") or ""),
+            session_anchor_ref=str(transport.get("session_anchor_ref") or ""),
+        )
+
+    def _run_session(self, adapter: SessionAdapter, request) -> ProviderSessionResult:
+        try:
+            return adapter.run(self._worker_prompt(request))
+        except ProviderSessionIdentityError as error:
+            raise WorkerDispatchError(
+                "WORKER_PROVIDER_FAILED", "WORKER_SESSION", str(error)
+            ) from error
+
     def _invoke_grok(self, request: Mapping[str, Any]) -> dict[str, Any]:
         executable, environment, _configured_model = _resolve_grok()
         if executable is None:
@@ -1172,11 +1193,11 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 "GROK_RUNTIME_PROFILE_INVALID",
             )
-        session_ids: list[str] = []
-        host_session_ref = ""
         try:
-            gateway = UniverseAcpGateway(
-                GrokAcpSession(
+            adapter = GrokSessionAdapter(
+                session=self._session_coordinates("GROK", request, supervisor_transport),
+                gateway_factory=UniverseAcpGateway,
+                factory=lambda observe: GrokAcpSession(
                     executable=executable,
                     cwd=self._worker_cwd(request),
                     environment=environment,
@@ -1187,7 +1208,7 @@ class RuntimeWorkerDispatcher:
                     permission_requester=lambda permission: self._task_frame_permission(
                         request, permission
                     ),
-                    session_observer=session_ids.append,
+                    session_observer=observe,
                     ephemeral=True,
                     response_timeout_seconds=(
                         None
@@ -1197,22 +1218,16 @@ class RuntimeWorkerDispatcher:
                     **supervisor_transport,
                 )
             )
-            try:
-                text = gateway.reply_stream(
-                    self._worker_prompt(request),
-                    lambda _delta: None,
-                )
-                session_ref = gateway.session_ref
-                host_session_ref = gateway.host_session_ref
-            finally:
-                gateway.close()
+            execution = self._run_session(adapter, request)
         except AgentSessionError as error:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED",
                 "WORKER_ADAPTER",
                 f"GROK_ACP_{error}",
             ) from error
-        session_id = session_ids[-1] if session_ids else session_ref.split(":", 1)[-1]
+        session_id = execution.session.provider_session_ref.split(":", 1)[-1]
+        host_session_ref = execution.session.host_session_ref
+        text = execution.text
         return {
             "schema": "universe.grok-worker-result.v1",
             "status": "COMPLETED",
@@ -1249,8 +1264,6 @@ class RuntimeWorkerDispatcher:
         model = self._request_model(request)
         effort = self._request_effort(request)
         supervisor_transport = self._request_supervisor_transport(request)
-        session_ids: list[str] = []
-        host_session_ref = ""
         editor = self._host_editors.get(str(request.get("worker_run_ref") or ""))
         dynamic_tools = [HOST_EDIT_TOOL] if editor is not None else []
         context = request.get("context_pack")
@@ -1271,8 +1284,10 @@ class RuntimeWorkerDispatcher:
             return {"status": "HOST_DYNAMIC_TOOL_REJECTED", "repository_write": False}
 
         try:
-            gateway = UniverseAcpGateway(
-                CodexAppServerSession(
+            adapter = CodexSessionAdapter(
+                session=self._session_coordinates("CODEX", request, supervisor_transport),
+                gateway_factory=UniverseAcpGateway,
+                factory=lambda observe: CodexAppServerSession(
                     executable=executable,
                     cwd=self._worker_cwd(request),
                     environment=environment,
@@ -1283,7 +1298,7 @@ class RuntimeWorkerDispatcher:
                     permission_requester=lambda permission: self._task_frame_permission(
                         request, permission
                     ),
-                    session_observer=session_ids.append,
+                    session_observer=observe,
                     ephemeral=True,
                     # Task Frame turns end on provider completion, explicit
                     # cancellation, or Host/provider failure. Their bounded
@@ -1294,15 +1309,7 @@ class RuntimeWorkerDispatcher:
                     **supervisor_transport,
                 )
             )
-            try:
-                text = gateway.reply_stream(
-                    self._worker_prompt(request),
-                    lambda _delta: None,
-                )
-                session_ref = gateway.session_ref
-                host_session_ref = gateway.host_session_ref
-            finally:
-                gateway.close()
+            execution = self._run_session(adapter, request)
         except TerminalHostError as error:
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
@@ -1315,7 +1322,9 @@ class RuntimeWorkerDispatcher:
                 "WORKER_ADAPTER",
                 f"CODEX_APP_SERVER_{error}",
             ) from error
-        session_id = session_ids[-1] if session_ids else session_ref.split(":", 1)[-1]
+        session_id = execution.session.provider_session_ref.split(":", 1)[-1]
+        host_session_ref = execution.session.host_session_ref
+        text = execution.text
         return {
             "schema": "universe.codex-worker-result.v1",
             "status": "COMPLETED",
@@ -1363,7 +1372,16 @@ class RuntimeWorkerDispatcher:
                     "CLAUDE_JSON_SCHEMA_REQUIRED",
                 )
             json_schema = dict(raw_schema)
-        if supervisor_transport:
+        context = request.get("context_pack")
+        journal_backed = (
+            isinstance(context, Mapping)
+            and isinstance(context.get("journal_assignment"), Mapping)
+        )
+        # Journal-backed roles must read their assignment and execute bounded
+        # tools. The ephemeral print adapter deliberately passes --tools "";
+        # use the existing permission-bridged stream adapter even when this
+        # independent Host has no Supervisor terminal coordinate.
+        if supervisor_transport or journal_backed:
             return self._invoke_managed_claude(
                 request,
                 executable=executable,
@@ -1373,10 +1391,11 @@ class RuntimeWorkerDispatcher:
                 json_schema=json_schema,
                 supervisor_transport=supervisor_transport,
             )
-        session_ids: list[str] = []
         try:
-            gateway = UniverseAcpGateway(
-                ClaudeCodeSession(
+            adapter = ClaudeSessionAdapter(
+                session=self._session_coordinates("CLAUDE", request, supervisor_transport),
+                gateway_factory=UniverseAcpGateway,
+                factory=lambda observe: ClaudeCodeSession(
                     executable=executable,
                     cwd=self._worker_cwd(request),
                     environment=environment,
@@ -1386,7 +1405,7 @@ class RuntimeWorkerDispatcher:
                     permission_requester=lambda permission: self._task_frame_permission(
                         request, permission
                     ),
-                    session_observer=session_ids.append,
+                    session_observer=observe,
                     ephemeral=True,
                     allow_read_only_tools=self._is_qa_reviewer(request),
                     # Task Frames complete on a terminal structured result. A
@@ -1401,21 +1420,15 @@ class RuntimeWorkerDispatcher:
                     native_runner=self.native_runner,
                 )
             )
-            try:
-                text = gateway.reply_stream(
-                    self._worker_prompt(request),
-                    lambda _delta: None,
-                )
-                session_ref = gateway.session_ref
-            finally:
-                gateway.close()
+            execution = self._run_session(adapter, request)
         except AgentSessionError as error:
             raise WorkerDispatchError(
                 "WORKER_PROVIDER_FAILED",
                 "WORKER_ADAPTER",
                 f"CLAUDE_CODE_{error}",
             ) from error
-        session_id = session_ref.split(":", 1)[-1]
+        session_id = execution.session.provider_session_ref.split(":", 1)[-1]
+        text = execution.text
         return {
             "schema": "universe.claude-worker-result.v1",
             "status": "COMPLETED",
@@ -1449,11 +1462,8 @@ class RuntimeWorkerDispatcher:
         json_schema: Mapping[str, Any] | None,
         supervisor_transport: Mapping[str, Any],
     ) -> dict[str, Any]:
-        session_ids: list[str] = []
-        host_session_ref = ""
         broker: ClaudePermissionBroker | None = None
         config_root: Path | None = None
-        gateway: UniverseAcpGateway | None = None
         try:
             bridge = ClaudePermissionBridge(
                 session_ref=f"claude-code:pending:{uuid4().hex}",
@@ -1471,40 +1481,32 @@ class RuntimeWorkerDispatcher:
             config_root = Path(tempfile.mkdtemp(prefix="universe-task-frame-claude-mcp-"))
             mcp_config = broker.write_mcp_config(config_root / "mcp.json")
 
-            def observe_session(session_id: str) -> None:
-                session_ids.append(session_id)
-                bridge.bind_session_ref(f"claude-code:{session_id}")
-
-            session = ClaudeResidentSession(
-                executable=executable,
-                cwd=self._worker_cwd(request),
-                environment=broker.provider_environment(dict(environment)),
-                model=model,
-                effort=effort,
-                json_schema=json_schema,
-                system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
-                session_id=None,
-                session_observer=observe_session,
-                extra_arguments=("--no-session-persistence",),
-                # A Task Frame finishes on the provider's terminal structured
-                # result (or an explicit cancel/failure). Editing and review do
-                # not have a defensible wall-clock duration, so the managed
-                # Claude path intentionally has no per-turn timer.
-                turn_timeout_seconds=None,
-                permission_mcp_config=mcp_config,
-                permission_bridge=bridge,
-                permission_ready=broker.wait_for_registration,
-                permission_failure=broker.close,
-                **dict(supervisor_transport),
+            adapter = ClaudeSessionAdapter(
+                session=self._session_coordinates("CLAUDE", request, supervisor_transport),
+                broker=broker,
+                gateway_factory=UniverseAcpGateway,
+                factory=lambda observe: ClaudeResidentSession(
+                    executable=executable,
+                    cwd=self._worker_cwd(request),
+                    environment=broker.provider_environment(dict(environment)),
+                    model=model,
+                    effort=effort,
+                    json_schema=json_schema,
+                    system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
+                    session_id=None,
+                    session_observer=observe,
+                    extra_arguments=("--no-session-persistence",),
+                    # Task Frames finish on terminal result or explicit failure,
+                    # not a wall-clock estimate of editing/review duration.
+                    turn_timeout_seconds=None,
+                    permission_mcp_config=mcp_config,
+                    permission_bridge=bridge,
+                    permission_ready=broker.wait_for_registration,
+                    permission_failure=broker.close,
+                    **dict(supervisor_transport),
+                ),
             )
-            bridge.bind_session_ref(session.session_ref)
-            gateway = UniverseAcpGateway(session)
-            text = gateway.reply_stream(
-                self._worker_prompt(request),
-                lambda _delta: None,
-            )
-            session_ref = gateway.session_ref
-            host_session_ref = session.host_session_ref
+            execution = self._run_session(adapter, request)
         except TerminalHostError as error:
             raise WorkerDispatchError(
                 "WORKER_TRANSPORT_FAILED",
@@ -1518,17 +1520,13 @@ class RuntimeWorkerDispatcher:
                 f"CLAUDE_CODE_{error}",
             ) from error
         finally:
-            if gateway is not None:
-                gateway.close()
             if broker is not None:
                 broker.close()
             if config_root is not None:
                 shutil.rmtree(config_root, ignore_errors=True)
-        session_id = (
-            session_ids[-1]
-            if session_ids
-            else session_ref.split(":", 1)[-1]
-        )
+        session_id = execution.session.provider_session_ref.split(":", 1)[-1]
+        host_session_ref = execution.session.host_session_ref
+        text = execution.text
         return {
             "schema": "universe.claude-worker-result.v1",
             "status": "COMPLETED",
@@ -1547,10 +1545,10 @@ class RuntimeWorkerDispatcher:
             ).upper(),
             "session_persistence": "EPHEMERAL",
             "persistent_session_ref": "UNKNOWN",
-            "universe_coordinate_persisted": True,
+            "universe_coordinate_persisted": bool(supervisor_transport),
             "provider_durable_chat_state": "NOT_PERSISTED",
             "host_session_ref": host_session_ref or "UNKNOWN",
-            "session_anchor_ref": supervisor_transport["session_anchor_ref"],
+            "session_anchor_ref": supervisor_transport.get("session_anchor_ref", "UNKNOWN"),
         }
 
     @staticmethod

@@ -457,6 +457,9 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         observed: list[dict[str, object]] = []
 
         class FakeBroker:
+            def bind_session_ref(self, ref):
+                self.session_ref = ref
+
             def start(self):
                 return self
 
@@ -529,6 +532,54 @@ class RuntimeWorkerDispatchTests(unittest.TestCase):
         self.assertEqual("CLAUDE_CODE_STREAM_ADAPTER", result["runtime_provider"])
         self.assertTrue(result["universe_coordinate_persisted"])
         self.assertEqual("host-claude-managed-1", result["host_session_ref"])
+
+    def test_independent_journal_roles_get_permission_bridged_tools(self) -> None:
+        from claude_resident_session import ClaudeResidentSession
+
+        for role, scope in (("IMPLEMENTER", "BOUNDED"), ("REVIEWER", "NONE")):
+            with self.subTest(role=role):
+                observed = []
+
+                def make_session(**kwargs):
+                    session = ClaudeResidentSession(**kwargs)
+                    observed.append(session)
+                    return session
+
+                request = {
+                    **self.request,
+                    "repository_write_scope": scope,
+                    "context_pack": {
+                        "semantic_role": role,
+                        "journal_assignment": {"schema": "pinned-test-reference"},
+                        "journal_read_argv": ["python", "reader.py", "--reference-base64", "e30="],
+                    },
+                }
+                dispatcher = RuntimeWorkerDispatcher(self.root)
+                # Real local broker and real session configuration; no provider
+                # process, global profile writes, or shared service is started.
+                with (
+                    patch("universe_runtime_worker_dispatch._resolve_claude",
+                          return_value=(self.root / "claude.exe", {}, "test-model")),
+                    patch("universe_runtime_worker_dispatch.ClaudeCodeSession") as print_adapter,
+                    patch("universe_runtime_worker_dispatch.ClaudeResidentSession", make_session),
+                    patch("universe_runtime_worker_dispatch.UniverseAcpGateway", FakeGateway),
+                ):
+                    result = dispatcher._invoke_claude(request)
+
+                print_adapter.assert_not_called()
+                session = observed[0]
+                args = session._arguments()
+                self.assertNotIn("--tools", args)
+                self.assertIn("--permission-prompt-tool", args)
+                self.assertIn("--strict-mcp-config", args)
+                self.assertIn("--no-session-persistence", args)
+                self.assertIsNotNone(session.permission_bridge)
+                self.assertIsNotNone(session.permission_ready)
+                self.assertFalse(session.permission_mcp_config.exists())
+                self.assertEqual("CLAUDE_CODE_STREAM_ADAPTER", result["runtime_provider"])
+                self.assertFalse(result["universe_coordinate_persisted"])
+                self.assertEqual("UNKNOWN", result["session_anchor_ref"])
+                self.assertEqual(scope, result["repository_write_scope"])
 
     def test_managed_claude_preserves_rust_host_launch_failure_detail(self) -> None:
         class FakeBroker:
