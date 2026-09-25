@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from task_frame_host import RoleResult
+from master_followup_policy import WORKER_FOLLOWUP_POLICY
 from task_frame_host_permission import HostPermissionEscalator
 from task_frame_host_transport import HttpBusPort, HttpRoomPort, HttpTodoPort, fetch_runtime_binding
 from universe_runtime_host import RuntimeHostError, UniverseRuntimeHost
@@ -44,7 +45,7 @@ WORKER_OUTPUT_CONTRACT = {
     },
     "instruction": (
         "Complete the assigned task inside the declared scope and return one JSON "
-        "object. Keep the task result separate from transport state."
+        "object. Keep the task result separate from transport state. " + WORKER_FOLLOWUP_POLICY
     ),
 }
 
@@ -65,7 +66,7 @@ REVIEWER_OUTPUT_CONTRACT = {
     },
     "instruction": (
         "Review the supplied Worker result against the Todo. Return one JSON object "
-        "with verdict PASS, NEEDS_REVISION, or BLOCKED and cite evidence_refs."
+        "with verdict PASS, NEEDS_REVISION, or BLOCKED and cite evidence_refs. " + WORKER_FOLLOWUP_POLICY
     ),
 }
 

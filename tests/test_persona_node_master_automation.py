@@ -612,6 +612,35 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertIn("persona.automation.decide", body)
         self.assertIn("ESCALATE", body)
         self.assertIn("lease", body)
+        from master_followup_policy import MASTER_FOLLOWUP_POLICY
+        self.assertIn(MASTER_FOLLOWUP_POLICY, body)
+        self.assertIn("MEMORY_CANDIDATE_ALREADY_RECORDED", body)
+        self.assertIn("original-scope defect requires REWORK", body)
+
+    def test_followup_candidate_http_replay_is_unadopted_and_non_executing(self):
+        from unittest.mock import patch
+        from task_frame_host_runner import WORKER_OUTPUT_CONTRACT, REVIEWER_OUTPUT_CONTRACT
+        from master_followup_policy import WORKER_FOLLOWUP_POLICY
+        for contract in (WORKER_OUTPUT_CONTRACT, REVIEWER_OUTPUT_CONTRACT):
+            self.assertIn(WORKER_FOLLOWUP_POLICY, contract["instruction"])
+        payload = {"stage": "SYNTHESIZE", "kind": "IDEA", "state": "REVIEW_REQUIRED",
+                   "summary": "Follow-up: add export preview; reason: optional usability; acceptance: preview before export; source: universe://todo/completed_fixture",
+                   "source_session": {"source_id": "run_completed_fixture", "source_ref": "universe://todo/completed_fixture"},
+                   "ref_digests": ["a" * 64]}
+        with patch.object(self.server.store, "create_feature_node", side_effect=AssertionError("must not create a node")), \
+             patch.object(self.server.store, "adopt_memory_candidate", side_effect=AssertionError("must not adopt")):
+            status, first = self.request("POST", "/v1/projects/TEST/memory-candidates", payload)
+            self.assertEqual(201, status, first)
+            self.assertEqual("MEMORY_CANDIDATE_RECORDED", first["status"])
+            status, replay = self.request("POST", "/v1/projects/TEST/memory-candidates", payload)
+            self.assertEqual(200, status, replay)
+            self.assertEqual("MEMORY_CANDIDATE_ALREADY_RECORDED", replay["status"])
+            candidate = replay["candidate"]
+            self.assertEqual(first["candidate"]["candidate_id"], candidate["candidate_id"])
+            self.assertEqual("REVIEW_REQUIRED", candidate["state"])
+            self.assertEqual("TEST", candidate["project_id"])
+            self.assertEqual(payload["source_session"]["source_ref"], candidate["provenance"]["source_ref"])
+            self.assertEqual(payload["ref_digests"], candidate["provenance"]["ref_digests"])
 
     def test_node_master_can_park_an_idle_run_as_waiting_with_a_reason(self):
         anchor, _node, run = self._start_driven_run("driver-escalate")

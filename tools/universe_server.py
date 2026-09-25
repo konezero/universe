@@ -37406,6 +37406,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             return skip("WAITING_NO_PENDING_CONTROL")
         idempotency_key = f"persona-control:{run_id}:{driver_key}"
         short_id = node_ref.removeprefix("feature_")[:8]
+        from master_followup_policy import MASTER_FOLLOWUP_POLICY
         body_text = "\n".join([
             "Persona automation node control turn.",
             f"run_id: {run_id}",
@@ -37473,6 +37474,7 @@ class UniverseHTTPServer(ThreadingHTTPServer):
             "conductor_approval_ref set to that reply's message id (without it the server refuses), "
             "or DENY. No decision means the Worker's write is denied when the Host's wait ends. "
             "Sub-agents are not available to Workers. Do not edit source files outside these routes.",
+            MASTER_FOLLOWUP_POLICY,
         ])
         posted = self.session_bus.post(
             host,
