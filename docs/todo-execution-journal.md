@@ -204,3 +204,66 @@ the original-pair restriction. See `persona-worker-review-automation-contract.md
 
 This repair does not claim to fix the separate native-queue snapshot sharing
 violation or prove RAG live restart/lease acceptance.
+
+### Independent Claude role tool routing (2026-09-25)
+
+An independent journal-backed Claude Host previously selected the ephemeral
+print adapter because it had no Supervisor terminal coordinate. That adapter
+passed `--tools ""`, so successful structured-output transport could still return
+a BLOCKED Worker that could not read its assignment. Codex tool availability
+does not prove Claude tool availability.
+
+Journal-backed Claude Worker and Reviewer calls now use the existing stream
+adapter and its permission MCP bridge even without a Supervisor coordinate.
+Native tools remain available; scope checks still run through the Task Frame
+permission bridge. This does not grant writes to a read-only Reviewer. Claude
+uses the supplied `journal_read_argv` reader; the Codex-specific
+`universe_read_assignment` tool is not required on this provider path.
+
+The regression test constructs the real broker/session configuration for both
+roles with an isolated fake provider gateway. It checks tool arguments, permission
+bridge, scope, cleanup and absence of invented Supervisor coordinates. It is not
+a live-provider acceptance result. Existing Hosts retain their imported code;
+inspect liveness and collect their results before attempting a fresh Host.
+
+### Master replacement and local work entry (2026-09-25)
+
+`persona.automation.transfer-journal` explicitly hands an existing Todo journal
+to its replacement run owner. It requires `run_id`, `owner_ref`, `todo_id`,
+`previous_owner_ref`, `request_id`, `expected_revision`, `expected_sequence`,
+and `expected_digest` (the last record's `record_digest`, not its byte-range SHA).
+The destination run must be WAITING at that exact revision and own the Todo
+scope. Every historical run must be quiescent in the same project/node and every
+historical Host must be known and EXITED. A STOPPED run alone does not establish
+Host termination. A live or unknown Host blocks the transfer.
+
+The Action appends `OWNER_TRANSFERRED` under the journal writer lock. Existing
+bytes, pinned ranges and result evidence are preserved; subsequent writes use
+the new owner. Exact retries replay; changed payloads or stale tails conflict.
+Transfer does not resume a run, launch a Worker, accept a review or finish a Todo.
+
+For direct local work, the Universe service endpoint is not a Project Runtime
+Host endpoint. Use the installed repo-local entry, without an endpoint/token:
+
+```text
+python .ai/runtime/reference_runtime/cli.py execution-binding begin-local-work
+  --repo-root C:/workspace/universe --request <UTF-8 JSON file or ->
+```
+
+The request contains the actual active `session_id`, registered `mode`, current
+`source_commit`, and `work` with `scope_kind: LOCAL_INSTRUCTION_WORK`, bounded
+absolute `write_roots`, `write_operations: [CREATE, MODIFY]`, `boundary`,
+`task_summary`, `instruction_id`, and the existing user `instruction_ref`. Do not copy another
+Master's session/receipt or start another server. The isolated CLI regression
+creates its own Registry/Current Anchor and verifies WORK_RECEIPT_ACTIVATED
+without HTTP; this does not assert activation for any live Master.
+
+Deployment `master-journal-transfer-deploy-20260925-1` completed through the
+supported service execution route (PID 52640 -> 44124, READY). The live UX
+handoff attempt was correctly blocked with `TODO_JOURNAL_TRANSFER_HOST_ACTIVE`:
+old run `persona_run_c56aa5723a1b4946863a6d96` is STOPPED, but
+`host_f0547a9e6c9e84eedf62` is still alive/RUNNING_WORKER (PID 49108, command line
+confirmed as that Host). Its six journal records were unchanged. No handoff,
+replacement Worker, acceptance, or Todo completion is claimed. This Host calls
+the role runner synchronously, so a queued DONE is not an interrupt while that
+call remains blocked; do not claim it terminated a running provider.

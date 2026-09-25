@@ -318,6 +318,7 @@ PERSONA_AUTOMATION_ACTION_IDS = (
     "persona.automation.host-status",
     "persona.automation.collect-frame",
     "persona.automation.recover-frame-review",
+    "persona.automation.transfer-journal",
     "persona.automation.host-permission",
     "persona.automation.host-binding",
 )
@@ -1201,6 +1202,7 @@ def build_default_action_registry(
         "persona.automation.host-status": ("READ_ONLY", "host_status"),
         "persona.automation.collect-frame": ("LOCAL_DATABASE_MUTATION", "collect_frame"),
         "persona.automation.recover-frame-review": ("LOCAL_DATABASE_MUTATION", "recover_frame_review"),
+        "persona.automation.transfer-journal": ("LOCAL_DATABASE_MUTATION", "transfer_journal"),
         "persona.automation.host-permission": ("LOCAL_DATABASE_MUTATION", "host_permission"),
         "persona.automation.host-binding": ("READ_ONLY", "host_binding"),
     }
@@ -1318,6 +1320,20 @@ def build_default_action_registry(
                 side_effect_class="LOCAL_DATABASE_MUTATION" if action_id in ("project.draft.save", "project.draft.register") else "READ_ONLY",
                 metadata={"ownership": "PROJECT_AUTHORING", "revision_control": "EXPECTED_REVISION",
                           "fields": ["title", "domain", "description", "goal", "target_users", "scenarios", "structure", "capabilities", "validation", "constraints", "project_root"]},
+            ), supplied_handlers[action_id], surfaces=(action_id,))
+    from universe_plan_item_actions import ACTION_IDS as PLAN_ITEM_ACTION_IDS, ERRORS as PLAN_ITEM_ERRORS, REQUEST_SCHEMAS as PLAN_ITEM_REQUEST_SCHEMAS
+    for action_id in PLAN_ITEM_ACTION_IDS:
+        if action_id in supplied_handlers:
+            registry.register(ActionContract(
+                action_id=action_id,
+                request_schema_ref=f"universe.{action_id}-request.v1",
+                result_schema_ref=f"universe.plan-item-{action_id.split('.')[2]}-action.v1",
+                side_effect_class="LOCAL_DATABASE_MUTATION" if action_id == "plan.item.save" else "READ_ONLY",
+                metadata={"ownership": "PROJECT_PLAN_ITEM", "request_schema": PLAN_ITEM_REQUEST_SCHEMAS[action_id],
+                          "revision_control": "EXPECTED_REVISION" if action_id == "plan.item.save" else "READ_ONLY",
+                          "replay": "SAME_REQUEST_ID_AND_CONTENT" if action_id == "plan.item.save" else "READ_ONLY",
+                          "link_targets": {"node_refs": "feature_node", "todo_refs": "project_todo", "depends_on": "plan_item"},
+                          "project_completion": "NOT_AGGREGATED", "errors": list(PLAN_ITEM_ERRORS)},
             ), supplied_handlers[action_id], surfaces=(action_id,))
     # Only handler-backed work-surface Actions are registered as discoverable
     # contracts. The remaining pending todo.* Actions are intentionally left

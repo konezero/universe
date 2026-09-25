@@ -1116,6 +1116,38 @@ class NodeMasterAutomationTests(unittest.TestCase):
         self.assertEqual("TASK_FRAME_SCOPE_INVALID", refused["error_code"])
         self.assertEqual([], spawned)
 
+    def test_journal_transfer_action_preserves_history_and_checks_live_hosts(self):
+        from unittest.mock import patch
+        from todo_execution_journal import append, journal_path, records, read_reference
+        anchor, node_ref, run = self._start_driven_run('journal-handoff-api')
+        todo = self._frame_todo(node_ref)
+        root = Path(self.server.store.get_project('TEST')['project_root'])
+        path = journal_path(root, todo['todo_id'])
+        old_run = {**run, 'run_id': 'old_run', 'state': 'STOPPED', 'session_anchor_ref': 'old_master'}
+        waiting = {**run, 'state': 'WAITING'}
+        pin = append(path, todo_id=todo['todo_id'], owner_ref='old_master', run_id='old_run',
+                     task_frame_id='old_frame', event_id='launch', kind='ASSIGNED', payload={})
+        body = dict(run_id=run['run_id'], owner_ref=anchor, todo_id=todo['todo_id'],
+                    previous_owner_ref='old_master', request_id='handoff_api',
+                    expected_revision=run['revision'], expected_sequence=1,
+                    expected_digest=records(path)[-1][0]['record_digest'])
+        with patch.object(self.server.persona_automation, 'get_run',
+                          side_effect=lambda key: old_run if key == 'old_run' else waiting), \
+             patch('universe_server.task_frame_host_status') as observed:
+            observed.return_value = {'known': True, 'alive': True, 'phase': 'RUNNING_WORKER'}
+            status, blocked = self.act('persona.automation.transfer-journal', body)
+            self.assertEqual(409, status, blocked)
+            self.assertEqual('TODO_JOURNAL_TRANSFER_HOST_ACTIVE', blocked['error_code'])
+            observed.return_value = {'known': True, 'alive': False, 'phase': 'EXITED'}
+            status, result = self.act('persona.automation.transfer-journal', body)
+            self.assertEqual(200, status, result)
+            self.assertEqual('TODO_JOURNAL_OWNER_TRANSFERRED', result['status'])
+            self.assertEqual(200, self.act('persona.automation.transfer-journal', body)[0])
+            self.assertEqual(400, self.act('persona.automation.transfer-journal',
+                                          {**body, 'expected_sequence': True})[0])
+        self.assertEqual(2, len(records(path)))
+        self.assertEqual('old_master', read_reference(pin, project_root=root)['owner_ref'])
+
     def test_direct_collect_and_status_only_work_for_a_frame_the_run_launched(self):
         anchor, node_ref, run = self._start_driven_run("frame-collect")
         for action, body in (

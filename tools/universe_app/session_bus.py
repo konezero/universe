@@ -799,6 +799,62 @@ class SessionBus:
                     errors.append({"message_id": message_id, "error_code": getattr(error, "code", type(error).__name__)})
         return {"message_ids": closed, "errors": errors}
 
+    def reconcile_permission_reply_handoffs(self, lookup: Callable) -> dict[str, Any]:
+        """Release only reply notifications consumed by a durable Master decision."""
+        closed, errors = [], []
+        with self._lock:
+            for mid, message in list(self._messages.items()):
+                if (_message_lifecycle(message) != "STARTED"
+                        or message.get("kind") != "INSTRUCTION"
+                        or (message.get("provenance") or {}).get("kind") != "SESSION_BUS_RESULT_FORWARD"):
+                    continue
+                result_id = str((message.get("lifecycle") or {}).get("forwarded_from_result_id") or "")
+                result = self._messages.get(result_id, {})
+                original = self._messages.get(str(result.get("in_reply_to") or ""), {})
+                source, target = original.get("from") or {}, original.get("to") or {}
+                key = str((original.get("lifecycle") or {}).get("idempotency_key") or "")
+                prefix = "host-permission-escalation:"
+                permission = key[len(prefix):] if key.startswith(prefix) else ""
+                thread = str(original.get("thread_id") or "")
+                if (not permission or original.get("kind") != "INSTRUCTION"
+                        or source.get("provider") != "UNIVERSE" or source.get("mode") != "MASTER"
+                        or not source.get("session_anchor_ref") or not source.get("project_id")
+                        or target.get("mode") != "CONDUCTOR" or not target.get("session_anchor_ref")
+                        or target.get("project_id") != source.get("project_id")
+                        or result.get("kind") != "RESULT"
+                        or any((result.get("from") or {}).get(k) != target.get(k)
+                               for k in ("mode", "project_id", "session_anchor_ref"))
+                        or (original.get("lifecycle") or {}).get("final_result_id") != result_id
+                        or (result.get("lifecycle") or {}).get("forwarded_instruction_id") != mid
+                        or message.get("in_reply_to") != result_id
+                        or not thread.startswith("persona-") or not thread.endswith("-perm-" + permission)
+                        or any(m.get("thread_id") != thread for m in (result, message))
+                        or any(m.get("recipient_anchor_ref") != source.get("session_anchor_ref")
+                               for m in (result, message))
+                        or (message.get("to") or {}).get("project_id") != source.get("project_id")):
+                    continue
+                try:
+                    proof = lookup(original)
+                    if (not isinstance(proof, Mapping)
+                            or proof.get("owner_ref") != source.get("session_anchor_ref")
+                            or proof.get("project_id") != source.get("project_id")
+                            or proof.get("permission_request_id") != permission
+                            or proof.get("decision") not in {"APPROVE", "DENY"}
+                            or not proof.get("message_id")):
+                        continue
+                    updated = _json_mod.loads(_json_mod.dumps(message))
+                    now = utc_now()
+                    updated.update(lifecycle_state="COMPLETED", delivery_state="COMPLETED", updated_at=now)
+                    updated.setdefault("lifecycle", {}).update(
+                        completed_at=now, awaits_authoritative_reply=False,
+                        permission_ack={**dict(proof), "status": "PERMISSION_DECISION_CONFIRMED"})
+                    self._persist_message(str(message.get("_terminal_id") or ""), updated)
+                    self._messages[mid] = updated
+                    closed.append(mid)
+                except Exception as error:
+                    errors.append({"message_id": mid, "error_code": getattr(error, "code", type(error).__name__)})
+        return {"message_ids": closed, "errors": errors}
+
     def reconcile_master_completion_handoff(
         self, master: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -1332,6 +1388,62 @@ class SessionBus:
                     "updated_at"
                 ]
                 self._persist_message(tid, message)
+
+    def forward_master_permission_results(
+        self, host: Any, *, result_message_id: str = "", limit: int = 32,
+    ) -> dict[str, Any]:
+        """Wake only the exact Master awaiting a server-owned escalation reply.
+
+        This transports evidence, never interprets APPROVE/DENY or decides a
+        Host permission. The normal result-forward ledger prevents reply loops
+        and lets the same sweep recover unread replies after a restart.
+        """
+        candidates = []
+        with self._lock:
+            for result in self._messages.values():
+                if (result.get("kind") != "RESULT" or result.get("delivery_state") != "UNREAD"
+                        or (result_message_id and result.get("message_id") != result_message_id)):
+                    continue
+                original = self._messages.get(str(result.get("in_reply_to") or ""), {})
+                lifecycle = original.get("lifecycle") or {}
+                source, target = original.get("from") or {}, original.get("to") or {}
+                sender, recipient = result.get("from") or {}, result.get("to") or {}
+                key = str(lifecycle.get("idempotency_key") or "")
+                prefix = "host-permission-escalation:"
+                permission = key[len(prefix):] if key.startswith(prefix) else ""
+                thread = str(original.get("thread_id") or "")
+                anchor, project = source.get("session_anchor_ref"), source.get("project_id")
+                if (not permission or not anchor or not project
+                        or original.get("kind") != "INSTRUCTION"
+                        or source.get("provider") != "UNIVERSE" or source.get("mode") != "MASTER"
+                        or target.get("mode") != "CONDUCTOR"
+                        or target.get("project_id") != project
+                        or not thread.startswith("persona-") or not thread.endswith("-perm-" + permission)
+                        or result.get("thread_id") != thread
+                        or lifecycle.get("final_result_id") != result.get("message_id")
+                        or result.get("recipient_anchor_ref") != anchor
+                        or recipient.get("session_anchor_ref") != anchor
+                        or recipient.get("mode") != "MASTER" or recipient.get("project_id") != project
+                        or any(sender.get(k) != target.get(k) for k in ("mode", "project_id", "session_anchor_ref"))
+                        or not target.get("session_anchor_ref")):
+                    continue
+                candidates.append((result["message_id"], anchor, project))
+                if len(candidates) >= max(1, min(limit, 128)):
+                    break
+        messages, errors = [], []
+        for mid, anchor, project in candidates:
+            try:
+                terminals = match_live_terminals(
+                    host, project_id=project, mode="MASTER", session_anchor_ref=anchor)
+                if len(terminals) != 1:
+                    errors.append({"message_id": mid, "error_code": "BUS_MASTER_RECIPIENT_UNAVAILABLE"})
+                    continue
+                messages.append(self.forward_result_as_instruction(
+                    host, result_message_id=mid,
+                    terminal_id=terminals[0]["terminal_id"], session_anchor_ref=anchor))
+            except (SessionBusError, TerminalHostError) as error:
+                errors.append({"message_id": mid, "error_code": error.code})
+        return {"messages": messages, "errors": errors}
 
     def forward_result_as_instruction(
         self,

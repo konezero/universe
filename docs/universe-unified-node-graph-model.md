@@ -209,6 +209,13 @@ The existing owner-node rules describe the current node-work contract; the
 representation of project-wide planning before node decomposition remains an
 explicit schema task, not an implicit migration in this document.
 
+Plan -> node -> Todo relations are stored as structured plan items
+(`plan.item.*` Actions; see `docs/project-authoring.md`). A plan item references
+existing nodes, Todos and other plan items. It is not a node, and it does not
+change `owner_node_ref`. It has no state of its own on the Todo. Plan-item
+completion is scoped to its linked Todos and is not rolled up into project
+completion.
+
 A Work Item hangs off exactly one `ADOPTED` node via `owner_node_ref`.
 
 ```text

@@ -105,8 +105,11 @@ class TodoActions:
     def read(self, request):
         request = _object(request, ('todo_id',))
         todo = self.store.get_todo(_text(request['todo_id'], 'todo_id'))
+        # Stored plan-item links, not plan labels in Todo text; see plan.item.trace.
+        from universe_plan_item_actions import plan_item_refs_for_store
         return {'schema': 'universe.todo-read-action.v1', 'action_id': READ_ID,
-                'status': 'TODO_READ', 'todo': todo}
+                'status': 'TODO_READ', 'todo': todo,
+                'plan_items': plan_item_refs_for_store(self.store, 'TODO', todo['todo_id'])}
 
     def list(self, request):
         request = _object(request, ('project_id',), ('node_ref', 'include_done', 'offset', 'limit'))

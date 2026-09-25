@@ -83,7 +83,7 @@ def records(path: Path) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
 def append(path: Path, *, todo_id: str, owner_ref: str, run_id: str,
            task_frame_id: str, event_id: str, kind: str,
-           payload: Mapping[str, Any]) -> dict[str, Any]:
+           payload: Mapping[str, Any], _transfer_from: str | None = None) -> dict[str, Any]:
     """Called only after Master ownership validation at the Action boundary.
 
 No remove/rename of the live journal. Exact retries reuse one event. A torn
@@ -93,16 +93,32 @@ tail fails closed and is preserved for explicit recovery, never silently lost.
         raise JournalError('TODO_JOURNAL_IDENTITY_REQUIRED', 'complete Master coordinates required')
     with _LOCK:
         rows = records(path)
+        active_owner = None
+        for record, _ in rows:
+            if record['todo_id'] != todo_id:
+                raise JournalError('TODO_JOURNAL_OWNER_MISMATCH', 'Todo identity changed')
+            if record['kind'] == 'OWNER_TRANSFERRED':
+                if active_owner != record['payload'].get('previous_owner_ref'):
+                    raise JournalError('TODO_JOURNAL_CORRUPT', 'invalid ownership chain')
+                active_owner = record['owner_ref']
+            elif active_owner is None:
+                active_owner = record['owner_ref']
+            elif record['owner_ref'] != active_owner:
+                raise JournalError('TODO_JOURNAL_CORRUPT', 'owner changed without transfer')
+        if kind == 'OWNER_TRANSFERRED' and not _transfer_from:
+            raise JournalError('TODO_JOURNAL_TRANSFER_REQUIRED', 'use the ownership transfer route')
+        if _transfer_from is None and active_owner not in (None, owner_ref):
+            raise JournalError('TODO_JOURNAL_OWNER_MISMATCH', 'explicit ownership transfer required')
         data = {'schema': SCHEMA, 'todo_id': todo_id, 'owner_ref': owner_ref,
                 'run_id': run_id, 'task_frame_id': task_frame_id,
                 'event_id': event_id, 'kind': kind, 'payload': dict(payload)}
         for record, ref in rows:
-            if record['todo_id'] != todo_id or record['owner_ref'] != owner_ref:
-                raise JournalError('TODO_JOURNAL_OWNER_MISMATCH', 'explicit ownership transfer required')
             if record['event_id'] == event_id:
                 if {k: record[k] for k in data} != data:
                     raise JournalError('TODO_JOURNAL_REPLAY_CONFLICT', 'event payload changed')
                 return ref
+        if _transfer_from is not None and active_owner != _transfer_from:
+            raise JournalError('TODO_JOURNAL_OWNER_MISMATCH', 'transfer source is not current owner')
         data['sequence'] = len(rows) + 1
         data['record_digest'] = digest(data)
         raw = (json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(',', ':')) + '\n').encode()
@@ -115,6 +131,34 @@ tail fails closed and is preserved for explicit recovery, never silently lost.
                 raise JournalError('TODO_JOURNAL_WRITE_INCOMPLETE', 'partial append; inspect preserved tail')
             os.fsync(stream.fileno())
         return _reference(path, offset, raw, data)
+
+
+def transfer_owner(path: Path, *, todo_id: str, owner_ref: str, run_id: str,
+                   previous_owner_ref: str, expected_sequence: int,
+                   expected_digest: str, request_id: str, validate) -> dict[str, Any]:
+    """Append-only CAS transfer; the server validates live ownership and Hosts.
+
+    Validation and append share the journal writer lock with new assignments.
+    Old pinned byte ranges and result provenance are never rewritten.
+    """
+    with _LOCK:
+        rows = records(path)
+        if not rows or previous_owner_ref == owner_ref:
+            raise JournalError('TODO_JOURNAL_TRANSFER_INVALID', 'existing distinct owner required')
+        validate(rows)
+        event_id = 'owner-transfer:' + request_id
+        replay = any(row['event_id'] == event_id for row, _ in rows)
+        if not replay and (rows[-1][0]['sequence'] != expected_sequence
+                           or rows[-1][0]['record_digest'] != expected_digest):
+            raise JournalError('TODO_JOURNAL_TRANSFER_CONFLICT', 'journal changed; inspect current tail')
+        return append(path, todo_id=todo_id, owner_ref=owner_ref, run_id=run_id,
+                      task_frame_id=rows[-1][0]['task_frame_id'] if not replay else next(
+                          row['task_frame_id'] for row, _ in rows if row['event_id'] == event_id),
+                      event_id=event_id, kind='OWNER_TRANSFERRED',
+                      payload={'previous_owner_ref': previous_owner_ref,
+                               'expected_sequence': expected_sequence,
+                               'expected_digest': expected_digest},
+                      _transfer_from=previous_owner_ref)
 
 
 def read_reference(ref: Mapping[str, Any], *, project_root: Path) -> dict[str, Any]:
