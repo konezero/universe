@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from host_profile import resolve_host_tool
+from host_profile import provider_launch_environment, resolve_host_tool
 from universe_app.managed_shell import (
     CLI_START_FAILED,
     CLI_STARTING,
@@ -1555,6 +1555,7 @@ class TerminalHost:
             "UNIVERSE_MANAGED_SHELL_IDENTITY_FILE": str(shell_identity_path),
             "UNIVERSE_SESSION_INBOX_CLI": str(SESSION_INBOX_CLI),
         }
+        child_environment.update(provider_launch_environment(resolved_provider, executable))
         if resolved_provider == "GROK":
             # Grok scans Claude-compatible hooks by default. Universe already
             # installs one provider-native Grok SessionStart hook, so importing

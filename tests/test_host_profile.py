@@ -34,6 +34,46 @@ def completed(version: str = "tool 1.0") -> NativeCliResult:
 
 
 class HostProfileTests(unittest.TestCase):
+    def test_selected_provider_survives_old_environment_rediscovery_and_missing_file(self):
+        from unittest.mock import patch
+        import os
+        from universe_runtime_worker_dispatch import _resolve_codex
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, selected = root / "old.exe", root / "selected.exe"
+            old.write_bytes(b"fixture")
+            selected.write_bytes(b"fixture")
+            store = HostProfileStore(root / "host.json", environment={
+                "AI_CAREER_CODEX_EXECUTABLE": str(old), "CODEX_CLI_PATH": str(old)},
+                path_lookup=lambda _: str(old), home=root, current_python=old,
+                native_runner=lambda request: completed(request.executable.name))
+            store.discover()
+            store.set_tool("codex", str(selected))
+            self.assertEqual(str(selected), store.discover()["tools"]["codex"]["executable"])
+            self.assertEqual("USER_SELECTED", store.snapshot()["tools"]["codex"]["discovery_source"])
+            with patch.dict(os.environ, {"CODEX_CLI_PATH": str(old)}), \
+                 patch("universe_runtime_worker_dispatch.resolve_host_tool", side_effect=store.resolve):
+                executable, environment, _ = _resolve_codex()
+                self.assertEqual(selected, executable)
+                self.assertEqual(str(selected), environment["CODEX_CLI_PATH"])
+                self.assertEqual(str(selected), environment["AI_CAREER_CODEX_EXECUTABLE"])
+                self.assertEqual(str(old), os.environ["CODEX_CLI_PATH"])
+            selected.unlink()
+            missing = store.discover()["tools"]["codex"]
+            self.assertEqual("UNAVAILABLE", missing["status"])
+            self.assertEqual(str(selected), missing["executable"])
+            self.assertIsNone(store.resolve("codex"))
+            selected.write_bytes(b"fixture restored")
+            self.assertEqual("AVAILABLE", store.discover()["tools"]["codex"]["status"])
+
+    def test_all_provider_path_aliases_derive_from_selected_executable(self):
+        from host_profile import provider_launch_environment
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            env = provider_launch_environment(provider, "C:/selected/agent.exe")
+            self.assertEqual("C:/selected/agent.exe", env[f"AI_CAREER_{provider}_EXECUTABLE"])
+            self.assertEqual(provider == "CODEX", "CODEX_CLI_PATH" in env)
+            self.assertNotIn("UNIVERSE_CODEX_QUEUE_EXECUTABLE", env)
+
     def test_default_path_uses_one_environment_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             expected = Path(directory) / "host.json"

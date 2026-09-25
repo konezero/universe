@@ -1298,6 +1298,36 @@ class TerminalHostTests(unittest.TestCase):
             host.close(created["terminal_id"])
             self.assertFalse(identity_path.exists())
 
+    def test_provider_paths_are_reserved_and_match_selected_executable(self) -> None:
+        for provider in ("CODEX", "CLAUDE", "GROK"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp, patch(
+                "universe_app.terminal_host.resolve_cli_executable",
+                return_value="C:/selected/agent.exe",
+            ), patch(
+                "universe_app.terminal_host.resolve_shell_identity",
+                return_value=ProcessIdentity(pid=4242, started_at=123.5),
+            ):
+                captured = {}
+
+                def spawn(_executable, _cwd, _cols, _rows, argv=None, environment=None):
+                    captured.update(environment or {})
+                    return FakePty()
+
+                host = TerminalHost(spawn=spawn)
+                key = f"AI_CAREER_{provider}_EXECUTABLE"
+                created = host.create(
+                    project_id="universe", mode="MASTER", cwd=tmp,
+                    session_anchor_ref=TEST_ANCHOR, provider=provider,
+                    provider_environment={key: "stale.exe", "CODEX_CLI_PATH": "old.exe"},
+                )
+                try:
+                    self.assertEqual("C:/selected/agent.exe", captured[key])
+                    if provider == "CODEX":
+                        self.assertEqual(captured[key], captured["CODEX_CLI_PATH"])
+                        self.assertEqual(captured[key], captured["UNIVERSE_CODEX_QUEUE_EXECUTABLE"])
+                finally:
+                    host.close(created["terminal_id"])
+
     def test_supervised_stdio_uses_one_managed_cmd_and_provider_protocol(self) -> None:
         captured: dict[str, object] = {}
 

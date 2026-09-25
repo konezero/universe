@@ -73,6 +73,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def provider_launch_environment(tool: str, executable: str | Path) -> dict[str, str]:
+    """Derive child-only path aliases from the already selected executable.
+
+    These are outputs, not a second configuration store. Keep CODEX_CLI_PATH
+    aligned while the legacy discovery input exists; never mutate os.environ.
+    """
+    name = tool.lower()
+    if name not in PROVIDER_TOOLS:
+        return {}
+    result = {EXECUTABLE_OVERRIDES[name]: str(executable)}
+    if name == "codex":
+        result["CODEX_CLI_PATH"] = str(executable)
+    return result
+
+
 def default_host_profile_path(
     environment: Mapping[str, str] | None = None,
 ) -> Path:
@@ -133,10 +148,13 @@ class HostProfileStore:
         previous = self._load(allow_absent=True)
         tools: dict[str, dict[str, Any]] = {}
         for tool in SUPPORTED_TOOLS:
-            record = self._discover_tool(tool)
             existing = previous["tools"].get(tool)
-            if record["status"] != "AVAILABLE":
-                if isinstance(existing, Mapping):
+            if isinstance(existing, Mapping) and existing.get("discovery_source") == "USER_SELECTED":
+                # A discovery action may verify, but never replace explicit choice.
+                record = self._verify_record(tool, existing)
+            else:
+                record = self._discover_tool(tool)
+                if record["status"] != "AVAILABLE" and isinstance(existing, Mapping):
                     record = self._verify_record(tool, existing)
             if isinstance(existing, Mapping):
                 record["model"] = self._normalize_model(
@@ -213,6 +231,7 @@ class HostProfileStore:
             for key, value in environment.items()
             if isinstance(key, str) and isinstance(value, str)
         }
+        safe_environment.update(provider_launch_environment(normalized, executable))
         return HostToolResolution(
             tool=normalized,
             executable=executable,
@@ -463,12 +482,15 @@ class HostProfileStore:
         executable = record.get("executable")
         if not isinstance(executable, str) or not executable:
             return self._unavailable_record(tool)
-        return self._candidate_record(
+        verified = self._candidate_record(
             tool,
             Path(executable),
             str(record.get("discovery_source") or "HOST_PROFILE"),
             model=record.get("model"),
         )
+        if record.get("discovery_source") == "USER_SELECTED":
+            verified["executable"] = executable
+        return verified
 
     @staticmethod
     def _native_path(value: Any) -> Path | None:
