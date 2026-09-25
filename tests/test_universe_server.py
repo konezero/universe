@@ -4773,6 +4773,30 @@ class UniverseLocalServiceTests(unittest.TestCase):
             message_id=message["message_id"],
         )
 
+    def test_session_bus_cancel_http_requires_exact_anchor_and_preserves_history(self):
+        terminal = {"terminal_id": "term-cancel-test", "project_id": "GCS",
+                    "mode": "MASTER", "provider": "CODEX", "state": "LIVE"}
+        anchor = "anchor-cancel-test"
+        host = Mock()
+        host.get.return_value = terminal
+        mid = self.server.session_bus.deliver_to_terminal(host, terminal=terminal,
+            to={"terminal_id": terminal["terminal_id"], "session_anchor_ref": anchor},
+            source={"provider": "UI", "node_ref": "GCS"}, kind="INSTRUCTION",
+            notify="NONE", body="keep cancellation history")["message_id"]
+        path = f"/v1/session-bus/messages/{mid}/cancel"
+        payload = {"session_anchor_ref": anchor, "reason": "operator cancellation"}
+        status, _ = self.request("POST", path, payload, extra_headers={"X-Universe-Access-Surface": "REMOTE_BROWSER"})
+        self.assertIn(status, (401, 403))
+        status, _ = self.request("POST", path, {**payload, "session_anchor_ref": "wrong"}, self.token)
+        self.assertEqual(409, status)
+        status, result = self.request("POST", path, payload, self.token)
+        self.assertEqual(200, status)
+        self.assertEqual("CANCELLED", result["status"])
+        self.assertFalse(result["provider_recalled"])
+        status, result = self.request("POST", path, payload, self.token)
+        self.assertEqual("ALREADY_CANCELLED", result["status"])
+        self.assertEqual("keep cancellation history", self.server.session_bus._messages[mid]["body_text"])
+
     def test_session_bus_state_and_reply_http_routes_project_results(self) -> None:
         terminal_id = "term-session-bus-result-http-001"
         anchor_ref = "anchor-session-bus-result-http-001"

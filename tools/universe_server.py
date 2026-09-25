@@ -56202,6 +56202,24 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
             except UniverseError as error:
                 self._send_error(error)
             return
+        session_bus_cancel = re.fullmatch(
+            r"/v1/session-bus/messages/([^/]+)/cancel", path
+        )
+        if session_bus_cancel is not None:
+            if not self._authorize_local_operator():
+                return
+            try:
+                body = _exact_object_fields(
+                    self._read_json(), field="session_bus_cancel",
+                    required=frozenset({"session_anchor_ref", "reason"}),
+                )
+                self._send(HTTPStatus.OK, self.server.session_bus.cancel_queued(
+                    unquote(session_bus_cancel.group(1)), **body))
+            except SessionBusError as error:
+                self._send_error(UniverseError(error.code, error.detail, error.status))
+            except UniverseError as error:
+                self._send_error(error)
+            return
         session_bus_state = re.fullmatch(
             r"/v1/session-bus/messages/([^/]+)/state", path
         )

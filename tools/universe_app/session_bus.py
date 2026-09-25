@@ -1992,6 +1992,46 @@ class SessionBus:
             "lifecycle_state": "DONE",
         }
 
+    def cancel_queued(self, message_id: str, *, session_anchor_ref: str,
+                      reason: str) -> dict[str, Any]:
+        """Cancel before claim under the same lock; never pretend to recall a provider queue."""
+        mid = _text(message_id, "message_id", required=True, limit=80)
+        anchor = _text(session_anchor_ref, "session_anchor_ref", required=True, limit=256)
+        reason = _text(reason, "reason", required=True, limit=500)
+        with self._lock:
+            message = self._messages.get(mid)
+            if not isinstance(message, dict):
+                raise SessionBusError("BUS_MESSAGE_NOT_FOUND", "message does not exist", 404)
+            if message.get("recipient_anchor_ref") != anchor:
+                raise SessionBusError("BUS_RECIPIENT_MISMATCH", "exact recipient Anchor required", 409)
+            state = _message_lifecycle(message)
+            lifecycle = message.get("lifecycle") or {}
+            result = {"schema": "universe.session-bus-cancel.v1", "message_id": mid,
+                      "session_anchor_ref": anchor, "provider_recalled": False,
+                      "execution_stopped": False, "history_preserved": True}
+            if state == "CANCELLED":
+                return {**result, "status": "ALREADY_CANCELLED", "cancelled": True}
+            handed_off = any(lifecycle.get(key) for key in (
+                "accepted_at", "dispatched_at", "started_at", "provider_received_at",
+                "bus_dispatch_ref", "delivery_channel"))
+            if state != "QUEUED" or handed_off:
+                status = "NOT_PENDING" if state in {"COMPLETED", "FAILED"} else "ALREADY_RECEIVED" if lifecycle.get("provider_received_at") else (
+                    "PROVIDER_RECALL_UNSUPPORTED" if handed_off else "NOT_PENDING")
+                return {**result, "status": status, "cancelled": False,
+                        "detail": "No provider recall or turn interruption was performed."}
+            # Claim and cancellation share this lock. A successful cancellation
+            # cannot race a subsequent claim into handing the message to a Host.
+            message = {**message, "lifecycle": dict(lifecycle)}
+            message["lifecycle_state"] = "CANCELLED"
+            message["delivery_state"] = "CANCELLED"
+            message["updated_at"] = utc_now()
+            message.setdefault("lifecycle", {}).update({
+                "cancelled_at": message["updated_at"], "cancel_reason": reason,
+                "cancel_scope": "BUS_BEFORE_CLAIM"})
+            self._persist_message(str(message.get("_terminal_id") or ""), message)
+            self._messages[mid] = message
+            return {**result, "status": "CANCELLED", "cancelled": True}
+
     def transition(
         self,
         message_id: str,
@@ -2041,6 +2081,9 @@ class SessionBus:
                     "terminal_id or session_anchor_ref is required",
                 )
             current = _message_lifecycle(message)
+            if next_state == "CANCELLED" and current != "CANCELLED":
+                raise SessionBusError("BUS_CANCEL_ROUTE_REQUIRED",
+                                      "use the cancellation route; state changes cannot recall delivery", 409)
             if next_state != current and next_state not in LIFECYCLE_TRANSITIONS.get(
                 current, frozenset()
             ):

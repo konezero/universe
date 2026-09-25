@@ -2764,6 +2764,25 @@ async function refreshSessionBusMessages() {
     );
     const body = node("pre", "session-bus-item-body", String(message.body_text || ""));
     item.append(heading, body, renderSessionBusEvidence(message));
+    if (["QUEUED", "ACCEPTED", "STARTED"].includes(message.lifecycle_state)) {
+      const cancel = node("button", "secondary-button", "대기 취소");
+      cancel.type = "button";
+      cancel.addEventListener("click", async () => {
+        if (!window.confirm("이 메시지의 대기 전달을 취소할까요? 이미 전달된 Provider 큐나 실행 중인 작업은 중단되지 않습니다.")) return;
+        cancel.disabled = true;
+        try {
+          const result = await api("/v1/session-bus/messages/" + encodeURIComponent(message.message_id) + "/cancel", {
+            method: "POST",
+            body: { session_anchor_ref: message.recipient_anchor_ref, reason: "Operator cancelled queued delivery from Session Bus UI" },
+          });
+          const labels = { CANCELLED: "대기 취소 완료", ALREADY_CANCELLED: "이미 취소됨", ALREADY_RECEIVED: "이미 수신됨 — 턴 중단은 별도", PROVIDER_RECALL_UNSUPPORTED: "Provider 회수 미지원 — 취소되지 않음", NOT_PENDING: "취소할 대기 메시지가 아님" };
+          toast(labels[result.status] || "취소 결과 확인 불가", !result.cancelled);
+          await refreshSessionBusMessages();
+        } catch (error) { toast(error.message, true); }
+        finally { cancel.disabled = false; }
+      });
+      item.append(cancel);
+    }
     const messageTerminalId = String(message.terminal_id || terminalId).trim();
     if (projection === "INBOX" && messageTerminalId) {
       const ack = node("button", "secondary-button", "Ack");
@@ -19038,15 +19057,13 @@ async function registerAcceptedProjectDraft() {
   try {
     const request = {
       draft_id: current.draft_id,
-      expected_revision: current.revision,
+      revision: Number(current.revision),
       request_id: requestId,
       idempotency_key: requestId,
       project_id: projectId,
       project_root: projectRoot,
-      release_id: state.releases[0]?.release_id || null,
-      // The gateway materializes the accepted revision, rather than relying on
-      // a browser-side snapshot or the generic connection lifecycle.
-      accepted_fields: { ...current.fields },
+      // The server materializes the saved draft revision; this list carries names only.
+      accepted_fields: Object.keys(current.fields),
     };
     const result = await invokeServerAction("project.draft.register", request);
     state.projectDraftRegistrations[key] = {

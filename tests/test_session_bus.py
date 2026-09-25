@@ -56,6 +56,52 @@ class FakePty:
 
 
 class SessionBusTests(unittest.TestCase):
+    def test_cancel_queue_is_durable_idempotent_and_not_claimable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bus.sqlite3"
+            bus = SessionBus(database_path=path)
+            posted = bus.post(self.host, {
+                "to": {"terminal_id": self.universe["terminal_id"], "project_id": "universe"},
+                "from": {"provider": "UNIVERSE", "project_id": "universe", "mode": "MASTER"},
+                "kind": "INSTRUCTION", "body_text": "preserve this history",
+            })
+            mid = posted["message_id"]
+            args = {"session_anchor_ref": _test_anchor("t1"), "reason": "wrong recipient"}
+            with self.assertRaises(SessionBusError):
+                bus.cancel_queued(mid, **{**args, "session_anchor_ref": _test_anchor("t2")})
+            with patch.object(bus, "_persist_message", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    bus.cancel_queued(mid, **args)
+            self.assertEqual("QUEUED", bus._messages[mid]["lifecycle_state"])
+            self.assertEqual("CANCELLED", bus.cancel_queued(mid, **args)["status"])
+            self.assertEqual("ALREADY_CANCELLED", bus.cancel_queued(mid, **args)["status"])
+            restarted = SessionBus(database_path=path)
+            self.assertEqual("CANCELLED", restarted._messages[mid]["lifecycle_state"])
+            self.assertEqual("preserve this history", restarted._messages[mid]["body_text"])
+            self.assertIsNone(restarted.claim_instruction(self.host,
+                terminal_id=self.universe["terminal_id"], session_anchor_ref=_test_anchor("t1"), message_id=mid))
+
+    def test_cancel_does_not_claim_provider_recall_or_allow_state_bypass(self):
+        bus = self.host.bus
+        mid = bus.post(self.host, {
+            "to": {"terminal_id": self.universe["terminal_id"], "project_id": "universe"},
+            "from": {"provider": "UNIVERSE", "project_id": "universe", "mode": "MASTER"},
+            "kind": "INSTRUCTION", "body_text": "bounded work",
+        })["message_id"]
+        args = {"session_anchor_ref": _test_anchor("t1"), "reason": "cancel"}
+        with self.assertRaises(SessionBusError):
+            bus.transition(mid, state="CANCELLED", session_anchor_ref=_test_anchor("t1"))
+        self.assertIsNotNone(bus.claim_instruction(self.host,
+            terminal_id=self.universe["terminal_id"], session_anchor_ref=_test_anchor("t1"), message_id=mid))
+        result = bus.cancel_queued(mid, **args)
+        self.assertEqual("PROVIDER_RECALL_UNSUPPORTED", result["status"])
+        self.assertFalse(result["cancelled"])
+        self.assertFalse(result["provider_recalled"])
+        self.assertFalse(result["execution_stopped"])
+        self.assertEqual("ACCEPTED", bus._messages[mid]["lifecycle_state"])
+        bus._messages[mid]["lifecycle"]["provider_received_at"] = "test-receipt"
+        self.assertEqual("ALREADY_RECEIVED", bus.cancel_queued(mid, **args)["status"])
+
     def test_collected_host_notice_releases_only_exact_result_delivery(self):
         bus = self.host.bus
         notice = {"schema": "universe.task-frame-host-notice.v1", "task_frame_id": "host_test",
