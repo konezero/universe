@@ -4,7 +4,17 @@ Provider factories translate configuration. Adapters own identity observation,
 permission binding and gateway lifetime. No credentials are stored in results.
 """
 from dataclasses import dataclass, replace
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Mapping
+
+
+@dataclass(frozen=True)
+class CommandInvocation:
+    """Internal Host command description; never an execution authorization."""
+    provider: str
+    native_tool: str
+    command: str
+    cwd: str
+    request_id: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,31 @@ class ProviderSessionIdentityError(ValueError):
 class GatewaySessionAdapter:
     provider: str
     prefix: str
+    command_tools: frozenset[str] = frozenset()
+
+    @classmethod
+    def normalize_permission(cls, permission: Mapping) -> dict:
+        result = dict(permission)
+        # Provider payloads cannot inject the Host's typed classification.
+        result.pop("command_invocation", None)
+        call = permission.get("tool_call")
+        if not isinstance(call, Mapping):
+            return result
+        tool = str(call.get("toolName") or call.get("title") or "").strip()
+        if tool.casefold() not in cls.command_tools:
+            return result
+        args = call.get("input") if isinstance(call.get("input"), Mapping) else {}
+        command = call.get("command") or args.get("command") or ""
+        # Unsupported command formats fail closed at the common review gate;
+        # never stringify an argv list into a different executable command.
+        if not isinstance(command, str):
+            command = ""
+        result["command_invocation"] = CommandInvocation(
+            provider=cls.provider, native_tool=tool, command=command,
+            cwd=str(call.get("cwd") or ""),
+            request_id=str(call.get("toolCallId") or permission.get("request_id") or ""),
+        )
+        return result
 
     def __init__(self, *, session: ProviderSession, factory: Callable,
                  gateway_factory: Callable):
@@ -82,16 +117,19 @@ class GatewaySessionAdapter:
 class GrokSessionAdapter(GatewaySessionAdapter):
     provider = 'GROK'
     prefix = 'grok-acp:'
+    command_tools = frozenset({'bash', 'powershell'})
 
 
 class CodexSessionAdapter(GatewaySessionAdapter):
     provider = 'CODEX'
     prefix = 'codex-app-server:'
+    command_tools = frozenset({'item/commandexecution/requestapproval'})
 
 
 class ClaudeSessionAdapter(GatewaySessionAdapter):
     provider = 'CLAUDE'
     prefix = 'claude-code:'
+    command_tools = frozenset({'bash', 'powershell'})
 
     def __init__(self, *, broker=None, **kwargs):
         super().__init__(**kwargs)

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,47 @@ class FakePty:
 
 
 class SessionBusTests(unittest.TestCase):
+    def test_collected_host_notice_releases_only_exact_result_delivery(self):
+        bus = self.host.bus
+        notice = {"schema": "universe.task-frame-host-notice.v1", "task_frame_id": "host_test",
+                  "todo_id": "todo_test", "role": "WORKER", "attempt": 1,
+                  "status": "COMPLETED", "result_ref": "task-frame-result://test/worker/receipt",
+                  "result_digest": "a" * 64}
+        posted = bus.post(self.host, {
+            "to": {"terminal_id": self.universe["terminal_id"], "project_id": "universe"},
+            "from": {"provider": "UNIVERSE", "project_id": "universe", "mode": "MASTER"},
+            "kind": "INSTRUCTION", "thread_id": "persona-run_test-host-host_test",
+            "body_text": "Worker result\n" + json.dumps(notice),
+        })
+        mid = posted["message_id"]
+        for state in ("ACCEPTED", "STARTED"):
+            bus.transition(mid, state=state, terminal_id=self.universe["terminal_id"])
+        proof = {"owner_ref": _test_anchor("t1"), "project_id": "universe", "todo_id": "todo_test",
+                 "collection": {"status": "COMPLETED", "result_ref": notice["result_ref"],
+                                "result_digest": notice["result_digest"]}}
+        self.assertEqual([], bus.reconcile_collected_frame_notices(lambda *args: None)["message_ids"])
+        for key, value in (("owner_ref", "another_owner"), ("project_id", "gcs"), ("todo_id", "another_todo")):
+            wrong = {**proof, key: value}
+            self.assertEqual([], bus.reconcile_collected_frame_notices(lambda *args: wrong)["message_ids"])
+        wrong = {**proof, "collection": {**proof["collection"], "result_digest": "b" * 64}}
+        self.assertEqual([], bus.reconcile_collected_frame_notices(lambda *args: wrong)["message_ids"])
+        def lookup(run, frame, reference, digest):
+            self.assertEqual(("run_test", "host_test"), (run, frame))
+            self.assertEqual((notice["result_ref"], notice["result_digest"]), (reference, digest))
+            return proof
+        with patch.object(bus, "_persist_message", side_effect=OSError("isolated storage failure")):
+            failed = bus.reconcile_collected_frame_notices(lookup)
+        self.assertEqual([], failed["message_ids"])
+        self.assertEqual("OSError", failed["errors"][0]["error_code"])
+        self.assertEqual("STARTED", bus._messages[mid]["lifecycle_state"])
+        self.assertEqual([mid], bus.reconcile_collected_frame_notices(lookup)["message_ids"])
+        self.assertEqual([], bus.reconcile_collected_frame_notices(lookup)["message_ids"])
+        stored = next(m for m in bus.inbox(self.host, terminal_id=self.universe["terminal_id"],
+                                         projection="ACTIVITY")["messages"] if m["message_id"] == mid)
+        self.assertEqual("COMPLETED", stored["lifecycle_state"])
+        self.assertEqual("RESULT_COLLECTION_CONFIRMED", stored["lifecycle"]["collection_ack"]["status"])
+        self.assertNotIn("final_result_id", stored["lifecycle"])
+
     def setUp(self) -> None:
         self.host = TerminalHost(spawn=lambda *_args, **_kwargs: FakePty())
         self.universe = self.host.create(
@@ -1315,6 +1357,7 @@ class ClaudeQuotaRecoveryTests(unittest.TestCase):
         transport=SimpleNamespace(channel_state=lambda tid:"READY", push_channel=Mock(return_value={"status":"ACCEPTED"}))
         server=SimpleNamespace(session_bus=self.bus, terminal_host=transport,
             _session_anchor_terminal_host=lambda:self.host, _complete_claimed_master_queue_wake=lambda m:False)
+        server._persona_automation_stale_instruction = lambda message: UniverseHTTPServer._persona_automation_stale_instruction(server, message)
         with patch("universe_app.provider_quota_transcript.claude_session_quota", return_value=self.observation), patch("universe_server.time.time", return_value=self.now+70):
             result=UniverseHTTPServer._dispatch_pending_session_instruction(server, project_id="test", session=session, trigger="TURN_IDLE", message_id=self.mid, terminal=self.terminal)
         self.assertEqual(result["status"], "DISPATCHED", result)

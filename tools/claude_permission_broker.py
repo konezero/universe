@@ -112,10 +112,12 @@ class ClaudePermissionBroker:
         target: str = "UNKNOWN",
         host: str = "127.0.0.1",
         port: int = 0,
+        decision_observer=None,
     ) -> None:
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ClaudePermissionBrokerError("CLAUDE_PERMISSION_BROKER_NOT_LOOPBACK")
         self.bridge = bridge
+        self.decision_observer = decision_observer
         self.token = CapabilityToken(
             provider=provider,
             session_ref=bridge.session_ref,
@@ -296,6 +298,38 @@ class ClaudePermissionBroker:
     # -- request handling -----------------------------------------------
 
     def handle_payload(
+        self, payload: Mapping[str, Any], *, presented_token: str | None
+    ) -> dict[str, Any]:
+        result = self._handle_payload(payload, presented_token=presented_token)
+        if self.decision_observer is not None:
+            # Fixed diagnostic fields only: never persist credentials, command
+            # bodies, arbitrary requester exception text or provider reasoning.
+            message = str(result.get("message") or "")
+            code = message.split(":", 1)[0]
+            if not (code.startswith("CLAUDE_PERMISSION_") and
+                    all(c.isupper() or c == "_" for c in code)):
+                code = "ALLOWED" if result.get("behavior") == "allow" else "REQUEST_REJECTED"
+            request = payload if isinstance(payload, Mapping) else {}
+            tool = str(request.get("tool_name") or "")
+            event = {
+                "schema": "universe.claude-permission-decision.v1",
+                "provider": "CLAUDE",
+                "boundary": "BROKER_BRIDGE",
+                "tool": tool if tool.casefold() in {"powershell", "bash", "read", "glob", "grep", "write", "edit"} else "UNKNOWN",
+                "behavior": result.get("behavior"),
+                "code": code,
+                "broker_bridge_session_match": self.token.current_session_ref() == self.bridge.session_ref,
+                "claimed_session_present": request.get("session_ref") is not None,
+                "claimed_session_match": request.get("session_ref") in (None, self.token.current_session_ref()),
+            }
+            try:
+                self.decision_observer(event)
+            except Exception:
+                # Audit availability cannot convert a denial into permission.
+                pass
+        return result
+
+    def _handle_payload(
         self, payload: Mapping[str, Any], *, presented_token: str | None
     ) -> dict[str, Any]:
         """Validate and dispatch one permission prompt. Every failure denies."""

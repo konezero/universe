@@ -45958,17 +45958,35 @@ class UniverseHTTPServer(ThreadingHTTPServer):
         provider adapter accepts the resulting instruction.
         """
 
+        def collected_frame_proof(run_id, frame_id, result_ref, result_digest):
+            run = self.persona_automation.get_run(run_id)
+            launched = self.persona_automation.host_frame_launched(run_id, frame_id)
+            if not launched or not launched.get("todo_journal"):
+                return None
+            return {"owner_ref": run["session_anchor_ref"], "project_id": run["project_id"],
+                    "todo_id": launched["todo_id"],
+                    "collection": self.persona_automation.host_frame_collected(
+                        run_id, frame_id, result_ref=result_ref, result_digest=result_digest)}
+
+        collected_notices = self.session_bus.reconcile_collected_frame_notices(collected_frame_proof)
         completion_results = self._publish_master_completion_results()
         limit = max(1, min(int(max_messages), 128))
         result: dict[str, Any] = {
             "schema": "universe.conductor-operating-loop.v1",
             "status": "OK",
             "master_completion_results": completion_results,
+            "collected_frame_notices": collected_notices,
             "reclaimed_master_message_ids": [],
             "forwarded_result_ids": [],
             "dispatched_instruction_ids": [],
             "deferred": [],
         }
+        if collected_notices["errors"]:
+            result["status"] = "PARTIAL"
+            result["deferred"].extend(
+                {"stage": "COLLECTED_FRAME_NOTICE", **error}
+                for error in collected_notices["errors"]
+            )
         try:
             result["reclaimed_master_message_ids"] = (
                 self.store.reclaim_expired_master_messages()

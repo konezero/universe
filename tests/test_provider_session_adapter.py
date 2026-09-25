@@ -11,9 +11,99 @@ from provider_session_adapter import (
 )
 from claude_permission_bridge import ClaudePermissionBridge
 from claude_permission_broker import ClaudePermissionBroker
+from universe_runtime_worker_dispatch import RuntimeWorkerDispatcher
 
 
 class ProviderSessionAdapterTests(unittest.TestCase):
+    def test_powershell_uses_same_master_decision_path_as_bash(self):
+        dispatcher = RuntimeWorkerDispatcher(Path.cwd())
+        events = []
+        decisions = []
+        bridge = ClaudePermissionBridge(
+            session_ref='claude-code:pending:test',
+            permission_requester=lambda p: dispatcher._task_frame_permission(
+                {'repository_write_scope': 'NONE'}, ClaudeSessionAdapter.normalize_permission(p)))
+        broker = ClaudePermissionBroker(bridge=bridge, decision_observer=decisions.append)
+        try:
+            broker.bind_session_ref('claude-code:test')
+            for tool in ('PowerShell', 'Bash'):
+                for verdict in ('APPROVE', 'DENY'):
+                    events.clear()
+                    dispatcher.permission_escalator = lambda p: events.append(p) or verdict
+                    result = broker.handle_payload(
+                        {'tool_name': tool, 'input': {'command': 'echo diagnostic'},
+                         'tool_use_id': tool + verdict}, presented_token=broker.token.value)
+                    self.assertEqual(1, len(events))
+                    self.assertEqual(['EXECUTE'], events[0]['operations'])
+                    self.assertEqual('allow' if verdict == 'APPROVE' else 'deny', result['behavior'])
+                    self.assertTrue(decisions[-1]['broker_bridge_session_match'])
+                    self.assertEqual(tool, decisions[-1]['tool'])
+            result = broker.handle_payload(
+                {'tool_name': 'PowerShell', 'input': {'command': 'secret-command'},
+                 'session_ref': 'claude-code:other'}, presented_token=broker.token.value)
+            self.assertEqual('deny', result['behavior'])
+            self.assertEqual('CLAUDE_PERMISSION_SESSION_MISMATCH', decisions[-1]['code'])
+            self.assertNotIn('secret-command', str(decisions))
+            self.assertNotIn(broker.token.value, str(decisions))
+            dispatcher.permission_escalator = None
+            result = broker.handle_payload(
+                {'tool_name': 'PowerShell', 'input': {'command': 'echo test'}},
+                presented_token=broker.token.value)
+            self.assertEqual('deny', result['behavior'])
+        finally:
+            broker.close()
+
+    def test_powershell_classification_preserves_destructive_review(self):
+        for command in ('Remove-Item C:/data/file', 'Set-Content C:/data/file changed'):
+            description = RuntimeWorkerDispatcher.describe_command_permission(
+                ClaudeSessionAdapter.normalize_permission(
+                    {'tool_call': {'toolName': 'PowerShell', 'input': {'command': command}}}))
+            self.assertTrue(description['destructive'])
+            self.assertEqual(command, description['command'])
+        self.assertIsNone(RuntimeWorkerDispatcher.describe_command_permission(
+            {'tool_call': {'toolName': 'UnknownTool', 'input': {'command': 'echo test'}}}))
+
+    def test_provider_commands_share_one_internal_contract(self):
+        from provider_session_adapter import CommandInvocation
+        for adapter, tool in ((ClaudeSessionAdapter, 'PowerShell'),
+                              (ClaudeSessionAdapter, 'Bash'),
+                              (GrokSessionAdapter, 'Bash'),
+                              (CodexSessionAdapter, 'item/commandExecution/requestApproval')):
+            raw = {'tool_call': {'toolName': tool, 'command': 'python reader.py',
+                                'cwd': 'C:/work', 'toolCallId': 'request-1'}}
+            normalized = adapter.normalize_permission(raw)
+            self.assertIsInstance(normalized['command_invocation'], CommandInvocation)
+            description = RuntimeWorkerDispatcher.describe_command_permission(normalized)
+            self.assertEqual('COMMAND', description['kind'])
+            self.assertEqual('python reader.py', description['command'])
+            self.assertEqual('request-1', description['native_request_id'])
+            self.assertNotIn('command_invocation', raw)
+        forged = {'command_invocation': normalized['command_invocation'],
+                  'tool_call': {'toolName': 'UnknownTool'}}
+        self.assertNotIn('command_invocation', ClaudeSessionAdapter.normalize_permission(forged))
+
+        class RenamedClaudeAdapter(ClaudeSessionAdapter):
+            command_tools = frozenset({'execute_shell_v2'})
+
+        # A native tool rename is confined to its adapter, not the common gate.
+        renamed = RenamedClaudeAdapter.normalize_permission(
+            {'tool_call': {'toolName': 'execute_shell_v2', 'command': 'echo test'}})
+        self.assertEqual('COMMAND', RuntimeWorkerDispatcher.describe_command_permission(renamed)['kind'])
+
+    def test_observer_failure_never_allows_a_denied_request(self):
+        bridge = ClaudePermissionBridge(session_ref='claude-code:test',
+                                        permission_requester=lambda request: None)
+        def broken_observer(event):
+            raise RuntimeError('audit unavailable')
+        broker = ClaudePermissionBroker(bridge=bridge, decision_observer=broken_observer)
+        try:
+            result = broker.handle_payload({'tool_name': 'PowerShell', 'input': {}},
+                                           presented_token='invalid')
+            self.assertEqual('deny', result['behavior'])
+            self.assertEqual('CLAUDE_PERMISSION_TOKEN_INVALID', result['message'])
+        finally:
+            broker.close()
+
     def make_adapter(self, kind, *, broker=None, fail=False):
         self.closed = []
         self.observer = None

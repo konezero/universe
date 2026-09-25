@@ -76,6 +76,16 @@ class HostPermissionEscalator:
         self._count_lock = threading.Lock()
         self.current_role = "WORKER"
 
+    def record_decision(self, decision: Mapping[str, Any]) -> None:
+        """Host-owned redacted transport evidence, not a model verdict."""
+        from uuid import uuid4
+        self.room.post_report(
+            body_text=json.dumps({**dict(decision), "task_frame_id": self.task_frame_id,
+                                  "role": self.current_role}, ensure_ascii=True),
+            severity="DIAGNOSTIC",
+            idempotency_key=f"host:{self.task_frame_id}:permission-observation:{uuid4().hex}",
+        )
+
     def __call__(self, description: Mapping[str, Any]) -> str:
         with self._count_lock:
             self._count += 1

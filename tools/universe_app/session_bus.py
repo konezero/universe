@@ -741,6 +741,64 @@ class SessionBus:
             self._inbox.setdefault("anchor:" + anchor, []).append(mid)
             return self._public_message(message, headers_only=False)
 
+    def reconcile_collected_frame_notices(self, lookup: Callable) -> dict[str, Any]:
+        """Settle only Host result delivery proven consumed by the owning Master.
+
+        This is not a provider reply, Worker PASS, or Todo completion. The
+        server supplies authoritative collection evidence; callers cannot post
+        a receipt into a message to satisfy this transition.
+        """
+        closed, errors = [], []
+        with self._lock:
+            for message_id, message in list(self._messages.items()):
+                if (_message_lifecycle(message) != "STARTED"
+                        or message.get("kind") != "INSTRUCTION"
+                        or (message.get("from") or {}).get("provider") != "UNIVERSE"):
+                    continue
+                try:
+                    notice = _json_mod.loads(str(message.get("body_text") or "").rsplit("\n", 1)[-1])
+                except (ValueError, TypeError):
+                    continue
+                if (not isinstance(notice, dict)
+                        or notice.get("schema") != "universe.task-frame-host-notice.v1"
+                        or notice.get("role") not in {"WORKER", "REVIEWER"}
+                        or notice.get("status") != "COMPLETED"
+                        or not notice.get("result_ref") or not notice.get("result_digest")):
+                    continue
+                frame = str(notice.get("task_frame_id") or "")
+                suffix = "-host-" + frame
+                thread = str(message.get("thread_id") or "")
+                if not frame or not thread.startswith("persona-") or not thread.endswith(suffix):
+                    continue
+                run_id = thread[len("persona-"):-len(suffix)]
+                try:
+                    proof = lookup(run_id, frame, notice["result_ref"], notice["result_digest"])
+                    if not isinstance(proof, Mapping):
+                        continue
+                    collection = proof.get("collection") or {}
+                    if (proof.get("owner_ref") != message.get("recipient_anchor_ref")
+                            or proof.get("project_id") != (message.get("to") or {}).get("project_id")
+                            or proof.get("todo_id") != notice.get("todo_id")
+                            or collection.get("status") != "COMPLETED"
+                            or collection.get("result_ref") != notice["result_ref"]
+                            or collection.get("result_digest") != notice["result_digest"]):
+                        continue
+                    updated = _json_mod.loads(_json_mod.dumps(message))
+                    now = utc_now()
+                    updated.update(lifecycle_state="COMPLETED", delivery_state="COMPLETED", updated_at=now)
+                    updated.setdefault("lifecycle", {}).update(
+                        completed_at=now, awaits_authoritative_reply=False,
+                        result_ref=notice["result_ref"],
+                        collection_ack={"run_id": run_id, "task_frame_id": frame,
+                                        "result_digest": notice["result_digest"],
+                                        "status": "RESULT_COLLECTION_CONFIRMED"})
+                    self._persist_message(str(message.get("_terminal_id") or ""), updated)
+                    self._messages[message_id] = updated
+                    closed.append(message_id)
+                except Exception as error:
+                    errors.append({"message_id": message_id, "error_code": getattr(error, "code", type(error).__name__)})
+        return {"message_ids": closed, "errors": errors}
+
     def reconcile_master_completion_handoff(
         self, master: Mapping[str, Any]
     ) -> dict[str, Any]:

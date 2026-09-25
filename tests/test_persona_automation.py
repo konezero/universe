@@ -106,6 +106,12 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         rework = {**worker, "result_ref": "task-frame-result://worker_2/result"}
         third = self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame, rework)
         self.assertNotEqual(first["event_id"], third["event_id"])
+        historical = self.store.host_frame_collected(
+            run["run_id"], frame, result_ref=worker["result_ref"],
+            result_digest=worker["result_digest"])
+        self.assertEqual(worker["result_ref"], historical["result_ref"])
+        self.assertIsNone(self.store.host_frame_collected(
+            run["run_id"], frame, result_ref=worker["result_ref"], result_digest="f" * 64))
         with self.assertRaises(PersonaAutomationError) as error:
             self.store.record_host_event(run["run_id"], "TASK_FRAME_COLLECTED", frame,
                                          {**reviewer, "result_digest": "c" * 64})

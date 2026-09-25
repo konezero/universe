@@ -28,7 +28,7 @@ from claude_permission_bridge import ClaudePermissionBridge
 from claude_permission_broker import ClaudePermissionBroker
 from claude_resident_session import ClaudeResidentError, ClaudeResidentSession
 from provider_session_adapter import (
-    ProviderSession, ProviderSessionResult, SessionAdapter,
+    ProviderSession, ProviderSessionResult, SessionAdapter, CommandInvocation,
     ProviderSessionIdentityError, GrokSessionAdapter,
     CodexSessionAdapter, ClaudeSessionAdapter,
 )
@@ -285,6 +285,7 @@ class RuntimeWorkerDispatcher:
         # Optional callable(description) -> "APPROVE" | "DENY".  When set, a write the
         # declared scope does not cover is asked upward instead of refused outright.
         self.permission_escalator: Callable[[Mapping[str, Any]], str] | None = None
+        self.permission_observer: Callable[[Mapping[str, Any]], None] | None = None
         self._host_editors: dict[str, TaskFrameFileEditor] = {}
         # Host-only bindings returned by the existing Runtime API. These never
         # enter the provider context or get accepted from a Worker request.
@@ -1206,7 +1207,7 @@ class RuntimeWorkerDispatcher:
                     system_prompt=self._system_prompt(runtime_profile),
                     session_id=None,
                     permission_requester=lambda permission: self._task_frame_permission(
-                        request, permission
+                        request, GrokSessionAdapter.normalize_permission(permission)
                     ),
                     session_observer=observe,
                     ephemeral=True,
@@ -1296,7 +1297,7 @@ class RuntimeWorkerDispatcher:
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
                     permission_requester=lambda permission: self._task_frame_permission(
-                        request, permission
+                        request, CodexSessionAdapter.normalize_permission(permission)
                     ),
                     session_observer=observe,
                     ephemeral=True,
@@ -1403,7 +1404,7 @@ class RuntimeWorkerDispatcher:
                     system_prompt=self._system_prompt("TASK_FRAME_RUNTIME"),
                     session_id=None,
                     permission_requester=lambda permission: self._task_frame_permission(
-                        request, permission
+                        request, ClaudeSessionAdapter.normalize_permission(permission)
                     ),
                     session_observer=observe,
                     ephemeral=True,
@@ -1468,11 +1469,12 @@ class RuntimeWorkerDispatcher:
             bridge = ClaudePermissionBridge(
                 session_ref=f"claude-code:pending:{uuid4().hex}",
                 permission_requester=lambda permission: self._task_frame_permission(
-                    request, permission
+                    request, ClaudeSessionAdapter.normalize_permission(permission)
                 ),
             )
             broker = ClaudePermissionBroker(
                 bridge=bridge,
+                decision_observer=self.permission_observer,
                 target=(
                     f"{self.project_id}/{self.mode}/"
                     f"{request['task_frame_id']}/{request['turn_id']}"
@@ -1731,7 +1733,6 @@ class RuntimeWorkerDispatcher:
     )
     _CHANGE_OPERATIONS = {"add": "CREATE", "update": "MODIFY", "delete": "DELETE"}
 
-    _COMMAND_TOOLS = frozenset({"item/commandexecution/requestapproval", "bash"})
     _DESTRUCTIVE_COMMAND = re.compile(
         r"(?ix)(?:^|[\s;&|(])(?:rm|rmdir|del|erase|rd|mv|move|ren|rename|format|mkfs|dd|truncate|shutdown|"
         r"remove-item|move-item|rename-item|set-content|out-file|clear-content|"
@@ -1748,17 +1749,18 @@ class RuntimeWorkerDispatcher:
         tool_call = permission.get("tool_call")
         if not isinstance(tool_call, Mapping):
             return None
-        tool = str(tool_call.get("toolName") or tool_call.get("title") or "").strip()
-        if tool.casefold() not in cls._COMMAND_TOOLS:
+        invocation = permission.get("command_invocation")
+        if not isinstance(invocation, CommandInvocation):
             return None
-        tool_input = tool_call.get("input") if isinstance(tool_call.get("input"), Mapping) else {}
-        command = str(tool_call.get("command") or tool_input.get("command") or "").strip()
+        command = invocation.command
         extra = tool_call.get("additionalPermissions")
         return {
-            "tool": tool,
+            "tool": invocation.native_tool,
+            "provider": invocation.provider,
+            "native_request_id": invocation.request_id,
             "kind": "COMMAND",
             "command": command,
-            "cwd": str(tool_call.get("cwd") or ""),
+            "cwd": invocation.cwd,
             "reason": str(tool_call.get("reason") or ""),
             "targets": [],
             "operations": ["EXECUTE"],

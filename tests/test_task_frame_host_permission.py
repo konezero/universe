@@ -303,10 +303,11 @@ class DispatcherEscalationTests(unittest.TestCase):
         self.assertEqual([], asked)
 
     def command(self, text, cwd=None, extra=None):
-        return {"options": self.options,
+        from provider_session_adapter import CodexSessionAdapter
+        return CodexSessionAdapter.normalize_permission({"options": self.options,
                 "tool_call": {"title": "item/commandExecution/requestApproval", "command": text,
                               "cwd": cwd or self.temp.name, "reason": "verify",
-                              "additionalPermissions": extra}}
+                              "additionalPermissions": extra}})
 
     def test_a_command_is_asked_upward_under_any_scope_and_runs_only_on_approve(self):
         asked = []

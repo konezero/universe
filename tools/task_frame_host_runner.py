@@ -105,6 +105,7 @@ class RuntimeHostRoleRunner:
         dispatcher = getattr(self.host, "worker_dispatcher", None)
         if permission_escalator is not None and dispatcher is not None:
             dispatcher.permission_escalator = permission_escalator
+            dispatcher.permission_observer = getattr(permission_escalator, "record_decision", None)
 
     def _current_binding(self) -> Mapping[str, Any]:
         """Resolve a fresh binding; never silently revive a stale endpoint."""

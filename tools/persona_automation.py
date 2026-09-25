@@ -2556,18 +2556,25 @@ class PersonaAutomationStore:
             ).fetchone()
         return _load(row["payload_json"], {}) if row is not None else None
 
-    def host_frame_collected(self, run_id: str, task_frame_id: str) -> dict[str, Any] | None:
+    def host_frame_collected(self, run_id: str, task_frame_id: str, *,
+                             result_ref: str | None = None,
+                             result_digest: str | None = None) -> dict[str, Any] | None:
         """Return the exact frame's latest durable collection, if any."""
 
         run_id = _text(run_id, "run_id")
         frame_id = _text(task_frame_id, "task_frame_id")
+        exact = ""
+        parameters = [run_id, frame_id]
+        if result_ref is not None or result_digest is not None:
+            exact = "AND json_extract(payload_json, '$.result_ref') = ? AND json_extract(payload_json, '$.result_digest') = ? "
+            parameters.extend([_text(result_ref, "result_ref"), _text(result_digest, "result_digest")])
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT payload_json FROM persona_automation_event "
                 "WHERE run_id = ? AND event_type = 'TASK_FRAME_COLLECTED' "
                 "AND json_extract(payload_json, '$.task_frame_id') = ? "
-                "ORDER BY created_at DESC, event_id DESC LIMIT 1",
-                (run_id, frame_id),
+                + exact + "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                parameters,
             ).fetchone()
         return _load(row["payload_json"], {}) if row is not None else None
 
