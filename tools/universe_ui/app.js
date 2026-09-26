@@ -20,6 +20,10 @@ const state = {
   /** Fleet Todo 상세의 결과(완료 근거) 캐시 — todo_id -> last todo.state action, or null when none exists. */
   homeTodoResultCache: {},
   homeTodoResultPending: new Set(),
+  /** scope key -> { status, items, error } from plan.item.list */
+  fleetPlanItems: {},
+  fleetPlanItemEditor: null,
+  fleetPlanItemTrace: {},
   expandedGoals: {},
   selectedProject: null,
   projection: null,
@@ -7974,12 +7978,350 @@ function renderHomeTodoStateControl(todo) {
   return wrap;
 }
 
+// Fleet plan-item panel: lists the structured plan items linked to the
+// selected Todo and (feature) node, and lets a human edit them through the
+// same plan.item.list/save/trace Actions an LLM uses. The panel never
+// changes Todo state; trace completion is for one item only (the server
+// reports project_completion NOT_AGGREGATED). Saves use expected_revision
+// CAS and keep an uncertain request in sessionStorage so it is retried with
+// its original request_id, exactly like updateTodoState().
+const PLAN_ITEM_KINDS = ["CASE", "STRUCTURE", "PROCESS", "WORK", "VALIDATION", "DEPENDENCY", "PHASE"];
+const PLAN_ITEM_TEXT_FIELDS = [
+  ["label", "Label", 40, false],
+  ["title", "Title", 160, false],
+  ["purpose", "Purpose", 4000, true],
+  ["work", "Work", 8000, true],
+  ["done_criteria", "Done criteria", 4000, true],
+];
+const PLAN_ITEM_REF_FIELDS = [
+  ["node_refs", "Node refs"],
+  ["todo_refs", "Todo refs"],
+  ["depends_on", "Depends on"],
+];
+const PLAN_ITEM_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+const PLAN_ITEM_SAVE_PREFIX = "universe.plan-item.save.";
+
+function fleetPlanItemScopes(selNode, selTodo) {
+  const projectId = selTodo?.project_id || state.selectedProject?.project_id || "";
+  const scopes = [];
+  if (!projectId) return { projectId, scopes };
+  if (selTodo?.todo_id) {
+    scopes.push({ key: `${projectId}|todo|${selTodo.todo_id}`, label: "Todo", filter: { todo_id: selTodo.todo_id } });
+  }
+  // Only feature nodes are feature_node rows; Goal nodes cannot be linked.
+  const nodeId = String(selNode?.node_id || "");
+  const featureId = nodeId.startsWith("feat:") ? homeNodeRefKey(nodeId) : "";
+  if (featureId && PLAN_ITEM_ID_PATTERN.test(featureId)) {
+    scopes.push({ key: `${projectId}|node|${featureId}`, label: "Node", filter: { node_ref: featureId } });
+  }
+  return { projectId, scopes, todoId: selTodo?.todo_id || "", featureId };
+}
+
+async function loadFleetPlanItems(projectId, scope, rerender) {
+  const cached = state.fleetPlanItems[scope.key];
+  if (cached && cached.status !== "STALE") return;
+  state.fleetPlanItems[scope.key] = { status: "LOADING", items: cached?.items || [] };
+  try {
+    const result = await invokeServerAction("plan.item.list", { project_id: projectId, ...scope.filter, include_retired: true });
+    state.fleetPlanItems[scope.key] = { status: "READY", items: result.plan_items || [] };
+  } catch (error) {
+    state.fleetPlanItems[scope.key] = { status: "ERROR", items: [], error: error.message };
+  }
+  rerender();
+}
+
+function invalidateFleetPlanItems(projectId) {
+  for (const key of Object.keys(state.fleetPlanItems)) {
+    if (key.startsWith(`${projectId}|`)) state.fleetPlanItems[key] = { ...state.fleetPlanItems[key], status: "STALE" };
+  }
+}
+
+function pendingFleetPlanItemSaves(projectId) {
+  const out = [];
+  for (let i = 0; i < sessionStorage.length; i += 1) {
+    const storageKey = sessionStorage.key(i);
+    if (!storageKey?.startsWith(PLAN_ITEM_SAVE_PREFIX)) continue;
+    try {
+      const request = JSON.parse(sessionStorage.getItem(storageKey) || "null");
+      if (request?.project_id === projectId) out.push(request);
+    } catch { sessionStorage.removeItem(storageKey); }
+  }
+  return out;
+}
+
+function newFleetPlanItemId() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return `plan_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function openFleetPlanItemEditor(panelKey, item, defaults) {
+  const draft = item
+    ? Object.fromEntries([
+        ["kind", item.kind], ["state", item.state],
+        ...PLAN_ITEM_TEXT_FIELDS.map(([key]) => [key, item[key] || ""]),
+        ...PLAN_ITEM_REF_FIELDS.map(([key]) => [key, (item[key] || []).join(", ")]),
+      ])
+    : {
+        kind: "WORK", state: "ACTIVE", label: "", title: "", purpose: "", work: "", done_criteria: "",
+        node_refs: defaults.featureId || "", todo_refs: defaults.todoId || "", depends_on: "",
+      };
+  state.fleetPlanItemEditor = {
+    panelKey,
+    planItemId: item?.plan_item_id || newFleetPlanItemId(),
+    expectedRevision: item?.revision || 0,
+    source: item?.source || { kind: "MANUAL" },
+    draft,
+    error: "",
+  };
+}
+
+function fleetPlanItemRefs(value, label) {
+  const refs = [...new Set(String(value || "").split(/[\s,]+/).filter(Boolean))];
+  const invalid = refs.find((ref) => !PLAN_ITEM_ID_PATTERN.test(ref));
+  if (invalid) throw new Error(`${label}: invalid id "${invalid}"`);
+  if (refs.length > 50) throw new Error(`${label}: at most 50 ids`);
+  return refs;
+}
+
+function fleetPlanItemRequest(projectId, editor) {
+  const { draft } = editor;
+  if (!String(draft.title).trim()) throw new Error("Title is required.");
+  const item = { kind: draft.kind, state: draft.state, source: editor.source };
+  for (const [key] of PLAN_ITEM_TEXT_FIELDS) item[key] = String(draft[key] || "");
+  for (const [key, label] of PLAN_ITEM_REF_FIELDS) item[key] = fleetPlanItemRefs(draft[key], label);
+  return {
+    plan_item_id: editor.planItemId,
+    project_id: projectId,
+    expected_revision: editor.expectedRevision,
+    request_id: crypto.randomUUID(),
+    item,
+  };
+}
+
+async function saveFleetPlanItem(request) {
+  const storageKey = PLAN_ITEM_SAVE_PREFIX + request.plan_item_id;
+  sessionStorage.setItem(storageKey, JSON.stringify(request));
+  try {
+    const result = await invokeServerAction("plan.item.save", request);
+    sessionStorage.removeItem(storageKey);
+    invalidateFleetPlanItems(request.project_id);
+    delete state.fleetPlanItemTrace[request.plan_item_id];
+    toast(result.replayed ? "Plan item 저장 확인됨" : "Plan item 저장됨");
+    return result;
+  } catch (error) {
+    // Definite 4xx failures did not apply. Transport/5xx stays uncertain.
+    if (typeof error.status === "number" && error.status >= 400 && error.status < 500) {
+      sessionStorage.removeItem(storageKey);
+    }
+    if (error.errorCode === "PLAN_ITEM_REVISION_CONFLICT") {
+      invalidateFleetPlanItems(request.project_id);
+      throw new Error("다른 곳에서 먼저 수정되었습니다. 목록을 새로 불러온 뒤 다시 편집해 주세요.");
+    }
+    throw error;
+  }
+}
+
+async function traceFleetPlanItem(planItemId, rerender) {
+  if (state.fleetPlanItemTrace[planItemId]?.status === "READY") {
+    delete state.fleetPlanItemTrace[planItemId];
+    rerender();
+    return;
+  }
+  state.fleetPlanItemTrace[planItemId] = { status: "LOADING" };
+  rerender();
+  try {
+    const trace = await invokeServerAction("plan.item.trace", { plan_item_id: planItemId });
+    state.fleetPlanItemTrace[planItemId] = { status: "READY", trace };
+  } catch (error) {
+    state.fleetPlanItemTrace[planItemId] = { status: "ERROR", error: error.message };
+  }
+  rerender();
+}
+
+function renderFleetPlanItemTrace(entry) {
+  const box = node("div", "fleet-plan-item-trace");
+  if (entry.status === "LOADING") { box.append(node("div", "", "Trace loading…")); return box; }
+  if (entry.status === "ERROR") { box.append(node("div", "fleet-plan-item-error", entry.error)); return box; }
+  const trace = entry.trace;
+  const completion = trace.completion || {};
+  box.append(node("div", "fleet-plan-item-meta",
+    `${completion.status} · ${completion.done_todos}/${completion.linked_todos} Todo done · this item only (project completion ${completion.project_completion || "NOT_AGGREGATED"})`));
+  if (completion.missing_targets) {
+    box.append(node("div", "fleet-plan-item-error", `Missing link targets: ${completion.missing_targets}`));
+  }
+  for (const n of trace.nodes || []) {
+    box.append(node("div", "", `Node ${n.node_ref} · ${n.status === "LINKED" ? `${n.title || ""} · ${n.state}` : n.status}`));
+  }
+  for (const t of trace.todos || []) {
+    const results = t.results ? ` · results ${t.results.length}` : "";
+    box.append(node("div", "", `Todo ${t.todo_id} · ${t.status === "LINKED" ? `${t.title || ""} · ${t.state}${results}` : t.status}`));
+  }
+  for (const d of trace.depends_on || []) {
+    box.append(node("div", "", `Depends on ${d.plan_item_id} · ${d.status === "LINKED" ? `${d.title} · ${d.state}` : d.status}`));
+  }
+  for (const d of trace.dependents || []) {
+    box.append(node("div", "", `Dependent ${d.plan_item_id} · ${d.title} · ${d.state}`));
+  }
+  if (trace.source_draft?.stale) {
+    box.append(node("div", "fleet-plan-item-meta",
+      `Source draft ${trace.source_draft.draft_id} changed (linked r${trace.source_draft.linked_revision}, current r${trace.source_draft.current_revision})`));
+  }
+  return box;
+}
+
+function renderFleetPlanItemEditor(projectId, editor, rerender) {
+  const form = node("div", "fleet-plan-item-editor");
+  const bind = (input, key) => {
+    input.value = editor.draft[key] ?? "";
+    input.addEventListener("input", () => { editor.draft[key] = input.value; });
+    input.addEventListener("change", () => { editor.draft[key] = input.value; });
+    return input;
+  };
+  const row = (label, input) => {
+    const wrap = node("label", "fleet-plan-item-editor-row", label);
+    input.setAttribute("aria-label", label);
+    wrap.append(input);
+    form.append(wrap);
+  };
+  const select = (key, values) => {
+    const input = node("select", "");
+    for (const value of values) {
+      const option = node("option", "", value);
+      option.value = value;
+      input.append(option);
+    }
+    return bind(input, key);
+  };
+  form.append(node("div", "fleet-plan-item-meta",
+    `${editor.planItemId} · ${editor.expectedRevision ? `revision ${editor.expectedRevision}` : "new"} · source ${editor.source.kind}`));
+  row("Kind", select("kind", PLAN_ITEM_KINDS));
+  row("State", select("state", ["ACTIVE", "RETIRED"]));
+  for (const [key, label, max, multiline] of PLAN_ITEM_TEXT_FIELDS) {
+    const input = node(multiline ? "textarea" : "input", "");
+    input.maxLength = max;
+    if (multiline) input.rows = 2;
+    row(label, bind(input, key));
+  }
+  for (const [key, label] of PLAN_ITEM_REF_FIELDS) {
+    const input = node("input", "");
+    input.placeholder = "comma-separated ids";
+    row(label, bind(input, key));
+  }
+  const pendingKey = PLAN_ITEM_SAVE_PREFIX + editor.planItemId;
+  const pending = sessionStorage.getItem(pendingKey);
+  const actions = node("div", "fleet-plan-items-head");
+  const save = node("button", "secondary-button", pending ? "이전 요청 확인" : "저장");
+  save.type = "button";
+  if (pending) save.title = "응답을 확인하지 못한 요청을 같은 요청 번호로 다시 확인합니다.";
+  const cancel = node("button", "home-nav", "취소");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => { state.fleetPlanItemEditor = null; rerender(); });
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const request = pending ? JSON.parse(pending) : fleetPlanItemRequest(projectId, editor);
+      await saveFleetPlanItem(request);
+      state.fleetPlanItemEditor = null;
+    } catch (error) {
+      editor.error = error.message;
+    }
+    rerender();
+  });
+  actions.append(save, cancel);
+  form.append(actions);
+  if (editor.error) form.append(node("div", "fleet-plan-item-error", editor.error));
+  return form;
+}
+
+function renderFleetPlanItemsPanel(selNode, selTodo) {
+  const { projectId, scopes, todoId, featureId } = fleetPlanItemScopes(selNode, selTodo);
+  if (!projectId || !scopes.length) return null;
+  const panelKey = scopes.map((scope) => scope.key).join("||");
+  const panel = node("section", "home-detail-section fleet-plan-items");
+  panel.dataset.panelKey = panelKey;
+  const rerender = () => {
+    const current = [...document.querySelectorAll(".fleet-plan-items")]
+      .find((element) => element.dataset.panelKey === panelKey);
+    const next = renderFleetPlanItemsPanel(selNode, selTodo);
+    if (current && next) current.replaceWith(next);
+  };
+
+  const head = node("div", "fleet-plan-items-head");
+  head.append(node("h4", "", "Plan items"));
+  const add = node("button", "home-nav", "+ 새 항목");
+  add.type = "button";
+  add.addEventListener("click", () => {
+    openFleetPlanItemEditor(panelKey, null, { todoId, featureId });
+    rerender();
+  });
+  head.append(add);
+  panel.append(head);
+
+  const editor = state.fleetPlanItemEditor?.panelKey === panelKey ? state.fleetPlanItemEditor : null;
+  const editingId = editor?.planItemId || "";
+  if (editor && !editor.expectedRevision) panel.append(renderFleetPlanItemEditor(projectId, editor, rerender));
+
+  const listed = new Set();
+  for (const scope of scopes) {
+    const entry = state.fleetPlanItems[scope.key];
+    if (!entry || entry.status === "STALE") void loadFleetPlanItems(projectId, scope, rerender);
+    const items = entry?.items || [];
+    panel.append(node("div", "fleet-plan-item-meta", `${scope.label} · ${items.length}`));
+    if (entry?.status === "ERROR") panel.append(node("div", "fleet-plan-item-error", entry.error));
+    else if (!entry || (entry.status === "LOADING" && !items.length)) panel.append(node("div", "fleet-plan-item-meta", "Loading…"));
+    for (const item of items) {
+      if (listed.has(item.plan_item_id)) continue;
+      listed.add(item.plan_item_id);
+      const row = node("div", `fleet-plan-item${item.state === "RETIRED" ? " retired" : ""}`);
+      const line = node("div", "fleet-plan-items-head");
+      const title = node("span", "fleet-plan-item-title", `${item.label ? `${item.label} · ` : ""}${item.title}`);
+      title.title = item.title;
+      line.append(node("span", "fleet-plan-item-kind", item.kind), title);
+      const edit = node("button", "home-nav", "편집");
+      edit.type = "button";
+      edit.addEventListener("click", () => { openFleetPlanItemEditor(panelKey, item, {}); rerender(); });
+      const traceButton = node("button", "home-nav", state.fleetPlanItemTrace[item.plan_item_id] ? "추적 닫기" : "추적");
+      traceButton.type = "button";
+      traceButton.addEventListener("click", () => void traceFleetPlanItem(item.plan_item_id, rerender));
+      line.append(edit, traceButton);
+      row.append(line, node("div", "fleet-plan-item-meta",
+        `r${item.revision} · ${item.state} · nodes ${item.node_refs.length} · todos ${item.todo_refs.length} · deps ${item.depends_on.length}`));
+      if (editingId === item.plan_item_id) row.append(renderFleetPlanItemEditor(projectId, editor, rerender));
+      const trace = state.fleetPlanItemTrace[item.plan_item_id];
+      if (trace) row.append(renderFleetPlanItemTrace(trace));
+      panel.append(row);
+    }
+  }
+
+  // New items whose editor state was lost (e.g. page refresh) are only
+  // recoverable from the stored request; offer a same-request_id retry.
+  for (const request of pendingFleetPlanItemSaves(projectId)) {
+    if (listed.has(request.plan_item_id) || request.plan_item_id === editingId) continue;
+    const row = node("div", "fleet-plan-item");
+    row.append(node("div", "fleet-plan-item-error", `확인되지 않은 저장 요청: ${request.item?.title || request.plan_item_id}`));
+    const retry = node("button", "home-nav", "이전 요청 확인");
+    retry.type = "button";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      try { await saveFleetPlanItem(request); }
+      catch (error) { toast(error.message, true); }
+      rerender();
+    });
+    row.append(retry);
+    panel.append(row);
+  }
+  return panel;
+}
+
 function renderHomeDetail(selNode, selTodo) {
   const el = document.querySelector("#home-todo-detail");
   if (!el) return;
   el.replaceChildren();
   if (!selTodo) {
     el.append(node("div", "goal-plan-empty", "Select a todo."));
+    const nodePlanItems = renderFleetPlanItemsPanel(selNode, null);
+    if (nodePlanItems) el.append(nodePlanItems);
     return;
   }
   el.append(renderFleetHierarchyTrail(selNode, selTodo));
@@ -8030,6 +8372,9 @@ function renderHomeDetail(selNode, selTodo) {
 
   const resultSection = renderHomeTodoResult(selTodo);
   if (resultSection) el.append(resultSection);
+
+  const planItems = renderFleetPlanItemsPanel(selNode, selTodo);
+  if (planItems) el.append(planItems);
 
   // Fleet↔Todo-list lineage consistency: the flat Todo list already surfaces
   // Task Frame/Host ownership and the Goal automation gate (with the exact

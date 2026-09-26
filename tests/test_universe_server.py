@@ -1486,6 +1486,8 @@ class UniverseLocalServiceTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.OK, status, reread)
         self.assertEqual("OPERATIONS", reread["feature"]["workstream_kind"])
+        # An unlinked node reads an empty plan-item back-reference.
+        self.assertEqual([], reread["plan_items"])
         status, stale = self.request(
             "POST", "/v1/actions",
             {"action_id": "feature.workstream-set", "request": request},

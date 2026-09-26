@@ -145,6 +145,15 @@ def _ensure_tables(connection):
         target_id TEXT NOT NULL, PRIMARY KEY(plan_item_id, target_kind, target_id),
         CHECK(target_kind IN ('NODE', 'TODO', 'PLAN_ITEM')))''')
     connection.execute('CREATE INDEX IF NOT EXISTS project_plan_item_link_target ON project_plan_item_link(target_kind, target_id)')
+    # Todo -> state-evidence lookup for plan.item.trace; malformed payloads index as NULL.
+    if _table_exists(connection, 'project_event'):
+        connection.execute(f"""CREATE INDEX IF NOT EXISTS project_event_todo_action_todo
+            ON project_event(project_id, ({_EVENT_TODO_ID}), created_at, event_id)
+            WHERE event_type='TODO_ACTION_APPLIED'""")
+
+
+# Must match the index expression exactly so SQLite can use the partial index.
+_EVENT_TODO_ID = "CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.todo_id') END"
 
 
 def _table_exists(connection, name):
@@ -385,8 +394,9 @@ class PlanItemActions:
                     WHERE project_id=? AND source_kind='TODO' AND source_id=? ORDER BY created_at, fanout_id''', (project_id, todo_id)):
                 results.append({'kind': 'RESULT_FANOUT', 'fanout_id': row[0], 'outcome': row[1], 'created_at': row[2]})
         if _table_exists(connection, 'project_event'):
-            for row in connection.execute('''SELECT event_id, payload_json, created_at FROM project_event
-                    WHERE project_id=? AND event_type='TODO_ACTION_APPLIED' ORDER BY created_at, event_id''', (project_id,)):
+            for row in connection.execute(f'''SELECT event_id, payload_json, created_at FROM project_event
+                    WHERE project_id=? AND event_type='TODO_ACTION_APPLIED' AND ({_EVENT_TODO_ID})=?
+                    ORDER BY created_at, event_id''', (project_id, todo_id)):
                 try:
                     payload = json.loads(row[1])
                 except (TypeError, ValueError):

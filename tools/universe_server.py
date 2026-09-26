@@ -55130,12 +55130,18 @@ class UniverseRequestHandler(BaseHTTPRequestHandler):
         feature_detail = re.fullmatch(r"/v1/feature-nodes/([^/]+)", path)
         if feature_detail is not None:
             try:
+                feature = self.server.store.get_feature_node(unquote(feature_detail.group(1)))
+                # Stored plan-item back-references, symmetric with todo.read.
+                from universe_plan_item_actions import plan_item_refs_for_store
                 self._send(
                     HTTPStatus.OK,
                     {
                         "schema": API_SCHEMA,
                         "status": "FEATURE_NODE_COLLECTED",
-                        "feature": self.server.store.get_feature_node(unquote(feature_detail.group(1))),
+                        "feature": feature,
+                        "plan_items": plan_item_refs_for_store(
+                            self.server.store, "NODE", feature["feature_id"]
+                        ),
                     },
                 )
             except UniverseError as error:

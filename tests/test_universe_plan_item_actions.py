@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests"))
-from universe_plan_item_actions import PlanItemActions, PlanItemError  # noqa: E402
+from universe_plan_item_actions import _EVENT_TODO_ID, PlanItemActions, PlanItemError  # noqa: E402
 from universe_project_drafts import FIELDS, ProjectDrafts  # noqa: E402
 from universe_server import UniverseStore  # noqa: E402
 from universe_todo_actions import TodoActions  # noqa: E402
@@ -87,6 +87,27 @@ class PlanItemStoreTests(unittest.TestCase):
         self.assertEqual(["plan_p1"], [entry["plan_item_id"] for entry in listed["plan_items"]])
         todo_read = TodoActions(self.store).read({"todo_id": self.open_todo})
         self.assertEqual(["plan_p1"], [entry["plan_item_id"] for entry in todo_read["plan_items"]])
+
+    def test_todo_state_evidence_uses_indexed_lookup_by_todo(self):
+        self.save(todo_refs=[self.done_todo])
+        events = [("evt_done", {"todo_id": self.done_todo, "state": "DONE", "evidence_ref": "ref://done"}),
+                  ("evt_other", {"todo_id": self.open_todo, "state": "DONE", "evidence_ref": "ref://other"}),
+                  ("evt_ready", {"todo_id": self.done_todo, "state": "READY"}),
+                  ("evt_list", [self.done_todo]), ("evt_bad", "{not json")]
+        with self.store._connection() as connection:
+            for event_id, payload in events:
+                connection.execute(
+                    "INSERT INTO project_event(event_id, project_id, event_type, payload_json, created_at)"
+                    " VALUES (?, 'TEST', 'TODO_ACTION_APPLIED', ?, '2026-09-25T00:00:00Z')",
+                    (event_id, payload if isinstance(payload, str) else json.dumps(payload)))
+            plan = " ".join(str(row[-1]) for row in connection.execute(
+                "EXPLAIN QUERY PLAN SELECT event_id FROM project_event WHERE project_id=? AND event_type='TODO_ACTION_APPLIED'"
+                f" AND ({_EVENT_TODO_ID})=?"
+                " ORDER BY created_at, event_id", ("TEST", self.done_todo)))
+        self.assertIn("project_event_todo_action_todo", plan)
+        results = self.actions.trace({"plan_item_id": "plan_p1"})["todos"][0]["results"]
+        self.assertEqual([("TODO_STATE_EVIDENCE", "evt_done", "DONE", "ref://done")],
+                         [(r["kind"], r["event_id"], r["state"], r["evidence_ref"]) for r in results])
 
     def test_change_and_remove_links_keep_history_and_reverse_index_current(self):
         self.save(node_refs=[self.node], todo_refs=[self.done_todo])
@@ -219,6 +240,11 @@ class PlanItemActionApiTests(unittest.TestCase):
         status, todo_read = self.act("todo.read", {"todo_id": todo["todo_id"]})
         self.assertEqual(200, status, todo_read)
         self.assertEqual(["plan_api_p1"], [entry["plan_item_id"] for entry in todo_read["plan_items"]])
+        status, node_read = self.request("GET", f"/v1/feature-nodes/{feature['feature_id']}")
+        self.assertEqual(200, status, node_read)
+        self.assertEqual(feature["feature_id"], node_read["feature"]["feature_id"])
+        self.assertEqual(["plan_api_p1"], [entry["plan_item_id"] for entry in node_read["plan_items"]])
+        self.assertEqual({"plan_item_id", "revision", "kind", "label", "title", "state"}, set(node_read["plan_items"][0]))
         registry = self.server.action_registry_catalog()["registry"]
         self.assertIn("plan.item.save", json.dumps(registry))
 
