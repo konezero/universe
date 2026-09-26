@@ -34,12 +34,15 @@ BOOTSTRAP_ENVIRONMENT = "UNIVERSE_CLAUDE_PERMISSION_BOOTSTRAP"
 TOKEN_HEADER = "X-Universe-Claude-Permission-Token"
 BROKER_PATH = "/v1/claude-permission/approve"
 EXCHANGE_PATH = "/v1/claude-permission/exchange"
+RECOVER_PATH = "/v1/claude-permission/recover"
 REQUEST_TIMEOUT_SECONDS = 300.0
 
 # The session token lives here and nowhere else: not on disk, not in the
 # environment, not in argv. It is obtained once by trading the one-time
-# bootstrap token during MCP initialize.
+# bootstrap token during MCP initialize. A replacement process may recover only
+# through the broker's OS-attested, same-parent rotation path.
 _SESSION_TOKEN: str | None = None
+_REGISTRATION_ERROR = "CLAUDE_PERMISSION_NOT_REGISTERED"
 
 TOOL_DEFINITION = {
     "name": TOOL_NAME,
@@ -80,7 +83,7 @@ def register(*, opener=urllib.request.urlopen) -> bool:
     process as soon as it is spent, so nothing replayable remains.
     """
 
-    global _SESSION_TOKEN
+    global _SESSION_TOKEN, _REGISTRATION_ERROR
 
     if _SESSION_TOKEN:
         return True
@@ -102,7 +105,22 @@ def register(*, opener=urllib.request.urlopen) -> bool:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     if not isinstance(decoded, Mapping) or decoded.get("status") != "REGISTERED":
-        return False
+        if isinstance(decoded, Mapping) and decoded.get("reason") == "BOOTSTRAP_ALREADY_USED":
+            # No credential on disk: the broker authenticates the TCP client's
+            # OS process identity as well as this original launch proof.
+            recovery = urllib.request.Request(f"{endpoint}{RECOVER_PATH}", data=b"{}",
+                method="POST", headers={"Content-Type": "application/json", TOKEN_HEADER: bootstrap})
+            try:
+                with opener(recovery, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                    decoded = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+                _REGISTRATION_ERROR = "CLAUDE_PERMISSION_RECOVERY_TRANSPORT_FAILED"
+                return False
+            if not isinstance(decoded, Mapping) or decoded.get("status") != "REGISTERED":
+                _REGISTRATION_ERROR = "CLAUDE_PERMISSION_RECOVERY_DENIED"
+                return False
+        else:
+            return False
     token = decoded.get("session_token")
     if not isinstance(token, str) or not token:
         return False
@@ -125,7 +143,7 @@ def ask_universe(
         return _deny("CLAUDE_PERMISSION_ENDPOINT_NOT_LOOPBACK")
     token = _SESSION_TOKEN
     if not token:
-        return _deny("CLAUDE_PERMISSION_NOT_REGISTERED")
+        return _deny(_REGISTRATION_ERROR)
     body = json.dumps(dict(arguments), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint}{BROKER_PATH}",
@@ -194,6 +212,10 @@ def handle_message(message: Mapping[str, Any], *, asker=ask_universe) -> dict[st
 
 
 def main() -> int:
+    # MCP uses UTF-8 regardless of the Windows console code page. An emoji in
+    # a permission result must not crash this process and sever its stdio link.
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
     for line in sys.stdin:
         line = line.strip()
         if not line:

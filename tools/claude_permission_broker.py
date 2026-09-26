@@ -21,6 +21,7 @@ Security boundary:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
 import threading
@@ -29,10 +30,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from claude_permission_bridge import ClaudePermissionBridge, deny
+from claude_permission_peer import connection_peer, replacement_allowed
 
 
 BROKER_PATH = "/v1/claude-permission/approve"
 EXCHANGE_PATH = "/v1/claude-permission/exchange"
+RECOVER_PATH = "/v1/claude-permission/recover"
 TOKEN_HEADER = "X-Universe-Claude-Permission-Token"
 # Only the one-time bootstrap token is ever written to the MCP config. The
 # real session token is handed back in the exchange response and lives in the
@@ -123,11 +126,13 @@ class ClaudePermissionBroker:
             session_ref=bridge.session_ref,
             target=target,
         )
-        # One-time bootstrap credential. It is the only secret that reaches
-        # disk, and it stops working the moment it is exchanged.
+        # One-time exchange credential. Recovery also requires OS evidence of
+        # replacement by the original live parent; this proof alone is inert.
         self._bootstrap_token = secrets.token_urlsafe(32)
         self._bootstrap_lock = threading.Lock()
         self._bootstrap_consumed = False
+        self._recovery_proof = ""
+        self._registered_peer = None
         self._registered = threading.Event()
         self._seen_lock = threading.Lock()
         self._seen: set[str] = set()
@@ -197,7 +202,7 @@ class ClaudePermissionBroker:
             self.abort_registration()
         return registered
 
-    def exchange_bootstrap(self, presented: str | None) -> dict[str, Any]:
+    def exchange_bootstrap(self, presented: str | None, *, peer=None) -> dict[str, Any]:
         """Trade the one-time bootstrap token for the session token.
 
         The bootstrap token is burned on the first successful exchange, so a
@@ -215,9 +220,35 @@ class ClaudePermissionBroker:
             ):
                 return {"status": "DENIED", "reason": "BOOTSTRAP_INVALID"}
             self._bootstrap_consumed = True
+            self._recovery_proof = hashlib.sha256(self._bootstrap_token.encode()).hexdigest()
+            self._registered_peer = peer
             self._bootstrap_token = ""
             self._registered.set()
             self._cleanup_mcp_config()
+            return {"status": "REGISTERED", "session_token": self.token.value}
+
+    def recover_connection(self, presented: str | None, *, peer=None) -> dict[str, Any]:
+        """Host-owned rotation, requiring both launch proof and OS process evidence.
+
+        The consumed bootstrap remains invalid at exchange. Its hash alone never
+        authorizes recovery; the original authenticated child's live parent and
+        executable must match a replacement after the old child has exited.
+        """
+        with self._bootstrap_lock:
+            if self._stopped.is_set() or self.token.revoked:
+                return {"status": "DENIED", "reason": "BROKER_STOPPED"}
+            proof = hashlib.sha256(str(presented or "").encode()).hexdigest()
+            if not self._recovery_proof or not secrets.compare_digest(proof, self._recovery_proof):
+                return {"status": "DENIED", "reason": "RECOVERY_PROOF_INVALID"}
+            if not replacement_allowed(self._registered_peer, peer):
+                return {"status": "DENIED", "reason": "RECOVERY_PEER_INVALID"}
+            old = self.token
+            replacement = CapabilityToken(provider=old.provider,
+                session_ref=old.current_session_ref(), target=old.target)
+            old.revoke()
+            self.token = replacement
+            self._registered_peer = peer
+            # Keep duplicate request history and the bridge's active turn intact.
             return {"status": "REGISTERED", "session_token": self.token.value}
 
     def provider_environment(self, environment: Mapping[str, str]) -> dict[str, str]:
@@ -272,6 +303,8 @@ class ClaudePermissionBroker:
             # Burn the bootstrap credential so a late child cannot use it.
             self._bootstrap_consumed = True
             self._bootstrap_token = ""
+            self._recovery_proof = ""
+            self._registered_peer = None
         self._cleanup_mcp_config()
 
     def _cleanup_mcp_config(self) -> None:
@@ -363,7 +396,7 @@ class ClaudePermissionBroker:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
-                if self.path not in {BROKER_PATH, EXCHANGE_PATH}:
+                if self.path not in {BROKER_PATH, EXCHANGE_PATH, RECOVER_PATH}:
                     self._send(404, deny("CLAUDE_PERMISSION_ROUTE_NOT_FOUND"))
                     return
                 try:
@@ -379,12 +412,17 @@ class ClaudePermissionBroker:
                 if not isinstance(payload, Mapping):
                     self._send(400, deny("CLAUDE_PERMISSION_PAYLOAD_INVALID"))
                     return
-                if self.path == EXCHANGE_PATH:
+                if self.path in {EXCHANGE_PATH, RECOVER_PATH}:
+                    try:
+                        peer = connection_peer(self.client_address, self.connection.getsockname())
+                    except OSError:
+                        peer = None  # No OS identity means no recovery capability.
+                    action = broker.exchange_bootstrap if self.path == EXCHANGE_PATH else broker.recover_connection
                     self._send(
                         200,
-                        broker.exchange_bootstrap(
+                        action(
                             self.headers.get(TOKEN_HEADER)
-                            or payload.get("bootstrap_token")
+                            or payload.get("bootstrap_token"), peer=peer
                         ),
                     )
                     return
