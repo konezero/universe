@@ -102,6 +102,17 @@ class ReworkProvenanceTests(unittest.TestCase):
         self.result('worker',5)
         with self.assertRaisesRegex(PersonaAutomationError,'Observed role'):self.read()
 
+    def test_observed_idle_exit_can_replace_missing_done_but_not_missing_results(self):
+        self.build(closed=False)
+        closure=dict(task_frame_id=self.frame,alive=False,phase='EXITED',exit_reason='IDLE_TIMEOUT')
+        self.assertEqual('PASS',self.read(host_closure=closure)['reviewer']['result']['verdict'])
+        for changed in ({'alive':True},{'alive':None},{'task_frame_id':'other'},{'exit_reason':'CRASH'}):
+            with self.subTest(changed=changed),self.assertRaises(JournalError):
+                self.read(host_closure={**closure,**changed})
+        append(self.path,**self.identity,event_id='pending',kind='ASSIGNED',payload={
+            'role':'WORKER','attempt':5,'todo':self.content,'worker_write_scope':self.scope})
+        with self.assertRaises(JournalError):self.read(host_closure=closure)
+
     def test_canonical_selector_rejects_unknown_or_noninteger_attempt(self):
         for role,attempt in [('MASTER',1),('WORKER',True),('WORKER',0),('WORKER','4')]:
             with self.subTest(role=role,attempt=attempt),self.assertRaises(JournalError):
@@ -113,3 +124,25 @@ class ReworkProvenanceTests(unittest.TestCase):
         path=self.root/'.ai/runtime/task_frames'/(hashlib.sha256((self.session+'\0'+rf).encode()).hexdigest()[:24]+'.sqlite3')
         with closing(sqlite3.connect(path)) as db,db:db.execute("UPDATE worker_execution_state SET result_receipt_ref='tampered'")
         with self.assertRaises(JournalError):resolve_role_result(self.root,self.session,self.owner,self.frame,self.todo,'REVIEWER',4)
+
+    def test_idle_exit_does_not_upgrade_scoped_validation_to_full_pass(self):
+        self.build(closed=False)
+        rf=self.frame+'_worker_4'
+        path=self.root/'.ai/runtime/task_frames'/(hashlib.sha256((self.session+'\0'+rf).encode()).hexdigest()[:24]+'.sqlite3')
+        # Model an internally consistent immutable scoped result, not a digest mismatch.
+        with closing(sqlite3.connect(path)) as db,db:
+            result=json.loads(db.execute('SELECT result_json FROM task_turns').fetchone()[0])
+            result['validation_state']='PASSED_SCOPED'
+            envelope=json.loads(db.execute('SELECT worker_result_envelope_json FROM worker_execution_state').fetchone()[0])
+            envelope['result']=result
+            db.execute('UPDATE task_turns SET result_json=?',(json.dumps(result),))
+            db.execute('UPDATE worker_execution_state SET worker_result_envelope_json=?',(json.dumps(envelope),))
+        # Legacy single-pair reader validates the PASS gate separately from journal selection.
+        from unittest.mock import patch
+        selection={'attempts':{'worker':4,'reviewer':4},
+                   'expected_frames':{f'{self.frame}_{role}_{attempt}' for role in ('worker','reviewer') for attempt in range(1,5)},
+                   'completion_provenance_verified':True}
+        self.pairs[4]['worker_result_digest']=hashlib.sha256(json.dumps(result,ensure_ascii=True,separators=(',',':'),sort_keys=True).encode()).hexdigest()
+        with patch('task_frame_review_provenance.select_journal_review',return_value=selection):
+            with self.assertRaisesRegex(PersonaAutomationError,'incomplete or unverified'):
+                self.read(host_closure=dict(task_frame_id=self.frame,alive=False,phase='EXITED',exit_reason='IDLE_TIMEOUT'))

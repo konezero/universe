@@ -22,7 +22,7 @@ from typing import Any, Callable, Mapping
 
 def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, todo_id, value,
                           *, launch_reference=None, run_id=None, current_todo=None,
-                          expected_source_ref=None):
+                          expected_source_ref=None, host_closure=None):
     """Validate immutable role evidence and journal-pinned rework lineage."""
     def reject(detail):
         raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID", detail, 409)
@@ -37,7 +37,7 @@ def read_host_review_pair(repository_root, session_id, anchor_ref, frame_id, tod
         from task_frame_review_provenance import select_journal_review
         selection = select_journal_review(Path(repository_root),run_id=run_id,frame_id=frame_id,
             todo_id=todo_id,owner_ref=anchor_ref,launch_reference=launch_reference,
-            value=value,current_todo=current_todo)
+            value=value,current_todo=current_todo,host_closure=host_closure)
         attempts, expected = selection['attempts'], selection['expected_frames']
         journal_verified = selection['completion_provenance_verified']
     observed = set()
@@ -1835,30 +1835,42 @@ class PersonaAutomationStore:
             return {"schema": SCHEMA, "status": "PERSONA_AUTOMATION_REVIEW_RECORDED", "run": self._row(self._get(connection, run_id)), "review": review_payload, "event": event}
 
     def todo_completion_gate(self, project_id: str, todo_id: str, node_ref: str | None = None) -> dict[str, Any] | None:
-        """Return a blocking active WORKER_REVIEW run for a Todo, if any."""
+        """Require bound review for delegated work, independent of Master mode."""
 
         project_id = _text(project_id, "project_id")
         todo_id = _text(todo_id, "todo_id")
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM persona_automation_run WHERE project_id = ? AND execution_mode = 'WORKER_REVIEW' AND state IN ('RUNNING','WAITING','PAUSED') ORDER BY updated_at DESC, run_id DESC",
+                "SELECT * FROM persona_automation_run WHERE project_id = ? AND state IN ('RUNNING','WAITING','PAUSED') ORDER BY updated_at DESC, run_id DESC",
                 (project_id,),
             ).fetchall()
             for row in rows:
                 assignment = _load(row["current_assignment_json"], None)
-                if not isinstance(assignment, Mapping) or str(assignment.get("todo_id") or "") != todo_id:
+                launches = connection.execute(
+                    "SELECT payload_json FROM persona_automation_event WHERE run_id=? "
+                    "AND event_type='TASK_FRAME_HOST_LAUNCHED' ORDER BY rowid DESC",
+                    (row['run_id'],)).fetchall()
+                host = next((p for item in launches if (p := _load(item[0], {})).get('todo_id') == todo_id), None)
+                assigned = isinstance(assignment, Mapping) and assignment.get('todo_id') == todo_id
+                if host is None and (row['execution_mode'] != 'WORKER_REVIEW' or not assigned):
                     continue
-                if node_ref is not None and str(row["node_ref"] or "") != str(node_ref or ""):
+                if host is None and node_ref is not None and str(row["node_ref"] or "") != str(node_ref or ""):
                     continue
                 review = _load(row["current_review_json"], None)
-                if isinstance(review, Mapping) and str(review.get("outcome") or "").upper() == "PASS":
+                if (assigned and assignment.get('state') == 'REVIEWED'
+                        and isinstance(review, Mapping) and review.get('outcome') == 'PASS'
+                        and review.get('acceptance_status') == 'VERIFIED_EVIDENCE'
+                        and assignment.get('review_id') and assignment.get('review_id') == review.get('review_id')
+                        and assignment.get('dispatch_id') == review.get('dispatch_id')
+                        and assignment.get('result_ref') == review.get('result_ref')
+                        and (host is None or assignment.get('task_frame_id') == host.get('task_frame_id'))):
                     continue
                 return {
                     "run_id": row["run_id"],
                     "project_id": project_id,
                     "node_ref": row["node_ref"],
                     "todo_id": todo_id,
-                    "execution_mode": "WORKER_REVIEW",
+                    "execution_mode": row['execution_mode'],
                     "review": review,
                     "next_condition": row["next_condition"],
                 }
@@ -3050,7 +3062,8 @@ class PersonaAutomationStore:
 
     def recover_host_review(self, value, *, repository_root, session_id,
                             completion_provenance_verified=False, current_todo=None,
-                            expected_source_ref=None, reconcile_existing=False):
+                            expected_source_ref=None, reconcile_existing=False,
+                            current_todo_done=False, host_closure=None):
         """Bind immutable Host evidence atomically.
 
         A normal recovery requires an empty current assignment/review.  A
@@ -3073,10 +3086,13 @@ class PersonaAutomationStore:
                                          frame, todo_id, value, run_id=run_id,
                                          launch_reference=frames[-1].get('todo_journal'),
                                          current_todo=current_todo,
-                                         expected_source_ref=expected_source_ref)
+                                         expected_source_ref=expected_source_ref, host_closure=host_closure)
         except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
             if isinstance(error, PersonaAutomationError):
                 raise
+            from todo_execution_journal import JournalError
+            if isinstance(error, JournalError):
+                raise PersonaAutomationError(error.code, str(error), 409) from error
             raise PersonaAutomationError("TASK_FRAME_RECOVERY_EVIDENCE_INVALID",
                                          "durable Host evidence could not be validated", 409) from error
         if (pair["reviewer"]["result"]["verdict"] == "PASS"
@@ -3107,7 +3123,8 @@ class PersonaAutomationStore:
                 (run_id,)).fetchone()
             if latest is None or _load(latest["payload_json"], {}).get("task_frame_id") != frame:
                 raise PersonaAutomationError("TASK_FRAME_RECOVERY_STALE", "a newer Host superseded this result", 409)
-            if row["state"] not in {"WAITING", "RUNNING"}:
+            evidence_only = row["state"] == "STOPPED" and current_todo_done is True
+            if row["state"] not in {"WAITING", "RUNNING"} and not evidence_only:
                 raise PersonaAutomationError("TASK_FRAME_RECOVERY_STATE_INVALID", "run is not recoverable", 409)
             if type(value.get("expected_revision")) is not int or row["revision"] != value["expected_revision"]:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "run revision changed", 409)
@@ -3175,12 +3192,15 @@ class PersonaAutomationStore:
                  next_action,dispatch_id,row["assignment_revision"],source_message_id,row["project_id"],now))
             changed = connection.execute(
                 "UPDATE persona_automation_run SET current_assignment_json=?, current_review_json=?,"
-                "state='WAITING', next_condition=?, revision=revision+1, updated_at=? WHERE run_id=? AND revision=?",
-                (_json(assignment),_json(review),next_action,now,run_id,value["expected_revision"]))
+                "state=?, next_condition=?, revision=revision+1, updated_at=? WHERE run_id=? AND revision=?",
+                (_json(assignment),_json(review),row["state"] if evidence_only else "WAITING",
+                 row["next_condition"] if evidence_only else next_action,now,run_id,value["expected_revision"]))
             if changed.rowcount != 1:
                 raise PersonaAutomationError("PERSONA_AUTOMATION_REVISION_CONFLICT", "run changed during recovery", 409)
             event, _ = self._event(connection, run_id, "TASK_FRAME_REVIEW_RECOVERED", event_key,
-                                   {"identity": identity, "review": review})
+                                   {"identity": identity, "review": review, "evidence_only": evidence_only,
+                                    "preserved_state": row["state"] if evidence_only else None,
+                                    "host_closure": host_closure})
             return {"status": "TASK_FRAME_REVIEW_RECOVERED", "run": self._row(self._get(connection, run_id)),
                     "review": review, "event_id": event["event_id"]}
 

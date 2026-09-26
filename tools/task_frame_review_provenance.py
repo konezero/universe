@@ -7,7 +7,8 @@ from todo_execution_journal import JournalError, journal_path, read_reference, r
 
 def select_journal_review(root: Path, *, run_id: str, frame_id: str, todo_id: str,
                           owner_ref: str, launch_reference: Mapping[str, Any],
-                          value: Mapping[str, Any], current_todo: Mapping[str, Any] | None):
+                          value: Mapping[str, Any], current_todo: Mapping[str, Any] | None,
+                          host_closure=None):
     def reject(detail):
         raise JournalError('TASK_FRAME_RECOVERY_EVIDENCE_INVALID', detail)
 
@@ -20,7 +21,12 @@ def select_journal_review(root: Path, *, run_id: str, frame_id: str, todo_id: st
             if record['task_frame_id'] == frame_id]
     if not rows or rows[0] != launch or any(coordinates(r) != identity for r in rows):
         reject('Host journal owner, run or launch changed')
-    if rows[-1]['kind'] != 'MASTER_DONE':
+    observed_closed = (isinstance(host_closure, Mapping)
+                       and host_closure.get('task_frame_id') == frame_id
+                       and host_closure.get('alive') is False
+                       and host_closure.get('phase') == 'EXITED'
+                       and host_closure.get('exit_reason') in {'MASTER_DONE', 'IDLE_TIMEOUT'})
+    if rows[-1]['kind'] != 'MASTER_DONE' and not observed_closed:
         reject('Journal must record the closed Host after all role results')
     original = launch['payload']
     selected, expected = {}, set()

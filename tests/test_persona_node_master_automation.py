@@ -1314,6 +1314,13 @@ class NodeMasterAutomationTests(unittest.TestCase):
             status,blocked=self.act('persona.automation.recover-frame-review',{**selected,'worker_result_ref':'supplied'})
             self.assertEqual(409,status,blocked)
         with mock.patch.object(server_module,"task_frame_host_status",
+                               return_value={"alive":False,"phase":"EXITED","exit_reason":"IDLE_TIMEOUT"}), \
+             mock.patch.object(self.server.persona_automation,"recover_host_review",
+                               return_value={"status":"TASK_FRAME_REVIEW_RECOVERED"}) as idle_recover:
+            status, recovered = self.act("persona.automation.recover-frame-review",body)
+            self.assertEqual(200,status,recovered)
+            idle_recover.assert_called_once()
+        with mock.patch.object(server_module,"task_frame_host_status",
                                return_value={"alive":True,"phase":"RUNNING_WORKER"}):
             status, rejected = self.act("persona.automation.recover-frame-review",body)
             self.assertEqual(409,status,rejected)

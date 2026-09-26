@@ -38205,7 +38205,8 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                 require_launched(value["run_id"], value["task_frame_id"])
                 frame = _identifier(value["task_frame_id"], "task_frame_id")
                 observed = task_frame_host_status(state_root, frame)
-                if observed.get("alive") or observed.get("phase") != "EXITED" or observed.get("exit_reason") != "MASTER_DONE":
+                if (observed.get("alive") is not False or observed.get("phase") != "EXITED"
+                        or observed.get("exit_reason") not in {"MASTER_DONE", "IDLE_TIMEOUT"}):
                     raise PersonaAutomationError("TASK_FRAME_RECOVERY_HOST_NOT_CLOSED",
                                                  "recovery requires an already-closed Host", 409)
                 launched = self.persona_automation.host_frame_launched(value["run_id"], frame)
@@ -38252,6 +38253,9 @@ class UniverseHTTPServer(ThreadingHTTPServer):
                     value, repository_root=project_root, session_id=sessions[0]["session_id"],
                     completion_provenance_verified=spec is not None,
                     current_todo={"title":todo.get("title"),"detail":todo.get("detail")},
+                    current_todo_done=todo.get("state") == "DONE",
+                    host_closure={"task_frame_id": frame, "alive": observed["alive"],
+                                  "phase": observed["phase"], "exit_reason": observed["exit_reason"]},
                     expected_source_ref=expected_source_ref,
                     reconcile_existing=value.get("reconcile_existing") is True)
             if action_id == "persona.automation.collect-frame":

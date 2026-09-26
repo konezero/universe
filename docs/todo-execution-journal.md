@@ -47,6 +47,42 @@ typed Actions and independent review.
 
 ## Activation and migration
 
+### Closed-Host review reconciliation (2026-09-26)
+
+`persona.automation.recover-frame-review` accepts a positively observed dead
+Host in `EXITED` with `MASTER_DONE` or `IDLE_TIMEOUT`. An idle timeout does not
+invalidate results already collected before exit. Unknown liveness, active
+roles and other exit reasons remain rejected; closure alone never proves PASS.
+The server passes its closure observation through journal validation and records
+it in the recovery event; it does not invent a `MASTER_DONE` journal record.
+Canonical role/attempt selection, immutable digests, both collection records,
+latest-frame identity, owner and unchanged Todo provenance are still required.
+
+If a Todo was already marked DONE and its run automatically STOPPED, this same
+Action can bind the missing assignment/review as evidence-only recovery. The
+server reads the Todo state; callers cannot supply a completion assertion.
+STOPPED, its reason and the Todo state are preserved: no resume, new Host,
+continuation or retroactive claim of `PERSONA_AUTOMATION_COMPLETED`. Replaying
+the same request is idempotent. This is not an atomic Todo/run completion API.
+For normal work, bind the actual independent review before completion; a
+`TASK_FRAME_COLLECTED` receipt by itself is not a review binding.
+The Todo completion gate also checks actual delegated Host launches under
+`MASTER_DIRECT`, not only the `WORKER_REVIEW` mode label. An active run's latest
+Host for that exact Todo needs a matching REVIEWED assignment and verified PASS;
+a prior Host's PASS or an unrelated Todo cannot clear the gate.
+
+Fleet plan-item browser acceptance is reproducible with
+`python tests/run_fleet_plan_item_browser.py`. It uses real Chromium and an
+isolated HTTP/SQLite fixture with external requests and event streams blocked.
+It covers create/edit/readback, trace links, CAS conflict, lost-response retry
+without duplication and narrow layout; captures go to `.artifacts/ui/`.
+It exercises the production component, not full Fleet navigation or real Goal
+acceptance/Run effects. It does not alter an existing immutable Reviewer verdict.
+In particular `PASSED_SCOPED` is not silently upgraded to a full Worker PASS.
+The Fleet result from `host_649010d6f741fad166f8` has that limited validation and
+a Reviewer note requesting visual acceptance before Todo closure. Its historical
+DONE is not proof that the independent full-acceptance gate was satisfied.
+
 New detached Hosts use this contract after server deployment. Old Hosts are not
 silently upgraded or given reconstructed assignments; finish/close them and make
 one bounded follow-up under the same Todo after checking liveness. Legacy DONE

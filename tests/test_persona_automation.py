@@ -74,6 +74,15 @@ class PersonaAutomationStoreTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_direct_master_with_host_cannot_complete_without_bound_review(self):
+        run = self.start()
+        self.assertIsNone(self.store.todo_completion_gate('project_test', 'todo_delegated'))
+        self.store.record_host_event(run['run_id'], 'TASK_FRAME_HOST_LAUNCHED', 'host_delegated',
+                                     {'todo_id': 'todo_delegated'})
+        gate = self.store.todo_completion_gate('project_test', 'todo_delegated')
+        self.assertEqual(run['run_id'], gate['run_id'])
+        self.assertIsNone(self.store.todo_completion_gate('project_test', 'todo_unrelated'))
+
     def start(self, key="start-1"):
         result = self.store.start_run(
             {
@@ -202,6 +211,16 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         value["expected_revision"] = self.store.get_run(run["run_id"])["revision"]
         return root, session, value
 
+    def test_completion_gate_requires_review_for_latest_host(self):
+        root, session, value = self._recovery_fixture('PASS', 'COMPLETED', 'PASSED')
+        self.assertIsNotNone(self.store.todo_completion_gate('project_test', 'todo_recovery'))
+        self.store.recover_host_review(value, repository_root=root, session_id=session,
+                                       completion_provenance_verified=True)
+        self.assertIsNone(self.store.todo_completion_gate('project_test', 'todo_recovery'))
+        self.store.record_host_event(value['run_id'], 'TASK_FRAME_HOST_LAUNCHED', 'host_followup',
+                                     {'todo_id': 'todo_recovery'})
+        self.assertIsNotNone(self.store.todo_completion_gate('project_test', 'todo_recovery'))
+
     def test_recover_fourth_journal_pair_binds_and_completes_without_transient_spec(self):
         from test_task_frame_review_provenance import ReworkProvenanceTests
         evidence=ReworkProvenanceTests();evidence.setUp();self.addCleanup(evidence.doCleanups)
@@ -225,6 +244,26 @@ class PersonaAutomationStoreTests(unittest.TestCase):
         completed=self.store.complete_run(dict(run_id=run['run_id'],complete=True,request_id='complete-fourth',
                                                expected_revision=result['run']['revision']))
         self.assertEqual('COMPLETED',completed['run']['state'])
+
+    def test_stopped_done_run_recovers_evidence_without_resuming(self):
+        root, session, value = self._recovery_fixture("PASS", "SUCCEEDED", "PASSED")
+        stopped = self.store.stop_run({"run_id": value["run_id"], "request_id": "stop-before-binding",
+                                      "reason": "No work remains", "expected_revision": value["expected_revision"]})
+        value["expected_revision"] = self.store.get_run(value["run_id"])["revision"]
+        with self.assertRaises(PersonaAutomationError) as error:
+            self.store.recover_host_review(value, repository_root=root, session_id=session,
+                                          completion_provenance_verified=True)
+        self.assertEqual("TASK_FRAME_RECOVERY_STATE_INVALID", error.exception.code)
+        result = self.store.recover_host_review(value, repository_root=root, session_id=session,
+            completion_provenance_verified=True, current_todo_done=True)
+        self.assertEqual("STOPPED", result["run"]["state"])
+        self.assertEqual("No work remains", result["run"]["stop_reason"])
+        self.assertEqual("PASS", result["run"]["current_review"]["outcome"])
+        self.assertEqual("REVIEWED", result["run"]["current_assignment"]["state"])
+        replay = self.store.recover_host_review(value, repository_root=root, session_id=session,
+            completion_provenance_verified=True, current_todo_done=True)
+        self.assertEqual(result["run"]["revision"], replay["run"]["revision"])
+        self.assertEqual("STOPPED", replay["run"]["state"])
 
     def test_recover_host_review_preserves_needs_revision_and_replays(self):
         root, session, value = self._recovery_fixture()
