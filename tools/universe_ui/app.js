@@ -14027,6 +14027,7 @@ const UNIFIED_KIND_STYLE = {
   DECISION: { kind: "goal", depth: 5 },
   MEMORY: { kind: "related", depth: 6 },
   PROPOSAL: { kind: "predicted", depth: 3 },
+  GOAL: { kind: "goal", depth: 4 },
 };
 
 // Which unified view drives the Galaxy render.
@@ -14183,6 +14184,72 @@ function galaxyProposalGraphNodes(projectId, candidates) {
     }));
 }
 
+function galaxyProposalLineageProjection(projectId, candidates, goals, existingNodes) {
+  const projectGoals = (Array.isArray(goals) ? goals : []).filter(
+    (goal) => goal?.project_id === projectId && goal?.goal_id,
+  );
+  const goalsById = new Map(projectGoals.map((goal) => [goal.goal_id, goal]));
+  const nodeIds = new Set((Array.isArray(existingNodes) ? existingNodes : [])
+    .map((item) => item?.node_id).filter(Boolean));
+  const goalNodes = [];
+  const edges = [];
+  const edgeIds = new Set();
+
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const acceptance = candidate?.goal_acceptance;
+    if (!candidate?.candidate_id || candidate.project_id !== projectId ||
+        typeof acceptance?.goal_id !== "string" || !acceptance.goal_id ||
+        typeof acceptance?.candidate_digest !== "string" || !acceptance.candidate_digest) {
+      continue;
+    }
+    if (!goalsById.has(acceptance.goal_id)) continue;
+
+    for (const goal of projectGoals) {
+      const origin = goal.proposal_origin;
+      if (origin?.candidate_id !== candidate.candidate_id ||
+          origin.candidate_digest !== acceptance.candidate_digest) continue;
+      const acceptedGoal = goal.goal_id === acceptance.goal_id && !origin.predecessor_goal_id;
+      if (!acceptedGoal) {
+        const predecessor = goalsById.get(origin.predecessor_goal_id);
+        const predecessorOrigin = predecessor?.proposal_origin;
+        if (goal.goal_id === acceptance.goal_id ||
+            predecessorOrigin?.candidate_id !== candidate.candidate_id ||
+            predecessorOrigin.candidate_digest !== acceptance.candidate_digest) continue;
+      }
+
+      const proposalNode = `proposal:${candidate.candidate_id}`;
+      const goalNode = `goal:${goal.goal_id}`;
+      if (!nodeIds.has(goalNode)) {
+        nodeIds.add(goalNode);
+        goalNodes.push({
+          node_id: goalNode,
+          kind: "GOAL",
+          title: String(goal.title || goal.goal_id),
+          state: goal.state,
+          data: {goal},
+        });
+      }
+      const edgeId = `proposal_goal:${candidate.candidate_id}:${goal.goal_id}`;
+      if (edgeIds.has(edgeId)) continue;
+      edgeIds.add(edgeId);
+      edges.push({
+        edge_id: edgeId,
+        from_node: proposalNode,
+        to_node: goalNode,
+        relation: acceptedGoal ? "PROPOSAL_ACCEPTED_AS_GOAL" : "PROPOSAL_FOLLOWUP_GOAL",
+        candidate_id: candidate.candidate_id,
+        candidate_digest: acceptance.candidate_digest,
+        accepted_goal_id: acceptance.goal_id,
+        accepted_at: acceptance.accepted_at || null,
+        predecessor_goal_id: origin.predecessor_goal_id || null,
+        source: "GALAXY_GOAL_PROPOSAL_PROJECTION",
+        projection_only: true,
+      });
+    }
+  }
+  return {goalNodes, edges};
+}
+
 function buildUnifiedGalaxyGraph() {
   const unified = state.projection?.unified_graph;
   if (!unified || !Array.isArray(unified.nodes) || !unified.nodes.length) {
@@ -14198,9 +14265,14 @@ function buildUnifiedGalaxyGraph() {
   // Galaxy remains the full relationship projection.  Registration filtering
   // applies only to Fleet/Ops work boards, not this topology view.
   let nodes = unified.nodes.filter((n) => !nodeAllow || nodeAllow.has(n.node_id));
+  let proposalLineage = {goalNodes: [], edges: []};
   if (["galaxy", "knowledge"].includes(viewName)) {
-    nodes = nodes.concat(galaxyProposalGraphNodes(
-      state.selectedProject?.project_id, state.goalProposals));
+    const projectId = state.selectedProject?.project_id;
+    const proposalNodes = galaxyProposalGraphNodes(projectId, state.goalProposals);
+    nodes = nodes.concat(proposalNodes);
+    proposalLineage = galaxyProposalLineageProjection(
+      projectId, state.goalProposals, state.goals, nodes);
+    nodes = nodes.concat(proposalLineage.goalNodes);
   }
   const query = String(state.galaxySearch || "").trim().toLowerCase();
   const stateFilter = String(state.galaxyStateFilter || "ALL").toUpperCase();
@@ -14222,7 +14294,7 @@ function buildUnifiedGalaxyGraph() {
     focused = true;
     const inView = new Set(nodes.map((n) => n.node_id));
     const adj = new Map();
-    for (const e of unified.edges || []) {
+    for (const e of [...(unified.edges || []), ...proposalLineage.edges]) {
       if (!inView.has(e.from_node) || !inView.has(e.to_node)) continue;
       (adj.get(e.from_node) || adj.set(e.from_node, []).get(e.from_node)).push(e.to_node);
       (adj.get(e.to_node) || adj.set(e.to_node, []).get(e.to_node)).push(e.from_node);
@@ -14278,12 +14350,17 @@ function buildUnifiedGalaxyGraph() {
   }
   const visible = new Set(graphNodes.map((i) => i.id));
   state.graph.nodes = graphNodes;
-  state.graph.edges = (unified.edges || [])
-    .filter((e) => (!edgeAllow || edgeAllow.has(e.edge_id)) && visible.has(e.from_node) && visible.has(e.to_node))
-    .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e }));
+  state.graph.edges = [
+    ...(unified.edges || [])
+      .filter((e) => (!edgeAllow || edgeAllow.has(e.edge_id)) && visible.has(e.from_node) && visible.has(e.to_node))
+      .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e })),
+    ...proposalLineage.edges
+      .filter((e) => visible.has(e.from_node) && visible.has(e.to_node))
+      .map((e) => ({ from: e.from_node, to: e.to_node, kind: e.relation, data: e })),
+  ];
   renderLiveSessionProjectionSurfaces();
 
-  const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "PROPOSAL", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
+  const legendOrder = ["PRODUCT", "APP", "SURFACE", "FEATURE", "CAPABILITY", "FLOW", "EXTERNAL_BOUNDARY", "PROPOSAL", "GOAL", "STRUCTURE", "COMPONENT", "DOCUMENT", "DECISION", "MEMORY"];
   setGraphLegend(
     legendOrder
       .filter((k) => kindsPresent.has(k))
